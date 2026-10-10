@@ -29,7 +29,7 @@ The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
 | `scripts/p1_checks.sh` | hash-chained log, write-ahead intents, tamper detection, approval gate, crash => unknown outcome, log kept under --no-sandbox | 19/19 |
 | `scripts/budget_checks.sh` | cost/token/wall budgets (flags and policy.toml), shared with subagents, graceful stop | 10/10 |
 | `scripts/caps_checks.sh` | runtime package capabilities: only granted primitives exist, `getfenv`/`loadstring`/`_G`/`require` escapes closed | 5/5 |
-| `scripts/llm_checks.sh` | wire formats (chat completions, responses, anthropic messages), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused | 15/15 |
+| `scripts/llm_checks.sh` | wire formats (chat completions, responses, anthropic messages), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, loop nudge on garbled tool-call markup, bare `<invoke>` code extracted | 18/18 |
 | `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
 | `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 30/30 |
