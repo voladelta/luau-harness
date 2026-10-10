@@ -18,9 +18,9 @@ def hx_endpoint(model):
     if os.environ.get("EVAL_HX_BASE_URL"):  # tests: a scripted model server
         return ["--api", "openai", "--base-url", os.environ["EVAL_HX_BASE_URL"], "--key-env", "EVAL_HX_KEY"]
     """Enclave models (cyberouter/*) use Enclave; anything else goes through OpenRouter."""
-    if model.startswith("cyberouter/"):
-        return ["--api", "openai", "--base-url", "https://router.enclave.ai/v1", "--key-env", "ENCLAVE_API_KEY"]
     extra = ["--reasoning", os.environ["EVAL_REASONING"]] if os.environ.get("EVAL_REASONING") else []
+    if model.startswith("cyberouter/"):
+        return ["--api", "openai", "--base-url", "https://router.enclave.ai/v1", "--key-env", "ENCLAVE_API_KEY"] + extra
     return ["--api", "openai", "--base-url", "https://openrouter.ai/api/v1", "--key-env", "OPENROUTER_API_KEY"] + extra
 
 def run_hx(ws, prompt_file, model, timeout, trace):
