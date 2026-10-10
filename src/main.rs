@@ -9,6 +9,7 @@ mod prims;
 mod vm;
 
 use anyhow::{bail, Result};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -16,9 +17,122 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
+const TOP_HELP: &str = "hx: Luau code-mode agent harness
+
+USAGE:
+    hx <command> [flags]
+
+COMMANDS:
+    exec         run Luau chunks in one session (no API key needed)
+    run          run an agent task
+    test         run a package's tests/*.luau
+    approve      lock a project package and grant the capabilities it requests
+    staged       list staged packages
+    accept       review and accept a staged package
+    reject       discard a staged package
+    upgrade      harness-module upgrade flow (propose|list|show|check|accept|rollback)
+    log verify   check an event log's hash chain and list unknown-outcome effects
+
+GLOBAL FLAGS:
+    --workspace DIR   workspace root (default: .)
+    --no-sandbox      disable the sandbox and path policy (prints a warning)
+    --net | --no-net  allow or deny network access
+    --approval MODE   approval mode
+    --resume LOG      resume from an event log
+    -h, --help        show help (also `hx <command> --help`)
+    -V, --version     show version
+
+EXAMPLES:
+    hx exec --workspace . 'print(1+1)'
+    hx run --prompt-file task.md --model claude-sonnet-5-5 --max-turns 20
+    hx log verify .harness/run.jsonl
+
+ENVIRONMENT:
+    HX_MODEL, HX_API, HX_BASE_URL   defaults for the matching `run` flags
+    HX_DEBUG=1                      print the full error chain on failure
+";
+
+fn help_for(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--no-sandbox] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            anthropic (default) | openai (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --max-turns N      turn limit (default 30)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
+        "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
+        "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\n",
+        "staged" => "hx staged\n\nList staged packages.\n",
+        "accept" => "hx accept NAME [--yes]\n\nReview a staged package, then lock it and grant its capabilities.\nPrompts on a terminal; without one, --yes is required.\n",
+        "reject" => "hx reject NAME\n\nDiscard a staged package.\n",
+        "upgrade" => "hx upgrade propose MODULE FILE [--reason R]\nhx upgrade list|show ID|check ID\nhx upgrade accept ID [--yes] [--force]\nhx upgrade rollback MODULE\n",
+        "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 tampered, 3 unknown outcomes.\n",
+        _ => return None,
+    })
+}
+
+/// A command-line usage mistake: reported like any error but exits 2 (not 1).
+#[derive(Debug)]
+struct Usage(String);
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Usage {}
+fn usage(msg: String) -> anyhow::Error {
+    anyhow::Error::new(Usage(msg))
+}
+
+/// Ask a y/N question on stderr. Never blocks a script: without a tty on stdin the caller must pass `--yes`.
+fn confirm(question: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        bail!("{question}\nstdin is not a terminal; pass --yes to confirm non-interactively");
+    }
+    eprint!("{question} [y/N] ");
+    let mut l = String::new();
+    std::io::stdin().read_line(&mut l)?;
+    if !matches!(l.trim(), "y" | "Y" | "yes") {
+        bail!("not accepted");
+    }
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = real_main().await {
+        eprintln!("Error: {e}");
+        if std::env::var_os("HX_DEBUG").is_some() {
+            eprintln!("{e:?}");
+        } else if e.chain().nth(1).is_some() {
+            for c in e.chain().skip(1) {
+                eprintln!("  caused by: {c}");
+            }
+            eprintln!("(set HX_DEBUG=1 for a full trace)");
+        }
+        std::process::exit(if e.is::<Usage>() { 2 } else { 1 });
+    }
+}
+
+async fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None | Some("-h" | "--help" | "help") => {
+            print!("{TOP_HELP}");
+            return Ok(());
+        }
+        Some("-V" | "-v" | "--version" | "version") => {
+            println!("hx {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(c) if args.iter().skip(1).any(|a| a == "-h" || a == "--help") => {
+            if let Some(h) = help_for(c) {
+                print!("{h}");
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+    if args.first().is_some_and(|c| help_for(c).is_none()) {
+        eprintln!("Error: unknown command `{}`\n\nRun `hx --help` for usage.", args[0]);
+        std::process::exit(2);
+    }
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
     // The sandbox and path policy are ON by default; `--no-sandbox` is an explicit opt-out (and says so on stderr).
     let sandbox = !args.iter().any(|a| a == "--no-sandbox");
@@ -76,7 +190,7 @@ async fn main() -> Result<()> {
         }
         // hx test PKG_DIR : run the package's tests/*.luau
         Some("test") => {
-            let dir = PathBuf::from(args.get(1).ok_or_else(|| anyhow::anyhow!("usage: hx test PKG_DIR"))?).canonicalize()?;
+            let dir = PathBuf::from(args.get(1).ok_or_else(|| usage(format!("usage: hx test PKG_DIR")))?).canonicalize()?;
             // Mount the package under test so `require("name")` finds it without installing or locking it, but ONLY for a
             // directory outside .harness/pkgs (e.g. a staged tool). Installed packages keep their lock and grant checks.
             let installed = dir.parent().is_some_and(|p| p == workspace.join(".harness/pkgs"));
@@ -98,7 +212,7 @@ async fn main() -> Result<()> {
         }
         // hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
         Some("approve") => {
-            let pkg = args.get(1).ok_or_else(|| anyhow::anyhow!("usage: hx approve PKG"))?;
+            let pkg = args.get(1).ok_or_else(|| usage(format!("usage: hx approve PKG")))?;
             println!("{}", modules::Resolver::new(workspace).approve(pkg)?);
             Ok(())
         }
@@ -106,10 +220,10 @@ async fn main() -> Result<()> {
         Some("upgrade") => {
             let r = modules::Resolver::new(workspace);
             let sub = args.get(1).map(String::as_str).unwrap_or("");
-            let id = || args.get(2).cloned().ok_or_else(|| anyhow::anyhow!("usage: hx upgrade {sub} ID"));
+            let id = || args.get(2).cloned().ok_or_else(|| usage(format!("usage: hx upgrade {sub} ID")));
             match sub {
                 "propose" => {
-                    let (m, f) = (args.get(2).ok_or_else(|| anyhow::anyhow!("usage: hx upgrade propose MODULE FILE [--reason R]"))?, args.get(3).ok_or_else(|| anyhow::anyhow!("usage: hx upgrade propose MODULE FILE"))?);
+                    let (m, f) = (args.get(2).ok_or_else(|| usage(format!("usage: hx upgrade propose MODULE FILE [--reason R]")))?, args.get(3).ok_or_else(|| usage(format!("usage: hx upgrade propose MODULE FILE")))?);
                     println!("{}", r.propose(m, &std::fs::read_to_string(f)?, &arg(&args, "--reason").unwrap_or_default())?);
                 }
                 "list" => {
@@ -123,19 +237,12 @@ async fn main() -> Result<()> {
                     let id = id()?;
                     println!("{}", r.show_proposal(&id)?);
                     if !args.iter().any(|a| a == "--yes") {
-                        use std::io::Write;
-                        print!("activate this change? [y/N] ");
-                        std::io::stdout().flush()?;
-                        let mut l = String::new();
-                        std::io::stdin().read_line(&mut l)?;
-                        if !matches!(l.trim(), "y" | "Y" | "yes") {
-                            bail!("not accepted");
-                        }
+                        confirm("activate this change?")?;
                     }
                     println!("{}", r.accept_upgrade(&id, args.iter().any(|a| a == "--force"))?);
                 }
-                "rollback" => println!("{}", r.rollback_upgrade(args.get(2).ok_or_else(|| anyhow::anyhow!("usage: hx upgrade rollback MODULE"))?)?),
-                _ => bail!("usage: hx upgrade propose|list|show|check|accept|rollback ..."),
+                "rollback" => println!("{}", r.rollback_upgrade(args.get(2).ok_or_else(|| usage(format!("usage: hx upgrade rollback MODULE")))?)?),
+                _ => return Err(usage(format!("usage: hx upgrade propose|list|show|check|accept|rollback ..."))),
             }
             Ok(())
         }
@@ -147,31 +254,24 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("reject") => {
-            let n = args.get(1).ok_or_else(|| anyhow::anyhow!("usage: hx reject NAME"))?;
+            let n = args.get(1).ok_or_else(|| usage(format!("usage: hx reject NAME")))?;
             modules::Resolver::new(workspace).reject(n)?;
             println!("rejected {n}");
             Ok(())
         }
         Some("accept") => {
-            let n = args.get(1).ok_or_else(|| anyhow::anyhow!("usage: hx accept NAME [--yes]"))?;
+            let n = args.get(1).ok_or_else(|| usage(format!("usage: hx accept NAME [--yes]")))?;
             let r = modules::Resolver::new(workspace);
             println!("{}", r.review(n)?);
             if !args.iter().any(|a| a == "--yes") {
-                use std::io::Write;
-                print!("accept {n}? it will be locked and granted the capabilities above [y/N] ");
-                std::io::stdout().flush()?;
-                let mut l = String::new();
-                std::io::stdin().read_line(&mut l)?;
-                if !matches!(l.trim(), "y" | "Y" | "yes") {
-                    bail!("not accepted");
-                }
+                confirm(&format!("accept {n}? it will be locked and granted the capabilities above"))?;
             }
             println!("{}", r.accept(n)?);
             Ok(())
         }
         // hx log verify FILE : check the hash chain and list effects with an unknown outcome (exit 1 tampered, 3 unknown)
         Some("log") if args.get(1).map(String::as_str) == Some("verify") => {
-            let f = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!("usage: hx log verify FILE"))?);
+            let f = PathBuf::from(args.get(2).ok_or_else(|| usage(format!("usage: hx log verify FILE")))?);
             let r = eventlog::verify(&f)?;
             println!("{} records, hash chain {}", r.records, if r.chain_ok { "intact".to_string() } else { format!("BROKEN at line {}", r.bad_line.unwrap_or(0)) });
             for (seq, tool, summary) in &r.unknown {
@@ -185,6 +285,6 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        _ => bail!("usage: hx exec|run|test|approve|staged|accept|reject|upgrade|log verify ..."),
+        _ => return Err(usage(format!("usage: hx log verify FILE (see `hx log --help`)"))),
     }
 }
