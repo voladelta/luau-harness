@@ -1,0 +1,16 @@
+[package]
+name = "std"
+version = "0.1.0"
+description = "The standard harness: loop, prompt assembly, code extraction, printing, feedback, hooks."
+
+[capabilities]
+# The std package is built into the binary and granted by it. Declared so the format is exercised from day one.
+fs = ["read", "write"]
+proc = ["sh"]
+llm = ["chat"]
+
+[exports]
+module = "init.luau"
+
+[tests]
+files = ["tests/*.luau"]

@@ -1,0 +1,14 @@
+/target
+__pycache__/
+*.pyc
+# runtime state written by hx itself (event logs and blobs contain file contents and command output)
+.harness/
+# eval outputs: raw per-run results, traces and logs (regenerate with eval/run.py; merged results live in eval/final/)
+eval/results*/
+eval/archive-v*/
+eval/smoke*/
+eval/*.log
+eval/claude0/
+eval/deepseek0/
+eval/claude-resume/
+eval/haiku-resume/
