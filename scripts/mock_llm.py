@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scripted model server (chat completions, /responses and /v1/messages) for deterministic harness tests.
+"""Scripted model server (chat completions and /responses) for deterministic harness tests.
 usage: mock_llm.py PORT  (replies are read from the MOCK_REPLIES env var, a JSON list, served in order)
 A reply is a string or an object. A string that starts with a ```luau fence becomes one native `luau` tool call with that code
 (any text after the fence is the reply text); any other string is a plain-text reply. An object is
@@ -42,9 +42,6 @@ class H(BaseHTTPRequestHandler):
                 out.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
             out += [{"type": "function_call", "call_id": i, "name": nm, "arguments": a} for i, (nm, a) in zip(ids, calls)]
             doc = {"output": out, "usage": {"input_tokens": 10, "output_tokens": 5, "cost": 0.001}}
-        elif self.path.endswith("/v1/messages"):  # Anthropic Messages shape
-            blocks = ([{"type": "text", "text": text}] if text or not calls else []) + [{"type": "tool_use", "id": i, "name": nm, "input": json.loads(a) if a.strip().startswith("{") else {}} for i, (nm, a) in zip(ids, calls)]
-            doc = {"content": blocks, "stop_reason": "tool_use" if calls else "end_turn", "usage": {"input_tokens": 10, "output_tokens": 5}}
         else:
             msg = {"role": "assistant", "content": text or None}
             if calls:

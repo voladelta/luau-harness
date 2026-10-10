@@ -1,4 +1,4 @@
-//! Provider client, three wire formats, all with native tool calling: Anthropic Messages (`anthropic`), OpenAI-compatible Chat Completions (`openai`) and
+//! Provider client, two wire formats, both with native tool calling: OpenAI-compatible Chat Completions (`openai`) and
 //! the Responses API (`responses`). Any model on any compatible endpoint (OpenRouter, Enclave, local) works: nothing here
 //! restricts the model or the upstream provider.
 use anyhow::{bail, Result};
@@ -8,7 +8,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct LlmCfg {
     pub model: String,
-    /// "anthropic" | "openai" | "responses"
+    /// "openai" | "responses"
     pub api: String,
     pub base_url: Option<String>,
     pub key_env: Option<String>,
@@ -39,13 +39,8 @@ pub struct Reply {
 }
 
 impl LlmCfg {
-    /// Chat Completions or Responses: both default to OpenRouter and use bearer auth.
-    fn openai_style(&self) -> bool {
-        matches!(self.api.as_str(), "openai" | "responses")
-    }
-
     pub fn key(&self) -> Result<String> {
-        let env = self.key_env.clone().unwrap_or_else(|| if self.openai_style() { "OPENROUTER_API_KEY" } else { "ANTHROPIC_API_KEY" }.into());
+        let env = self.key_env.clone().unwrap_or_else(|| "OPENROUTER_API_KEY".into());
         std::env::var(&env).map_err(|_| anyhow::anyhow!("{env} not set"))
     }
 }
@@ -112,48 +107,6 @@ fn chat_messages(system: &Value, msgs: &[Value], cache: bool) -> Vec<Value> {
     out
 }
 
-/// Neutral messages -> Anthropic Messages. Tool results become `tool_result` blocks of one user message; a user text that
-/// follows them joins that message (tool_result blocks must come first).
-fn anthropic_messages(msgs: &[Value], cache: bool) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    let mut pending: Vec<Value> = Vec::new(); // content blocks of the user message being assembled
-    fn flush(out: &mut Vec<Value>, pending: &mut Vec<Value>) {
-        if !pending.is_empty() {
-            out.push(json!({"role": "user", "content": std::mem::take(pending)}));
-        }
-    }
-    for m in msgs {
-        match m["role"].as_str().unwrap_or("user") {
-            "assistant" => {
-                flush(&mut out, &mut pending);
-                if let Some(raw) = m["raw"].as_str().and_then(|r| serde_json::from_str::<Value>(r).ok()) {
-                    out.push(json!({"role": "assistant", "content": raw}));
-                    continue;
-                }
-                let mut blocks: Vec<Value> = Vec::new();
-                if let Some(t) = m["content"].as_str().filter(|t| !t.is_empty()) {
-                    blocks.push(json!({"type": "text", "text": t}));
-                }
-                for c in m["calls"].as_array().into_iter().flatten() {
-                    blocks.push(json!({"type": "tool_use", "id": c["id"], "name": c["name"], "input": c["input"]}));
-                }
-                out.push(json!({"role": "assistant", "content": blocks}));
-            }
-            "tool" => pending.push(json!({"type": "tool_result", "tool_use_id": m["id"], "content": m["content"].as_str().unwrap_or("")})),
-            _ => {
-                pending.push(json!({"type": "text", "text": m["content"].as_str().unwrap_or("")}));
-                flush(&mut out, &mut pending);
-            }
-        }
-    }
-    flush(&mut out, &mut pending);
-    if cache
-        && let Some(b) = out.last_mut().and_then(|m| m["content"].as_array_mut()).and_then(|c| c.last_mut()) {
-            b["cache_control"] = cache_marker();
-        }
-    out
-}
-
 /// Neutral messages -> Responses API input items (the model's own output items are spliced back in verbatim).
 fn responses_input(msgs: &[Value]) -> Vec<Value> {
     let mut out = Vec::new();
@@ -180,13 +133,12 @@ fn responses_input(msgs: &[Value]) -> Vec<Value> {
 
 /// `req`: { system?: string, messages: [neutral message], tools?: [{name, description, parameters}], max_tokens?: number }
 pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) -> Result<Reply> {
-    if !matches!(cfg.api.as_str(), "anthropic" | "openai" | "responses") {
-        bail!("unknown --api {:?} (expected anthropic, openai or responses)", cfg.api);
+    if !matches!(cfg.api.as_str(), "openai" | "responses") {
+        bail!("unknown --api {:?} (expected openai or responses)", cfg.api);
     }
-    let openai = cfg.openai_style();
     let responses = cfg.api == "responses";
     let system = req["system"].as_str().unwrap_or("");
-    // Prompt caching is always on, never optional. Anthropic Messages and Chat Completions get `cache_control` markers
+    // Prompt caching is always on, never optional. Chat Completions gets `cache_control` markers
     // (OpenRouter honours them for Anthropic/Gemini and ignores them elsewhere, where caching is automatic); the Responses
     // API has no markers and caches automatically. OpenAI-style requests also carry `prompt_cache_key`.
     let cache = !responses;
@@ -204,7 +156,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         }
         add_cache_key(&mut b, cfg);
         b
-    } else if openai {
+    } else {
         let mut b = json!({"model": cfg.model, "max_tokens": max_tokens, "messages": chat_messages(&sys_block, &msgs, cache), "usage": {"include": true}});
         if !tools.is_empty() {
             b["tools"] = json!(tools.iter().map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}})).collect::<Vec<_>>());
@@ -217,20 +169,13 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         }
         add_cache_key(&mut b, cfg);
         b
-    } else {
-        let mut b = json!({"model": cfg.model, "max_tokens": max_tokens, "system": [sys_block], "messages": anthropic_messages(&msgs, cache)});
-        if !tools.is_empty() {
-            b["tools"] = json!(tools.iter().map(|t| json!({"name": t["name"], "description": t["description"], "input_schema": t["parameters"]})).collect::<Vec<_>>());
-        }
-        b
     };
-    let default = if openai { "https://openrouter.ai/api/v1" } else { "https://api.anthropic.com" };
-    let base = cfg.base_url.clone().or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok().filter(|_| !openai)).unwrap_or(default.into());
-    let url = if responses { format!("{base}/responses") } else if openai { format!("{base}/chat/completions") } else { format!("{base}/v1/messages") };
+    let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
+    let url = if responses { format!("{base}/responses") } else { format!("{base}/chat/completions") };
     let mut resp: Option<Value> = None;
     for attempt in 0..6u32 {
         let r = http.post(&url).json(&body);
-        let r = if openai { r.bearer_auth(key) } else { r.header("x-api-key", key).header("anthropic-version", "2023-06-01") };
+        let r = r.bearer_auth(key);
         match r.send().await {
             Ok(r) if r.status().is_success() => {
                 resp = Some(r.json().await?);
@@ -262,7 +207,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         out.raw = serde_json::to_string(&items)?;
         let cut = resp["incomplete_details"]["reason"].as_str() == Some("max_output_tokens");
         out.finish = Some(if cut { "length".into() } else { "stop".to_string() });
-    } else if openai {
+    } else {
         let d = &u["prompt_tokens_details"];
         out.cache_read = d["cached_tokens"].as_u64().unwrap_or(0);
         out.cache_write = d["cache_write_tokens"].as_u64().unwrap_or(0);
@@ -281,22 +226,6 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         }
         out.raw = serde_json::to_string(&Value::Object(keep))?;
         out.finish = resp["choices"][0]["finish_reason"].as_str().map(String::from);
-    } else {
-        out.input = u["input_tokens"].as_u64().unwrap_or(0);
-        out.output = u["output_tokens"].as_u64().unwrap_or(0);
-        out.cache_write = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-        out.cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
-        let blocks: Vec<Value> = resp["content"].as_array().cloned().unwrap_or_default();
-        out.text = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
-        out.calls = blocks.iter().filter(|b| b["type"] == "tool_use").map(|b| {
-            let mut c = json!({"id": b["id"], "name": b["name"], "input": b["input"]});
-            if !b["input"].is_object() {
-                c["error"] = json!("arguments are not a JSON object");
-            }
-            c
-        }).collect();
-        out.raw = serde_json::to_string(&blocks)?;
-        out.finish = resp["stop_reason"].as_str().map(|s| if s == "max_tokens" { "length".into() } else { s.to_string() });
     }
     Ok(out)
 }

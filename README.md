@@ -21,7 +21,7 @@ cargo install --path . && hx exec 'print(#search("fn main", {glob = "*.rs"}))'
 | Budgets | Cost, token and wall-clock limits, shared with subagents; the run stops cleanly when one is hit |
 | Overridable harness | Loop, prompt, printer and hooks are Luau in `stdlib/std/`; replace any module in `.harness/override/std/` |
 | Extensions | Tool and skill packages locked by hash, MCP servers (stdio and HTTP), agent-written tools promoted only after your review |
-| Any provider | Anthropic Messages, OpenAI Chat Completions or Responses API; any compatible base URL |
+| Any provider | OpenAI Chat Completions or Responses API; any compatible base URL (OpenRouter by default) |
 
 ## Quick example
 
@@ -86,10 +86,10 @@ cargo build --release
 
 ## Quick start
 
-1. Set an API key. The default key variable depends on `--api`: `ANTHROPIC_API_KEY` for `anthropic` (default), `OPENROUTER_API_KEY` for `openai` and `responses`.
+1. Set an API key. The default key variable is `OPENROUTER_API_KEY` (override with `--key-env`).
 
    ```bash
-   export ANTHROPIC_API_KEY=...
+   export OPENROUTER_API_KEY=...
    ```
 
 2. Write the task to a file:
@@ -134,8 +134,8 @@ hx run --prompt-file task.md --model deepseek/deepseek-v4.1-flash \
 |---|---|---|
 | `--prompt-file F` | | Task text (not needed with `--resume` if the log recorded it) |
 | `--model M` | `HX_MODEL` | Model id |
-| `--api A` | `anthropic` (`HX_API`) | `anthropic`, `openai` (Chat Completions) or `responses` |
-| `--base-url U` | `HX_BASE_URL` | API base URL; defaults to Anthropic or OpenRouter |
+| `--api A` | `openai` (`HX_API`) | `openai` (Chat Completions) or `responses` |
+| `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
 | `--key-env E` | see Quick start | Env var holding the API key |
 | `--reasoning R` | | Reasoning effort |
 | `--max-turns N` | 30 | Turn limit |
@@ -267,7 +267,7 @@ cargo test --release
 - **macOS only for sandboxing.** The sandbox uses `sandbox-exec`, which Apple has deprecated. There is no Linux sandbox; on other systems you would need `--no-sandbox`, which removes the path policy as well. <!-- TODO: confirm behaviour on Linux; untested -->
 - **Network is all-or-nothing.** Seatbelt cannot filter by host.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
-- **The Anthropic Messages path is tested only against a mock.** Chat Completions was verified live on OpenRouter and Enclave.
+- **Only Chat Completions was verified live** (OpenRouter and Enclave); the Responses API is tested against a mock.
 - **No compaction.** Long tasks are bounded by `--max-turns` and the model's context window.
 - **Small benchmark.** 20 small Python tasks; results on large repositories are not measured.
 - **Not covered by resume:** a crash mid-model-call repeats that call (no side effect), and the stdout of a killed `sh` is lost.

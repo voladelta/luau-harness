@@ -14,7 +14,7 @@ What exists, how to verify it, and what is still missing. `PLAN.md` is the plan;
 - `eval/` runner, report, task generators; `tasks/` (15 frozen, hashed in `tasks/MANIFEST.sha256`), `tasks-unseen/` (5).
 
 ## CLI
-`hx run --workspace D --prompt-file F --model M [--max-cost USD --max-tokens N --max-wall SECS] [--api anthropic|openai|responses --base-url U --key-env E --reasoning R] [--provider-only A,B] [--approval prompt]`
+`hx run --workspace D --prompt-file F --model M [--max-cost USD --max-tokens N --max-wall SECS] [--api openai|responses --base-url U --key-env E --reasoning R] [--provider-only A,B] [--approval prompt]`
 `hx run --workspace D --model M ... --resume .harness/log/<session>.jsonl` (continue a crashed run; the task is read from the log)
 `hx exec --workspace D 'luau chunk' ...` (no API key) · `hx test PKG_DIR` · `hx approve PKG` · `hx log verify FILE`
 The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
@@ -29,7 +29,7 @@ The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
 | `scripts/p1_checks.sh` | hash-chained log, write-ahead intents, tamper detection, approval gate, crash => unknown outcome, log kept under --no-sandbox | 19/19 |
 | `scripts/budget_checks.sh` | cost/token/wall budgets (flags and policy.toml), shared with subagents, graceful stop | 10/10 |
 | `scripts/caps_checks.sh` | runtime package capabilities: only granted primitives exist, `getfenv`/`loadstring`/`_G`/`require` escapes closed | 5/5 |
-| `scripts/llm_checks.sh` | wire formats (chat completions, responses, anthropic messages), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, native tool calls on all three wire formats: parallel calls answered one result each, invalid arguments and unknown tool names get an error result, prose before any code is nudged | 26/26 |
+| `scripts/llm_checks.sh` | wire formats (chat completions, responses), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, native tool calls on both wire formats: parallel calls answered one result each, invalid arguments and unknown tool names get an error result, prose before any code is nudged | 19/19 |
 | `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
 | `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 30/30 |
@@ -134,14 +134,14 @@ harness gaps (unextracted markup), not the effort level.
   with 3.3x DeepSeek's fresh tokens and 16% Luau errors. That code was not kept.
 
 ## Native `luau(code)` tool (2026-10-10) - replaces fenced-block extraction
-The model has ONE tool, `luau(code)`, declared on every request (chat completions `tools`, Responses `function` tools, Anthropic `tools`).
+The model has ONE tool, `luau(code)`, declared on every request (chat completions `tools`, Responses `function` tools).
 The loop runs each call in the persistent session and answers every call id with one tool result; a reply with no call is the final answer
 (before any code has run it is nudged, max 2). Invalid or cut-off arguments and unknown tool names get an error result, never a crash.
 `std/extract` and all the markup nudges are gone: a model's own tool-call format is parsed by the provider, not by us.
-- The provider's raw assistant message (Anthropic content blocks incl. thinking, Chat Completions message incl. `reasoning`, Responses
+- The provider's raw assistant message (Chat Completions message incl. `reasoning`, Responses
   output items) is kept on the neutral message and echoed back verbatim; the replay log's reply blob stores `{text, calls, raw}`.
-- No forced `tool_choice` (newer Claude models 400 on it): `auto` plus the prompt. The Anthropic Messages path is only tested against
-  the mock (no Anthropic API key here); chat completions was verified live on Enclave and OpenRouter.
+- No forced `tool_choice` (newer Claude models 400 on it): `auto` plus the prompt. Chat completions was verified live on Enclave and OpenRouter.
+- The Anthropic Messages wire format was removed (it was only ever tested against the mock); Claude models are reached through OpenRouter.
 - `scripts/mock_llm.py` turns a scripted ```luau reply into a native call (objects `{text, calls:[{code}|{name, arguments}]}` for parallel/bad calls).
 
 Frozen suite x3 (45 runs each), fresh tokens per task / turns / $ per task, native tool vs the old extraction:
