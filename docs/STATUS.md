@@ -7,7 +7,7 @@ What exists, how to verify it, and what is still missing. `PLAN.md` is the plan;
   `effects.rs` (every effect live or replayed: write-ahead intents, recorded results, resume queues),
   `policy.rs` (sandbox, path policy, approval gate), `eventlog.rs` (hash-chained log), `modules.rs` (resolver, manifest,
   lockfile, grants), `llm.rs` / `host.rs` (model client, usage, subagents), `main.rs` (CLI).
-- `stdlib/std/` the built-in `std` package (L2, Luau): `loop`, `prompt`, `extract`, `printer`, `feedback`, `hooks`.
+- `stdlib/std/` the built-in `std` package (L2, Luau): `loop`, `prompt` (system prompt, the `luau` tool schema, nudges), `printer`, `feedback`, `hooks`.
   Embedded in the binary; override any module per project with `.harness/override/std/<mod>.luau`
   (`require("base:std/<mod>")` wraps the original). A broken override falls back to the built-in with a warning.
 - `prompts/system.md` the system prompt (also an overridable asset).
@@ -22,14 +22,14 @@ The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
 ## Checks (all need `cargo build --release` first; none needs an API key)
 | Script | Covers | Result |
 |---|---|---|
-| `hx test stdlib/std` | printer, extractor, mcp, hooks unit tests (Luau) | 24 pass |
+| `hx test stdlib/std` | printer, mcp, hooks unit tests (Luau) | 17 pass |
 | `cargo test --release` | Rust unit tests: mcp glob, path normalize, command classes, protected paths | 3 pass |
 | `scripts/p2_checks.sh` | printer override without rebuild, broken-override fallback, parallel, vars, lock/grants gate, hooks, subagents, hot reload, failed lock check stays failed | 16/16 |
 | `scripts/sandbox_checks.sh` | writes outside project, ../, symlinks, protected `.harness`, env scrubbing, network, process cap, timeout kills group | 35/35 |
 | `scripts/p1_checks.sh` | hash-chained log, write-ahead intents, tamper detection, approval gate, crash => unknown outcome, log kept under --no-sandbox | 19/19 |
 | `scripts/budget_checks.sh` | cost/token/wall budgets (flags and policy.toml), shared with subagents, graceful stop | 10/10 |
 | `scripts/caps_checks.sh` | runtime package capabilities: only granted primitives exist, `getfenv`/`loadstring`/`_G`/`require` escapes closed | 5/5 |
-| `scripts/llm_checks.sh` | wire formats (chat completions, responses, anthropic messages), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, loop nudge on garbled tool-call markup, bare `<invoke>` code extracted | 18/18 |
+| `scripts/llm_checks.sh` | wire formats (chat completions, responses, anthropic messages), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, native tool calls on all three wire formats: parallel calls answered one result each, invalid arguments and unknown tool names get an error result, prose before any code is nudged | 26/26 |
 | `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
 | `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 30/30 |
@@ -133,11 +133,36 @@ harness gaps (unextracted markup), not the effort level.
 - Hugging Face router (Qwen3.8-27B on Cerebras) was tried and dropped: needs a strict request body (no cache markers / `usage`), got 13/15
   with 3.3x DeepSeek's fresh tokens and 16% Luau errors. That code was not kept.
 
+## Native `luau(code)` tool (2026-10-10) - replaces fenced-block extraction
+The model has ONE tool, `luau(code)`, declared on every request (chat completions `tools`, Responses `function` tools, Anthropic `tools`).
+The loop runs each call in the persistent session and answers every call id with one tool result; a reply with no call is the final answer
+(before any code has run it is nudged, max 2). Invalid or cut-off arguments and unknown tool names get an error result, never a crash.
+`std/extract` and all the markup nudges are gone: a model's own tool-call format is parsed by the provider, not by us.
+- The provider's raw assistant message (Anthropic content blocks incl. thinking, Chat Completions message incl. `reasoning`, Responses
+  output items) is kept on the neutral message and echoed back verbatim; the replay log's reply blob stores `{text, calls, raw}`.
+- No forced `tool_choice` (newer Claude models 400 on it): `auto` plus the prompt. The Anthropic Messages path is only tested against
+  the mock (no Anthropic API key here); chat completions was verified live on Enclave and OpenRouter.
+- `scripts/mock_llm.py` turns a scripted ```luau reply into a native call (objects `{text, calls:[{code}|{name, arguments}]}` for parallel/bad calls).
+
+Frozen suite x3 (45 runs each), fresh tokens per task / turns / $ per task, native tool vs the old extraction:
+
+| Model | Pass | Fresh tok | Turns | $/task |
+|---|---|---|---|---|
+| hx DeepSeek, native | 45/45 | 6.4k | 4.5 | 0.0041 |
+| hx DeepSeek, extraction | 45/45 | 5.8k | 3.8 | 0.0041 |
+| hx Haiku 5.5 medium, native | 45/45 | 6.4k | 3.5 | 0.0019 |
+| hx Haiku 5.5 medium, extraction | 44/45 | 7.6k | 3.2 | 0.0025 |
+
+Unseen (5, 1 run): DeepSeek 5/5 (6.1k), Haiku medium 5/5 (5.1k). Luau errors per code turn 6-7%, truncated turns 0 (extraction: 8 on Haiku).
+DeepSeek's +10% tokens on frozen is inside the ~1.34x noise between identical runs. Haiku medium is now the cheapest setup ($0.0019/task).
+Both Haiku extraction failures above (bare `<invoke-luau>`, garbled `<parameter name="cmd">`) cannot occur any more.
+
 ## Decisions
 - The `dev` pack (changeset edit gate, test adapters, git, tree-sitter symbols) was built, measured and purged. Full pack: 1.21x MORE
   fresh tokens than the plain harness (extra verification turns, git misuse errors); the light variant was neutral (1.05x). The
   benchmark tasks are small and well-tested, so plain `edit` + a test run is already efficient. If a larger suite ever shows value,
   start from git history rather than from this branch of ideas. The general pack mechanism (`--pack`, `hx.expose`) stays.
+- Extraction was purged in favour of the native tool (see above); do not reintroduce a text-protocol fallback for models without function calling unless one is actually needed.
 - Preferences if test adapters return: uv for Python, bun for JS, never npm.
 
 ## P4: open extension system (done except WASM)
