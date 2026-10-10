@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LLM client checks: each wire format (chat completions, responses, anthropic messages) completes a run against a scripted
+# LLM client checks (also: loop nudge on garbled tool-call markup): each wire format (chat completions, responses, anthropic messages) completes a run against a scripted
 # server, and an openrouter-looking URL does not restrict the upstream provider. No API key needed.
 set -u
 cd "$(dirname "$0")/.."
@@ -30,4 +30,15 @@ runq anthropic claude-x --cache off; check "no way to turn caching off: --cache 
 runq openai any/model --provider-only anthropic,google; check "--provider-only pins providers" "$(has allow_fallbacks)" "yes"
 runq anthropic claude-x --provider-only anthropic; check "provider pin is chat-completions only" "$(has allow_fallbacks)" "no"
 check "unknown api is refused" "$(K=x $H run --workspace $T/openai --prompt-file $T/p.txt --model m --api bogus --base-url http://127.0.0.1:8795 --key-env K 2>&1 | grep -c 'unknown --api')" "1"
+# --- malformed tool-call markup after a code turn is nudged, not taken as the final answer; bare <invoke> code is run
+mockrun() { # replies-json -> report fields "finished|final_answer|turns|code_turns|truncated_turns"
+  MOCK_REPLIES="$1" MOCK_BY_LEN=1 python3 scripts/mock_llm.py 8796 & local m=$!; sleep 1
+  W=$T/m-$RANDOM; mkdir -p $W/.harness
+  local o; o=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --api openai --base-url http://127.0.0.1:8796 --key-env K 2>&1 | tail -1)
+  kill $m 2>/dev/null; wait $m 2>/dev/null
+  python3 -c "import sys,json;r=json.loads(sys.argv[1]);print('|'.join(str(r[k]) for k in ('finished','final_answer','turns','code_turns','truncated_turns')))" "$o" 2>/dev/null
+}
+check "garbled </invoke> after a code turn: nudged, run continues" "$(mockrun '["```luau\nprint(7)\n```","<\n<parameter name=\"cmd\">I will fix it</parameter>\n</invoke>\nelu","```luau\nprint(8)\n```","all done"]')" "True|all done|4|2|1"
+check "bare <invoke-luau> raw code is extracted and run" "$(mockrun '["<invoke-luau>\nprint(9)\n</invoke-luau>","all done"]')" "True|all done|2|1|0"
+check "plain prose after a code turn still finishes (no nudge)" "$(mockrun '["```luau\nprint(7)\n```","The fix is in place."]')" "True|The fix is in place.|2|1|0"
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
