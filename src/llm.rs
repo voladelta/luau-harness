@@ -16,6 +16,10 @@ pub struct LlmCfg {
     pub reasoning: Option<String>,
     /// default per-call output limit (a request can override it); a runaway reply costs at most this many tokens
     pub max_output: u64,
+    /// OpenAI-style `prompt_cache_key` (the run's session id, so every turn and subagent routes to one cache)
+    pub cache_key: Option<String>,
+    /// OpenRouter only: restrict routing to these upstream providers, no fallbacks (keeps a prompt cache on one provider)
+    pub provider_only: Vec<String>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -41,6 +45,12 @@ impl LlmCfg {
     }
 }
 
+fn add_cache_key(b: &mut Value, cfg: &LlmCfg) {
+    if let Some(k) = &cfg.cache_key {
+        b["prompt_cache_key"] = json!(k);
+    }
+}
+
 /// `req`: { system?: string, messages: [{role, content: string}], max_tokens?: number, cache?: bool }
 pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) -> Result<Reply> {
     if !matches!(cfg.api.as_str(), "anthropic" | "openai" | "responses") {
@@ -49,7 +59,10 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     let openai = cfg.openai_style();
     let responses = cfg.api == "responses";
     let system = req["system"].as_str().unwrap_or("");
-    let cache = req["cache"].as_bool().unwrap_or(true);
+    // Prompt caching is always on, never optional. Anthropic Messages and Chat Completions get `cache_control` markers
+    // (OpenRouter honours them for Anthropic/Gemini and ignores them elsewhere, where caching is automatic); the Responses
+    // API has no markers and caches automatically. OpenAI-style requests also carry `prompt_cache_key`.
+    let cache = !responses;
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(cfg.max_output);
     let mut msgs: Vec<Value> = req["messages"].as_array().cloned().unwrap_or_default();
     if cache {
@@ -67,6 +80,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         if let Some(e) = &cfg.reasoning {
             b["reasoning"] = json!({"effort": e});
         }
+        add_cache_key(&mut b, cfg);
         b
     } else if openai {
         let mut all = vec![json!({"role": "system", "content": [sys_block]})];
@@ -75,6 +89,10 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         if let Some(e) = &cfg.reasoning {
             b["reasoning"] = json!({"effort": e});
         }
+        if !cfg.provider_only.is_empty() {
+            b["provider"] = json!({"only": cfg.provider_only, "allow_fallbacks": false});
+        }
+        add_cache_key(&mut b, cfg);
         b
     } else {
         json!({"model": cfg.model, "max_tokens": max_tokens, "system": [sys_block], "messages": msgs})

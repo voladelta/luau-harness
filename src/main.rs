@@ -55,7 +55,7 @@ ENVIRONMENT:
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--no-sandbox] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            anthropic (Messages, default) | openai (Chat Completions) | responses (Responses API) (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --max-turns N      turn limit (default 30)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            anthropic (Messages, default) | openai (Chat Completions) | responses (Responses API) (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --provider-only A,B  OpenRouter (--api openai): route only to these providers, no fallbacks\n    --max-turns N      turn limit (default 30)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\n",
         "staged" => "hx staged\n\nList staged packages.\n",
@@ -180,6 +180,8 @@ async fn real_main() -> Result<()> {
                 key_env: arg(&args, "--key-env"),
                 reasoning: arg(&args, "--reasoning"),
                 max_output: arg(&args, "--max-output").and_then(|v| v.parse().ok()).unwrap_or(16384),
+                cache_key: Some(policy.log.session.clone()),
+                provider_only: arg(&args, "--provider-only").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default(),
             };
             let max_turns = arg(&args, "--max-turns").and_then(|s| s.parse().ok()).unwrap_or(30);
             let budget = policy::Budget { max_cost: arg(&args, "--max-cost").and_then(|v| v.parse().ok()), max_tokens: arg(&args, "--max-tokens").and_then(|v| v.parse().ok()), max_wall_secs: arg(&args, "--max-wall").and_then(|v| v.parse().ok()) };

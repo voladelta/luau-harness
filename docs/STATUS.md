@@ -14,7 +14,7 @@ What exists, how to verify it, and what is still missing. `PLAN.md` is the plan;
 - `eval/` runner, report, task generators; `tasks/` (15 frozen, hashed in `tasks/MANIFEST.sha256`), `tasks-unseen/` (5).
 
 ## CLI
-`hx run --workspace D --prompt-file F --model M [--max-cost USD --max-tokens N --max-wall SECS] [--api anthropic|openai|responses --base-url U --key-env E --reasoning R] [--approval prompt]`
+`hx run --workspace D --prompt-file F --model M [--max-cost USD --max-tokens N --max-wall SECS] [--api anthropic|openai|responses --base-url U --key-env E --reasoning R] [--provider-only A,B] [--approval prompt]`
 `hx run --workspace D --model M ... --resume .harness/log/<session>.jsonl` (continue a crashed run; the task is read from the log)
 `hx exec --workspace D 'luau chunk' ...` (no API key) · `hx test PKG_DIR` · `hx approve PKG` · `hx log verify FILE`
 The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
@@ -29,7 +29,8 @@ The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
 | `scripts/p1_checks.sh` | hash-chained log, write-ahead intents, tamper detection, approval gate, crash => unknown outcome, log kept under --no-sandbox | 19/19 |
 | `scripts/budget_checks.sh` | cost/token/wall budgets (flags and policy.toml), shared with subagents, graceful stop | 10/10 |
 | `scripts/caps_checks.sh` | runtime package capabilities: only granted primitives exist, `getfenv`/`loadstring`/`_G`/`require` escapes closed | 5/5 |
-| `scripts/llm_checks.sh` | wire formats (chat completions, responses, anthropic messages), no provider pin, unknown `--api` refused | 7/7 |
+| `scripts/llm_checks.sh` | wire formats (chat completions, responses, anthropic messages), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused | 15/15 |
+| `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
 | `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 30/30 |
 | `scripts/mcp_checks.sh` | MCP: binding, schema signatures, approval gate, sandboxed server (fs/net/env), prompt index | 19/19 |
