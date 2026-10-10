@@ -50,10 +50,13 @@ def run_claude(ws, prompt, model, timeout, trace):
     flags = ["--bare"]
     if BASELINE_AUTH == "openrouter":  # lean stock agent, paid; same provider and model as hx
         env.update(ANTHROPIC_BASE_URL="https://openrouter.ai/api", ANTHROPIC_AUTH_TOKEN=os.environ["OPENROUTER_API_KEY"], ANTHROPIC_API_KEY="")
-    else:  # subscription login: --bare skips OAuth, so trim context with flags (still ~20k tokens heavier)
+    else:  # subscription / subscription-lean login: --bare skips OAuth, so trim context with flags (still ~20k tokens heavier)
         for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"): env.pop(k, None)
         flags = ["--setting-sources", "project", "--disable-slash-commands", "--strict-mcp-config"]
+        if BASELINE_AUTH == "subscription-lean":  # ~3.6k prompt instead of ~23.7k; minimal system prompt, 4 core tools
+            flags += ["--system-prompt", "You are a coding agent. Complete the task by editing files in the working directory.", "--tools", "Bash,Read,Edit,Write"]
     p = subprocess.run(["claude", "-p", prompt, *flags, "--model", model_for_claude(model), "--output-format", "json",
+                        *(["--effort", os.environ["EVAL_EFFORT"]] if os.environ.get("EVAL_EFFORT") else []),
                         "--dangerously-skip-permissions", "--no-session-persistence"],
                        cwd=ws, capture_output=True, text=True, timeout=timeout, env=env)
     Path(trace).write_text(p.stdout + "\n" + p.stderr)

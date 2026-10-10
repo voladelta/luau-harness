@@ -65,8 +65,8 @@ function M.run(cfg)
 		bad = 0
 
 		if code == nil then
-			if rep.code_turns == 0 and no_block < 2 then
-				-- A "final answer" before any code ran is a malformed reply (e.g. pseudo tool-call markup): nudge.
+			if (rep.code_turns == 0 or text:find("<invoke", 1, true) or text:find("```luau", 1, true)) and no_block < 2 then
+				-- A "final answer" before any code ran, or one that still carries unextractable code markup, is a malformed reply: nudge.
 				no_block += 1
 				rep.truncated_turns += 1
 				table.insert(messages, { role = "assistant", content = text })

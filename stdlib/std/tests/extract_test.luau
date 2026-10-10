@@ -37,6 +37,11 @@ test.case("truncated or missing blocks are not runnable", function()
 	test.eq(extract.code("no code here"), nil)
 end)
 
+test.case("bare invoke-luau tag holding raw code, no fence", function()
+	test.eq(extract.code("<invoke-luau>\nprint(8)\n</invoke-luau>"), "print(8)")
+	test.eq(extract.code("<invoke-luau>\nprint(8)"), nil)
+end)
+
 test.case("claude-style invoke/parameter markup, with and without a namespace prefix", function()
 	local plain = '<invoke name="luau">\n<parameter name="code">\nprint(7)\n</parameter>\n</invoke>'
 	test.eq(extract.code(plain), "print(7)")

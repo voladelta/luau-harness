@@ -68,6 +68,14 @@ function M.code(text: string): (string?, boolean)
 			end
 		end
 	end
+	-- Bare <invoke-luau>...</invoke-luau> (or <invoke name="luau">...</invoke>) holding raw code, no fence and no parameter element.
+	local bare = text:match("<invoke[%w%-]*[^>]*>(.-)</invoke[%w%-]*>")
+	if bare and not bare:find("<[%w:]*parameter", 1) then
+		local code = bare:match("^%s*(.-)%s*$") :: string
+		if code ~= "" then
+			return code, false
+		end
+	end
 	for _, f in all do
 		if not f.closed and isluau(f.info) then
 			local e = f.body:find("</" .. DSML, 1, true) or f.body:find("<" .. DSML, 1, true)

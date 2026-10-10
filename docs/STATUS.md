@@ -95,6 +95,25 @@ $0.30 / 600k tokens / 900s by default as a runaway guard.
   reasoning produced ~17k output tokens (Claude Code lean ran without extra reasoning). DeepSeek-hx total for the same 20: $0.07.
 - Spent $1.70 of OpenRouter credit on this run.
 
+## Haiku 5.5 (high effort) on hx vs DeepSeek vs Claude Code (2026-10-10)
+Claude Code runs on the subscription (`BASELINE_AUTH=subscription`; `--bare` cannot use it, it never reads OAuth). `subscription-lean`
+adds `--system-prompt` + `--tools Bash,Read,Edit,Write` (~3.6k prompt tokens instead of ~23.7k). `EVAL_EFFORT=high` sets `--effort`.
+
+| Frozen suite | Pass | Fresh tok/task | Turns | $/task | Wall |
+|---|---|---|---|---|---|
+| hx DeepSeek (3 runs x 15) | 45/45 | 5.8k | 3.8 | 0.0041 | 12s |
+| hx Haiku high (3 runs x 15) | 44/45 | 9.1k | 3.3 | 0.0031 | 24s |
+| Claude Code lean, Haiku high (1 run) | 15/15 | 21.9k | 11.9 | 0.0078 (API-equivalent) | 42s |
+| Claude Code heavy, Haiku high (1 run) | 15/15 | 24.9k | 13.0 | 0.0093 (API-equivalent) | - |
+
+Unseen (5 tasks, 1 run): hx Haiku 5/5 (6.2k), hx DeepSeek 5/5 (7.3k), Claude Code lean Haiku 5/5 (13.6k).
+- Haiku medium was bad earlier; high passes everything, so Haiku needs high effort. DeepSeek stays the default (better pass rate, fewer tokens, 2x faster).
+- The one Haiku failure (`shop-feature-bogo` #3) was a harness gap, not the model: it wrapped raw code in a bare `<invoke-luau>` tag (no fence, no
+  `<parameter>`), the extractor found nothing, and the loop ended the run as "finished" with nothing applied. Fixed: `std/extract` accepts a
+  bare invoke body, and `std/loop` nudges (max 2) on replies that still carry `<invoke` or a ```luau fence but extract no code, even after earlier code turns.
+  Rerun of that task: 3/3 pass. Other suites green (`scripts/all_checks.sh`).
+- NOT re-measured: DeepSeek on the frozen suite after this loop/extractor change (the 45/45 above predates it). Expected unaffected.
+
 ## Decisions
 - The `dev` pack (changeset edit gate, test adapters, git, tree-sitter symbols) was built, measured and purged. Full pack: 1.21x MORE
   fresh tokens than the plain harness (extra verification turns, git misuse errors); the light variant was neutral (1.05x). The
