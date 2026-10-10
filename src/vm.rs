@@ -88,11 +88,10 @@ impl Session {
             let (head, last) = trimmed.split_at(idx + 1);
             // Only rewrite when `head` is a complete chunk by itself; otherwise the last line closes a block
             // (`end`) and `return end` would silently exit the loop/if body early.
-            if self.lua.load(head).set_name("=chunk").into_function().is_ok() {
-                if let Ok(f) = load(&format!("{head}return {last}")) {
+            if self.lua.load(head).set_name("=chunk").into_function().is_ok()
+                && let Ok(f) = load(&format!("{head}return {last}")) {
                     return Ok(f);
                 }
-            }
         } else if let Ok(f) = load(&format!("return {trimmed}")) {
             return Ok(f);
         }
@@ -130,16 +129,8 @@ const SAFE_GLOBALS: &[&str] = &[
     "coroutine", "os", "parallel",
 ];
 
-/// Which capability a primitive needs: (capability, scope).
-fn needs(name: &str) -> Option<(&'static str, &'static str)> {
-    Some(match name {
-        "read" | "search" => ("fs", "read"),
-        "write" | "edit" => ("fs", "write"),
-        "sh" => ("proc", "sh"),
-        "agent" => ("llm", "agent"),
-        _ => return None,
-    })
-}
+/// Each primitive with the (capability, scope) it needs.
+const PRIM_CAPS: [(&str, &str, &str); 6] = [("read", "fs", "read"), ("search", "fs", "read"), ("write", "fs", "write"), ("edit", "fs", "write"), ("sh", "proc", "sh"), ("agent", "llm", "agent")];
 
 fn has(caps: &BTreeMap<String, Vec<String>>, cap: &str, scope: &str) -> bool {
     caps.get(cap).is_some_and(|v| v.iter().any(|s| s == scope || s == "*"))
@@ -153,13 +144,11 @@ fn package_env(lua: &Lua, pkg: &str, caps: &BTreeMap<String, Vec<String>>, requi
     for k in SAFE_GLOBALS {
         view.set(*k, g.get::<Value>(*k)?)?;
     }
-    let (name, caps2) = (pkg.to_string(), caps.clone());
-    for prim in ["read", "search", "write", "edit", "sh", "agent"] {
-        let (cap, scope) = needs(prim).unwrap();
-        if has(&caps2, cap, scope) {
+    for (prim, cap, scope) in PRIM_CAPS {
+        if has(caps, cap, scope) {
             view.set(prim, g.get::<Value>(prim)?)?;
         } else {
-            let msg = format!("capability_denied: package '{name}' was not granted {cap}.{scope}, which {prim}() needs");
+            let msg = format!("capability_denied: package '{pkg}' was not granted {cap}.{scope}, which {prim}() needs");
             view.set(prim, lua.create_function(move |_, _: mlua::MultiValue| -> mlua::Result<()> { Err(mlua::Error::runtime(msg.clone())) })?)?;
         }
     }
@@ -263,20 +252,17 @@ impl Vm {
         g.set("__format", lua.create_function(move |lua, v: Value| {
             if pf.lock().unwrap().is_none() {
                 let req = rc.lock().unwrap().clone();
-                if let Some(req) = req {
-                    if let Ok(Value::Table(m)) = req.call::<Value>("std/printer") {
-                        if let Ok(f) = m.get::<Function>("top") {
+                if let Some(req) = req
+                    && let Ok(Value::Table(m)) = req.call::<Value>("std/printer")
+                        && let Ok(f) = m.get::<Function>("top") {
                             *pf.lock().unwrap() = Some(f);
                         }
-                    }
-                }
             }
             let f = pf.lock().unwrap().clone();
-            if let Some(f) = f {
-                if let Ok(s) = f.call::<String>(v.clone()) {
+            if let Some(f) = f
+                && let Ok(s) = f.call::<String>(v.clone()) {
                     return Ok(s);
                 }
-            }
             Ok(lua.coerce_string(v.clone())?.map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| format!("<{}>", v.type_name())))
         })?)?;
         let env_for_vars = session_env.clone();
@@ -303,7 +289,7 @@ impl Vm {
                     pfx.register_thread(&th, format!("{parent}.{}", i + 1));
                     threads.push(th);
                 }
-                let handles: Vec<_> = threads.iter().cloned().collect();
+                let handles: Vec<_> = threads.to_vec();
                 let futs: Vec<_> = threads.into_iter().map(|t| t.into_async::<MultiValue>(())).collect::<mlua::Result<_>>()?;
                 let results = join_all(futs).await;
                 for th in &handles {
@@ -366,9 +352,7 @@ impl Vm {
                         let r = m.request(&server, "tools/list", json!({})).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
                         Ok(Ret::Json(r["tools"].clone()))
                     }).await?;
-                    match ret {
-                        r => prims::json_value(&lua, r),
-                    }
+                    prims::json_value(&lua, ret)
                 }
             })?)?;
             let (cfx, cm) = (fx.clone(), m.clone());
@@ -387,9 +371,7 @@ impl Vm {
                         let r = m.request(&server, "tools/call", json!({"name": tool, "arguments": args_json})).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
                         Ok(Ret::Json(r))
                     }).await?;
-                    match ret {
-                        r => prims::json_value(&lua, r),
-                    }
+                    prims::json_value(&lua, ret)
                 }
             })?)?;
         }
@@ -400,11 +382,10 @@ impl Vm {
         lua.set_memory_limit(mem_limit)?;
         let dl = deadline.clone();
         lua.set_interrupt(move |_| {
-            if let Some(t) = *dl.lock().unwrap() {
-                if Instant::now() > t {
+            if let Some(t) = *dl.lock().unwrap()
+                && Instant::now() > t {
                     return Err(mlua::Error::runtime("time budget exceeded (infinite loop?)"));
                 }
-            }
             Ok(VmState::Continue)
         });
 
@@ -458,8 +439,7 @@ impl Vm {
                     let base = res.resolve(&format!("base:{name}")).map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     load(&base)?
                 }
-                Ok(v) => v,
-                Err(e) => return Err(e),
+                other => other?,
             };
             ld.set(name.as_str(), v.clone())?;
             Ok(v)
@@ -618,9 +598,7 @@ impl Vm {
                         "output": tail,
                     })))
                 }).await?;
-                match ret {
-                    r => prims::json_value(&lua, r),
-                }
+                prims::json_value(&lua, ret)
             }
         })?;
         let (u_res, u_fx) = (resolver.clone(), fx.clone());
@@ -635,9 +613,7 @@ impl Vm {
                         Err(e) => Ret::Json(json!({"ok": false, "message": e.to_string()})),
                     })
                 }).await?;
-                match ret {
-                    r => prims::json_value(&lua, r),
-                }
+                prims::json_value(&lua, ret)
             }
         })?;
         for (n, f) in [("deftool", deftool), ("promote", promote), ("propose_module", propose_module)] {

@@ -147,11 +147,10 @@ fn anthropic_messages(msgs: &[Value], cache: bool) -> Vec<Value> {
         }
     }
     flush(&mut out, &mut pending);
-    if cache {
-        if let Some(b) = out.last_mut().and_then(|m| m["content"].as_array_mut()).and_then(|c| c.last_mut()) {
+    if cache
+        && let Some(b) = out.last_mut().and_then(|m| m["content"].as_array_mut()).and_then(|c| c.last_mut()) {
             b["cache_control"] = cache_marker();
         }
-    }
     out
 }
 

@@ -4,6 +4,7 @@
 //!   1. `<ws>/.harness/override/<pkg>/<mod>.luau`   user override of any module (e.g. the printer), no rebuild needed
 //!   2. `<ws>/.harness/pkgs/<pkg>/<mod>.luau`       project package (needs a lockfile entry + granted capabilities)
 //!   3. the built-in `std` package embedded in the binary
+//!
 //! `require("base:std/printer")` skips (1), so an override can wrap the module it replaces.
 //! `require("project/init")` is `<ws>/.harness/init.luau`, run before the loop starts (hook registration etc.).
 use anyhow::{anyhow, bail, Result};
@@ -40,7 +41,6 @@ pub struct Manifest {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct PackageInfo {
-    pub name: String,
     pub version: String,
     /// "tool" (functions the model calls as tools.NAME), "skill" (SKILL.md + optional Luau), or empty (plain module)
     pub kind: Option<String>,
@@ -98,6 +98,14 @@ pub struct Source {
     pub is_override: bool,
     /// project packages: (name, capabilities) so the loader can run the code with only those primitives
     pub pkg: Option<(String, BTreeMap<String, Vec<String>>)>,
+}
+
+/// A TOML file, or its default when it does not exist yet.
+fn read_toml<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(toml::from_str(&t)?),
+        Err(_) => Ok(T::default()),
+    }
 }
 
 fn file_for(module: &str) -> String {
@@ -161,13 +169,12 @@ impl Resolver {
         };
         let (pkg, module) = split_name(name);
         let file = file_for(module);
-        if let Some((tn, tdir)) = TEST_PKG.get() {
-            if pkg == tn && tdir.join(&file).is_file() {
+        if let Some((tn, tdir)) = TEST_PKG.get()
+            && pkg == tn && tdir.join(&file).is_file() {
                 let man: Manifest = toml::from_str(&std::fs::read_to_string(tdir.join("hx.toml"))?)?;
                 let p = tdir.join(&file);
                 return Ok(Source { text: std::fs::read_to_string(&p)?, origin: p.display().to_string(), is_override: false, pkg: Some((pkg.to_string(), man.capabilities)) });
             }
-        }
         let over = self.harness().join("override").join(pkg).join(&file);
         if !skip_override && over.is_file() {
             return Ok(Source { text: std::fs::read_to_string(&over)?, origin: over.display().to_string(), is_override: true, pkg: None });
@@ -202,10 +209,7 @@ impl Resolver {
 
     fn verify(&self, pkg: &str, dir: &Path, man: &Manifest) -> Result<()> {
         let hash = hash_dir(dir)?;
-        let lock: Lockfile = match std::fs::read_to_string(self.root.join("hx.lock")) {
-            Ok(t) => toml::from_str(&t)?,
-            Err(_) => Lockfile::default(),
-        };
+        let lock: Lockfile = read_toml(&self.root.join("hx.lock"))?;
         match lock.package.iter().find(|e| e.name == pkg) {
             None => bail!("package {pkg} is not locked; review it, then run `hx approve {pkg}`"),
             Some(e) if e.hash != hash || e.version != man.package.version => bail!(
@@ -215,10 +219,7 @@ impl Resolver {
             ),
             Some(_) => {}
         }
-        let grants: Grants = match std::fs::read_to_string(self.harness().join("grants.toml")) {
-            Ok(t) => toml::from_str(&t)?,
-            Err(_) => Grants::default(),
-        };
+        let grants: Grants = read_toml(&self.harness().join("grants.toml"))?;
         let granted = grants.grant.get(pkg);
         for (cap, scopes) in &man.capabilities {
             for s in scopes {
@@ -335,10 +336,7 @@ impl Resolver {
     /// The source in force right now: the active override, or the built-in module.
     pub fn effective_source(&self, module: &str) -> Result<String> {
         let (pkg, m) = Self::module_file(module)?;
-        match std::fs::read_to_string(self.override_path(module)?) {
-            Ok(t) => Ok(t),
-            Err(_) => Ok(Self::embedded(&pkg, &file_for(&m)).unwrap().to_string()),
-        }
+        Ok(std::fs::read_to_string(self.override_path(module)?).unwrap_or_else(|_| Self::embedded(&pkg, &file_for(&m)).unwrap().to_string()))
     }
 
     pub fn proposals_dir(&self) -> PathBuf {
@@ -433,6 +431,13 @@ impl Resolver {
         self.harness().join("versions").join(module.replace('/', "__"))
     }
 
+    fn log_upgrade(&self, mut rec: serde_json::Value) -> Result<()> {
+        use std::io::Write;
+        rec["ts"] = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().into();
+        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(self.harness().join("upgrades.jsonl"))?, "{rec}")?;
+        Ok(())
+    }
+
     /// Activate a proposal. Requires a passing gate report for THIS exact candidate, unless forced.
     pub fn accept_upgrade(&self, id: &str, force: bool) -> Result<String> {
         let (dir, meta) = self.proposal_meta(id)?;
@@ -460,9 +465,7 @@ impl Resolver {
         std::fs::write(vdir.join(format!("{n:04}.luau")), &previous)?;
         std::fs::create_dir_all(target.parent().unwrap())?;
         std::fs::write(&target, &new)?;
-        let rec = serde_json::json!({"ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(), "action": if force { "accept(force)" } else { "accept" }, "module": module, "proposal": id, "new_sha": sha, "version": n});
-        use std::io::Write;
-        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(self.harness().join("upgrades.jsonl"))?, "{rec}")?;
+        self.log_upgrade(serde_json::json!({"action": if force { "accept(force)" } else { "accept" }, "module": module, "proposal": id, "new_sha": sha, "version": n}))?;
         Ok(format!("activated {module} (version {n}); undo with `hx upgrade rollback {module}`"))
     }
 
@@ -479,9 +482,7 @@ impl Resolver {
             std::fs::write(&target, previous)?;
         }
         std::fs::remove_file(&last)?;
-        let rec = serde_json::json!({"ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(), "action": "rollback", "module": module});
-        use std::io::Write;
-        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(self.harness().join("upgrades.jsonl"))?, "{rec}")?;
+        self.log_upgrade(serde_json::json!({"action": "rollback", "module": module}))?;
         Ok(format!("rolled back {module} to {}", if files.is_empty() { "the built-in module" } else { "the previous version" }))
     }
 
@@ -496,10 +497,7 @@ impl Resolver {
         let man: Manifest = toml::from_str(&std::fs::read_to_string(dir.join("hx.toml"))?)?;
         let hash = hash_dir(&dir)?;
         let lock_path = self.root.join("hx.lock");
-        let mut entries: Vec<LockEntry> = match std::fs::read_to_string(&lock_path) {
-            Ok(t) => toml::from_str::<Lockfile>(&t)?.package,
-            Err(_) => vec![],
-        };
+        let mut entries = read_toml::<Lockfile>(&lock_path)?.package;
         entries.retain(|e| e.name != pkg);
         entries.push(LockEntry { name: pkg.into(), version: man.package.version.clone(), hash: hash.clone() });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -509,10 +507,7 @@ impl Resolver {
         }
         std::fs::write(&lock_path, out)?;
         let gpath = self.harness().join("grants.toml");
-        let mut g: Grants = match std::fs::read_to_string(&gpath) {
-            Ok(t) => toml::from_str(&t)?,
-            Err(_) => Grants::default(),
-        };
+        let mut g: Grants = read_toml(&gpath)?;
         g.grant.insert(pkg.into(), man.capabilities.clone());
         let mut gs = String::new();
         for (p, caps) in &g.grant {

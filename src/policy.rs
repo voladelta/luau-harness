@@ -5,9 +5,10 @@
 //!    no network unless granted, a scrubbed environment, its own process group (killed on timeout), and a process cap.
 //!  * `read`/`write`/`edit`/`search` check the *canonical* path against the same roots, never write through symlinks.
 //!  * `.harness/` and `hx.lock` are protected: the model can read them but never write them (grants, overrides, init).
+//!
 //! User-owned config: `<workspace>/.harness/policy.toml` (protected from the model):
-//!   [fs]  read = ["/extra/read/root"]   write = ["/extra/write/root"]
-//!   [net] allow = true                   # Seatbelt cannot filter by host; this is all-or-nothing
+//!     [fs]  read = ["/extra/read/root"]   write = ["/extra/write/root"]
+//!     [net] allow = true                   # Seatbelt cannot filter by host; this is all-or-nothing
 use crate::eventlog::EventLog;
 use anyhow::{bail, Result};
 use serde_json::json;

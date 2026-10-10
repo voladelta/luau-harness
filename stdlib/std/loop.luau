@@ -7,6 +7,11 @@ local prompt = require("std/prompt")
 
 local M = {}
 
+local function code_of(call): string?
+	local input = call.input
+	return if type(input) == "table" and type(input.code) == "string" then input.code else nil
+end
+
 -- cfg: { task: string, max_turns: number }
 -- returns a report: { turns, code_turns, luau_errors, truncated_turns, ops_per_turn, finished, final_answer }
 function M.run(cfg)
@@ -17,8 +22,7 @@ function M.run(cfg)
 	require("std/packages").install({ hooks = hooks })
 	require("std/mcp").install({ hooks = hooks })
 	for _, name in cfg.packs or {} do
-		local pack = require(name)
-		pack.install({ hooks = hooks })
+		require(name).install({ hooks = hooks })
 	end
 	local rep = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" }
 	local messages = { { role = "user", content = prompt.task_message(cfg.task) } }
@@ -41,7 +45,7 @@ function M.run(cfg)
 		local text, calls = reply.text, resp.calls
 		local summary = text
 		for _, c in calls do
-			summary ..= "\n[tool call " .. c.name .. "]\n" .. (if type(c.input) == "table" and type(c.input.code) == "string" then c.input.code else tostring(c.error))
+			summary ..= "\n[tool call " .. c.name .. "]\n" .. (code_of(c) or tostring(c.error))
 		end
 		hx.log("### MODEL (turn " .. rep.turns .. ")\n" .. summary)
 		local cut = resp.finish == "length"
@@ -80,7 +84,7 @@ function M.run(cfg)
 		table.insert(messages, { role = "assistant", content = text, calls = calls, raw = resp.raw })
 		-- every call id gets exactly one result, in order
 		for _, c in calls do
-			local code = if type(c.input) == "table" and type(c.input.code) == "string" then c.input.code else nil
+			local code = code_of(c)
 			local fb
 			if c.name ~= "luau" then
 				fb = "error: unknown tool " .. tostring(c.name) .. "; the only tool is luau(code)."

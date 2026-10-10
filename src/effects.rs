@@ -110,10 +110,8 @@ pub fn load_replay(path: &Path) -> Result<ReplayData> {
                 q.push(mk(RecState::Unknown, r["seq"].as_u64()));
             }
             Some("outcome") => {
-                if let Some((t, i)) = pos.get(&r["of"].as_u64().unwrap_or(0)) {
-                    if !r["ret"].is_null() {
-                        queues.get_mut(t).unwrap()[*i].state = RecState::Done(r["ret"].clone());
-                    }
+                if let (Some((t, i)), false) = (pos.get(&r["of"].as_u64().unwrap_or(0)), r["ret"].is_null()) {
+                    queues.get_mut(t).unwrap()[*i].state = RecState::Done(r["ret"].clone());
                 }
             }
             Some("call") => queues.entry(tid).or_default().push(mk(RecState::Done(r["ret"].clone()), None)),
@@ -124,11 +122,23 @@ pub fn load_replay(path: &Path) -> Result<ReplayData> {
     Ok(ReplayData { queues: queues.into_iter().map(|(k, v)| (k, v.into())).collect(), llm, task, dir })
 }
 
+type Queues = (HashMap<String, VecDeque<Rec>>, PathBuf);
+
 pub struct Effects {
     pub pol: Arc<Policy>,
     pub depth: usize,
-    replay: Mutex<Option<(HashMap<String, VecDeque<Rec>>, PathBuf)>>,
+    replay: Mutex<Option<Queues>>,
     threads: Mutex<HashMap<usize, String>>,
+}
+
+/// What one effect call is, for the log records around it.
+#[derive(Clone, Copy)]
+struct Call<'a> {
+    tool: &'a str,
+    class: Class,
+    args: &'a Value,
+    tid: &'a str,
+    sha: &'a str,
 }
 
 enum Replayed {
@@ -148,7 +158,7 @@ fn args_sha(args: &Value) -> String {
 }
 
 impl Effects {
-    pub fn new(pol: Arc<Policy>, depth: usize, replay: Option<(HashMap<String, VecDeque<Rec>>, PathBuf)>) -> Arc<Effects> {
+    pub fn new(pol: Arc<Policy>, depth: usize, replay: Option<Queues>) -> Arc<Effects> {
         Arc::new(Effects { pol, depth, replay: Mutex::new(replay), threads: Mutex::new(HashMap::new()) })
     }
 
@@ -209,7 +219,8 @@ impl Effects {
         }
     }
 
-    fn begin(&self, tool: &str, class: Class, args: &Value, tid: &str, sha: &str) -> Option<u64> {
+    fn begin(&self, c: &Call) -> Option<u64> {
+        let Call { tool, class, args, tid, sha } = *c;
         (class != Class::Read).then(|| {
             let mut r = self.base(tid, sha);
             r["tool"] = json!(tool);
@@ -220,7 +231,8 @@ impl Effects {
         })
     }
 
-    fn finish(&self, intent: Option<u64>, tool: &str, class: Class, args: &Value, tid: &str, sha: &str, res: &mlua::Result<Ret>, ms: u64) {
+    fn finish(&self, intent: Option<u64>, c: &Call, res: &mlua::Result<Ret>, ms: u64) {
+        let Call { tool, class, args, tid, sha } = *c;
         let ret = match res {
             Ok(r) => r.clone(),
             Err(e) => Ret::Err(err_text(e)),
@@ -258,9 +270,10 @@ impl Effects {
             None => {}
         }
         let t0 = std::time::Instant::now();
-        let intent = self.begin(tool, class, &args, &tid, &sha);
+        let call = Call { tool, class, args: &args, tid: &tid, sha: &sha };
+        let intent = self.begin(&call);
         let res = f();
-        self.finish(intent, tool, class, &args, &tid, &sha, &res, t0.elapsed().as_millis() as u64);
+        self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64);
         res
     }
 
@@ -277,9 +290,10 @@ impl Effects {
             None => {}
         }
         let t0 = std::time::Instant::now();
-        let intent = self.begin(tool, class, &args, &tid, &sha);
+        let call = Call { tool, class, args: &args, tid: &tid, sha: &sha };
+        let intent = self.begin(&call);
         let res = f().await;
-        self.finish(intent, tool, class, &args, &tid, &sha, &res, t0.elapsed().as_millis() as u64);
+        self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64);
         res
     }
 }

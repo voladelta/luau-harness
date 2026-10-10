@@ -3,7 +3,6 @@
 use crate::effects::{rt, Effects, Ret};
 use crate::policy::Class;
 use anyhow::Result;
-use grep::matcher::Matcher as _;
 use grep::regex::RegexMatcherBuilder;
 use grep::searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
 use ignore::{overrides::OverrideBuilder, WalkBuilder};
@@ -75,9 +74,8 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
     g.set("tmpdir", lua.create_function(move |_, ()| Ok(tmp.clone()))?)?;
 
     // __nd_value(kind, live) -> the recorded value on replay, else `live` (recorded). Wraps os.time/clock/date/math.random.
-    let (f, o) = (fx.clone(), ops.clone());
+    let f = fx.clone();
     g.set("__nd_value", lua.create_function(move |lua, (kind, live): (String, Value)| {
-        let _ = &o;
         let r = match &live {
             Value::Number(n) => Ret::Num(*n),
             Value::Integer(i) => Ret::Num(*i as f64),
@@ -340,7 +338,6 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>) -> mlua::Result<Result<(
         Ok(m) => m,
         Err(e) => return Ok(Err(("invalid_regex", e.to_string(), "escape special characters or pass literal=true"))),
     };
-    let _ = matcher.is_match(b""); // touch trait import
     let base = resolve(root, &opt_str(opts, "path").unwrap_or_else(|| ".".into()));
     let cap = opt_num(opts, "max").map(|m| m.max(1.0) as usize).unwrap_or(DEFAULT_HITS);
     let mut wb = WalkBuilder::new(&base);

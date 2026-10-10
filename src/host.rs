@@ -110,21 +110,16 @@ impl Host {
     pub fn check_budget(&self) -> std::result::Result<(), String> {
         let u = self.usage.lock().unwrap();
         let b = &self.budget;
-        if let Some(m) = b.max_cost {
-            if u.cost >= m {
-                return Err(format!("budget_exceeded: cost ${:.4} reached the ${m:.4} limit", u.cost));
-            }
+        if let Some(m) = b.max_cost.filter(|m| u.cost >= *m) {
+            return Err(format!("budget_exceeded: cost ${:.4} reached the ${m:.4} limit", u.cost));
         }
         let tokens = u.input + u.cache_write + u.output;
-        if let Some(m) = b.max_tokens {
-            if tokens >= m {
-                return Err(format!("budget_exceeded: {tokens} tokens reached the {m} token limit"));
-            }
+        if let Some(m) = b.max_tokens.filter(|m| tokens >= *m) {
+            return Err(format!("budget_exceeded: {tokens} tokens reached the {m} token limit"));
         }
-        if let Some(m) = b.max_wall_secs {
-            if self.started.elapsed().as_secs_f64() >= m {
-                return Err(format!("budget_exceeded: wall clock {:.0}s reached the {m:.0}s limit", self.started.elapsed().as_secs_f64()));
-            }
+        let wall = self.started.elapsed().as_secs_f64();
+        if let Some(m) = b.max_wall_secs.filter(|m| wall >= *m) {
+            return Err(format!("budget_exceeded: wall clock {wall:.0}s reached the {m:.0}s limit"));
         }
         Ok(())
     }

@@ -76,8 +76,8 @@ impl std::fmt::Display for Usage {
     }
 }
 impl std::error::Error for Usage {}
-fn usage(msg: String) -> anyhow::Error {
-    anyhow::Error::new(Usage(msg))
+fn usage(msg: &str) -> anyhow::Error {
+    anyhow::Error::new(Usage(msg.into()))
 }
 
 /// Ask a y/N question on stderr. Never blocks a script: without a tty on stdin the caller must pass `--yes`.
@@ -196,17 +196,16 @@ async fn real_main() -> Result<()> {
         // hx test PKG_DIR : run the package's tests/*.luau
         Some("test") => {
             let policy = mk_policy()?;
-            let dir = PathBuf::from(args.get(1).ok_or_else(|| usage(format!("usage: hx test PKG_DIR")))?).canonicalize()?;
+            let dir = PathBuf::from(args.get(1).ok_or_else(|| usage("usage: hx test PKG_DIR"))?).canonicalize()?;
             // Mount the package under test so `require("name")` finds it without installing or locking it, but ONLY for a
             // directory outside .harness/pkgs (e.g. a staged tool). Installed packages keep their lock and grant checks.
             let installed = dir.parent().is_some_and(|p| p == workspace.join(".harness/pkgs"));
             if installed {
                 // fall through: resolved normally via .harness/pkgs (lock + grants enforced)
-            } else if let Ok(t) = std::fs::read_to_string(dir.join("hx.toml")) {
-                if let Some(name) = t.lines().find_map(|l| l.trim().strip_prefix("name = ").map(|v| v.trim_matches('"').to_string())) {
+            } else if let Ok(t) = std::fs::read_to_string(dir.join("hx.toml"))
+                && let Some(name) = t.lines().find_map(|l| l.trim().strip_prefix("name = ").map(|v| v.trim_matches('"').to_string())) {
                     let _ = modules::TEST_PKG.set((name, dir.clone()));
                 }
-            }
             let vm = vm::Vm::new(policy.clone(), Duration::from_secs(30), 256 << 20, None, None)?;
             let (pass, fail, report) = vm.run_tests(&dir).await?;
             print!("{report}");
@@ -218,7 +217,7 @@ async fn real_main() -> Result<()> {
         }
         // hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
         Some("approve") => {
-            let pkg = args.get(1).ok_or_else(|| usage(format!("usage: hx approve PKG")))?;
+            let pkg = args.get(1).ok_or_else(|| usage("usage: hx approve PKG"))?;
             println!("{}", modules::Resolver::new(workspace).approve(pkg)?);
             Ok(())
         }
@@ -226,10 +225,10 @@ async fn real_main() -> Result<()> {
         Some("upgrade") => {
             let r = modules::Resolver::new(workspace);
             let sub = args.get(1).map(String::as_str).unwrap_or("");
-            let id = || args.get(2).cloned().ok_or_else(|| usage(format!("usage: hx upgrade {sub} ID")));
+            let id = || args.get(2).cloned().ok_or_else(|| usage(&format!("usage: hx upgrade {sub} ID")));
             match sub {
                 "propose" => {
-                    let (m, f) = (args.get(2).ok_or_else(|| usage(format!("usage: hx upgrade propose MODULE FILE [--reason R]")))?, args.get(3).ok_or_else(|| usage(format!("usage: hx upgrade propose MODULE FILE")))?);
+                    let (m, f) = (args.get(2).ok_or_else(|| usage("usage: hx upgrade propose MODULE FILE [--reason R]"))?, args.get(3).ok_or_else(|| usage("usage: hx upgrade propose MODULE FILE"))?);
                     println!("{}", r.propose(m, &std::fs::read_to_string(f)?, &arg(&args, "--reason").unwrap_or_default())?);
                 }
                 "list" => {
@@ -247,8 +246,8 @@ async fn real_main() -> Result<()> {
                     }
                     println!("{}", r.accept_upgrade(&id, args.iter().any(|a| a == "--force"))?);
                 }
-                "rollback" => println!("{}", r.rollback_upgrade(args.get(2).ok_or_else(|| usage(format!("usage: hx upgrade rollback MODULE")))?)?),
-                _ => return Err(usage(format!("usage: hx upgrade propose|list|show|check|accept|rollback ..."))),
+                "rollback" => println!("{}", r.rollback_upgrade(args.get(2).ok_or_else(|| usage("usage: hx upgrade rollback MODULE"))?)?),
+                _ => return Err(usage("usage: hx upgrade propose|list|show|check|accept|rollback ...")),
             }
             Ok(())
         }
@@ -260,13 +259,13 @@ async fn real_main() -> Result<()> {
             Ok(())
         }
         Some("reject") => {
-            let n = args.get(1).ok_or_else(|| usage(format!("usage: hx reject NAME")))?;
+            let n = args.get(1).ok_or_else(|| usage("usage: hx reject NAME"))?;
             modules::Resolver::new(workspace).reject(n)?;
             println!("rejected {n}");
             Ok(())
         }
         Some("accept") => {
-            let n = args.get(1).ok_or_else(|| usage(format!("usage: hx accept NAME [--yes]")))?;
+            let n = args.get(1).ok_or_else(|| usage("usage: hx accept NAME [--yes]"))?;
             let r = modules::Resolver::new(workspace);
             println!("{}", r.review(n)?);
             if !args.iter().any(|a| a == "--yes") {
@@ -277,7 +276,7 @@ async fn real_main() -> Result<()> {
         }
         // hx log verify FILE : check the hash chain and list effects with an unknown outcome (exit 1 tampered, 3 unknown)
         Some("log") if args.get(1).map(String::as_str) == Some("verify") => {
-            let f = PathBuf::from(args.get(2).ok_or_else(|| usage(format!("usage: hx log verify FILE")))?);
+            let f = PathBuf::from(args.get(2).ok_or_else(|| usage("usage: hx log verify FILE"))?);
             let r = eventlog::verify(&f)?;
             println!("{} records, hash chain {}", r.records, if r.chain_ok { "intact".to_string() } else { format!("BROKEN at line {}", r.bad_line.unwrap_or(0)) });
             for (seq, tool, summary) in &r.unknown {
@@ -291,6 +290,6 @@ async fn real_main() -> Result<()> {
             }
             Ok(())
         }
-        _ => return Err(usage(format!("usage: hx log verify FILE (see `hx log --help`)"))),
+        _ => Err(usage("usage: hx log verify FILE (see `hx log --help`)")),
     }
 }
