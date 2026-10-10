@@ -2,6 +2,7 @@
 # Budget checks (scripted model: every call costs 10+5 tokens and $0.001). No API key needed.
 set -u
 cd "$(dirname "$0")/.."
+export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M1 $M2 2>/dev/null' EXIT
 pass=0; fail=0

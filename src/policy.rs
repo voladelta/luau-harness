@@ -159,7 +159,12 @@ impl Policy {
             }
         }
         p.read_roots.extend(toolchain_roots());
-        if let Ok(t) = std::fs::read_to_string(workspace.join(".harness/policy.toml")) {
+        // the trust store must never be writable by the model, even if the user's write roots cover ~/.config
+        if let Some(d) = crate::trust::store_dir_canonical() {
+            p.protected.push(d);
+        }
+        let trusted = crate::trust::is_trusted(&workspace);
+        if let Some(t) = std::fs::read_to_string(workspace.join(".harness/policy.toml")).ok().filter(|_| trusted) {
             let f: PolicyFile = toml::from_str(&t).map_err(|e| anyhow::anyhow!("bad .harness/policy.toml: {e}"))?;
             p.read_roots.extend(f.fs.read.iter().filter_map(canon));
             let w: Vec<PathBuf> = f.fs.write.iter().filter_map(canon).collect();
@@ -425,6 +430,8 @@ mod tests {
         std::fs::create_dir_all(&off).unwrap();
         std::fs::create_dir_all(on.join(".harness")).unwrap();
         std::fs::write(on.join(".harness/policy.toml"), "[gpu]\nallow = true\n").unwrap();
+        // the launcher's consent to use workspace config (no other test in this binary depends on trust)
+        unsafe { std::env::set_var("HX_TRUST", "1") };
         assert!(!Policy::new(&off, true, None, None, None).unwrap().seatbelt_profile().contains("iokit-open"));
         let prof = Policy::new(&on, true, None, None, None).unwrap().seatbelt_profile();
         assert!(prof.contains("(allow iokit-open)") && prof.contains("MTLCompilerService"));

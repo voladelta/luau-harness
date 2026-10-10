@@ -6,6 +6,7 @@ mod mcp;
 mod modules;
 mod policy;
 mod prims;
+mod trust;
 mod vm;
 
 use anyhow::{bail, Result};
@@ -28,6 +29,7 @@ COMMANDS:
     test         run a package's tests/*.luau
     approve      lock a project package or skill and grant the capabilities it requests
     skills       list skills in .agents/skills and ~/.agents/skills and whether each is approved
+    trust        review this workspace's .harness config and hx.lock, then trust it (untrusted config is ignored)
     staged       list staged packages
     accept       review and accept a staged package
     reject       discard a staged package
@@ -61,6 +63,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
         "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
         "staged" => "hx staged\n\nList staged packages.\n",
+        "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,grants,mcp}.toml, .harness/init.luau, .harness/override/,\nhx.lock) and trust its exact content. Until then hx ignores it: a cloned repo cannot widen the sandbox, start MCP\nservers or pre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=1 trusts the workspace for one launch.\n",
         "accept" => "hx accept NAME [--yes]\n\nReview a staged package, then lock it and grant its capabilities.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard a staged package.\n",
         "upgrade" => "hx upgrade propose MODULE FILE [--reason R]\nhx upgrade list|show ID|check ID\nhx upgrade accept ID [--yes] [--force]\nhx upgrade rollback MODULE\n",
@@ -146,6 +149,7 @@ async fn real_main() -> Result<()> {
     match args.first().map(String::as_str) {
         // hx exec --workspace DIR 'chunk1' 'chunk2'  : run chunks in one session (no API key needed; used for testing)
         Some("exec") => {
+            trust::warn_if_untrusted(&workspace);
             let policy = mk_policy()?;
             let vm = vm::Vm::new(policy.clone(), Duration::from_secs(30), 256 << 20, None, None)?;
             let packs: Vec<String> = arg(&args, "--pack").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default();
@@ -167,6 +171,7 @@ async fn real_main() -> Result<()> {
         }
         // hx run --workspace DIR --prompt-file F --model M [--api openai --base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
         Some("run") => {
+            trust::warn_if_untrusted(&workspace);
             let policy = mk_policy()?;
             let resume = arg(&args, "--resume").map(PathBuf::from);
             let replay = resume.as_ref().map(|p| effects::load_replay(p)).transpose()?;
@@ -220,7 +225,38 @@ async fn real_main() -> Result<()> {
         // hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
         Some("approve") => {
             let pkg = args.get(1).ok_or_else(|| usage("usage: hx approve PKG"))?;
-            println!("{}", modules::Resolver::new(workspace).approve(pkg)?);
+            let rt = trust::Retrust::before(&workspace);
+            println!("{}", modules::Resolver::new(workspace.clone()).approve(pkg)?);
+            rt.after()?;
+            Ok(())
+        }
+        // hx trust [--yes] : review the workspace config and record its hash as trusted (outside the repo)
+        Some("trust") => {
+            let files = trust::config_files(&workspace);
+            if files.is_empty() {
+                println!("nothing to trust: this workspace has no .harness config or hx.lock");
+                return Ok(());
+            }
+            let links = trust::symlinks(&workspace);
+            if !links.is_empty() {
+                return Err(anyhow::anyhow!("cannot trust this config: it has symlinks ({}), whose targets the trust hash does not cover; replace them with real files", links.join(", ")));
+            }
+            for f in &files {
+                println!("===== {f}");
+                match std::fs::read_to_string(workspace.join(f)) {
+                    Ok(t) => print!("{t}{}", if t.ends_with('\n') { "" } else { "\n" }),
+                    Err(_) => println!("(binary or unreadable)"),
+                }
+            }
+            if trust::is_trusted(&workspace) && std::env::var("HX_TRUST").is_err() {
+                println!("already trusted");
+                return Ok(());
+            }
+            if !args.iter().any(|a| a == "--yes") {
+                confirm("trust this config? hx will apply it (sandbox, MCP servers, packages, skills, overrides)")?;
+            }
+            let h = trust::record(&workspace)?.unwrap_or_default();
+            println!("trusted {} ({}…)", workspace.display(), &h[..12.min(h.len())]);
             Ok(())
         }
         // hx skills : agent skills on disk and their approval state
@@ -230,7 +266,7 @@ async fn real_main() -> Result<()> {
         }
         // hx upgrade propose|list|show|check|accept|rollback : the harness-module upgrade flow (AC5)
         Some("upgrade") => {
-            let r = modules::Resolver::new(workspace);
+            let r = modules::Resolver::new(workspace.clone());
             let sub = args.get(1).map(String::as_str).unwrap_or("");
             let id = || args.get(2).cloned().ok_or_else(|| usage(&format!("usage: hx upgrade {sub} ID")));
             match sub {
@@ -251,9 +287,15 @@ async fn real_main() -> Result<()> {
                     if !args.iter().any(|a| a == "--yes") {
                         confirm("activate this change?")?;
                     }
+                    let rt = trust::Retrust::before(&workspace);
                     println!("{}", r.accept_upgrade(&id, args.iter().any(|a| a == "--force"))?);
+                    rt.after()?;
                 }
-                "rollback" => println!("{}", r.rollback_upgrade(args.get(2).ok_or_else(|| usage("usage: hx upgrade rollback MODULE"))?)?),
+                "rollback" => {
+                    let rt = trust::Retrust::before(&workspace);
+                    println!("{}", r.rollback_upgrade(args.get(2).ok_or_else(|| usage("usage: hx upgrade rollback MODULE"))?)?);
+                    rt.after()?;
+                }
                 _ => return Err(usage("usage: hx upgrade propose|list|show|check|accept|rollback ...")),
             }
             Ok(())
@@ -273,12 +315,14 @@ async fn real_main() -> Result<()> {
         }
         Some("accept") => {
             let n = args.get(1).ok_or_else(|| usage("usage: hx accept NAME [--yes]"))?;
-            let r = modules::Resolver::new(workspace);
+            let r = modules::Resolver::new(workspace.clone());
             println!("{}", r.review(n)?);
             if !args.iter().any(|a| a == "--yes") {
                 confirm(&format!("accept {n}? it will be locked and granted the capabilities above"))?;
             }
+            let rt = trust::Retrust::before(&workspace);
             println!("{}", r.accept(n)?);
+            rt.after()?;
             Ok(())
         }
         // hx log verify FILE : check the hash chain and list effects with an unknown outcome (exit 1 tampered, 3 unknown)

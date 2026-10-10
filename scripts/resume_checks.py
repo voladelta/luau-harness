@@ -5,6 +5,8 @@ Strong cases (crash not between an intent and its outcome): the resumed run must
 Unknown-outcome cases (crash right after a write-ahead intent): the effect ran at most once, the model is told
 `unknown_outcome`, and the log ends with no unresolved intent."""
 import json, os, shutil, subprocess, sys, tempfile, time
+os.environ["HX_TRUST"] = "1"  # these checks write .harness config on purpose; trust_checks.sh tests trust
+import tempfile as _tf; os.environ["XDG_CONFIG_HOME"] = _tf.mkdtemp()
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent

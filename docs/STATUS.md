@@ -177,6 +177,14 @@ All of it is opt-in or costs nothing when unused (no packages and no mcp.toml =>
   global; `.harness/pkgs/NAME` shadows both). No hx.toml: description from SKILL.md frontmatter, no Luau, no capabilities.
   Same trust model: invisible until `hx approve NAME` locks the dir hash (`hx skills` shows state). `skill()` also returns
   `dir` and `files`; approved skill dirs are added to the read roots (read-only). Unlocked dirs are never hashed.
+- **Workspace trust** (src/trust.rs, like `direnv allow`): workspace config (.harness policy/grants/mcp toml, init.luau,
+  override/, hx.lock) is ignored until `hx trust` records its hash in ~/.config/hx/trust.toml (protected path). Closes
+  "a cloned repo approves its own skills / widens policy / starts MCP servers". approve/accept/upgrade re-trust only a
+  workspace that was already trusted. `HX_TRUST=1` = launcher consent (all check suites and eval/run.py set it;
+  scripts/trust_checks.sh tests the real mechanism). Also hashed: `.harness/versions/` (rollback targets). A symlink
+  anywhere in the config makes it untrustable. The hash is length-framed; the store path is protected by its canonical
+  path. `HX_TRUST=1` never makes trust permanent (Retrust ignores it). Not covered: `.harness/proposals` (accept shows
+  the diff and asks).
 - **Vision** (`--pack std/vision`): `view(path | {paths}, {max})` (max 4 per call, long side <= max, default 1024) queues
   images; the pack's before_model hook appends one user message with them (Chat: image_url parts, Responses: input_image).
   Images stay in history (cache-friendly). Recorded like `read` (path + sha256, never pixels); resume re-reads and refuses a

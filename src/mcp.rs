@@ -180,6 +180,9 @@ impl Mcp {
     pub fn load(pol: Arc<Policy>) -> Result<Option<Arc<Mcp>>> {
         let path = pol.workspace.join(".harness/mcp.toml");
         let Ok(text) = std::fs::read_to_string(&path) else { return Ok(None) };
+        if !crate::trust::is_trusted(&pol.workspace) {
+            return Ok(None); // an untrusted mcp.toml starts nothing
+        }
         let f: File = toml::from_str(&text).map_err(|e| anyhow!("bad .harness/mcp.toml: {e}"))?;
         if f.server.is_empty() {
             return Ok(None);

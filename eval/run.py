@@ -29,7 +29,8 @@ def run_hx(ws, prompt_file, model, timeout, trace):
     limits = ["--max-cost", os.environ.get("EVAL_MAX_COST", "0.30"), "--max-tokens", os.environ.get("EVAL_MAX_TOKENS", "600000"), "--max-wall", os.environ.get("EVAL_MAX_WALL", "900")]
     p = subprocess.run([str(HX), "run", "--workspace", ws, "--prompt-file", str(prompt_file),
                         "--model", model, "--trace", str(trace)] + limits + (["--pack", os.environ["EVAL_PACKS"]] if os.environ.get("EVAL_PACKS") else []) + (["--max-output", os.environ["EVAL_MAX_OUTPUT"]] if os.environ.get("EVAL_MAX_OUTPUT") else []) + hx_endpoint(model),
-                       capture_output=True, text=True, timeout=timeout)
+                       capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, "HX_TRUST": "1"})  # throwaway copy we built (gate overrides), so its config is ours
     if p.returncode != 0:
         return {"harness_error": p.stderr[-500:]}
     r = json.loads(p.stdout.strip().splitlines()[-1])

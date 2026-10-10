@@ -3,6 +3,7 @@
 # Chat Completions and Responses; replay re-reads the file and refuses a changed one; without the pack nothing changes.
 set -u
 cd "$(dirname "$0")/.."
+export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M 2>/dev/null' EXIT
 pass=0; fail=0

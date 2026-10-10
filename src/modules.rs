@@ -9,6 +9,9 @@
 //! They need no hx.toml (the manifest comes from SKILL.md frontmatter), carry no Luau and no capabilities, and are locked
 //! by `hx approve NAME` like any package. `.harness/pkgs/<name>` shadows them.
 //!
+//! Everything under (1), (2), `project/init` and the agent skills is used only when the workspace config is trusted
+//! (see trust.rs); otherwise only the built-in package resolves.
+//!
 //! `require("base:std/printer")` skips (1), so an override can wrap the module it replaces.
 //! `require("project/init")` is `<ws>/.harness/init.luau`, run before the loop starts (hook registration etc.).
 use anyhow::{anyhow, bail, Result};
@@ -208,7 +211,11 @@ impl Resolver {
     }
 
     pub fn resolve(&self, name: &str) -> Result<Source> {
+        let trusted = crate::trust::is_trusted(&self.root);
         if name == "project/init" {
+            if !trusted {
+                bail!("no project init");
+            }
             let p = self.harness().join("init.luau");
             return std::fs::read_to_string(&p)
                 .map(|text| Source { text, origin: p.display().to_string(), is_override: false, pkg: None })
@@ -228,11 +235,11 @@ impl Resolver {
                 return Ok(Source { text: std::fs::read_to_string(&p)?, origin: p.display().to_string(), is_override: false, pkg: Some((pkg.to_string(), man.capabilities)) });
             }
         let over = self.harness().join("override").join(pkg).join(&file);
-        if !skip_override && over.is_file() {
+        if trusted && !skip_override && over.is_file() {
             return Ok(Source { text: std::fs::read_to_string(&over)?, origin: over.display().to_string(), is_override: true, pkg: None });
         }
         let pdir = self.harness().join("pkgs").join(pkg);
-        if pdir.join(&file).is_file() {
+        if trusted && pdir.join(&file).is_file() {
             let man = self.check_package(pkg, &pdir)?;
             let p = pdir.join(&file);
             return Ok(Source { text: std::fs::read_to_string(&p)?, origin: p.display().to_string(), is_override: false, pkg: Some((pkg.to_string(), man.capabilities)) });
@@ -323,6 +330,9 @@ impl Resolver {
             };
             s.push_str(&format!("{name:<28} {state:<24} {}\n", dir.display()));
         }
+        if !crate::trust::is_trusted(&self.root) {
+            s.insert_str(0, "workspace config not trusted: no skill is visible until you run `hx trust`\n");
+        }
         if s.is_empty() { "no skills in .agents/skills or ~/.agents/skills".into() } else { s }
     }
 
@@ -360,6 +370,9 @@ impl Resolver {
     /// Every installed package that is locked, unchanged and fully granted: what the model may use. Others are skipped.
     pub fn list_packages(&self) -> Vec<PkgInfo> {
         let mut out = Vec::new();
+        if !crate::trust::is_trusted(&self.root) {
+            return out; // hx.lock is untrusted, so nothing it approves is visible
+        }
         let mut dirs: Vec<_> = std::fs::read_dir(self.harness().join("pkgs")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         dirs.sort();
         for dir in dirs {

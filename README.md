@@ -173,7 +173,7 @@ Inside the VM the model also has `agent(task)` for subagents, `parallel{...}` fo
 
 All configuration lives in `.harness/` in the workspace. The model can read it but never write it.
 
-`.harness/policy.toml`:
+`.harness/policy.toml` (like all workspace config, used only after `hx trust`, see below):
 
 ```toml
 [fs]
@@ -228,6 +228,8 @@ MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `all
 | MCP server | `.harness/mcp.toml` | On the next run |
 | Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Your `hx accept NAME` |
 | Harness-module upgrade | `hx upgrade propose MODULE FILE` | `python3 eval/gate.py --proposal ID --model M` must pass, then `hx upgrade accept ID` |
+
+**Workspace trust.** `.harness/{policy,grants,mcp}.toml`, `.harness/init.luau`, `.harness/override/` and `hx.lock` live in the repo, so whoever wrote the repo could widen the sandbox, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model). Any edit makes it untrusted again; `hx approve`/`accept`/`upgrade accept` keep an already trusted workspace trusted. A workspace without such files needs nothing. `HX_TRUST=1` in hx's environment trusts the workspace for one launch (tests, throwaway eval copies).
 
 A package that is unapproved, or changed since approval, is invisible to the model. A package only gets the primitives its manifest requests and you granted. An agent-written tool runs with only the capabilities it declares, and nothing the agent can call approves it. Every upgrade accept and rollback is appended to `.harness/upgrades.jsonl`; `hx upgrade rollback MODULE` undoes one.
 

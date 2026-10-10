@@ -2,6 +2,8 @@
 """Crash after every record of a run that calls MCP tools, resume, and check the server saw each call at most once
 (exactly once when the crash was not inside the call). No API key needed."""
 import json, os, shutil, subprocess, sys, tempfile, time
+os.environ["HX_TRUST"] = "1"  # these checks write .harness config on purpose; trust_checks.sh tests trust
+import tempfile as _tf; os.environ["XDG_CONFIG_HOME"] = _tf.mkdtemp()
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 HX = str(ROOT / "target/release/hx"); PORT = 8782

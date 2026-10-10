@@ -2,6 +2,7 @@
 # Harness-module upgrade flow (AC5), no API key: propose -> check -> eval gate -> accept -> rollback.
 set -u
 cd "$(dirname "$0")/.."
+export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 R=$PWD; H=$R/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $MOCK 2>/dev/null' EXIT
 MOCK=

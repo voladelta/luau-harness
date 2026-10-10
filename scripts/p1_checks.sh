@@ -2,6 +2,7 @@
 # P1 checks: event log (hash chain, write-ahead intents), approval gate, crash consistency. No API key needed.
 set -u
 cd "$(dirname "$0")/.."
+export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; pkill -f "sleep 4242" 2>/dev/null; kill $MOCK 2>/dev/null' EXIT
 MOCK=

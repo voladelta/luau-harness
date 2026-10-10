@@ -533,7 +533,7 @@ impl Vm {
             // "std/system.md": project override first, then the embedded file
             let (pkg, file) = name.split_once('/').unwrap_or(("std", &name));
             let over = rroot.join(".harness/override").join(pkg).join(file);
-            if let Ok(t) = std::fs::read_to_string(&over) {
+            if let Some(t) = std::fs::read_to_string(&over).ok().filter(|_| crate::trust::is_trusted(&rroot)) {
                 return Ok(t);
             }
             Resolver::embedded(pkg, file).map(String::from).ok_or_else(|| mlua::Error::runtime(format!("no asset {name}")))

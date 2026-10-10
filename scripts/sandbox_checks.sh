@@ -3,6 +3,7 @@
 # Uses sentinel files in $HOME and a bounded process spawner (NOT a real fork bomb). Run after `cargo build --release`.
 set -u
 cd "$(dirname "$0")/.."
+export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 W=$(mktemp -d); W=$(cd "$W" && pwd -P)
 S1=$HOME/hx-sandbox-sentinel.txt; ESC=$HOME/hx-escape-target.txt; ESC2=$HOME/hx-escape-dotdot.txt; ESC3=$HOME/hx-escape-viadir.txt; ESC4=/tmp/hx-escape-tmp.txt
