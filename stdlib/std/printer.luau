@@ -12,10 +12,10 @@ M.OUTPUT_CAP = 12000 -- total characters of printed output per turn
 
 local function clip(s: string, max: number): string
 	local n = utf8.len(s)
-	if n == nil or n <= max then
-		if n == nil and #s > max then
-			return s:sub(1, max) .. "…(+" .. (#s - max) .. " bytes)"
-		end
+	if n == nil then -- not valid UTF-8: cut by bytes
+		return if #s > max then s:sub(1, max) .. "…(+" .. (#s - max) .. " bytes)" else s
+	end
+	if n <= max then
 		return s
 	end
 	local cut = utf8.offset(s, max + 1) - 1
@@ -130,14 +130,7 @@ end
 
 local function toptable(t): string
 	local arr, rest = split(t)
-	local capped = false
-	local ok, flag = pcall(function()
-		return t.truncated
-	end)
-	if ok and flag == true then
-		capped = true
-	end
-	local cap = if capped then ", capped" else ""
+	local cap = if t.truncated == true then ", capped" else ""
 	if isrecords(arr) then
 		local out = { "<table: " .. #arr .. " rows {" .. table.concat(keyed(arr[1]) :: any, ",") .. "}" .. cap .. ">" }
 		for i = 1, math.min(#arr, M.ROWS) do
@@ -174,11 +167,6 @@ function M.top(v: any): string
 		return toptable(v)
 	end
 	return fmt(v, 0)
-end
-
--- Nested form (used for variable listings).
-function M.inline(v: any): string
-	return fmt(v, 1)
 end
 
 -- Cap the total printed output of one turn.
