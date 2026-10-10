@@ -187,10 +187,11 @@ impl Resolver {
 
     /// Project packages must be locked (hash matches) and have every requested capability granted by the user.
     fn check_package(&self, pkg: &str, dir: &Path) -> Result<Manifest> {
-        let first = self.checked.lock().unwrap().insert(pkg.to_string());
         let man = Self::read_manifest(pkg, dir)?;
-        if first {
+        // Mark a package as checked only once it has PASSED: a failed check must fail again on the next require.
+        if !self.checked.lock().unwrap().contains(pkg) {
             self.verify(pkg, dir, &man)?;
+            self.checked.lock().unwrap().insert(pkg.to_string());
         }
         Ok(man)
     }
