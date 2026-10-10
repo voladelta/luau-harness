@@ -167,16 +167,15 @@ impl Policy {
         if let Some(n) = net {
             p.net = n; // so does --net / --no-net
         }
-        if enabled {
-            match resume {
-                Some(path) => {
-                    p.log = EventLog::reopen(path)?;
-                    p.log.write("resume", json!({"sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
-                }
-                None => {
-                    p.log = EventLog::open(&workspace.join(".harness/log"))?;
-                    p.log.write("session", json!({"workspace": workspace.to_string_lossy(), "sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
-                }
+        // The audit log is independent of the sandbox: `--no-sandbox` drops confinement, not the record of what ran.
+        match resume {
+            Some(path) => {
+                p.log = EventLog::reopen(path)?;
+                p.log.write("resume", json!({"sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
+            }
+            None => {
+                p.log = EventLog::open(&workspace.join(".harness/log"))?;
+                p.log.write("session", json!({"workspace": workspace.to_string_lossy(), "sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
             }
         }
         p.read_roots.sort();
@@ -358,4 +357,32 @@ fn toolchain_roots() -> Vec<PathBuf> {
     out.sort();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_resolves_dots_lexically() {
+        assert_eq!(normalize(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
+        assert_eq!(normalize(Path::new("/a/../../b")), PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn classify_sh_orders_irreversible_before_external() {
+        let dir = std::env::temp_dir().join(format!("hx-policy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Policy::new(&dir, true, None, None, None).unwrap();
+        assert_eq!(p.classify_sh("git push --force origin main"), Class::Irreversible);
+        assert_eq!(p.classify_sh("git push origin main"), Class::External);
+        assert_eq!(p.classify_sh("ls -la"), Class::LocalWrite);
+        // writes: inside the workspace ok, protected and escaping paths refused
+        assert!(p.check_write("src/new.txt").is_ok());
+        assert!(p.check_write(".harness/policy.toml").is_err());
+        assert!(p.check_write("hx.lock").is_err());
+        assert!(p.check_write("../escape.txt").is_err());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

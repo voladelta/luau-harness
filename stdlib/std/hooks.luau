@@ -8,7 +8,7 @@ local handlers: { [string]: { (any) -> any } } = {}
 --   before_model { system, messages }  -> transformed request
 --   after_model  { text, finish }      -> transformed reply
 --   before_run   { code }              -> transformed code, or { deny = "why" }
---   after_run    { result }            -> transformed result
+--   after_run    { output, values, error, ops } -> transformed result of the chunk
 function M.on(event: string, fn: (any) -> any)
 	handlers[event] = handlers[event] or {}
 	table.insert(handlers[event], fn)

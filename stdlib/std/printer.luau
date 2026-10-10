@@ -1,5 +1,5 @@
 -- Smart printer: values become truncated summaries instead of dumps.
--- Override per project with .harness/modules/printer.luau (same API) -- no rebuild needed.
+-- Override per project with .harness/override/std/printer.luau (same API) -- no rebuild needed.
 local M = {}
 
 M.STR_TOP = 6000 -- a bare string the model asked to see

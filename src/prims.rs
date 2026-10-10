@@ -1,6 +1,6 @@
 //! Native primitives: read, write, edit, sh, search (+ the non-determinism recorder). Every effect goes through
 //! `Effects` (live or replayed) and every path through `Policy`; `sh` runs under Seatbelt.
-use crate::effects::{Effects, Ret};
+use crate::effects::{rt, Effects, Ret};
 use crate::policy::Class;
 use anyhow::Result;
 use grep::matcher::Matcher as _;
@@ -21,16 +21,13 @@ const MAX_READ: u64 = 10 * 1024 * 1024;
 const MAX_CAPTURE: usize = 1024 * 1024;
 const DEFAULT_HITS: usize = 200;
 
-pub fn rt(msg: impl Into<String>) -> mlua::Error {
-    mlua::Error::runtime(msg.into())
-}
 
 fn resolve(root: &Path, p: &str) -> PathBuf {
     let p = Path::new(p);
     if p.is_absolute() { p.to_path_buf() } else { root.join(p) }
 }
 
-fn opt_str(o: &Option<Table>, k: &str) -> Option<String> {
+pub fn opt_str(o: &Option<Table>, k: &str) -> Option<String> {
     o.as_ref().and_then(|t| t.get::<Option<String>>(k).ok().flatten())
 }
 fn opt_num(o: &Option<Table>, k: &str) -> Option<f64> {
@@ -39,8 +36,16 @@ fn opt_num(o: &Option<Table>, k: &str) -> Option<f64> {
 fn opt_bool(o: &Option<Table>, k: &str) -> bool {
     o.as_ref().and_then(|t| t.get::<Option<bool>>(k).ok().flatten()).unwrap_or(false)
 }
-fn bad(r: Ret) -> mlua::Error {
+pub fn bad(r: Ret) -> mlua::Error {
     rt(format!("replay: unexpected recorded result {r:?}"))
+}
+
+/// A recorded `Ret::Json` as a Lua value (anything else is a replay mismatch).
+pub fn json_value(lua: &Lua, r: Ret) -> mlua::Result<Value> {
+    match r {
+        Ret::Json(v) => mlua::LuaSerdeExt::to_value(lua, &v),
+        r => Err(bad(r)),
+    }
 }
 
 pub fn rows_table(lua: &Lua, rows: &[(String, i64, String)], truncated: bool) -> mlua::Result<Table> {

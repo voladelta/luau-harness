@@ -41,6 +41,16 @@ struct File {
     server: BTreeMap<String, ServerCfg>,
 }
 
+/// The server process is gone or stopped answering: the cached connection must be dropped.
+#[derive(Debug)]
+struct ConnLost(String);
+impl std::fmt::Display for ConnLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for ConnLost {}
+
 struct Conn {
     #[allow(dead_code)] // kept alive; killed when dropped
     child: Child,
@@ -146,9 +156,9 @@ impl Mcp {
         c.stdin.flush().await?;
         loop {
             let mut buf = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(60), c.out.read_line(&mut buf)).await.map_err(|_| anyhow!("MCP server did not answer {method} within 60s"))??;
+            let n = tokio::time::timeout(Duration::from_secs(60), c.out.read_line(&mut buf)).await.map_err(|_| anyhow::Error::new(ConnLost(format!("MCP server did not answer {method} within 60s"))))??;
             if n == 0 {
-                bail!("MCP server exited while handling {method}");
+                return Err(anyhow::Error::new(ConnLost(format!("MCP server exited while handling {method}"))));
             }
             let Ok(v) = serde_json::from_str::<Value>(buf.trim()) else { continue };
             if v["id"].as_u64() != Some(id) {
@@ -167,12 +177,30 @@ impl Mcp {
         match Self::request_on(&mut c, method, params).await {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.to_string().contains("exited") || e.to_string().contains("did not answer") {
+                if e.is::<ConnLost>() {
                     drop(c);
                     self.conns.lock().await.remove(server); // the next call starts a fresh server
                 }
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob;
+
+    #[test]
+    fn glob_matches_only_where_wildcards_allow() {
+        assert!(glob("read_*", "read_file"));
+        assert!(!glob("read_*", "write_file"));
+        assert!(glob("*_file", "read_file"));
+        assert!(!glob("*_file", "read_files"));
+        assert!(glob("get_*_info", "get_user_info"));
+        assert!(!glob("get_*_info", "get_info"));
+        assert!(glob("exact", "exact"));
+        assert!(!glob("exact", "exact2"));
+        assert!(!glob("a*a", "a"));
     }
 }

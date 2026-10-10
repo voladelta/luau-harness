@@ -10,6 +10,13 @@ check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf '#!/bin/bash\necho deployed > deployed.txt\n' > $W/deploy.sh; chmod +x $W/deploy.sh; }
 lastlog() { ls -t $W/.harness/log/*.jsonl | head -1; }
 
+# --- 0. the log is independent of the sandbox flag, and admin commands do not open a session
+newws n
+$H exec --workspace $W --no-sandbox 'write("a.txt", "hi")' >/dev/null 2>&1
+check "--no-sandbox still writes a log" "$(ls $W/.harness/log/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
+$H staged --workspace $W >/dev/null
+check "admin commands open no log session" "$(ls $W/.harness/log/*.jsonl | wc -l | tr -d ' ')" "1"
+
 # --- 1. the log records effects write-ahead and the chain verifies
 newws a
 $H exec --workspace $W 'write("a.txt", "hi")

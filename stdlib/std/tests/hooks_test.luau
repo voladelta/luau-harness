@@ -1,0 +1,33 @@
+local hooks = require("std/hooks")
+
+test.case("handlers transform the payload in registration order", function()
+	hooks.clear()
+	hooks.on("e", function(p) return p .. "a" end)
+	hooks.on("e", function(p) return p .. "b" end)
+	test.eq(hooks.emit("e", ""), "ab")
+end)
+
+test.case("a deny stops the chain and is returned", function()
+	hooks.clear()
+	local ran = false
+	hooks.on("e", function() return { deny = "no" } end)
+	hooks.on("e", function() ran = true end)
+	test.eq(hooks.emit("e", {}).deny, "no")
+	test.ok(not ran, "later handler must not run after a deny")
+end)
+
+test.case("a failing handler is skipped, not fatal", function()
+	hooks.clear()
+	hooks.on("e", function() error("boom") end)
+	hooks.on("e", function(p) return p + 1 end)
+	test.eq(hooks.emit("e", 1), 2)
+end)
+
+test.case("clear(event) drops only that event", function()
+	hooks.clear()
+	hooks.on("a", function() return 1 end)
+	hooks.on("b", function() return 2 end)
+	hooks.clear("a")
+	test.eq(hooks.emit("a", 0), 0)
+	test.eq(hooks.emit("b", 0), 2)
+end)

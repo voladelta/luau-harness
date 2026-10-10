@@ -55,7 +55,7 @@ ENVIRONMENT:
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--no-sandbox] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            anthropic (default) | openai (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --max-turns N      turn limit (default 30)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            anthropic (Messages, default) | openai (Chat Completions) | responses (Responses API) (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --max-turns N      turn limit (default 30)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\n",
         "staged" => "hx staged\n\nList staged packages.\n",
@@ -139,10 +139,12 @@ async fn real_main() -> Result<()> {
     if !sandbox {
         eprintln!("warning: --no-sandbox: sh and file primitives are NOT restricted");
     }
-    let policy = std::sync::Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval"), arg(&args, "--resume").map(PathBuf::from).as_deref(), if args.iter().any(|a| a == "--net") { Some(true) } else if args.iter().any(|a| a == "--no-net") { Some(false) } else { None })?);
+    // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
+    let mk_policy = || -> Result<std::sync::Arc<policy::Policy>> { Ok(std::sync::Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval"), arg(&args, "--resume").map(PathBuf::from).as_deref(), if args.iter().any(|a| a == "--net") { Some(true) } else if args.iter().any(|a| a == "--no-net") { Some(false) } else { None })?)) };
     match args.first().map(String::as_str) {
         // hx exec --workspace DIR 'chunk1' 'chunk2'  : run chunks in one session (no API key needed; used for testing)
         Some("exec") => {
+            let policy = mk_policy()?;
             let vm = vm::Vm::new(policy.clone(), Duration::from_secs(30), 256 << 20, None, None)?;
             let packs: Vec<String> = arg(&args, "--pack").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default();
             let mut all = vec!["std/packages".to_string(), "std/mcp".to_string()];
@@ -163,6 +165,7 @@ async fn real_main() -> Result<()> {
         }
         // hx run --workspace DIR --prompt-file F --model M [--api openai --base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
         Some("run") => {
+            let policy = mk_policy()?;
             let resume = arg(&args, "--resume").map(PathBuf::from);
             let replay = resume.as_ref().map(|p| effects::load_replay(p)).transpose()?;
             let task = match (&replay, arg(&args, "--prompt-file")) {
@@ -190,6 +193,7 @@ async fn real_main() -> Result<()> {
         }
         // hx test PKG_DIR : run the package's tests/*.luau
         Some("test") => {
+            let policy = mk_policy()?;
             let dir = PathBuf::from(args.get(1).ok_or_else(|| usage(format!("usage: hx test PKG_DIR")))?).canonicalize()?;
             // Mount the package under test so `require("name")` finds it without installing or locking it, but ONLY for a
             // directory outside .harness/pkgs (e.g. a staged tool). Installed packages keep their lock and grant checks.

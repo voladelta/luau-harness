@@ -167,10 +167,7 @@ fn package_env(lua: &Lua, pkg: &str, caps: &BTreeMap<String, Vec<String>>, requi
         view.set("tmpdir", g.get::<Value>("tmpdir")?)?;
     }
     view.set("require", require.clone())?;
-    view.set("print", lua.create_function(|_, args: Variadic<Value>| {
-        eprintln!("{}", args.iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t"));
-        Ok(())
-    })?)?;
+    view.set("print", lua.create_function(stderr_print)?)?;
     let pkg_hx = lua.create_table()?;
     pkg_hx.set("log", hx.get::<Value>("log")?)?;
     if has(caps, "llm", "chat") {
@@ -200,7 +197,12 @@ fn valid_name(n: &str) -> bool {
 }
 
 fn opt_string(o: &Option<Table>, k: &str) -> String {
-    o.as_ref().and_then(|t| t.get::<Option<String>>(k).ok().flatten()).unwrap_or_default()
+    prims::opt_str(o, k).unwrap_or_default()
+}
+
+fn stderr_print(_: &Lua, args: Variadic<Value>) -> mlua::Result<()> {
+    eprintln!("{}", args.iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t"));
+    Ok(())
 }
 
 /// opts.caps = { fs = {"read"}, proc = {"sh"} }
@@ -346,7 +348,7 @@ impl Vm {
                             t.set("turns", turns)?;
                             Ok(t)
                         }
-                        r => Err(mlua::Error::runtime(format!("replay: unexpected recorded result {r:?}"))),
+                        r => Err(prims::bad(r)),
                     }
                 }
             })?)?;
@@ -365,8 +367,7 @@ impl Vm {
                         Ok(Ret::Json(r["tools"].clone()))
                     }).await?;
                     match ret {
-                        Ret::Json(v) => lua.to_value(&v),
-                        r => Err(mlua::Error::runtime(format!("replay: unexpected recorded result {r:?}"))),
+                        r => prims::json_value(&lua, r),
                     }
                 }
             })?)?;
@@ -387,8 +388,7 @@ impl Vm {
                         Ok(Ret::Json(r))
                     }).await?;
                     match ret {
-                        Ret::Json(v) => lua.to_value(&v),
-                        r => Err(mlua::Error::runtime(format!("replay: unexpected recorded result {r:?}"))),
+                        r => prims::json_value(&lua, r),
                     }
                 }
             })?)?;
@@ -475,10 +475,7 @@ impl Vm {
             }
             Ok(())
         })?)?;
-        modenv.set("print", lua.create_function(|_, args: Variadic<Value>| {
-            eprintln!("{}", args.iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t"));
-            Ok(())
-        })?)?;
+        modenv.set("print", lua.create_function(stderr_print)?)?;
 
         let hx = lua.create_table()?;
         // A pack adds functions/tables to the model's session (not to `vars()`): hx.expose("tests", tests)
@@ -526,7 +523,7 @@ impl Vm {
         hx.set("tree", lua.create_function(move |lua, ()| {
             match tfx.sync(lua, "tree", Class::Read, serde_json::json!({}), || Ok(Ret::Str(host::file_tree(&troot))))? {
                 Ret::Str(s) => Ok(s),
-                r => Err(mlua::Error::runtime(format!("replay: unexpected recorded result {r:?}"))),
+                r => Err(prims::bad(r)),
             }
         })?)?;
         if let Some(h) = host {
@@ -620,8 +617,7 @@ impl Vm {
                     })))
                 }).await?;
                 match ret {
-                    Ret::Json(v) => lua.to_value(&v),
-                    r => Err(mlua::Error::runtime(format!("replay: unexpected recorded result {r:?}"))),
+                    r => prims::json_value(&lua, r),
                 }
             }
         })?;
@@ -638,8 +634,7 @@ impl Vm {
                     })
                 }).await?;
                 match ret {
-                    Ret::Json(v) => lua.to_value(&v),
-                    r => Err(mlua::Error::runtime(format!("replay: unexpected recorded result {r:?}"))),
+                    r => prims::json_value(&lua, r),
                 }
             }
         })?;

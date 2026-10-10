@@ -25,10 +25,6 @@ pub struct EventLog {
     crash_after: Option<u64>,
 }
 
-fn sha(s: &str) -> String {
-    Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
-}
-
 pub fn sha_bytes(b: &[u8]) -> String {
     Sha256::digest(b).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -52,7 +48,7 @@ impl EventLog {
             match serde_json::from_str::<Value>(line) {
                 Ok(v) => {
                     seq = v["seq"].as_u64().unwrap_or(seq);
-                    prev = sha(line);
+                    prev = sha_bytes(line.as_bytes());
                     keep.push_str(line);
                     keep.push('\n');
                 }
@@ -106,7 +102,7 @@ impl EventLog {
                 let _ = f.sync_data();
             }
         }
-        g.prev = sha(&line);
+        g.prev = sha_bytes(line.as_bytes());
         if self.crash_after == Some(seq) {
             if let Some(f) = g.file.as_mut() {
                 let _ = f.sync_data();
@@ -140,7 +136,7 @@ pub fn verify(path: &Path) -> Result<Report> {
         if v["prev"].as_str() != Some(prev.as_str()) && bad.is_none() {
             bad = Some(i + 1);
         }
-        prev = sha(line);
+        prev = sha_bytes(line.as_bytes());
         n += 1;
         match v["kind"].as_str() {
             Some("intent") => {

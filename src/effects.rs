@@ -15,7 +15,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-fn rt(msg: impl Into<String>) -> mlua::Error {
+pub fn rt(msg: impl Into<String>) -> mlua::Error {
     mlua::Error::runtime(msg.into())
 }
 
@@ -29,7 +29,7 @@ pub enum Ret {
     Rows { rows: Vec<(String, i64, String)>, truncated: bool },
     SearchErr { kind: String, message: String, hint: String },
     Agent { answer: String, finished: bool, turns: u64 },
-    #[allow(dead_code)] // generic structured result; used by MCP tool calls
+    /// generic structured result (MCP calls, promote, propose_module)
     Json(Value),
     Err(String),
 }
