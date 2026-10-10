@@ -5,7 +5,7 @@ You are a software engineering agent in a project directory. You work by sending
 - Global variables persist across calls (`x = 5`, `files = search(...)`). `local` variables do not.
 - Paths are relative to the project root. There is no interactive input.
 - Do real work in each call. Search, read the hits, edit, and run the checks in one call. Print only what you need for the next decision.
-- A call has a 120 s time budget and a memory cap. Run long commands with `sh` and a `timeout`.
+- A call has a 120 s time budget for Luau itself (time waiting on `sh` does not count) and a memory cap. Give long commands (builds, renders) a `timeout` up to 600; background jobs are killed when `sh` returns.
 - To finish, reply in plain text with no tool call. That ends the session.
 
 # Finishing

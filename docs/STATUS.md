@@ -170,7 +170,22 @@ All of it is opt-in or costs nothing when unused (no packages and no mcp.toml =>
 - **Packages** (`.harness/pkgs/NAME/`, manifest `hx.toml`, `kind = "tool" | "skill"`): installed by the user, locked by hash and
   granted capabilities with `hx approve NAME`; anything unapproved or modified since approval is invisible to the model.
   Tools: `tools.NAME.fn(...)`. Skills: `skill("NAME")` -> `{ text, module }` (SKILL.md without frontmatter, plus runnable Luau).
-  The prompt lists installed tools (signature + doc) and skills (description) only.
+  The prompt lists installed tools (signature + doc). Skills are NOT listed (no catalog: it costs tokens every turn and pulls
+  the model into irrelevant skills); one line says `skill("name")` loads one the user names (`/name` works) and
+  `skills("words")` searches approved names + descriptions. A wrong name suggests the closest.
+- **Agent skills** (`.agents/skills` convention): `<ws>/.agents/skills/NAME/` then `~/.agents/skills/NAME/` (project shadows
+  global; `.harness/pkgs/NAME` shadows both). No hx.toml: description from SKILL.md frontmatter, no Luau, no capabilities.
+  Same trust model: invisible until `hx approve NAME` locks the dir hash (`hx skills` shows state). `skill()` also returns
+  `dir` and `files`; approved skill dirs are added to the read roots (read-only). Unlocked dirs are never hashed.
+- **Vision** (`--pack std/vision`): `view(path | {paths}, {max})` (max 4 per call, long side <= max, default 1024) queues
+  images; the pack's before_model hook appends one user message with them (Chat: image_url parts, Responses: input_image).
+  Images stay in history (cache-friendly). Recorded like `read` (path + sha256, never pixels); resume re-reads and refuses a
+  changed file. Off by default, so the eval prompt is unchanged. No fallback for non-vision models: the provider error surfaces.
+- **Chunk budget vs waiting**: the 120 s Luau budget skips only the thread awaiting an effect (sh/agent/mcp), so a
+  `parallel{}` branch spinning while another waits is still stopped; waits move the deadline forward.
+- **Event log names**: `{secs}-{pid}`, then `-1`, `-2`... if a session of the same process already took it.
+- **Rust and GPU in `sh`**: `RUSTUP_HOME`/`CARGO_HOME` point at the real toolchain (HOME is the temp dir); crate-cache writes
+  need `[fs] write`. `[gpu] allow = true` adds Seatbelt rules for Metal (iokit + MTLCompilerService), off by default.
 - **Agent-written tools** (`--pack std/authoring` adds the docs): `deftool(name, source, {doc, signature, caps, tests})` is usable at
   once but runs with ONLY the capabilities it declares (default none); `promote(name)` stages it under `.harness/staged/` after its
   tests pass in a fresh process; only the user's `hx accept NAME` (review, lock, grant) activates it. Nothing the agent can call approves.

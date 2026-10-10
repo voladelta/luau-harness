@@ -391,3 +391,51 @@ impl Drop for GroupKill {
         unsafe { libc::killpg(self.0, libc::SIGKILL) };
     }
 }
+
+/// An image for the model: re-encoded so its long side is at most `max` px.
+pub struct ViewImage {
+    pub width: u32,
+    pub height: u32,
+    pub orig: (u32, u32),
+    pub mime: &'static str,
+    pub data_b64: String,
+    pub sha256: String,
+}
+
+const MAX_IMAGE_FILE: u64 = 20 * 1024 * 1024;
+
+/// Load `path` (under the read policy) for `view`: PNG, JPEG, WebP or GIF (first frame), at most 20 MB.
+/// JPEG stays JPEG; everything else becomes PNG. An image already within `max` is passed through unchanged.
+pub fn load_view_image(pol: &crate::policy::Policy, path: &str, max: u32) -> std::result::Result<ViewImage, String> {
+    use base64::Engine;
+    use image::{GenericImageView, ImageFormat};
+    let p = pol.check_read(path).map_err(|e| format!("view {path}: {e}"))?;
+    let len = std::fs::metadata(&p).map_err(|e| format!("view {path}: {e}"))?.len();
+    if len > MAX_IMAGE_FILE {
+        return Err(format!("view {path}: file is {len} bytes, over the 20MB limit"));
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("view {path}: {e}"))?;
+    let fmt = image::guess_format(&bytes).map_err(|_| format!("view {path}: not an image (PNG, JPEG, WebP or GIF)"))?;
+    if !matches!(fmt, ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif) {
+        return Err(format!("view {path}: unsupported format {fmt:?} (PNG, JPEG, WebP or GIF)"));
+    }
+    let img = image::load_from_memory_with_format(&bytes, fmt).map_err(|e| format!("view {path}: {e}"))?;
+    let (w, h) = img.dimensions();
+    let sha256 = crate::eventlog::sha_bytes(&bytes);
+    let jpeg = fmt == ImageFormat::Jpeg;
+    let mime = if jpeg { "image/jpeg" } else { "image/png" };
+    let (out, (ow, oh)) = if w.max(h) <= max && matches!(fmt, ImageFormat::Png | ImageFormat::Jpeg) {
+        (bytes, (w, h))
+    } else {
+        let small = if w.max(h) > max { img.resize(max, max, image::imageops::FilterType::Triangle) } else { img };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        if jpeg {
+            small.to_rgb8().write_to(&mut buf, ImageFormat::Jpeg).map_err(|e| format!("view {path}: {e}"))?;
+        } else {
+            small.write_to(&mut buf, ImageFormat::Png).map_err(|e| format!("view {path}: {e}"))?;
+        }
+        let d = small.dimensions();
+        (buf.into_inner(), d)
+    };
+    Ok(ViewImage { width: ow, height: oh, orig: (w, h), mime, data_b64: base64::engine::general_purpose::STANDARD.encode(out), sha256 })
+}

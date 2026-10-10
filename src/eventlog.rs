@@ -33,9 +33,18 @@ impl EventLog {
     pub fn open(dir: &Path) -> Result<Arc<EventLog>> {
         std::fs::create_dir_all(dir)?;
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-        let session = format!("{}-{}", ts.as_secs(), std::process::id());
-        let path = dir.join(format!("{session}.jsonl"));
-        let file = std::fs::OpenOptions::new().create_new(true).append(true).open(&path)?;
+        // `{secs}-{pid}`, plus `-N` when another session of this process opened one in the same second
+        let base = format!("{}-{}", ts.as_secs(), std::process::id());
+        let mut n = 0;
+        let (session, path, file) = loop {
+            let session = if n == 0 { base.clone() } else { format!("{base}-{n}") };
+            let path = dir.join(format!("{session}.jsonl"));
+            match std::fs::OpenOptions::new().create_new(true).append(true).open(&path) {
+                Ok(f) => break (session, path, f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n += 1,
+                Err(e) => return Err(e.into()),
+            }
+        };
         Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file: Some(file), seq: 0, prev: "genesis".into() }), session, path: Some(path), crash_after: crash_hook() }))
     }
 
@@ -163,4 +172,15 @@ pub fn read_blob(log_dir: &Path, sha: &str) -> Result<Vec<u8>> {
 pub fn load(path: &Path) -> Result<Vec<Value>> {
     let text = std::fs::read_to_string(path)?;
     Ok(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+}
+
+#[cfg(test)]
+mod open_tests {
+    #[test]
+    fn two_sessions_in_the_same_second_get_distinct_logs() {
+        let dir = std::env::temp_dir().join(format!("hx-eventlog-{}", std::process::id()));
+        let (a, b) = (super::EventLog::open(&dir).unwrap(), super::EventLog::open(&dir).unwrap());
+        assert_ne!(a.session, b.session);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

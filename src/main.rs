@@ -26,7 +26,8 @@ COMMANDS:
     exec         run Luau chunks in one session (no API key needed)
     run          run an agent task
     test         run a package's tests/*.luau
-    approve      lock a project package and grant the capabilities it requests
+    approve      lock a project package or skill and grant the capabilities it requests
+    skills       list skills in .agents/skills and ~/.agents/skills and whether each is approved
     staged       list staged packages
     accept       review and accept a staged package
     reject       discard a staged package
@@ -57,7 +58,8 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--no-sandbox] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
         "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            openai (Chat Completions, default) | responses (Responses API) (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --provider-only A,B  OpenRouter (--api openai): route only to these providers, no fallbacks\n    --max-turns N      turn limit (default 30)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
-        "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\n",
+        "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
+        "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
         "staged" => "hx staged\n\nList staged packages.\n",
         "accept" => "hx accept NAME [--yes]\n\nReview a staged package, then lock it and grant its capabilities.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard a staged package.\n",
@@ -219,6 +221,11 @@ async fn real_main() -> Result<()> {
         Some("approve") => {
             let pkg = args.get(1).ok_or_else(|| usage("usage: hx approve PKG"))?;
             println!("{}", modules::Resolver::new(workspace).approve(pkg)?);
+            Ok(())
+        }
+        // hx skills : agent skills on disk and their approval state
+        Some("skills") => {
+            print!("{}", modules::Resolver::new(workspace).skills_status());
             Ok(())
         }
         // hx upgrade propose|list|show|check|accept|rollback : the harness-module upgrade flow (AC5)

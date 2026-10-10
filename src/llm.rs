@@ -94,14 +94,28 @@ fn chat_messages(system: &Value, msgs: &[Value], cache: bool) -> Vec<Value> {
                 out.push(a);
             }
             "tool" => out.push(json!({"role": "tool", "tool_call_id": m["id"], "content": m["content"].as_str().unwrap_or("")})),
-            r => out.push(json!({"role": r, "content": m["content"].as_str().unwrap_or("")})),
+            r => match m["images"].as_array().filter(|a| !a.is_empty()) {
+                // {role:user, content, images:[{mime, data}]} (the vision pack): text part, then one image_url part per image
+                Some(imgs) => {
+                    let mut parts = vec![json!({"type": "text", "text": m["content"].as_str().unwrap_or("")})];
+                    parts.extend(imgs.iter().map(|i| json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", i["mime"].as_str().unwrap_or("image/png"), i["data"].as_str().unwrap_or(""))}})));
+                    out.push(json!({"role": r, "content": parts}));
+                }
+                None => out.push(json!({"role": r, "content": m["content"].as_str().unwrap_or("")})),
+            },
         }
     }
     if cache {
         // one moving breakpoint on the conversation prefix, plus the system prompt
         if let Some(last) = out.last_mut() {
-            let text = last["content"].as_str().unwrap_or_default().to_string();
-            last["content"] = json!([{"type": "text", "text": text, "cache_control": cache_marker()}]);
+            if let Some(parts) = last["content"].as_array_mut() {
+                if let Some(p) = parts.last_mut() {
+                    p["cache_control"] = cache_marker();
+                }
+            } else {
+                let text = last["content"].as_str().unwrap_or_default().to_string();
+                last["content"] = json!([{"type": "text", "text": text, "cache_control": cache_marker()}]);
+            }
         }
     }
     out
@@ -125,7 +139,14 @@ fn responses_input(msgs: &[Value]) -> Vec<Value> {
                 }
             }
             "tool" => out.push(json!({"type": "function_call_output", "call_id": m["id"], "output": m["content"].as_str().unwrap_or("")})),
-            r => out.push(json!({"role": r, "content": m["content"].as_str().unwrap_or("")})),
+            r => match m["images"].as_array().filter(|a| !a.is_empty()) {
+                Some(imgs) => {
+                    let mut parts = vec![json!({"type": "input_text", "text": m["content"].as_str().unwrap_or("")})];
+                    parts.extend(imgs.iter().map(|i| json!({"type": "input_image", "image_url": format!("data:{};base64,{}", i["mime"].as_str().unwrap_or("image/png"), i["data"].as_str().unwrap_or(""))})));
+                    out.push(json!({"role": r, "content": parts}));
+                }
+                None => out.push(json!({"role": r, "content": m["content"].as_str().unwrap_or("")})),
+            },
         }
     }
     out

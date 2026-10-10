@@ -41,4 +41,21 @@ check "subagent shares the parent's budget (3 calls total, then both stop)" "$(e
 ws g; out=$(run 8791 $W)
 check "no budget: run completes normally" "$(echo "$out" | field finished)$(echo "$out" | field stopped)" "TrueNone"
 
+# the per-call Luau budget (30 s in exec) counts Luau work, not time waiting on sh; loops are still stopped
+mkdir -p $T/wait
+check "a 32 s sh outlasts the 30 s chunk budget" "$($H exec --workspace $T/wait 'print(sh("sleep 32; echo waited", {timeout=60}).stdout)' 2>&1 | head -1)" "waited"
+check "a parallel branch spinning while another waits on sh is still stopped" "$($H exec --workspace $T/wait 'print(parallel{ function() return sh("sleep 40", {timeout=60}).code end, function() while true do end end })' 2>&1 | grep -c 'time budget exceeded')" "1"
+ESC='local co = coroutine.create(function() return sh("sleep 1") end)
+coroutine.resume(co)
+local addr = tostring(co)
+co = nil
+for i = 1, 200000 do local t = {i} end
+for i = 1, 5000 do
+  local c = coroutine.create(function() while true do end end)
+  if tostring(c) == addr then coroutine.resume(c) end
+end
+while true do end'
+check "an sh abandoned in a coroutine cannot shelter a loop (address reuse)" "$(timeout 90 $H exec --workspace $T/wait "$ESC" 2>&1 | grep -c 'time budget exceeded')" "1"
+check "an infinite loop still hits the budget" "$($H exec --workspace $T/wait 'while true do end' 2>&1 | grep -c 'time budget exceeded')" "1"
+
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

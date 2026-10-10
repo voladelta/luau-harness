@@ -9,6 +9,7 @@
 //! User-owned config: `<workspace>/.harness/policy.toml` (protected from the model):
 //!     [fs]  read = ["/extra/read/root"]   write = ["/extra/write/root"]
 //!     [net] allow = true                   # Seatbelt cannot filter by host; this is all-or-nothing
+//!     [gpu] allow = true                   # let `sh` use Metal (GPU renderers such as Skia); off by default
 use crate::eventlog::EventLog;
 use anyhow::{bail, Result};
 use serde_json::json;
@@ -28,6 +29,14 @@ struct PolicyFile {
     budget: Budget,
     #[serde(default)]
     packs: PacksSection,
+    #[serde(default)]
+    gpu: GpuSection,
+}
+/// `[gpu] allow = true`: let `sh` open the GPU (Metal), e.g. for Skia/wgpu renderers. Off by default.
+#[derive(Deserialize, Default)]
+struct GpuSection {
+    #[serde(default)]
+    allow: bool,
 }
 #[derive(Deserialize, Default)]
 struct PacksSection {
@@ -75,6 +84,7 @@ pub struct Policy {
     pub write_roots: Vec<PathBuf>,
     pub protected: Vec<PathBuf>,
     pub net: bool,
+    pub gpu: bool,
     pub log: Arc<EventLog>,
     ask: Vec<String>,
     allow: Vec<String>,
@@ -108,6 +118,8 @@ const EXTERNAL: &[&str] = &["git push", "npm publish", "cargo publish", "twine u
 const IRREVERSIBLE: &[&str] = &["git push --force", "git push -f", "rm -rf /", "rm -rf ~", "mkfs", "dd if="];
 
 const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/dev", "/opt", "/Applications", "/private/var/db"];
+/// Seatbelt rules for Metal: the GPU driver user clients and the shader compiler service.
+const GPU_RULES: &str = "(allow iokit-open)\n(allow iokit-get-properties)\n(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name-regex #\"^com\\\\.apple\\\\.(metal|gpu|iosurface|CARenderServer|cvmsServ)\"))\n(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/C/com\\\\.apple\\\\.(metal|gpuarchiver)\"))\n";
 const ENV_ALLOW: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL"];
 const TOOLS: &[&str] = &["python3", "python", "pip3", "node", "npm", "npx", "git", "cargo", "rustc", "go", "uv", "ruby", "java", "make", "gcc", "clang", "deno", "bun"];
 
@@ -137,7 +149,7 @@ impl Policy {
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
-        let mut p = Policy { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], net: false, log: EventLog::off(), ask: vec![], allow: vec![], mode: "deny".into(), budget: Budget::default(), packs: vec![] };
+        let mut p = Policy { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], net: false, gpu: false, log: EventLog::off(), ask: vec![], allow: vec![], mode: "deny".into(), budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
@@ -154,6 +166,7 @@ impl Policy {
             p.read_roots.extend(w.clone());
             p.write_roots.extend(w);
             p.net = f.net.allow;
+            p.gpu = f.gpu.allow;
             p.budget = f.budget;
             p.packs = f.packs.enable;
             p.ask = f.approval.ask;
@@ -167,6 +180,12 @@ impl Policy {
         }
         if let Some(n) = net {
             p.net = n; // so does --net / --no-net
+        }
+        // Approved skills may live outside the workspace (~/.agents/skills); their files must be readable (read-only).
+        for pk in crate::modules::Resolver::new(workspace.clone()).list_packages() {
+            if pk.kind == "skill" && !pk.dir.is_empty() {
+                p.read_roots.push(PathBuf::from(pk.dir));
+            }
         }
         // The audit log is independent of the sandbox: `--no-sandbox` drops confinement, not the record of what ran.
         match resume {
@@ -287,6 +306,15 @@ impl Policy {
         let t = self.tmp.to_string_lossy().to_string();
         v.push(("HOME".into(), t.clone()));
         v.push(("TMPDIR".into(), t));
+        // HOME is the temp dir, so rustup/cargo would not find the user's toolchain; point them at the real (readable) dirs.
+        // Writes there (registry cache) still need `[fs] write` in policy.toml.
+        let home = std::env::var("HOME").unwrap_or_default();
+        for (var, dir) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+            let val = std::env::var(var).ok().or_else(|| canon(Path::new(&home).join(dir)).map(|p| p.to_string_lossy().to_string()));
+            if let Some(val) = val {
+                v.push((var.into(), val));
+            }
+        }
         v
     }
 
@@ -312,6 +340,9 @@ impl Policy {
         s.push_str("(deny file-read* (regex #\"/(credentials(\\\\.toml)?|\\\\.netrc|id_rsa|id_ed25519|\\\\.npmrc|\\\\.pypirc)$\"))\n");
         for p in &self.protected {
             s.push_str(&format!("(deny file-write* (subpath {}))\n", q(p)));
+        }
+        if self.gpu {
+            s.push_str(GPU_RULES);
         }
         if net {
             s.push_str("(allow network*)\n");
@@ -385,5 +416,18 @@ mod tests {
         assert!(p.check_write("../escape.txt").is_err());
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gpu_rules_only_when_policy_allows() {
+        let base = std::env::temp_dir().join(format!("hx-policy-gpu-{}", std::process::id()));
+        let (off, on) = (base.join("off"), base.join("on"));
+        std::fs::create_dir_all(&off).unwrap();
+        std::fs::create_dir_all(on.join(".harness")).unwrap();
+        std::fs::write(on.join(".harness/policy.toml"), "[gpu]\nallow = true\n").unwrap();
+        assert!(!Policy::new(&off, true, None, None, None).unwrap().seatbelt_profile().contains("iokit-open"));
+        let prof = Policy::new(&on, true, None, None, None).unwrap().seatbelt_profile();
+        assert!(prof.contains("(allow iokit-open)") && prof.contains("MTLCompilerService"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

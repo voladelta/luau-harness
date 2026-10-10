@@ -234,7 +234,7 @@ impl Vm {
         let deadline: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let resolver = Arc::new(Resolver::new(root.clone()));
         let g = lua.globals();
-        let fx = Effects::new(policy.clone(), host.as_ref().map(|h| h.depth).unwrap_or(0), replay);
+        let fx = Effects::new(policy.clone(), host.as_ref().map(|h| h.depth).unwrap_or(0), replay, deadline.clone());
 
         // --- session-side builtins (visible to the model) ---
         let session_env = lua.create_table()?;
@@ -380,8 +380,14 @@ impl Vm {
 
         lua.sandbox(true)?;
         lua.set_memory_limit(mem_limit)?;
-        let dl = deadline.clone();
-        lua.set_interrupt(move |_| {
+        let (dl, waiting) = (deadline.clone(), fx.waiting.clone());
+        lua.set_interrupt(move |lua| {
+            {
+                let w = waiting.lock().unwrap();
+                if !w.is_empty() && w.contains_key(&(lua.current_thread().to_pointer() as usize)) {
+                    return Ok(VmState::Continue); // this thread awaits sh/agent/mcp: their own timeouts apply
+                }
+            }
             if let Some(t) = *dl.lock().unwrap()
                 && Instant::now() > t {
                     return Err(mlua::Error::runtime("time budget exceeded (infinite loop?)"));
@@ -479,6 +485,40 @@ impl Vm {
                 t.set("ops", r.ops)?;
                 Ok(t)
             }
+        })?)?;
+        // hx.view_image(path, max) -> { path, width, height, orig_width, orig_height, mime, data } for the vision pack.
+        // Recorded like `read` (path + sha256 + size); on replay the file is read again and must still match.
+        let vfx = fx.clone();
+        hx.set("view_image", lua.create_function(move |lua, (path, max): (String, Option<u32>)| {
+            let max = max.unwrap_or(1024).clamp(64, 2048);
+            let pol = vfx.pol.clone();
+            let mut live: Option<crate::prims::ViewImage> = None;
+            let rec = vfx.sync(lua, "view", Class::Read, json!({"path": &path, "max": max}), || {
+                let v = crate::prims::load_view_image(&pol, &path, max).map_err(mlua::Error::runtime)?;
+                let meta = json!({"sha256": v.sha256, "width": v.width, "height": v.height}).to_string();
+                live = Some(v);
+                Ok(Ret::Str(meta))
+            })?;
+            let v = match live {
+                Some(v) => v,
+                None => {
+                    let v = crate::prims::load_view_image(&pol, &path, max).map_err(mlua::Error::runtime)?;
+                    let want = match &rec { Ret::Str(s) => serde_json::from_str::<serde_json::Value>(s).ok().and_then(|m| m["sha256"].as_str().map(String::from)), _ => None };
+                    if want.as_deref() != Some(v.sha256.as_str()) {
+                        return Err(mlua::Error::runtime(format!("view {path}: replay diverged (the file changed since it was recorded)")));
+                    }
+                    v
+                }
+            };
+            let t = lua.create_table()?;
+            t.set("path", path)?;
+            t.set("width", v.width)?;
+            t.set("height", v.height)?;
+            t.set("orig_width", v.orig.0)?;
+            t.set("orig_height", v.orig.1)?;
+            t.set("mime", v.mime)?;
+            t.set("data", v.data_b64)?;
+            Ok(t)
         })?)?;
         let h2 = host.clone();
         hx.set("log", lua.create_function(move |_, line: String| {

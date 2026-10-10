@@ -129,6 +129,12 @@ pub struct Effects {
     pub depth: usize,
     replay: Mutex<Option<Queues>>,
     threads: Mutex<HashMap<usize, String>>,
+    /// The chunk's time budget guards against Luau loops, not waiting: time spent awaiting an effect moves it forward.
+    pub deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Luau threads (by pointer) awaiting an effect, with a count per thread; the interrupt skips only those threads,
+    /// so a `parallel{}` branch spinning in Luau while another branch waits is still stopped at the deadline.
+    /// The entry holds the thread itself so its address cannot be reused by another thread while it is marked.
+    pub waiting: Arc<Mutex<HashMap<usize, (usize, mlua::Thread)>>>,
 }
 
 /// What one effect call is, for the log records around it.
@@ -158,8 +164,8 @@ fn args_sha(args: &Value) -> String {
 }
 
 impl Effects {
-    pub fn new(pol: Arc<Policy>, depth: usize, replay: Option<Queues>) -> Arc<Effects> {
-        Arc::new(Effects { pol, depth, replay: Mutex::new(replay), threads: Mutex::new(HashMap::new()) })
+    pub fn new(pol: Arc<Policy>, depth: usize, replay: Option<Queues>, deadline: Arc<Mutex<Option<std::time::Instant>>>) -> Arc<Effects> {
+        Arc::new(Effects { pol, depth, replay: Mutex::new(replay), threads: Mutex::new(HashMap::new()), deadline, waiting: Arc::default() })
     }
 
     pub fn log(&self) -> &Arc<EventLog> {
@@ -292,8 +298,46 @@ impl Effects {
         let t0 = std::time::Instant::now();
         let call = Call { tool, class, args: &args, tid: &tid, sha: &sha };
         let intent = self.begin(&call);
-        let res = f().await;
+        let start_deadline = *self.deadline.lock().unwrap();
+        let res = {
+            let _wait = WaitGuard::enter(&self.waiting, lua.current_thread());
+            f().await
+        };
+        // max, not sum: parallel effects waiting at the same time extend the budget once
+        if let Some(d0) = start_deadline {
+            let mut d = self.deadline.lock().unwrap();
+            if let Some(cur) = *d {
+                *d = Some(cur.max(d0 + t0.elapsed()));
+            }
+        }
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64);
         res
+    }
+}
+
+/// Marks a thread as awaiting an effect; unmarks on drop, so an abandoned future (a coroutine left suspended inside
+/// `sh` and later collected) cannot leave a stale mark behind.
+struct WaitGuard {
+    map: Arc<Mutex<HashMap<usize, (usize, mlua::Thread)>>>,
+    key: usize,
+}
+
+impl WaitGuard {
+    fn enter(map: &Arc<Mutex<HashMap<usize, (usize, mlua::Thread)>>>, th: mlua::Thread) -> WaitGuard {
+        let key = th.to_pointer() as usize;
+        map.lock().unwrap().entry(key).or_insert((0, th)).0 += 1;
+        WaitGuard { map: map.clone(), key }
+    }
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        let mut w = self.map.lock().unwrap();
+        if let Some(e) = w.get_mut(&self.key) {
+            e.0 -= 1;
+            if e.0 == 0 {
+                w.remove(&self.key);
+            }
+        }
     }
 }

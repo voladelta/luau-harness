@@ -5,6 +5,10 @@
 //!   2. `<ws>/.harness/pkgs/<pkg>/<mod>.luau`       project package (needs a lockfile entry + granted capabilities)
 //!   3. the built-in `std` package embedded in the binary
 //!
+//! Agent skills (the `.agents/skills` convention): `<ws>/.agents/skills/<name>/SKILL.md`, then `~/.agents/skills/<name>/SKILL.md`.
+//! They need no hx.toml (the manifest comes from SKILL.md frontmatter), carry no Luau and no capabilities, and are locked
+//! by `hx approve NAME` like any package. `.harness/pkgs/<name>` shadows them.
+//!
 //! `require("base:std/printer")` skips (1), so an override can wrap the module it replaces.
 //! `require("project/init")` is `<ws>/.harness/init.luau`, run before the loop starts (hook registration etc.).
 use anyhow::{anyhow, bail, Result};
@@ -27,6 +31,7 @@ pub const EMBEDDED: &[(&str, &str, &str)] = &[
     ("std", "packages.luau", include_str!("../stdlib/std/packages.luau")),
     ("std", "mcp.luau", include_str!("../stdlib/std/mcp.luau")),
     ("std", "authoring.luau", include_str!("../stdlib/std/authoring.luau")),
+    ("std", "vision.luau", include_str!("../stdlib/std/vision.luau")),
     ("std", "system.md", include_str!("../prompts/system.md")),
 ];
 
@@ -62,6 +67,9 @@ pub struct PkgInfo {
     pub description: String,
     pub signature: String,
     pub doc: String,
+    /// skills: absolute directory and its files (relative), so SKILL.md's references can be read
+    pub dir: String,
+    pub files: Vec<String>,
 }
 
 /// `hx test DIR` mounts the package under test here so it can be required without being installed.
@@ -122,9 +130,10 @@ pub fn hash_dir(dir: &Path) -> Result<String> {
     fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for e in std::fs::read_dir(dir)? {
             let p = e?.path();
-            if p.is_dir() {
+            // symlink_metadata: a symlinked directory is not walked (a link to / would hash the disk); see below
+            if std::fs::symlink_metadata(&p)?.is_dir() {
                 walk(&p, base, out)?;
-            } else {
+            } else if p.file_name().is_some_and(|n| n != ".DS_Store") {
                 out.push(p.strip_prefix(base).unwrap().to_path_buf());
             }
         }
@@ -136,10 +145,53 @@ pub fn hash_dir(dir: &Path) -> Result<String> {
     for f in files {
         h.update(f.to_string_lossy().as_bytes());
         h.update([0]);
-        h.update(std::fs::read(dir.join(&f))?);
+        let full = dir.join(&f);
+        // a symlink contributes its target path, not the target's content (reads through it are refused anyway)
+        match std::fs::read_link(&full) {
+            Ok(t) => h.update(format!("symlink:{}", t.display()).as_bytes()),
+            Err(_) => h.update(std::fs::read(&full)?),
+        }
         h.update([0]);
     }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The value of `description:` in SKILL.md frontmatter (plain, quoted, or a `>`/`|` block).
+fn frontmatter_description(text: &str) -> String {
+    let Some(fm) = text.strip_prefix("---\n").and_then(|t| t.split_once("\n---").map(|(f, _)| f)) else { return String::new() };
+    let mut lines = fm.lines();
+    while let Some(l) = lines.next() {
+        let Some(v) = l.strip_prefix("description:") else { continue };
+        let v = v.trim();
+        if v.is_empty() || v.starts_with('>') || v.starts_with('|') {
+            let block: Vec<&str> = lines.take_while(|l| l.starts_with(' ') || l.starts_with('\t') || l.is_empty()).map(str::trim).collect();
+            return block.join(" ").trim().to_string();
+        }
+        return v.trim_matches(|c| c == '"' || c == '\'').to_string();
+    }
+    String::new()
+}
+
+/// Files under `dir`, relative and sorted (skips dotfiles).
+fn list_files(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, base, out);
+            } else {
+                out.push(p.strip_prefix(base).unwrap().to_string_lossy().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 impl Resolver {
@@ -202,15 +254,88 @@ impl Resolver {
         Ok(man)
     }
 
+    /// `.agents/skills` roots, project first: `<ws>/.agents/skills`, then `~/.agents/skills`.
+    fn agent_skill_roots(&self) -> Vec<PathBuf> {
+        let mut v = vec![self.root.join(".agents/skills")];
+        if let Ok(h) = std::env::var("HOME") {
+            v.push(PathBuf::from(h).join(".agents/skills"));
+        }
+        v
+    }
+
+    fn agent_skill_dir(&self, name: &str) -> Option<PathBuf> {
+        if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
+            return None;
+        }
+        self.agent_skill_roots().into_iter().map(|r| r.join(name)).find(|d| d.join("SKILL.md").is_file())
+    }
+
+    /// A skill without hx.toml: kind "skill", no capabilities, description from SKILL.md frontmatter.
+    fn agent_skill_manifest(dir: &Path) -> Manifest {
+        let text = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+        let mut m = Manifest::default();
+        m.package.version = "agent-skill".into();
+        m.package.kind = Some("skill".into());
+        m.package.description = Some(frontmatter_description(&text));
+        m
+    }
+
+    /// Where package `name` lives and its manifest: `.harness/pkgs/<name>`, else an agent skill.
+    fn locate(&self, name: &str) -> Result<(PathBuf, Manifest)> {
+        let pdir = self.harness().join("pkgs").join(name);
+        if pdir.is_dir() {
+            return Ok((pdir.clone(), Self::read_manifest(name, &pdir)?));
+        }
+        if let Some(d) = self.agent_skill_dir(name) {
+            return Ok((d.clone(), Self::agent_skill_manifest(&d)));
+        }
+        bail!("no package or skill named {name} (looked in .harness/pkgs, .agents/skills, ~/.agents/skills)")
+    }
+
+    /// Every skill found under the `.agents/skills` roots: (name, dir), first root wins.
+    pub fn agent_skills(&self) -> Vec<(String, PathBuf)> {
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        for root in self.agent_skill_roots() {
+            let Ok(rd) = std::fs::read_dir(&root) else { continue };
+            let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+            names.sort();
+            for n in names {
+                if !out.iter().any(|(m, _)| *m == n) && self.agent_skill_dir(&n).is_some_and(|d| d.parent() == Some(root.as_path())) {
+                    out.push((n.clone(), root.join(&n)));
+                }
+            }
+        }
+        out
+    }
+
+    /// `hx skills`: every agent skill and whether the model can see it.
+    pub fn skills_status(&self) -> String {
+        let mut s = String::new();
+        for (name, dir) in self.agent_skills() {
+            let state = if self.harness().join("pkgs").join(&name).is_dir() {
+                "shadowed by .harness/pkgs".to_string()
+            } else {
+                match self.verify(&name, &dir, &Self::agent_skill_manifest(&dir)) {
+                    Ok(()) => "approved".into(),
+                    Err(e) if e.to_string().contains("not locked") => "not approved".into(),
+                    Err(_) => "changed since approval".into(),
+                }
+            };
+            s.push_str(&format!("{name:<28} {state:<24} {}\n", dir.display()));
+        }
+        if s.is_empty() { "no skills in .agents/skills or ~/.agents/skills".into() } else { s }
+    }
+
     fn read_manifest(pkg: &str, dir: &Path) -> Result<Manifest> {
         toml::from_str(&std::fs::read_to_string(dir.join("hx.toml")).map_err(|_| anyhow!("package {pkg}: missing hx.toml"))?)
             .map_err(|e| anyhow!("package {pkg}: bad hx.toml: {e}"))
     }
 
     fn verify(&self, pkg: &str, dir: &Path, man: &Manifest) -> Result<()> {
-        let hash = hash_dir(dir)?;
         let lock: Lockfile = read_toml(&self.root.join("hx.lock"))?;
-        match lock.package.iter().find(|e| e.name == pkg) {
+        let entry = lock.package.iter().find(|e| e.name == pkg);
+        let hash = if entry.is_some() { hash_dir(dir)? } else { String::new() }; // unlocked: skip hashing (~/.agents/skills can be large)
+        match entry {
             None => bail!("package {pkg} is not locked; review it, then run `hx approve {pkg}`"),
             Some(e) if e.hash != hash || e.version != man.package.version => bail!(
                 "package {pkg} changed since it was approved (locked {}…, now {}…); review it and run `hx approve {pkg}` again",
@@ -235,8 +360,7 @@ impl Resolver {
     /// Every installed package that is locked, unchanged and fully granted: what the model may use. Others are skipped.
     pub fn list_packages(&self) -> Vec<PkgInfo> {
         let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(self.harness().join("pkgs")) else { return out };
-        let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        let mut dirs: Vec<_> = std::fs::read_dir(self.harness().join("pkgs")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         dirs.sort();
         for dir in dirs {
             let name = dir.file_name().unwrap().to_string_lossy().to_string();
@@ -244,16 +368,33 @@ impl Resolver {
             if self.verify(&name, &dir, &man).is_err() {
                 continue;
             }
-            out.push(PkgInfo {
-                name,
-                version: man.package.version.clone(),
-                kind: man.package.kind.clone().unwrap_or_default(),
-                description: man.package.description.clone().unwrap_or_default(),
-                signature: man.tool.signature.clone().unwrap_or_default(),
-                doc: man.tool.doc.clone().unwrap_or_default(),
-            });
+            out.push(Self::info(name, &dir, &man));
+        }
+        for (name, dir) in self.agent_skills() {
+            if out.iter().any(|p| p.name == name) || self.harness().join("pkgs").join(&name).is_dir() {
+                continue;
+            }
+            let man = Self::agent_skill_manifest(&dir);
+            if self.verify(&name, &dir, &man).is_ok() {
+                out.push(Self::info(name, &dir, &man));
+            }
         }
         out
+    }
+
+    fn info(name: String, dir: &Path, man: &Manifest) -> PkgInfo {
+        let kind = man.package.kind.clone().unwrap_or_default();
+        let skill = kind == "skill";
+        PkgInfo {
+            name,
+            version: man.package.version.clone(),
+            description: man.package.description.clone().unwrap_or_default(),
+            signature: man.tool.signature.clone().unwrap_or_default(),
+            doc: man.tool.doc.clone().unwrap_or_default(),
+            dir: if skill { std::fs::canonicalize(dir).unwrap_or(dir.into()).display().to_string() } else { String::new() },
+            files: if skill { list_files(dir) } else { vec![] },
+            kind,
+        }
     }
 
     pub fn staged_dir(&self) -> PathBuf {
@@ -493,8 +634,7 @@ impl Resolver {
 
     /// `hx approve <pkg>`: record the lock entry and grant exactly the capabilities the manifest requests.
     pub fn approve(&self, pkg: &str) -> Result<String> {
-        let dir = self.harness().join("pkgs").join(pkg);
-        let man: Manifest = toml::from_str(&std::fs::read_to_string(dir.join("hx.toml"))?)?;
+        let (dir, man) = self.locate(pkg)?;
         let hash = hash_dir(&dir)?;
         let lock_path = self.root.join("hx.lock");
         let mut entries = read_toml::<Lockfile>(&lock_path)?.package;
@@ -507,6 +647,7 @@ impl Resolver {
         }
         std::fs::write(&lock_path, out)?;
         let gpath = self.harness().join("grants.toml");
+        std::fs::create_dir_all(self.harness())?;
         let mut g: Grants = read_toml(&gpath)?;
         g.grant.insert(pkg.into(), man.capabilities.clone());
         let mut gs = String::new();
@@ -518,6 +659,20 @@ impl Resolver {
             gs.push('\n');
         }
         std::fs::write(&gpath, gs)?;
-        Ok(format!("approved {pkg} {} ({}…) with capabilities {:?}", man.package.version, &hash[..8], man.capabilities))
+        Ok(format!("approved {pkg} {} ({}…) from {} with capabilities {:?}", man.package.version, &hash[..8], dir.display(), man.capabilities))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frontmatter_description as d;
+
+    #[test]
+    fn frontmatter_description_forms() {
+        assert_eq!(d("---\nname: a\ndescription: plain words\n---\nbody"), "plain words");
+        assert_eq!(d("---\ndescription: \"quoted: yes\"\n---\n"), "quoted: yes");
+        assert_eq!(d("---\ndescription: >\n  folded\n  lines\nname: a\n---\n"), "folded lines");
+        assert_eq!(d("---\ndescription: |\n  block\n---\n"), "block");
+        assert_eq!(d("no frontmatter"), "");
     }
 }

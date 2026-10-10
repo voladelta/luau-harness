@@ -142,7 +142,7 @@ hx run --prompt-file task.md --model deepseek/deepseek-v4.1-flash \
 | `--max-output N` | 16384 | Max output tokens per turn |
 | `--max-cost USD` `--max-tokens N` `--max-wall SECS` | none | Budgets; flags override `policy.toml` |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
-| `--pack A,B` | | Extra packs (for example `std/authoring`) |
+| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
 | `--trace FILE` | | Write a readable trace |
 
 Global flags: `--workspace DIR` (default `.`), `--no-sandbox` (disables the sandbox and path policy, prints a warning), `--net` / `--no-net`, `--approval prompt` (ask on the terminal instead of refusing). Every command takes `--help`.
@@ -183,6 +183,9 @@ write = ["/extra/write/root"]   # extra write roots
 [net]
 allow = false                   # all-or-nothing; Seatbelt cannot filter by host
 
+[gpu]
+allow = false                   # true lets `sh` use Metal (Skia/wgpu renderers such as fframes)
+
 [approval]
 mode = "deny"                   # "deny" (headless default) or "prompt"
 ask = ["terraform apply"]       # extra command substrings that need approval
@@ -220,7 +223,8 @@ MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `all
 |---|---|---|
 | Module override | `.harness/override/std/<mod>.luau` | Immediately; `require("base:std/<mod>")` wraps the original; a broken override falls back with a warning |
 | Tool package | `.harness/pkgs/NAME/` with `hx.toml`, `kind = "tool"` | `hx approve NAME`; model calls `tools.NAME.fn(...)` |
-| Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx approve NAME`; model calls `skill("NAME")` |
+| Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx approve NAME`; model calls `skill("NAME")` (or finds it with `skills("words")`; skills are not listed in the prompt) |
+| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (no `hx.toml`; project shadows global) | `hx approve NAME` (`hx skills` lists them); its directory becomes read-only readable |
 | MCP server | `.harness/mcp.toml` | On the next run |
 | Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Your `hx accept NAME` |
 | Harness-module upgrade | `hx upgrade propose MODULE FILE` | `python3 eval/gate.py --proposal ID --model M` must pass, then `hx upgrade accept ID` |
@@ -229,7 +233,7 @@ A package that is unapproved, or changed since approval, is invisible to the mod
 
 ## Security model
 
-- `sh` runs under macOS Seatbelt: writes only to the project and a per-run temp dir, reads from an allowlist (project, system dirs, detected toolchains), no network unless `[net] allow = true`, a minimal environment with no API keys, its own process group killed when the command ends, and a per-user process cap.
+- `sh` runs under macOS Seatbelt: writes only to the project and a per-run temp dir, reads from an allowlist (project, system dirs, detected toolchains, approved skill dirs), no network unless `[net] allow = true`, a minimal environment with no API keys, its own process group killed when the command ends, and a per-user process cap.
 - `read`, `write`, `edit` and `search` check the canonical path against the same roots. Writes never go through symlinks.
 - `.harness/` and `hx.lock` are read-only to the model.
 - Shell commands are classed read / local write / external / irreversible. The classifier is a tripwire for obvious commands such as `git push`; the sandbox is the real boundary.
