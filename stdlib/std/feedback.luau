@@ -23,7 +23,7 @@ function M.context(code: string, msg: string): string
 	return out
 end
 
-function M.compose(res, code: string, multi: boolean?): string
+function M.compose(res, code: string): string
 	local text = printer.cap(res.output)
 	if #res.values > 0 then
 		local shown = {}
@@ -37,9 +37,6 @@ function M.compose(res, code: string, multi: boolean?): string
 	end
 	if text:match("^%s*$") then
 		text = "(no output)\n"
-	end
-	if multi then
-		text ..= "(note: only the first luau block was run; send one block per reply)\n"
 	end
 	return text
 end

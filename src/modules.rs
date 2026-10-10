@@ -19,7 +19,6 @@ pub const EMBEDDED: &[(&str, &str, &str)] = &[
     ("std", "init.luau", include_str!("../stdlib/std/init.luau")),
     ("std", "loop.luau", include_str!("../stdlib/std/loop.luau")),
     ("std", "prompt.luau", include_str!("../stdlib/std/prompt.luau")),
-    ("std", "extract.luau", include_str!("../stdlib/std/extract.luau")),
     ("std", "printer.luau", include_str!("../stdlib/std/printer.luau")),
     ("std", "feedback.luau", include_str!("../stdlib/std/feedback.luau")),
     ("std", "hooks.luau", include_str!("../stdlib/std/hooks.luau")),

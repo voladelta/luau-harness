@@ -62,18 +62,17 @@ check "rollback: one command restores the built-in module" "$($H upgrade rollbac
 check "the audit trail records accept and rollback" "$(python3 -c "import json;print([json.loads(l)['action'] for l in open('$W/.harness/upgrades.jsonl')])")" "['accept', 'rollback']"
 
 # --- a harmful candidate is stopped by the gate
-cat > $T/extract_bad.luau <<'LUA'
+cat > $T/loop_bad.luau <<'LUA'
 local M = {}
-function M.fences() return {} end
-function M.code() return nil, false end
+function M.run(cfg) return { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = true, final_answer = "" } end
 return M
 LUA
-BAD=$($H upgrade propose std/extract $T/extract_bad.luau --reason "simplify" --workspace $W)
+BAD=$($H upgrade propose std/loop $T/loop_bad.luau --reason "simplify" --workspace $W)
 check "harmful candidate: passes the structural check (it is valid Luau)" "$($H upgrade check $BAD --workspace $W 2>&1 | head -1)" "loads, returns a table, keeps every export"
 g $BAD > $T/gate2.out; rc=$?
 check "harmful candidate: the gate FAILS it (pass rate collapses)" "$rc$(python3 -c "import json;g=json.load(open('$W/.harness/proposals/$BAD/gate.json'));print(g['pass'], g['candidate']['passed'])")" "1False 0"
 check "harmful candidate: accept refuses" "$($H upgrade accept $BAD --yes --workspace $W 2>&1 | grep -c 'gate FAILED')" "1"
-check "harmful candidate: nothing became active" "$([ -e $W/.harness/override/std/extract.luau ] && echo ACTIVE || echo inactive)" "inactive"
+check "harmful candidate: nothing became active" "$([ -e $W/.harness/override/std/loop.luau ] && echo ACTIVE || echo inactive)" "inactive"
 
 # --- tampering after the gate
 echo '-- tampered' >> $W/.harness/proposals/$ID/new.luau

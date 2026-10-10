@@ -536,6 +536,8 @@ impl Vm {
                     let r = h.chat(&json).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     let t = lua.create_table()?;
                     t.set("text", r.text)?;
+                    t.set("calls", lua.to_value(&r.calls)?)?;
+                    t.set("raw", r.raw)?;
                     t.set("finish", r.finish)?;
                     t.set("input", r.input)?;
                     t.set("output", r.output)?;

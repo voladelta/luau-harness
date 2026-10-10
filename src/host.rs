@@ -145,9 +145,11 @@ impl Host {
             }
             let dir = self.replay_dir.lock().unwrap().clone().unwrap_or_default();
             let v = &rec.rec;
-            let text = String::from_utf8_lossy(&crate::eventlog::read_blob(&dir, v["reply"].as_str().unwrap_or(""))?).into_owned();
+            let body: Value = serde_json::from_slice(&crate::eventlog::read_blob(&dir, v["reply"].as_str().unwrap_or(""))?)?;
             Reply {
-                text,
+                text: body["text"].as_str().unwrap_or("").to_string(),
+                calls: body["calls"].as_array().cloned().unwrap_or_default(),
+                raw: body["raw"].as_str().unwrap_or("").to_string(),
                 finish: v["finish"].as_str().map(String::from),
                 input: v["input"].as_u64().unwrap_or(0),
                 cache_read: v["cache_read"].as_u64().unwrap_or(0),
@@ -161,7 +163,8 @@ impl Host {
                 anyhow::bail!(why);
             }
             let r = llm::chat(&self.http, &self.llm, &self.key, req).await?;
-            let reply = self.policy.log.blob(r.text.as_bytes());
+            // the reply blob holds everything the loop reads: the text, the tool calls and the raw assistant message
+            let reply = self.policy.log.blob(json!({"text": r.text, "calls": r.calls, "raw": r.raw}).to_string().as_bytes());
             self.policy.log.write("llm", json!({"model": self.llm.model, "depth": self.depth, "req_sha": req_sha, "reply": reply, "input": r.input, "cache_read": r.cache_read, "cache_write": r.cache_write, "output": r.output, "cost": r.cost, "finish": r.finish}), true);
             r
         };

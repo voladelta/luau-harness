@@ -3,7 +3,6 @@
 return {
 	loop = require("std/loop"),
 	prompt = require("std/prompt"),
-	extract = require("std/extract"),
 	printer = require("std/printer"),
 	feedback = require("std/feedback"),
 	hooks = require("std/hooks"),

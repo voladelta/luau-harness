@@ -7,8 +7,8 @@ T=$(mktemp -d); trap 'rm -rf "$T"; kill $MOCK 2>/dev/null' EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 
-# 1. std package tests (printer, extractor)
-out=$($H test stdlib/std --workspace "$T" | tail -1); check "std tests" "$out" "25 passed, 0 failed"
+# 1. std package tests (printer, hooks, mcp)
+out=$($H test stdlib/std --workspace "$T" | tail -1); check "std tests" "$out" "17 passed, 0 failed"
 
 # 2. override the printer in one project, no rebuild; removing the override restores the default
 W=$T/ws; mkdir -p $W/.harness/override/std

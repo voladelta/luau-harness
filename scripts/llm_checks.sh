@@ -30,15 +30,25 @@ runq anthropic claude-x --cache off; check "no way to turn caching off: --cache 
 runq openai any/model --provider-only anthropic,google; check "--provider-only pins providers" "$(has allow_fallbacks)" "yes"
 runq anthropic claude-x --provider-only anthropic; check "provider pin is chat-completions only" "$(has allow_fallbacks)" "no"
 check "unknown api is refused" "$(K=x $H run --workspace $T/openai --prompt-file $T/p.txt --model m --api bogus --base-url http://127.0.0.1:8795 --key-env K 2>&1 | grep -c 'unknown --api')" "1"
-# --- malformed tool-call markup after a code turn is nudged, not taken as the final answer; bare <invoke> code is run
-mockrun() { # replies-json -> report fields "finished|final_answer|turns|code_turns|truncated_turns"
-  MOCK_REPLIES="$1" MOCK_BY_LEN=1 python3 scripts/mock_llm.py 8796 & local m=$!; sleep 1
+# --- native tool calling: the loop answers every call id, per wire format; bad calls get an error result, not a crash
+mockrun() { # replies-json api -> "finished|final_answer|turns|code_turns|truncated_turns"
+  MOCK_REPLIES="$1" MOCK_BY_LEN=1 MOCK_LOG=$T/tool.log python3 scripts/mock_llm.py 8796 & local m=$!; sleep 1; : > $T/tool.log
   W=$T/m-$RANDOM; mkdir -p $W/.harness
-  local o; o=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --api openai --base-url http://127.0.0.1:8796 --key-env K 2>&1 | tail -1)
+  local o; o=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --api ${2:-openai} --base-url http://127.0.0.1:8796 --key-env K 2>&1 | tail -1)
   kill $m 2>/dev/null; wait $m 2>/dev/null
   python3 -c "import sys,json;r=json.loads(sys.argv[1]);print('|'.join(str(r[k]) for k in ('finished','final_answer','turns','code_turns','truncated_turns')))" "$o" 2>/dev/null
 }
-check "garbled </invoke> after a code turn: nudged, run continues" "$(mockrun '["```luau\nprint(7)\n```","<\n<parameter name=\"cmd\">I will fix it</parameter>\n</invoke>\nelu","```luau\nprint(8)\n```","all done"]')" "True|all done|4|2|1"
-check "bare <invoke-luau> raw code is extracted and run" "$(mockrun '["<invoke-luau>\nprint(9)\n</invoke-luau>","all done"]')" "True|all done|2|1|0"
-check "plain prose after a code turn still finishes (no nudge)" "$(mockrun '["```luau\nprint(7)\n```","The fix is in place."]')" "True|The fix is in place.|2|1|0"
+TWO='[{"text":"","calls":[{"code":"print(1)"},{"code":"print(2)"}]},"all done"]'
+for api in openai responses anthropic; do
+  check "$api: two parallel calls both run, run finishes" "$(mockrun "$TWO" $api)" "True|all done|2|2|0"
+  case $api in
+    openai) want='"role": "tool"' ;; responses) want='function_call_output' ;; anthropic) want='tool_result' ;;
+  esac
+  check "$api: results go back in the native tool-result shape (one per call)" "$(grep -o "$want" $T/tool.log | wc -l | tr -d ' ')" "2"
+done
+check "invalid tool arguments: error result, run continues" "$(mockrun '[{"calls":[{"name":"luau","arguments":"{\"code\": \"print(1"}]},"```luau\nprint(2)\n```","all done"]')" "True|all done|3|1|1"
+check "unknown tool name: error result, run continues" "$(mockrun '[{"calls":[{"name":"bash","arguments":"{}"}]},"```luau\nprint(2)\n```","all done"]')" "True|all done|3|1|0"
+check "plain prose after a code turn finishes (no nudge)" "$(mockrun '["```luau\nprint(7)\n```","The fix is in place."]')" "True|The fix is in place.|2|1|0"
+check "prose before any code is nudged to start" "$(mockrun '["I will look.","```luau\nprint(7)\n```","done"]')" "True|done|3|1|1"
+check "the luau tool is declared in the request" "$(grep -c '"luau"' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
