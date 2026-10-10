@@ -65,4 +65,59 @@ import json
 l=[json.loads(x) for x in open('$T/req.jsonl')][-1]; m=l['messages'][0]['content']; print(m[0]['text'] if isinstance(m,list) else m)")
 check "no MCP config: nothing added to the prompt" "$(echo "$sysmsg" | grep -c 'MCP tools')" "0"
 
+# --- Streamable HTTP transport (remote server: url + header auth from env)
+HP=8798; HL=$T/hdr.jsonl
+hcfg() { # url, extra mcp.toml lines
+  printf '[server.web]\nurl = "%s"\nread_only_tools = ["read_*"]\n%s\n' "$1" "${2:-}" > $W/.harness/mcp.toml
+  printf '[approval]\nallow = ["mcp web."]\n' > $W/.harness/policy.toml
+}
+hx() { WEB_KEY=sk-web-secret $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
+for mode in json sse; do
+  (export NEED_HEADER="x-api-key:sk-web-secret" SESSION=1 HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP $mode) & SRV=$!; sleep 1; : > $HL
+  hcfg "http://127.0.0.1:$HP/mcp" 'headers_env = { "x-api-key" = "WEB_KEY" }'
+  check "http/$mode: tool call works with header auth" "$(hx 'print(mcp.web.add{a = 2, b = 3})' | head -1)" "5"
+  check "http/$mode: read-only tool runs, tool error is a Luau error" "$(hx 'print(mcp.web.read_note{name="a"}); print(pcall(mcp.web.boom, {}))' | tr '\n' ' ' | grep -c 'note:a.*mcp tool error (web.boom): boom')" "1"
+  check "http/$mode: session id is echoed after initialize" "$(python3 -c "
+import json
+r=[json.loads(l) for l in open('$HL')]; c=[x for x in r if x['_method']=='tools/call']
+print(bool(c) and all(x.get('mcp-session-id') for x in c) and all(x.get('mcp-protocol-version')=='2025-06-18' for x in c))")" "True"
+  check "http/$mode: initialized notification is sent" "$(grep -c notifications/initialized $HL | awk '{print ($1>0)}')" "1"
+  hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
+  check "http/$mode: wrong auth scheme surfaces HTTP 401" "$(hx 'print(pcall(mcp.web.add, {a=1,b=1}))' | head -1 | grep -c 'HTTP 401')" "1"
+  kill $SRV; wait $SRV 2>/dev/null
+done
+(export NEED_HEADER="authorization:Bearer sk-web-secret" HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP json) & SRV=$!; sleep 1
+check "http: bearer_env sends Authorization: Bearer" "$(hx 'print(mcp.web.add{a = 4, b = 5})' | head -1)" "9"
+hcfg "http://127.0.0.1:$HP/redir" 'bearer_env = "WEB_KEY"'
+check "http: a redirect is not followed" "$(hx 'print(pcall(mcp.web.add, {a=1,b=2}))' | head -1 | grep -c 'redirects are not followed')" "1"
+hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "NO_SUCH_VAR"'
+check "http: unset env var fails clearly before any request" "$(hx 'print(pcall(mcp.web.add, {a=1,b=2}))' | head -1 | grep -c 'NO_SUCH_VAR.*not set')" "1"
+hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
+hx 'print(mcp.web.add{a = 1, b = 1})' >/dev/null; hx 'print(mcp.web.add{a = 1, b = 1})' >/dev/null
+check "http: the key never reaches the event log" "$(grep -rl sk-web-secret $W/.harness 2>/dev/null | grep -v 'mcp.toml\|policy.toml' | wc -l | tr -d ' ')" "0"
+kill $SRV; wait $SRV 2>/dev/null
+hcfg "https://127.0.0.1:1/mcp" ''
+check "http: unreachable server is a Luau error, VM survives" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=2} end)); print("alive")' | tail -1)" "alive"
+hcfg "http://example.com/mcp" ''
+check "http: plain http to a remote host is refused" "$(hx 'print(1)' | grep -c 'must be https')" "1"
+hcfg "https://example.com/mcp" 'command = "python3"'
+check "http: command and url together are refused" "$(hx 'print(1)' | grep -c 'mutually exclusive')" "1"
+hcfg "https://example.com/mcp" 'net = true'
+check "http: sandbox-only keys are refused on a url server" "$(hx 'print(1)' | grep -c 'do not apply')" "1"
+
+# --- HTTP edge cases: split SSE stream, server request id collision, echoed secret, session expiry
+(export SESSION=1 EXPIRE=$T/expire HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP sse-split) & SRV=$!; sleep 1; : > $HL
+hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
+check "http/sse-split: 3-byte chunks, server request with our id, no final blank line" "$(hx 'print(mcp.web.add{a = 6, b = 7})' | head -1)" "13"
+touch $T/expire
+check "http: session expiry (404) re-initializes and the call succeeds on retry" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'session expired.*true.*3')" "1"
+kill $SRV; wait $SRV 2>/dev/null
+(export NEED_HEADER="authorization:Bearer other-key" ECHO_KEY=1; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP json) & SRV=$!; sleep 1
+out=$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end))' | head -1)
+check "http: a 401 body that echoes the secret is scrubbed" "$(echo "$out" | grep -c 'sk-web-secret')" "0"
+check "http: ...and the status is still reported" "$(echo "$out" | grep -c 'HTTP 401.*\*\*\*')" "1"
+kill $SRV; wait $SRV 2>/dev/null
+hcfg "https://example.com/mcp" 'headers_env = { "accept" = "WEB_KEY" }'
+check "http: headers the client sets itself cannot be overridden" "$(hx 'print(1)' | grep -c 'cannot be overridden')" "1"
+
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

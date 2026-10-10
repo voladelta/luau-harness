@@ -5,6 +5,7 @@ import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 HX = str(ROOT / "target/release/hx"); PORT = 8782
+TRANSPORT = "stdio"; SERVERS = []; NEXT_PORT = [8790]
 REPLIES = ['```luau\nprint(mcp.demo.add{a = 1, b = 2})\nprint(mcp.demo.delete_note{name = "x"})\nprint(mcp.demo.read_note{name = "y"})\n```',
            '```luau\nwrite("done.txt", "1")\n```', "All done."]
 
@@ -16,7 +17,12 @@ def run(ws, extra, env_extra=None):
 def newws(base):
     ws = Path(tempfile.mkdtemp(prefix="mcp-resume-", dir=base)).resolve(); (ws / ".harness").mkdir()
     (ws / "p.txt").write_text("call the tools\n")
-    (ws / ".harness/mcp.toml").write_text(f'[server.demo]\ncommand = "python3"\nargs = ["{ROOT}/scripts/mcp_demo_server.py"]\nread_only_tools = ["read_*"]\n')
+    if TRANSPORT == "http":
+        port = NEXT_PORT[0]; NEXT_PORT[0] += 1
+        SERVERS.append(subprocess.Popen([sys.executable, str(ROOT / "scripts/mcp_http_server.py"), str(port)], cwd=ws)); time.sleep(0.7)
+        (ws / ".harness/mcp.toml").write_text(f'[server.demo]\nurl = "http://127.0.0.1:{port}/mcp"\nread_only_tools = ["read_*"]\n')
+    else:
+        (ws / ".harness/mcp.toml").write_text(f'[server.demo]\ncommand = "python3"\nargs = ["{ROOT}/scripts/mcp_demo_server.py"]\nread_only_tools = ["read_*"]\n')
     (ws / ".harness/policy.toml").write_text(f'[fs]\nread = ["{ROOT}/scripts"]\n[approval]\nallow = ["mcp demo."]\n')
     return ws
 
@@ -27,6 +33,8 @@ def lastlog(ws):
     return sorted((ws / ".harness/log").glob("*.jsonl"), key=lambda p: p.stat().st_mtime)[-1]
 
 def main():
+    global TRANSPORT
+    TRANSPORT = "http" if len(sys.argv) > 1 and sys.argv[1] == "http" else "stdio"
     env = {**os.environ, "MOCK_REPLIES": json.dumps(REPLIES), "MOCK_BY_LEN": "1"}
     mock = subprocess.Popen([sys.executable, str(ROOT / "scripts/mock_llm.py"), str(PORT)], env=env); time.sleep(1)
     base = tempfile.mkdtemp(prefix="hx-mcp-resume-"); fails = []; cases = 0
@@ -53,6 +61,6 @@ def main():
             if problems: fails.append(tag); print("FAIL", tag, problems)
             else: print("ok  ", tag, "(unknown outcome: never re-run)" if unknown else "")
     finally:
-        mock.kill(); shutil.rmtree(base, ignore_errors=True)
+        mock.kill(); [x.kill() for x in SERVERS]; shutil.rmtree(base, ignore_errors=True)
     print(f"{cases - len(fails)} passed, {len(fails)} failed of {cases} crash points"); sys.exit(1 if fails else 0)
 main()

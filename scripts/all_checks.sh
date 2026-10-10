@@ -10,6 +10,8 @@ done
 for s in mcp_checks upgrade_checks llm_checks; do out=$(scripts/$s.sh 2>&1); [ $? -eq 0 ] || { rc=1; echo "$out" | grep FAIL; }; printf '%-16s %s\n' "$s:" "$(echo "$out" | grep -E 'passed' | tail -1)"; done
 out=$(scripts/mcp_resume_check.py 2>&1); [ $? -eq 0 ] || { rc=1; echo "$out" | grep FAIL; }
 printf '%-16s %s\n' "mcp_resume:" "$(echo "$out" | tail -1)"
+out=$(scripts/mcp_resume_check.py http 2>&1); [ $? -eq 0 ] || { rc=1; echo "$out" | grep FAIL; }
+printf '%-16s %s\n' "mcp_resume_http:" "$(echo "$out" | tail -1)"
 out=$(scripts/resume_checks.py 2>&1); [ $? -eq 0 ] || { rc=1; echo "$out" | grep FAIL; }
 printf '%-16s %s\n' "resume_checks:" "$(echo "$out" | tail -1)"
 exit $rc

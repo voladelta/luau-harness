@@ -33,8 +33,8 @@ The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
 | `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
 | `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 30/30 |
-| `scripts/mcp_checks.sh` | MCP: binding, schema signatures, approval gate, sandboxed server (fs/net/env), prompt index | 19/19 |
-| `scripts/mcp_resume_check.py` | crash after every record of a run that calls MCP tools: no call is ever repeated on the server | 16/16 |
+| `scripts/mcp_checks.sh` | MCP: binding, schema signatures, approval gate, sandboxed server (fs/net/env), prompt index, HTTP transport (json/SSE, session, header auth, redirects, secrets) | 42/42 |
+| `scripts/mcp_resume_check.py [http]` | crash after every record of a run that calls MCP tools (stdio, and `http`): no call is ever repeated on the server | 16/16 each |
 | `scripts/upgrade_checks.sh` | harness-module upgrades: propose, structural check, eval gate (scripted model), accept, rollback, tamper, force | 23/23 |
 | `scripts/resume_checks.py` | AC6: SIGKILL after EVERY log record of a scripted run, resume, assert no repeated side effect, state rebuilt, logs intact; changed harness => `replay diverged` | 36/36 |
 
@@ -175,10 +175,13 @@ All of it is opt-in or costs nothing when unused (no packages and no mcp.toml =>
   once but runs with ONLY the capabilities it declares (default none); `promote(name)` stages it under `.harness/staged/` after its
   tests pass in a fresh process; only the user's `hx accept NAME` (review, lock, grant) activates it. Nothing the agent can call approves.
 - **Hot reload**: `refresh_extensions()` drops cached tool modules; session variables survive.
-- **MCP** (stdio): servers in the user-owned `.harness/mcp.toml` run under their own Seatbelt profile (network and extra write
+- **MCP** (stdio and Streamable HTTP): servers in the user-owned `.harness/mcp.toml` run under their own Seatbelt profile (network and extra write
   roots per server, env scrubbed except what the user lists). Tools bind as `mcp.SERVER.tool{...}` with signatures generated
   from their JSON schemas. Tools matching `read_only_tools` run freely; every other tool is an *external* effect that needs
   approval (`allow = ["mcp server.tool"]` in policy.toml). Calls and `tools/list` are recorded effects: replayed on resume, never repeated.
+  A server with `url` instead of `command` is remote (https; http only for localhost; JSON or SSE replies; `Mcp-Session-Id` kept; redirects
+  refused). Auth headers come from env vars (`headers_env = {"x-api-key" = "VAR"}`, `bearer_env = "VAR"`), resolved in Rust and scrubbed from
+  errors. No Seatbelt applies to a remote server (args/env/write/net are rejected for it); the `url` in the user-owned mcp.toml is the consent. No OAuth.
 - **Harness-module upgrades** (`hx upgrade propose|list|show|check|accept|rollback`; agent side: `propose_module`): a proposal must
   load, return a table and keep every export; `python3 eval/gate.py --project DIR --proposal ID --tasks ... --model ...` runs the
   current module, the candidate and an A/A control, and records a verdict bound to the candidate's sha256; `hx upgrade accept`

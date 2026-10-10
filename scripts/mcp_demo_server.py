@@ -67,4 +67,5 @@ def main():
         sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\n")
         sys.stdout.flush()
 
-main()
+if __name__ == "__main__":
+    main()
