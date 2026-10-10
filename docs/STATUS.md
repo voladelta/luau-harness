@@ -114,6 +114,25 @@ Unseen (5 tasks, 1 run): hx Haiku 5/5 (6.2k), hx DeepSeek 5/5 (7.3k), Claude Cod
   Rerun of that task: 3/3 pass. Other suites green (`scripts/all_checks.sh`).
 - NOT re-measured: DeepSeek on the frozen suite after this loop/extractor change (the 45/45 above predates it). Expected unaffected.
 
+### Haiku medium and Sonnet low (2026-10-10, same day)
+Frozen suite, 1 run unless noted. Haiku medium (3 runs x 15) passes as well as high and is cheaper; the earlier "bad" medium result was
+harness gaps (unextracted markup), not the effort level.
+
+| System | Pass | Fresh tok/task | Turns | $/task | Wall |
+|---|---|---|---|---|---|
+| hx Haiku medium (3 runs) | 44/45 | 7.6k | 3.2 | 0.0025 | 19s |
+| hx Haiku medium (1 run) | 15/15 | 7.1k | 3.1 | 0.0022 | 17s |
+| hx Sonnet low (1 run) | 15/15 | 4.7k | 3.4 | 0.0239 | 15s |
+| Claude Code lean, Haiku medium | 15/15 | 13.4k | 10.8 | 0.0045 (API-equiv.) | 23s |
+| Claude Code lean, Sonnet low | 15/15 | 5.7k | 4.5 | 0.0336 (API-equiv.) | 13s |
+
+- hx saves ~0.5x fresh tokens on Haiku, but only ~0.83x on Sonnet low (Sonnet at low effort needs few turns either way).
+- Second Haiku failure (`wiki-bug-bold` #3, medium): a garbled turn-2 reply (prose inside a half-formed `<parameter name="cmd">` tag, closing
+  `</invoke>`, stray text). No extractable code, and the nudge only matched an opening `<invoke`, so the run ended "finished" with no edits.
+  Fix: `std/loop` now also nudges on `</invoke`, `<parameter` and `</parameter`. Rerun of the task: 5/5. All suites green.
+- Hugging Face router (Qwen3.8-27B on Cerebras) was tried and dropped: needs a strict request body (no cache markers / `usage`), got 13/15
+  with 3.3x DeepSeek's fresh tokens and 16% Luau errors. That code was not kept.
+
 ## Decisions
 - The `dev` pack (changeset edit gate, test adapters, git, tree-sitter symbols) was built, measured and purged. Full pack: 1.21x MORE
   fresh tokens than the plain harness (extra verification turns, git misuse errors); the light variant was neutral (1.05x). The
