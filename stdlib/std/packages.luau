@@ -92,7 +92,21 @@ function M.install(ctx)
 		end
 		local text = strip_frontmatter(read(p.dir .. "/SKILL.md"))
 		local ok, mod = pcall(require, name)
-		return { name = name, text = text, module = if ok then mod else nil, dir = p.dir, files = p.files }
+		local module = if ok then mod else nil
+		if not ok and not tostring(mod):find("module not found", 1, true) then
+			-- the skill ships a module that does not load: keep the instructions usable and raise the load error where the
+			-- module is used, instead of a bare nil that hides why
+			local why = "skill " .. string.format("%q", name) .. ": its Luau module failed to load: " .. tostring(mod)
+			module = setmetatable({}, {
+				__index = function(_, k)
+					if type(k) == "string" then
+						error(why, 2)
+					end
+					return nil
+				end,
+			})
+		end
+		return { name = name, text = text, module = module, dir = p.dir, files = p.files }
 	end)
 
 	hx.expose("refresh_extensions", function()

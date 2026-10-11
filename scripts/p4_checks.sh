@@ -41,6 +41,13 @@ check "tool package: tools.slug.run works after approval" "$(x 'print(tools.slug
 out=$(x 'local s = skill("release") print(s.text) print(s.module.checklist()[1], s.name)')
 check "skill: text without frontmatter" "$(echo "$out" | sed -n 1p)" "Steps: 1. bump version 2. tag it."
 check "skill: runnable Luau module" "$(echo "$out" | sed -n 3p)" "bump	release"
+B=$T/bws; mkdir -p $B/.harness/pkgs/broken  # own workspace: a third package in $W would change the hot-reload count
+printf '[package]\nname = "broken"\nversion = "0.1.0"\nkind = "skill"\ndescription = "a skill whose module does not compile"\n' > $B/.harness/pkgs/broken/hx.toml
+printf -- '---\nname: broken\ndescription: a skill whose module does not compile\n---\nStill readable.\n' > $B/.harness/pkgs/broken/SKILL.md
+echo 'return { go = function() return 1 end' > $B/.harness/pkgs/broken/init.luau; $H approve broken --workspace $B >/dev/null
+out=$($H exec --workspace $B 'local s = skill("broken") print(s.text) print(pcall(function() return s.module.go() end))' 2>&1 | grep -v '^-- ops=')
+check "skill with a broken module: instructions still load" "$(echo "$out" | sed -n 1p)" "Still readable."
+check "skill with a broken module: using it raises the load error" "$(echo "$out" | grep -c 'its Luau module failed to load: syntax error')" "1"
 echo 'return { run = function(s) return "tampered" end }' > $W/.harness/pkgs/slug/init.luau
 check "a tampered tool package disappears (hash no longer matches the approval)" "$(x 'print(tools.slug)' | head -1)" "nil"
 echo 'return { run = function(s) return (s:lower():gsub("[^%w]+", "-")) end }' > $W/.harness/pkgs/slug/init.luau
