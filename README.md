@@ -276,7 +276,7 @@ cargo test --release
 - **Network is all-or-nothing.** Seatbelt cannot filter by host.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
 - **Only Chat Completions was verified live** (OpenRouter and Enclave); the Responses API is tested against a mock.
-- **Compaction is opt-in and checked only against a scripted model.** Summary quality depends on the model; the window is not detected, so pass `--context-window` (the pack assumes 128000), and repeat it (like `--pack`) on `--resume`, or replay reports `replay diverged`.
+- **Compaction is opt-in and lightly tested on real models** (scripted checks plus one Haiku 5.5 video run with a forced 60k window: one compaction, 30k to 12k tokens, task finished). Summary quality depends on the model; the window is not detected, so pass `--context-window` (the pack assumes 128000), and repeat it (like `--pack`) on `--resume`, or replay reports `replay diverged`.
 - **Small benchmark.** 20 small Python tasks; results on large repositories are not measured.
 - **Not covered by resume:** a crash mid-model-call repeats that call (no side effect), and the stdout of a killed `sh` is lost.
 
