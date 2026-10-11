@@ -196,6 +196,10 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                     c.arg("-p").arg(pol.seatbelt_profile()).arg("/bin/bash").arg("-c").arg(&cmd);
                     c.env_clear().envs(pol.env());
                     c
+                } else if let Some(profile) = pol.yolo_profile() {
+                    let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
+                    c.arg("-p").arg(profile).arg("/bin/bash").arg("-c").arg(&cmd);
+                    c
                 } else {
                     let mut c = tokio::process::Command::new("bash");
                     c.arg("-c").arg(&cmd);

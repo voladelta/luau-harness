@@ -143,7 +143,8 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 impl Policy {
-    /// `enabled = false` turns every check and the sandbox off (explicit opt-out, used for `--no-sandbox`).
+    /// `enabled = false` is `--yolo`: no Seatbelt confinement, path roots or approval gate. Protected paths (`.harness/`,
+    /// `hx.lock`, the trust store) stay read-only to the model, so a yolo run cannot rewrite config later runs apply.
     pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<String>, resume: Option<&Path>, net: Option<bool>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
@@ -192,7 +193,7 @@ impl Policy {
                 p.read_roots.push(PathBuf::from(pk.dir));
             }
         }
-        // The audit log is independent of the sandbox: `--no-sandbox` drops confinement, not the record of what ran.
+        // The audit log is independent of the sandbox: `--yolo` drops confinement, not the record of what ran.
         match resume {
             Some(path) => {
                 p.log = EventLog::reopen(path)?;
@@ -270,9 +271,6 @@ impl Policy {
     /// target, existing ancestor canonicalized, result inside a write root and outside every protected path.
     pub fn check_write(&self, p: &str) -> Result<PathBuf> {
         let full = normalize(&self.abs(p));
-        if !self.enabled {
-            return Ok(full);
-        }
         let mut existing = full.clone();
         let mut tail: Vec<std::ffi::OsString> = vec![];
         while std::fs::symlink_metadata(&existing).is_err() {
@@ -284,14 +282,14 @@ impl Policy {
                 _ => bail!("policy: cannot resolve {p}"),
             }
         }
-        if tail.is_empty() && std::fs::symlink_metadata(&existing)?.file_type().is_symlink() {
+        if self.enabled && tail.is_empty() && std::fs::symlink_metadata(&existing)?.file_type().is_symlink() {
             bail!("policy: refusing to write through the symlink {p}");
         }
         let mut c = std::fs::canonicalize(&existing)?;
         for t in tail.iter().rev() {
             c.push(t);
         }
-        if !Self::within(&c, &self.write_roots) {
+        if self.enabled && !Self::within(&c, &self.write_roots) {
             bail!("policy: writing {p} is outside the allowed roots");
         }
         if Self::within(&c, &self.protected) {
@@ -326,6 +324,19 @@ impl Policy {
     /// The Seatbelt profile for `sh`. Later rules win, so protected-path denies come after the write allows.
     pub fn seatbelt_profile(&self) -> String {
         self.seatbelt_profile_with(self.net, &[])
+    }
+
+    /// `--yolo` profile: everything allowed except writes to protected paths. None where Seatbelt is unavailable.
+    pub fn yolo_profile(&self) -> Option<String> {
+        if !Path::new("/usr/bin/sandbox-exec").exists() {
+            return None;
+        }
+        let q = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""));
+        let mut s = String::from("(version 1)\n(allow default)\n");
+        for p in &self.protected {
+            s.push_str(&format!("(deny file-write* (subpath {}))\n", q(p)));
+        }
+        Some(s)
     }
 
     /// Same profile with an explicit network setting and extra writable roots (used for MCP server processes).

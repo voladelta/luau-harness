@@ -145,7 +145,7 @@ hx run --prompt-file task.md --model deepseek/deepseek-v4.1-flash \
 | `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
 | `--trace FILE` | | Write a readable trace |
 
-Global flags: `--workspace DIR` (default `.`), `--no-sandbox` (disables the sandbox and path policy, prints a warning), `--net` / `--no-net`, `--approval prompt` (ask on the terminal instead of refusing). Every command takes `--help`.
+Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open network, no path limits and no approval gate; `.harness/` and `hx.lock` stay read-only; prints a warning), `--net` / `--no-net`, `--approval prompt` (ask on the terminal instead of refusing). Every command takes `--help`.
 
 ## How it works
 
@@ -270,7 +270,7 @@ cargo test --release
 
 ## Limitations
 
-- **macOS only for sandboxing.** The sandbox uses `sandbox-exec`, which Apple has deprecated. There is no Linux sandbox; on other systems you would need `--no-sandbox`, which removes the path policy as well. <!-- TODO: confirm behaviour on Linux; untested -->
+- **macOS only for sandboxing.** The sandbox uses `sandbox-exec`, which Apple has deprecated. There is no Linux sandbox; on other systems you would need `--yolo`, which also removes the path limits and the approval gate, and there `sh` can write `.harness/` (on macOS `--yolo` still blocks that with Seatbelt). <!-- TODO: confirm behaviour on Linux; untested -->
 - **Network is all-or-nothing.** Seatbelt cannot filter by host.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
 - **Only Chat Completions was verified live** (OpenRouter and Enclave); the Responses API is tested against a mock.

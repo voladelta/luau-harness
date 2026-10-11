@@ -226,6 +226,10 @@ impl Mcp {
             c.arg("-p").arg(self.pol.seatbelt_profile_with(cfg.net, &extra)).arg(&cfg.command).args(&cfg.args);
             c.env_clear().envs(self.pol.env());
             c
+        } else if let Some(profile) = self.pol.yolo_profile() {
+            let mut c = Command::new("/usr/bin/sandbox-exec");
+            c.arg("-p").arg(profile).arg(&cfg.command).args(&cfg.args);
+            c
         } else {
             let mut c = Command::new(&cfg.command);
             c.args(&cfg.args);

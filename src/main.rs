@@ -38,7 +38,7 @@ COMMANDS:
 
 GLOBAL FLAGS:
     --workspace DIR   workspace root (default: .)
-    --no-sandbox      disable the sandbox and path policy (prints a warning)
+    --yolo            no sandbox, network, path limits or approval gate; .harness/ stays read-only (prints a warning)
     --net | --no-net  allow or deny network access
     --approval MODE   approval mode
     --resume LOG      resume from an event log
@@ -57,7 +57,7 @@ ENVIRONMENT:
 
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
-        "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--no-sandbox] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
+        "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
         "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            openai (Chat Completions, default) | responses (Responses API) (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --provider-only A,B  OpenRouter (--api openai): route only to these providers, no fallbacks\n    --max-turns N      turn limit (default 30)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
@@ -139,10 +139,10 @@ async fn real_main() -> Result<()> {
         std::process::exit(2);
     }
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
-    // The sandbox and path policy are ON by default; `--no-sandbox` is an explicit opt-out (and says so on stderr).
-    let sandbox = !args.iter().any(|a| a == "--no-sandbox");
+    // The sandbox, path policy and approval gate are ON by default; `--yolo` is an explicit opt-out (and says so on stderr).
+    let sandbox = !args.iter().any(|a| a == "--yolo");
     if !sandbox {
-        eprintln!("warning: --no-sandbox: sh and file primitives are NOT restricted");
+        eprintln!("warning: --yolo: no sandbox, network open, no path limits, no approval gate (.harness/ and hx.lock stay read-only)");
     }
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
     let mk_policy = || -> Result<std::sync::Arc<policy::Policy>> { Ok(std::sync::Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval"), arg(&args, "--resume").map(PathBuf::from).as_deref(), if args.iter().any(|a| a == "--net") { Some(true) } else if args.iter().any(|a| a == "--no-net") { Some(false) } else { None })?)) };
@@ -162,7 +162,7 @@ async fn real_main() -> Result<()> {
                     it.next();
                     continue;
                 }
-                if matches!(a.as_str(), "--net" | "--no-net" | "--no-sandbox") {
+                if matches!(a.as_str(), "--net" | "--no-net" | "--yolo") {
                     continue;
                 }
                 println!("{}", vm.exec_text(a).await?);

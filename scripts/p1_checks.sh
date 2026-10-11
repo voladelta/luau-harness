@@ -13,10 +13,22 @@ lastlog() { ls -t $W/.harness/log/*.jsonl | head -1; }
 
 # --- 0. the log is independent of the sandbox flag, and admin commands do not open a session
 newws n
-$H exec --workspace $W --no-sandbox 'write("a.txt", "hi")' >/dev/null 2>&1
-check "--no-sandbox still writes a log" "$(ls $W/.harness/log/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
+$H exec --workspace $W --yolo 'write("a.txt", "hi")' >/dev/null 2>&1
+check "--yolo still writes a log" "$(ls $W/.harness/log/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
 $H staged --workspace $W >/dev/null
 check "admin commands open no log session" "$(ls $W/.harness/log/*.jsonl | wc -l | tr -d ' ')" "1"
+
+# --- 0b. --yolo drops roots and the gate, but .harness/ and hx.lock stay read-only (to write() and to sh)
+newws y
+O=$T/yolo-outside.txt
+check "--yolo writes outside the workspace" "$($H exec --workspace $W --yolo "write('$O', 'x')" >/dev/null 2>&1; cat $O 2>/dev/null)" "x"
+check "--yolo skips the approval gate" "$($H exec --workspace $W --yolo 'sh("./deploy.sh # git push")' >/dev/null 2>&1; cat $W/deployed.txt 2>/dev/null)" "deployed"
+check "--yolo write() to .harness refused" "$($H exec --workspace $W --yolo 'print((pcall(write, ".harness/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
+check "--yolo write() to hx.lock refused" "$($H exec --workspace $W --yolo 'print((pcall(write, "hx.lock", "x")))' 2>/dev/null | head -1)" "false"
+ln -s .harness $W/link
+check "--yolo write() via symlink into .harness refused" "$($H exec --workspace $W --yolo 'print((pcall(write, "link/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
+$H exec --workspace $W --yolo 'sh("echo x > .harness/policy.toml; echo x > hx.lock")' >/dev/null 2>&1
+check "--yolo sh cannot write .harness or hx.lock" "$(ls $W/.harness/policy.toml $W/hx.lock 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 # --- 1. the log records effects write-ahead and the chain verifies
 newws a

@@ -17,7 +17,9 @@ What exists, how to verify it, and what is still missing. `PLAN.md` is the plan;
 `hx run --workspace D --prompt-file F --model M [--max-cost USD --max-tokens N --max-wall SECS] [--api openai|responses --base-url U --key-env E --reasoning R] [--provider-only A,B] [--approval prompt]`
 `hx run --workspace D --model M ... --resume .harness/log/<session>.jsonl` (continue a crashed run; the task is read from the log)
 `hx exec --workspace D 'luau chunk' ...` (no API key) · `hx test PKG_DIR` · `hx approve PKG` · `hx log verify FILE`
-The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
+The sandbox, path policy and approval gate are ON by default; `--yolo` is an explicit opt-out of all three. Under `--yolo`,
+`.harness/` and `hx.lock` stay read-only (path check for `write`/`edit`, an allow-all Seatbelt profile with protected-path
+denies for `sh` and MCP servers on macOS).
 
 ## Checks (all need `cargo build --release` first; none needs an API key)
 | Script | Covers | Result |
@@ -26,7 +28,7 @@ The sandbox is ON by default; `--no-sandbox` is an explicit opt-out.
 | `cargo test --release` | Rust unit tests: mcp glob, path normalize, command classes, protected paths | 3 pass |
 | `scripts/p2_checks.sh` | printer override without rebuild, broken-override fallback, parallel, vars, lock/grants gate, hooks, subagents, hot reload, failed lock check stays failed | 16/16 |
 | `scripts/sandbox_checks.sh` | writes outside project, ../, symlinks, protected `.harness`, env scrubbing, network, process cap, timeout kills group | 35/35 |
-| `scripts/p1_checks.sh` | hash-chained log, write-ahead intents, tamper detection, approval gate, crash => unknown outcome, log kept under --no-sandbox | 19/19 |
+| `scripts/p1_checks.sh` | hash-chained log, write-ahead intents, tamper detection, approval gate, crash => unknown outcome, log kept under --yolo, --yolo keeps .harness read-only | 25/25 |
 | `scripts/budget_checks.sh` | cost/token/wall budgets (flags and policy.toml), shared with subagents, graceful stop | 10/10 |
 | `scripts/caps_checks.sh` | runtime package capabilities: only granted primitives exist, `getfenv`/`loadstring`/`_G`/`require` escapes closed | 5/5 |
 | `scripts/llm_checks.sh` | wire formats (chat completions, responses), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, native tool calls on both wire formats: parallel calls answered one result each, invalid arguments and unknown tool names get an error result, prose before any code is nudged | 19/19 |

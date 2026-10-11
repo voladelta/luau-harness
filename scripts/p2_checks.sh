@@ -74,12 +74,19 @@ W3=$T/ws3; mkdir -p $W3/pk/tests $W3/.harness/override/std
 cat > $W3/pk/tests/reload_test.luau <<'LUA'
 test.case("hot reload swaps the printer", function()
 	test.eq(__format(5), "5")
-	write(".harness/override/std/printer.luau", 'local b = require("base:std/printer")\nlocal M = {}\nfor k, v in b do M[k] = v end\nfunction M.top(v) return "X" .. b.top(v) end\nreturn M')
+	-- the override is user-owned (protected even under --yolo): signal the script, which writes it like a user would
+	write("ready", "1")
+	for _ = 1, 100 do
+		if pcall(read, ".harness/override/std/printer.luau") then break end
+		sh("sleep 0.05")
+	end
 	test.eq(__format(5), "5")
 	reload("std/printer")
 	test.eq(__format(5), "X5")
 end)
 LUA
-check "hot reload" "$($H test $W3/pk --workspace $W3 --no-sandbox 2>/dev/null | tail -1)" "1 passed, 0 failed"
+( for _ in $(seq 100); do [ -f $W3/ready ] && break; sleep 0.05; done
+  printf 'local b = require("base:std/printer")\nlocal M = {}\nfor k, v in b do M[k] = v end\nfunction M.top(v) return "X" .. b.top(v) end\nreturn M' > $W3/.harness/override/std/printer.luau ) &
+check "hot reload" "$($H test $W3/pk --workspace $W3 2>/dev/null | tail -1)" "1 passed, 0 failed"
 
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
