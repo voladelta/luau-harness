@@ -111,6 +111,12 @@ check "A6 overflow with a failed compaction ends the run with the API error" "$(
 newws a6d; mock "$S6c" $T/a6d.req 8814; run $W 8814 $T/a6d.tr; rc=$?; unmock
 check "A6 without the pack an overflow fails as before (no summarizer call)" "$([ $rc -ne 0 ] && echo fail) $(Q 'print(len(load("'$T'/a6d.req")))')" "fail 3"
 
+# ---- 6b. real-model shape: reasoning (echoed back in raw) dominates the context, and keep_recent is the default ----
+S6r=$(R 'R1 = "r" * 6000; dump(*[dict(C("t%d = %d" % (i, i), 30000 if i == 8 else 3000 * i), reasoning=R1) for i in range(1, 9)], S("SUMMARY-R"), C("print(t1)", 2000), S("done"))')
+W=$T/a6r; mkdir -p $W/.harness; echo 'require("std/compact").keep_recent_tokens = 5000' > $W/.harness/init.luau
+mock "$S6r" $T/a6r.req 8814; run $W 8814 $T/a6r.tr --pack std/compact; rc=$?; unmock
+check "6b reasoning-heavy turns: the compaction summarizes most of the history, keeping a short tail" "$rc $(field finished) $(grep -A1 '^### COMPACT$' $T/a6r.tr | tail -1 | sed -E 's/summarized ([0-9]+) messages, kept ([0-9]+),.*/\1 \2/')" "0 True 12 4"
+
 # ---- 7. A7: kill the run after chosen records, resume: replay must not diverge ----
 resume_case() { # name crash-seq replies-json   (runs the scenario, SIGKILLs it after record #seq, resumes against the remaining replies)
   newws $1; mock "$3" $T/$1.c.req 8815; HX_TEST_CRASH_AFTER_RECORD=$2 run $W 8815 $T/$1.c.tr --pack std/compact; local crashed=$?; unmock

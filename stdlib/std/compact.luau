@@ -11,7 +11,7 @@ local M = {}
 
 M.context_window = 128000 -- used only when --context-window is not given
 M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer (prime-agent/pi default)
-M.keep_recent_tokens = 20000 -- recent history kept verbatim (clamped to a quarter of the window)
+M.keep_recent_tokens = 20000 -- recent history kept verbatim (clamped to a quarter of the threshold)
 
 local MAX_FAILURES = 2
 local TRUNCATE_ABOVE, TRUNCATE_HEAD, TRUNCATE_TAIL = 2000, 1500, 500
@@ -123,22 +123,44 @@ function M.threshold(window: number, max_output: number, reserve: number): numbe
 	return math.min(math.floor(window * 0.95), window - max_output - math.max(reserve, 4096))
 end
 
-local function estimate(msg): number
-	local chars = #(msg.content or "")
-	for _, c in msg.calls or {} do
-		local code = if type(c.input) == "table" then c.input.code else nil
-		chars += #(if type(code) == "string" then code else tostring(c.error or ""))
+-- Rough size of one message in tokens (chars/4). An assistant message's `raw` (the provider-native message the loop echoes
+-- back) is counted instead of its text and calls when present, because it also carries the reasoning blocks.
+function M.estimate(msg): number
+	local chars = 0
+	if type(msg.raw) == "string" and msg.raw ~= "" then
+		chars = #msg.raw
+	else
+		chars = #(msg.content or "")
+		for _, c in msg.calls or {} do
+			local code = if type(c.input) == "table" then c.input.code else nil
+			chars += #(if type(code) == "string" then code else tostring(c.error or ""))
+		end
 	end
 	return math.ceil(chars / 4) + #(msg.images or {}) * IMAGE_TOKENS
 end
 
+-- Factor that turns estimates into real tokens: the provider's count for the last request over the estimate of the whole
+-- request (system prompt + messages). Clamped to [0.5, 4]; 1 when there is no usage yet.
+function M.scale(last_tokens: number, system: string, messages): number
+	local est = math.ceil(#(system or "") / 4)
+	for _, m in messages do
+		est += M.estimate(m)
+	end
+	if last_tokens <= 0 or est <= 0 then
+		return 1
+	end
+	return math.clamp(last_tokens / est, 0.5, 4)
+end
+
 -- Index of the first message to keep, or nil when there is nothing to summarize. Walks back from the end until the kept
--- messages add up to `keep_tokens`, then moves forward to an assistant message: a tool result is never cut away from the
--- call it answers (results follow their assistant message). messages[1 .. start-1] are never summarized.
-function M.find_cut(messages, start: number, keep_tokens: number): number?
+-- messages add up to `keep_tokens` (estimates times `scale`, see M.scale), then moves forward to an assistant message: a
+-- tool result is never cut away from the call it answers (results follow their assistant message). messages[1 .. start-1]
+-- are never summarized.
+function M.find_cut(messages, start: number, keep_tokens: number, scale: number?): number?
+	local k = scale or 1
 	local sum, i = 0, #messages
 	while i >= start do
-		sum += estimate(messages[i])
+		sum += M.estimate(messages[i]) * k
 		if sum >= keep_tokens then
 			break
 		end
@@ -222,13 +244,17 @@ function M.install(ctx)
 	local task_text -- the first user message (task + file listing), re-sent verbatim after every compaction
 	local prev -- the previous summary, once a compaction happened
 	local last_tokens = 0 -- context size reported by the last reply
+	local system = "" -- the system prompt of the last request (for M.scale)
 	local failures, disabled = 0, false
 
 	-- Replace messages[2 .. cut-1] by a summary, in place. Returns true when the messages were replaced.
 	local function compact(messages): boolean
-		local window = limits()
+		local window, max_output = limits()
 		task_text = task_text or messages[1].content
-		local cut = M.find_cut(messages, 2, math.min(M.keep_recent_tokens, math.floor(window / 4)))
+		-- keep a quarter of the threshold at most, so a compaction always frees most of the room up to the next one
+		local limit = M.threshold(window, max_output, M.reserve_tokens)
+		local keep = math.min(M.keep_recent_tokens, math.floor((if limit > 0 then limit else window) / 4))
+		local cut = M.find_cut(messages, 2, keep, M.scale(last_tokens, system, messages))
 		if not cut then
 			hx.log("### COMPACT SKIPPED\nnothing old enough to summarize (" .. #messages .. " messages)")
 			return false
@@ -271,6 +297,7 @@ function M.install(ctx)
 	end)
 
 	ctx.hooks.on("before_model", function(req)
+		system = req.system or ""
 		if not disabled and last_tokens > 0 then
 			local window, max_output = limits()
 			local limit = M.threshold(window, max_output, M.reserve_tokens)

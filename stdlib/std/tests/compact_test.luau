@@ -65,3 +65,26 @@ test.case("serialize shows images as [image]", function()
 	local m = { { role = "user", content = "look", images = { { mime = "image/png", data = "AAAA" } } } }
 	test.eq(compact.serialize(m, 1, 1), "[User]: look\n[image]")
 end)
+
+test.case("estimate counts the raw provider message (with its reasoning) instead of the text", function()
+	local plain = { role = "assistant", content = "", calls = { { id = "a", name = "luau", input = { code = string.rep("c", 40) } } } }
+	test.eq(compact.estimate(plain), 10)
+	plain.raw = string.rep("r", 4000) -- reasoning echoed back each turn
+	test.eq(compact.estimate(plain), 1000)
+	test.eq(compact.estimate({ role = "user", content = "abcd", images = { {}, {} } }), 1 + 2 * 1200)
+end)
+
+test.case("scale turns estimates into the provider's real count, clamped", function()
+	local m = { user(string.rep("u", 400)), tool("a", string.rep("t", 400)) } -- 200 estimated tokens
+	test.eq(compact.scale(0, "", m), 1) -- no usage yet
+	test.eq(compact.scale(400, string.rep("s", 400), m), 400 / 300) -- the system prompt counts too
+	test.eq(compact.scale(100000, "", m), 4)
+	test.eq(compact.scale(10, "", m), 0.5)
+end)
+
+test.case("find_cut applies the scale", function()
+	local pad = string.rep("x", 400) -- 100 tokens
+	local m = { user("task"), asst(pad, "a"), tool("a", "ok"), asst(pad, "b"), tool("b", "ok"), asst(pad, "c"), tool("c", "ok") }
+	test.eq(compact.find_cut(m, 2, 150), 4)
+	test.eq(compact.find_cut(m, 2, 150, 2), 6) -- each message weighs twice as much: "c" alone reaches 150
+end)

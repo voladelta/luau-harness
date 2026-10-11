@@ -5,7 +5,8 @@ A reply is a string or an object. A string that starts with a ```luau fence beco
 (any text after the fence is the reply text); any other string is a plain-text reply. An object is
 {"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments.
 An object may also carry "prompt_tokens": N (reported as the usage prompt/input tokens, default 10) and, instead of a reply,
-"status": 400, "error": "<body>" (answer with that HTTP status and body)."""
+"status": 400, "error": "<body>" (answer with that HTTP status and body), and "reasoning": str (Chat Completions: a
+reasoning field on the assistant message, as reasoning models return)."""
 import json, os, re, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 R = json.loads(os.environ["MOCK_REPLIES"]); n = [0]
@@ -52,6 +53,8 @@ class H(BaseHTTPRequestHandler):
             doc = {"output": out, "usage": {"input_tokens": ptok, "output_tokens": 5, "cost": 0.001}}
         else:
             msg = {"role": "assistant", "content": text or None}
+            if isinstance(reply, dict) and reply.get("reasoning"):
+                msg["reasoning"] = reply["reasoning"]  # echoed back by hx inside the raw assistant message
             if calls:
                 msg["tool_calls"] = [{"id": i, "type": "function", "function": {"name": nm, "arguments": a}} for i, (nm, a) in zip(ids, calls)]
             doc = {"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else "stop"}],

@@ -25,7 +25,7 @@ denies for `sh` and MCP servers on macOS).
 ## Checks (all need `cargo build --release` first; none needs an API key)
 | Script | Covers | Result |
 |---|---|---|
-| `hx test stdlib/std` | printer, mcp, hooks, compact unit tests (Luau) | 24 pass |
+| `hx test stdlib/std` | printer, mcp, hooks, compact unit tests (Luau) | 27 pass |
 | `cargo test --release` | Rust unit tests: mcp glob, path normalize, command classes, protected paths | 3 pass |
 | `scripts/p2_checks.sh` | printer override without rebuild, broken-override fallback, parallel, vars, lock/grants gate, hooks, subagents, hot reload, failed lock check stays failed | 16/16 |
 | `scripts/sandbox_checks.sh` | writes outside project, ../, symlinks, protected `.harness`, env scrubbing, network, process cap, timeout kills group | 35/35 |
@@ -35,8 +35,8 @@ denies for `sh` and MCP servers on macOS).
 | `scripts/llm_checks.sh` | wire formats (chat completions, responses), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, native tool calls on both wire formats: parallel calls answered one result each, invalid arguments and unknown tool names get an error result, prose before any code is nudged | 19/19 |
 | `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
-| `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 49/49 |
-| `scripts/compact_checks.sh` | `std/compact`: pack below the threshold leaves requests byte-identical, one summarizer call then task + summary + kept tail (tool results stay with their calls), globals survive, `<previous-summary>` update, 2 summarizer failures disable it, overflow compact-and-retry (once), SIGKILL/resume around every compaction record incl. double resume, subagents | 30/30 |
+| `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session, a skill whose module fails to load still returns its text and raises the load error on use | 51/51 |
+| `scripts/compact_checks.sh` | `std/compact`: pack below the threshold leaves requests byte-identical, one summarizer call then task + summary + kept tail (tool results stay with their calls), globals survive, `<previous-summary>` update, a reasoning-heavy history is mostly summarized (calibrated sizes), 2 summarizer failures disable it, overflow compact-and-retry (once), SIGKILL/resume around every compaction record incl. double resume, divergence at a trailing failure, subagents | 32/32 |
 | `scripts/mcp_checks.sh` | MCP: binding, schema signatures, approval gate, sandboxed server (fs/net/env), prompt index, HTTP transport (json/SSE, session, header auth, redirects, secrets) | 42/42 |
 | `scripts/mcp_resume_check.py [http]` | crash after every record of a run that calls MCP tools (stdio, and `http`): no call is ever repeated on the server | 16/16 each |
 | `scripts/upgrade_checks.sh` | harness-module upgrades: propose, structural check, eval gate (scripted model), accept, rollback, tamper, force | 23/23 |
@@ -195,7 +195,10 @@ All of it is opt-in or costs nothing when unused (no packages and no mcp.toml =>
   changed file. Off by default, so the eval prompt is unchanged. No fallback for non-vision models: the provider error surfaces.
 - **Compaction** (`--pack std/compact`): trigger = last reply's input+cache+output tokens >= min(0.95*window,
   window - max_output - max(16384, 4096)) (prime-agent/pi formula); window from `--context-window` (`hx.model_info()`),
-  else 128000. Keeps ~min(20000, window/4) recent tokens verbatim, cut only before an assistant message. One summarizer
+  else 128000. Keeps ~min(20000, threshold/4) recent tokens verbatim, cut only before an assistant message. Message
+  sizes are chars/4 estimates (an assistant message's `raw` counts, since it carries reasoning) scaled by the provider's
+  real count for the last request over the estimate of the whole request (clamped 0.5..4). Found on a real run: without
+  `raw` and the scale, Haiku's echoed reasoning made the pack keep almost everything and compact every turn. One summarizer
   call via `hx.llm` (own system prompt, history serialized as text, tool results/code over 2000 chars cut to head 1500 +
   tail 500, no tools, max_tokens 13107); 2nd+ compaction sends `<previous-summary>` with the update prompt. The task
   message is re-sent verbatim with the summary block; the pack writes no files. Loop: `after_model` carries `usage`; new
