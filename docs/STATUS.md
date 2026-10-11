@@ -236,3 +236,17 @@ All of it is opt-in or costs nothing when unused (no packages and no mcp.toml =>
 
 Real-model checks: a DeepSeek run authored, tested and promoted `slugify` in 2 turns ($0.002); the user's `hx accept` made it
 available to a new session. Regression eval after all of P4: 60/60, fresh tokens 1.01x of before.
+
+## claude-sdk: native tool calling (2026-10-11)
+`--api claude-sdk` used a text protocol (`<luau>...</luau>` tags parsed in src/claude_sdk.rs) because the `claude` CLI takes no custom tool
+definitions on its command line. Haiku sometimes mangled the tag (`<<luau`, a bare `<` + `<parameter name="luau">`), the reply carried no call,
+and the run ended unfinished (2 of the first 40 eval runs). Now hx registers its tools as an in-process SDK MCP server (`--mcp-config
+{"type":"sdk"}` + the `initialize` control request); the CLI asks hx for `tools/list` and `tools/call` over the control channel. A `tools/call`
+is returned as the reply's call and parked; the next `chat` answers it with the tool result, so the loop, hooks, sandbox and event log stay
+in hx. The child is reused while its seen messages are a prefix of the request; otherwise a fresh child gets a text transcript replay.
+All text-tag parsing (`unfence`, `invoke`, the protocol section of the system prompt) is gone. Caveat: cost is reported only with the final
+`result` event, so a turn that ends in tool calls reports 0 and `--max-cost` lags by one segment.
+Output tokens: the streamed assistant events carry usage from before a reply is complete (output far too low), so the last segment of a user
+message reports the `result` event's exact usage minus what earlier segments already reported.
+Eval (1 run/task, frozen 15 + unseen 5), all 40/40 pass: Haiku medium 7.5k/5.1k fresh tokens per task, high 10.6k/7.8k (same passes, ~40% more
+cost), Sonnet low 4.3k/3.7k, medium 3.7k/3.5k (3.2 turns, ~10x Haiku's $/task). Suites are saturated; they separate efficiency, not quality.

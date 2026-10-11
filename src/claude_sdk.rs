@@ -1,13 +1,14 @@
 //! `--api claude-sdk`: use Claude through the `claude` CLI (the way the Claude Agent SDK does), so the calls draw on the
 //! user's Claude plan instead of an API key. One long-lived `claude -p --input-format stream-json --output-format
-//! stream-json` child holds the conversation; hx sends only the new user turn each time. The CLI cannot take custom tool
-//! definitions, so a tool call is plain text: `<name>` + the single string argument + `</name>`, parsed back into a call here.
+//! stream-json` child holds the conversation; hx sends only the new user turn each time. hx's tools reach the model as
+//! native tools of an in-process "SDK" MCP server (`hx`): the CLI asks hx for `tools/list` and `tools/call` over the
+//! control channel. A `tools/call` is not answered at once: `chat` returns it as the reply's tool call, parks the child with
+//! the call outstanding, and the next `chat` (which carries the tool results) answers it and lets the model go on.
 use crate::llm::{LlmCfg, Reply};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,59 +18,43 @@ use tokio::sync::Mutex;
 /// idle children kept for reuse; the oldest is dropped (and killed) beyond this
 const POOL_MAX: usize = 8;
 static POOL: OnceLock<Mutex<Vec<Proc>>> = OnceLock::new();
-static CALL_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Proc {
     _child: Child,
     stdin: ChildStdin,
     out: tokio::io::Lines<BufReader<ChildStdout>>,
-    /// what this child was started with; a request with a different system prompt or model needs another child
+    /// what this child was started with; a request with a different system prompt, model or tool set needs another child
     sys_sha: String,
-    /// the user turns this child has seen, in order (its own replies sit between them)
-    users: Vec<String>,
+    /// keys of the user / tool-result messages this child has been given, in order (its own replies sit between them)
+    seen: Vec<String>,
+    /// tool calls the model made that hx has not answered yet
+    pending: Vec<Pending>,
+    /// tokens (input, cache_read, cache_write, output) already reported for the user message being worked on
+    sent: [u64; 4],
     /// total_cost_usd is cumulative per session; the last value seen, to report each turn's share
     last_cost: f64,
 }
 
-/// A tool the model can call in text: `<name>VALUE</name>` where VALUE is the tool's one string parameter.
-struct TextTool {
-    name: String,
-    param: String,
+/// A `tools/call` the CLI is waiting on.
+struct Pending {
+    request_id: String,
+    rpc_id: Value,
+    tool_use_id: String,
 }
 
-fn text_tools(tools: &[Value]) -> Vec<TextTool> {
-    tools
-        .iter()
-        .filter_map(|t| {
-            let props = t["parameters"]["properties"].as_object()?;
-            let (param, _) = props.iter().find(|(_, v)| v["type"] == "string")?;
-            Some(TextTool { name: t["name"].as_str()?.to_string(), param: param.clone() })
-        })
-        .collect()
-}
+const SERVER: &str = "hx";
 
-fn system_with_protocol(system: &str, tools: &[Value], tt: &[TextTool]) -> String {
-    if tt.is_empty() {
-        return system.to_string();
-    }
-    let mut s = format!("{system}\n\n# How to call tools\nYour tools are called with text, not native tool calling. To call one, end your reply with exactly one block, the tag named after the tool around its argument, and write nothing after the closing tag:\n");
-    for t in tt {
-        let desc = tools.iter().find(|x| x["name"] == t.name.as_str()).and_then(|x| x["description"].as_str()).unwrap_or("");
-        s += &format!("\n<{n}>\n(the `{p}` argument, verbatim, no code fence)\n</{n}>\n{desc}\n", n = t.name, p = t.param);
-    }
-    if let Some(t) = tt.first() {
-        s += &format!("\nExample reply: a sentence of what you are about to do, then\n<{n}>\n...the {p}...\n</{n}>\n", n = t.name, p = t.param);
-    }
-    s += "\nUse only this exact tag form: no <invoke>, no <function_calls>, no JSON wrapper. The harness runs the call and answers in the next user message as `[<tool> result]`. Never write results yourself. To finish, reply in plain text with no block.";
-    s
+/// The tools as an MCP `tools/list` result.
+fn mcp_tools(tools: &[Value]) -> Value {
+    json!(tools.iter().map(|t| json!({"name": t["name"], "description": t["description"], "inputSchema": t["parameters"]})).collect::<Vec<_>>())
 }
 
 /// One side of the wire conversation: its text and the images (`{mime, data}`) attached to it.
 type Turn = (bool, String, Vec<Value>);
 
-/// Neutral messages -> alternating (user, assistant) wire turns. Tool results and user messages between two assistant
-/// turns merge into one user turn.
-fn wire(msgs: &[Value], tt: &[TextTool]) -> Vec<Turn> {
+/// Neutral messages -> alternating (user, assistant) wire turns, as text. Tool results and user messages between two
+/// assistant turns merge into one user turn.
+fn wire(msgs: &[Value]) -> Vec<Turn> {
     let mut names: HashMap<String, String> = HashMap::new();
     let mut out: Vec<Turn> = Vec::new();
     let mut push = |user: bool, t: String, imgs: Vec<Value>| match out.last_mut() {
@@ -87,10 +72,9 @@ fn wire(msgs: &[Value], tt: &[TextTool]) -> Vec<Turn> {
                 for c in m["calls"].as_array().into_iter().flatten() {
                     let name = c["name"].as_str().unwrap_or("");
                     names.insert(c["id"].as_str().unwrap_or("").to_string(), name.to_string());
-                    if let Some(tool) = tt.iter().find(|x| x.name == name) {
-                        let arg = c["input"][&tool.param].as_str().unwrap_or("");
-                        t += &format!("\n<{name}>\n{arg}\n</{name}>");
-                    }
+                    // only a transcript replay (a fresh child) renders calls as text; a live child holds its own
+                    let arg = c["input"].as_object().and_then(|o| o.values().find_map(|v| v.as_str())).unwrap_or("");
+                    t += &format!("\n[tool call {name}]\n{arg}");
                 }
                 push(false, t.trim_start().to_string(), vec![]);
             }
@@ -122,15 +106,30 @@ fn turn_key(t: &Turn) -> String {
     t.2.iter().fold(t.1.clone(), |k, i| format!("{k}\n[image {}]", sha(i["data"].as_str().unwrap_or(""))))
 }
 
+/// One key per non-assistant message: its text and images, or the id of the tool call it answers.
+fn msg_keys(msgs: &[Value]) -> Vec<String> {
+    msgs.iter()
+        .filter(|m| m["role"].as_str() != Some("assistant"))
+        .map(|m| match m["role"].as_str() {
+            Some("tool") => format!("tool:{}", m["id"].as_str().unwrap_or("")),
+            _ => format!("u:{}", turn_key(&(true, m["content"].as_str().unwrap_or("").to_string(), m["images"].as_array().cloned().unwrap_or_default()))),
+        })
+        .collect()
+}
+
 fn sha(s: &str) -> String {
     crate::eventlog::sha_bytes(s.as_bytes())
 }
 
-async fn spawn(cfg: &LlmCfg, system: &str, max_tokens: u64) -> Result<Proc> {
+async fn spawn(cfg: &LlmCfg, system: &str, max_tokens: u64, tools: &[Value], sys_sha: String) -> Result<Proc> {
     let dir = std::env::temp_dir().join("hx-claude-sdk");
     std::fs::create_dir_all(&dir)?;
     let mut cmd = Command::new("claude");
     cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--tools", "", "--setting-sources", "", "--strict-mcp-config", "--no-session-persistence", "--model", &cfg.model, "--system-prompt", system]);
+    if !tools.is_empty() {
+        let allowed: Vec<String> = tools.iter().filter_map(|t| t["name"].as_str()).map(|n| format!("mcp__{SERVER}__{n}")).collect();
+        cmd.args(["--allowedTools", &allowed.join(","), "--mcp-config", &json!({"mcpServers": {SERVER: {"type": "sdk", "name": SERVER}}}).to_string()]);
+    }
     if let Some(e) = &cfg.reasoning {
         cmd.args(["--effort", e]);
     }
@@ -140,36 +139,162 @@ async fn spawn(cfg: &LlmCfg, system: &str, max_tokens: u64) -> Result<Proc> {
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("could not start `claude` (is Claude Code installed and logged in?): {e}"))?;
     let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("claude: no stdin"))?;
     let out = BufReader::new(child.stdout.take().ok_or_else(|| anyhow::anyhow!("claude: no stdout"))?).lines();
-    Ok(Proc { _child: child, stdin, out, sys_sha: sha(&format!("{}\n{}\n{:?}", cfg.model, system, cfg.reasoning)), users: Vec::new(), last_cost: 0.0 })
+    let mut p = Proc { _child: child, stdin, out, sys_sha, seen: Vec::new(), pending: Vec::new(), sent: [0; 4], last_cost: 0.0 };
+    if !tools.is_empty() {
+        send(&mut p, &json!({"type": "control_request", "request_id": "hx-init", "request": {"subtype": "initialize", "sdkMcpServers": [SERVER]}})).await?;
+    }
+    Ok(p)
+}
+
+async fn send(p: &mut Proc, v: &Value) -> Result<()> {
+    p.stdin.write_all(serde_json::to_string(v)?.as_bytes()).await?;
+    p.stdin.write_all(b"\n").await?;
+    p.stdin.flush().await?;
+    Ok(())
+}
+
+/// Answer an MCP request the CLI sent over the control channel.
+async fn mcp_reply(p: &mut Proc, request_id: &str, rpc_id: Option<&Value>, result: Value) -> Result<()> {
+    let mut msg = json!({"jsonrpc": "2.0", "result": result});
+    if let Some(id) = rpc_id {
+        msg["id"] = id.clone();
+    }
+    send(p, &json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"mcp_response": msg}}})).await
+}
+
+/// What the model did since the last message hx sent.
+#[derive(Default)]
+struct Segment {
+    text: String,
+    calls: Vec<Value>,
+    pending: Vec<Pending>,
+    /// input, cache_read, cache_write, output (summed over the assistant messages seen)
+    usage: [u64; 4],
+    /// the `result` event, when the model finished instead of calling tools
+    result: Option<Value>,
+}
+
+/// Read the child's output until the model either finishes (`result`) or has made every tool call of one assistant message.
+async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
+    let mut seg = Segment::default();
+    let mut usage: HashMap<String, [u64; 4]> = HashMap::new();
+    let mut expected = 0usize;
+    loop {
+        let l = match tokio::time::timeout(Duration::from_secs(900), p.out.next_line()).await {
+            Err(_) => bail!("claude-sdk: no reply within 15 minutes"),
+            Ok(r) => r?,
+        };
+        let Some(l) = l else { bail!("claude-sdk: the claude process exited (not logged in? run `claude` once to log in; or the plan's usage limit was reached)") };
+        let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
+        match v["type"].as_str() {
+            Some("rate_limit_event") if v["rate_limit_info"]["status"].as_str().is_some_and(|s| s == "rejected" || s == "blocked") => {
+                bail!("claude-sdk: plan usage limit reached ({})", v["rate_limit_info"]);
+            }
+            Some("assistant") => {
+                let m = &v["message"];
+                let u = &m["usage"];
+                usage.insert(m["id"].as_str().unwrap_or("").to_string(), [u["input_tokens"].as_u64().unwrap_or(0), u["cache_read_input_tokens"].as_u64().unwrap_or(0), u["cache_creation_input_tokens"].as_u64().unwrap_or(0), u["output_tokens"].as_u64().unwrap_or(0)]);
+                for b in m["content"].as_array().into_iter().flatten() {
+                    match b["type"].as_str() {
+                        Some("text") => {
+                            if !seg.text.is_empty() {
+                                seg.text.push('\n');
+                            }
+                            seg.text.push_str(b["text"].as_str().unwrap_or(""));
+                        }
+                        Some("tool_use") => {
+                            expected += 1;
+                            let name = b["name"].as_str().unwrap_or("");
+                            let name = name.strip_prefix(&format!("mcp__{SERVER}__")).unwrap_or(name);
+                            seg.calls.push(json!({"id": b["id"], "name": name, "input": b["input"]}));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("control_request") if v["request"]["subtype"] == "mcp_message" => {
+                let rid = v["request_id"].as_str().unwrap_or("").to_string();
+                let msg = &v["request"]["message"];
+                let rpc = msg.get("id");
+                match msg["method"].as_str().unwrap_or("") {
+                    "initialize" => mcp_reply(p, &rid, rpc, json!({"protocolVersion": msg["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": SERVER, "version": "1"}})).await?,
+                    "tools/list" => mcp_reply(p, &rid, rpc, json!({"tools": tools})).await?,
+                    "tools/call" => seg.pending.push(Pending { request_id: rid, rpc_id: rpc.cloned().unwrap_or(Value::Null), tool_use_id: msg["params"]["_meta"]["claudecode/toolUseId"].as_str().unwrap_or("").to_string() }),
+                    _ => mcp_reply(p, &rid, rpc, json!({})).await?,
+                }
+            }
+            Some("result") => {
+                seg.result = Some(v);
+                break;
+            }
+            _ => {}
+        }
+        if expected > 0 && seg.pending.len() >= expected {
+            break;
+        }
+    }
+    for u in usage.values() {
+        for i in 0..4 {
+            seg.usage[i] += u[i];
+        }
+    }
+    Ok(seg)
 }
 
 /// `req` is the same shape `llm::chat` takes.
 pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
     let tools: Vec<Value> = req["tools"].as_array().cloned().unwrap_or_default();
-    let tt = text_tools(&tools);
-    let system = system_with_protocol(req["system"].as_str().unwrap_or(""), &tools, &tt);
+    let tools_list = mcp_tools(&tools);
+    let system = req["system"].as_str().unwrap_or("");
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(cfg.max_output);
     let msgs: Vec<Value> = req["messages"].as_array().cloned().unwrap_or_default();
-    let w = wire(&msgs, &tt);
-    let users: Vec<String> = w.iter().filter(|t| t.0).map(turn_key).collect();
-    if users.is_empty() {
+    let keys = msg_keys(&msgs);
+    if keys.is_empty() {
         bail!("claude-sdk: the request has no user message");
     }
-    if w.last().is_some_and(|t| !t.0) {
+    if msgs.last().is_some_and(|m| m["role"].as_str() == Some("assistant")) {
         bail!("claude-sdk: the request must end with a user message");
     }
-    let sys_sha = sha(&format!("{}\n{}\n{:?}", cfg.model, system, cfg.reasoning));
+    // the messages after the last assistant message: new input for a child that has seen everything before them
+    let trailing: Vec<Value> = msgs.iter().rev().take_while(|m| m["role"].as_str() != Some("assistant")).cloned().collect::<Vec<_>>().into_iter().rev().collect();
+    let sys_sha = sha(&format!("{}\n{}\n{:?}\n{}", cfg.model, system, cfg.reasoning, tools_list));
 
-    // a child that has seen exactly the earlier user turns just gets the new one; otherwise start over with the transcript
     let pool = POOL.get_or_init(|| Mutex::new(Vec::new()));
     let reused = {
         let mut p = pool.lock().await;
-        p.iter().position(|c| c.sys_sha == sys_sha && c.users[..] == users[..users.len() - 1]).map(|i| p.remove(i))
+        p.iter()
+            .position(|c| {
+                let n = c.seen.len();
+                if c.sys_sha != sys_sha || n + trailing.len() != keys.len() || c.seen[..] != keys[..n] {
+                    return false;
+                }
+                let tail = &keys[n..];
+                if c.pending.is_empty() {
+                    tail.iter().all(|k| k.starts_with("u:"))
+                } else {
+                    tail.len() == c.pending.len() && c.pending.iter().all(|q| tail.contains(&format!("tool:{}", q.tool_use_id)))
+                }
+            })
+            .map(|i| p.remove(i))
     };
-    let (mut proc, prompt) = match reused {
-        Some(p) => (p, content(&w[w.len() - 1].1, &w[w.len() - 1].2)),
+    let mut proc = match reused {
+        Some(mut p) => {
+            if p.pending.is_empty() {
+                let w = wire(&trailing);
+                let prompt = content(&w[0].1, &w[0].2);
+                send(&mut p, &json!({"type": "user", "message": {"role": "user", "content": prompt}})).await?;
+                p.sent = [0; 4];
+            } else {
+                for q in std::mem::take(&mut p.pending) {
+                    let out = trailing.iter().find(|m| m["id"].as_str() == Some(&q.tool_use_id)).and_then(|m| m["content"].as_str()).unwrap_or("");
+                    mcp_reply(&mut p, &q.request_id, Some(&q.rpc_id), json!({"content": [{"type": "text", "text": out}]})).await?;
+                }
+            }
+            p
+        }
         None => {
-            let p = spawn(cfg, &system, max_tokens).await?;
+            let mut p = spawn(cfg, system, max_tokens, &tools, sys_sha).await?;
+            let w = wire(&msgs);
             let last = &w[w.len() - 1];
             let prompt = if w.len() == 1 {
                 content(&last.1, &last.2)
@@ -182,46 +307,45 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
                 }
                 content(&t, &last.2)
             };
-            (p, prompt)
+            send(&mut p, &json!({"type": "user", "message": {"role": "user", "content": prompt}})).await?;
+            p
         }
     };
+    proc.seen = keys;
 
-    let line = serde_json::to_string(&json!({"type": "user", "message": {"role": "user", "content": prompt}}))?;
-    proc.stdin.write_all(line.as_bytes()).await?;
-    proc.stdin.write_all(b"\n").await?;
-    proc.stdin.flush().await?;
-
-    let result = loop {
-        let l = match tokio::time::timeout(Duration::from_secs(900), proc.out.next_line()).await {
-            Err(_) => bail!("claude-sdk: no reply within 15 minutes"),
-            Ok(r) => r?,
-        };
-        let Some(l) = l else { bail!("claude-sdk: the claude process exited (not logged in? run `claude` once to log in; or the plan's usage limit was reached)") };
-        let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
-        match v["type"].as_str() {
-            Some("rate_limit_event") if v["rate_limit_info"]["status"].as_str().is_some_and(|s| s == "rejected" || s == "blocked") => {
-                bail!("claude-sdk: plan usage limit reached ({})", v["rate_limit_info"]);
+    let seg = drive(&mut proc, &tools_list).await?;
+    let mut usage = seg.usage;
+    let mut out = Reply { finish: Some("stop".into()), ..Default::default() };
+    if let Some(result) = &seg.result {
+        // the streamed assistant events carry usage from before the reply was complete (output is far too low); the result
+        // event's usage is exact for the whole user message, so this last segment reports what the earlier ones did not
+        let u = &result["usage"];
+        let total = [u["input_tokens"].as_u64(), u["cache_read_input_tokens"].as_u64(), u["cache_creation_input_tokens"].as_u64(), u["output_tokens"].as_u64()];
+        for i in 0..4 {
+            if let Some(t) = total[i] {
+                usage[i] = t.saturating_sub(proc.sent[i]);
             }
-            Some("result") => break v,
-            _ => {}
         }
-    };
-    if result["is_error"].as_bool().unwrap_or(false) || result["subtype"].as_str() != Some("success") {
-        bail!("claude-sdk: {}", result["result"].as_str().unwrap_or("the claude CLI reported an error"));
+        if result["is_error"].as_bool().unwrap_or(false) || result["subtype"].as_str() != Some("success") {
+            bail!("claude-sdk: {}", result["result"].as_str().unwrap_or("the claude CLI reported an error"));
+        }
+        // the session's cost is cumulative and only reported with a result, so a turn that ends in tool calls reports none
+        let total = result["total_cost_usd"].as_f64().unwrap_or(0.0);
+        out.cost = (total - proc.last_cost).max(0.0);
+        proc.last_cost = total;
+        if result["stop_reason"].as_str() == Some("max_tokens") {
+            out.finish = Some("length".into());
+        }
+        out.text = if seg.calls.is_empty() { result["result"].as_str().unwrap_or("").to_string() } else { seg.text };
+    } else {
+        out.text = seg.text;
     }
-
-    proc.users = users;
-    let total = result["total_cost_usd"].as_f64().unwrap_or(0.0);
-    let u = &result["usage"];
-    let mut out = Reply {
-        input: u["input_tokens"].as_u64().unwrap_or(0),
-        cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
-        cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-        output: u["output_tokens"].as_u64().unwrap_or(0),
-        cost: (total - proc.last_cost).max(0.0),
-        ..Default::default()
-    };
-    proc.last_cost = total;
+    for i in 0..4 {
+        proc.sent[i] += usage[i];
+    }
+    (out.input, out.cache_read, out.cache_write, out.output) = (usage[0], usage[1], usage[2], usage[3]);
+    out.calls = seg.calls;
+    proc.pending = seg.pending;
     {
         let mut p = pool.lock().await;
         p.push(proc);
@@ -229,95 +353,12 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
             p.remove(0);
         }
     }
-
-    let text = result["result"].as_str().unwrap_or("").to_string();
-    let cut = result["stop_reason"].as_str() == Some("max_tokens");
-    out.finish = Some(if cut { "length".into() } else { "stop".into() });
-    // the earliest opening tag of a known tool starts the call
-    let found = tt.iter().filter_map(|t| text.find(&format!("<{}>", t.name)).map(|i| (i, t))).min_by_key(|(i, _)| *i);
-    match found {
-        None => match (invoke(&text, &tt), text.find("<invoke"), tt.first()) {
-            // the model's habitual `<invoke name="tool"><parameter name="arg">..` form
-            (Some((i, t, arg)), _, _) => {
-                out.text = text[..i].trim_end().to_string();
-                out.calls.push(json!({"id": format!("call_{}", CALL_ID.fetch_add(1, Ordering::Relaxed)), "name": t.name, "input": {t.param.clone(): unfence(&arg)}}));
-            }
-            // an unparseable attempt is a failed call (the loop says so and asks again), not a final answer
-            (None, Some(i), Some(t)) => {
-                out.text = text[..i].trim_end().to_string();
-                out.calls.push(json!({"id": format!("call_{}", CALL_ID.fetch_add(1, Ordering::Relaxed)), "name": t.name, "input": null, "error": format!("malformed tool call; write <{n}>...</{n}> exactly", n = t.name)}));
-            }
-            _ => out.text = text,
-        },
-        Some((i, t)) => {
-            out.text = text[..i].trim_end().to_string();
-            let open = format!("<{}>", t.name);
-            let body = &text[i + open.len()..];
-            let id = format!("call_{}", CALL_ID.fetch_add(1, Ordering::Relaxed));
-            match body.find(&format!("</{}>", t.name)) {
-                Some(j) => out.calls.push(json!({"id": id, "name": t.name, "input": {t.param.clone(): unfence(&body[..j])}})),
-                None => {
-                    out.finish = Some("length".into());
-                    out.calls.push(json!({"id": id, "name": t.name, "input": null, "error": "the tool call was cut off before its closing tag"}));
-                }
-            }
-        }
-    }
-    out.raw = String::new();
     Ok(out)
-}
-
-/// The argument verbatim, minus the surrounding newlines and a code fence the model added anyway.
-fn unfence(s: &str) -> String {
-    let mut t = s.trim_matches('\n');
-    // a `<parameter name="x">..</parameter>` wrapper inside the tool tag
-    if let Some(r) = t.trim().strip_prefix("<parameter") && let Some(gt) = r.find('>') && let Some(inner) = r[gt + 1..].trim_end().strip_suffix("</parameter>") {
-        t = inner.trim_matches('\n');
-    }
-    if let Some(rest) = t.trim().strip_prefix("```") {
-        if let Some(nl) = rest.find('\n') {
-            let body = &rest[nl + 1..];
-            if let Some(b) = body.trim_end().strip_suffix("```") {
-                return b.trim_end_matches('\n').to_string();
-            }
-        }
-    }
-    t.to_string()
-}
-
-/// `<invoke name="TOOL"> <parameter name="PARAM">VALUE</parameter> </invoke>` -> (start, tool, VALUE).
-fn invoke<'a>(text: &str, tt: &'a [TextTool]) -> Option<(usize, &'a TextTool, String)> {
-    let start = text.find("<invoke")?;
-    let t = tt.iter().find(|t| text[start..].starts_with(&format!("<invoke name=\"{}\"", t.name)))?;
-    let open = format!("<parameter name=\"{}\">", t.param);
-    let a = text[start..].find(&open)? + start + open.len();
-    let b = text[a..].find("</parameter>")? + a;
-    Some((start, t, text[a..b].to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tt() -> Vec<TextTool> {
-        vec![TextTool { name: "luau".into(), param: "code".into() }]
-    }
-
-    #[test]
-    fn unfence_strips_fences_and_parameter_wrapper() {
-        assert_eq!(unfence("\nprint(1)\n"), "print(1)");
-        assert_eq!(unfence("```luau\nprint(1)\n```"), "print(1)");
-        assert_eq!(unfence("<parameter name=\"code\">\nprint(1)\n</parameter>"), "print(1)");
-        assert_eq!(unfence("  indented()\n"), "  indented()");
-    }
-
-    #[test]
-    fn invoke_form_is_read() {
-        let t = tt();
-        let (i, tool, arg) = invoke("go\n<invoke name=\"luau\"><parameter name=\"code\">x()</parameter></invoke>", &t).unwrap();
-        assert_eq!((i, tool.name.as_str(), arg.as_str()), (3, "luau", "x()"));
-        assert!(invoke("<invoke\n{\"cmd\":\"true\"}\n</invoke>", &t).is_none());
-    }
 
     #[test]
     fn wire_merges_tool_results_and_names_them() {
@@ -327,9 +368,9 @@ mod tests {
             json!({"role": "tool", "id": "c1", "content": "ok"}),
             json!({"role": "user", "content": "nudge"}),
         ];
-        let w = wire(&msgs, &tt());
+        let w = wire(&msgs);
         assert_eq!(w.len(), 3);
-        assert_eq!(w[1].1, "doing\n<luau>\nf()\n</luau>");
+        assert_eq!(w[1].1, "doing\n[tool call luau]\nf()");
         assert_eq!(w[2].1, "[luau result]\nok\n\nnudge");
     }
 
@@ -337,13 +378,13 @@ mod tests {
     fn images_become_base64_blocks_and_change_the_turn_key() {
         let img = json!({"mime": "image/jpeg", "data": "QUJD"});
         let msgs = vec![json!({"role": "user", "content": "look", "images": [img]})];
-        let w = wire(&msgs, &tt());
+        let w = wire(&msgs);
         assert_eq!(w[0].2.len(), 1);
         let c = content(&w[0].1, &w[0].2);
         assert_eq!(c[0], json!({"type": "text", "text": "look"}));
         assert_eq!(c[1], json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}}));
         assert_eq!(content("hi", &[]), json!("hi"));
-        let other = wire(&[json!({"role": "user", "content": "look", "images": [{"mime": "image/jpeg", "data": "WFla"}]})], &tt());
+        let other = wire(&[json!({"role": "user", "content": "look", "images": [{"mime": "image/jpeg", "data": "WFla"}]})]);
         assert_ne!(turn_key(&w[0]), turn_key(&other[0]));
     }
 
