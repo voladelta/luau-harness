@@ -680,6 +680,35 @@ impl Resolver {
 #[cfg(test)]
 mod tests {
     use super::frontmatter_description as d;
+    use super::*;
+
+    /// A fresh, empty workspace under the temp dir.
+    fn ws(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hx-modules-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: PathBuf, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// `.harness/pkgs/<name>` with an fs=["read"] capability.
+    fn install_pkg(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(".harness/pkgs").join(name);
+        write(dir.join("hx.toml"), "[package]\nversion = \"1.0\"\n\n[capabilities]\nfs = [\"read\"]\n");
+        write(dir.join("init.luau"), "return { x = 1 }\n");
+        dir
+    }
+
+    fn err(r: Result<impl Sized>) -> String {
+        match r {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        }
+    }
 
     #[test]
     fn frontmatter_description_forms() {
@@ -688,5 +717,176 @@ mod tests {
         assert_eq!(d("---\ndescription: >\n  folded\n  lines\nname: a\n---\n"), "folded lines");
         assert_eq!(d("---\ndescription: |\n  block\n---\n"), "block");
         assert_eq!(d("no frontmatter"), "");
+    }
+
+    #[test]
+    fn package_must_be_locked_unchanged_and_granted() {
+        let root = ws("lock");
+        let dir = install_pkg(&root, "foo");
+        let r = Resolver::new(root.clone());
+        assert!(err(r.check_package("foo", &dir)).contains("not locked"));
+        // a failed check is not cached: after approval the same resolver passes
+        let msg = r.approve("foo").unwrap();
+        assert!(msg.starts_with("approved foo 1.0"), "{msg}");
+        let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
+        assert!(lock.contains("name = \"foo\"") && lock.contains("version = \"1.0\""), "{lock}");
+        assert!(std::fs::read_to_string(root.join(".harness/grants.toml")).unwrap().contains("[grant.foo]\nfs = [\"read\"]"));
+        assert_eq!(r.check_package("foo", &dir).unwrap().capabilities["fs"], vec!["read"]);
+        // any content change invalidates the lock
+        std::fs::write(dir.join("init.luau"), "return { x = 2 }\n").unwrap();
+        assert!(err(Resolver::new(root.clone()).check_package("foo", &dir)).contains("changed since it was approved"));
+        // so does a version that differs from the locked one
+        std::fs::write(dir.join("hx.toml"), "[package]\nversion = \"2.0\"\n\n[capabilities]\nfs = [\"read\"]\n").unwrap();
+        let man = Resolver::read_manifest("foo", &dir).unwrap();
+        // lock the new content under the old version: only the version differs
+        std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"1.0\"\nhash = {:?}\n", hash_dir(&dir).unwrap())).unwrap();
+        assert!(err(Resolver::new(root.clone()).verify("foo", &dir, &man)).contains("changed since it was approved"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ungranted_capability_is_refused_and_wildcard_allowed() {
+        let root = ws("grants");
+        let dir = install_pkg(&root, "foo");
+        let r = Resolver::new(root.clone());
+        r.approve("foo").unwrap();
+        let man = Resolver::read_manifest("foo", &dir).unwrap();
+        std::fs::write(root.join(".harness/grants.toml"), "[grant.foo]\nfs = [\"write\"]\n").unwrap();
+        assert!(err(r.verify("foo", &dir, &man)).contains("capability fs=read which has not been granted"));
+        std::fs::write(root.join(".harness/grants.toml"), "").unwrap();
+        assert!(err(r.verify("foo", &dir, &man)).contains("not been granted"));
+        std::fs::write(root.join(".harness/grants.toml"), "[grant.foo]\nfs = [\"*\"]\n").unwrap();
+        assert!(r.verify("foo", &dir, &man).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn approve_keeps_other_entries_and_rejects_unknown_names() {
+        let root = ws("approve");
+        install_pkg(&root, "foo");
+        install_pkg(&root, "bar");
+        let r = Resolver::new(root.clone());
+        r.approve("foo").unwrap();
+        r.approve("bar").unwrap();
+        r.approve("foo").unwrap();
+        let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
+        assert_eq!(lock.matches("[[package]]").count(), 2);
+        assert!(lock.find("\"bar\"").unwrap() < lock.find("\"foo\"").unwrap(), "sorted by name: {lock}");
+        assert!(err(r.approve("nope")).contains("no package or skill named nope"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_order_override_package_builtin() {
+        let root = ws("resolve");
+        // the launcher's consent to use workspace config; policy tests set the same value
+        unsafe { std::env::set_var("HX_TRUST", "1") };
+        let r = Resolver::new(root.clone());
+        let s = r.resolve("std/printer").unwrap();
+        assert_eq!((s.origin.as_str(), s.is_override, s.pkg.is_none()), ("std:printer.luau", false, true));
+        assert_eq!(r.resolve("std").unwrap().origin, "std:init.luau");
+        assert!(err(r.resolve("nope/x")).contains("module not found: nope/x"));
+        assert!(err(r.resolve("project/init")).contains("no project init"));
+        write(root.join(".harness/init.luau"), "-- init\n");
+        assert_eq!(r.resolve("project/init").unwrap().text, "-- init\n");
+        // an override wins, and `base:` skips it
+        write(root.join(".harness/override/std/printer.luau"), "return {}\n");
+        let s = r.resolve("std/printer").unwrap();
+        assert!(s.is_override && s.text == "return {}\n");
+        assert!(!r.resolve("base:std/printer").unwrap().is_override);
+        // a project package resolves only once approved, and carries its capabilities
+        install_pkg(&root, "foo");
+        assert!(err(r.resolve("foo")).contains("not locked"));
+        r.approve("foo").unwrap();
+        let s = r.resolve("foo").unwrap();
+        assert_eq!(s.pkg.unwrap().1["fs"], vec!["read"]);
+        assert!(err(r.resolve("foo/missing")).contains("module not found"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staged_package_review_accept_reject() {
+        let root = ws("staged");
+        let r = Resolver::new(root.clone());
+        assert!(r.list_staged().is_empty());
+        let files = |v: &str| vec![("hx.toml".to_string(), format!("[package]\nversion = \"{v}\"\n")), ("init.luau".to_string(), "return {}\n".to_string()), ("tests/a.luau".to_string(), "-- t\n".to_string())];
+        r.stage("foo", &files("1.0")).unwrap();
+        r.stage("bar", &files("1.0")).unwrap();
+        assert_eq!(r.list_staged(), vec!["bar", "foo"]);
+        let review = r.review("foo").unwrap();
+        assert!(review.contains("--- hx.toml ---") && review.contains("--- tests/a.luau ---\n-- t"), "{review}");
+        assert!(err(r.review("nope")).contains("nothing staged"));
+        assert!(r.accept("foo").unwrap().starts_with("approved foo 1.0"));
+        assert!(root.join(".harness/pkgs/foo/init.luau").is_file());
+        assert_eq!(r.list_staged(), vec!["bar"]);
+        // re-staging and accepting replaces the installed copy
+        r.stage("foo", &files("1.1")).unwrap();
+        assert!(r.accept("foo").unwrap().starts_with("approved foo 1.1"));
+        assert!(err(r.accept("foo")).contains("nothing staged"));
+        r.reject("bar").unwrap();
+        assert!(r.list_staged().is_empty());
+        assert!(r.reject("bar").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_builtin_modules_can_be_upgraded() {
+        assert!(Resolver::module_file("std/printer").is_ok());
+        for bad in ["std", "std/", "foo/printer", "std/../x", "std/Printer", "std/nope"] {
+            assert!(Resolver::module_file(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn proposal_must_load_return_a_table_and_keep_exports() {
+        let root = ws("check");
+        let r = Resolver::new(root.clone());
+        assert!(err(r.propose("std/printer", " ", "")).contains("1 byte to 200 KB"));
+        let check = |src: &str| r.check_proposal(&r.propose("std/printer", src, "").unwrap());
+        assert!(err(check("return {")).contains("does not compile"));
+        assert!(err(check("error('boom')")).contains("fails when loaded"));
+        assert!(err(check("return 1")).contains("must return a table"));
+        assert!(err(check("return {}")).contains("drops exports"));
+        // a wrapper that copies `base:` keeps every export
+        assert!(check("local b = require('base:std/printer')\nlocal m = {}\nfor k, v in b do m[k] = v end\nreturn m\n").is_ok());
+        assert!(err(r.check_proposal("nope")).contains("no proposal"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upgrade_accept_needs_a_passing_gate_and_rolls_back() {
+        let root = ws("upgrade");
+        let r = Resolver::new(root.clone());
+        let builtin = r.effective_source("std/printer").unwrap();
+        let new = format!("{builtin}\n-- v2\n");
+        let id = r.propose("std/printer", &new, "test").unwrap();
+        assert_eq!(r.list_proposals()[0]["reason"], "test");
+        let dir = r.proposals_dir().join(&id);
+        let sha = crate::eventlog::sha_bytes(new.as_bytes());
+        assert!(err(r.accept_upgrade(&id, false)).contains("gate has not been run"));
+        std::fs::write(dir.join("gate.json"), r#"{"candidate_sha": "other", "pass": true}"#).unwrap();
+        assert!(err(r.accept_upgrade(&id, false)).contains("different candidate"));
+        std::fs::write(dir.join("gate.json"), format!(r#"{{"candidate_sha": "{sha}", "pass": false, "reason": "slower"}}"#)).unwrap();
+        assert!(err(r.accept_upgrade(&id, false)).contains("FAILED for this proposal: slower"));
+        std::fs::write(dir.join("gate.json"), format!(r#"{{"candidate_sha": "{sha}", "pass": true}}"#)).unwrap();
+        assert!(r.accept_upgrade(&id, false).unwrap().contains("version 1"));
+        assert_eq!(r.effective_source("std/printer").unwrap(), new);
+        // a second (forced, gate-less) upgrade stacks on the first
+        let newer = format!("{new}-- v3\n");
+        let id2 = r.propose("std/printer", &newer, "").unwrap();
+        assert!(r.accept_upgrade(&id2, true).unwrap().contains("version 2"));
+        assert_eq!(r.effective_source("std/printer").unwrap(), newer);
+        // a candidate edited after proposing is refused even when forced
+        std::fs::write(r.proposals_dir().join(&id2).join("new.luau"), "return {}\n").unwrap();
+        assert!(err(r.accept_upgrade(&id2, true)).contains("modified after it was proposed"));
+        let log = std::fs::read_to_string(root.join(".harness/upgrades.jsonl")).unwrap();
+        assert!(log.contains("\"accept\"") && log.contains("\"accept(force)\""));
+        assert!(r.rollback_upgrade("std/printer").unwrap().ends_with("the previous version"));
+        assert_eq!(r.effective_source("std/printer").unwrap(), new);
+        assert!(r.rollback_upgrade("std/printer").unwrap().ends_with("the built-in module"));
+        assert_eq!(r.effective_source("std/printer").unwrap(), builtin);
+        assert!(!root.join(".harness/override/std/printer.luau").exists());
+        assert!(err(r.rollback_upgrade("std/printer")).contains("nothing to roll back"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -441,7 +441,7 @@ mod tests {
         std::fs::create_dir_all(&off).unwrap();
         std::fs::create_dir_all(on.join(".harness")).unwrap();
         std::fs::write(on.join(".harness/policy.toml"), "[gpu]\nallow = true\n").unwrap();
-        // the launcher's consent to use workspace config (no other test in this binary depends on trust)
+        // the launcher's consent to use workspace config (modules tests set the same value; no test needs it unset)
         unsafe { std::env::set_var("HX_TRUST", "1") };
         assert!(!Policy::new(&off, true, None, None, None).unwrap().seatbelt_profile().contains("iokit-open"));
         let prof = Policy::new(&on, true, None, None, None).unwrap().seatbelt_profile();
