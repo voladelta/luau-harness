@@ -658,10 +658,12 @@ impl Vm {
                 prims::json_value(&lua, ret)
             }
         })?;
+        // the opt-in std/authoring pack exposes these to the model's session (hx.expose)
+        let authoring = lua.create_table()?;
         for (n, f) in [("deftool", deftool), ("promote", promote), ("propose_module", propose_module)] {
-            session.env.raw_set(n, f)?;
-            exposed.lock().unwrap().insert(n.into());
+            authoring.set(n, f)?;
         }
+        hx.set("authoring", authoring)?;
         *hx_cell.lock().unwrap() = Some(hx.clone());
         modenv.set("hx", hx)?;
         Ok(Vm { lua, session, modenv })

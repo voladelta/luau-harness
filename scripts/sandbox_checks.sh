@@ -39,6 +39,23 @@ check "sh cannot read \$HOME sentinel" "$(echo "$out" | grep -c SECRET)" "0"
 out=$(run "print(pcall(read, \"$S1\"))" | head -1)
 check "read() rejects path outside roots" "$(echo "$out" | grep -c 'outside the allowed roots')$(echo "$out" | grep -c SECRET)" "10"
 
+# --- credential files stay unreadable even inside a read root (sh, read, search alike)
+mkdir -p $W/creds; for f in credentials credentials.toml .netrc .npmrc .pypirc id_rsa id_ed25519; do echo "CRED-$f" > "$W/creds/$f"; done
+out=$(run '
+local leaked = {}
+for _, f in {"credentials","credentials.toml",".netrc",".npmrc",".pypirc","id_rsa","id_ed25519"} do
+	if sh("cat creds/" .. f).stdout:find("CRED") then table.insert(leaked, "sh:" .. f) end
+	local ok, t = pcall(read, "creds/" .. f)
+	if ok and t:find("CRED") then table.insert(leaked, "read:" .. f) end
+end
+if #search("CRED", {path = "creds", literal = true}) > 0 then table.insert(leaked, "search") end
+for _, f in {"credentials.toml", ".npmrc"} do
+	-- edit() reads the file: its result must not tell whether a guessed string is in it
+	if pcall(edit, "creds/" .. f, "CRED", "CRED") then table.insert(leaked, "edit:" .. f) end
+end
+print("leaked=" .. table.concat(leaked, ","))' | head -1)
+check "credential files: unreadable via sh, read(), search() and edit()" "$out" "leaked="
+
 # --- symlink tricks
 ln -s $S1 $W/link-file; ln -s $HOME $W/link-dir
 out=$(run 'print(pcall(read, "link-file"))' | head -1)

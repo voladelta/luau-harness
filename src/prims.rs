@@ -153,6 +153,10 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let pol = f.pol.clone();
         match f.sync(lua, "edit", Class::LocalWrite, args, || {
             let p = pol.check_write(&path).map_err(|e| rt(format!("edit {path}: {e}")))?;
+            // edit reads the file, and whether `old` matched would reveal its content
+            if pol.enabled && crate::policy::is_secret(&p) {
+                return Err(rt(format!("edit {path}: policy: a credential file cannot be read")));
+            }
             let text = std::fs::read_to_string(&p).map_err(|e| rt(format!("edit {path}: {e}")))?;
             if old.is_empty() {
                 return Err(rt(format!("edit {path}: `old` is empty")));
@@ -268,7 +272,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let pol = f.pol.clone();
         match f.sync(lua, "search", Class::Read, args, || {
             pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-            Ok(match search(&pol.workspace, &pat, &opts)? {
+            Ok(match search(&pol.workspace, &pat, &opts, pol.enabled)? {
                 Ok((rows, truncated)) => Ret::Rows { rows, truncated },
                 Err((kind, message, hint)) => Ret::SearchErr { kind: kind.into(), message, hint: hint.into() },
             })
@@ -309,8 +313,9 @@ impl Sink for Collect<'_> {
     }
 }
 
-// search(pattern, {path=".", glob="*.rs", max=200, ignore_case=false, literal=false})
-fn search(root: &Path, pat: &str, opts: &Option<Table>) -> mlua::Result<Result<(Rows, bool), SearchErr>> {
+// search(pattern, {path=".", glob="*.rs", max=200, ignore_case=false, literal=false}). With `skip_secrets` (the policy is on),
+// credential files are not searched, as `read` refuses them.
+fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool) -> mlua::Result<Result<(Rows, bool), SearchErr>> {
     let literal = opt_bool(opts, "literal");
     if !literal {
         for tok in ["(?=", "(?!", "(?<=", "(?<!"] {
@@ -367,6 +372,9 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>) -> mlua::Result<Result<(
             continue;
         }
         let path = entry.path();
+        if skip_secrets && crate::policy::is_secret(path) {
+            continue;
+        }
         let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
         let mut sink = Collect { rows: &mut rows, file: rel, cap };
         let _ = searcher.search_path(&matcher, path, &mut sink);

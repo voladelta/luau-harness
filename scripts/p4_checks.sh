@@ -11,6 +11,8 @@ pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 W=$T/ws; mkdir -p $W/.harness/pkgs/release $W/.harness/pkgs/slug
 x() { $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
+# agent-written tools are an opt-in pack: xt runs with it
+xt() { x --pack std/authoring "$@"; }
 
 # --- the user installs a skill and a tool package (plain files; nothing is active until approved)
 cat > $W/.harness/pkgs/release/hx.toml <<'TOML'
@@ -70,18 +72,19 @@ E=$T/empty; mkdir -p $E; run $E
 check "no extensions installed: the prompt is unchanged" "$(system_of_last | grep -c 'Installed extensions')" "0"
 
 # --- agent-written tools: usable immediately, only with the capabilities they declare
+check "authoring is opt-in: without --pack std/authoring there is no deftool/promote/propose_module" "$(x 'print(type(deftool), type(promote), type(propose_module))' | head -1)" "nil	nil	nil"
 echo "secret" > $W/data.txt
-out=$(x 'deftool("peek", [==[
+out=$(xt 'deftool("peek", [==[
 return { run = function() return read("data.txt") end }
 ]==], { doc = "reads a file" })
 print(pcall(tools.peek.run))')
 check "deftool: a tool without declared caps cannot read files" "$(echo "$out" | head -1 | grep -c 'capability_denied')" "1"
-out=$(x 'deftool("peek", [==[
+out=$(xt 'deftool("peek", [==[
 return { run = function() return read("data.txt") end }
 ]==], { caps = { fs = { "read" } } })
 print(tools.peek.run())')
 check "deftool: declaring fs.read lets it read" "$(echo "$out" | head -1)" "secret"
-check "deftool: defined tools do not show up in vars()" "$(x 'deftool("t1", "return {}") x = 1 print(vars().tools, vars().deftool, vars().x)' | head -1)" "nil	nil	1"
+check "deftool: defined tools do not show up in vars()" "$(xt 'deftool("t1", "return {}") x = 1 print(vars().tools, vars().deftool, vars().x)' | head -1)" "nil	nil	1"
 
 TOOL='deftool("shout", [==[
 local M = {}
@@ -92,7 +95,7 @@ return M
 local m = require("shout")
 test.case("shouts", function() test.eq(m.run("hi"), "HI!") end)
 ]==] })'
-out=$(x "$TOOL"$'\nprint(tools.shout.run("a"))\nlocal r = promote("shout")\nprint(r.ok)\nprint(r.message)')
+out=$(xt "$TOOL"$'\nprint(tools.shout.run("a"))\nlocal r = promote("shout")\nprint(r.ok)\nprint(r.message)')
 check "deftool: usable at once in the session" "$(echo "$out" | sed -n 1p)" "A!"
 check "promote: tests pass => staged" "$(echo "$out" | sed -n 2p)" "true"
 check "promote: tells the agent a human must accept" "$(echo "$out" | sed -n 3p | grep -c 'hx accept shout')" "1"
@@ -103,15 +106,15 @@ $H accept shout --yes --workspace $W >/dev/null 2>&1
 check "after the user runs hx accept, a new session can use it" "$(x 'print(tools.shout.run("ok"))' | head -1)" "OK!"
 check "accepted tool is locked in hx.lock" "$(grep -c 'name = "shout"' $W/hx.lock)" "1"
 
-out=$(x 'deftool("bad", "return { run = function() return 1 end }", { tests = [==[
+out=$(xt 'deftool("bad", "return { run = function() return 1 end }", { tests = [==[
 local m = require("bad")
 test.case("fails", function() test.eq(m.run(), 2) end)
 ]==] })
 local r = promote("bad") print(r.ok, r.message)')
 check "promote: failing tests => refused, nothing staged" "$(echo "$out" | head -1)$([ -d $W/.harness/staged/bad ] && echo STAGED)" "false	the tool's tests failed; nothing was staged"
-out=$(x 'deftool("untested", "return {}") local r = promote("untested") print(r.ok, r.message)')
+out=$(xt 'deftool("untested", "return {}") local r = promote("untested") print(r.ok, r.message)')
 check "promote: no tests => refused" "$(echo "$out" | head -1 | grep -c 'must have tests')" "1"
-out=$(x 'deftool("greedy", [==[
+out=$(xt 'deftool("greedy", [==[
 return { run = function() return sh("echo x").stdout end }
 ]==], { tests = [==[
 test.case("runs", function() local m = require("greedy") test.eq(m.run(), "x\n") end)

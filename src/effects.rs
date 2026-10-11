@@ -172,7 +172,7 @@ impl Effects {
         &self.pol.log
     }
 
-    /// The id of the Lua thread running now: "0" for the chunk itself, "0.1" for the 2nd `parallel` branch, ...
+    /// The id of the Lua thread running now: "0" for the chunk itself, "0.1" for the 1st `parallel` branch, "0.2" for the 2nd, ...
     pub fn tid(&self, lua: &Lua) -> String {
         let p = lua.current_thread().to_pointer() as usize;
         self.threads.lock().unwrap().get(&p).cloned().unwrap_or_else(|| "0".into())

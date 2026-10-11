@@ -4,7 +4,7 @@
 //! editing or deleting any earlier line breaks the chain (`hx log verify`). Effects that change the world are written
 //! write-ahead: an `intent` record (flushed and synced) BEFORE the effect, an `outcome` record (`of` = the intent's
 //! seq) after. An intent with no outcome is an UNKNOWN outcome: the process died mid-effect, and a human decides.
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -48,23 +48,21 @@ impl EventLog {
         Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file: Some(file), seq: 0, prev: "genesis".into() }), session, path: Some(path), crash_after: crash_hook() }))
     }
 
-    /// Continue an existing log after a crash: restore seq and the hash chain, drop a torn final line.
+    /// Continue an existing log after a crash: restore seq and the hash chain, drop a torn final line. A malformed line
+    /// before the end is not a crash: the log is refused, never truncated (the records after it are evidence).
     pub fn reopen(path: &Path) -> Result<Arc<EventLog>> {
         let text = std::fs::read_to_string(path)?;
-        let mut keep = String::new();
+        let (records, torn) = parse(&text).map_err(|n| anyhow::anyhow!("{}: line {n} is not valid JSON; not resuming a damaged log", path.display()))?;
         let (mut seq, mut prev) = (0u64, "genesis".to_string());
-        for line in text.lines() {
-            match serde_json::from_str::<Value>(line) {
-                Ok(v) => {
-                    seq = v["seq"].as_u64().unwrap_or(seq);
-                    prev = sha_bytes(line.as_bytes());
-                    keep.push_str(line);
-                    keep.push('\n');
-                }
-                Err(_) => break,
-            }
+        for (line, v) in &records {
+            seq = v["seq"].as_u64().unwrap_or(seq);
+            prev = sha_bytes(line.as_bytes());
         }
-        std::fs::write(path, &keep)?;
+        // a torn tail is dropped; a complete final record that lost its newline gets one, so appends start a new line
+        if torn || !text.is_empty() && !text.ends_with('\n') {
+            let keep: String = records.iter().map(|(l, _)| format!("{l}\n")).collect();
+            write_atomic(path, keep.as_bytes())?;
+        }
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
         let session = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file: Some(file), seq, prev }), session, path: Some(path.to_path_buf()), crash_after: crash_hook() }))
@@ -86,7 +84,8 @@ impl EventLog {
             let _ = std::fs::create_dir_all(&dir);
             let f = dir.join(&h);
             if !f.exists() {
-                let _ = std::fs::write(f, bytes);
+                // atomic: a crash mid-write must not leave a truncated blob under its final name
+                let _ = write_atomic(&f, bytes);
             }
         }
         h
@@ -130,18 +129,41 @@ pub struct Report {
     pub unknown: Vec<(u64, String, String)>,
 }
 
+/// One complete record: its line exactly as written (the hash chain covers it) and the parsed value.
+type Record<'a> = (&'a str, Value);
+
+/// The records of a log, in order, with whether its final line is torn (a crash mid-write; that line is left out).
+/// A malformed line anywhere else is damage, not a crash: Err(its 1-based line number).
+fn parse(text: &str) -> std::result::Result<(Vec<Record<'_>>, bool), usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => out.push((*line, v)),
+            Err(_) if i + 1 == lines.len() => return Ok((out, true)),
+            Err(_) => return Err(i + 1),
+        }
+    }
+    Ok((out, false))
+}
+
+/// Write `bytes` to `path` through a temp file and a rename, so readers see the old or the new content, never a part.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Verify the hash chain and list effects whose outcome is unknown.
 pub fn verify(path: &Path) -> Result<Report> {
     let text = std::fs::read_to_string(path)?;
+    let records = parse(&text).map_err(|n| anyhow::anyhow!("line {n} is not valid JSON"))?.0;
     let mut prev = "genesis".to_string();
     let mut intents: std::collections::BTreeMap<u64, (String, String)> = Default::default();
     let (mut n, mut bad) = (0, None);
-    for (i, line) in text.lines().enumerate() {
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) if i + 1 == text.lines().count() => break, // a torn final line = crash mid-write; not tampering
-            Err(_) => bail!("line {} is not valid JSON", i + 1),
-        };
+    for (i, (line, v)) in records.into_iter().enumerate() {
         if v["prev"].as_str() != Some(prev.as_str()) && bad.is_none() {
             bad = Some(i + 1);
         }
@@ -168,19 +190,73 @@ pub fn read_blob(log_dir: &Path, sha: &str) -> Result<Vec<u8>> {
     Ok(std::fs::read(log_dir.join("blobs").join(sha))?)
 }
 
-/// All complete records of a log (a torn final line from a crash is ignored).
+/// All complete records of a log (a torn final line from a crash is ignored; a malformed line before it is an error).
 pub fn load(path: &Path) -> Result<Vec<Value>> {
     let text = std::fs::read_to_string(path)?;
-    Ok(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+    let records = parse(&text).map_err(|n| anyhow::anyhow!("{}: line {n} is not valid JSON", path.display()))?.0;
+    Ok(records.into_iter().map(|(_, v)| v).collect())
 }
 
 #[cfg(test)]
 mod open_tests {
+    use super::*;
+
     #[test]
     fn two_sessions_in_the_same_second_get_distinct_logs() {
         let dir = std::env::temp_dir().join(format!("hx-eventlog-{}", std::process::id()));
         let (a, b) = (super::EventLog::open(&dir).unwrap(), super::EventLog::open(&dir).unwrap());
         assert_ne!(a.session, b.session);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log with three records, written the normal way.
+    fn three_records(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hx-eventlog-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = EventLog::open(&dir).unwrap();
+        for i in 0..3 {
+            log.write("note", json!({"i": i}), false);
+        }
+        log.path.clone().unwrap()
+    }
+
+    #[test]
+    fn reopen_drops_only_a_torn_final_line_and_keeps_the_chain() {
+        let path = three_records("torn");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"seq\": 4, \"kin");
+        std::fs::write(&path, &text).unwrap();
+        let log = EventLog::reopen(&path).unwrap();
+        assert_eq!(log.write("note", json!({}), false), 4);
+        let r = verify(&path).unwrap();
+        assert!(r.chain_ok && r.records == 4, "{} records, chain {}", r.records, r.chain_ok);
+        assert_eq!(load(&path).unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reopen_after_a_lost_final_newline_appends_on_a_new_line() {
+        let path = three_records("nonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.trim_end_matches('\n')).unwrap();
+        EventLog::reopen(&path).unwrap().write("note", json!({}), false);
+        let r = verify(&path).unwrap();
+        assert!(r.chain_ok && r.records == 4, "{} records, chain {}", r.records, r.chain_ok);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_line_before_the_end_is_refused_not_truncated() {
+        let path = three_records("corrupt");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines[1] = "not json";
+        let bad = lines.join("\n") + "\n";
+        std::fs::write(&path, &bad).unwrap();
+        assert!(EventLog::reopen(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad, "resume must not delete the records after the bad line");
+        assert!(load(&path).is_err());
+        assert!(verify(&path).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -126,8 +126,13 @@ fn list_arg(args: &[String], name: &str) -> Vec<String> {
     arg(args, name).map(|v| v.split(',').map(String::from).collect()).unwrap_or_default()
 }
 
-fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
-    arg(args, name).and_then(|v| v.parse().ok())
+/// A numeric flag: None when absent, a usage error when present but not a number (a mistyped `--max-cost` must not
+/// silently run without a budget).
+fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>> {
+    match arg(args, name) {
+        None => Ok(None),
+        Some(v) => v.parse().map(Some).map_err(|_| usage(&format!("{name}: expected a number, got {v:?}"))),
+    }
 }
 
 /// `--net` / `--no-net`, or None to let the policy decide.
@@ -214,7 +219,7 @@ fn exec_chunks(args: &[String]) -> Vec<&str> {
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--workspace" | "--pack" | "--approval" => {
+            "--workspace" | "--pack" | "--approval" | "--resume" => {
                 it.next();
             }
             "--net" | "--no-net" | "--yolo" => {}
@@ -244,8 +249,8 @@ fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
         base_url: arg(args, "--base-url").or_else(|| std::env::var("HX_BASE_URL").ok()),
         key_env: arg(args, "--key-env"),
         reasoning: arg(args, "--reasoning"),
-        max_output: parsed(args, "--max-output").unwrap_or(16384),
-        context_window: parsed(args, "--context-window"),
+        max_output: parsed(args, "--max-output")?.unwrap_or(16384),
+        context_window: parsed(args, "--context-window")?,
         cache_key: Some(session),
         provider_only: list_arg(args, "--provider-only"),
     })
@@ -260,8 +265,8 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         (None, None) => bail!("--prompt-file required (or --resume LOG for a log that recorded its task)"),
     };
     let cfg = llm_cfg(args, policy.log.session.clone())?;
-    let max_turns = parsed(args, "--max-turns").unwrap_or(30);
-    let budget = policy::Budget { max_cost: parsed(args, "--max-cost"), max_tokens: parsed(args, "--max-tokens"), max_wall_secs: parsed(args, "--max-wall") };
+    let max_turns = parsed(args, "--max-turns")?.unwrap_or(30);
+    let budget = policy::Budget { max_cost: parsed(args, "--max-cost")?, max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
     let host = host::Host::new(cfg, workspace, policy, max_turns, arg(args, "--trace").map(PathBuf::from), budget, list_arg(args, "--pack"))?;
     if let Some(r) = replay {
         host.set_replay(r);
@@ -409,7 +414,7 @@ mod tests {
 
     #[test]
     fn exec_chunks_skip_global_flags_and_their_values() {
-        let a = argv("exec --workspace /w print(1) --pack a,b --net print(2) --approval auto --yolo --no-net print(3)");
+        let a = argv("exec --workspace /w print(1) --pack a,b --net print(2) --approval auto --yolo --resume l.jsonl --no-net print(3)");
         assert_eq!(exec_chunks(&a), vec!["print(1)", "print(2)", "print(3)"]);
         assert!(exec_chunks(&argv("exec")).is_empty());
     }
@@ -419,8 +424,10 @@ mod tests {
         let a = argv("run --pack a,b --max-turns 7 --max-cost x --net");
         assert_eq!(list_arg(&a, "--pack"), vec!["a", "b"]);
         assert!(list_arg(&a, "--provider-only").is_empty());
-        assert_eq!(parsed::<u32>(&a, "--max-turns"), Some(7));
-        assert_eq!(parsed::<f64>(&a, "--max-cost"), None, "unparsable values are ignored");
+        assert_eq!(parsed::<u32>(&a, "--max-turns").unwrap(), Some(7));
+        assert_eq!(parsed::<u32>(&a, "--max-tokens").unwrap(), None);
+        let e = parsed::<f64>(&a, "--max-cost").unwrap_err();
+        assert!(e.is::<Usage>() && e.to_string().contains("--max-cost"), "a mistyped budget is a usage error, not unlimited: {e}");
         assert_eq!(net_flag(&a), Some(true));
         assert_eq!(net_flag(&argv("run --no-net")), Some(false));
         assert_eq!(net_flag(&argv("run")), None);

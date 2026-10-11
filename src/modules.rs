@@ -79,20 +79,20 @@ pub struct PkgInfo {
 /// `hx test DIR` mounts the package under test here so it can be required without being installed.
 pub static TEST_PKG: std::sync::OnceLock<(String, PathBuf)> = std::sync::OnceLock::new();
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, serde::Serialize, Default)]
 struct Lockfile {
     #[serde(default)]
     package: Vec<LockEntry>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, serde::Serialize, Clone)]
 struct LockEntry {
     name: String,
     version: String,
     hash: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, serde::Serialize, Default)]
 struct Grants {
     #[serde(default)]
     grant: BTreeMap<String, BTreeMap<String, Vec<String>>>,
@@ -128,7 +128,7 @@ fn split_name(name: &str) -> (&str, &str) {
     name.split_once('/').unwrap_or((name, ""))
 }
 
-/// Hash of every file in a package directory (relative path + content, sorted), excluding tests.
+/// Hash of every file in a package directory (relative path + content, sorted), tests included.
 pub fn hash_dir(dir: &Path) -> Result<String> {
     let mut files = Vec::new();
     fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -326,7 +326,8 @@ impl Resolver {
                 match self.verify(&name, &dir, &Self::agent_skill_manifest(&dir)) {
                     Ok(()) => "approved".into(),
                     Err(e) if e.to_string().contains("not locked") => "not approved".into(),
-                    Err(_) => "changed since approval".into(),
+                    Err(e) if e.to_string().contains("changed since it was approved") => "changed since approval".into(),
+                    Err(e) => format!("error: {}", e.to_string().lines().next().unwrap_or("")),
                 }
             };
             s.push_str(&format!("{name:<28} {state:<24} {}\n", dir.display()));
@@ -534,6 +535,15 @@ impl Resolver {
         let (dir, meta) = self.proposal_meta(id)?;
         let (base, new) = (std::fs::read_to_string(dir.join("base.luau"))?, std::fs::read_to_string(dir.join("new.luau"))?);
         let lua = mlua::Lua::new();
+        // the candidate is model-written and runs in the user's CLI: bound its time and memory like a session chunk
+        lua.set_memory_limit(256 << 20)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        lua.set_interrupt(move |_| {
+            if std::time::Instant::now() > deadline {
+                return Err(mlua::Error::runtime("time limit exceeded (infinite loop?)"));
+            }
+            Ok(mlua::VmState::Continue)
+        });
         // Loading may `require` other modules: they get a permissive stub so only this module's own shape is judged.
         // `base:<this module>` gets the REAL current module, so a wrapper that copies it keeps its exports.
         let proxy: mlua::Table = lua.load(r#"return setmetatable({}, { __index = function() return function() return nil end end, __call = function() return nil end })"#).eval()?;
@@ -602,6 +612,12 @@ impl Resolver {
         if sha != meta["new_sha"].as_str().unwrap_or("") {
             bail!("the staged candidate was modified after it was proposed");
         }
+        // The candidate replaces the whole module and its gate compared it with the module in force at proposal time:
+        // if that module has changed since (another upgrade, a rollback), accepting would silently drop the change.
+        let current = crate::eventlog::sha_bytes(self.effective_source(&module)?.as_bytes());
+        if Some(current.as_str()) != meta["base_sha"].as_str() {
+            bail!("{module} has changed since this proposal was made; propose the change again against the current module");
+        }
         self.check_proposal(id)?;
         if !force {
             let gate: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("gate.json")).map_err(|_| anyhow!("the eval gate has not been run for this proposal (python3 eval/gate.py --proposal {id} ...)"))?)?;
@@ -655,24 +671,12 @@ impl Resolver {
         entries.retain(|e| e.name != pkg);
         entries.push(LockEntry { name: pkg.into(), version: man.package.version.clone(), hash: hash.clone() });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut out = String::new();
-        for e in &entries {
-            out.push_str(&format!("[[package]]\nname = {:?}\nversion = {:?}\nhash = {:?}\n\n", e.name, e.version, e.hash));
-        }
-        std::fs::write(&lock_path, out)?;
+        std::fs::write(&lock_path, toml::to_string(&Lockfile { package: entries })?)?;
         let gpath = self.harness().join("grants.toml");
         std::fs::create_dir_all(self.harness())?;
         let mut g: Grants = read_toml(&gpath)?;
         g.grant.insert(pkg.into(), man.capabilities.clone());
-        let mut gs = String::new();
-        for (p, caps) in &g.grant {
-            gs.push_str(&format!("[grant.{p}]\n"));
-            for (c, s) in caps {
-                gs.push_str(&format!("{c} = {:?}\n", s));
-            }
-            gs.push('\n');
-        }
-        std::fs::write(&gpath, gs)?;
+        std::fs::write(&gpath, toml::to_string(&g)?)?;
         Ok(format!("approved {pkg} {} ({}…) from {} with capabilities {:?}", man.package.version, &hash[..8], dir.display(), man.capabilities))
     }
 }
@@ -777,6 +781,19 @@ mod tests {
     }
 
     #[test]
+    fn approve_writes_valid_toml_for_any_name() {
+        let root = ws("dotted");
+        let dir = install_pkg(&root, "my.pkg");
+        install_pkg(&root, "other");
+        let r = Resolver::new(root.clone());
+        r.approve("my.pkg").unwrap();
+        r.approve("other").unwrap();
+        let man = Resolver::read_manifest("my.pkg", &dir).unwrap();
+        assert!(r.verify("my.pkg", &dir, &man).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn resolve_order_override_package_builtin() {
         let root = ws("resolve");
         // the launcher's consent to use workspace config; policy tests set the same value
@@ -850,6 +867,23 @@ mod tests {
         // a wrapper that copies `base:` keeps every export
         assert!(check("local b = require('base:std/printer')\nlocal m = {}\nfor k, v in b do m[k] = v end\nreturn m\n").is_ok());
         assert!(err(r.check_proposal("nope")).contains("no proposal"));
+        // model-written code runs in the user's CLI: a loop or a memory bomb must fail the check, not hang it
+        assert!(err(check("while true do end")).contains("fails when loaded"));
+        assert!(err(check("local t = {} for i = 1, 1e9 do t[i] = string.rep('x', 1024) .. i end return t")).contains("fails when loaded"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upgrade_accept_refuses_a_proposal_whose_base_is_no_longer_in_force() {
+        let root = ws("stale");
+        let r = Resolver::new(root.clone());
+        let builtin = r.effective_source("std/printer").unwrap();
+        let a = r.propose("std/printer", &format!("{builtin}\n-- A\n"), "").unwrap();
+        let b = r.propose("std/printer", &format!("{builtin}\n-- B\n"), "").unwrap();
+        r.accept_upgrade(&a, true).unwrap();
+        // B was made against the built-in module; accepting it now would silently drop A
+        assert!(err(r.accept_upgrade(&b, true)).contains("changed since this proposal was made"));
+        assert!(r.effective_source("std/printer").unwrap().ends_with("-- A\n"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

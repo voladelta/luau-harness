@@ -119,7 +119,16 @@ const IRREVERSIBLE: &[&str] = &["git push --force", "git push -f", "rm -rf /", "
 
 const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/dev", "/opt", "/Applications", "/private/var/db"];
 /// Seatbelt rules for Metal: the GPU driver user clients and the shader compiler service.
-const GPU_RULES: &str = "(allow iokit-open)\n(allow iokit-get-properties)\n(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name-regex #\"^com\\\\.apple\\\\.(metal|gpu|iosurface|CARenderServer|cvmsServ)\"))\n(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/C/com\\\\.apple\\\\.(metal|gpuarchiver)\"))\n";
+const GPU_RULES: &str = "(allow iokit-open)\n(allow iokit-get-properties)\n(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name-regex #\"^com\\.apple\\.(metal|gpu|iosurface|CARenderServer|cvmsServ)\"))\n(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/C/com\\.apple\\.(metal|gpuarchiver)\"))\n";
+/// Credential files no model-reachable read may open, even inside a read root (e.g. `~/.cargo/credentials.toml`): `read`,
+/// `search` and `view` refuse them and the Seatbelt profile denies them to `sh`.
+const SECRET_FILES: &[&str] = &["credentials", "credentials.toml", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519"];
+
+/// Is `path` (by file name) one of the credential files in SECRET_FILES?
+pub fn is_secret(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| SECRET_FILES.contains(&n))
+}
+
 const ENV_ALLOW: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL"];
 const TOOLS: &[&str] = &["python3", "python", "pip3", "node", "npm", "npx", "git", "cargo", "rustc", "go", "uv", "ruby", "java", "make", "gcc", "clang", "deno", "bun"];
 
@@ -264,6 +273,9 @@ impl Policy {
         if !Self::within(&c, &self.read_roots) {
             bail!("policy: reading {p} is outside the allowed roots");
         }
+        if is_secret(&c) {
+            bail!("policy: {p} is a credential file and cannot be read");
+        }
         Ok(c)
     }
 
@@ -353,7 +365,9 @@ impl Policy {
         for w in self.write_roots.iter().chain(extra_write) {
             s.push_str(&format!("(allow file-write* (subpath {}))\n", q(w)));
         }
-        s.push_str("(deny file-read* (regex #\"/(credentials(\\\\.toml)?|\\\\.netrc|id_rsa|id_ed25519|\\\\.npmrc|\\\\.pypirc)$\"))\n");
+        // `\.` in the profile: SBPL hands the #"..." string to the regex engine as is
+        let names: Vec<String> = SECRET_FILES.iter().map(|n| n.replace('.', "\\.")).collect();
+        s.push_str(&format!("(deny file-read* (regex #\"/({})$\"))\n", names.join("|")));
         for p in &self.protected {
             s.push_str(&format!("(deny file-write* (subpath {}))\n", q(p)));
         }

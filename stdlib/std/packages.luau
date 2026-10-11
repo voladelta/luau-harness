@@ -4,8 +4,8 @@
 --                          if any, and where its other files are (agent skills from .agents/skills or ~/.agents/skills too)
 --   skills(query?)         -> { {name, description} }: search approved skills by name and description (best first).
 --                          Skills are NOT listed in the prompt: the model searches or loads one when the user names it.
---   deftool / promote      agent-written tools: usable at once with only the capabilities they declare; activated for
---                          later sessions only when the user reviews them and runs `hx accept`
+--   deftool / promote      (the std/authoring pack) agent-written tools: usable at once with only the capabilities they
+--                          declare; activated for later sessions only when the user reviews them and runs `hx accept`
 --   refresh_extensions()   hot reload: drop cached tool modules so edited/newly accepted packages are picked up;
 --                          session variables are untouched
 local M = {}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """P0 eval runner: frozen tasks x {hx, claude} x N runs -> results.jsonl. Script graders only.
 
-ASSUMED task layout (tasks/ was not present when this was written; adjust TASK_* if the frozen format differs):
+Task layout (built by eval/build_tasks.py):
   tasks/<id>/prompt.md   the task statement given verbatim to both agents
   tasks/<id>/repo/       optional starting snapshot, copied into a fresh workspace per run
   tasks/<id>/grade.sh    run with cwd = workspace; exit 0 = pass
@@ -30,9 +30,9 @@ def run(cmd, timeout, **kw):
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 def hx_endpoint(model):
+    """Enclave models (cyberouter/*) use Enclave; anything else goes through OpenRouter."""
     if os.environ.get("EVAL_HX_BASE_URL"):  # tests: a scripted model server
         return ["--api", "openai", "--base-url", os.environ["EVAL_HX_BASE_URL"], "--key-env", "EVAL_HX_KEY"]
-    """Enclave models (cyberouter/*) use Enclave; anything else goes through OpenRouter."""
     extra = ["--reasoning", os.environ["EVAL_REASONING"]] if os.environ.get("EVAL_REASONING") else []
     if model.startswith("claude-sdk/"):  # the claude CLI on the user's plan (no key); hx:claude-sdk/haiku
         return ["--api", "claude-sdk"] + extra
@@ -56,10 +56,7 @@ def run_hx(ws, prompt_file, model, timeout, trace):
     r["wall_secs"] = time.time() - t0
     return r
 
-BASELINE_AUTH = os.environ.get("BASELINE_AUTH", "subscription")  # or "subscription"
-
-def model_for_claude(model):
-    return model
+BASELINE_AUTH = os.environ.get("BASELINE_AUTH", "subscription")  # or "subscription-lean" or "openrouter"
 
 def run_claude(ws, prompt, model, timeout, trace):
     t0 = time.time()
@@ -73,7 +70,7 @@ def run_claude(ws, prompt, model, timeout, trace):
         flags = ["--setting-sources", "project", "--disable-slash-commands", "--strict-mcp-config"]
         if BASELINE_AUTH == "subscription-lean":  # ~3.6k prompt instead of ~23.7k; minimal system prompt, 4 core tools
             flags += ["--system-prompt", "You are a coding agent. Complete the task by editing files in the working directory.", "--tools", "Bash,Read,Edit,Write"]
-    p = run(["claude", "-p", prompt, *flags, "--model", model_for_claude(model), "--output-format", "json",
+    p = run(["claude", "-p", prompt, *flags, "--model", model, "--output-format", "json",
                         *(["--effort", os.environ["EVAL_EFFORT"]] if os.environ.get("EVAL_EFFORT") else []),
                         "--dangerously-skip-permissions", "--no-session-persistence"],
                        cwd=ws, timeout=timeout, env=env)
@@ -116,9 +113,9 @@ def main():
         for fp in Path(a.resume).glob("**/results.jsonl"):
             done |= {(r["task"], r["system"], r["run"]) for r in map(json.loads, fp.read_text().splitlines())}
     for task in tasks:
-        for run in range(1, a.runs + 1):
+        for rep in range(1, a.runs + 1):
             for system in a.systems.split(","):
-                if (task.name, system, run) in done: continue
+                if (task.name, system, rep) in done: continue
                 ws = tempfile.mkdtemp(prefix=f"p0-{task.name}-")
                 if (task / TASK_REPO).is_dir(): shutil.copytree(task / TASK_REPO, ws, dirs_exist_ok=True)
                 # EVAL_OVERRIDE="std/printer=/abs/file.luau;std/loop=/abs/other.luau": per-arm module overrides (upgrade gate)
@@ -126,7 +123,7 @@ def main():
                     mod, src = spec.split("=", 1); pkg, m = mod.split("/", 1)
                     dest = Path(ws) / ".harness" / "override" / pkg / f"{m}.luau"; dest.parent.mkdir(parents=True, exist_ok=True); shutil.copy(src, dest)
                 tag = system.replace("/", "_").replace(":", "-")
-                trace = out / f"{task.name}.{tag}.{run}.trace"
+                trace = out / f"{task.name}.{tag}.{rep}.trace"
                 prompt = (task / TASK_PROMPT).read_text()
                 try:
                     r = (run_hx(ws, task / TASK_PROMPT, system.split(":", 1)[1], a.timeout, trace) if system.startswith("hx:")
@@ -134,11 +131,11 @@ def main():
                 except subprocess.TimeoutExpired:
                     r = {"harness_error": "timeout"}
                 g = run(["bash", str(task / TASK_GRADE)], cwd=ws, env={**os.environ, "TASK_DIR": str(task.resolve())}, timeout=600)
-                r.update(task=task.name, system=system, run=run, passed=(g.returncode == 0), grader_tail=(g.stdout + g.stderr)[-300:])
+                r.update(task=task.name, system=system, run=rep, passed=(g.returncode == 0), grader_tail=(g.stdout + g.stderr)[-300:])
                 m = re.search(r"^SCORE (\d+)/(\d+)$", g.stdout, re.M)  # partial credit (suites built with --score)
                 if m: r["score"] = [int(m.group(1)), int(m.group(2))]
                 with results.open("a") as f: f.write(json.dumps(r) + "\n")
-                print(f"{task.name} {system} #{run}: {'PASS' if r['passed'] else 'FAIL'}{' %d/%d' % tuple(r['score']) if 'score' in r else ''} tokens={r.get('tokens_total')} turns={r.get('turns')} cost={r.get('cost_usd')}", flush=True)
+                print(f"{task.name} {system} #{rep}: {'PASS' if r['passed'] else 'FAIL'}{' %d/%d' % tuple(r['score']) if 'score' in r else ''} tokens={r.get('tokens_total')} turns={r.get('turns')} cost={r.get('cost_usd')}", flush=True)
                 shutil.rmtree(ws, ignore_errors=True)
 
 if __name__ == "__main__":

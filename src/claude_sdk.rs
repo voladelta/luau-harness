@@ -234,8 +234,8 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
         }
     }
     for u in usage.values() {
-        for i in 0..4 {
-            seg.usage[i] += u[i];
+        for (s, x) in seg.usage.iter_mut().zip(u) {
+            *s += x;
         }
     }
     Ok(seg)
@@ -321,9 +321,9 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
         // event's usage is exact for the whole user message, so this last segment reports what the earlier ones did not
         let u = &result["usage"];
         let total = [u["input_tokens"].as_u64(), u["cache_read_input_tokens"].as_u64(), u["cache_creation_input_tokens"].as_u64(), u["output_tokens"].as_u64()];
-        for i in 0..4 {
-            if let Some(t) = total[i] {
-                usage[i] = t.saturating_sub(proc.sent[i]);
+        for ((u, t), sent) in usage.iter_mut().zip(total).zip(proc.sent) {
+            if let Some(t) = t {
+                *u = t.saturating_sub(sent);
             }
         }
         if result["is_error"].as_bool().unwrap_or(false) || result["subtype"].as_str() != Some("success") {
@@ -340,8 +340,8 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
     } else {
         out.text = seg.text;
     }
-    for i in 0..4 {
-        proc.sent[i] += usage[i];
+    for (sent, u) in proc.sent.iter_mut().zip(usage) {
+        *sent += u;
     }
     (out.input, out.cache_read, out.cache_write, out.output) = (usage[0], usage[1], usage[2], usage[3]);
     out.calls = seg.calls;

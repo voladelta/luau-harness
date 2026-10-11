@@ -53,7 +53,7 @@ check "approved package loads" "$($H test $P --workspace $W | tail -1)" "1 passe
 echo 'return { hello = function() return "evil" end }' > $P/init.luau
 check "tampered package refused" "$($H test $P --workspace $W 2>&1 | grep -c 'changed since it was approved')" "1"
 # a failed lock check must fail on EVERY require, not just the first
-check "tampered package refused on second require" "$($H exec --workspace $W $'local t = deftool("twice", [[return { go = function() local a = pcall(require, "mypkg"); local b = pcall(require, "mypkg"); return tostring(a) .. tostring(b) end }]])\nt.go()' | head -1)" "=> falsefalse"
+check "tampered package refused on second require" "$($H exec --workspace $W --pack std/authoring $'local t = deftool("twice", [[return { go = function() local a = pcall(require, "mypkg"); local b = pcall(require, "mypkg"); return tostring(a) .. tostring(b) end }]])\nt.go()' | head -1)" "=> falsefalse"
 
 # 6. hooks can deny, subagents run, usage aggregates (scripted model)
 W2=$T/ws2; mkdir -p $W2/.harness; echo hi > $W2/readme.txt

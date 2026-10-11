@@ -12,6 +12,9 @@ You cannot approve, install or activate anything yourself.
 ]==]
 
 function M.install(ctx)
+	for name, fn in hx.authoring do
+		hx.expose(name, fn)
+	end
 	ctx.hooks.on("before_model", function(req)
 		req.system = req.system .. "\n\n" .. DOCS
 		return req
