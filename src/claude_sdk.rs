@@ -64,17 +64,21 @@ fn system_with_protocol(system: &str, tools: &[Value], tt: &[TextTool]) -> Strin
     s
 }
 
-/// Neutral messages -> alternating (user, assistant) wire texts. Tool results and user messages between two assistant
+/// One side of the wire conversation: its text and the images (`{mime, data}`) attached to it.
+type Turn = (bool, String, Vec<Value>);
+
+/// Neutral messages -> alternating (user, assistant) wire turns. Tool results and user messages between two assistant
 /// turns merge into one user turn.
-fn wire(msgs: &[Value], tt: &[TextTool]) -> Vec<(bool, String)> {
+fn wire(msgs: &[Value], tt: &[TextTool]) -> Vec<Turn> {
     let mut names: HashMap<String, String> = HashMap::new();
-    let mut out: Vec<(bool, String)> = Vec::new();
-    let mut push = |user: bool, t: String| match out.last_mut() {
-        Some((u, s)) if *u == user => {
+    let mut out: Vec<Turn> = Vec::new();
+    let mut push = |user: bool, t: String, imgs: Vec<Value>| match out.last_mut() {
+        Some((u, s, im)) if *u == user => {
             s.push_str("\n\n");
             s.push_str(&t);
+            im.extend(imgs);
         }
-        _ => out.push((user, t)),
+        _ => out.push((user, t, imgs)),
     };
     for m in msgs {
         match m["role"].as_str().unwrap_or("user") {
@@ -88,22 +92,34 @@ fn wire(msgs: &[Value], tt: &[TextTool]) -> Vec<(bool, String)> {
                         t += &format!("\n<{name}>\n{arg}\n</{name}>");
                     }
                 }
-                push(false, t.trim_start().to_string());
+                push(false, t.trim_start().to_string(), vec![]);
             }
             "tool" => {
                 let name = names.get(m["id"].as_str().unwrap_or("")).cloned().unwrap_or_else(|| "tool".into());
-                push(true, format!("[{name} result]\n{}", m["content"].as_str().unwrap_or("")));
+                push(true, format!("[{name} result]\n{}", m["content"].as_str().unwrap_or("")), vec![]);
             }
             _ => {
-                let mut t = m["content"].as_str().unwrap_or("").to_string();
-                if m["images"].as_array().is_some_and(|a| !a.is_empty()) {
-                    t += "\n[image omitted: this backend is text-only]";
-                }
-                push(true, t);
+                let imgs = m["images"].as_array().cloned().unwrap_or_default();
+                push(true, m["content"].as_str().unwrap_or("").to_string(), imgs);
             }
         }
     }
     out
+}
+
+/// The `content` of a user message: a plain string, or text + base64 image blocks when there are images.
+fn content(text: &str, imgs: &[Value]) -> Value {
+    if imgs.is_empty() {
+        return json!(text);
+    }
+    let mut parts = vec![json!({"type": "text", "text": text})];
+    parts.extend(imgs.iter().map(|i| json!({"type": "image", "source": {"type": "base64", "media_type": i["mime"].as_str().unwrap_or("image/png"), "data": i["data"].as_str().unwrap_or("")}})));
+    json!(parts)
+}
+
+/// What a user turn is remembered as for child reuse: its text plus a hash of each image.
+fn turn_key(t: &Turn) -> String {
+    t.2.iter().fold(t.1.clone(), |k, i| format!("{k}\n[image {}]", sha(i["data"].as_str().unwrap_or(""))))
 }
 
 fn sha(s: &str) -> String {
@@ -135,9 +151,11 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(cfg.max_output);
     let msgs: Vec<Value> = req["messages"].as_array().cloned().unwrap_or_default();
     let w = wire(&msgs, &tt);
-    let users: Vec<String> = w.iter().filter(|(u, _)| *u).map(|(_, t)| t.clone()).collect();
-    let Some(last) = users.last().cloned() else { bail!("claude-sdk: the request has no user message") };
-    if w.last().is_some_and(|(u, _)| !*u) {
+    let users: Vec<String> = w.iter().filter(|t| t.0).map(turn_key).collect();
+    if users.is_empty() {
+        bail!("claude-sdk: the request has no user message");
+    }
+    if w.last().is_some_and(|t| !t.0) {
         bail!("claude-sdk: the request must end with a user message");
     }
     let sys_sha = sha(&format!("{}\n{}\n{:?}", cfg.model, system, cfg.reasoning));
@@ -149,17 +167,20 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
         p.iter().position(|c| c.sys_sha == sys_sha && c.users[..] == users[..users.len() - 1]).map(|i| p.remove(i))
     };
     let (mut proc, prompt) = match reused {
-        Some(p) => (p, last.clone()),
+        Some(p) => (p, content(&w[w.len() - 1].1, &w[w.len() - 1].2)),
         None => {
             let p = spawn(cfg, &system, max_tokens).await?;
+            let last = &w[w.len() - 1];
             let prompt = if w.len() == 1 {
-                last.clone()
+                content(&last.1, &last.2)
             } else {
+                // earlier images are not replayed (a note stands in); the last turn's images are sent for real
                 let mut t = String::from("The conversation so far (continue it as the assistant; your next reply answers the last user turn):\n");
-                for (u, s) in &w {
-                    t += &format!("\n[{}]\n{s}\n", if *u { "user" } else { "assistant" });
+                for (i, (u, s, im)) in w.iter().enumerate() {
+                    let note = if i + 1 < w.len() && !im.is_empty() { format!("\n[{} image(s) omitted from this replay]", im.len()) } else { String::new() };
+                    t += &format!("\n[{}]\n{s}{note}\n", if *u { "user" } else { "assistant" });
                 }
-                t
+                content(&t, &last.2)
             };
             (p, prompt)
         }
@@ -310,5 +331,38 @@ mod tests {
         assert_eq!(w.len(), 3);
         assert_eq!(w[1].1, "doing\n<luau>\nf()\n</luau>");
         assert_eq!(w[2].1, "[luau result]\nok\n\nnudge");
+    }
+
+    #[test]
+    fn images_become_base64_blocks_and_change_the_turn_key() {
+        let img = json!({"mime": "image/jpeg", "data": "QUJD"});
+        let msgs = vec![json!({"role": "user", "content": "look", "images": [img]})];
+        let w = wire(&msgs, &tt());
+        assert_eq!(w[0].2.len(), 1);
+        let c = content(&w[0].1, &w[0].2);
+        assert_eq!(c[0], json!({"type": "text", "text": "look"}));
+        assert_eq!(c[1], json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}}));
+        assert_eq!(content("hi", &[]), json!("hi"));
+        let other = wire(&[json!({"role": "user", "content": "look", "images": [{"mime": "image/jpeg", "data": "WFla"}]})], &tt());
+        assert_ne!(turn_key(&w[0]), turn_key(&other[0]));
+    }
+
+    /// Live: needs a logged-in `claude` CLI. `cargo test live_image -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn live_image_reaches_the_model() {
+        // 16x16 solid red PNG
+        let png = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=";
+        let cfg = LlmCfg { model: "haiku".into(), api: "claude-sdk".into(), base_url: None, key_env: None, reasoning: None, max_output: 200, context_window: None, cache_key: None, provider_only: vec![] };
+        let m1 = json!({"role": "user", "content": "What single color fills the attached image? Answer with one word.", "images": [{"mime": "image/png", "data": png}]});
+        let r = chat(&cfg, &json!({"system": "Answer briefly.", "messages": [m1.clone()]})).await.unwrap();
+        println!("turn 1: {}", r.text);
+        assert!(r.text.to_lowercase().contains("red"), "{}", r.text);
+        // second turn reuses the child (same earlier turn key) and a fresh child must replay with the image still described
+        let m2 = json!({"role": "assistant", "content": r.text});
+        let m3 = json!({"role": "user", "content": "And what was the image's size in pixels, if you can tell? One short sentence."});
+        let r2 = chat(&cfg, &json!({"system": "Answer briefly.", "messages": [m1, m2, m3]})).await.unwrap();
+        println!("turn 2: {}", r2.text);
+        assert!(!r2.text.is_empty());
     }
 }
