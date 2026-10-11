@@ -35,6 +35,7 @@ pub const EMBEDDED: &[(&str, &str, &str)] = &[
     ("std", "mcp.luau", include_str!("../stdlib/std/mcp.luau")),
     ("std", "authoring.luau", include_str!("../stdlib/std/authoring.luau")),
     ("std", "vision.luau", include_str!("../stdlib/std/vision.luau")),
+    ("std", "compact.luau", include_str!("../stdlib/std/compact.luau")),
     ("std", "system.md", include_str!("../prompts/system.md")),
 ];
 

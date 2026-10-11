@@ -6,7 +6,9 @@ local handlers: { [string]: { (any) -> any } } = {}
 
 -- Events fired by std/loop:
 --   before_model { system, messages }  -> transformed request
---   after_model  { text, finish }      -> transformed reply
+--   after_model  { text, finish, usage = { input, cache_read, cache_write, output } } -> transformed reply
+--   model_error  { error, messages }   -> { retry = true } asks for the same turn again (once per turn; messages may be
+--                                         changed in place first). Fired when the model call fails, except budget stops.
 --   before_run   { code }              -> transformed code, or { deny = "why" }
 --   after_run    { output, values, error, ops } -> transformed result of the chunk
 function M.on(event: string, fn: (any) -> any)

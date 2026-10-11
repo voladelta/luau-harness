@@ -16,6 +16,8 @@ pub struct LlmCfg {
     pub reasoning: Option<String>,
     /// default per-call output limit (a request can override it); a runaway reply costs at most this many tokens
     pub max_output: u64,
+    /// the model's context window in tokens, when the user says so (`--context-window`); modules read it via `hx.model_info()`
+    pub context_window: Option<u64>,
     /// OpenAI-style `prompt_cache_key` (the run's session id, so every turn and subagent routes to one cache)
     pub cache_key: Option<String>,
     /// OpenRouter only: restrict routing to these upstream providers, no fallbacks (keeps a prompt cache on one provider)

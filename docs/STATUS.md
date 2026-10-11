@@ -7,7 +7,8 @@ What exists, how to verify it, and what is still missing. `PLAN.md` is the plan;
   `effects.rs` (every effect live or replayed: write-ahead intents, recorded results, resume queues),
   `policy.rs` (sandbox, path policy, approval gate), `eventlog.rs` (hash-chained log), `modules.rs` (resolver, manifest,
   lockfile, grants), `llm.rs` / `host.rs` (model client, usage, subagents), `main.rs` (CLI).
-- `stdlib/std/` the built-in `std` package (L2, Luau): `loop`, `prompt` (system prompt, the `luau` tool schema, nudges), `printer`, `feedback`, `hooks`.
+- `stdlib/std/` the built-in `std` package (L2, Luau): `loop`, `prompt` (system prompt, the `luau` tool schema, nudges), `printer`, `feedback`, `hooks`, opt-in packs
+  `vision` and `compact`.
   Embedded in the binary; override any module per project with `.harness/override/std/<mod>.luau`
   (`require("base:std/<mod>")` wraps the original). A broken override falls back to the built-in with a warning.
 - `prompts/system.md` the system prompt (also an overridable asset).
@@ -24,17 +25,18 @@ denies for `sh` and MCP servers on macOS).
 ## Checks (all need `cargo build --release` first; none needs an API key)
 | Script | Covers | Result |
 |---|---|---|
-| `hx test stdlib/std` | printer, mcp, hooks unit tests (Luau) | 17 pass |
+| `hx test stdlib/std` | printer, mcp, hooks, compact unit tests (Luau) | 24 pass |
 | `cargo test --release` | Rust unit tests: mcp glob, path normalize, command classes, protected paths | 3 pass |
 | `scripts/p2_checks.sh` | printer override without rebuild, broken-override fallback, parallel, vars, lock/grants gate, hooks, subagents, hot reload, failed lock check stays failed | 16/16 |
 | `scripts/sandbox_checks.sh` | writes outside project, ../, symlinks, protected `.harness`, env scrubbing, network, process cap, timeout kills group | 35/35 |
 | `scripts/p1_checks.sh` | hash-chained log, write-ahead intents, tamper detection, approval gate, crash => unknown outcome, log kept under --yolo, --yolo keeps .harness read-only | 25/25 |
-| `scripts/budget_checks.sh` | cost/token/wall budgets (flags and policy.toml), shared with subagents, graceful stop | 10/10 |
+| `scripts/budget_checks.sh` | cost/token/wall budgets (flags and policy.toml), shared with subagents, graceful stop | 14/14 |
 | `scripts/caps_checks.sh` | runtime package capabilities: only granted primitives exist, `getfenv`/`loadstring`/`_G`/`require` escapes closed | 5/5 |
 | `scripts/llm_checks.sh` | wire formats (chat completions, responses), cache markers/key per API (caching is always on), `--provider-only`, bad `--api` refused, native tool calls on both wire formats: parallel calls answered one result each, invalid arguments and unknown tool names get an error result, prose before any code is nudged | 19/19 |
 | `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
-| `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 30/30 |
+| `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session | 49/49 |
+| `scripts/compact_checks.sh` | `std/compact`: pack below the threshold leaves requests byte-identical, one summarizer call then task + summary + kept tail (tool results stay with their calls), globals survive, `<previous-summary>` update, 2 summarizer failures disable it, overflow compact-and-retry (once), SIGKILL/resume around every compaction record incl. double resume, subagents | 30/30 |
 | `scripts/mcp_checks.sh` | MCP: binding, schema signatures, approval gate, sandboxed server (fs/net/env), prompt index, HTTP transport (json/SSE, session, header auth, redirects, secrets) | 42/42 |
 | `scripts/mcp_resume_check.py [http]` | crash after every record of a run that calls MCP tools (stdio, and `http`): no call is ever repeated on the server | 16/16 each |
 | `scripts/upgrade_checks.sh` | harness-module upgrades: propose, structural check, eval gate (scripted model), accept, rollback, tamper, force | 23/23 |
@@ -191,6 +193,17 @@ All of it is opt-in or costs nothing when unused (no packages and no mcp.toml =>
   images; the pack's before_model hook appends one user message with them (Chat: image_url parts, Responses: input_image).
   Images stay in history (cache-friendly). Recorded like `read` (path + sha256, never pixels); resume re-reads and refuses a
   changed file. Off by default, so the eval prompt is unchanged. No fallback for non-vision models: the provider error surfaces.
+- **Compaction** (`--pack std/compact`): trigger = last reply's input+cache+output tokens >= min(0.95*window,
+  window - max_output - max(16384, 4096)) (prime-agent/pi formula); window from `--context-window` (`hx.model_info()`),
+  else 128000. Keeps ~min(20000, window/4) recent tokens verbatim, cut only before an assistant message. One summarizer
+  call via `hx.llm` (own system prompt, history serialized as text, tool results/code over 2000 chars cut to head 1500 +
+  tail 500, no tools, max_tokens 13107); 2nd+ compaction sends `<previous-summary>` with the update prompt. The task
+  message is re-sent verbatim with the summary block; the pack writes no files. Loop: `after_model` carries `usage`; new
+  `model_error` hook; one retry per turn. Failed model calls are now `llm` records with `error`; replay skips one that
+  is the last record for the same request or is followed by the same request (the run stopped there / an earlier resume
+  re-asked). `--resume` needs the same `--pack` and `--context-window` flags as the original run (the window changes when
+  the summarizer is called, so a different value diverges). Budget exhaustion between an overflow and its summarizer call
+  (only possible via the wall clock or a parallel subagent) ends the run with the overflow error, not `budget_exceeded`.
 - **Chunk budget vs waiting**: the 120 s Luau budget skips only the thread awaiting an effect (sh/agent/mcp), so a
   `parallel{}` branch spinning while another waits is still stopped; waits move the deadline forward.
 - **Event log names**: `{secs}-{pid}`, then `-1`, `-2`... if a session of the same process already took it.

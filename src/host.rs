@@ -130,16 +130,37 @@ impl Host {
         json!({"cost": u.cost, "max_cost": self.budget.max_cost, "tokens": u.input + u.cache_write + u.output, "max_tokens": self.budget.max_tokens, "wall": self.started.elapsed().as_secs_f64(), "max_wall": self.budget.max_wall_secs})
     }
 
+    /// The model and its limits, for modules (`hx.model_info()`). `context_window` is null unless `--context-window` was given.
+    pub fn model_info(&self) -> Value {
+        json!({"model": self.llm.model, "context_window": self.llm.context_window, "max_output": self.llm.max_output})
+    }
+
     pub async fn chat(&self, req: &Value) -> Result<Reply> {
         let req_sha = crate::eventlog::sha_bytes(serde_json::to_string(req)?.as_bytes());
-        let logged = self.replay_llm.lock().unwrap().pop_front();
+        let logged = {
+            let mut q = self.replay_llm.lock().unwrap();
+            let mut logged = q.pop_front();
+            // Skip a recorded failure that the run never got past: the LAST model record for this same request (the run
+            // stopped there, so ask the API again; a different request still reports `replay diverged` below) or one
+            // followed by the same request (an earlier resume asked again; its newer record wins). The std loop never
+            // re-sends an identical request after a failure, so neither case drops a real recovery. A package that retries an
+            // identical `hx.llm` request after a failure would see the success on replay without the failure first.
+            while logged.as_ref().is_some_and(|rec| rec.rec.get("error").is_some() && q.front().map_or(rec.req_sha == req_sha, |next| next.req_sha == rec.req_sha)) {
+                logged = q.pop_front();
+            }
+            logged
+        };
         let r = if let Some(rec) = logged {
             // replay: the model's earlier reply is returned as-is (no API call, no new log record)
             if rec.req_sha != req_sha {
                 anyhow::bail!("replay diverged: the request to the model differs from the logged one (was the prompt, a module or the printer changed since the crash?)");
             }
-            let dir = self.replay_dir.lock().unwrap().clone().unwrap_or_default();
             let v = &rec.rec;
+            if let Some(e) = v["error"].as_str() {
+                // a model call that failed in the original run (e.g. a context overflow the loop then recovered from)
+                anyhow::bail!("{e}");
+            }
+            let dir = self.replay_dir.lock().unwrap().clone().unwrap_or_default();
             let body: Value = serde_json::from_slice(&crate::eventlog::read_blob(&dir, v["reply"].as_str().unwrap_or(""))?)?;
             Reply {
                 text: body["text"].as_str().unwrap_or("").to_string(),
@@ -157,7 +178,14 @@ impl Host {
                 self.policy.log.write("budget", json!({"depth": self.depth, "reason": why}), true);
                 anyhow::bail!(why);
             }
-            let r = llm::chat(&self.http, &self.llm, &self.key, req).await?;
+            let r = match llm::chat(&self.http, &self.llm, &self.key, req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // record the failure so replay issues the same sequence of model calls (the loop may recover and go on)
+                    self.policy.log.write("llm", json!({"model": self.llm.model, "depth": self.depth, "req_sha": req_sha, "error": e.to_string()}), true);
+                    return Err(e);
+                }
+            };
             // the reply blob holds everything the loop reads: the text, the tool calls and the raw assistant message
             let reply = self.policy.log.blob(json!({"text": r.text, "calls": r.calls, "raw": r.raw}).to_string().as_bytes());
             self.policy.log.write("llm", json!({"model": self.llm.model, "depth": self.depth, "req_sha": req_sha, "reply": reply, "input": r.input, "cache_read": r.cache_read, "cache_write": r.cache_write, "output": r.output, "cost": r.cost, "finish": r.finish}), true);

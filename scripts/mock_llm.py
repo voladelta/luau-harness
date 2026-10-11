@@ -3,7 +3,9 @@
 usage: mock_llm.py PORT  (replies are read from the MOCK_REPLIES env var, a JSON list, served in order)
 A reply is a string or an object. A string that starts with a ```luau fence becomes one native `luau` tool call with that code
 (any text after the fence is the reply text); any other string is a plain-text reply. An object is
-{"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments."""
+{"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments.
+An object may also carry "prompt_tokens": N (reported as the usage prompt/input tokens, default 10) and, instead of a reply,
+"status": 400, "error": "<body>" (answer with that HTTP status and body)."""
 import json, os, re, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 R = json.loads(os.environ["MOCK_REPLIES"]); n = [0]
@@ -34,20 +36,26 @@ class H(BaseHTTPRequestHandler):
             idx = turns(body)
         else:
             idx = n[0]; n[0] += 1
-        text, calls = parse(R[min(idx, len(R) - 1)])
+        reply = R[min(idx, len(R) - 1)]
+        if isinstance(reply, dict) and "status" in reply:
+            out = str(reply.get("error", "")).encode()
+            self.send_response(reply["status"]); self.send_header("content-length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            return
+        ptok = reply.get("prompt_tokens", 10) if isinstance(reply, dict) else 10
+        text, calls = parse(reply)
         ids = [f"call_{idx}_{k}" for k in range(len(calls))]
         if self.path.endswith("/responses"):  # Responses API shape
             out = [{"type": "reasoning", "summary": []}]
             if text or not calls:
                 out.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
             out += [{"type": "function_call", "call_id": i, "name": nm, "arguments": a} for i, (nm, a) in zip(ids, calls)]
-            doc = {"output": out, "usage": {"input_tokens": 10, "output_tokens": 5, "cost": 0.001}}
+            doc = {"output": out, "usage": {"input_tokens": ptok, "output_tokens": 5, "cost": 0.001}}
         else:
             msg = {"role": "assistant", "content": text or None}
             if calls:
                 msg["tool_calls"] = [{"id": i, "type": "function", "function": {"name": nm, "arguments": a}} for i, (nm, a) in zip(ids, calls)]
             doc = {"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else "stop"}],
-                   "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.001}}
+                   "usage": {"prompt_tokens": ptok, "completion_tokens": 5, "cost": 0.001}}
         out = json.dumps(doc).encode()
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(out)))
         self.end_headers(); self.wfile.write(out)

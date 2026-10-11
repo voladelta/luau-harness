@@ -28,6 +28,7 @@ function M.run(cfg)
 	local messages = { { role = "user", content = prompt.task_message(cfg.task) } }
 	hx.log("### TASK\n" .. messages[1].content)
 	local bad, no_call = 0, 0
+	local retried = false -- one compact-and-retry per turn after a model_error hook asks for it
 
 	while rep.turns < cfg.max_turns do
 		local req = hooks.emit("before_model", { system = prompt.system(), messages = messages, tools = prompt.tools })
@@ -38,10 +39,18 @@ function M.run(cfg)
 				hx.log("### STOPPED\n" .. rep.stopped)
 				break
 			end
-			error(resp, 0)
+			-- a hook (std/compact) may fix the cause, e.g. shrink an overflowing context, and ask for the same turn again
+			local ev = if retried then nil else hooks.emit("model_error", { error = tostring(resp), messages = messages })
+			if ev and ev.retry then
+				retried = true
+				continue -- rep.turns was not incremented; before_model runs again
+			end
+			error(if retried then "the model call failed again after one compact-and-retry: " .. tostring(resp) else resp, 0)
 		end
+		retried = false
 		rep.turns += 1
-		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish })
+		local usage = { input = resp.input or 0, cache_read = resp.cache_read or 0, cache_write = resp.cache_write or 0, output = resp.output or 0 }
+		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish, usage = usage })
 		local text, calls = reply.text, resp.calls
 		local summary = text
 		for _, c in calls do

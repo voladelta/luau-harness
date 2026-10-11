@@ -549,6 +549,8 @@ impl Vm {
         if let Some(h) = host {
             let bh = h.clone();
             hx.set("budget", lua.create_function(move |lua, ()| lua.to_value(&bh.budget_status()))?)?;
+            let mh = h.clone();
+            hx.set("model_info", lua.create_function(move |lua, ()| lua.to_value(&mh.model_info()))?)?;
             hx.set("llm", lua.create_async_function(move |lua, req: Value| {
                 let h = h.clone();
                 async move {

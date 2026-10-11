@@ -19,6 +19,7 @@ cargo install --path . && hx exec 'print(#search("fn main", {glob = "*.rs"}))'
 | Approval gate | `git push`, publish, `ssh` and other external commands need the user's approval; nothing the model writes can approve |
 | Replay and resume | Every effect is logged in a hash-chained log; `--resume` rebuilds the session and never repeats a side effect |
 | Budgets | Cost, token and wall-clock limits, shared with subagents; the run stops cleanly when one is hit |
+| Compaction (opt-in) | `--pack std/compact`: near the context window, older history becomes a structured summary; recent messages and Luau globals stay; one compact-and-retry on a context-overflow error |
 | Overridable harness | Loop, prompt, printer and hooks are Luau in `stdlib/std/`; replace any module in `.harness/override/std/` |
 | Extensions | Tool and skill packages locked by hash, MCP servers (stdio and HTTP), agent-written tools promoted only after your review |
 | Any provider | OpenAI Chat Completions or Responses API; any compatible base URL (OpenRouter by default) |
@@ -140,9 +141,10 @@ hx run --prompt-file task.md --model deepseek/deepseek-v4.1-flash \
 | `--reasoning R` | | Reasoning effort |
 | `--max-turns N` | 30 | Turn limit |
 | `--max-output N` | 16384 | Max output tokens per turn |
+| `--context-window N` | 128000 (pack default) | The model's context window, used by `std/compact`; lower it to compact earlier |
 | `--max-cost USD` `--max-tokens N` `--max-wall SECS` | none | Budgets; flags override `policy.toml` |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
-| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
+| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model), `std/compact` (context compaction) |
 | `--trace FILE` | | Write a readable trace |
 
 Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open network, no path limits and no approval gate; `.harness/` and `hx.lock` stay read-only; prints a warning), `--net` / `--no-net`, `--approval prompt` (ask on the terminal instead of refusing). Every command takes `--help`.
@@ -274,7 +276,7 @@ cargo test --release
 - **Network is all-or-nothing.** Seatbelt cannot filter by host.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
 - **Only Chat Completions was verified live** (OpenRouter and Enclave); the Responses API is tested against a mock.
-- **No compaction.** Long tasks are bounded by `--max-turns` and the model's context window.
+- **Compaction is opt-in and checked only against a scripted model.** Summary quality depends on the model; the window is not detected, so pass `--context-window` (the pack assumes 128000), and repeat it (like `--pack`) on `--resume`, or replay reports `replay diverged`.
 - **Small benchmark.** 20 small Python tasks; results on large repositories are not measured.
 - **Not covered by resume:** a crash mid-model-call repeats that call (no side effect), and the stdout of a killed `sh` is lost.
 
