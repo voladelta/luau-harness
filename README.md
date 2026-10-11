@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.png" alt="hx: a Luau code-mode agent harness" width="100%">
+  <img src="docs/banner.png" alt="hx, the moon imp mascot, tries to fly a git push paper plane out of a sandbox while a crossing guard stops it" width="100%">
 </p>
 
 # hx
