@@ -1,0 +1,324 @@
+### TASK
+This is a small Python log-analysis tool (`logkit/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Add a "top N" report:
+
+1. `stats.top_n(records, key, n)` returns the `n` most common values of a record key (`"level"` or `"component"`, same keys as `count_by`) as a list of `(value, count)` tuples, sorted by count descending and then by value ascending. If there are fewer than `n` distinct values, return them all. `n <= 0` returns `[]`.
+2. A CLI option `--top KEY N` (it applies after `--level`/`--component` filtering). Instead of the raw lines it prints one line per result, formatted `f"{value} {count}"`. A KEY other than `level` or `component`, or a non-integer N, prints an error to stderr and makes `main` return 2.
+
+Update or add tests as you see fit.
+
+
+[files in the working directory]
+logkit/__init__.py (0 lines)
+logkit/cli.py (38 lines)
+logkit/filters.py (19 lines)
+logkit/parser.py (29 lines)
+logkit/render.py (17 lines)
+logkit/stats.py (28 lines)
+logkit/timeutil.py (16 lines)
+tests/__init__.py (0 lines)
+tests/test_logkit.py (27 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+local files = {"logkit/stats.py", "logkit/cli.py", "tests/test_logkit.py", "logkit/parser.py", "logkit/filters.py"}
+for _, f in ipairs(files) do
+	print("=== " .. f)
+	print(read(f))
+end
+### RESULT
+=== logkit/stats.py
+import math
+from collections import Counter
+
+
+def count_by(records, key):
+    return dict(Counter(r[key] for r in records))
+
+
+def percentile(values, p):
+    """Nearest-rank percentile: sorted[ceil(p/100 * n) - 1]."""
+    if not values:
+        raise ValueError("no values")
+    s = sorted(values)
+    rank = max(1, math.ceil(p / 100 * len(s)))
+    return s[rank - 1]
+
+
+def latency_summary(records, field="ms"):
+    vals = [float(r["fields"][field]) for r in records if field in r["fields"]]
+    if not vals:
+        return {"count": 0, "p50": None, "p95": None, "max": None}
+    return {"count": len(vals), "p50": percentile(vals, 50), "p95": percentile(vals, 95), "max": max(vals)}
+
+
+def error_rate(records):
+    if not records:
+        return 0.0
+    return sum(1 for r in records if r["level"] == "ERROR") / len(records)
+
+=== logkit/cli.py
+import sys
+
+from .filters import by_component, by_level
+from .parser import read_records
+from .render import summary_text
+
+
+def main(argv):
+    if not argv:
+        print("usage: logkit FILE [--level L] [--component C] [--summary]", file=sys.stderr)
+        return 2
+    path, opts = argv[0], argv[1:]
+    records = read_records(path)
+    i = 0
+    summary = False
+    while i < len(opts):
+        if opts[i] == "--level":
+            records = by_level(records, opts[i + 1])
+            i += 2
+        elif opts[i] == "--component":
+            records = by_component(records, opts[i + 1])
+            i += 2
+        elif opts[i] == "--summary":
+            summary = True
+            i += 1
+        else:
+            print(f"unknown option: {opts[i]}", file=sys.stderr)
+            return 2
+    if summary:
+        print(summary_text(records))
+    else:
+        for r in records:
+            print(r["raw"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
+=== tests/test_logkit.py
+import unittest
+
+from logkit.filters import between, by_level
+from logkit.parser import parse_line
+from logkit.stats import percentile
+from logkit.timeutil import parse_ts
+
+LINE = '2026-01-05T10:00:03Z INFO auth user=alice ms=120 "login ok"'
+
+
+class LogkitTests(unittest.TestCase):
+    def test_parse(self):
+        r = parse_line(LINE)
+        self.assertEqual((r["level"], r["component"], r["fields"]["ms"], r["msg"]), ("INFO", "auth", "120", "login ok"))
+        self.assertIsNone(parse_line("garbage"))
+
+    def test_filters(self):
+        rs = [parse_line(LINE), parse_line("2026-01-05T10:00:09Z ERROR db ms=900 boom")]
+        self.assertEqual(len(by_level(rs, "WARN")), 1)
+        self.assertEqual(len(between(rs, start=parse_ts("2026-01-05T10:00:05Z"))), 1)
+
+    def test_percentile(self):
+        self.assertEqual(percentile([1, 2, 3, 4, 5], 50), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+=== logkit/parser.py
+import shlex
+
+from .timeutil import parse_ts
+
+LEVELS = ["DEBUG", "INFO", "WARN", "ERROR"]
+
+
+def parse_line(line):
+    """`<ts> <LEVEL> <component> key=value ... ["message"]` -> record dict, or None if malformed."""
+    parts = line.strip().split(None, 3)
+    if len(parts) < 3 or parts[1] not in LEVELS:
+        return None
+    try:
+        ts = parse_ts(parts[0])
+    except ValueError:
+        return None
+    fields, msg = {}, []
+    for tok in shlex.split(parts[3]) if len(parts) == 4 else []:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            fields[k] = v
+        else:
+            msg.append(tok)
+    return {"ts": ts, "level": parts[1], "component": parts[2], "fields": fields, "msg": " ".join(msg), "raw": line.rstrip("\n")}
+
+
+def read_records(path):
+    with open(path) as f:
+        return [r for r in map(parse_line, f) if r]
+
+=== logkit/filters.py
+from .parser import LEVELS
+
+
+def by_level(records, min_level):
+    floor = LEVELS.index(min_level)
+    return [r for r in records if LEVELS.index(r["level"]) >= floor]
+
+
+def by_component(records, component):
+    return [r for r in records if r["component"] == component]
+
+
+def between(records, start=None, end=None):
+    """start inclusive, end exclusive; either may be None."""
+    return [r for r in records if (start is None or r["ts"] >= start) and (end is None or r["ts"] < end)]
+
+
+def has_field(records, name):
+    return [r for r in records if name in r["fields"]]
+
+### MODEL (turn 2)
+
+<<luau
+edit("logkit/stats.py", [==[def percentile(values, p):]==], [==[def top_n(records, key, n):
+    """The n most common (value, count) pairs for `key`, by count desc then value asc."""
+    if n <= 0:
+        return []
+    counts = Counter(r[key] for r in records)
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def percentile(values, p):]==])
+
+write("logkit/cli.py", [==[import sys
+
+from .filters import by_component, by_level
+from .parser import read_records
+from .render import summary_text
+from .stats import top_n
+
+TOP_KEYS = ("level", "component")
+
+
+def main(argv):
+    if not argv:
+        print("usage: logkit FILE [--level L] [--component C] [--summary] [--top KEY N]", file=sys.stderr)
+        return 2
+    path, opts = argv[0], argv[1:]
+    records = read_records(path)
+    i = 0
+    summary = False
+    top = None
+    while i < len(opts):
+        if opts[i] == "--level":
+            records = by_level(records, opts[i + 1])
+            i += 2
+        elif opts[i] == "--component":
+            records = by_component(records, opts[i + 1])
+            i += 2
+        elif opts[i] == "--summary":
+            summary = True
+            i += 1
+        elif opts[i] == "--top":
+            if i + 2 >= len(opts):
+                print("usage: --top KEY N", file=sys.stderr)
+                return 2
+            key, n_text = opts[i + 1], opts[i + 2]
+            if key not in TOP_KEYS:
+                print(f"--top key must be one of {', '.join(TOP_KEYS)}; got {key!r}", file=sys.stderr)
+                return 2
+            try:
+                n = int(n_text)
+            except ValueError:
+                print(f"--top N must be an integer; got {n_text!r}", file=sys.stderr)
+                return 2
+            top = (key, n)
+            i += 3
+        else:
+            print(f"unknown option: {opts[i]}", file=sys.stderr)
+            return 2
+    if summary:
+        print(summary_text(records))
+    elif top is not None:
+        key, n = top
+        for value, count in top_n(records, key, n):
+            print(f"{value} {count}")
+    else:
+        for r in records:
+            print(r["raw"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+]==])
+
+write("tests/test_logkit.py", [==[import contextlib
+import io
+import os
+import tempfile
+import unittest
+
+from logkit.cli import main
+from logkit.filters import between, by_level
+from logkit.parser import parse_line
+from logkit.stats import percentile, top_n
+from logkit.timeutil import parse_ts
+
+LINE = '2026-01-05T10:00:03Z INFO auth user=alice ms=120 "login ok"'
+
+
+class LogkitTests(unittest.TestCase):
+    def test_parse(self):
+        r = parse_line(LINE)
+        self.assertEqual((r["level"], r["component"], r["fields"]["ms"], r["msg"]), ("INFO", "auth", "120", "login ok"))
+        self.assertIsNone(parse_line("garbage"))
+
+    def test_filters(self):
+        rs = [parse_line(LINE), parse_line("2026-01-05T10:00:09Z ERROR db ms=900 boom")]
+        self.assertEqual(len(by_level(rs, "WARN")), 1)
+        self.assertEqual(len(between(rs, start=parse_ts("2026-01-05T10:00:05Z"))), 1)
+
+    def test_percentile(self):
+        self.assertEqual(percentile([1, 2, 3, 4, 5], 50), 3)
+
+    def test_top_n(self):
+        rs = [{"component": c} for c in ["db", "auth", "db", "api", "auth", "web"]]
+        self.assertEqual(top_n(rs, "component", 2), [("auth", 2), ("db", 2)])
+        self.assertEqual(top_n(rs, "component", 10), [("api", 1), ("auth", 2), ("db", 2), ("web", 1)])
+        self.assertEqual(top_n(rs, "component", 0), [])
+        self.assertEqual(top_n(rs, "component", -3), [])
+
+    def test_cli_top(self):
+        lines = [
+            "2026-01-05T10:00:01Z INFO auth ms=1 a",
+            "2026-01-05T10:00:02Z ERROR db ms=2 b",
+            "2026-01-05T10:00:03Z INFO auth ms=3 c",
+        ]
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main([path, "--top", "level", "1"]), 0)
+            self.assertEqual(out.getvalue(), "INFO 2\n")
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(main([path, "--top", "ms", "1"]), 2)
+                self.assertEqual(main([path, "--top", "level", "x"]), 2)
+            self.assertIn("ms", err.getvalue())
+        finally:
+            os.remove(path)
+
+
+if __name__ == "__main__":
+    unittest.main()
+]==])
+
+local r = sh("python3 -m unittest discover -s tests -t . 2>&1")
+print(r.stdout, r.code)
+</luau>

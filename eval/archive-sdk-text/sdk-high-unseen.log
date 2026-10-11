@@ -1,0 +1,5 @@
+ledger-bug-equity hx:claude-sdk/haiku #1: PASS tokens=18905 turns=3 cost=0.0013793
+log-feature-top hx:claude-sdk/haiku #1: PASS tokens=27256 turns=3 cost=0.004156740000000001
+shop-bug-money hx:claude-sdk/haiku #1: PASS tokens=14539 turns=3 cost=0.0007447600000000001
+taskq-feature-cancel hx:claude-sdk/haiku #1: PASS tokens=27005 turns=3 cost=0.00432282
+wiki-refactor-linkre hx:claude-sdk/haiku #1: PASS tokens=20349 turns=3 cost=0.00241311

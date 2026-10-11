@@ -1,0 +1,313 @@
+### TASK
+This is a small Python in-memory job queue (`taskq/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Add job cancellation:
+
+1. `JobQueue.cancel(job_id)` marks a queued job as cancelled: its `status` becomes `"cancelled"` and the new field `Job.cancelled_at` (float, default `None`) is set to the queue clock's current time. Cancelled jobs are never returned by `pop_ready` and are never retried. Cancelling a job that is `"running"`, `"done"` or `"dead"` raises `ValueError(f"cannot cancel {status} job: {job_id}")`; cancelling an already cancelled job is a no-op returning the job; an unknown id raises `KeyError`. `cancel` returns the job.
+2. `stats()` counts cancelled jobs under `"cancelled"`.
+3. `store.dump` / `store.load` round-trip `cancelled_at`; dumps written before this change (no `cancelled_at` key) must still load, with `None`.
+
+Update or add tests as you see fit.
+
+
+[files in the working directory]
+taskq/__init__.py (0 lines)
+taskq/clock.py (17 lines)
+taskq/jobs.py (14 lines)
+taskq/queue.py (44 lines)
+taskq/retry.py (8 lines)
+taskq/store.py (19 lines)
+taskq/worker.py (26 lines)
+tests/__init__.py (0 lines)
+tests/test_taskq.py (37 lines)
+### MODEL (turn 1)
+I'll read the queue source, store, clock, and tests together first.
+[tool call luau]
+local files = {"taskq/jobs.py", "taskq/queue.py", "taskq/store.py", "taskq/clock.py", "taskq/retry.py", "taskq/worker.py", "taskq/__init__.py", "tests/test_taskq.py"}
+for _, f in ipairs(files) do
+	print("=== " .. f .. " ===")
+	print(read(f))
+end
+### RESULT
+=== taskq/jobs.py ===
+from dataclasses import dataclass
+
+
+@dataclass
+class Job:
+    id: str
+    name: str
+    payload: dict
+    priority: int = 0
+    attempts: int = 0
+    max_attempts: int = 3
+    run_at: float = 0.0
+    status: str = "queued"  # queued | running | done | dead
+    error: str | None = None
+
+=== taskq/queue.py ===
+from .jobs import Job
+from .retry import backoff, should_retry
+
+
+class JobQueue:
+    def __init__(self, clock):
+        self.clock = clock
+        self.jobs = {}
+        self._n = 0
+
+    def enqueue(self, name, payload=None, priority=0, delay=0.0, max_attempts=3):
+        self._n += 1
+        job = Job(f"job-{self._n}", name, payload or {}, priority, 0, max_attempts, self.clock.now() + delay)
+        self.jobs[job.id] = job
+        return job
+
+    def pop_ready(self):
+        """Highest priority first, then earliest run_at, then creation order. Counts an attempt."""
+        now = self.clock.now()
+        ready = [j for j in self.jobs.values() if j.status == "queued" and j.run_at <= now]
+        if not ready:
+            return None
+        job = min(ready, key=lambda j: (-j.priority, j.run_at, int(j.id.split("-")[1])))
+        job.status = "running"
+        job.attempts += 1
+        return job
+
+    def complete(self, job):
+        job.status = "done"
+        job.error = None
+
+    def fail(self, job, error):
+        job.error = error
+        if should_retry(job):
+            job.status = "queued"
+            job.run_at = self.clock.now() + backoff(job.attempts)
+        else:
+            job.status = "dead"
+
+    def stats(self):
+        out = {}
+        for j in self.jobs.values():
+            out[j.status] = out.get(j.status, 0) + 1
+        return out
+
+=== taskq/store.py ===
+import json
+
+from .jobs import Job
+from .queue import JobQueue
+
+_FIELDS = ["id", "name", "payload", "priority", "attempts", "max_attempts", "run_at", "status", "error"]
+
+
+def dump(queue):
+    return json.dumps({"n": queue._n, "jobs": [{f: getattr(j, f) for f in _FIELDS} for j in queue.jobs.values()]})
+
+
+def load(clock, text):
+    data = json.loads(text)
+    q = JobQueue(clock)
+    q._n = data["n"]
+    for d in data["jobs"]:
+        q.jobs[d["id"]] = Job(**{f: d[f] for f in _FIELDS})
+    return q
+
+=== taskq/clock.py ===
+import time
+
+
+class Clock:
+    def now(self):
+        return time.time()
+
+
+class FakeClock(Clock):
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+=== taskq/retry.py ===
+def backoff(attempt, base=2.0, cap=60.0):
+    """Delay in seconds before retry number `attempt` (1 = first retry): base * 2**(attempt-1), capped."""
+    return min(cap, base * 2 ** (attempt - 1))
+
+
+def should_retry(job):
+    """A job may run at most `max_attempts` times in total."""
+    return job.attempts < job.max_attempts
+
+=== taskq/worker.py ===
+class Worker:
+    def __init__(self, queue, handlers):
+        self.queue = queue
+        self.handlers = handlers
+
+    def run_once(self):
+        job = self.queue.pop_ready()
+        if job is None:
+            return False
+        handler = self.handlers.get(job.name)
+        if handler is None:
+            self.queue.fail(job, "no handler")
+            return True
+        try:
+            handler(job.payload)
+        except Exception as e:  # noqa: BLE001
+            self.queue.fail(job, repr(e))
+        else:
+            self.queue.complete(job)
+        return True
+
+    def run_until_idle(self, max_steps=1000):
+        n = 0
+        while n < max_steps and self.run_once():
+            n += 1
+        return n
+
+=== taskq/__init__.py ===
+
+=== tests/test_taskq.py ===
+import unittest
+
+from taskq.clock import FakeClock
+from taskq.queue import JobQueue
+from taskq.retry import backoff
+from taskq.store import dump, load
+from taskq.worker import Worker
+
+
+class TaskqTests(unittest.TestCase):
+    def test_priority_order(self):
+        q = JobQueue(FakeClock())
+        q.enqueue("a", priority=1)
+        hi = q.enqueue("b", priority=5)
+        self.assertEqual(q.pop_ready().id, hi.id)
+
+    def test_delay(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        q.enqueue("a", delay=10)
+        self.assertIsNone(q.pop_ready())
+        c.advance(10)
+        self.assertIsNotNone(q.pop_ready())
+
+    def test_worker_and_roundtrip(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        q.enqueue("ok", {"x": 1})
+        seen = []
+        Worker(q, {"ok": seen.append}).run_until_idle()
+        self.assertEqual(seen, [{"x": 1}])
+        self.assertEqual(load(c, dump(q)).stats(), {"done": 1})
+        self.assertEqual(backoff(1), 2.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+### MODEL (turn 2)
+I'll make the edits: add the `cancelled_at` field, a `cancel` method, round-trip support in the store, and new tests. Then I'll run the suite.
+[tool call luau]
+print(edit("taskq/jobs.py", [==[    status: str = "queued"  # queued | running | done | dead
+    error: str | None = None]==], [==[    status: str = "queued"  # queued | running | done | dead | cancelled
+    error: str | None = None
+    cancelled_at: float | None = None]==]))
+
+print(edit("taskq/queue.py", [==[    def stats(self):]==], [==[    def cancel(self, job_id):
+        """Cancel a queued job. Cancelled jobs are never popped or retried."""
+        job = self.jobs[job_id]
+        if job.status == "cancelled":
+            return job
+        if job.status != "queued":
+            raise ValueError(f"cannot cancel {job.status} job: {job_id}")
+        job.status = "cancelled"
+        job.cancelled_at = self.clock.now()
+        return job
+
+    def stats(self):]==]))
+
+print(edit("taskq/store.py", [==[_FIELDS = ["id", "name", "payload", "priority", "attempts", "max_attempts", "run_at", "status", "error"]]==],
+	[==[_FIELDS = ["id", "name", "payload", "priority", "attempts", "max_attempts", "run_at", "status", "error", "cancelled_at"]]==]))
+
+print(edit("taskq/store.py", [==[        q.jobs[d["id"]] = Job(**{f: d[f] for f in _FIELDS})]==],
+	[==[        # fields missing from older dumps (e.g. cancelled_at) fall back to Job defaults
+        q.jobs[d["id"]] = Job(**{f: d[f] for f in _FIELDS if f in d})]==]))
+
+print(edit("tests/test_taskq.py", "import unittest\n", "import json\nimport unittest\n"))
+
+print(edit("tests/test_taskq.py", [==[        self.assertEqual(backoff(1), 2.0)]==], [==[        self.assertEqual(backoff(1), 2.0)
+
+    def test_cancel_queued_job(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        j = q.enqueue("a")
+        c.advance(5)
+        self.assertIs(q.cancel(j.id), j)
+        self.assertEqual(j.status, "cancelled")
+        self.assertEqual(j.cancelled_at, 5.0)
+        self.assertIsNone(q.pop_ready())
+        self.assertEqual(q.stats(), {"cancelled": 1})
+
+    def test_cancel_idempotent_and_guards(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        j = q.enqueue("a")
+        q.cancel(j.id)
+        c.advance(3)
+        self.assertIs(q.cancel(j.id), j)
+        self.assertEqual(j.cancelled_at, 0.0)
+        r = q.enqueue("b")
+        q.pop_ready()  # r is now running
+        with self.assertRaises(ValueError):
+            q.cancel(r.id)
+        with self.assertRaises(KeyError):
+            q.cancel("job-99")
+
+    def test_cancelled_job_is_not_retried(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        j = q.enqueue("a")
+        q.pop_ready()
+        q.fail(j, "boom")  # scheduled for retry
+        q.cancel(j.id)
+        c.advance(100)
+        self.assertIsNone(q.pop_ready())
+        self.assertEqual(j.status, "cancelled")
+
+    def test_cancelled_at_roundtrip_and_old_dump(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        j = q.enqueue("a")
+        c.advance(7)
+        q.cancel(j.id)
+        q2 = load(c, dump(q))
+        self.assertEqual(q2.jobs[j.id].cancelled_at, 7.0)
+        self.assertEqual(q2.jobs[j.id].status, "cancelled")
+        old = json.dumps({"n": 1, "jobs": [{"id": "job-1", "name": "a", "payload": {}, "priority": 0,
+                          "attempts": 0, "max_attempts": 3, "run_at": 0.0, "status": "queued", "error": None}]})
+        self.assertIsNone(load(c, old).jobs["job-1"].cancelled_at)]==]))
+
+local r = sh("python3 -m unittest discover -s tests -t . 2>&1", {timeout = 120})
+print(r.stdout)
+print("exit", r.code)
+### RESULT
+ok: 1 replacement, +3/-2 lines
+ok: 1 replacement, +12/-1 lines
+ok: 1 replacement, +1/-1 lines
+ok: 1 replacement, +2/-1 lines
+ok: 1 replacement, +2/-1 lines
+ok: 1 replacement, +51/-1 lines
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 0.000s
+
+OK
+
+exit	0
+### MODEL (turn 3)
+Job cancellation is in place: `JobQueue.cancel(job_id)` marks a queued job as cancelled and sets `cancelled_at` from the queue clock, and `stats()` counts it under `"cancelled"`. `store.dump`/`load` round-trip `cancelled_at`, and older dumps without the key load with `None`. All 7 tests pass, including new ones for cancel behaviour, the error cases, retry-pending jobs, and the old-dump load.

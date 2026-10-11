@@ -1,0 +1,365 @@
+### TASK
+This is a small Python shopping-cart package (`shop/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Refactor: money currently flows through the package as float dollars. Convert it to integer cents everywhere, keeping behaviour otherwise identical:
+
+- `Item.price` becomes `Item.price_cents` (int). `Cart` is unchanged.
+- `pricing.line_total`, `pricing.subtotal` and every number in the dict returned by `pricing.total` are int cents.
+- Discounts return int cents: `SAVE10` is 10% of the subtotal rounded half up using integer arithmetic (`(sub * 10 + 50) // 100`); `FIVEOFF` is `500` when the subtotal is at least `3000`, else `0`; no coupon gives `0`. Unknown coupons still raise `ValueError`.
+- `tax.RATES` becomes `tax.RATES_BP`, rates in basis points (`CA` 725, `NY` 400, `OR` 0). `tax_for(cents, region)` returns `(cents * bp + 5000) // 10000`; unknown regions still raise `ValueError`.
+- `fmt.money(cents)` takes int cents and formats like before (`1234` gives `$12.34`, thousands separated by commas). `fmt.receipt` is otherwise unchanged. Order dicts carry int cents.
+- The CLI reads `price_cents` from the cart JSON.
+- No float arithmetic may remain in `shop/`: no `float`, no `round(`, no decimal-point numeric literals.
+
+Update the existing tests to match.
+
+
+[files in the working directory]
+shop/__init__.py (0 lines)
+shop/cli.py (27 lines)
+shop/discounts.py (10 lines)
+shop/fmt.py (14 lines)
+shop/models.py (28 lines)
+shop/orders.py (11 lines)
+shop/pricing.py (17 lines)
+shop/tax.py (8 lines)
+tests/__init__.py (0 lines)
+tests/test_shop.py (37 lines)
+### MODEL (turn 1)
+I'll read every source and test file first so I can see the current float-dollar code before changing it.
+[tool call luau]
+local files = {"shop/__init__.py", "shop/cli.py", "shop/discounts.py", "shop/fmt.py", "shop/models.py", "shop/orders.py", "shop/pricing.py", "shop/tax.py", "tests/test_shop.py"}
+for _, f in ipairs(files) do
+	print("=== " .. f)
+	print(read(f))
+end
+### RESULT
+=== shop/__init__.py
+
+=== shop/cli.py
+import json
+import sys
+
+from .fmt import receipt
+from .models import Cart, Item
+from .orders import place_order
+
+
+def load_cart(path):
+    with open(path) as f:
+        data = json.load(f)
+    cart = Cart(coupon=data.get("coupon"))
+    for it in data["items"]:
+        cart.add(Item(it["sku"], it["name"], it["price"], it.get("qty", 1)))
+    return cart
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: shop CART.json REGION", file=sys.stderr)
+        return 2
+    print(receipt(place_order(load_cart(argv[0]), argv[1])))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
+=== shop/discounts.py
+def discount_for(cart, code):
+    """Discount amount in dollars for `code` on `cart`. Unknown codes raise ValueError."""
+    if not code:
+        return 0.0
+    sub = sum(i.price * i.qty for i in cart.items)
+    if code == "SAVE10":
+        return round(sub * 0.10, 2)
+    if code == "FIVEOFF":
+        return 5.0 if sub >= 30 else 0.0
+    raise ValueError(f"unknown coupon: {code}")
+
+=== shop/fmt.py
+def money(x):
+    return f"${x:,.2f}"
+
+
+def receipt(order):
+    out = [f"Order {order['id']} ({order['region']})"]
+    for ln in order["lines"]:
+        out.append(f"{ln['qty']} x {ln['name']}: {money(ln['total'])}")
+    out.append(f"Subtotal: {money(order['subtotal'])}")
+    if order["discount"]:
+        out.append(f"Discount: -{money(order['discount'])}")
+    out.append(f"Tax: {money(order['tax'])}")
+    out.append(f"Total: {money(order['total'])}")
+    return "\n".join(out)
+
+=== shop/models.py
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Item:
+    sku: str
+    name: str
+    price: float
+    qty: int = 1
+
+
+@dataclass
+class Cart:
+    items: list = field(default_factory=list)
+    coupon: str | None = None
+
+    def add(self, item):
+        for it in self.items:
+            if it.sku == item.sku:
+                it.qty += item.qty
+                return
+        self.items.append(Item(item.sku, item.name, item.price, item.qty))
+
+    def remove(self, sku):
+        self.items = [i for i in self.items if i.sku != sku]
+
+    def count(self):
+        return sum(i.qty for i in self.items)
+
+=== shop/orders.py
+import itertools
+
+from .pricing import line_total, total
+
+_ids = itertools.count(1)
+
+
+def place_order(cart, region):
+    t = total(cart, region)
+    lines = [{"sku": i.sku, "name": i.name, "qty": i.qty, "total": line_total(i)} for i in cart.items]
+    return {"id": f"ORD-{next(_ids):04d}", "region": region, "lines": lines, **t}
+
+=== shop/pricing.py
+from .discounts import discount_for
+from .tax import tax_for
+
+
+def line_total(item):
+    return round(item.price * item.qty, 2)
+
+
+def subtotal(cart):
+    return round(sum(line_total(i) for i in cart.items), 2)
+
+
+def total(cart, region):
+    sub = subtotal(cart)
+    disc = discount_for(cart, cart.coupon)
+    tax = tax_for(round(sub - disc, 2), region)
+    return {"subtotal": sub, "discount": disc, "tax": tax, "total": round(sub - disc + tax, 2)}
+
+=== shop/tax.py
+RATES = {"CA": 0.0725, "NY": 0.04, "OR": 0.0}
+
+
+def tax_for(amount, region):
+    rate = RATES.get(region)
+    if rate is None:
+        raise ValueError(f"unknown region: {region}")
+    return round(amount * rate, 2)
+
+=== tests/test_shop.py
+import unittest
+
+from shop.fmt import money
+from shop.models import Cart, Item
+from shop.orders import place_order
+from shop.pricing import subtotal, total
+
+
+def cart(*items, coupon=None):
+    c = Cart(coupon=coupon)
+    for it in items:
+        c.add(it)
+    return c
+
+
+class ShopTests(unittest.TestCase):
+    def test_merge_and_subtotal(self):
+        c = cart(Item("a", "A", 2.5, 2), Item("a", "A", 2.5, 1))
+        self.assertEqual(c.count(), 3)
+        self.assertEqual(subtotal(c), 7.5)
+
+    def test_total_no_coupon(self):
+        t = total(cart(Item("a", "A", 10.0, 1)), "NY")
+        self.assertEqual(t["total"], 10.4)
+
+    def test_fiveoff(self):
+        t = total(cart(Item("a", "A", 40.0, 1), coupon="FIVEOFF"), "OR")
+        self.assertEqual((t["discount"], t["total"]), (5.0, 35.0))
+
+    def test_order_and_money(self):
+        o = place_order(cart(Item("a", "A", 1.0, 1)), "OR")
+        self.assertTrue(o["id"].startswith("ORD-"))
+        self.assertEqual(money(1234.5), "$1,234.50")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+### MODEL (turn 2)
+I'll rewrite the six `shop/` modules and the test file to use int cents, then run the test suite and grep `shop/` for leftover float code.
+[tool call luau]
+write("shop/models.py", [==[
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Item:
+    sku: str
+    name: str
+    price_cents: int
+    qty: int = 1
+
+
+@dataclass
+class Cart:
+    items: list = field(default_factory=list)
+    coupon: str | None = None
+
+    def add(self, item):
+        for it in self.items:
+            if it.sku == item.sku:
+                it.qty += item.qty
+                return
+        self.items.append(Item(item.sku, item.name, item.price_cents, item.qty))
+
+    def remove(self, sku):
+        self.items = [i for i in self.items if i.sku != sku]
+
+    def count(self):
+        return sum(i.qty for i in self.items)
+]==])
+
+write("shop/discounts.py", [==[
+def discount_for(cart, code):
+    """Discount in int cents for `code` on `cart`. Unknown codes raise ValueError."""
+    if not code:
+        return 0
+    sub = sum(i.price_cents * i.qty for i in cart.items)
+    if code == "SAVE10":
+        return (sub * 10 + 50) // 100
+    if code == "FIVEOFF":
+        return 500 if sub >= 3000 else 0
+    raise ValueError(f"unknown coupon: {code}")
+]==])
+
+write("shop/tax.py", [==[
+RATES_BP = {"CA": 725, "NY": 400, "OR": 0}
+
+
+def tax_for(cents, region):
+    bp = RATES_BP.get(region)
+    if bp is None:
+        raise ValueError(f"unknown region: {region}")
+    return (cents * bp + 5000) // 10000
+]==])
+
+write("shop/pricing.py", [==[
+from .discounts import discount_for
+from .tax import tax_for
+
+
+def line_total(item):
+    return item.price_cents * item.qty
+
+
+def subtotal(cart):
+    return sum(line_total(i) for i in cart.items)
+
+
+def total(cart, region):
+    sub = subtotal(cart)
+    disc = discount_for(cart, cart.coupon)
+    tax = tax_for(sub - disc, region)
+    return {"subtotal": sub, "discount": disc, "tax": tax, "total": sub - disc + tax}
+]==])
+
+write("shop/fmt.py", [==[
+def money(cents):
+    return f"${cents // 100:,}.{cents % 100:02d}"
+
+
+def receipt(order):
+    out = [f"Order {order['id']} ({order['region']})"]
+    for ln in order["lines"]:
+        out.append(f"{ln['qty']} x {ln['name']}: {money(ln['total'])}")
+    out.append(f"Subtotal: {money(order['subtotal'])}")
+    if order["discount"]:
+        out.append(f"Discount: -{money(order['discount'])}")
+    out.append(f"Tax: {money(order['tax'])}")
+    out.append(f"Total: {money(order['total'])}")
+    return "\n".join(out)
+]==])
+
+print(edit("shop/cli.py", [==[it["name"], it["price"], it.get("qty", 1)]==], [==[it["name"], it["price_cents"], it.get("qty", 1)]==]))
+
+write("tests/test_shop.py", [==[
+import unittest
+
+from shop.fmt import money
+from shop.models import Cart, Item
+from shop.orders import place_order
+from shop.pricing import subtotal, total
+from shop.discounts import discount_for
+
+
+def cart(*items, coupon=None):
+    c = Cart(coupon=coupon)
+    for it in items:
+        c.add(it)
+    return c
+
+
+class ShopTests(unittest.TestCase):
+    def test_merge_and_subtotal(self):
+        c = cart(Item("a", "A", 250, 2), Item("a", "A", 250, 1))
+        self.assertEqual(c.count(), 3)
+        self.assertEqual(subtotal(c), 750)
+
+    def test_total_no_coupon(self):
+        t = total(cart(Item("a", "A", 1000, 1)), "NY")
+        self.assertEqual(t["total"], 1040)
+
+    def test_fiveoff(self):
+        t = total(cart(Item("a", "A", 4000, 1), coupon="FIVEOFF"), "OR")
+        self.assertEqual((t["discount"], t["total"]), (500, 3500))
+
+    def test_save10_rounds_half_up(self):
+        c = cart(Item("a", "A", 1005, 1), coupon="SAVE10")
+        self.assertEqual(discount_for(c, "SAVE10"), 101)
+
+    def test_order_and_money(self):
+        o = place_order(cart(Item("a", "A", 100, 1)), "OR")
+        self.assertTrue(o["id"].startswith("ORD-"))
+        self.assertEqual(money(123450), "$1,234.50")
+        self.assertEqual(money(1234), "$12.34")
+
+
+if __name__ == "__main__":
+    unittest.main()
+]==])
+
+local t = sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -15")
+print(t.stdout)
+local g = sh([[grep -nE 'float|round\(|[0-9]\.[0-9]' shop/*.py; echo "grep exit: $?"]])
+print(g.stdout)
+### RESULT
+ok: 1 replacement, +1/-1 lines
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 0.000s
+
+OK
+
+grep exit: 1
+
+### MODEL (turn 3)
+The package now stores money as int cents throughout: `Item.price_cents`, `tax.RATES_BP` with basis-point rates, integer discount and tax rounding, `fmt.money(cents)`, and the CLI reads `price_cents`. The five tests pass after being updated to cents values, and I added a `SAVE10` half-up rounding test. A grep of `shop/` finds no `float`, `round(` or decimal literals.

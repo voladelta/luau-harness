@@ -1,0 +1,393 @@
+### TASK
+This is a small Python markdown-to-HTML converter (`wiki/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Add these features:
+
+1. Ordered lists: consecutive lines that start with digits, a dot and whitespace (`1. one`) form a list rendered as `<ol><li>one</li><li>two</li></ol>` (inline markup works inside items). Like bullet lists, an ordered list ends at a blank line, a heading, or a line of a different kind, and it can directly follow a paragraph line without a blank line in between.
+2. A line consisting only of `[TOC]` becomes a table of contents listing ALL headings of the document (also those after the marker), in order, rendered exactly as `<nav class="toc"><ul><li><a href="#SLUG">TEXT</a></li>...</ul></nav>` where TEXT is the inline-rendered heading text. If the document has no headings the output is `<nav class="toc"></nav>`.
+3. Heading ids must be unique: when several headings have the same slug, the first keeps it and later ones get `-2`, `-3`, ... appended (`intro`, `intro-2`, `intro-3`). The ids used on the `<hN>` tags and in the TOC links must agree, and `toc.build(blocks)` must return the same unique slugs.
+
+Update or add tests as you see fit.
+
+
+[files in the working directory]
+tests/__init__.py (0 lines)
+tests/test_wiki.py (27 lines)
+wiki/__init__.py (0 lines)
+wiki/blocks.py (50 lines)
+wiki/convert.py (5 lines)
+wiki/html.py (21 lines)
+wiki/inline.py (23 lines)
+wiki/links.py (8 lines)
+wiki/toc.py (10 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+local files = {"wiki/blocks.py", "wiki/convert.py", "wiki/html.py", "wiki/inline.py", "wiki/links.py", "wiki/toc.py", "tests/test_wiki.py"}
+for _, f in ipairs(files) do
+	print("=== " .. f .. " ===")
+	print(read(f))
+end
+### RESULT
+=== wiki/blocks.py ===
+import re
+
+_HEADING = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+
+
+def parse(text):
+    """Split markdown-lite into blocks:
+    ("heading", level, text) | ("para", text) | ("list", [items]) | ("code", text)
+    """
+    blocks, para, items, code = [], [], [], None
+
+    def flush():
+        nonlocal para, items
+        if para:
+            blocks.append(("para", " ".join(para)))
+            para = []
+        if items:
+            blocks.append(("list", items))
+            items = []
+
+    for line in text.split("\n"):
+        if code is not None:
+            if line.strip() == "```":
+                blocks.append(("code", "\n".join(code)))
+                code = None
+            else:
+                code.append(line)
+            continue
+        if line.strip() == "```":
+            flush()
+            code = []
+            continue
+        m = _HEADING.match(line)
+        if m:
+            flush()
+            blocks.append(("heading", len(m.group(1)), m.group(2)))
+        elif line.startswith("- "):
+            if para:
+                flush()
+            items.append(line[2:].strip())
+        elif not line.strip():
+            flush()
+        else:
+            if items:
+                flush()
+            para.append(line.strip())
+    flush()
+    if code is not None:
+        blocks.append(("code", "\n".join(code)))
+    return blocks
+
+=== wiki/convert.py ===
+from . import blocks, html
+
+
+def convert(text):
+    return html.render(blocks.parse(text))
+
+=== wiki/html.py ===
+import html as _html
+
+from . import inline
+from .toc import slug
+
+
+def render(blocks):
+    out = []
+    for b in blocks:
+        kind = b[0]
+        if kind == "heading":
+            out.append(f'<h{b[1]} id="{slug(b[2])}">{inline.render(b[2])}</h{b[1]}>')
+        elif kind == "para":
+            out.append(f"<p>{inline.render(b[1])}</p>")
+        elif kind == "list":
+            out.append("<ul>" + "".join(f"<li>{inline.render(i)}</li>" for i in b[1]) + "</ul>")
+        elif kind == "code":
+            out.append(f"<pre><code>{_html.escape(b[1], quote=False)}</code></pre>")
+        else:
+            raise ValueError(f"unknown block: {kind}")
+    return "\n".join(out)
+
+=== wiki/inline.py ===
+import html
+import re
+
+_CODE = re.compile(r"`([^`]+)`")
+_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_EM = re.compile(r"\*(.+?)\*")
+_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+
+
+def render(text):
+    """Inline markup -> HTML. Code spans are protected from further formatting."""
+    text = html.escape(text, quote=False)
+    spans = []
+
+    def stash(m):
+        spans.append(f"<code>{m.group(1)}</code>")
+        return f"\x00{len(spans) - 1}\x00"
+
+    text = _CODE.sub(stash, text)
+    text = _BOLD.sub(r"<strong>\1</strong>", text)
+    text = _EM.sub(r"<em>\1</em>", text)
+    text = _LINK.sub(r'<a href="\2">\1</a>', text)
+    return re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], text)
+
+=== wiki/links.py ===
+import re
+
+_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+
+
+def extract(text):
+    """[(label, url)] in document order."""
+    return _LINK.findall(text)
+
+=== wiki/toc.py ===
+import re
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def build(blocks):
+    """[(level, text, slug)] for every heading block, in order."""
+    return [(b[1], b[2], slug(b[2])) for b in blocks if b[0] == "heading"]
+
+=== tests/test_wiki.py ===
+import unittest
+
+from wiki.convert import convert
+from wiki.links import extract
+from wiki.toc import build, slug
+from wiki import blocks
+
+
+class WikiTests(unittest.TestCase):
+    def test_convert(self):
+        out = convert("# Hi There\n\nsome *em* and `x*y*` text\n\n- a\n- b\n")
+        self.assertIn('<h1 id="hi-there">Hi There</h1>', out)
+        self.assertIn("<em>em</em>", out)
+        self.assertIn("<code>x*y*</code>", out)
+        self.assertIn("<ul><li>a</li><li>b</li></ul>", out)
+
+    def test_code_and_links(self):
+        self.assertIn("<pre><code>a &lt; b</code></pre>", convert("```\na < b\n```"))
+        self.assertEqual(extract("see [x](http://a) and [y](b)"), [("x", "http://a"), ("y", "b")])
+
+    def test_toc(self):
+        self.assertEqual(build(blocks.parse("# A\n## B c")), [(1, "A", "a"), (2, "B c", "b-c")])
+        self.assertEqual(slug("Hello, World!"), "hello-world")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+### MODEL (turn 2)
+I'll rewrite the parser, renderer and TOC module so ordered lists, `[TOC]` and unique heading ids all go through one shared slug assignment, then add tests and run the suite.
+[tool call luau]
+write("wiki/blocks.py", [==[
+import re
+
+_HEADING = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+_OLIST = re.compile(r"^\d+\.\s+(.*)$")
+
+
+def parse(text):
+    """Split markdown-lite into blocks:
+    ("heading", level, text) | ("para", text) | ("list", [items])
+    | ("olist", [items]) | ("code", text) | ("toc",)
+    """
+    blocks, para, items, olist, code = [], [], [], [], None
+
+    def flush():
+        nonlocal para, items, olist
+        if para:
+            blocks.append(("para", " ".join(para)))
+            para = []
+        if items:
+            blocks.append(("list", items))
+            items = []
+        if olist:
+            blocks.append(("olist", olist))
+            olist = []
+
+    for line in text.split("\n"):
+        if code is not None:
+            if line.strip() == "```":
+                blocks.append(("code", "\n".join(code)))
+                code = None
+            else:
+                code.append(line)
+            continue
+        if line.strip() == "```":
+            flush()
+            code = []
+            continue
+        m = _HEADING.match(line)
+        om = _OLIST.match(line)
+        if line.strip() == "[TOC]":
+            flush()
+            blocks.append(("toc",))
+        elif m:
+            flush()
+            blocks.append(("heading", len(m.group(1)), m.group(2)))
+        elif line.startswith("- "):
+            if para or olist:
+                flush()
+            items.append(line[2:].strip())
+        elif om:
+            if para or items:
+                flush()
+            olist.append(om.group(1).strip())
+        elif not line.strip():
+            flush()
+        else:
+            if items or olist:
+                flush()
+            para.append(line.strip())
+    flush()
+    if code is not None:
+        blocks.append(("code", "\n".join(code)))
+    return blocks
+]==])
+
+write("wiki/toc.py", [==[
+import re
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def unique_slugs(blocks):
+    """Slug for every heading block, in order. Repeats get -2, -3, ... suffixes."""
+    used, counts, out = set(), {}, []
+    for b in blocks:
+        if b[0] != "heading":
+            continue
+        base = slug(b[2])
+        cand = base
+        if cand in used:
+            n = counts.get(base, 1)
+            while True:
+                n += 1
+                cand = f"{base}-{n}"
+                if cand not in used:
+                    break
+            counts[base] = n
+        used.add(cand)
+        out.append(cand)
+    return out
+
+
+def build(blocks):
+    """[(level, text, slug)] for every heading block, in order."""
+    heads = [b for b in blocks if b[0] == "heading"]
+    return [(b[1], b[2], i) for b, i in zip(heads, unique_slugs(blocks))]
+]==])
+
+write("wiki/html.py", [==[
+import html as _html
+
+from . import inline
+from .toc import build
+
+
+def _toc_html(entries):
+    if not entries:
+        return '<nav class="toc"></nav>'
+    items = "".join(f'<li><a href="#{i}">{inline.render(t)}</a></li>' for _, t, i in entries)
+    return f'<nav class="toc"><ul>{items}</ul></nav>'
+
+
+def render(blocks):
+    entries = build(blocks)
+    heads = iter(entries)
+    out = []
+    for b in blocks:
+        kind = b[0]
+        if kind == "heading":
+            _, _, hid = next(heads)
+            out.append(f'<h{b[1]} id="{hid}">{inline.render(b[2])}</h{b[1]}>')
+        elif kind == "para":
+            out.append(f"<p>{inline.render(b[1])}</p>")
+        elif kind == "list":
+            out.append("<ul>" + "".join(f"<li>{inline.render(i)}</li>" for i in b[1]) + "</ul>")
+        elif kind == "olist":
+            out.append("<ol>" + "".join(f"<li>{inline.render(i)}</li>" for i in b[1]) + "</ol>")
+        elif kind == "code":
+            out.append(f"<pre><code>{_html.escape(b[1], quote=False)}</code></pre>")
+        elif kind == "toc":
+            out.append(_toc_html(entries))
+        else:
+            raise ValueError(f"unknown block: {kind}")
+    return "\n".join(out)
+]==])
+
+write("tests/test_wiki.py", [==[
+import unittest
+
+from wiki.convert import convert
+from wiki.links import extract
+from wiki.toc import build, slug
+from wiki import blocks
+
+
+class WikiTests(unittest.TestCase):
+    def test_convert(self):
+        out = convert("# Hi There\n\nsome *em* and `x*y*` text\n\n- a\n- b\n")
+        self.assertIn('<h1 id="hi-there">Hi There</h1>', out)
+        self.assertIn("<em>em</em>", out)
+        self.assertIn("<code>x*y*</code>", out)
+        self.assertIn("<ul><li>a</li><li>b</li></ul>", out)
+
+    def test_code_and_links(self):
+        self.assertIn("<pre><code>a &lt; b</code></pre>", convert("```\na < b\n```"))
+        self.assertEqual(extract("see [x](http://a) and [y](b)"), [("x", "http://a"), ("y", "b")])
+
+    def test_toc(self):
+        self.assertEqual(build(blocks.parse("# A\n## B c")), [(1, "A", "a"), (2, "B c", "b-c")])
+        self.assertEqual(slug("Hello, World!"), "hello-world")
+
+    def test_ordered_list(self):
+        self.assertEqual(blocks.parse("1. one\n2. two"), [("olist", ["one", "two"])])
+        out = convert("para\n1. one\n2. **two**\n\nafter")
+        self.assertIn("<p>para</p>\n<ol><li>one</li><li><strong>two</strong></li></ol>", out)
+        self.assertIn("<p>after</p>", out)
+        self.assertIn("<ol><li>x</li></ol>\n<h1", convert("1. x\n# h"))
+
+    def test_toc_block(self):
+        out = convert("[TOC]\n\n# Intro\n## Sub\n\n# Intro\n")
+        self.assertIn(
+            '<nav class="toc"><ul><li><a href="#intro">Intro</a></li>'
+            '<li><a href="#sub">Sub</a></li>'
+            '<li><a href="#intro-2">Intro</a></li></ul></nav>',
+            out,
+        )
+        self.assertIn('<h1 id="intro-2">Intro</h1>', out)
+        self.assertEqual(convert("[TOC]"), '<nav class="toc"></nav>')
+
+    def test_unique_ids(self):
+        got = build(blocks.parse("# intro\n# intro\n# intro\n# intro-2"))
+        self.assertEqual([i for _, _, i in got], ["intro", "intro-2", "intro-3", "intro-2-2"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+]==])
+
+print(sh("cd " .. "$(pwd)" .. " && python3 -m unittest discover -s tests -t . 2>&1 | tail -30").stdout)
+### RESULT
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.000s
+
+OK
+
+### MODEL (turn 3)
+I added ordered lists, the `[TOC]` block and unique heading ids. Parsing is in `wiki/blocks.py`, slug assignment in `wiki/toc.py`, and rendering in `wiki/html.py`. The updated test suite passes (6 tests).

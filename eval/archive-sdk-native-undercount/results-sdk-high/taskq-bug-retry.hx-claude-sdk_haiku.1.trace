@@ -1,0 +1,277 @@
+### TASK
+This is a small Python in-memory job queue (`taskq/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Bug report: a job enqueued with `max_attempts=3` whose handler always raises is executed four times before it is marked dead. It should run exactly three times in total.
+
+Find and fix the bug. Don't change any public function names or signatures.
+
+
+[files in the working directory]
+taskq/__init__.py (0 lines)
+taskq/clock.py (17 lines)
+taskq/jobs.py (14 lines)
+taskq/queue.py (44 lines)
+taskq/retry.py (8 lines)
+taskq/store.py (19 lines)
+taskq/worker.py (26 lines)
+tests/__init__.py (0 lines)
+tests/test_taskq.py (37 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+local files = {"taskq/jobs.py","taskq/queue.py","taskq/retry.py","taskq/store.py","taskq/worker.py","taskq/clock.py","tests/test_taskq.py"}
+for _, f in ipairs(files) do
+  print("=== " .. f)
+  print(read(f))
+end
+### RESULT
+=== taskq/jobs.py
+from dataclasses import dataclass
+
+
+@dataclass
+class Job:
+    id: str
+    name: str
+    payload: dict
+    priority: int = 0
+    attempts: int = 0
+    max_attempts: int = 3
+    run_at: float = 0.0
+    status: str = "queued"  # queued | running | done | dead
+    error: str | None = None
+
+=== taskq/queue.py
+from .jobs import Job
+from .retry import backoff, should_retry
+
+
+class JobQueue:
+    def __init__(self, clock):
+        self.clock = clock
+        self.jobs = {}
+        self._n = 0
+
+    def enqueue(self, name, payload=None, priority=0, delay=0.0, max_attempts=3):
+        self._n += 1
+        job = Job(f"job-{self._n}", name, payload or {}, priority, 0, max_attempts, self.clock.now() + delay)
+        self.jobs[job.id] = job
+        return job
+
+    def pop_ready(self):
+        """Highest priority first, then earliest run_at, then creation order. Counts an attempt."""
+        now = self.clock.now()
+        ready = [j for j in self.jobs.values() if j.status == "queued" and j.run_at <= now]
+        if not ready:
+            return None
+        job = min(ready, key=lambda j: (-j.priority, j.run_at, int(j.id.split("-")[1])))
+        job.status = "running"
+        job.attempts += 1
+        return job
+
+    def complete(self, job):
+        job.status = "done"
+        job.error = None
+
+    def fail(self, job, error):
+        job.error = error
+        if should_retry(job):
+            job.status = "queued"
+            job.run_at = self.clock.now() + backoff(job.attempts)
+        else:
+            job.status = "dead"
+
+    def stats(self):
+        out = {}
+        for j in self.jobs.values():
+            out[j.status] = out.get(j.status, 0) + 1
+        return out
+
+=== taskq/retry.py
+def backoff(attempt, base=2.0, cap=60.0):
+    """Delay in seconds before retry number `attempt` (1 = first retry): base * 2**(attempt-1), capped."""
+    return min(cap, base * 2 ** (attempt - 1))
+
+
+def should_retry(job):
+    """A job may run at most `max_attempts` times in total."""
+    return job.attempts <= job.max_attempts
+
+=== taskq/store.py
+import json
+
+from .jobs import Job
+from .queue import JobQueue
+
+_FIELDS = ["id", "name", "payload", "priority", "attempts", "max_attempts", "run_at", "status", "error"]
+
+
+def dump(queue):
+    return json.dumps({"n": queue._n, "jobs": [{f: getattr(j, f) for f in _FIELDS} for j in queue.jobs.values()]})
+
+
+def load(clock, text):
+    data = json.loads(text)
+    q = JobQueue(clock)
+    q._n = data["n"]
+    for d in data["jobs"]:
+        q.jobs[d["id"]] = Job(**{f: d[f] for f in _FIELDS})
+    return q
+
+=== taskq/worker.py
+class Worker:
+    def __init__(self, queue, handlers):
+        self.queue = queue
+        self.handlers = handlers
+
+    def run_once(self):
+        job = self.queue.pop_ready()
+        if job is None:
+            return False
+        handler = self.handlers.get(job.name)
+        if handler is None:
+            self.queue.fail(job, "no handler")
+            return True
+        try:
+            handler(job.payload)
+        except Exception as e:  # noqa: BLE001
+            self.queue.fail(job, repr(e))
+        else:
+            self.queue.complete(job)
+        return True
+
+    def run_until_idle(self, max_steps=1000):
+        n = 0
+        while n < max_steps and self.run_once():
+            n += 1
+        return n
+
+=== taskq/clock.py
+import time
+
+
+class Clock:
+    def now(self):
+        return time.time()
+
+
+class FakeClock(Clock):
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+=== tests/test_taskq.py
+import unittest
+
+from taskq.clock import FakeClock
+from taskq.queue import JobQueue
+from taskq.retry import backoff
+from taskq.store import dump, load
+from taskq.worker import Worker
+
+
+class TaskqTests(unittest.TestCase):
+    def test_priority_order(self):
+        q = JobQueue(FakeClock())
+        q.enqueue("a", priority=1)
+        hi = q.enqueue("b", priority=5)
+        self.assertEqual(q.pop_ready().id, hi.id)
+
+    def test_delay(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        q.enqueue("a", delay=10)
+        self.assertIsNone(q.pop_ready())
+        c.advance(10)
+        self.assertIsNotNone(q.pop_ready())
+
+    def test_worker_and_roundtrip(self):
+        c = FakeClock()
+        q = JobQueue(c)
+        q.enqueue("ok", {"x": 1})
+        seen = []
+        Worker(q, {"ok": seen.append}).run_until_idle()
+        self.assertEqual(seen, [{"x": 1}])
+        self.assertEqual(load(c, dump(q)).stats(), {"done": 1})
+        self.assertEqual(backoff(1), 2.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+### MODEL (turn 2)
+The cause looks like `should_retry` in `taskq/retry.py`: `attempts` is incremented on pop, so after the third run `attempts == 3`, and `3 <= 3` still allows a retry. I'll reproduce that, fix the comparison, and rerun the tests.
+[tool call luau]
+local repro = [==[
+import sys
+sys.path.insert(0, ".")
+from taskq.clock import FakeClock
+from taskq.queue import JobQueue
+from taskq.worker import Worker
+c = FakeClock()
+q = JobQueue(c)
+j = q.enqueue("bad", max_attempts=3)
+calls = []
+def boom(p):
+    calls.append(1)
+    raise RuntimeError("x")
+Worker(q, {"bad": boom}).run_until_idle(max_steps=50)
+print("runs:", len(calls), "status:", j.status, "attempts:", j.attempts)
+]==]
+write(tmpdir() .. "/repro.py", repro)
+local before = sh("python3 -I " .. tmpdir() .. "/repro.py", {cwd = "."})
+print("before:", before.stdout, before.stderr)
+
+print(edit("taskq/retry.py", "return job.attempts <= job.max_attempts", "return job.attempts < job.max_attempts"))
+
+local after = sh("python3 -I " .. tmpdir() .. "/repro.py", {cwd = "."})
+print("after:", after.stdout, after.stderr)
+local t = sh("python3 -m unittest discover -s tests -t .", {cwd = "."})
+print(t.stdout, t.stderr, "code:", t.code)
+### RESULT
+before:	runs: 1 status: queued attempts: 1
+	
+ok: 1 replacement, +1/-1 lines
+after:	runs: 1 status: queued attempts: 1
+	
+	...
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK
+	code:	0
+### MODEL (turn 3)
+The repro stopped after one run because the retry's backoff pushes `run_at` into the future and the fake clock never advances. I'll advance the clock between steps and check the run count with the fix in place.
+[tool call luau]
+local repro = [==[
+import sys
+sys.path.insert(0, ".")
+from taskq.clock import FakeClock
+from taskq.queue import JobQueue
+from taskq.worker import Worker
+c = FakeClock()
+q = JobQueue(c)
+j = q.enqueue("bad", max_attempts=3)
+calls = []
+def boom(p):
+    calls.append(1)
+    raise RuntimeError("x")
+w = Worker(q, {"bad": boom})
+for _ in range(20):
+    c.advance(1000)
+    w.run_once()
+print("runs:", len(calls), "status:", j.status, "attempts:", j.attempts)
+]==]
+write(tmpdir() .. "/repro.py", repro)
+local r = sh("python3 -I " .. tmpdir() .. "/repro.py", {cwd = "."})
+print(r.stdout, r.stderr, r.code)
+### RESULT
+runs: 3 status: dead attempts: 3
+		0
+### MODEL (turn 4)
+The bug was in `should_retry` in `taskq/retry.py`, which compared `job.attempts <= job.max_attempts`. Because `pop_ready` counts an attempt before the handler runs, the third failed run still passed that check and was requeued. I changed the comparison to `<`. A job with `max_attempts=3` now runs exactly three times and ends `dead`, and the existing test suite passes.

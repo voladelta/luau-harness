@@ -1,0 +1,70 @@
+### TASK
+This is a small Python double-entry bookkeeping package (`ledger/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Bug report: importing a bank CSV row whose amount is written with a single decimal digit, such as `10.5`, books $10.05 instead of $10.50. Amounts with two decimals or none are fine.
+
+Find and fix the bug. Don't change any public function names or signatures.
+
+
+[files in the working directory]
+ledger/__init__.py (0 lines)
+ledger/accounts.py (18 lines)
+ledger/importer.py (15 lines)
+ledger/journal.py (27 lines)
+ledger/money.py (17 lines)
+ledger/reports.py (25 lines)
+tests/__init__.py (0 lines)
+tests/test_ledger.py (39 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+print(read("ledger/money.py"))print(read("ledger/importer.py"))
+### RESULT
+def parse_amount(s):
+    """'12.50' -> 1250 (integer cents). Accepts '1,200', '0.5', '-3.07'. Raises ValueError on junk."""
+    s = s.strip().replace(",", "")
+    neg = s.startswith("-")
+    if neg:
+        s = s[1:]
+    whole, _, frac = s.partition(".")
+    if not whole.isdigit() or (frac and not frac.isdigit()) or len(frac) > 2:
+        raise ValueError(f"bad amount: {s!r}")
+    cents = int(whole) * 100 + int(frac or 0)
+    return -cents if neg else cents
+
+
+def fmt(cents):
+    sign = "-" if cents < 0 else ""
+    cents = abs(cents)
+    return f"{sign}{cents // 100:,}.{cents % 100:02d}"
+
+import csv
+import io
+
+from .journal import Entry
+from .money import parse_amount
+
+
+def import_csv(text, journal):
+    """Rows: date,memo,debit_account,credit_account,amount. Returns number of entries posted."""
+    n = 0
+    for row in csv.DictReader(io.StringIO(text)):
+        cents = parse_amount(row["amount"])
+        journal.post(Entry(row["date"], row["memo"], [(row["debit_account"], cents), (row["credit_account"], -cents)]))
+        n += 1
+    return n
+
+### MODEL (turn 2)
+
+[tool call luau]
+edit("ledger/money.py","int(frac or 0)","int(frac.ljust(2, \"0\") or 0)")
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -5").stdout)
+### RESULT
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK
+
+### MODEL (turn 3)
+I fixed the bug in `parse_amount` in `ledger/money.py`. It read a one-digit fraction as cents, so `10.5` became 10.05. It now pads the fraction to two digits first, so `10.5` gives 10.50. The existing tests pass, but I didn't add a test for the one-decimal case.

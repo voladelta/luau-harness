@@ -1,0 +1,75 @@
+### TASK
+This is a small Python double-entry bookkeeping package (`ledger/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Bug report: importing a bank CSV row whose amount is written with a single decimal digit, such as `10.5`, books $10.05 instead of $10.50. Amounts with two decimals or none are fine.
+
+Find and fix the bug. Don't change any public function names or signatures.
+
+
+[files in the working directory]
+ledger/__init__.py (0 lines)
+ledger/accounts.py (18 lines)
+ledger/importer.py (15 lines)
+ledger/journal.py (27 lines)
+ledger/money.py (17 lines)
+ledger/reports.py (25 lines)
+tests/__init__.py (0 lines)
+tests/test_ledger.py (39 lines)
+### MODEL (turn 1)
+I'll read the importer and money modules first, since the amount parsing is the likely culprit.
+[tool call luau]
+print(read("ledger/importer.py"))
+print(read("ledger/money.py"))
+### RESULT
+import csv
+import io
+
+from .journal import Entry
+from .money import parse_amount
+
+
+def import_csv(text, journal):
+    """Rows: date,memo,debit_account,credit_account,amount. Returns number of entries posted."""
+    n = 0
+    for row in csv.DictReader(io.StringIO(text)):
+        cents = parse_amount(row["amount"])
+        journal.post(Entry(row["date"], row["memo"], [(row["debit_account"], cents), (row["credit_account"], -cents)]))
+        n += 1
+    return n
+
+def parse_amount(s):
+    """'12.50' -> 1250 (integer cents). Accepts '1,200', '0.5', '-3.07'. Raises ValueError on junk."""
+    s = s.strip().replace(",", "")
+    neg = s.startswith("-")
+    if neg:
+        s = s[1:]
+    whole, _, frac = s.partition(".")
+    if not whole.isdigit() or (frac and not frac.isdigit()) or len(frac) > 2:
+        raise ValueError(f"bad amount: {s!r}")
+    cents = int(whole) * 100 + int(frac or 0)
+    return -cents if neg else cents
+
+
+def fmt(cents):
+    sign = "-" if cents < 0 else ""
+    cents = abs(cents)
+    return f"{sign}{cents // 100:,}.{cents % 100:02d}"
+
+### MODEL (turn 2)
+The bug is in `parse_amount`: the fractional part is read as a raw integer, so `"5"` becomes 5 cents instead of 50. I'll pad the fraction to two digits and run the tests.
+[tool call luau]
+print(edit("ledger/money.py", "cents = int(whole) * 100 + int(frac or 0)", "cents = int(whole) * 100 + int(frac.ljust(2, \"0\") or 0)"))
+print(sh("python3 -I -c \"import sys; sys.path.insert(0, '.'); from ledger.money import parse_amount as p; print(p('10.5'), p('10.50'), p('10'), p('0.5'), p('-3.07'), p('1,200.4'))\"").stdout)
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -5").stdout)
+### RESULT
+ok: 1 replacement, +1/-1 lines
+1050 1050 1000 50 -307 120040
+
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK
+
+### MODEL (turn 3)
+Fixed the single-decimal bug in `ledger/money.py`: `parse_amount` now pads the fractional part to two digits, so `10.5` parses as 1050 cents instead of 1005. The spot checks (`10.5`, `10.50`, `10`, `0.5`, `-3.07`, `1,200.4`) return the expected values, and the 3 existing tests pass. Public names and signatures are unchanged.

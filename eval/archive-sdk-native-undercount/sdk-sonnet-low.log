@@ -1,0 +1,5 @@
+ledger-bug-amount hx:claude-sdk/sonnet #1: PASS tokens=13876 turns=3 cost=0.0237016
+ledger-feature-register hx:claude-sdk/sonnet #1: PASS tokens=25917 turns=4 cost=0.0316729
+ledger-refactor-errors hx:claude-sdk/sonnet #1: PASS tokens=19868 turns=3 cost=0.0411405
+log-bug-percentile hx:claude-sdk/sonnet #1: PASS tokens=14101 turns=3 cost=0.014258
+log-feature-cli hx:claude-sdk/sonnet #1: PASS tokens=19692 turns=3 cost=0.0367083

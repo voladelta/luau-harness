@@ -1,0 +1,239 @@
+### TASK
+This is a small Python shopping-cart package (`shop/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Bug report: a customer in California who checked out with the SAVE10 coupon says the tax on their receipt looks like it was computed on the full price, not on the price after the discount. Same for any other coupon.
+
+Find and fix the bug. Don't change any public function names or signatures.
+
+
+[files in the working directory]
+shop/__init__.py (0 lines)
+shop/cli.py (27 lines)
+shop/discounts.py (10 lines)
+shop/fmt.py (14 lines)
+shop/models.py (28 lines)
+shop/orders.py (11 lines)
+shop/pricing.py (17 lines)
+shop/tax.py (8 lines)
+tests/__init__.py (0 lines)
+tests/test_shop.py (37 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+for _, f in ipairs({"shop/pricing.py","shop/tax.py","shop/discounts.py","shop/orders.py","shop/models.py","shop/cli.py"}) do print("== "..f.."\n"..read(f)) end
+### RESULT
+== shop/pricing.py
+from .discounts import discount_for
+from .tax import tax_for
+
+
+def line_total(item):
+    return round(item.price * item.qty, 2)
+
+
+def subtotal(cart):
+    return round(sum(line_total(i) for i in cart.items), 2)
+
+
+def total(cart, region):
+    sub = subtotal(cart)
+    disc = discount_for(cart, cart.coupon)
+    tax = tax_for(sub, region)
+    return {"subtotal": sub, "discount": disc, "tax": tax, "total": round(sub - disc + tax, 2)}
+
+== shop/tax.py
+RATES = {"CA": 0.0725, "NY": 0.04, "OR": 0.0}
+
+
+def tax_for(amount, region):
+    rate = RATES.get(region)
+    if rate is None:
+        raise ValueError(f"unknown region: {region}")
+    return round(amount * rate, 2)
+
+== shop/discounts.py
+def discount_for(cart, code):
+    """Discount amount in dollars for `code` on `cart`. Unknown codes raise ValueError."""
+    if not code:
+        return 0.0
+    sub = sum(i.price * i.qty for i in cart.items)
+    if code == "SAVE10":
+        return round(sub * 0.10, 2)
+    if code == "FIVEOFF":
+        return 5.0 if sub >= 30 else 0.0
+    raise ValueError(f"unknown coupon: {code}")
+
+== shop/orders.py
+import itertools
+
+from .pricing import line_total, total
+
+_ids = itertools.count(1)
+
+
+def place_order(cart, region):
+    t = total(cart, region)
+    lines = [{"sku": i.sku, "name": i.name, "qty": i.qty, "total": line_total(i)} for i in cart.items]
+    return {"id": f"ORD-{next(_ids):04d}", "region": region, "lines": lines, **t}
+
+== shop/models.py
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Item:
+    sku: str
+    name: str
+    price: float
+    qty: int = 1
+
+
+@dataclass
+class Cart:
+    items: list = field(default_factory=list)
+    coupon: str | None = None
+
+    def add(self, item):
+        for it in self.items:
+            if it.sku == item.sku:
+                it.qty += item.qty
+                return
+        self.items.append(Item(item.sku, item.name, item.price, item.qty))
+
+    def remove(self, sku):
+        self.items = [i for i in self.items if i.sku != sku]
+
+    def count(self):
+        return sum(i.qty for i in self.items)
+
+== shop/cli.py
+import json
+import sys
+
+from .fmt import receipt
+from .models import Cart, Item
+from .orders import place_order
+
+
+def load_cart(path):
+    with open(path) as f:
+        data = json.load(f)
+    cart = Cart(coupon=data.get("coupon"))
+    for it in data["items"]:
+        cart.add(Item(it["sku"], it["name"], it["price"], it.get("qty", 1)))
+    return cart
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: shop CART.json REGION", file=sys.stderr)
+        return 2
+    print(receipt(place_order(load_cart(argv[0]), argv[1])))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
+### MODEL (turn 2)
+
+[tool call luau]
+print(read("tests/test_shop.py"))
+### RESULT
+import unittest
+
+from shop.fmt import money
+from shop.models import Cart, Item
+from shop.orders import place_order
+from shop.pricing import subtotal, total
+
+
+def cart(*items, coupon=None):
+    c = Cart(coupon=coupon)
+    for it in items:
+        c.add(it)
+    return c
+
+
+class ShopTests(unittest.TestCase):
+    def test_merge_and_subtotal(self):
+        c = cart(Item("a", "A", 2.5, 2), Item("a", "A", 2.5, 1))
+        self.assertEqual(c.count(), 3)
+        self.assertEqual(subtotal(c), 7.5)
+
+    def test_total_no_coupon(self):
+        t = total(cart(Item("a", "A", 10.0, 1)), "NY")
+        self.assertEqual(t["total"], 10.4)
+
+    def test_fiveoff(self):
+        t = total(cart(Item("a", "A", 40.0, 1), coupon="FIVEOFF"), "OR")
+        self.assertEqual((t["discount"], t["total"]), (5.0, 35.0))
+
+    def test_order_and_money(self):
+        o = place_order(cart(Item("a", "A", 1.0, 1)), "OR")
+        self.assertTrue(o["id"].startswith("ORD-"))
+        self.assertEqual(money(1234.5), "$1,234.50")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+### MODEL (turn 3)
+The bug is in `pricing.total`: it passes the pre-discount subtotal to `tax_for`. I'll fix that, add a regression test for a California order with SAVE10, and run the suite.
+[tool call luau]
+print(edit("shop/pricing.py", "    tax = tax_for(sub, region)\n    return {\"subtotal\": sub, \"discount\": disc, \"tax\": tax, \"total\": round(sub - disc + tax, 2)}",
+"    taxable = round(sub - disc, 2)\n    tax = tax_for(taxable, region)\n    return {\"subtotal\": sub, \"discount\": disc, \"tax\": tax, \"total\": round(taxable + tax, 2)}"))
+print(edit("tests/test_shop.py", "    def test_order_and_money(self):",
+"""    def test_tax_is_on_discounted_price(self):
+        t = total(cart(Item("a", "A", 100.0, 1), coupon="SAVE10"), "CA")
+        self.assertEqual((t["discount"], t["tax"], t["total"]), (10.0, 6.53, 96.53))
+
+    def test_order_and_money(self):"""))
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -15", {timeout = 120}).stdout)
+### RESULT
+error: syntax error: chunk:4: Expected ')' (to close '(' at line 3), got malformed string
+  at line 4: """    def test_tax_is_on_discounted_price(self):
+### MODEL (turn 4)
+
+[tool call luau]
+print(edit("shop/pricing.py", "    tax = tax_for(sub, region)\n    return {\"subtotal\": sub, \"discount\": disc, \"tax\": tax, \"total\": round(sub - disc + tax, 2)}",
+"    taxable = round(sub - disc, 2)\n    tax = tax_for(taxable, region)\n    return {\"subtotal\": sub, \"discount\": disc, \"tax\": tax, \"total\": round(taxable + tax, 2)}"))
+print(edit("tests/test_shop.py", "    def test_order_and_money(self):", [==[    def test_tax_is_on_discounted_price(self):
+        t = total(cart(Item("a", "A", 100.0, 1), coupon="SAVE10"), "CA")
+        self.assertEqual((t["discount"], t["tax"], t["total"]), (10.0, 6.53, 96.53))
+
+    def test_order_and_money(self):]==]))
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -15", {timeout = 120}).stdout)
+### RESULT
+ok: 1 replacement, +3/-2 lines
+ok: 1 replacement, +5/-1 lines
+First differing element 1:
+6.52
+6.53
+
+- (10.0, 6.52, 96.52)
+?           ^      ^
+
++ (10.0, 6.53, 96.53)
+?           ^      ^
+
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.001s
+
+FAILED (failures=1)
+
+### MODEL (turn 5)
+The code is correct, but my expected value was wrong: 90 × 0.0725 = 6.525, which Python rounds to 6.52. I'll correct the test's expected values and rerun.
+[tool call luau]
+print(edit("tests/test_shop.py", "(10.0, 6.53, 96.53)", "(10.0, 6.52, 96.52)"))
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -4", {timeout = 120}).stdout)
+### RESULT
+ok: 1 replacement, +1/-1 lines
+----------------------------------------------------------------------
+Ran 5 tests in 0.000s
+
+OK
+
+### MODEL (turn 6)
+The bug was in `shop/pricing.py`: `total()` passed the pre-discount subtotal to `tax_for`, so every coupon left tax computed on the full price. It now taxes `subtotal − discount`, and the total is computed from that same taxable amount. I added a regression test for a $100 California order with SAVE10 (tax $6.52, total $96.52), and all 5 tests pass.

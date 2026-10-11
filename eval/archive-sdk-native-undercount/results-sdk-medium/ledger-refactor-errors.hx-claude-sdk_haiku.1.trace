@@ -1,0 +1,408 @@
+### TASK
+This is a small Python double-entry bookkeeping package (`ledger/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Refactor: every error is a bare `ValueError` with a message, so callers cannot tell the cases apart. Introduce a proper exception hierarchy:
+
+- New module `ledger/errors.py` with `LedgerError(Exception)` and these subclasses, each also inheriting `ValueError` so existing `except ValueError` code keeps working: `InvalidAmount`, `InvalidAccountType`, `DuplicateAccount`, `UnknownAccount`, `UnbalancedEntry`.
+- Replace every `raise ValueError` in `ledger/` with the matching class (bad amount, bad account type, duplicate account, unknown account, unbalanced entry). Messages stay exactly as they are.
+- Also in `errors.py`: `ImportRowError(LedgerError, ValueError)` with attributes `line` and `cause`, and message `f"line {line}: {cause}"`. `importer.import_csv` raises it when a row fails with any `LedgerError`; `line` is the 1-based line number in the CSV text, counting the header as line 1, so the first data row is line 2. Rows posted before the failing one stay posted. `cause` is the original exception and is also chained with `raise ... from`.
+- `raise ValueError` must not appear anywhere in `ledger/` afterwards.
+
+Update the existing tests.
+
+
+[files in the working directory]
+ledger/__init__.py (0 lines)
+ledger/accounts.py (18 lines)
+ledger/importer.py (15 lines)
+ledger/journal.py (27 lines)
+ledger/money.py (17 lines)
+ledger/reports.py (25 lines)
+tests/__init__.py (0 lines)
+tests/test_ledger.py (39 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+local out = {}
+for _, f in ipairs({"ledger/__init__.py","ledger/accounts.py","ledger/importer.py","ledger/journal.py","ledger/money.py","ledger/reports.py","tests/test_ledger.py"}) do
+  out[#out+1] = "=== " .. f .. " ===\n" .. read(f)
+end
+print(table.concat(out, "\n"))
+print(search("ValueError", {path = "."}).truncated)
+local hits = search("ValueError")
+for _, h in ipairs(hits) do print(h.file, h.line, h.text) end
+### RESULT
+=== ledger/__init__.py ===
+
+=== ledger/accounts.py ===
+TYPES = ("asset", "liability", "equity", "income", "expense")
+
+
+class Chart:
+    def __init__(self):
+        self.accounts = {}
+
+    def add(self, name, type_):
+        if type_ not in TYPES:
+            raise ValueError(f"bad account type: {type_}")
+        if name in self.accounts:
+            raise ValueError(f"duplicate account: {name}")
+        self.accounts[name] = type_
+
+    def type_of(self, name):
+        if name not in self.accounts:
+            raise ValueError(f"unknown account: {name}")
+        return self.accounts[name]
+
+=== ledger/importer.py ===
+import csv
+import io
+
+from .journal import Entry
+from .money import parse_amount
+
+
+def import_csv(text, journal):
+    """Rows: date,memo,debit_account,credit_account,amount. Returns number of entries posted."""
+    n = 0
+    for row in csv.DictReader(io.StringIO(text)):
+        cents = parse_amount(row["amount"])
+        journal.post(Entry(row["date"], row["memo"], [(row["debit_account"], cents), (row["credit_account"], -cents)]))
+        n += 1
+    return n
+
+=== ledger/journal.py ===
+from dataclasses import dataclass
+
+
+@dataclass
+class Entry:
+    date: str  # YYYY-MM-DD
+    memo: str
+    lines: list  # [(account, cents)]: debit positive, credit negative; must sum to zero
+
+
+class Journal:
+    def __init__(self, chart):
+        self.chart = chart
+        self.entries = []
+
+    def post(self, entry):
+        if sum(c for _, c in entry.lines) != 0:
+            raise ValueError(f"unbalanced entry: {entry.memo}")
+        for acct, _ in entry.lines:
+            self.chart.type_of(acct)
+        self.entries.append(entry)
+
+    def balance(self, account):
+        return sum(c for e in self.entries for a, c in e.lines if a == account)
+
+    def trial_balance(self):
+        return {a: self.balance(a) for a in self.chart.accounts}
+
+=== ledger/money.py ===
+def parse_amount(s):
+    """'12.50' -> 1250 (integer cents). Accepts '1,200', '0.5', '-3.07'. Raises ValueError on junk."""
+    s = s.strip().replace(",", "")
+    neg = s.startswith("-")
+    if neg:
+        s = s[1:]
+    whole, _, frac = s.partition(".")
+    if not whole.isdigit() or (frac and not frac.isdigit()) or len(frac) > 2:
+        raise ValueError(f"bad amount: {s!r}")
+    cents = int(whole) * 100 + int(frac.ljust(2, "0") or 0)
+    return -cents if neg else cents
+
+
+def fmt(cents):
+    sign = "-" if cents < 0 else ""
+    cents = abs(cents)
+    return f"{sign}{cents // 100:,}.{cents % 100:02d}"
+
+=== ledger/reports.py ===
+def _sum(journal, type_):
+    return sum(b for a, b in journal.trial_balance().items() if journal.chart.type_of(a) == type_)
+
+
+def balance_sheet(journal):
+    """Assets = liabilities + equity (+ retained earnings). Credits are negative internally."""
+    assets = _sum(journal, "asset")
+    liabilities = -_sum(journal, "liability")
+    equity = -_sum(journal, "equity")
+    retained = -(_sum(journal, "income") + _sum(journal, "expense"))
+    return {"assets": assets, "liabilities": liabilities, "equity": equity + retained}
+
+
+def income_statement(journal, start, end):
+    """Dates are YYYY-MM-DD strings; start and end both inclusive."""
+    income = expense = 0
+    for e in journal.entries:
+        if start <= e.date <= end:
+            for a, c in e.lines:
+                t = journal.chart.type_of(a)
+                if t == "income":
+                    income += -c
+                elif t == "expense":
+                    expense += c
+    return {"income": income, "expenses": expense, "net": income - expense}
+
+=== tests/test_ledger.py ===
+import unittest
+
+from ledger.accounts import Chart
+from ledger.importer import import_csv
+from ledger.journal import Entry, Journal
+from ledger.money import fmt, parse_amount
+from ledger.reports import balance_sheet, income_statement
+
+
+def make():
+    c = Chart()
+    for n, t in [("cash", "asset"), ("loan", "liability"), ("capital", "equity"), ("sales", "income"), ("rent", "expense")]:
+        c.add(n, t)
+    return Journal(c)
+
+
+class LedgerTests(unittest.TestCase):
+    def test_money(self):
+        self.assertEqual(parse_amount("1,200.5"), 120050)
+        self.assertEqual(fmt(-1234), "-12.34")
+
+    def test_post_and_reports(self):
+        j = make()
+        j.post(Entry("2026-01-01", "seed", [("cash", 10000), ("capital", -10000)]))
+        j.post(Entry("2026-01-02", "sale", [("cash", 5000), ("sales", -5000)]))
+        j.post(Entry("2026-01-03", "rent", [("rent", 2000), ("cash", -2000)]))
+        self.assertEqual(balance_sheet(j), {"assets": 13000, "liabilities": 0, "equity": 13000})
+        self.assertEqual(income_statement(j, "2026-01-01", "2026-01-31")["net"], 3000)
+        with self.assertRaises(ValueError):
+            j.post(Entry("2026-01-04", "bad", [("cash", 1)]))
+
+    def test_import(self):
+        j = make()
+        n = import_csv("date,memo,debit_account,credit_account,amount\n2026-01-02,sale,cash,sales,12.50\n", j)
+        self.assertEqual((n, j.balance("cash")), (1, 1250))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+nil
+ledger/accounts.py	10	            raise ValueError(f"bad account type: {type_}")
+ledger/accounts.py	12	            raise ValueError(f"duplicate account: {name}")
+ledger/accounts.py	17	            raise ValueError(f"unknown account: {name}")
+ledger/journal.py	18	            raise ValueError(f"unbalanced entry: {entry.memo}")
+ledger/money.py	2	    """'12.50' -> 1250 (integer cents). Accepts '1,200', '0.5', '-3.07'. Raises ValueError on junk."""
+ledger/money.py	9	        raise ValueError(f"bad amount: {s!r}")
+tests/test_ledger.py	29	        with self.assertRaises(ValueError):
+### MODEL (turn 2)
+
+[tool call luau]
+write("ledger/errors.py", [==[
+class LedgerError(Exception):
+    """Base class for all ledger errors."""
+
+
+class InvalidAmount(LedgerError, ValueError):
+    """An amount string could not be parsed."""
+
+
+class InvalidAccountType(LedgerError, ValueError):
+    """An account was given a type that is not in TYPES."""
+
+
+class DuplicateAccount(LedgerError, ValueError):
+    """An account with this name already exists in the chart."""
+
+
+class UnknownAccount(LedgerError, ValueError):
+    """An account name is not in the chart."""
+
+
+class UnbalancedEntry(LedgerError, ValueError):
+    """An entry's lines do not sum to zero."""
+
+
+class ImportRowError(LedgerError, ValueError):
+    """A CSV row failed to import. `line` is 1-based (header is line 1)."""
+
+    def __init__(self, line, cause):
+        self.line = line
+        self.cause = cause
+        super().__init__(f"line {line}: {cause}")
+]==])
+
+edit("ledger/accounts.py", "class Chart:", "from .errors import DuplicateAccount, InvalidAccountType, UnknownAccount\n\n\nclass Chart:")
+edit("ledger/accounts.py", 'raise ValueError(f"bad account type', 'raise InvalidAccountType(f"bad account type')
+edit("ledger/accounts.py", 'raise ValueError(f"duplicate account', 'raise DuplicateAccount(f"duplicate account')
+edit("ledger/accounts.py", 'raise ValueError(f"unknown account', 'raise UnknownAccount(f"unknown account')
+
+edit("ledger/journal.py", "from dataclasses import dataclass\n", "from dataclasses import dataclass\n\nfrom .errors import UnbalancedEntry\n")
+edit("ledger/journal.py", 'raise ValueError(f"unbalanced entry', 'raise UnbalancedEntry(f"unbalanced entry')
+
+edit("ledger/money.py", "def parse_amount(s):", "from .errors import InvalidAmount\n\n\ndef parse_amount(s):")
+edit("ledger/money.py", "Raises ValueError on junk.", "Raises InvalidAmount on junk.")
+edit("ledger/money.py", 'raise ValueError(f"bad amount', 'raise InvalidAmount(f"bad amount')
+
+write("ledger/importer.py", [==[
+import csv
+import io
+
+from .errors import ImportRowError, LedgerError
+from .journal import Entry
+from .money import parse_amount
+
+
+def import_csv(text, journal):
+    """Rows: date,memo,debit_account,credit_account,amount. Returns number of entries posted.
+
+    Raises ImportRowError (chaining the original error) on the first failing row.
+    Rows before the failing one remain posted.
+    """
+    n = 0
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        try:
+            cents = parse_amount(row["amount"])
+            journal.post(Entry(row["date"], row["memo"], [(row["debit_account"], cents), (row["credit_account"], -cents)]))
+        except LedgerError as exc:
+            raise ImportRowError(reader.line_num, exc) from exc
+        n += 1
+    return n
+]==])
+
+write("tests/test_ledger.py", [==[
+import unittest
+
+from ledger.accounts import Chart
+from ledger.errors import (
+    DuplicateAccount,
+    ImportRowError,
+    InvalidAccountType,
+    InvalidAmount,
+    LedgerError,
+    UnbalancedEntry,
+    UnknownAccount,
+)
+from ledger.importer import import_csv
+from ledger.journal import Entry, Journal
+from ledger.money import fmt, parse_amount
+from ledger.reports import balance_sheet, income_statement
+
+HEADER = "date,memo,debit_account,credit_account,amount\n"
+
+
+def make():
+    c = Chart()
+    for n, t in [("cash", "asset"), ("loan", "liability"), ("capital", "equity"), ("sales", "income"), ("rent", "expense")]:
+        c.add(n, t)
+    return Journal(c)
+
+
+class LedgerTests(unittest.TestCase):
+    def test_money(self):
+        self.assertEqual(parse_amount("1,200.5"), 120050)
+        self.assertEqual(fmt(-1234), "-12.34")
+
+    def test_bad_amount(self):
+        with self.assertRaises(InvalidAmount):
+            parse_amount("12.345")
+
+    def test_post_and_reports(self):
+        j = make()
+        j.post(Entry("2026-01-01", "seed", [("cash", 10000), ("capital", -10000)]))
+        j.post(Entry("2026-01-02", "sale", [("cash", 5000), ("sales", -5000)]))
+        j.post(Entry("2026-01-03", "rent", [("rent", 2000), ("cash", -2000)]))
+        self.assertEqual(balance_sheet(j), {"assets": 13000, "liabilities": 0, "equity": 13000})
+        self.assertEqual(income_statement(j, "2026-01-01", "2026-01-31")["net"], 3000)
+        with self.assertRaises(UnbalancedEntry):
+            j.post(Entry("2026-01-04", "bad", [("cash", 1)]))
+
+    def test_unknown_account(self):
+        j = make()
+        with self.assertRaises(UnknownAccount):
+            j.post(Entry("2026-01-04", "ghost", [("nope", 100), ("cash", -100)]))
+        with self.assertRaises(UnknownAccount):
+            j.chart.type_of("nope")
+
+    def test_chart_errors(self):
+        c = make()
+        with self.assertRaises(DuplicateAccount):
+            c.add("cash", "asset")
+        with self.assertRaises(InvalidAccountType):
+            c.add("misc", "bogus")
+
+    def test_error_hierarchy(self):
+        for cls in (InvalidAmount, InvalidAccountType, DuplicateAccount, UnknownAccount, UnbalancedEntry, ImportRowError):
+            self.assertTrue(issubclass(cls, LedgerError))
+            self.assertTrue(issubclass(cls, ValueError))
+        with self.assertRaises(ValueError):
+            make().post(Entry("2026-01-04", "bad", [("cash", 1)]))
+
+    def test_import(self):
+        j = make()
+        n = import_csv(HEADER + "2026-01-02,sale,cash,sales,12.50\n", j)
+        self.assertEqual((n, j.balance("cash")), (1, 1250))
+
+    def test_import_row_error(self):
+        j = make()
+        text = HEADER + "2026-01-02,sale,cash,sales,12.50\n2026-01-03,oops,cash,sales,abc\n2026-01-04,late,cash,sales,1.00\n"
+        with self.assertRaises(ImportRowError) as ctx:
+            import_csv(text, j)
+        err = ctx.exception
+        self.assertEqual(err.line, 3)
+        self.assertIsInstance(err.cause, InvalidAmount)
+        self.assertIs(err.__cause__, err.cause)
+        self.assertEqual(str(err), f"line 3: {err.cause}")
+        self.assertEqual(j.balance("cash"), 1250)
+        self.assertEqual(len(j.entries), 1)
+
+    def test_import_row_error_unknown_account(self):
+        j = make()
+        text = HEADER + "2026-01-02,sale,ghost,sales,1.00\n"
+        with self.assertRaises(ImportRowError) as ctx:
+            import_csv(text, j)
+        self.assertEqual(ctx.exception.line, 2)
+        self.assertIsInstance(ctx.exception.cause, UnknownAccount)
+
+
+if __name__ == "__main__":
+    unittest.main()
+]==])
+
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -20", {timeout = 120}).stdout)
+print(sh("grep -rn 'raise ValueError' ledger/ ; echo exit=$?").stdout)
+### RESULT
+.E.......
+======================================================================
+ERROR: test_chart_errors (tests.test_ledger.LedgerTests.test_chart_errors)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/var/folders/kx/nf54r3cx6lg5tz23l72qs14h0000gn/T/p0-ledger-refactor-errors-qw1x45_s/tests/test_ledger.py", line 57, in test_chart_errors
+    c.add("cash", "asset")
+    ^^^^^
+AttributeError: 'Journal' object has no attribute 'add'
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.001s
+
+FAILED (errors=1)
+
+exit=1
+
+### MODEL (turn 3)
+The one failure is in my new test: `make()` returns a `Journal`, not a `Chart`. I'll fix that test to build its own chart.
+[tool call luau]
+edit("tests/test_ledger.py", "    def test_chart_errors(self):\n        c = make()\n", "    def test_chart_errors(self):\n        c = Chart()\n        c.add(\"cash\", \"asset\")\n")
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -4", {timeout = 120}).stdout)
+print(sh("grep -rn 'raise ValueError' ledger/; echo exit=$?").stdout)
+### RESULT
+----------------------------------------------------------------------
+Ran 9 tests in 0.000s
+
+OK
+
+exit=1
+
+### MODEL (turn 4)
+All five error cases now raise their own `LedgerError` subclasses, and each also inherits `ValueError`. The new `ImportRowError` carries `line` and `cause`, is raised from `import_csv` with the original error chained, and rows before the failure stay posted. No `raise ValueError` remains in `ledger/`, and the 9 tests pass with the updated and new cases in `tests/test_ledger.py`.

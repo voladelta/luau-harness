@@ -1,0 +1,100 @@
+### TASK
+This is a small Python markdown-to-HTML converter (`wiki/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Bug report: when a paragraph contains two bold phrases, e.g. `**a** and **b**`, the output has one big bold region covering everything from the first `**` to the last `**`, including the text in between, instead of two separate bold phrases.
+
+Find and fix the bug. Don't change any public function names or signatures.
+
+
+[files in the working directory]
+tests/__init__.py (0 lines)
+tests/test_wiki.py (27 lines)
+wiki/__init__.py (0 lines)
+wiki/blocks.py (50 lines)
+wiki/convert.py (5 lines)
+wiki/html.py (21 lines)
+wiki/inline.py (23 lines)
+wiki/links.py (8 lines)
+wiki/toc.py (10 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+print(read("wiki/inline.py"))
+print(read("tests/test_wiki.py"))
+print(sh("cd . && python3 -m unittest discover -s tests -t . 2>&1 | tail -20").stdout)
+### RESULT
+import html
+import re
+
+_CODE = re.compile(r"`([^`]+)`")
+_BOLD = re.compile(r"\*\*(.+)\*\*")
+_EM = re.compile(r"\*(.+?)\*")
+_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+
+
+def render(text):
+    """Inline markup -> HTML. Code spans are protected from further formatting."""
+    text = html.escape(text, quote=False)
+    spans = []
+
+    def stash(m):
+        spans.append(f"<code>{m.group(1)}</code>")
+        return f"\x00{len(spans) - 1}\x00"
+
+    text = _CODE.sub(stash, text)
+    text = _BOLD.sub(r"<strong>\1</strong>", text)
+    text = _EM.sub(r"<em>\1</em>", text)
+    text = _LINK.sub(r'<a href="\2">\1</a>', text)
+    return re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], text)
+
+import unittest
+
+from wiki.convert import convert
+from wiki.links import extract
+from wiki.toc import build, slug
+from wiki import blocks
+
+
+class WikiTests(unittest.TestCase):
+    def test_convert(self):
+        out = convert("# Hi There\n\nsome *em* and `x*y*` text\n\n- a\n- b\n")
+        self.assertIn('<h1 id="hi-there">Hi There</h1>', out)
+        self.assertIn("<em>em</em>", out)
+        self.assertIn("<code>x*y*</code>", out)
+        self.assertIn("<ul><li>a</li><li>b</li></ul>", out)
+
+    def test_code_and_links(self):
+        self.assertIn("<pre><code>a &lt; b</code></pre>", convert("```\na < b\n```"))
+        self.assertEqual(extract("see [x](http://a) and [y](b)"), [("x", "http://a"), ("y", "b")])
+
+    def test_toc(self):
+        self.assertEqual(build(blocks.parse("# A\n## B c")), [(1, "A", "a"), (2, "B c", "b-c")])
+        self.assertEqual(slug("Hello, World!"), "hello-world")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK
+
+### MODEL (turn 2)
+The bug is the greedy `(.+)` in `_BOLD`, which spans from the first `**` to the last. I'll make it non-greedy, add a regression test for two bold phrases, and rerun the suite.
+[tool call luau]
+print(edit("wiki/inline.py", '_BOLD = re.compile(r"\\*\\*(.+)\\*\\*")', '_BOLD = re.compile(r"\\*\\*(.+?)\\*\\*")'))
+print(edit("tests/test_wiki.py", '        self.assertIn("<code>x*y*</code>", out)\n', '        self.assertIn("<code>x*y*</code>", out)\n        self.assertIn("<strong>a</strong> and <strong>b</strong>", convert("**a** and **b**"))\n'))
+print(sh("python3 -m unittest discover -s tests -t . 2>&1 | tail -5").stdout)
+### RESULT
+ok: 1 replacement, +1/-1 lines
+ok: 1 replacement, +2/-1 lines
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK
+
+### MODEL (turn 3)
+The bold regex in `wiki/inline.py` was greedy (`\*\*(.+)\*\*`), so it matched from the first `**` to the last. I made it non-greedy (`.+?`) and added a regression test for `**a** and **b**` in `tests/test_wiki.py`. The suite passes (3 tests, OK).

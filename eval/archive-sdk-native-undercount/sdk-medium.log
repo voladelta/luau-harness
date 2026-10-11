@@ -1,0 +1,15 @@
+ledger-bug-amount hx:claude-sdk/haiku #1: PASS tokens=14750 turns=3 cost=0.0009578600000000002
+ledger-feature-register hx:claude-sdk/haiku #1: PASS tokens=39119 turns=5 cost=0.00299172
+ledger-refactor-errors hx:claude-sdk/haiku #1: PASS tokens=34798 turns=4 cost=0.004350530000000001
+log-bug-percentile hx:claude-sdk/haiku #1: PASS tokens=15178 turns=3 cost=0.00117348
+log-feature-cli hx:claude-sdk/haiku #1: PASS tokens=36033 turns=4 cost=0.004921610000000001
+log-refactor-record hx:claude-sdk/haiku #1: PASS tokens=21931 turns=3 cost=0.0027246899999999997
+shop-bug-tax hx:claude-sdk/haiku #1: PASS tokens=36173 turns=6 cost=0.00201784
+shop-feature-bogo hx:claude-sdk/haiku #1: PASS tokens=21655 turns=3 cost=0.00380488
+shop-refactor-cents hx:claude-sdk/haiku #1: PASS tokens=20141 turns=3 cost=0.00257891
+taskq-bug-retry hx:claude-sdk/haiku #1: PASS tokens=15540 turns=3 cost=0.00091051
+taskq-feature-deps hx:claude-sdk/haiku #1: PASS tokens=21807 turns=3 cost=0.00411249
+taskq-refactor-status hx:claude-sdk/haiku #1: PASS tokens=19888 turns=3 cost=0.0023379000000000004
+wiki-bug-bold hx:claude-sdk/haiku #1: PASS tokens=21027 turns=4 cost=0.0011089
+wiki-feature-ol-toc hx:claude-sdk/haiku #1: PASS tokens=36029 turns=4 cost=0.005214860000000001
+wiki-refactor-blocks hx:claude-sdk/haiku #1: PASS tokens=19599 turns=3 cost=0.0026117099999999997

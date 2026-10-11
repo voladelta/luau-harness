@@ -1,0 +1,424 @@
+### TASK
+This is a small Python log-analysis tool (`logkit/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Refactor: log records are plain dicts (`r["level"]`, `r["fields"]["ms"]`, ...) passed through every module. Replace them with a dataclass:
+
+- New module `logkit/record.py` with `@dataclass class Record` having the attributes `ts` (datetime), `level`, `component`, `fields` (dict), `msg`, `raw`.
+- `parser.parse_line` returns a `Record` (or `None` for malformed lines); `read_records` returns a list of `Record`.
+- `filters`, `stats`, `render` and `cli` use attribute access. `stats.count_by(records, key)` keeps taking the attribute name as a string (`"level"`, `"component"`).
+- No dict-style access to record keys (`r["level"]`, `r["fields"]`, ...) may remain anywhere in `logkit/`.
+- Behaviour, output and the CLI are otherwise unchanged. Update the existing tests.
+
+
+[files in the working directory]
+logkit/__init__.py (0 lines)
+logkit/cli.py (38 lines)
+logkit/filters.py (19 lines)
+logkit/parser.py (29 lines)
+logkit/render.py (17 lines)
+logkit/stats.py (28 lines)
+logkit/timeutil.py (16 lines)
+tests/__init__.py (0 lines)
+tests/test_logkit.py (27 lines)
+### MODEL (turn 1)
+I'll read the whole package and its tests first, then make the refactor.
+[tool call luau]
+local files = {"logkit/cli.py", "logkit/filters.py", "logkit/parser.py", "logkit/render.py", "logkit/stats.py", "logkit/timeutil.py", "logkit/__init__.py", "tests/test_logkit.py"}
+for _, f in ipairs(files) do
+	print("=== " .. f)
+	print(read(f))
+end
+### RESULT
+=== logkit/cli.py
+import sys
+
+from .filters import by_component, by_level
+from .parser import read_records
+from .render import summary_text
+
+
+def main(argv):
+    if not argv:
+        print("usage: logkit FILE [--level L] [--component C] [--summary]", file=sys.stderr)
+        return 2
+    path, opts = argv[0], argv[1:]
+    records = read_records(path)
+    i = 0
+    summary = False
+    while i < len(opts):
+        if opts[i] == "--level":
+            records = by_level(records, opts[i + 1])
+            i += 2
+        elif opts[i] == "--component":
+            records = by_component(records, opts[i + 1])
+            i += 2
+        elif opts[i] == "--summary":
+            summary = True
+            i += 1
+        else:
+            print(f"unknown option: {opts[i]}", file=sys.stderr)
+            return 2
+    if summary:
+        print(summary_text(records))
+    else:
+        for r in records:
+            print(r["raw"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
+=== logkit/filters.py
+from .parser import LEVELS
+
+
+def by_level(records, min_level):
+    floor = LEVELS.index(min_level)
+    return [r for r in records if LEVELS.index(r["level"]) >= floor]
+
+
+def by_component(records, component):
+    return [r for r in records if r["component"] == component]
+
+
+def between(records, start=None, end=None):
+    """start inclusive, end exclusive; either may be None."""
+    return [r for r in records if (start is None or r["ts"] >= start) and (end is None or r["ts"] < end)]
+
+
+def has_field(records, name):
+    return [r for r in records if name in r["fields"]]
+
+=== logkit/parser.py
+import shlex
+
+from .timeutil import parse_ts
+
+LEVELS = ["DEBUG", "INFO", "WARN", "ERROR"]
+
+
+def parse_line(line):
+    """`<ts> <LEVEL> <component> key=value ... ["message"]` -> record dict, or None if malformed."""
+    parts = line.strip().split(None, 3)
+    if len(parts) < 3 or parts[1] not in LEVELS:
+        return None
+    try:
+        ts = parse_ts(parts[0])
+    except ValueError:
+        return None
+    fields, msg = {}, []
+    for tok in shlex.split(parts[3]) if len(parts) == 4 else []:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            fields[k] = v
+        else:
+            msg.append(tok)
+    return {"ts": ts, "level": parts[1], "component": parts[2], "fields": fields, "msg": " ".join(msg), "raw": line.rstrip("\n")}
+
+
+def read_records(path):
+    with open(path) as f:
+        return [r for r in map(parse_line, f) if r]
+
+=== logkit/render.py
+from .stats import count_by, error_rate, latency_summary
+
+
+def table(rows, cols):
+    widths = [max(len(str(c)), *(len(str(r[c])) for r in rows)) if rows else len(str(c)) for c in cols]
+    lines = ["  ".join(str(c).ljust(w) for c, w in zip(cols, widths))]
+    lines += ["  ".join(str(r[c]).ljust(w) for c, w in zip(cols, widths)) for r in rows]
+    return "\n".join(lines)
+
+
+def summary_text(records):
+    lat = latency_summary(records)
+    out = [f"records: {len(records)}", f"error rate: {error_rate(records):.1%}"]
+    out.append(table([{"level": k, "count": v} for k, v in sorted(count_by(records, "level").items())], ["level", "count"]))
+    if lat["count"]:
+        out.append(f"latency ms: p50={lat['p50']:g} p95={lat['p95']:g} max={lat['max']:g}")
+    return "\n".join(out)
+
+=== logkit/stats.py
+import math
+from collections import Counter
+
+
+def count_by(records, key):
+    return dict(Counter(r[key] for r in records))
+
+
+def percentile(values, p):
+    """Nearest-rank percentile: sorted[ceil(p/100 * n) - 1]."""
+    if not values:
+        raise ValueError("no values")
+    s = sorted(values)
+    rank = max(1, math.ceil(p / 100 * len(s)))
+    return s[rank - 1]
+
+
+def latency_summary(records, field="ms"):
+    vals = [float(r["fields"][field]) for r in records if field in r["fields"]]
+    if not vals:
+        return {"count": 0, "p50": None, "p95": None, "max": None}
+    return {"count": len(vals), "p50": percentile(vals, 50), "p95": percentile(vals, 95), "max": max(vals)}
+
+
+def error_rate(records):
+    if not records:
+        return 0.0
+    return sum(1 for r in records if r["level"] == "ERROR") / len(records)
+
+=== logkit/timeutil.py
+from datetime import datetime, timezone
+
+
+def parse_ts(s):
+    """Parse an ISO-8601 UTC timestamp like 2026-01-05T10:00:03Z."""
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def fmt_ts(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def bucket(dt, seconds):
+    """Floor `dt` to a multiple of `seconds` since the epoch."""
+    t = int(dt.timestamp())
+    return datetime.fromtimestamp(t - t % seconds, tz=timezone.utc)
+
+=== logkit/__init__.py
+
+=== tests/test_logkit.py
+import unittest
+
+from logkit.filters import between, by_level
+from logkit.parser import parse_line
+from logkit.stats import percentile
+from logkit.timeutil import parse_ts
+
+LINE = '2026-01-05T10:00:03Z INFO auth user=alice ms=120 "login ok"'
+
+
+class LogkitTests(unittest.TestCase):
+    def test_parse(self):
+        r = parse_line(LINE)
+        self.assertEqual((r["level"], r["component"], r["fields"]["ms"], r["msg"]), ("INFO", "auth", "120", "login ok"))
+        self.assertIsNone(parse_line("garbage"))
+
+    def test_filters(self):
+        rs = [parse_line(LINE), parse_line("2026-01-05T10:00:09Z ERROR db ms=900 boom")]
+        self.assertEqual(len(by_level(rs, "WARN")), 1)
+        self.assertEqual(len(between(rs, start=parse_ts("2026-01-05T10:00:05Z"))), 1)
+
+    def test_percentile(self):
+        self.assertEqual(percentile([1, 2, 3, 4, 5], 50), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+### MODEL (turn 2)
+The package is small, so I'll rewrite each module, update the tests, then run the suite and grep for leftover dict-style record access.
+[tool call luau]
+write("logkit/record.py", [==[
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass
+class Record:
+    ts: datetime
+    level: str
+    component: str
+    fields: dict
+    msg: str
+    raw: str
+]==])
+
+edit("logkit/parser.py", "from .timeutil import parse_ts", "from .record import Record\nfrom .timeutil import parse_ts")
+edit("logkit/parser.py", '"""`<ts> <LEVEL> <component> key=value ... ["message"]` -> record dict, or None if malformed."""', '"""`<ts> <LEVEL> <component> key=value ... ["message"]` -> Record, or None if malformed."""')
+edit("logkit/parser.py", 'return {"ts": ts, "level": parts[1], "component": parts[2], "fields": fields, "msg": " ".join(msg), "raw": line.rstrip("\\n")}',
+	'return Record(ts=ts, level=parts[1], component=parts[2], fields=fields, msg=" ".join(msg), raw=line.rstrip("\\n"))')
+edit("logkit/parser.py", "return [r for r in map(parse_line, f) if r]", "return [r for r in map(parse_line, f) if r is not None]")
+
+write("logkit/filters.py", [==[
+from .parser import LEVELS
+
+
+def by_level(records, min_level):
+    floor = LEVELS.index(min_level)
+    return [r for r in records if LEVELS.index(r.level) >= floor]
+
+
+def by_component(records, component):
+    return [r for r in records if r.component == component]
+
+
+def between(records, start=None, end=None):
+    """start inclusive, end exclusive; either may be None."""
+    return [r for r in records if (start is None or r.ts >= start) and (end is None or r.ts < end)]
+
+
+def has_field(records, name):
+    return [r for r in records if name in r.fields]
+]==])
+
+write("logkit/stats.py", [==[
+import math
+from collections import Counter
+
+
+def count_by(records, key):
+    return dict(Counter(getattr(r, key) for r in records))
+
+
+def percentile(values, p):
+    """Nearest-rank percentile: sorted[ceil(p/100 * n) - 1]."""
+    if not values:
+        raise ValueError("no values")
+    s = sorted(values)
+    rank = max(1, math.ceil(p / 100 * len(s)))
+    return s[rank - 1]
+
+
+def latency_summary(records, field="ms"):
+    vals = [float(r.fields[field]) for r in records if field in r.fields]
+    if not vals:
+        return {"count": 0, "p50": None, "p95": None, "max": None}
+    return {"count": len(vals), "p50": percentile(vals, 50), "p95": percentile(vals, 95), "max": max(vals)}
+
+
+def error_rate(records):
+    if not records:
+        return 0.0
+    return sum(1 for r in records if r.level == "ERROR") / len(records)
+]==])
+
+write("logkit/render.py", [==[
+from .stats import count_by, error_rate, latency_summary
+
+
+def table(rows, cols):
+    """rows: sequences of values, ordered like cols."""
+    widths = [max(len(str(c)), *(len(str(row[i])) for row in rows)) if rows else len(str(c)) for i, c in enumerate(cols)]
+    lines = ["  ".join(str(c).ljust(w) for c, w in zip(cols, widths))]
+    lines += ["  ".join(str(v).ljust(w) for v, w in zip(row, widths)) for row in rows]
+    return "\n".join(lines)
+
+
+def summary_text(records):
+    lat = latency_summary(records)
+    out = [f"records: {len(records)}", f"error rate: {error_rate(records):.1%}"]
+    out.append(table([[k, v] for k, v in sorted(count_by(records, "level").items())], ["level", "count"]))
+    if lat["count"]:
+        out.append(f"latency ms: p50={lat['p50']:g} p95={lat['p95']:g} max={lat['max']:g}")
+    return "\n".join(out)
+]==])
+
+edit("logkit/cli.py", "            print(r[\"raw\"])", "            print(r.raw)")
+
+write("tests/test_logkit.py", [==[
+import unittest
+
+from logkit.filters import between, by_level
+from logkit.parser import parse_line
+from logkit.record import Record
+from logkit.stats import percentile
+from logkit.timeutil import parse_ts
+
+LINE = '2026-01-05T10:00:03Z INFO auth user=alice ms=120 "login ok"'
+
+
+class LogkitTests(unittest.TestCase):
+    def test_parse(self):
+        r = parse_line(LINE)
+        self.assertIsInstance(r, Record)
+        self.assertEqual((r.level, r.component, r.fields["ms"], r.msg), ("INFO", "auth", "120", "login ok"))
+        self.assertIsNone(parse_line("garbage"))
+
+    def test_filters(self):
+        rs = [parse_line(LINE), parse_line("2026-01-05T10:00:09Z ERROR db ms=900 boom")]
+        self.assertEqual(len(by_level(rs, "WARN")), 1)
+        self.assertEqual(len(between(rs, start=parse_ts("2026-01-05T10:00:05Z"))), 1)
+
+    def test_percentile(self):
+        self.assertEqual(percentile([1, 2, 3, 4, 5], 50), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+]==])
+
+local t = sh("cd " .. "/private/var/folders/kx/nf54r3cx6lg5tz23l72qs14h0000gn/T/hx-claude-sdk" .. " && python3 -m unittest discover -s tests -t . 2>&1; echo '--- dict-style hits:'; grep -nE '\\b(r|rec|record|x)\\[\"' logkit/*.py; true")
+print(t.stdout, t.stderr)
+### RESULT
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/mbp/.local/share/uv/python/cpython-3.14.7-macos-aarch64-none/lib/python3.14/unittest/__main__.py", line 18, in <module>
+    main(module=None)
+    ~~~~^^^^^^^^^^^^^
+  File "/Users/mbp/.local/share/uv/python/cpython-3.14.7-macos-aarch64-none/lib/python3.14/unittest/main.py", line 103, in __init__
+    self.parseArgs(argv)
+    ~~~~~~~~~~~~~~^^^^^^
+  File "/Users/mbp/.local/share/uv/python/cpython-3.14.7-macos-aarch64-none/lib/python3.14/unittest/main.py", line 119, in parseArgs
+    self._do_discovery(argv[2:])
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/mbp/.local/share/uv/python/cpython-3.14.7-macos-aarch64-none/lib/python3.14/unittest/main.py", line 242, in _do_discovery
+    self.createTests(from_discovery=True, Loader=Loader)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mbp/.local/share/uv/python/cpython-3.14.7-macos-aarch64-none/lib/python3.14/unittest/main.py", line 149, in createTests
+    self.test = loader.discover(self.start, self.pattern, self.top)
+                ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mbp/.local/share/uv/python/cpython-3.14.7-macos-aarch64-none/lib/python3.14/unittest/loader.py", line 273, in discover
+    top_level_dir = os.path.abspath(top_level_dir)
+  File "<frozen posixpath>", line 381, in abspath
+PermissionError: [Errno 1] Operation not permitted
+--- dict-style hits:
+	grep: logkit/*.py: No such file or directory
+
+### MODEL (turn 3)
+The test run hit a permission error, and the grep found no `logkit/` directory, so the `cd` into the absolute path was probably the problem. I'll drop the `cd` and check the working directory first.
+[tool call luau]
+local p = sh("pwd; ls -la; ls logkit tests")
+print(p.stdout, p.stderr)
+### RESULT
+/private/var/folders/kx/nf54r3cx6lg5tz23l72qs14h0000gn/T/p0-log-refactor-record-aocn8sb6
+total 0
+drwxr-xr-x      5 mbp  staff     160 Oct 11 14:32 .
+drwx------@ 21830 mbp  staff  698560 Oct 11 14:32 ..
+drwxr-xr-x      3 mbp  staff      96 Oct 11 14:32 .harness
+drwxr-xr-x     10 mbp  staff     320 Oct 11 14:33 logkit
+drwxr-xr-x      4 mbp  staff     128 Oct 10 11:20 tests
+logkit:
+__init__.py
+cli.py
+filters.py
+parser.py
+record.py
+render.py
+stats.py
+timeutil.py
+
+tests:
+__init__.py
+test_logkit.py
+	
+### MODEL (turn 4)
+The project root is actually `p0-log-refactor-record-aocn8sb6`, and the earlier `cd` pointed at the wrong directory. My edits go through the relative paths, so they landed here. I'll run the tests and the grep from this directory.
+[tool call luau]
+local t = sh("python3 -m unittest discover -s tests -t . 2>&1; echo '--- dict-style hits:'; grep -nE '[A-Za-z_]+\\[\"' logkit/*.py; true")
+print(t.stdout, t.stderr)
+### RESULT
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK
+--- dict-style hits:
+logkit/render.py:16:    if lat["count"]:
+	
+### MODEL (turn 5)
+The refactor is done: `logkit/record.py` adds a `Record` dataclass, and the parser, filters, stats, render, and CLI now use attribute access. The three existing tests pass after updating them to the new attributes. The only remaining bracket-string access in `logkit/` is `lat["count"]` in `render.py`, which reads the latency summary dict from `stats`, not a record.

@@ -1,0 +1,66 @@
+### TASK
+This is a small Python log-analysis tool (`logkit/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`).
+
+Bug report: the latency percentiles printed by `--summary` are too high on some inputs. For example, with exactly 20 requests whose latencies are 1..20 ms, p95 is reported as 20 and not 19, and the p50 of four values 1,2,3,4 is reported as 3. The percentile function is supposed to use the nearest-rank method.
+
+Find and fix the bug. Don't change any public function names or signatures.
+
+
+[files in the working directory]
+logkit/__init__.py (0 lines)
+logkit/cli.py (38 lines)
+logkit/filters.py (19 lines)
+logkit/parser.py (29 lines)
+logkit/render.py (17 lines)
+logkit/stats.py (27 lines)
+logkit/timeutil.py (16 lines)
+tests/__init__.py (0 lines)
+tests/test_logkit.py (27 lines)
+### MODEL (turn 1)
+
+[tool call luau]
+print(read("logkit/stats.py"))
+### RESULT
+import math
+from collections import Counter
+
+
+def count_by(records, key):
+    return dict(Counter(r[key] for r in records))
+
+
+def percentile(values, p):
+    """Nearest-rank percentile: sorted[ceil(p/100 * n) - 1]."""
+    if not values:
+        raise ValueError("no values")
+    s = sorted(values)
+    return s[min(len(s) - 1, int(p / 100 * len(s)))]
+
+
+def latency_summary(records, field="ms"):
+    vals = [float(r["fields"][field]) for r in records if field in r["fields"]]
+    if not vals:
+        return {"count": 0, "p50": None, "p95": None, "max": None}
+    return {"count": len(vals), "p50": percentile(vals, 50), "p95": percentile(vals, 95), "max": max(vals)}
+
+
+def error_rate(records):
+    if not records:
+        return 0.0
+    return sum(1 for r in records if r["level"] == "ERROR") / len(records)
+
+### MODEL (turn 2)
+Floating-point care: 95/100*20 = 19.0 exactly? Use integer math to be safe.
+[tool call luau]
+edit("logkit/stats.py","s[min(len(s) - 1, int(p / 100 * len(s)))]","s[max(0, min(len(s) - 1, -(-p * len(s) // 100) - 1))]")
+print(sh("python3 -c \"from logkit.stats import percentile as p;print(p(list(range(1,21)),95),p([1,2,3,4],50),p([5],0))\"; python3 -m unittest discover -s tests -t . 2>&1|tail -3").stdout)
+### RESULT
+19 2 5
+Ran 3 tests in 0.000s
+
+OK
+
+### MODEL (turn 3)
+I fixed `percentile` in `logkit/stats.py`. It was indexing with `int(p/100*n)` and now uses the nearest-rank formula `ceil(p*n/100) - 1`. That formula is computed with integer math, so float rounding can't shift the index.
+
+Your examples now give the expected results: p95 of 1..20 is 19, and p50 of 1,2,3,4 is 2. The existing tests pass. I didn't add a regression test for these cases.
