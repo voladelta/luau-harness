@@ -23,7 +23,9 @@ def hit(r):  # share of prompt tokens served from the provider's prompt cache
 def stats(rs):
     ok = [r for r in rs if "harness_error" not in r]
     solved = [r for r in ok if r["passed"]]
+    sc = [r["score"] for r in rs if "score" in r]
     d = {"pass": f"{sum(r['passed'] for r in rs)}/{len(rs)}", "errs": len(rs) - len(ok),
+         "score": sum(a for a, _ in sc) / sum(b for _, b in sc) if sc else None,
          "tok": med([r["tokens_total"] for r in solved]), "fresh": med([r["tokens_fresh"] for r in solved]),
          "cost": med([r["cost_usd"] for r in solved if r.get("cost_usd") is not None]),
          "turns": med([r["turns"] for r in ok if r.get("turns") is not None]), "wall": med([r["wall_secs"] for r in ok]),
@@ -36,12 +38,12 @@ def stats(rs):
     return d
 
 D = {(t, s): stats(by[(t, s)]) for t in tasks for s in systems if by[(t, s)]}
-print(f"{'task':<24}{'system':<18}{'pass':<6}{'tok':>8}{'fresh':>8}{'cost$':>8}{'turns':>6}{'luauErr%':>9}{'ops/t':>6}{'wall s':>7}{'cache%':>7}")
+print(f"{'task':<24}{'system':<18}{'pass':<6}{'score':>6}{'tok':>8}{'fresh':>8}{'cost$':>8}{'turns':>6}{'luauErr%':>9}{'ops/t':>6}{'wall s':>7}{'cache%':>7}")
 for t in tasks:
     for s in systems:
         if (t, s) in D:
             d = D[(t, s)]
-            print(f"{t:<24}{short(s):<18}{d['pass']:<6}{f(d['tok']):>8}{f(d['fresh']):>8}{f(d['cost'],4):>8}{f(d['turns'],1):>6}"
+            print(f"{t:<24}{short(s):<18}{d['pass']:<6}{f(None if d['score'] is None else 100 * d['score']):>6}{f(d['tok']):>8}{f(d['fresh']):>8}{f(d['cost'],4):>8}{f(d['turns'],1):>6}"
                   f"{f(None if d.get('err') is None else d['err']*100):>9}{f(d.get('ops'),1):>6}{f(d['wall']):>7}{f(None if d['hit'] is None else d['hit']*100):>7}")
 
 print("\nPER SYSTEM (medians over tasks with >=1 solve; pass = all runs)")
@@ -49,7 +51,9 @@ for s in systems:
     xs = [D[(t, s)] for t in tasks if (t, s) in D]
     sol = [d for d in xs if d["tok"] is not None]
     p = sum(r["passed"] for r in rows if r["system"] == s); n = sum(1 for r in rows if r["system"] == s)
-    print(f"  {short(s):<16} pass={p}/{n}  tok={f(med([d['tok'] for d in sol]))} fresh={f(med([d['fresh'] for d in sol]))} "
+    sc = [r["score"] for r in rows if r["system"] == s and "score" in r]
+    sc = f" tests={sum(a for a, _ in sc)}/{sum(b for _, b in sc)}" if sc else ""
+    print(f"  {short(s):<16} pass={p}/{n}{sc}  tok={f(med([d['tok'] for d in sol]))} fresh={f(med([d['fresh'] for d in sol]))} "
           f"cost=${f(med([d['cost'] for d in sol if d['cost'] is not None]),4)} turns={f(med([d['turns'] for d in sol]),1)} wall={f(med([d['wall'] for d in sol]))}s "
           f"cache_hit={f(med([d['hit'] for d in sol if d['hit'] is not None]) and 100 * med([d['hit'] for d in sol if d['hit'] is not None]))}%")
 

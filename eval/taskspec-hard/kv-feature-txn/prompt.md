@@ -1,0 +1,12 @@
+This is a small Python log-structured key-value store (`kv/`, tests in `tests/`, run with `python3 -m unittest discover -s tests -t .`). Changes go to a write-ahead log (`wal.log` in the store directory) and an in-memory table, which is flushed into immutable segment files.
+
+`Store.transaction()` buffers writes and applies them on commit, but it is not atomic, it cannot be nested, and it silently overwrites concurrent changes. Make transactions work as follows:
+
+1. **Atomic commit.** All writes of a committed top-level transaction reach the log as one unit. If the process dies at any moment while committing, reopening the store shows either all of that transaction's writes or none of them, and nothing written before is lost. Keep the log in `wal.log` as an append-only file: tests simulate a crash by cutting `wal.log` at every byte offset between its size before the commit and its size after it. A transaction without writes leaves the log unchanged. Stores written by the current version must still open.
+2. **Nesting.** `txn.begin()` returns a child transaction (also usable as a context manager). A child reads its own writes first, then its parent's (and so on up the chain), then the store. Committing a child moves its writes into the parent; nothing reaches the store or the log until the top-level transaction commits. Rolling back a child discards only the child's writes.
+   - A transaction has at most one open child. While a child is open, calling `begin`, `get`, `put`, `delete` or `commit` on the parent raises `TxnError`. `rollback` on the parent is allowed and also rolls back the open child.
+   - Any call except the context-manager exit on a finished (committed or rolled back) transaction raises `TxnError`.
+   - As a context manager, a transaction commits on normal exit and rolls back when an exception escapes; the exception still propagates.
+3. **Conflicts (first committer wins).** Committing a top-level transaction raises `ConflictError` (a new subclass of `TxnError`, importable from `kv.txn`) if any key it writes, including writes folded in from children, was changed in the store after the transaction was created. Changes are `Store.put`, `Store.delete` and other transactions' commits, even when they write the value the key already had. Keys that were only read don't conflict. When the commit raises, nothing is written and the transaction is finished. Conflict tracking only needs to cover changes made through the same `Store` object while it is open.
+
+Update or add tests as you see fit.

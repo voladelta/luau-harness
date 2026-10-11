@@ -4,7 +4,9 @@ the grader must FAIL on the starting repo and PASS after the reference solution.
 
 taskspec/<id>/{prompt.md, hidden_test.py, task.py}; task.py defines DOMAIN and either MUTATIONS
 [(path, good, bad)] (bug tasks: the repo gets `bad`, the solution restores `good`) or solve(h), plus optional CHECK
-(extra shell lines for grade.sh, run with cwd = workspace).
+(extra shell lines for grade.sh, run with cwd = workspace). A taskspec/<id>/solution/ tree, if present, is the
+reference solution: it is copied over the repo (after any solve/MUTATIONS) for --verify.
+--score adds a final "SCORE passed/total" line (hidden test methods passed) to grade.sh, for partial credit.
 Output layout (what run.py expects): tasks/<id>/{prompt.md, repo/, grade.sh, hidden/test_hidden.py}.
 """
 import argparse, hashlib, os, shutil, subprocess, sys, tempfile
@@ -15,6 +17,7 @@ _ap = argparse.ArgumentParser()
 _ap.add_argument("--verify", action="store_true")
 _ap.add_argument("--spec", default="taskspec")
 _ap.add_argument("--out", default="tasks")
+_ap.add_argument("--score", action="store_true")
 _args = _ap.parse_args()
 SPEC = HERE / _args.spec
 OUT = HERE.parent / _args.out
@@ -24,9 +27,19 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 fail=0
 PYTHONPATH=. python3 -m unittest discover -s "$TASK_DIR/hidden" -p 'test_hidden.py' >/tmp/grade.$$ 2>&1 || { tail -15 /tmp/grade.$$; fail=1; }
-rm -f /tmp/grade.$$
+%srm -f /tmp/grade.$$
 %s
 exit $fail
+"""
+# Failing test methods are counted once (subTests included); a hidden file that fails to import scores 0.
+SCORE = """python3 - "$TASK_DIR/hidden/test_hidden.py" /tmp/grade.$$ <<'PY'
+import re, sys
+total = len(re.findall(r"^    def test_", open(sys.argv[1]).read(), re.M))
+out = open(sys.argv[2]).read()
+m = re.search(r"^Ran (\\d+) test", out, re.M)
+bad = set(re.findall(r"^(?:FAIL|ERROR): (\\w+)", out, re.M))
+print(f"SCORE {total - len(bad) if m and int(m.group(1)) == total else 0}/{total}")
+PY
 """
 
 class H:
@@ -55,7 +68,7 @@ def build():
         make_repo(ns, d / "repo")
         shutil.copy(spec / "prompt.md", d / "prompt.md")
         (d / "hidden").mkdir(); shutil.copy(spec / "hidden_test.py", d / "hidden" / "test_hidden.py")
-        (d / "grade.sh").write_text(GRADE % ns.get("CHECK", ""))
+        (d / "grade.sh").write_text(GRADE % (SCORE if _args.score else "", ns.get("CHECK", "")))
     lines = []
     for f in sorted(p for p in OUT.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
         lines.append(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.relative_to(OUT)}")
@@ -76,8 +89,10 @@ def verify():
             b = Path(t) / "solved"; shutil.copytree(task / "repo", b)
             if ns.get("MUTATIONS"):
                 for path, good, badtxt in ns["MUTATIONS"]: H(b).edit(path, badtxt, good)
-            else:
+            elif "solve" in ns:
                 ns["solve"](H(b))
+            if (spec / "solution").is_dir():
+                shutil.copytree(spec / "solution", b, dirs_exist_ok=True)
             r1 = grade(task, b)
         ok = r0.returncode != 0 and r1.returncode == 0
         bad += not ok

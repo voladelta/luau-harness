@@ -250,3 +250,19 @@ Output tokens: the streamed assistant events carry usage from before a reply is 
 message reports the `result` event's exact usage minus what earlier segments already reported.
 Eval (1 run/task, frozen 15 + unseen 5), all 40/40 pass: Haiku medium 7.5k/5.1k fresh tokens per task, high 10.6k/7.8k (same passes, ~40% more
 cost), Sonnet low 4.3k/3.7k, medium 3.7k/3.5k (3.2 turns, ~10x Haiku's $/task). Suites are saturated; they separate efficiency, not quality.
+
+## Hard suite: tasks-hard/ (2026-10-11)
+The frozen and unseen suites are saturated (every configuration passes everything), so they only separate efficiency. `tasks-hard/`
+(9 tasks, built by `python3 eval/build_tasks.py --spec taskspec-hard --out tasks-hard --score --verify`) is meant to separate quality.
+Four new domains, 300-860 lines each (old domains are ~100): `qengine` (SQL engine: lexer, parser, evaluator, grouping, joins),
+`recur` (RFC 5545 recurrence subset), `kv` (log-structured store: WAL with checksums, memtable, segments, compaction, transactions),
+`diffy` (LCS diff, GNU-compatible unified output, parser, patch apply).
+- Features with many precise rules: SQL NULL semantics (12 hidden tests), BYDAY ordinals + negative BYMONTHDAY + BYSETPOS + describe(),
+  atomic/nested/conflict-checked transactions (crash simulated by cutting wal.log at every byte), GNU-patch fuzzy apply + report + .rej.
+- Performance with exact-equivalence: hash join that must reproduce the nested-loop output byte for byte (digests of the old output).
+- Multi-cause bug reports: 5 qengine symptoms with separate causes; recur month-end (helper clamps + iterative anchor, both needed);
+  kv tombstones dropped by partial compaction + stale scan order + torn WAL tail not truncated; diffy empty-range headers (formatter and
+  parser wrong in matching ways, so round-trip tests pass) + hunk merge off by one.
+Every task's starting repo passes its own visible tests. `taskspec-hard/<id>/solution/` holds the reference solution used by --verify.
+`--score` appends `SCORE passed/total` (hidden test methods) to grade.sh; run.py stores it as `score`, report.py shows it, so a failed
+task still says how close it got. The frozen suites are built without --score and stay byte-identical (MANIFEST unchanged).

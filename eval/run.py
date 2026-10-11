@@ -7,7 +7,7 @@ ASSUMED task layout (tasks/ was not present when this was written; adjust TASK_*
   tasks/<id>/grade.sh    run with cwd = workspace; exit 0 = pass
 Tasks are never modified; each run works in a throwaway copy.
 """
-import argparse, json, os, shutil, subprocess, sys, tempfile, time
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -121,8 +121,10 @@ def main():
                 g = subprocess.run(["bash", str(task / TASK_GRADE)], cwd=ws, env={**os.environ, "TASK_DIR": str(task.resolve())},
                                    capture_output=True, text=True, timeout=600)
                 r.update(task=task.name, system=system, run=run, passed=(g.returncode == 0), grader_tail=(g.stdout + g.stderr)[-300:])
+                m = re.search(r"^SCORE (\d+)/(\d+)$", g.stdout, re.M)  # partial credit (suites built with --score)
+                if m: r["score"] = [int(m.group(1)), int(m.group(2))]
                 with results.open("a") as f: f.write(json.dumps(r) + "\n")
-                print(f"{task.name} {system} #{run}: {'PASS' if r['passed'] else 'FAIL'} tokens={r.get('tokens_total')} turns={r.get('turns')} cost={r.get('cost_usd')}", flush=True)
+                print(f"{task.name} {system} #{run}: {'PASS' if r['passed'] else 'FAIL'}{' %d/%d' % tuple(r['score']) if 'score' in r else ''} tokens={r.get('tokens_total')} turns={r.get('turns')} cost={r.get('cost_usd')}", flush=True)
                 shutil.rmtree(ws, ignore_errors=True)
 
 if __name__ == "__main__":
