@@ -21,6 +21,7 @@ function M.run(cfg)
 	end
 	require("std/packages").install({ hooks = hooks })
 	require("std/mcp").install({ hooks = hooks })
+	require("std/compact").install({ hooks = hooks }) -- adds nothing to requests until the context nears the window
 	for _, name in cfg.packs or {} do
 		require(name).install({ hooks = hooks })
 	end

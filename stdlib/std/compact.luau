@@ -1,4 +1,5 @@
--- Opt-in pack (--pack std/compact): keeps a long run inside the model's context window.
+-- Default pack (installed by std/loop; off with `require("std/compact").enabled = false` in .harness/init.luau): keeps a
+-- long run inside the model's context window.
 -- When the last reply's context reaches the threshold (see M.threshold), the next model call is preceded by one summarizer
 -- call (through hx.llm: logged, budgeted, replayable). Older messages are replaced by a structured summary; the task message
 -- and the most recent messages stay verbatim; the Luau session (globals) is untouched. A context-overflow error from the model
@@ -6,12 +7,16 @@
 -- Below the threshold the pack adds nothing to the requests. It never writes files.
 -- Config (set in .harness/init.luau, which runs before packs install):
 --   require("std/compact").keep_recent_tokens = 8000
--- The window comes from --context-window, else M.context_window.
+-- The window comes from --context-window, else M.context_window. Compaction starts at M.trigger (never above
+-- M.max_trigger_tokens, so a 1M window does not mean resending ~1M tokens a turn); a model whose real window is smaller
+-- than the assumed one hits an overflow error first, which compacts and retries once.
 local M = {}
 
-M.context_window = 128000 -- used only when --context-window is not given
+M.enabled = true
+M.context_window = 1000000 -- used only when --context-window is not given
+M.max_trigger_tokens = 256000 -- compaction starts at this context size at the latest
 M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer (prime-agent/pi default)
-M.keep_recent_tokens = 20000 -- recent history kept verbatim (clamped to a quarter of the threshold)
+M.keep_recent_tokens = 64000 -- recent history kept verbatim (clamped to a quarter of the trigger)
 
 local MAX_FAILURES = 2
 local TRUNCATE_ABOVE, TRUNCATE_HEAD, TRUNCATE_TAIL = 2000, 1500, 500
@@ -121,6 +126,12 @@ local OVERFLOW = {
 -- <= 0 means the window is too small for compaction (the pack stays off).
 function M.threshold(window: number, max_output: number, reserve: number): number
 	return math.min(math.floor(window * 0.95), window - max_output - math.max(reserve, 4096))
+end
+
+-- The context size that starts a compaction: M.threshold, capped at M.max_trigger_tokens. <= 0 means off.
+function M.trigger(window: number, max_output: number): number
+	local t = M.threshold(window, max_output, M.reserve_tokens)
+	return if t > 0 then math.min(t, M.max_trigger_tokens) else t
 end
 
 -- Rough size of one message in tokens (chars/4). An assistant message's `raw` (the provider-native message the loop echoes
@@ -240,7 +251,13 @@ local function limits()
 	return info.context_window or M.context_window, info.max_output or 16384
 end
 
+local installed = false -- once per session: the loop installs the pack and `--pack std/compact` may name it again
+
 function M.install(ctx)
+	if installed or not M.enabled then
+		return
+	end
+	installed = true
 	local task_text -- the first user message (task + file listing), re-sent verbatim after every compaction
 	local prev -- the previous summary, once a compaction happened
 	local last_tokens = 0 -- context size reported by the last reply
@@ -252,7 +269,7 @@ function M.install(ctx)
 		local window, max_output = limits()
 		task_text = task_text or messages[1].content
 		-- keep a quarter of the threshold at most, so a compaction always frees most of the room up to the next one
-		local limit = M.threshold(window, max_output, M.reserve_tokens)
+		local limit = M.trigger(window, max_output)
 		local keep = math.min(M.keep_recent_tokens, math.floor((if limit > 0 then limit else window) / 4))
 		local cut = M.find_cut(messages, 2, keep, M.scale(last_tokens, system, messages))
 		if not cut then
@@ -300,7 +317,7 @@ function M.install(ctx)
 		system = req.system or ""
 		if not disabled and last_tokens > 0 then
 			local window, max_output = limits()
-			local limit = M.threshold(window, max_output, M.reserve_tokens)
+			local limit = M.trigger(window, max_output)
 			if limit > 0 and last_tokens >= limit then
 				compact(req.messages)
 			end

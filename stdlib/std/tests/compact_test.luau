@@ -88,3 +88,9 @@ test.case("find_cut applies the scale", function()
 	test.eq(compact.find_cut(m, 2, 150), 4)
 	test.eq(compact.find_cut(m, 2, 150, 2), 6) -- each message weighs twice as much: "c" alone reaches 150
 end)
+
+test.case("trigger caps the threshold at max_trigger_tokens", function()
+	test.eq(compact.trigger(1000000, 16384), 256000) -- an unknown window is assumed to be 1M: start at 256k
+	test.eq(compact.trigger(200000, 16384), 167232) -- a known smaller window: the threshold wins
+	test.ok(compact.trigger(10000, 16384) <= 0, "too small a window stays off")
+end)

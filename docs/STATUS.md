@@ -7,8 +7,8 @@ What exists, how to verify it, and what is still missing. `PLAN.md` is the plan;
   `effects.rs` (every effect live or replayed: write-ahead intents, recorded results, resume queues),
   `policy.rs` (sandbox, path policy, approval gate), `eventlog.rs` (hash-chained log), `modules.rs` (resolver, manifest,
   lockfile, grants), `llm.rs` / `host.rs` (model client, usage, subagents), `main.rs` (CLI).
-- `stdlib/std/` the built-in `std` package (L2, Luau): `loop`, `prompt` (system prompt, the `luau` tool schema, nudges), `printer`, `feedback`, `hooks`, opt-in packs
-  `vision` and `compact`.
+- `stdlib/std/` the built-in `std` package (L2, Luau): `loop`, `prompt` (system prompt, the `luau` tool schema, nudges), `printer`, `feedback`, `hooks`, `compact`
+  (installed by default), opt-in pack `vision`.
   Embedded in the binary; override any module per project with `.harness/override/std/<mod>.luau`
   (`require("base:std/<mod>")` wraps the original). A broken override falls back to the built-in with a warning.
 - `prompts/system.md` the system prompt (also an overridable asset).
@@ -25,7 +25,7 @@ denies for `sh` and MCP servers on macOS).
 ## Checks (all need `cargo build --release` first; none needs an API key)
 | Script | Covers | Result |
 |---|---|---|
-| `hx test stdlib/std` | printer, mcp, hooks, compact unit tests (Luau) | 27 pass |
+| `hx test stdlib/std` | printer, mcp, hooks, compact unit tests (Luau) | 28 pass |
 | `cargo test --release` | Rust unit tests: mcp glob, path normalize, command classes, protected paths | 3 pass |
 | `scripts/p2_checks.sh` | printer override without rebuild, broken-override fallback, parallel, vars, lock/grants gate, hooks, subagents, hot reload, failed lock check stays failed | 16/16 |
 | `scripts/sandbox_checks.sh` | writes outside project, ../, symlinks, protected `.harness`, env scrubbing, network, process cap, timeout kills group | 35/35 |
@@ -36,7 +36,7 @@ denies for `sh` and MCP servers on macOS).
 | `scripts/cache_stats.py LOG` | per-turn prompt-cache hit ratio from an event log (turn 1 ~0%, later turns high) | tool |
 | `scripts/all_checks.sh` | runs every suite above | |
 | `scripts/p4_checks.sh` | skills, tool packages, prompt index, `deftool`/`promote`/`hx accept`, no self-approval, hot reload keeps session, a skill whose module fails to load still returns its text and raises the load error on use | 51/51 |
-| `scripts/compact_checks.sh` | `std/compact`: pack below the threshold leaves requests byte-identical, one summarizer call then task + summary + kept tail (tool results stay with their calls), globals survive, `<previous-summary>` update, a reasoning-heavy history is mostly summarized (calibrated sizes), 2 summarizer failures disable it, overflow compact-and-retry (once), SIGKILL/resume around every compaction record incl. double resume, divergence at a trailing failure, subagents | 32/32 |
+| `scripts/compact_checks.sh` | `std/compact`: on by default, `enabled = false` turns it off, below the threshold requests are identical to off, one summarizer call then task + summary + kept tail (tool results stay with their calls), globals survive, `<previous-summary>` update, a reasoning-heavy history is mostly summarized (calibrated sizes), 2 summarizer failures disable it, overflow compact-and-retry (once), SIGKILL/resume around every compaction record incl. double resume, divergence at a trailing failure, subagents | 34/34 |
 | `scripts/mcp_checks.sh` | MCP: binding, schema signatures, approval gate, sandboxed server (fs/net/env), prompt index, HTTP transport (json/SSE, session, header auth, redirects, secrets) | 42/42 |
 | `scripts/mcp_resume_check.py [http]` | crash after every record of a run that calls MCP tools (stdio, and `http`): no call is ever repeated on the server | 16/16 each |
 | `scripts/upgrade_checks.sh` | harness-module upgrades: propose, structural check, eval gate (scripted model), accept, rollback, tamper, force | 23/23 |
@@ -193,9 +193,10 @@ All of it is opt-in or costs nothing when unused (no packages and no mcp.toml =>
   images; the pack's before_model hook appends one user message with them (Chat: image_url parts, Responses: input_image).
   Images stay in history (cache-friendly). Recorded like `read` (path + sha256, never pixels); resume re-reads and refuses a
   changed file. Off by default, so the eval prompt is unchanged. No fallback for non-vision models: the provider error surfaces.
-- **Compaction** (`--pack std/compact`): trigger = last reply's input+cache+output tokens >= min(0.95*window,
-  window - max_output - max(16384, 4096)) (prime-agent/pi formula); window from `--context-window` (`hx.model_info()`),
-  else 128000. Keeps ~min(20000, threshold/4) recent tokens verbatim, cut only before an assistant message. Message
+- **Compaction** (`std/compact`, installed by std/loop; `require("std/compact").enabled = false` in init turns it off; a
+  second install is a no-op): trigger = last reply's input+cache+output tokens >= min(0.95*window, window - max_output -
+  max(16384, 4096), 256000) (prime-agent/pi formula plus a cap); window from `--context-window` (`hx.model_info()`), else
+  assumed 1000000. Keeps ~min(64000, trigger/4) recent tokens verbatim, cut only before an assistant message. Message
   sizes are chars/4 estimates (an assistant message's `raw` counts, since it carries reasoning) scaled by the provider's
   real count for the last request over the estimate of the whole request (clamped 0.5..4). Found on a real run: without
   `raw` and the scale, Haiku's echoed reasoning made the pack keep almost everything and compact every turn. One summarizer

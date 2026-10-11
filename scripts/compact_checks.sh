@@ -36,6 +36,7 @@ Q() { PYTHONPATH=$T python3 -c "from q import *; $1"; }
 mock() { MOCK_REPLIES="$1" MOCK_LOG="$2" python3 scripts/mock_llm.py $3 & MP=$!; sleep 1; }  # replies-json log port
 unmock() { kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=""; }
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; echo 'require("std/compact").keep_recent_tokens = 40' > $W/.harness/init.luau; }
+off() { echo 'require("std/compact").enabled = false' >> $W/.harness/init.luau; }  # the pack is on by default
 run() { # workspace port trace extra-flags...   (stdout/stderr in $T/out, $T/err; status is hx's)
   OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:$2 --key-env OPENROUTER_API_KEY \
     --context-window 40000 --max-output 1000 --trace $3 "${@:4}" > $T/out 2> $T/err
@@ -43,11 +44,11 @@ run() { # workspace port trace extra-flags...   (stdout/stderr in $T/out, $T/err
 field() { python3 -c "import sys,json;r=json.loads(open('$T/out').read().strip().splitlines()[-1]);print(r.get('$1'))" 2>/dev/null; }
 lastlog() { ls -t $1/.harness/log/*.jsonl | head -1; }
 
-# ---- 1. A1: without the pack, and with the pack below the threshold, requests are identical ----
+# ---- 1. A1: with the pack off, and with it on below the threshold, requests are identical ----
 THREE=$(R 'dump(C("a=1"), C("b=2"), S("done"))')
-newws a1; mock "$THREE" $T/a1.plain 8810; run $W 8810 $T/a1.tr1; unmock
+newws a1; off; mock "$THREE" $T/a1.plain 8810; run $W 8810 $T/a1.tr1; unmock
 newws a1b; mock "$THREE" $T/a1.pack 8810; run $W 8810 $T/a1.tr2 --pack std/compact; unmock
-check "A1 pack below the threshold: request bodies identical to a run without the pack" "$(python3 - <<PY
+check "A1 pack below the threshold: request bodies identical to a run with the pack off" "$(python3 - <<PY
 import json
 def norm(f):
     out = []
@@ -108,8 +109,14 @@ check "A6 a second overflow on the same turn fails the run and says so" "$([ $rc
 S6c=$(R 'dump(C("a=1"), C("b=2"), E("maximum context length exceeded"), S(""), S("never used"))')
 newws a6c; mock "$S6c" $T/a6c.req 8814; run $W 8814 $T/a6c.tr --pack std/compact; rc=$?; unmock
 check "A6 overflow with a failed compaction ends the run with the API error" "$([ $rc -ne 0 ] && echo fail) $(grep -c 'maximum context length exceeded' $T/err)" "fail 1"
-newws a6d; mock "$S6c" $T/a6d.req 8814; run $W 8814 $T/a6d.tr; rc=$?; unmock
-check "A6 without the pack an overflow fails as before (no summarizer call)" "$([ $rc -ne 0 ] && echo fail) $(Q 'print(len(load("'$T'/a6d.req")))')" "fail 3"
+newws a6d; off; mock "$S6c" $T/a6d.req 8814; run $W 8814 $T/a6d.tr; rc=$?; unmock
+check "A6 with the pack off an overflow fails as before (no summarizer call)" "$([ $rc -ne 0 ] && echo fail) $(Q 'print(len(load("'$T'/a6d.req")))')" "fail 3"
+
+# ---- 6c. on by default: no --pack needed; enabled = false turns it off ----
+newws a6e; mock "$S2" $T/a6e.req 8814; run $W 8814 $T/a6e.tr; rc=$?; unmock
+check "6c default: compacts without --pack (one summarizer request)" "$rc $(field finished) $(Q 'print(len(sums("'$T'/a6e.req")))')" "0 True 1"
+newws a6f; off; mock "$S2" $T/a6f.req 8814; run $W 8814 $T/a6f.tr; rc=$?; unmock
+check "6c enabled = false: no summarizer request, no summary in any request" "$(Q 'print(len(sums("'$T'/a6f.req")))') $(grep -c 'compaction-summary' $T/a6f.req)" "0 0"
 
 # ---- 6b. real-model shape: reasoning (echoed back in raw) dominates the context, and keep_recent is the default ----
 S6r=$(R 'R1 = "r" * 6000; dump(*[dict(C("t%d = %d" % (i, i), 30000 if i == 8 else 3000 * i), reasoning=R1) for i in range(1, 9)], S("SUMMARY-R"), C("print(t1)", 2000), S("done"))')
