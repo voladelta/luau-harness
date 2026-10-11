@@ -7,12 +7,27 @@ ASSUMED task layout (tasks/ was not present when this was written; adjust TASK_*
   tasks/<id>/grade.sh    run with cwd = workspace; exit 0 = pass
 Tasks are never modified; each run works in a throwaway copy.
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TASK_PROMPT, TASK_REPO, TASK_GRADE = "prompt.md", "repo", "grade.sh"
 HX = ROOT / "target" / "release" / "hx"
+
+def run(cmd, timeout, **kw):
+    """subprocess.run in its own process group; a timeout kills the whole group, so an agent's runaway grandchild
+    (e.g. a test suite stuck in a loop) cannot outlive the run as an orphan."""
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, **kw) as p:
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.communicate()
+            raise
+        finally:
+            try: os.killpg(p.pid, signal.SIGKILL)  # leftovers after a normal exit too
+            except ProcessLookupError: pass
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 def hx_endpoint(model):
     if os.environ.get("EVAL_HX_BASE_URL"):  # tests: a scripted model server
@@ -29,9 +44,9 @@ def run_hx(ws, prompt_file, model, timeout, trace):
     t0 = time.time()
     # runaway guard: a single task should never need more than this (typical run: $0.005, 15k tokens, 15s)
     limits = ["--max-cost", os.environ.get("EVAL_MAX_COST", "0.30"), "--max-tokens", os.environ.get("EVAL_MAX_TOKENS", "600000"), "--max-wall", os.environ.get("EVAL_MAX_WALL", "900")]
-    p = subprocess.run([str(HX), "run", "--workspace", ws, "--prompt-file", str(prompt_file),
+    p = run([str(HX), "run", "--workspace", ws, "--prompt-file", str(prompt_file),
                         "--model", model.removeprefix("claude-sdk/"), "--trace", str(trace)] + limits + (["--pack", os.environ["EVAL_PACKS"]] if os.environ.get("EVAL_PACKS") else []) + (["--max-output", os.environ["EVAL_MAX_OUTPUT"]] if os.environ.get("EVAL_MAX_OUTPUT") else []) + hx_endpoint(model),
-                       capture_output=True, text=True, timeout=timeout,
+                       timeout=timeout,
                        env={**os.environ, "HX_TRUST": "1"})  # throwaway copy we built (gate overrides), so its config is ours
     if p.returncode != 0:
         return {"harness_error": p.stderr[-500:]}
@@ -58,10 +73,10 @@ def run_claude(ws, prompt, model, timeout, trace):
         flags = ["--setting-sources", "project", "--disable-slash-commands", "--strict-mcp-config"]
         if BASELINE_AUTH == "subscription-lean":  # ~3.6k prompt instead of ~23.7k; minimal system prompt, 4 core tools
             flags += ["--system-prompt", "You are a coding agent. Complete the task by editing files in the working directory.", "--tools", "Bash,Read,Edit,Write"]
-    p = subprocess.run(["claude", "-p", prompt, *flags, "--model", model_for_claude(model), "--output-format", "json",
+    p = run(["claude", "-p", prompt, *flags, "--model", model_for_claude(model), "--output-format", "json",
                         *(["--effort", os.environ["EVAL_EFFORT"]] if os.environ.get("EVAL_EFFORT") else []),
                         "--dangerously-skip-permissions", "--no-session-persistence"],
-                       cwd=ws, capture_output=True, text=True, timeout=timeout, env=env)
+                       cwd=ws, timeout=timeout, env=env)
     Path(trace).write_text(p.stdout + "\n" + p.stderr)
     try:
         j = json.loads(p.stdout)
@@ -118,8 +133,7 @@ def main():
                          else run_claude(ws, prompt, a.claude_model, a.timeout, trace))
                 except subprocess.TimeoutExpired:
                     r = {"harness_error": "timeout"}
-                g = subprocess.run(["bash", str(task / TASK_GRADE)], cwd=ws, env={**os.environ, "TASK_DIR": str(task.resolve())},
-                                   capture_output=True, text=True, timeout=600)
+                g = run(["bash", str(task / TASK_GRADE)], cwd=ws, env={**os.environ, "TASK_DIR": str(task.resolve())}, timeout=600)
                 r.update(task=task.name, system=system, run=run, passed=(g.returncode == 0), grader_tail=(g.stdout + g.stderr)[-300:])
                 m = re.search(r"^SCORE (\d+)/(\d+)$", g.stdout, re.M)  # partial credit (suites built with --score)
                 if m: r["score"] = [int(m.group(1)), int(m.group(2))]
