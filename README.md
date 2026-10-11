@@ -1,9 +1,17 @@
+<p align="center">
+  <img src="docs/banner.png" alt="hx: a Luau code-mode agent harness" width="100%">
+</p>
+
 # hx
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
+![Sandbox: macOS](https://img.shields.io/badge/sandbox-macOS-lightgrey.svg)
 
 A headless coding-agent harness in which the model writes Luau instead of calling tools one at a time. On the same 15 tasks with the same model, it used about half the fresh tokens of Claude Code.
 
 ```bash
-cargo install --path . && hx exec 'print(#search("fn main", {glob = "*.rs"}))'
+cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(#search("fn main", {glob = "*.rs"}))'
 ```
 
 ## TL;DR
@@ -75,7 +83,7 @@ Rerun with `python3 eval/run.py` (see `--help`).
 Requires Rust 1.85 or newer (edition 2024). The sandbox requires macOS.
 
 ```bash
-git clone <!-- TODO: repository URL --> luau-harness
+git clone https://github.com/voladelta/luau-harness
 cd luau-harness
 cargo install --path .
 ```
@@ -88,7 +96,7 @@ cargo build --release
 
 ## Quick start
 
-1. Set an API key. The default key variable is `OPENROUTER_API_KEY` (override with `--key-env`).
+1. Set an API key. By default hx calls OpenRouter and reads `OPENROUTER_API_KEY` (override with `--base-url` and `--key-env`).
 
    ```bash
    export OPENROUTER_API_KEY=...
@@ -103,19 +111,22 @@ cargo build --release
 3. Run it in the project directory:
 
    ```bash
-   hx run --workspace . --prompt-file task.md --model claude-sonnet-5-5 --max-cost 0.50
+   hx run --workspace . --prompt-file task.md --model anthropic/claude-sonnet-5.5 --max-cost 0.50
    ```
 
 hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens, cost). The event log is written to `.harness/log/`.
 
-To use an OpenAI-compatible provider instead:
+Any model on OpenRouter works the same way, for example `--model deepseek/deepseek-v4.1-flash`. For another OpenAI-compatible provider, pass its URL and key variable:
 
 ```bash
-hx run --prompt-file task.md --model deepseek/deepseek-v4.1-flash \
-  --api openai --base-url https://openrouter.ai/api/v1 --key-env OPENROUTER_API_KEY
+hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1 --key-env EXAMPLE_API_KEY
 ```
 
-<!-- TODO: confirm the OpenRouter model id for DeepSeek V4.1 Flash; the evals used it through Enclave as cyberouter/deepseek-v4.1-flash -->
+With a Claude subscription and the `claude` CLI logged in, no API key is needed:
+
+```bash
+hx run --prompt-file task.md --api claude-sdk --model sonnet
+```
 
 ## Commands
 
@@ -125,7 +136,9 @@ hx run --prompt-file task.md --model deepseek/deepseek-v4.1-flash \
 | `hx run --resume LOG` | Continue a crashed run from its event log |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
 | `hx test PKG_DIR` | Run a package's `tests/*.luau`; exits 1 on failure |
-| `hx approve PKG` | Lock a project package's hash and grant the capabilities it requests |
+| `hx approve PKG` | Lock a project package's or skill's hash and grant the capabilities it requests |
+| `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and whether each is approved |
+| `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review agent-promoted tools |
 | `hx upgrade propose\|list\|show\|check\|accept\|rollback` | Harness-module upgrade flow |
 | `hx log verify FILE` | Check a log's hash chain; exit 0 ok, 1 tampered, 3 unknown outcomes |
@@ -136,9 +149,9 @@ hx run --prompt-file task.md --model deepseek/deepseek-v4.1-flash \
 |---|---|---|
 | `--prompt-file F` | | Task text (not needed with `--resume` if the log recorded it) |
 | `--model M` | `HX_MODEL` | Model id |
-| `--api A` | `openai` (`HX_API`) | `openai` (Chat Completions) or `responses` |
+| `--api A` | `openai` (`HX_API`) | `openai` (Chat Completions), `responses`, or `claude-sdk` (the `claude` CLI and your Claude plan; `--model haiku\|sonnet\|opus`) |
 | `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
-| `--key-env E` | see Quick start | Env var holding the API key |
+| `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
 | `--reasoning R` | | Reasoning effort |
 | `--max-turns N` | 30 | Turn limit |
 | `--max-output N` | 16384 | Max output tokens per turn |
@@ -269,16 +282,17 @@ cargo test --release
 | `prompts/system.md` | System prompt |
 | `eval/` | Eval runner, report, upgrade gate, task generators |
 | `tasks/`, `tasks-unseen/` | 15 frozen tasks (hashed in `tasks/MANIFEST.sha256`) and 5 unseen tasks |
+| `tasks-hard/` | 9 harder tasks over four larger codebases (300 to 860 lines each), scored by the share of hidden tests passed |
 | `scripts/` | Check suites and mock servers |
 
 ## Limitations
 
-- **macOS only for sandboxing.** The sandbox uses `sandbox-exec`, which Apple has deprecated. There is no Linux sandbox; on other systems you would need `--yolo`, which also removes the path limits and the approval gate, and there `sh` can write `.harness/` (on macOS `--yolo` still blocks that with Seatbelt). <!-- TODO: confirm behaviour on Linux; untested -->
+- **macOS only for sandboxing.** The sandbox uses `sandbox-exec`, which Apple has deprecated. There is no Linux sandbox; on other systems you would need `--yolo`, which also removes the path limits and the approval gate, and there `sh` can write `.harness/` (on macOS `--yolo` still blocks that with Seatbelt). hx has not been tested on Linux.
 - **Network is all-or-nothing.** Seatbelt cannot filter by host.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
 - **Only Chat Completions was verified live** (OpenRouter and Enclave); the Responses API is tested against a mock.
 - **Compaction is on by default but lightly tested on real models** (scripted checks plus one Haiku 5.5 video run with a forced 60k window: one compaction, 30k to 12k tokens, task finished). Summary quality depends on the model. The window is not detected: without `--context-window` a model with a window under ~256k relies on recognising its overflow error (compact and retry once). Repeat `--context-window` on `--resume`, or replay reports `replay diverged`. Turn it off with `require("std/compact").enabled = false` in `.harness/init.luau`.
-- **Small benchmark.** 20 small Python tasks; results on large repositories are not measured.
+- **Small benchmark.** The published results cover 20 small Python tasks, which every tested configuration passes, so they measure efficiency rather than quality. A harder 9-task suite (`tasks-hard/`) exists but has no published results yet, and results on large repositories are not measured.
 - **Not covered by resume:** a crash mid-model-call repeats that call (no side effect), and the stdout of a killed `sh` is lost.
 
 ## License
