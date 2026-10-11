@@ -18,6 +18,8 @@ def hx_endpoint(model):
     if os.environ.get("EVAL_HX_BASE_URL"):  # tests: a scripted model server
         return ["--api", "openai", "--base-url", os.environ["EVAL_HX_BASE_URL"], "--key-env", "EVAL_HX_KEY"]
     """Enclave models (cyberouter/*) use Enclave; anything else goes through OpenRouter."""
+    if model.startswith("claude-sdk/"):  # the claude CLI on the user's plan (no key); hx:claude-sdk/haiku
+        return ["--api", "claude-sdk"]
     extra = ["--reasoning", os.environ["EVAL_REASONING"]] if os.environ.get("EVAL_REASONING") else []
     if model.startswith("cyberouter/"):
         return ["--api", "openai", "--base-url", "https://router.enclave.ai/v1", "--key-env", "ENCLAVE_API_KEY"] + extra
@@ -28,7 +30,7 @@ def run_hx(ws, prompt_file, model, timeout, trace):
     # runaway guard: a single task should never need more than this (typical run: $0.005, 15k tokens, 15s)
     limits = ["--max-cost", os.environ.get("EVAL_MAX_COST", "0.30"), "--max-tokens", os.environ.get("EVAL_MAX_TOKENS", "600000"), "--max-wall", os.environ.get("EVAL_MAX_WALL", "900")]
     p = subprocess.run([str(HX), "run", "--workspace", ws, "--prompt-file", str(prompt_file),
-                        "--model", model, "--trace", str(trace)] + limits + (["--pack", os.environ["EVAL_PACKS"]] if os.environ.get("EVAL_PACKS") else []) + (["--max-output", os.environ["EVAL_MAX_OUTPUT"]] if os.environ.get("EVAL_MAX_OUTPUT") else []) + hx_endpoint(model),
+                        "--model", model.removeprefix("claude-sdk/"), "--trace", str(trace)] + limits + (["--pack", os.environ["EVAL_PACKS"]] if os.environ.get("EVAL_PACKS") else []) + (["--max-output", os.environ["EVAL_MAX_OUTPUT"]] if os.environ.get("EVAL_MAX_OUTPUT") else []) + hx_endpoint(model),
                        capture_output=True, text=True, timeout=timeout,
                        env={**os.environ, "HX_TRUST": "1"})  # throwaway copy we built (gate overrides), so its config is ours
     if p.returncode != 0:

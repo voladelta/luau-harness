@@ -8,7 +8,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct LlmCfg {
     pub model: String,
-    /// "openai" | "responses"
+    /// "openai" | "responses" | "claude-sdk"
     pub api: String,
     pub base_url: Option<String>,
     pub key_env: Option<String>,
@@ -42,6 +42,9 @@ pub struct Reply {
 
 impl LlmCfg {
     pub fn key(&self) -> Result<String> {
+        if self.api == "claude-sdk" {
+            return Ok(String::new()); // the claude CLI holds the login
+        }
         let env = self.key_env.clone().unwrap_or_else(|| "OPENROUTER_API_KEY".into());
         std::env::var(&env).map_err(|_| anyhow::anyhow!("{env} not set"))
     }
@@ -156,8 +159,11 @@ fn responses_input(msgs: &[Value]) -> Vec<Value> {
 
 /// `req`: { system?: string, messages: [neutral message], tools?: [{name, description, parameters}], max_tokens?: number }
 pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) -> Result<Reply> {
+    if cfg.api == "claude-sdk" {
+        return crate::claude_sdk::chat(cfg, req).await;
+    }
     if !matches!(cfg.api.as_str(), "openai" | "responses") {
-        bail!("unknown --api {:?} (expected openai or responses)", cfg.api);
+        bail!("unknown --api {:?} (expected openai, responses or claude-sdk)", cfg.api);
     }
     let responses = cfg.api == "responses";
     let system = req["system"].as_str().unwrap_or("");

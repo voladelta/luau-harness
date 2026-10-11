@@ -248,7 +248,9 @@ end
 
 local function limits()
 	local info = if hx.model_info then hx.model_info() else {}
-	return info.context_window or M.context_window, info.max_output or 16384
+	-- an unset --context-window reaches Luau as a null sentinel (truthy userdata), so test the type
+	local w, mo = info.context_window, info.max_output
+	return if type(w) == "number" then w else M.context_window, if type(mo) == "number" then mo else 16384
 end
 
 local installed = false -- once per session: the loop installs the pack and `--pack std/compact` may name it again

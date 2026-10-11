@@ -23,6 +23,7 @@ cargo install --path . && hx exec 'print(#search("fn main", {glob = "*.rs"}))'
 | Overridable harness | Loop, prompt, printer and hooks are Luau in `stdlib/std/`; replace any module in `.harness/override/std/` |
 | Extensions | Tool and skill packages locked by hash, MCP servers (stdio and HTTP), agent-written tools promoted only after your review |
 | Any provider | OpenAI Chat Completions or Responses API; any compatible base URL (OpenRouter by default) |
+| Claude plan | `--api claude-sdk --model haiku\|sonnet\|opus`: drives the `claude` CLI over stream-json (as the Agent SDK does), so calls use your Claude login and plan limits, no API key; tools are called as text tags; text only |
 
 ## Quick example
 
