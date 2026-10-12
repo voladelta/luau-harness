@@ -15,6 +15,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+/// With partial messages on, a working model streams deltas (thinking included) every few seconds; this much silence
+/// means the call is stuck, and `chat` retries it once on a fresh child.
+const IDLE: Duration = Duration::from_secs(180);
+const STALL: &str = "claude-sdk: no output for";
+
 /// idle children kept for reuse; the oldest is dropped (and killed) beyond this
 const POOL_MAX: usize = 8;
 static POOL: OnceLock<Mutex<Vec<Proc>>> = OnceLock::new();
@@ -125,7 +130,7 @@ async fn spawn(cfg: &LlmCfg, system: &str, max_tokens: u64, tools: &[Value], sys
     let dir = std::env::temp_dir().join("hx-claude-sdk");
     std::fs::create_dir_all(&dir)?;
     let mut cmd = Command::new("claude");
-    cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--tools", "", "--setting-sources", "", "--strict-mcp-config", "--no-session-persistence", "--model", &cfg.model, "--system-prompt", system]);
+    cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--tools", "", "--setting-sources", "", "--strict-mcp-config", "--no-session-persistence", "--model", &cfg.model, "--system-prompt", system]);
     if !tools.is_empty() {
         let allowed: Vec<String> = tools.iter().filter_map(|t| t["name"].as_str()).map(|n| format!("mcp__{SERVER}__{n}")).collect();
         cmd.args(["--allowedTools", &allowed.join(","), "--mcp-config", &json!({"mcpServers": {SERVER: {"type": "sdk", "name": SERVER}}}).to_string()]);
@@ -180,8 +185,8 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
     let mut usage: HashMap<String, [u64; 4]> = HashMap::new();
     let mut expected = 0usize;
     loop {
-        let l = match tokio::time::timeout(Duration::from_secs(900), p.out.next_line()).await {
-            Err(_) => bail!("claude-sdk: no reply within 15 minutes"),
+        let l = match tokio::time::timeout(IDLE, p.out.next_line()).await {
+            Err(_) => bail!("{STALL} {} s", IDLE.as_secs()),
             Ok(r) => r?,
         };
         let Some(l) = l else { bail!("claude-sdk: the claude process exited (not logged in? run `claude` once to log in; or the plan's usage limit was reached)") };
@@ -241,6 +246,26 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
     Ok(seg)
 }
 
+/// A new child given the whole conversation: as is when it is one user turn, else as a transcript replay.
+async fn fresh(cfg: &LlmCfg, system: &str, max_tokens: u64, tools: &[Value], sys_sha: String, msgs: &[Value]) -> Result<Proc> {
+    let mut p = spawn(cfg, system, max_tokens, tools, sys_sha).await?;
+    let w = wire(msgs);
+    let last = &w[w.len() - 1];
+    let prompt = if w.len() == 1 {
+        content(&last.1, &last.2)
+    } else {
+        // earlier images are not replayed (a note stands in); the last turn's images are sent for real
+        let mut t = String::from("The conversation so far (continue it as the assistant; your next reply answers the last user turn):\n");
+        for (i, (u, s, im)) in w.iter().enumerate() {
+            let note = if i + 1 < w.len() && !im.is_empty() { format!("\n[{} image(s) omitted from this replay]", im.len()) } else { String::new() };
+            t += &format!("\n[{}]\n{s}{note}\n", if *u { "user" } else { "assistant" });
+        }
+        content(&t, &last.2)
+    };
+    send(&mut p, &json!({"type": "user", "message": {"role": "user", "content": prompt}})).await?;
+    Ok(p)
+}
+
 /// `req` is the same shape `llm::chat` takes.
 pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
     let tools: Vec<Value> = req["tools"].as_array().cloned().unwrap_or_default();
@@ -292,28 +317,20 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
             }
             p
         }
-        None => {
-            let mut p = spawn(cfg, system, max_tokens, &tools, sys_sha).await?;
-            let w = wire(&msgs);
-            let last = &w[w.len() - 1];
-            let prompt = if w.len() == 1 {
-                content(&last.1, &last.2)
-            } else {
-                // earlier images are not replayed (a note stands in); the last turn's images are sent for real
-                let mut t = String::from("The conversation so far (continue it as the assistant; your next reply answers the last user turn):\n");
-                for (i, (u, s, im)) in w.iter().enumerate() {
-                    let note = if i + 1 < w.len() && !im.is_empty() { format!("\n[{} image(s) omitted from this replay]", im.len()) } else { String::new() };
-                    t += &format!("\n[{}]\n{s}{note}\n", if *u { "user" } else { "assistant" });
-                }
-                content(&t, &last.2)
-            };
-            send(&mut p, &json!({"type": "user", "message": {"role": "user", "content": prompt}})).await?;
-            p
-        }
+        None => fresh(cfg, system, max_tokens, &tools, sys_sha.clone(), &msgs).await?,
     };
-    proc.seen = keys;
+    proc.seen = keys.clone();
 
-    let seg = drive(&mut proc, &tools_list).await?;
+    let seg = match drive(&mut proc, &tools_list).await {
+        // a stalled call: drop (and kill) the child and ask again from a replay of the whole conversation
+        Err(e) if e.to_string().starts_with(STALL) => {
+            drop(proc);
+            proc = fresh(cfg, system, max_tokens, &tools, sys_sha, &msgs).await?;
+            proc.seen = keys;
+            drive(&mut proc, &tools_list).await.map_err(|e2| anyhow::anyhow!("{e2} (after one retry on a fresh child: {e})"))?
+        }
+        r => r?,
+    };
     let mut usage = seg.usage;
     let mut out = Reply { finish: Some("stop".into()), ..Default::default() };
     if let Some(result) = &seg.result {
