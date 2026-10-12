@@ -190,6 +190,13 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
             Ok(r) => r?,
         };
         let Some(l) = l else { bail!("claude-sdk: the claude process exited (not logged in? run `claude` once to log in; or the plan's usage limit was reached)") };
+        if let Some(path) = std::env::var_os("HX_SDK_TRACE") {
+            // debugging aid: every line the claude child prints, so a slow call shows what it is doing
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{} {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), l);
+            }
+        }
         let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
         match v["type"].as_str() {
             Some("rate_limit_event") if v["rate_limit_info"]["status"].as_str().is_some_and(|s| s == "rejected" || s == "blocked") => {
