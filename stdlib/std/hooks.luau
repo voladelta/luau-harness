@@ -9,6 +9,8 @@ local handlers: { [string]: { (any) -> any } } = {}
 --   after_model  { text, finish, usage = { input, cache_read, cache_write, output } } -> transformed reply
 --   model_error  { error, messages }   -> { retry = true } asks for the same turn again (once per turn; messages may be
 --                                         changed in place first). Fired when the model call fails, except budget stops.
+--   before_finish { text, turn }       -> { continue_with = "message" } turns the final answer back into a turn: the
+--                                         message is sent as the next user turn and the loop goes on
 --   before_run   { code }              -> transformed code, or { deny = "why" }
 --   after_run    { output, values, error, ops } -> transformed result of the chunk
 function M.on(event: string, fn: (any) -> any)

@@ -69,6 +69,22 @@ check "hook denied rm -rf" "$(grep -c 'no rm -rf here' $T/trace.txt)" "1"
 check "subagent answer reached parent" "$(grep -c "sub said: SUB-ANSWER" $T/trace.txt)" "1"
 check "usage aggregated across subagent (5 llm calls)" "$(python3 -c "import json;print(json.load(open('$T/rep.json'))['llm_calls'])")" "5"
 
+# 6b. a before_finish hook can send the model back to work once
+W4=$T/ws4; mkdir -p $W4/.harness
+cat > $W4/.harness/init.luau <<'LUA'
+local asked = false
+require("std/hooks").on("before_finish", function(p)
+	if asked then return nil end
+	asked = true
+	return { continue_with = "Check once more." }
+end)
+LUA
+kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
+MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
+sleep 1
+OPENROUTER_API_KEY=x $H run --workspace $W4 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace4.txt > $T/rep4.json
+check "before_finish continues once" "$(python3 -c "import json;r=json.load(open('$T/rep4.json'));print(r['llm_calls'], r['final_answer'])")" "3 Checked: final answer."
+
 # 7. hot reload keeps session state
 W3=$T/ws3; mkdir -p $W3/pk/tests $W3/.harness/override/std
 cat > $W3/pk/tests/reload_test.luau <<'LUA'

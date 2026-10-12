@@ -85,6 +85,14 @@ function M.run(cfg)
 				table.insert(messages, { role = "user", content = prompt.nudge_no_call })
 				continue
 			end
+			-- a project hook may ask for more work before the answer is accepted (e.g. a final self-check)
+			local fin = hooks.emit("before_finish", { text = text, turn = rep.turns })
+			if fin and fin.continue_with then
+				table.insert(messages, { role = "assistant", content = text, raw = resp.raw })
+				hx.log("### HARNESS\n" .. fin.continue_with)
+				table.insert(messages, { role = "user", content = fin.continue_with })
+				continue
+			end
 			rep.finished = true
 			rep.final_answer = text
 			break
