@@ -1,8 +1,22 @@
 -- Prompt assembly: the system prompt, the tool the model calls, the first user message, and the nudges the loop sends.
 local M = {}
 
+local NO_NET = "`/tmp`, your home directory, and the network are not available."
+
+-- The sandbox section must match the run: with network on, say so, and never tell the model the listed MCP tools are
+-- unreachable (they run in the harness, outside the sandbox, either way).
+function M.sandbox(text: string, net: boolean, has_mcp: boolean): string
+	local line = if net then "`/tmp` and your home directory are not available. `sh` has network access."
+		else "`/tmp`, your home directory, and the network are not available to `sh`."
+	if has_mcp then
+		line ..= " The MCP tools listed below work."
+	end
+	local i, j = text:find(NO_NET, 1, true)
+	return if i then text:sub(1, i - 1) .. line .. text:sub(j + 1) else text
+end
+
 function M.system(): string
-	return hx.asset("std/system.md")
+	return M.sandbox(hx.asset("std/system.md"), hx.net, #hx.mcp_servers() > 0)
 end
 
 -- The one tool the model has. Everything else (read, write, edit, sh, search, ...) is a function inside the Luau it sends.

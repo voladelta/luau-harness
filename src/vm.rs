@@ -572,6 +572,8 @@ impl Vm {
         }
         // ---- extension API: installed packages, agent-defined tools, staging for promotion ----
         let pres = resolver.clone();
+        // whether `sh` can reach the network (sandbox off, or --net / policy allow): std/prompt words the sandbox section by it
+        hx.set("net", !policy.enabled || policy.net)?;
         hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_names.clone()))?)?;
         hx.set("packages", lua.create_function(move |lua, ()| lua.to_value(&pres.list_packages()))?)?;
         let defs: Arc<Mutex<HashMap<String, ToolDef>>> = Arc::new(Mutex::new(HashMap::new()));
