@@ -215,9 +215,10 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
                             seg.text.push_str(b["text"].as_str().unwrap_or(""));
                         }
                         Some("tool_use") => {
+                            // only hx's own tools reach hx (as tools/call); the CLI itself rejects any other name (e.g. a
+                            // bare `luau` copied from a transcript replay), so waiting for it would hang this read
+                            let Some(name) = b["name"].as_str().and_then(|n| n.strip_prefix(&format!("mcp__{SERVER}__"))) else { continue };
                             expected += 1;
-                            let name = b["name"].as_str().unwrap_or("");
-                            let name = name.strip_prefix(&format!("mcp__{SERVER}__")).unwrap_or(name);
                             seg.calls.push(json!({"id": b["id"], "name": name, "input": b["input"]}));
                         }
                         _ => {}
@@ -262,7 +263,7 @@ async fn fresh(cfg: &LlmCfg, system: &str, max_tokens: u64, tools: &[Value], sys
         content(&last.1, &last.2)
     } else {
         // earlier images are not replayed (a note stands in); the last turn's images are sent for real
-        let mut t = String::from("The conversation so far (continue it as the assistant; your next reply answers the last user turn):\n");
+        let mut t = String::from("The conversation so far (continue it as the assistant; your next reply answers the last user turn). The [tool call] lines are a record of earlier calls; make new calls with your tool, not as text:\n");
         for (i, (u, s, im)) in w.iter().enumerate() {
             let note = if i + 1 < w.len() && !im.is_empty() { format!("\n[{} image(s) omitted from this replay]", im.len()) } else { String::new() };
             t += &format!("\n[{}]\n{s}{note}\n", if *u { "user" } else { "assistant" });
