@@ -26,8 +26,8 @@ from collections import defaultdict
 from math import comb
 from pathlib import Path
 
-MODELS = {"haiku", "sonnet", "opus"}
-EFFORTS = {"low", "medium", "high"}
+MODELS = {"haiku", "sonnet", "opus", "ds41f", "glm53f", "rds41f", "rglm53f"}
+EFFORTS = {"low", "medium", "high", "none"}
 FATAL = [
     ("rate-limit", "plan usage limit reached"),
     ("sdk-error", "claude-sdk:"),
