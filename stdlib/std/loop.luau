@@ -131,6 +131,11 @@ function M.run(cfg)
 			table.insert(messages, { role = "tool", id = c.id, content = fb })
 		end
 	end
+	if not rep.finished and not rep.stopped and rep.turns >= cfg.max_turns then
+		-- out of turns is not a failure of the task: say so, so a report can tell a cut-off run from a wrong answer
+		rep.stopped = "max_turns: " .. cfg.max_turns
+		hx.log("### STOPPED\n" .. rep.stopped)
+	end
 	return rep
 end
 

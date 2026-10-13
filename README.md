@@ -153,7 +153,7 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
 | `--reasoning R` | | Reasoning effort |
-| `--max-turns N` | 30 | Turn limit |
+| `--max-turns N` | 200 | Turn limit; the report says `stopped: "max_turns: N"` when it is hit |
 | `--max-output N` | 16384 | Max output tokens per turn |
 | `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at min(~95% of it, 256k); give a smaller model's window so it compacts before an overflow |
 | `--max-cost USD` `--max-tokens N` `--max-wall SECS` | none | Budgets; flags override `policy.toml` |

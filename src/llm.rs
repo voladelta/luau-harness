@@ -202,24 +202,39 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
     let url = if responses { format!("{base}/responses") } else { format!("{base}/chat/completions") };
     let mut resp: Option<Value> = None;
+    let mut last = String::new();
     for attempt in 0..6u32 {
         let r = http.post(&url).json(&body);
         let r = r.bearer_auth(key);
         match r.send().await {
             Ok(r) if r.status().is_success() => {
-                resp = Some(r.json().await?);
-                break;
+                // A 200 is not yet a reply: the body can be cut off (a dropped connection, the client timeout during a
+                // long generation), not JSON, or an `{"error": ...}` object (OpenRouter, when an upstream provider fails
+                // mid-request). All of those are retried like a 5xx instead of ending the run.
+                match r.text().await {
+                    Ok(t) => match serde_json::from_str::<Value>(&t) {
+                        Ok(v) if v.get("error").is_some() && v.get("choices").is_none() && v.get("output").is_none() => {
+                            last = format!("error body: {}", v["error"]);
+                        }
+                        Ok(v) => {
+                            resp = Some(v);
+                            break;
+                        }
+                        Err(e) => last = format!("undecodable body ({e}): {}", t.chars().take(200).collect::<String>()),
+                    },
+                    Err(e) => last = format!("body read failed: {e}"),
+                }
             }
-            Ok(r) if matches!(r.status().as_u16(), 429 | 500 | 502 | 503 | 529) => {}
+            Ok(r) if matches!(r.status().as_u16(), 429 | 500 | 502 | 503 | 529) => last = format!("API {}", r.status()),
             Ok(r) => bail!("API {}: {}", r.status(), r.text().await.unwrap_or_default()),
-            Err(e) if e.is_timeout() || e.is_connect() => {}
+            Err(e) if e.is_timeout() || e.is_connect() => last = format!("request failed: {e}"),
             Err(e) => bail!("API request failed: {e}"),
         }
         if attempt < 5 {
             tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
         }
     }
-    let Some(resp) = resp else { bail!("API unavailable after retries") };
+    let Some(resp) = resp else { bail!("API unavailable after retries (last: {last})") };
 
     let u = &resp["usage"];
     let mut out = Reply::default();

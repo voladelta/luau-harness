@@ -85,6 +85,14 @@ sleep 1
 OPENROUTER_API_KEY=x $H run --workspace $W4 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace4.txt > $T/rep4.json
 check "before_finish continues once" "$(python3 -c "import json;r=json.load(open('$T/rep4.json'));print(r['llm_calls'], r['final_answer'])")" "3 Checked: final answer."
 
+# 6c. a 200 whose body is cut off, or is an {"error": ...} object, is retried instead of ending the run
+W5=$T/ws5; mkdir -p $W5
+kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
+MOCK_REPLIES='[{"status":200,"error":"{\"choices\": [{\"mess"},{"status":200,"error":"{\"error\":{\"code\":502,\"message\":\"upstream\"}}"},"Recovered."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
+sleep 1
+OPENROUTER_API_KEY=x $H run --workspace $W5 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY > $T/rep5.json 2>$T/err5.txt
+check "bad 200 bodies are retried" "$(python3 -c "import json;print(json.load(open('$T/rep5.json'))['final_answer'])" 2>/dev/null)" "Recovered."
+
 # 7. hot reload keeps session state
 W3=$T/ws3; mkdir -p $W3/pk/tests $W3/.harness/override/std
 cat > $W3/pk/tests/reload_test.luau <<'LUA'
