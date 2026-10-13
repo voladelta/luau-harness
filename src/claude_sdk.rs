@@ -34,8 +34,14 @@ struct Proc {
     seen: Vec<String>,
     /// tool calls the model made that hx has not answered yet
     pending: Vec<Pending>,
-    /// tokens (input, cache_read, cache_write, output) already reported for the user message being worked on
-    sent: [u64; 4],
+    /// usage (input, cache_read, cache_write, output) of every message this child has streamed, by message id: kept for the
+    /// child's life because a message's final output count (its message_delta) can arrive after hx stopped reading for
+    /// the turn that message belongs to
+    msgs: HashMap<String, [u64; 4]>,
+    /// the message being streamed (from its message_start), so a late message_delta is credited to it
+    cur_msg: String,
+    /// the sum over `msgs` already reported; each turn reports the growth since
+    reported: [u64; 4],
     /// total_cost_usd is cumulative per session; the last value seen, to report each turn's share
     last_cost: f64,
 }
@@ -144,7 +150,7 @@ async fn spawn(cfg: &LlmCfg, system: &str, max_tokens: u64, tools: &[Value], sys
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("could not start `claude` (is Claude Code installed and logged in?): {e}"))?;
     let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("claude: no stdin"))?;
     let out = BufReader::new(child.stdout.take().ok_or_else(|| anyhow::anyhow!("claude: no stdout"))?).lines();
-    let mut p = Proc { _child: child, stdin, out, sys_sha, seen: Vec::new(), pending: Vec::new(), sent: [0; 4], last_cost: 0.0 };
+    let mut p = Proc { _child: child, stdin, out, sys_sha, seen: Vec::new(), pending: Vec::new(), msgs: HashMap::new(), cur_msg: String::new(), reported: [0; 4], last_cost: 0.0 };
     if !tools.is_empty() {
         send(&mut p, &json!({"type": "control_request", "request_id": "hx-init", "request": {"subtype": "initialize", "sdkMcpServers": [SERVER]}})).await?;
     }
@@ -173,8 +179,6 @@ struct Segment {
     text: String,
     calls: Vec<Value>,
     pending: Vec<Pending>,
-    /// input, cache_read, cache_write, output (summed over the assistant messages seen)
-    usage: [u64; 4],
     /// the `result` event, when the model finished instead of calling tools
     result: Option<Value>,
 }
@@ -182,7 +186,6 @@ struct Segment {
 /// Read the child's output until the model either finishes (`result`) or has made every tool call of one assistant message.
 async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
     let mut seg = Segment::default();
-    let mut usage: HashMap<String, [u64; 4]> = HashMap::new();
     let mut expected = 0usize;
     loop {
         let l = match tokio::time::timeout(IDLE, p.out.next_line()).await {
@@ -205,7 +208,14 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
             Some("assistant") => {
                 let m = &v["message"];
                 let u = &m["usage"];
-                usage.insert(m["id"].as_str().unwrap_or("").to_string(), [u["input_tokens"].as_u64().unwrap_or(0), u["cache_read_input_tokens"].as_u64().unwrap_or(0), u["cache_creation_input_tokens"].as_u64().unwrap_or(0), u["output_tokens"].as_u64().unwrap_or(0)]);
+                {
+                    let id = m["id"].as_str().unwrap_or("").to_string();
+                    let e = p.msgs.entry(id).or_insert([0; 4]);
+                    let new = [u["input_tokens"].as_u64().unwrap_or(0), u["cache_read_input_tokens"].as_u64().unwrap_or(0), u["cache_creation_input_tokens"].as_u64().unwrap_or(0), u["output_tokens"].as_u64().unwrap_or(0)];
+                    for (x, n) in e.iter_mut().zip(new) {
+                        *x = (*x).max(n);
+                    }
+                }
                 for b in m["content"].as_array().into_iter().flatten() {
                     match b["type"].as_str() {
                         Some("text") => {
@@ -236,6 +246,30 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
                     _ => mcp_reply(p, &rid, rpc, json!({})).await?,
                 }
             }
+            Some("stream_event") => {
+                // the streamed `assistant` events carry the usage of a message still being written (output far too low);
+                // message_start names the message, and its closing message_delta has the final output count
+                let ev = &v["event"];
+                match ev["type"].as_str() {
+                    Some("message_start") => {
+                        let m = &ev["message"];
+                        p.cur_msg = m["id"].as_str().unwrap_or("").to_string();
+                        let u = &m["usage"];
+                        let e = p.msgs.entry(p.cur_msg.clone()).or_insert([0; 4]);
+                        let new = [u["input_tokens"].as_u64().unwrap_or(0), u["cache_read_input_tokens"].as_u64().unwrap_or(0), u["cache_creation_input_tokens"].as_u64().unwrap_or(0), u["output_tokens"].as_u64().unwrap_or(0)];
+                        for (x, n) in e.iter_mut().zip(new) {
+                            *x = (*x).max(n);
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(o) = ev["usage"]["output_tokens"].as_u64() {
+                            let e = p.msgs.entry(p.cur_msg.clone()).or_insert([0; 4]);
+                            e[3] = e[3].max(o);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Some("result") => {
                 seg.result = Some(v);
                 break;
@@ -244,11 +278,6 @@ async fn drive(p: &mut Proc, tools: &Value) -> Result<Segment> {
         }
         if expected > 0 && seg.pending.len() >= expected {
             break;
-        }
-    }
-    for u in usage.values() {
-        for (s, x) in seg.usage.iter_mut().zip(u) {
-            *s += x;
         }
     }
     Ok(seg)
@@ -316,7 +345,6 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
                 let w = wire(&trailing);
                 let prompt = content(&w[0].1, &w[0].2);
                 send(&mut p, &json!({"type": "user", "message": {"role": "user", "content": prompt}})).await?;
-                p.sent = [0; 4];
             } else {
                 for q in std::mem::take(&mut p.pending) {
                     let out = trailing.iter().find(|m| m["id"].as_str() == Some(&q.tool_use_id)).and_then(|m| m["content"].as_str()).unwrap_or("");
@@ -339,18 +367,8 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
         }
         r => r?,
     };
-    let mut usage = seg.usage;
     let mut out = Reply { finish: Some("stop".into()), ..Default::default() };
     if let Some(result) = &seg.result {
-        // the streamed assistant events carry usage from before the reply was complete (output is far too low); the result
-        // event's usage is exact for the whole user message, so this last segment reports what the earlier ones did not
-        let u = &result["usage"];
-        let total = [u["input_tokens"].as_u64(), u["cache_read_input_tokens"].as_u64(), u["cache_creation_input_tokens"].as_u64(), u["output_tokens"].as_u64()];
-        for ((u, t), sent) in usage.iter_mut().zip(total).zip(proc.sent) {
-            if let Some(t) = t {
-                *u = t.saturating_sub(sent);
-            }
-        }
         if result["is_error"].as_bool().unwrap_or(false) || result["subtype"].as_str() != Some("success") {
             bail!("claude-sdk: {}", result["result"].as_str().unwrap_or("the claude CLI reported an error"));
         }
@@ -365,9 +383,18 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
     } else {
         out.text = seg.text;
     }
-    for (sent, u) in proc.sent.iter_mut().zip(usage) {
-        *sent += u;
+    // this turn's usage: what the child's messages add up to now, less what earlier turns already reported
+    let mut total = [0u64; 4];
+    for m in proc.msgs.values() {
+        for (t, x) in total.iter_mut().zip(m) {
+            *t += x;
+        }
     }
+    let mut usage = [0u64; 4];
+    for ((u, t), r) in usage.iter_mut().zip(total).zip(proc.reported) {
+        *u = t.saturating_sub(r);
+    }
+    proc.reported = total;
     (out.input, out.cache_read, out.cache_write, out.output) = (usage[0], usage[1], usage[2], usage[3]);
     out.calls = seg.calls;
     proc.pending = seg.pending;

@@ -156,7 +156,12 @@ impl Policy {
     /// `hx.lock`, the trust store) stay read-only to the model, so a yolo run cannot rewrite config later runs apply.
     pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<String>, resume: Option<&Path>, net: Option<bool>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
-        let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
+        // a resumed run reuses the logged scratch path: replayed output that printed it must match byte for byte, or the
+        // replay diverges (the directory itself starts empty again; its files are not part of the replay)
+        let tmp = match resume.and_then(logged_tmp) {
+            Some(t) => t,
+            None => std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos())),
+        };
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
         let mut p = Policy { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], net: false, gpu: false, log: EventLog::off(), ask: vec![], allow: vec![], mode: "deny".into(), budget: Budget::default(), packs: vec![] };
@@ -210,7 +215,7 @@ impl Policy {
             }
             None => {
                 p.log = EventLog::open(&workspace.join(".harness/log"))?;
-                p.log.write("session", json!({"workspace": workspace.to_string_lossy(), "sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
+                p.log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
             }
         }
         p.read_roots.sort();
@@ -381,6 +386,37 @@ impl Policy {
         }
         s
     }
+}
+
+/// The scratch directory a logged session used: the `tmp` field of its `session` record, or, for logs written before
+/// that field existed, the first `<temp dir>/hx-<pid>-<nanos>` path that appears in the log.
+fn logged_tmp(log: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(log).ok()?;
+    for line in text.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v["kind"] == "session" {
+                if let Some(t) = v["tmp"].as_str() {
+                    return Some(PathBuf::from(t));
+                }
+                break;
+            }
+        }
+    }
+    let base = std::fs::canonicalize(std::env::temp_dir()).ok()?.join("hx-");
+    let base = base.to_string_lossy();
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find(base.as_ref()) {
+        let tail = &rest[i + base.len()..];
+        let n: usize = tail.char_indices().find(|(_, c)| !(c.is_ascii_digit() || *c == '-')).map(|(i, _)| i).unwrap_or(tail.len());
+        let id = &tail[..n];
+        if let Some((pid, nanos)) = id.split_once('-') {
+            if !pid.is_empty() && !nanos.is_empty() && !nanos.contains('-') {
+                return Some(PathBuf::from(format!("{base}{id}")));
+            }
+        }
+        rest = &rest[i + base.len()..];
+    }
+    None
 }
 
 impl Drop for Policy {
