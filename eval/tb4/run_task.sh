@@ -19,7 +19,9 @@ if [ -d $TB4_HOME/venvs/$SHORT ]; then cp -R $TB4_HOME/venvs/$SHORT $R/ws/.venv;
 case $A in
   base) PACK= ;;
   checkpoint) PACK="--pack std/checkpoint" ;;
-  *) echo "unknown arm $A"; exit 1 ;;
+  # any other arm: eval/tb4/arms/<arm>.luau becomes the workspace's .harness/init.luau (hooks only, no task hints)
+  *) [ -f "$HX_REPO/eval/tb4/arms/$A.luau" ] || { echo "unknown arm $A"; exit 1; }
+     cp "$HX_REPO/eval/tb4/arms/$A.luau" $R/ws/.harness/init.luau; PACK= ;;
 esac
 case $M in
   ds41f)   MID=deepseek/deepseek-v4.1-flash;    PROV=openrouter ;;

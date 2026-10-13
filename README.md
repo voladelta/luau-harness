@@ -76,6 +76,7 @@ Caveats:
 - On Sonnet 5.5 at low effort the gap is smaller: 4.7k vs 5.7k fresh tokens per task, because Sonnet needs few turns either way.
 - Part of the system prompt was tuned after reading frozen-task traces. On a separate unseen suite of 5 tasks, hx passed 5/5 on both models (DeepSeek 6.1k, Haiku 5.1k fresh tokens per task).
 - Claude Code ran without a sandbox; hx ran with it.
+- Re-checked 2026-10-13 on the Claude plan (`--api claude-sdk`, after output tokens became exact): 5 bug tasks, Haiku 5.5 medium, one run each. Both passed 5/5; medians per task were 3.7k vs 7.0k fresh tokens, 770 vs 2,074 output tokens, 3 vs 6 turns, hx first.
 
 Rerun with `python3 eval/run.py` (see `--help`).
 
@@ -87,7 +88,7 @@ Terminal-Bench 4.0 tasks, run on the macOS host with hx on Sonnet 5.5 at medium 
 |---|---|---|
 | mvcc-lsm-compaction | 1/20 solved, 0.76 of tests | 13/20 solved, 0.92 of tests (two-tailed Fisher p=0.0001) |
 | risk-scorer-replay | 0/1 solved (3/5 tests) | 2/2 solved |
-| hof-topology-interpenetration | 0/1 solved (37/38 tests) | 1/1 solved |
+| hof-topology-interpenetration | 0/1 solved (37/38 tests) | 2/2 solved |
 
 Caveats:
 - mvcc is the only pre-registered comparison (20 runs per arm, interleaved); risk and hof are leads from a few runs. Setup, method and task notes: `eval/tb4/README.md`. Opus 5.5 at low and medium effort solved mvcc 0/12, in both hx and Claude Code.

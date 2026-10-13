@@ -11,9 +11,13 @@ Sonnet 5.5, medium effort, Claude plan (`--api claude-sdk`). "Checkpoint" = `--p
 |---|---|---|---|
 | mvcc-lsm-compaction | 1/20 solved, 0.76 of tests | 13/20 solved, 0.92 of tests | Pre-registered, n=20 per arm, two-tailed Fisher p=0.0001 |
 | risk-scorer-replay | 0/1 (3/5 tests) | 2/2 solved (5/5 tests) | Lead: base rate not yet measured |
-| hof-topology-interpenetration | 0/1 (37/38 tests) | 1/1 solved (38/38 tests); run 2 pending | Lead: base rate not yet measured |
+| hof-topology-interpenetration | 0/1 (37/38 tests) | 2/2 solved (38/38 tests) | Lead: base rate not yet measured |
 | production-planning | 0/1 (18/20 tests) | 0/1 (18/20 tests) | Same two tests fail in every arm (see task notes) |
 | lake-temp-glm | 0/1 (RMSE 5.09, limit 1.75) | not run | Open: one checkpoint run is worth trying |
+
+Other arms, one run each on production-planning (all 18/20 tests, same two failures): `spec2` (a spec map at the start via a
+`before_model` hook, plus the checkpoint) and `musk` (a five-step method in the system prompt: question requirements,
+delete, simplify, shorten the loop, automate; plus "which single decision, settled now, unblocks the rest").
 
 Opus 5.5 at low and medium effort solved mvcc 0/12, in both hx and Claude Code: on that task the harness change beats
 the model upgrade.
@@ -49,7 +53,8 @@ bash /tmp/rt.sh mvcc-lsm-compaction checkpoint sonnet medium 1
 TB4_RUNS=$TB4_HOME/runs python3 eval/tb4_results.py --task mvcc --baseline base
 ```
 
-Arms: `base`, `checkpoint`. Models: `haiku|sonnet|opus` (Claude plan; effort = `--reasoning`), `ds41f` and `glm53f`
+Arms: `base`, `checkpoint`, or any `eval/tb4/arms/<arm>.luau`, which becomes the run's `.harness/init.luau` (hooks
+only; generic wording, no task hints). `arms/musk.luau` is an example. Models: `haiku|sonnet|opus` (Claude plan; effort = `--reasoning`), `ds41f` and `glm53f`
 (DeepSeek V4.1 Flash and GLM 5.3 Flash via OpenRouter), `rds41f` and `rglm53f` (same models via River). OpenRouter and
 River runs are capped at $0.25 each (`--max-cost`); the effort argument is ignored for them, but keep it in the run name.
 
@@ -86,6 +91,12 @@ queue should stop at its first VOID. A fast task (production, about 5 minutes) c
   and foodstuff (hidden conventions); prompt-text nudges in `prompts/system.md` changed nothing.
 - **Excluded by setup:** gsea-proteomics, cad-model, mp-checkpoint-consolidation.
 
+Runs from 2026-10-12/13 are archived (result, logs, trace, grade; no workspaces) in `$TB4_HOME/archive-2026-10-13/runs`,
+with the hook files and scripts used in `.../hooks`. Read them with
+`TB4_RUNS=$TB4_HOME/archive-2026-10-13/runs python3 eval/tb4_results.py --task mvcc --baseline base`.
+The archive also holds an earlier DeepSeek/GLM pilot on mvcc (`ds41f`, `glm53f`, `rds41f`, `rglm53f`); several of its
+runs died on the OpenRouter decode error that f14da9d fixed. GLM 5.3 Flash solved mvcc base 2/4: in the 1–4/5 band.
+
 `tb4-matrix.csv` is the public leaderboard (pass rate per task and agent) used to pick candidates; its columns include
 `GLM-5.3-Flash|Claude Code`.
 
@@ -93,7 +104,13 @@ queue should stop at its first VOID. A fast task (production, about 5 minutes) c
 
 1. **DeepSeek V4.1 Flash and GLM 5.3 Flash** (`ds41f`, `glm53f`): hx should be universal, not a Claude-plan harness. Screen
    the same tasks with `base` (one run each first), pick tasks in the 1–4/5 band for that model (it will differ from
-   Sonnet's), then compare `checkpoint`. Check an OpenRouter run's `result.json` cost before scaling up.
+   Sonnet's), then compare `checkpoint`. Check an OpenRouter run's `result.json` cost before scaling up. mvcc on GLM
+   (base 2/4 in the pilot) is the obvious first comparison.
 2. Base rate for risk and hof on Sonnet (4 more `base` runs each), then a small pre-registered comparison if either
    lands in the 1–4/5 band.
 3. One `checkpoint` run on lake-temp-glm.
+4. A stuck-triggered re-orient hook: when the same error repeats, tests stop improving or many turns pass without a
+   file change, ask what the last results showed, whether the plan still holds, and which single decision unblocks the
+   rest (the `musk` arm's question). Prompt text alone did nothing so far; a hook at a decision moment did.
+5. The checkpoint wrote a test file into the deliverable directory on hof (it still passed). A later wording keeps
+   tests in `tmpdir()` when the task asks for none; fold that in only with a new measurement.
