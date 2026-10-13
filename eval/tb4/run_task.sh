@@ -21,7 +21,8 @@ case $A in
   checkpoint) PACK="--pack std/checkpoint" ;;
   # any other arm: eval/tb4/arms/<arm>.luau becomes the workspace's .harness/init.luau (hooks only, no task hints)
   *) [ -f "$HX_REPO/eval/tb4/arms/$A.luau" ] || { echo "unknown arm $A"; exit 1; }
-     cp "$HX_REPO/eval/tb4/arms/$A.luau" $R/ws/.harness/init.luau; PACK= ;;
+     cp "$HX_REPO/eval/tb4/arms/$A.luau" $R/ws/.harness/init.luau; PACK=
+     mkdir -p $R/ws/.harness/override/arms && cp "$HX_REPO"/eval/tb4/arms/*.luau $R/ws/.harness/override/arms/ ;;  # require("arms/x")
 esac
 case $M in
   ds41f)   MID=deepseek/deepseek-v4.1-flash;    PROV=openrouter ;;
