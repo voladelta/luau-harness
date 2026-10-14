@@ -79,8 +79,21 @@ impl Host {
     }
 
     pub fn child(&self) -> Arc<Host> {
+        self.child_with(None, None)
+    }
+
+    /// A subagent host, optionally on another model or reasoning effort of the same API (e.g. a lead on opus hands
+    /// exploration to haiku at low effort). Usage, trace, budget and policy stay shared with the parent.
+    pub fn child_with(&self, model: Option<String>, reasoning: Option<String>) -> Arc<Host> {
+        let mut llm = self.llm.clone();
+        if let Some(m) = model {
+            llm.model = m;
+        }
+        if reasoning.is_some() {
+            llm.reasoning = reasoning;
+        }
         Arc::new(Host {
-            llm: self.llm.clone(),
+            llm,
             workspace: self.workspace.clone(),
             policy: self.policy.clone(),
             max_turns: self.max_turns,

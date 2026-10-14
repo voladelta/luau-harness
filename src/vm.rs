@@ -318,11 +318,18 @@ impl Vm {
                         return Err(mlua::Error::runtime(format!("agent depth limit ({}) reached", h.max_depth)));
                     }
                     let turns = opts.as_ref().and_then(|o| o.get::<Option<usize>>("max_turns").ok().flatten()).unwrap_or(12);
-                    let args = serde_json::json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": turns});
+                    let model = opts.as_ref().and_then(|o| o.get::<Option<String>>("model").ok().flatten());
+                    let effort = opts.as_ref().and_then(|o| o.get::<Option<String>>("effort").ok().flatten());
+                    if let Some(e) = &effort {
+                        if !["low", "medium", "high", "xhigh", "max"].contains(&e.as_str()) {
+                            return Err(mlua::Error::runtime(format!("agent: effort must be low, medium, high, xhigh or max (got {e:?})")));
+                        }
+                    }
+                    let args = serde_json::json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": turns, "model": model, "effort": effort});
                     // a subagent is an effect: replayed from the log on resume, never re-run
                     let ret = afx.run(&lua, "agent", Class::LocalWrite, args, || async {
-                        let child = h.child();
-                        child.log(&format!("### SUBAGENT (depth {})\n{task}", child.depth));
+                        let child = h.child_with(model.clone(), effort.clone());
+                        child.log(&format!("### SUBAGENT (depth {}, model {}, effort {})\n{task}", child.depth, child.llm.model, child.llm.reasoning.as_deref().unwrap_or("default")));
                         let rep = child.run_task(task.clone(), turns).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
                         Ok(Ret::Agent { answer: rep["final_answer"].as_str().unwrap_or("").to_string(), finished: rep["finished"].as_bool().unwrap_or(false), turns: rep["turns"].as_u64().unwrap_or(0) })
                     }).await?;
