@@ -78,6 +78,7 @@ if grep -q 'plan usage limit reached' $R/stderr.log; then reason=rate-limit
 elif grep -qiE 'API (unavailable after retries|429)|rate.?limit' $R/stderr.log; then reason=rate-limit
 elif grep -qiE 'API 402|insufficient.?credits|insufficient.?quota|quota' $R/stderr.log; then reason=credits
 elif grep -qiE 'decoding response body|API [0-9]{3}|API request failed' $R/stderr.log; then reason=api-error
+elif [ -f $R/trace.txt ] && grep -q '^project init failed' $R/trace.txt; then reason=setup-init  # a broken arm hook: not the model's run
 elif grep -q 'safeguards flagged' $R/stderr.log; then reason=refusal  # model safety classifier (e.g. a [bio] false positive): not a failure
 elif grep -q 'runtime error:' $R/stderr.log; then reason=hx-error
 elif [ ! -s $R/result.json ]; then reason=empty-result
