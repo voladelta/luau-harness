@@ -26,7 +26,7 @@ from collections import defaultdict
 from math import comb
 from pathlib import Path
 
-MODELS = {"haiku", "sonnet", "opus", "ds41f", "glm53f", "rds41f", "rglm53f"}
+MODELS = {"haiku", "sonnet", "opus", "ds41f", "glm53f", "rds41f", "rglm53f", "orhaiku", "eds41f"}
 EFFORTS = {"low", "medium", "high", "none"}
 FATAL = [
     ("rate-limit", "plan usage limit reached"),
@@ -55,6 +55,11 @@ def void_reason(d):
             if needle in err:
                 return label
         return "empty-result"
+    try:
+        if json.loads(rj.read_text()).get("is_error"):  # arm cc: Claude Code reports its own failures in result.json
+            return "cc-error"
+    except ValueError:
+        pass
     return None
 
 

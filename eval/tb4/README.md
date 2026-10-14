@@ -22,6 +22,59 @@ delete, simplify, shorten the loop, automate; plus "which single decision, settl
 Opus 5.5 at low and medium effort solved mvcc 0/12, in both hx and Claude Code: on that task the harness change beats
 the model upgrade.
 
+### 2026-10-14: replication on the new system prompt
+
+The release binary had carried a Finishing rule ("when the tests or checks you ran pass, stop; do not re-run passing
+tests") that pulls against any checkpoint. `prompts/system.md` now says "keep working until everything the task asks for
+is done and checked" instead; the old text is the arm `sys0`. Pre-registered, mvcc, Sonnet 5.5 medium, n=10 per arm,
+four arms per round in parallel (interleaved), no VOID runs:
+
+| Arm | Solved | Mean tests |
+|---|---|---|
+| base (new prompt) | 0/10 | 0.77 |
+| checkpoint (new prompt) | 9/10 | 0.99 |
+| sys0ck (old prompt + checkpoint, the 2026-10-12 setup) | 8/10 | 0.96 |
+| rpi4ck (rpi4 preamble + checkpoint) | 7/10 | 0.92 |
+
+The checkpoint effect replicates (base vs checkpoint, two-tailed Fisher p=0.0001); the new system prompt does not cost
+it (9/10 vs 8/10, p=1.0); a research-first preamble on top adds nothing (7/10, p=0.58). Prompt-only preambles
+(`arms/rpi*.prompt`, appended to the task text) were unreliable alone: Sonnet often skipped them (rpi3 1/2, rpi4 0/2
+on mvcc). Claude Code (`cc`) failed mvcc like base. A nudge appended to a tool result (`plan3`) was dismissed by Sonnet
+as prompt injection; deliver mid-run instructions as user turns (the checkpoint) or system messages.
+
+Runner fixes the same day: tasks that write `/results` (roy, biped-contact-dynamics, gsea-proteomics) were never seen
+by the grader (`results/` is now mounted at `/results`); Claude models get `--max-output 64000` (thinking counts toward
+the per-call cap; Haiku at high effort hit 16384); `<arm>ck` works for `.prompt` arms; `<arm>.prompt` files exist.
+
+### 2026-10-14: Opus, build tasks, GLM, and the heads-up (`warnck`)
+
+mvcc unless noted; one run per cell unless n is given, so most rows are leads, not results.
+
+- **Opus needs the checkpoint and something more.** Opus without a checkpoint: 0/14 solved. With the hook alone it
+  passes most tests but did not solve (low 13/15, medium 11/15 tests). The measured checkpoint text appended to the task
+  (`ckp.prompt`): low 3/5, medium 1/1, about $0.25 per low run. Rewordings of it (`ckp2` "inserts, updates and deletes",
+  `ckp3` definition of done, `ckpr`/`ckprp` recall prior art first) did no better (2/5, 2/5, 0–1/1): wording changes sit
+  below the noise floor; keep `ckp` word for word. Opus low often skips up-front instructions (4–5 calls).
+- **The checkpoint hurts build tasks.** react-lead-form base 6/6 vs checkpoint 1/6 (Fisher p=0.015): runs left fragile
+  tests in the project's suite (`process.chdir` in vitest workers; an "unwritable" path root can write) or broke the
+  main path with late edits. `checkpoint5` (plus test-placement and re-run-main sentences): mvcc 3/6, react 3/4.
+  `route.luau` (defect keywords get the checkpoint, other tasks a light prove-it-works check): mvcc 4/4, react 2/4.
+- **Delegation:** `agent(task, {model, effort})` now exists; with `lead.md` (a delegation section) Opus never delegated.
+- **GLM 5.3 Flash** (River): mvcc solved 14/14 with any checkpoint form vs base 1/3, but weak elsewhere (base vs ckp on
+  eight other tasks: 2 vs 2 solved; ckp on wal truncated by the 16384 per-call output cap). Dropped for now.
+- **Heads-up + hook (`warnck`):** `warn.md` is the system prompt plus one Finishing line, "When you first try to finish,
+  you will be asked to state the root cause you fixed, list the other situations where it could fire, and show a
+  passing test for each. Plan so that your first answer already meets this.", with the checkpoint hook on top.
+
+  | Model, effort | warnck | Cost | hook only | ckp |
+  |---|---|---|---|---|
+  | Sonnet medium | 1/1 (15/15) | $0.14 | 9/10 | – |
+  | Opus low | 1/1 (15/15) | $0.37 | 0/1 | 3/5 |
+  | Opus medium | 1/1 (15/15) | $0.37 | 0/1 | 1/1 |
+
+  Next: confirm on Opus low at n=5 (sequential). If it holds (4/5 or better), `std/checkpoint` should add the heads-up
+  line itself when installed.
+
 ## Setup
 
 Everything outside the repo lives in `TB4_HOME` (default `~/.cache/hx-tb4`):
@@ -53,9 +106,13 @@ bash /tmp/rt.sh mvcc-lsm-compaction checkpoint sonnet medium 1
 TB4_RUNS=$TB4_HOME/runs python3 eval/tb4_results.py --task mvcc --baseline base
 ```
 
-Arms: `base`, `checkpoint`, or any `eval/tb4/arms/<arm>.luau`, which becomes the run's `.harness/init.luau` (hooks
-only; generic wording, no task hints). `arms/musk.luau` is an example. Models: `haiku|sonnet|opus` (Claude plan; effort = `--reasoning`), `ds41f` and `glm53f`
-(DeepSeek V4.1 Flash and GLM 5.3 Flash via OpenRouter), `rds41f` and `rglm53f` (same models via River). OpenRouter and
+Arms: `base`, `checkpoint` (`--pack std/checkpoint`), `cc` (Claude Code itself), or files in `eval/tb4/arms/` named
+after the arm (generic wording, no task hints): `<arm>.luau` becomes the run's `.harness/init.luau` (hooks, e.g.
+`route.luau`); `<arm>.md` replaces the system prompt (e.g. `warn.md`, `sys0.md`); `<arm>.prompt` is appended under the
+task text and `<arm>.pre` prepended above it (e.g. `ckp.prompt`). `<arm>ck`, when no files of that name exist, is
+`<arm>` plus the checkpoint pack (`warnck` = `warn.md` + checkpoint). Models: `haiku|sonnet|opus` (Claude plan; effort =
+`--reasoning`), `ds41f` and `glm53f` (DeepSeek V4.1 Flash and GLM 5.3 Flash via OpenRouter), `rds41f` and `rglm53f`
+(same models via River), `eglm53f` (GLM via Enclave), `orhaiku` (Haiku via OpenRouter). OpenRouter and
 River runs are capped at $0.25 each (`--max-cost`); the effort argument is ignored for them, but keep it in the run name.
 
 Run jobs one at a time on the Claude plan. Parallel pools drained the five-hour limit and turned runs into VOIDs; a
