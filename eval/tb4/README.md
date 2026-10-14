@@ -72,8 +72,11 @@ mvcc unless noted; one run per cell unless n is given, so most rows are leads, n
   | Opus low | 1/1 (15/15) | $0.37 | 0/1 | 3/5 |
   | Opus medium | 1/1 (15/15) | $0.37 | 0/1 | 1/1 |
 
-  Next: confirm on Opus low at n=5 (sequential). If it holds (4/5 or better), `std/checkpoint` should add the heads-up
-  line itself when installed.
+  **Confirmed on Opus low, pre-registered n=5 (#202–206, sequential, success = 4/5 or better): 5/5 solved, 15/15 tests
+  each, $0.17–0.24 per run (mean $0.21; `ckp` low was 3/5 at about $0.25).** `std/checkpoint` now adds the heads-up line
+  itself (a `before_model` hook puts it after the real-check bullet, so the default prompt equals `warn.md`; a prompt
+  that already has it is left alone). A check run through the plain `checkpoint` arm on the new binary (#207) failed
+  (4 tests; Opus stopped after 6 calls, 49s), so Opus low stands at 6/7 with the heads-up.
 
 ## Setup
 
