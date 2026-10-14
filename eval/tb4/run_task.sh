@@ -1,5 +1,6 @@
 #!/bin/bash
-# usage: run_task.sh <task> <arm: base|checkpoint|cc|<arms/x>> <model> <effort> [n=1]
+# usage: run_task.sh <task> <arm: base|nock|cc|<arms/x>> <model> <effort> [n=1]
+# base = hx defaults, which include std/checkpoint since 2026-10-14; nock = without it (the old base); checkpoint = base
 # Runs hx (arm cc: Claude Code, `claude -p`, as the comparison harness) on the macOS host in a copy of the task's environment, then grades with the task's own tests/test.sh inside
 # its verifier image (tb4-<short>-verifier) with the workspace mounted at /app. Prints one "==" line and one reward line.
 # A run that died (plan or rate limit, API error, hx error) prints "== VOID ..." and is not graded: it is not a failure.
@@ -11,6 +12,7 @@ HX_REPO=$(cd "$(dirname "$0")/../.." && pwd)
 TASK=$1; A=$2; M=$3; E=$4; N=${5:-1}; T=$TB4_HOME/repo/tasks/$TASK; SHORT=${TASK%%-*}; R=$TB4_HOME/runs/$SHORT-$A-$M-$E-$N
 [ -d "$T" ] || { echo "no task $T"; exit 1; }
 SRC=$T/environment/app; [ -d $SRC ] || SRC=$T/environment
+[ -e $R ] && [ -z "${TB4_OVERWRITE:-}" ] && { echo "run $R exists: pick another n (TB4_OVERWRITE=1 replaces it)"; exit 3; }
 rm -rf $R; mkdir -p $R/ws; (cd $SRC && tar cf - --exclude Dockerfile .) | (cd $R/ws && tar xf -); mkdir -p $R/ws/.harness
 # the task text with /app rewritten to the workspace; the canary line goes (contamination checks look for it)
 sed '/harbor-canary/d; s#-C /app#-C .#g; s#`/app/`#the current directory#g; s#`/app/#`#g; s#`/app`#the current directory#g; s# /app/# #g' $T/instruction.md > $R/prompt.md

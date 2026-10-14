@@ -22,6 +22,7 @@ function M.run(cfg)
 	require("std/packages").install({ hooks = hooks })
 	require("std/mcp").install({ hooks = hooks })
 	require("std/compact").install({ hooks = hooks }) -- adds nothing to requests until the context nears the window
+	require("std/checkpoint").install({ hooks = hooks }) -- one self-check before the first final answer
 	for _, name in cfg.packs or {} do
 		require(name).install({ hooks = hooks })
 	end

@@ -28,7 +28,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Replay and resume | Every effect is logged in a hash-chained log; `--resume` rebuilds the session and never repeats a side effect |
 | Budgets | Cost, token and wall-clock limits, shared with subagents; the run stops cleanly when one is hit |
 | Compaction | On by default (`std/compact`): from 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; recent messages and Luau globals stay; one compact-and-retry on a context-overflow error |
-| Checkpoint | Opt-in (`--pack std/checkpoint`): before the first final answer is accepted, the model is sent back once to name the root cause, list the other cases it implies, test each and re-check the task's requirements |
+| Checkpoint | On by default (`std/checkpoint`): the system prompt warns that the first final answer will be checked, and before it is accepted the model is sent back once to name the root cause, list the other cases it implies, test each and re-check the task's requirements; off with `require("std/checkpoint").enabled = false` in `.harness/init.luau` |
 | Overridable harness | Loop, prompt, printer and hooks are Luau in `stdlib/std/`; replace any module in `.harness/override/std/` |
 | Extensions | Tool and skill packages locked by hash, MCP servers (stdio and HTTP), agent-written tools promoted only after your review |
 | Any provider | OpenAI Chat Completions or Responses API; any compatible base URL (OpenRouter by default) |
@@ -82,7 +82,7 @@ Rerun with `python3 eval/run.py` (see `--help`).
 
 ### Checkpoint on hard tasks
 
-Terminal-Bench 4.0 tasks, run on the macOS host with hx on Sonnet 5.5 at medium effort (Claude plan), graded by each task's own tests in its verifier container. "Checkpoint" is `--pack std/checkpoint`. Runs the Claude plan's usage limit cut off are excluded, not counted as failures.
+Terminal-Bench 4.0 tasks, run on the macOS host with hx on Sonnet 5.5 at medium effort (Claude plan), graded by each task's own tests in its verifier container. "Checkpoint" is the `std/checkpoint` pack (opt-in when these runs were made, on by default since). Runs the Claude plan's usage limit cut off are excluded, not counted as failures.
 
 | Task | Without checkpoint | With checkpoint |
 |---|---|---|
@@ -93,7 +93,9 @@ Terminal-Bench 4.0 tasks, run on the macOS host with hx on Sonnet 5.5 at medium 
 Caveats:
 - mvcc is the only pre-registered comparison (20 runs per arm, interleaved); risk and hof are leads from a few runs. Setup, method and task notes: `eval/tb4/README.md`. Opus 5.5 at low and medium effort solved mvcc 0/12, in both hx and Claude Code.
 - The checkpoint does not help when a task hinges on a convention its text does not state: production-planning failed 18/20 tests with and without it.
-- The checkpoint adds turns, and so cost, on every run, including easy ones; that is why it is opt-in.
+- The checkpoint adds turns, and so cost, on every run, including easy ones.
+- It can hurt build tasks: on react-lead-form (Sonnet 5.5 medium) base solved 6/6 and the checkpoint 1/6, through fragile tests left in the project and late edits that broke the main path. Turn it off for such work.
+- With the heads-up line in the system prompt (added 2026-10-14), Opus 5.5 low solved mvcc 5/5 (pre-registered; the check alone never got Opus to a solve).
 
 ## Installation
 
@@ -175,7 +177,7 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at min(~95% of it, 256k); give a smaller model's window so it compacts before an overflow |
 | `--max-cost USD` `--max-tokens N` `--max-wall SECS` | none | Budgets; flags override `policy.toml` |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
-| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model), `std/checkpoint` (one self-check before the final answer) |
+| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
 | `--trace FILE` | | Write a readable trace |
 
 Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open network, no path limits and no approval gate; `.harness/` and `hx.lock` stay read-only; prints a warning), `--net` / `--no-net`, `--approval prompt` (ask on the terminal instead of refusing). Every command takes `--help`.

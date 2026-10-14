@@ -78,6 +78,13 @@ mvcc unless noted; one run per cell unless n is given, so most rows are leads, n
   that already has it is left alone). A check run through the plain `checkpoint` arm on the new binary (#207) failed
   (4 tests; Opus stopped after 6 calls, 49s), so Opus low stands at 6/7 with the heads-up.
 
+Sonnet 5.5 medium on the same setup, pre-registered n=5 (#301–305, success = 4/5 or better): 4/5 solved (one 11/15),
+$0.07–0.10 per run (mean $0.09). The heads-up costs Sonnet nothing (hook alone 9/10).
+
+**Naming from here on:** `std/checkpoint` (heads-up + check) is a default pack, so `base` now runs it; no arm name is
+needed. Every `base` result above this line is without it: that setup is now the arm `nock`. `checkpoint`, `warnck` and
+`<arm>ck` still work and equal `base` / `<arm>` (installing the pack twice is a no-op).
+
 ## Setup
 
 Everything outside the repo lives in `TB4_HOME` (default `~/.cache/hx-tb4`):
@@ -105,11 +112,11 @@ $TB4_HOME/.env           optional: export OPENROUTER_API_KEY=... RIVER_API_KEY=.
 
 ```bash
 cp eval/tb4/run_task.sh /tmp/rt.sh       # freeze it: bash reads a script while running it, so edits mid-batch break runs
-bash /tmp/rt.sh mvcc-lsm-compaction checkpoint sonnet medium 1
+bash /tmp/rt.sh mvcc-lsm-compaction base sonnet medium 1
 TB4_RUNS=$TB4_HOME/runs python3 eval/tb4_results.py --task mvcc --baseline base
 ```
 
-Arms: `base`, `checkpoint` (`--pack std/checkpoint`), `cc` (Claude Code itself), or files in `eval/tb4/arms/` named
+Arms: `base` (hx defaults, including `std/checkpoint` since 2026-10-14), `nock` (without it), `cc` (Claude Code itself), or files in `eval/tb4/arms/` named
 after the arm (generic wording, no task hints): `<arm>.luau` becomes the run's `.harness/init.luau` (hooks, e.g.
 `route.luau`); `<arm>.md` replaces the system prompt (e.g. `warn.md`, `sys0.md`); `<arm>.prompt` is appended under the
 task text and `<arm>.pre` prepended above it (e.g. `ckp.prompt`). `<arm>ck`, when no files of that name exist, is
