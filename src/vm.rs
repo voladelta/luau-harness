@@ -465,7 +465,7 @@ impl Vm {
             let max = max.unwrap_or(1024).clamp(64, 2048);
             let pol = vfx.pol.clone();
             let mut live: Option<crate::prims::ViewImage> = None;
-            vfx.sync(lua, "view", Class::Read, json!({"path": &path, "max": max}), || {
+            vfx.sync(lua, "view", Class::Read, json!({"path": &path, "max": max}), |_| {
                 let v = crate::prims::load_view_image(&pol, &path, max).map_err(mlua::Error::runtime)?;
                 let meta = json!({"sha256": v.sha256, "width": v.width, "height": v.height}).to_string();
                 live = Some(v);

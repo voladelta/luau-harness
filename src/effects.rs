@@ -143,7 +143,8 @@ impl Effects {
     }
 
     /// Authorize and record one synchronous effect.
-    pub fn sync(&self, _lua: &Lua, tool: &str, class: Class, args: Value, f: impl FnOnce() -> mlua::Result<Ret>) -> mlua::Result<Ret> {
+    /// `f` receives the durable intent's ID (None for reads).
+    pub fn sync(&self, _lua: &Lua, tool: &str, class: Class, args: Value, f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
         let _permit = if class != Class::Read && tool != "agent" {
             Some(self.supervisor.mutations.clone().try_acquire_owned().map_err(|_| rt("another mutation is in progress"))?)
@@ -152,7 +153,7 @@ impl Effects {
         let t0 = std::time::Instant::now();
         let call = Call { tool, class, args: &args, sha: &sha };
         let intent = self.begin(&call)?;
-        let res = f();
+        let res = f(intent);
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
         res
     }

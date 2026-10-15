@@ -23,6 +23,30 @@ pub struct LlmCfg {
     pub provider_only: Vec<String>,
 }
 
+/// The provider answered but returned no usable generation. A transport loss is a plain error instead: only then is
+/// it unknown whether a billable generation happened.
+#[derive(Debug)]
+pub struct Answered {
+    pub status: u16,
+    pub message: String,
+    /// seconds from a `Retry-After` header
+    pub retry_after: Option<f64>,
+}
+
+impl std::fmt::Display for Answered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+
+impl std::error::Error for Answered {}
+
+impl Answered {
+    /// A 4xx rejects the request and a 503 refuses it before any generation, so nothing was billed. Other 5xx can
+    /// follow a generation the upstream billed (a gateway timeout, say).
+    pub fn unbilled(&self) -> bool { (400..500).contains(&self.status) || self.status == 503 }
+    /// Worth one more attempt: rate limits, server errors and malformed 200 bodies. Other 4xx repeat identically.
+    pub fn retryable(&self) -> bool { matches!(self.status, 408 | 429 | 200) || self.status >= 500 }
+}
+
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Reply {
     pub text: String,
@@ -204,10 +228,12 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     // neither this adapter nor reqwest may silently dispatch a second attempt.
     let response = http.post(&url).bearer_auth(key).json(&body).send().await?;
     let status = response.status();
+    let retry_after = response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()?.trim().parse::<f64>().ok());
     let text = response.text().await?;
-    if !status.is_success() { bail!("API {status}: {text}"); }
-    let resp: Value = serde_json::from_str(&text)?;
-    if resp.get("error").is_some() { bail!("API error: {}", resp["error"]); }
+    let answered = |message: String| Answered { status: status.as_u16(), message, retry_after };
+    if !status.is_success() { return Err(answered(format!("API {status}: {text}")).into()); }
+    let resp: Value = serde_json::from_str(&text).map_err(|e| answered(format!("API returned a malformed body: {e}")))?;
+    if resp.get("error").is_some() { return Err(answered(format!("API error: {}", resp["error"])).into()); }
 
     let u = &resp["usage"];
     let mut out = Reply::default();

@@ -156,7 +156,7 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | `hx run` | Run an agent task; prints a JSON report |
 | `hx run --resume LOG` | Restore the saved manifest and latest checkpoint; no repeated launch flags |
 | `hx run --branch LOG --model M` | Start a new run using current approved configuration and inherited saved data |
-| `hx recover LOG OP --decision complete\|abandon\|retry --yes` | Record an owner's decision about an uncertain mutation; never executes it |
+| `hx recover LOG OP --decision complete\|abandon --yes` | Record an owner's decision about an uncertain mutation; never executes it |
 | `hx recover LOG OP --decision billing --tokens N --cost USD --yes` | Settle an uncertain model request's reservation using asserted usage |
 | `hx revoke LOG` | Stop admitting further operations for a run |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
@@ -285,10 +285,10 @@ A package that is unapproved, or changed since approval, is invisible to a new r
 
 `hx run --resume LOG` restores frozen settings and the latest committed controller state and `durable` data into fresh VMs. Ordinary globals and functions are lost. It supplies receipts from interrupted work to a recovery turn and never reruns old chunks to reconstruct memory.
 
-- An effect with an intent but no outcome is uncertain. New mutations are blocked until the owner records a reconciliation decision with `hx recover`.
-- Resume uses the original manifest even if workspace modules changed. The same binary is required; `--branch LOG` selects new configuration explicitly.
+- An effect with an intent but no outcome is uncertain. `write` and `edit` replace files atomically, so resume settles them from the file's hash. For `sh` and MCP calls, new mutations are blocked until the owner records a decision with `hx recover`.
+- Resume uses the original manifest, including the standard library, even if workspace modules or the binary changed; `--branch LOG` selects new configuration explicitly.
 - An OS lock prevents simultaneous resume.
-- Model adapters do not automatically retry lost responses. Uncertain requests retain reservations until owner billing reconciliation.
+- Model adapters never retry lost responses; those keep their reservations until owner billing reconciliation. A 4xx or 503 answer releases its reservation, and a 408, 429, 5xx or malformed 200 gets one more request.
 - The log stores file contents and command output as blobs in `.harness/log/blobs/`. Treat it as sensitive.
 
 ## Development

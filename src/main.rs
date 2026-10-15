@@ -68,7 +68,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
         "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
-        "recover" => "hx recover LOG OP --decision complete|abandon|retry [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nRetry permits only a new operation matching the original tool and argument hash, linked to the old ID.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
+        "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume and need no decision.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
@@ -288,6 +288,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         let inherited = arg(args, "--branch").map(|path| -> Result<_> {
             let journal = eventlog::EventLog::reopen(Path::new(&path))?;
             let manifest = supervisor::Manifest::inspect(Path::new(&path))?;
+            supervisor::reconcile_local_writes(&journal, &eventlog::load(Path::new(&path))?)?;
             let recovery = eventlog::verify(Path::new(&path))?;
             anyhow::ensure!(recovery.unknown.is_empty() && recovery.unknown_models.is_empty(), "reconcile uncertain operations and model billing before branching");
             let records = eventlog::load(Path::new(&path))?;
@@ -322,15 +323,15 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
 }
 
 fn cmd_recover(args: &[String]) -> Result<()> {
-    let path = Path::new(args.get(1).ok_or_else(|| usage("usage: hx recover LOG OP --decision complete|abandon|retry"))?);
+    let path = Path::new(args.get(1).ok_or_else(|| usage("usage: hx recover LOG OP --decision complete|abandon"))?);
     let id: u64 = args.get(2).ok_or_else(|| usage("missing operation ID"))?.parse()?;
     let decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?;
-    anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon" | "retry" | "billing"), "decision must be complete, abandon, retry or billing");
+    anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon" | "billing"), "decision must be complete, abandon or billing");
     let log = eventlog::EventLog::reconcile(path)?;
     let records = eventlog::load(path)?;
     if decision == "billing" {
         anyhow::ensure!(records.iter().any(|r| r["seq"] == id && r["kind"] == "model_intent"), "not a model operation ID");
-        anyhow::ensure!(!records.iter().any(|r| r["of"] == id && (r["kind"] == "billing" || (r["kind"] == "llm" && r.get("error").is_none()))), "model operation already settled");
+        anyhow::ensure!(!records.iter().any(|r| r["of"] == id && eventlog::settles_model(r)), "model operation already settled");
         let tokens: u64 = parsed(args, "--tokens")?.ok_or_else(|| usage("billing requires --tokens"))?;
         let cost: f64 = parsed(args, "--cost")?.ok_or_else(|| usage("billing requires --cost"))?;
         anyhow::ensure!(cost.is_finite() && cost >= 0.0, "billing cost must be finite and nonnegative");
@@ -341,11 +342,7 @@ fn cmd_recover(args: &[String]) -> Result<()> {
     }
     let intent = records.iter().find(|r| r["seq"] == id && r["kind"] == "intent").ok_or_else(|| usage("not a mutating operation ID"))?;
     anyhow::ensure!(!records.iter().any(|r| r["kind"] == "outcome" && r["of"] == id), "operation already has an outcome");
-    if let Some(previous) = records.iter().rev().find(|r| r["kind"] == "resolution" && r["of"] == id) {
-        anyhow::ensure!(previous["decision"] == "retry" && decision != "retry"
-            && !records.iter().any(|r| r["kind"] == "intent" && r["retry_of"] == id),
-            "operation already resolved; only an undispatched retry can be completed or abandoned");
-    }
+    anyhow::ensure!(!records.iter().any(|r| r["kind"] == "resolution" && r["of"] == id), "operation already resolved");
     if !has(args, "--yes") { confirm(&format!("Record {decision} for operation {id}? This is your assertion about its external state."))?; }
     log.write("resolution", serde_json::json!({"of":id, "decision":decision, "tool":intent["tool"], "args_sha":intent["args_sha"]}), true)?;
     println!("recorded {decision} for {id}; no operation was executed");

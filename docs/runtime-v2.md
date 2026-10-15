@@ -46,18 +46,19 @@ Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB
 
 Every mutating effect records a synced intent before its executor runs. Outcomes include full argument hashes and result receipts. A global mutation permit serializes mutations; sealed read batches may run concurrently. Subagents and packages retain or reduce their caller's authority.
 
-There is at most one application-level dispatch attempt for an operation ID. The HTTP and Claude adapters do not automatically retry lost generations. Underlying services and the Claude CLI may have their own internal behavior; hx does not establish exactly-once remote execution.
+There is at most one application-level dispatch attempt for an operation ID. The HTTP and Claude adapters do not automatically retry lost generations. A provider that answers without a generation is different: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 429, 5xx or malformed 200 body gets one new request under a new operation ID (honouring `Retry-After`, capped at 30 s). Any other failed attempt stays reserved as uncertain billing, so under a dollar threshold a 500, 502 or 504 still needs owner billing reconciliation before the run can continue. Underlying services and the Claude CLI may have their own internal behavior; hx does not establish exactly-once remote execution.
 
-An intent without an outcome is uncertain. Resume allows inspection but blocks new mutations until the owner reconciles it:
+An intent without an outcome is uncertain. Local `write` and `edit` settle themselves on resume or branch: each journals the hash of the content it is about to produce (`expect`) and replaces the file atomically (temp file, fsync, rename), so the file holds either its old content or exactly that. hx records a `resolution` with `"by": "hx"` and its evidence: `complete` when the file's hash matches, `abandon` when no `expect` was journaled or the file holds its previous content. An unreadable file is left for the owner.
+
+Other mutations (`sh`, MCP calls) can act outside the workspace, so resume allows inspection but blocks new mutations until the owner reconciles them:
 
 ```bash
 hx log verify .harness/log/RUN.jsonl
 hx recover .harness/log/RUN.jsonl OP --decision complete --yes
 hx recover .harness/log/RUN.jsonl OP --decision abandon --yes
-hx recover .harness/log/RUN.jsonl OP --decision retry --yes
 ```
 
-Record a decision based on the actual external state. `retry` dispatches nothing: it permits a single subsequent operation with the original tool and argument hash. The new intent records `retry_of`. Other mutations are refused while this exact retry is pending. Before the linked intent is dispatched, the owner can replace that authorization with `complete` or `abandon`. Both assertions remain in the journal.
+Record a decision based on the actual external state; it dispatches nothing and is final. After `abandon`, the resumed agent sees the receipts and can issue the operation again if it is still needed.
 
 Uncertain model calls retain budget reservations. After checking provider usage, the owner can settle one explicitly:
 
@@ -75,7 +76,7 @@ Journal or blob failure is fatal to effect admission, including when Luau catche
 hx run --workspace PROJECT --resume PROJECT/.harness/log/RUN.jsonl
 ```
 
-The manifest restores provider/model settings, context/output limits, extra packs, budgets, policy and exact module/package bytes. Do not repeat these flags on resume. Credential values are never stored; the named environment variables must still be available. The same binary is required. Workspace configuration edits do not alter an existing run.
+The manifest restores provider/model settings, context/output limits, extra packs, budgets, policy and exact module/package bytes, including the standard library and system prompt. Repeating these flags on resume is an error. Credential values are never stored; the named environment variables must still be available. A rebuilt binary can resume a run of the same journal format (it prints a note): the workflow's Luau comes from the manifest, and old chunks are never re-executed. Workspace configuration edits do not alter an existing run.
 
 The latest committed controller checkpoint and durable data are restored into fresh VMs. An interrupted chunk's code and operation receipts are supplied to a recovery turn; pending historical tool calls are closed with an interruption result. The old chunk is not re-executed. Receipts reference content-addressed blobs in the protected log directory. Ordinary globals, closures and scratch files are not restored. A finished run returns its saved report without another provider call.
 
@@ -138,9 +139,9 @@ Compaction and finish review remain heuristics. A successful checkpoint proves a
 
 ## Budgets and validation
 
-One journal-backed ledger accounts for the root and all descendants. Admission atomically reserves an allowance; successful receipts settle it. Under a dollar threshold, one outstanding request reserves the remaining allowance because hx has no universal per-request price bound. Token allowances use request bytes plus the configured output cap. Both limits are documented admission thresholds, not exact tokenizer or billing ceilings. Reservations from uncertain requests survive restarts.
+One journal-backed ledger accounts for the root and all descendants. Admission atomically reserves an allowance; successful receipts settle it. Under a dollar threshold, one outstanding request reserves the remaining allowance because hx has no universal per-request price bound; other requests (concurrent subagents) wait for it to settle instead of failing. Only settled usage and uncertain reservations, which never settle by themselves, stop admission. Token allowances use request bytes plus the configured output cap. Both limits are documented admission thresholds, not exact tokenizer or billing ceilings. Reservations from uncertain requests survive restarts.
 
-HTTP errors, including context rejection, conservatively retain reservations. With a dollar threshold, automatic compaction can therefore stop at admission until the owner reconciles billing. Without that blocked allowance, a definite context rejection may trigger one compaction and a new request; transport loss is never automatically retried.
+A 4xx answer, including a context rejection, releases its reservation, so a definite context rejection can trigger one compaction and a new request under any threshold. Transport loss and failed 5xx attempts retain their reservations; transport loss is never automatically retried.
 
 The absolute run deadline includes downtime. It is checked before admission and interrupts local VM/process/model work where possible. Cancellation cannot revoke a request already accepted by a remote service.
 
