@@ -4,7 +4,7 @@
 //!  * `sh` runs under Seatbelt: writes only to the workspace and a per-run temp dir, reads only from an allowlist,
 //!    no network unless granted, a scrubbed environment, its own process group (killed on timeout), and a process cap.
 //!  * `read`/`write`/`edit`/`search` check the *canonical* path against the same roots, never write through symlinks.
-//!  * `.harness/` and `hx.lock` are protected: the model can read them but never write them (grants, overrides, init).
+//!  * `.harness/` and `hx.lock` are protected: the model can read them but never write them (overrides, init, staging).
 //!
 //! User-owned config: `<workspace>/.harness/policy.toml` (protected from the model):
 //!     [fs]  read = ["/extra/read/root"]   write = ["/extra/write/root"]

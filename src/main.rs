@@ -39,10 +39,10 @@ COMMANDS:
     approve      lock a project package or skill and grant the capabilities it requests
     skills       list skills in .agents/skills and ~/.agents/skills and whether each is approved
     trust        review this workspace's .harness config and hx.lock, then trust it (untrusted config is ignored)
-    staged       list staged packages
-    accept       review and accept a staged package
-    reject       discard a staged package
-    upgrade      harness-module upgrade flow (propose|list|show|check|accept|rollback)
+    staged       list what the agent staged: packages and harness-module replacements
+    accept       review and activate something staged
+    reject       discard something staged
+    rollback     undo the last accepted replacement of a harness module
     log verify   check an event log's hash chain and list unknown-outcome effects
 
 GLOBAL FLAGS:
@@ -73,11 +73,11 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
         "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
-        "staged" => "hx staged\n\nList staged packages.\n",
-        "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,grants,mcp}.toml, .harness/init.luau, .harness/override/,\nhx.lock) and trust its exact content. Until then hx ignores it: a cloned repo cannot widen the sandbox, start MCP\nservers or pre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=1 trusts the workspace for one launch.\n",
-        "accept" => "hx accept NAME [--yes]\n\nReview a staged package, then lock it and grant its capabilities.\nPrompts on a terminal; without one, --yes is required.\n",
-        "reject" => "hx reject NAME\n\nDiscard a staged package.\n",
-        "upgrade" => "hx upgrade propose MODULE FILE [--reason R]\nhx upgrade list|show ID|check ID\nhx upgrade accept ID [--yes] [--force]\nhx upgrade rollback MODULE\n",
+        "staged" => "hx staged\n\nList what the agent staged: packages (NAME) and harness-module replacements (std/MODULE).\n",
+        "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp}.toml, .harness/init.luau, .harness/override/,\nhx.lock) and trust its exact content. Until then hx ignores it: a cloned repo cannot widen the sandbox, start MCP\nservers or pre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=1 trusts the workspace for one launch.\n",
+        "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate it. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
+        "reject" => "hx reject NAME\n\nDiscard something staged.\n",
+        "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
         "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 tampered, 3 unknown outcomes.\n",
         _ => return None,
     })
@@ -213,8 +213,7 @@ async fn real_main() -> Result<()> {
             print!("{}", modules::Resolver::new(workspace).skills_status());
             Ok(())
         }
-        "upgrade" => cmd_upgrade(&args, &workspace),
-        // hx staged | hx accept NAME [--yes] | hx reject NAME : the user's side of promotion (nothing the agent can call does this)
+        // hx staged | accept NAME [--yes] | reject NAME | rollback MODULE : the user's side of staging (nothing the agent can call does this)
         "staged" => {
             let l = modules::Resolver::new(workspace).list_staged();
             println!("{}", if l.is_empty() { "nothing staged".to_string() } else { l.join("\n") });
@@ -227,6 +226,7 @@ async fn real_main() -> Result<()> {
             Ok(())
         }
         "accept" => cmd_accept(&args, &workspace),
+        "rollback" => cmd_rollback(&args, &workspace),
         "log" if args.get(1).map(String::as_str) == Some("verify") => cmd_log_verify(&args),
         _ => Err(usage("usage: hx log verify FILE (see `hx log --help`)")),
     }
@@ -415,50 +415,21 @@ fn cmd_trust(args: &[String], workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-/// hx upgrade propose|list|show|check|accept|rollback : the harness-module upgrade flow (AC5)
-fn cmd_upgrade(args: &[String], workspace: &Path) -> Result<()> {
-    let r = modules::Resolver::new(workspace.to_path_buf());
-    let sub = args.get(1).map(String::as_str).unwrap_or("");
-    let id = || args.get(2).cloned().ok_or_else(|| usage(&format!("usage: hx upgrade {sub} ID")));
-    match sub {
-        "propose" => {
-            let (m, f) = (args.get(2).ok_or_else(|| usage("usage: hx upgrade propose MODULE FILE [--reason R]"))?, args.get(3).ok_or_else(|| usage("usage: hx upgrade propose MODULE FILE"))?);
-            println!("{}", r.propose(m, &std::fs::read_to_string(f)?, &arg(args, "--reason").unwrap_or_default())?);
-        }
-        "list" => {
-            for p in r.list_proposals() {
-                println!("{}  {}  {}", p["id"].as_str().unwrap_or(""), p["module"].as_str().unwrap_or(""), p["reason"].as_str().unwrap_or(""));
-            }
-        }
-        "show" => println!("{}", r.show_proposal(&id()?)?),
-        "check" => println!("{}", r.check_proposal(&id()?)?),
-        "accept" => {
-            let id = id()?;
-            println!("{}", r.show_proposal(&id)?);
-            if !has(args, "--yes") {
-                confirm("activate this change?")?;
-            }
-            let rt = trust::Retrust::before(workspace);
-            println!("{}", r.accept_upgrade(&id, has(args, "--force"))?);
-            rt.after()?;
-        }
-        "rollback" => {
-            let rt = trust::Retrust::before(workspace);
-            println!("{}", r.rollback_upgrade(args.get(2).ok_or_else(|| usage("usage: hx upgrade rollback MODULE"))?)?);
-            rt.after()?;
-        }
-        _ => return Err(usage("usage: hx upgrade propose|list|show|check|accept|rollback ...")),
-    }
-    Ok(())
+/// hx rollback MODULE : undo the last accepted replacement of a harness module
+fn cmd_rollback(args: &[String], workspace: &Path) -> Result<()> {
+    let module = args.get(1).ok_or_else(|| usage("usage: hx rollback MODULE"))?;
+    let rt = trust::Retrust::before(workspace);
+    println!("{}", modules::Resolver::new(workspace.to_path_buf()).rollback(module)?);
+    rt.after()
 }
 
-/// hx accept NAME [--yes] : review a staged package, then lock and grant it
+/// hx accept NAME [--yes] : review something staged, then activate it
 fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
     let n = args.get(1).ok_or_else(|| usage("usage: hx accept NAME [--yes]"))?;
     let r = modules::Resolver::new(workspace.to_path_buf());
     println!("{}", r.review(n)?);
     if !has(args, "--yes") {
-        confirm(&format!("accept {n}? it will be locked and granted the capabilities above"))?;
+        confirm(&format!("accept {n}? {}", if n.contains('/') { "it replaces the module in force for new runs" } else { "it will be locked and granted the capabilities above" }))?;
     }
     let rt = trust::Retrust::before(workspace);
     println!("{}", r.accept(n)?);

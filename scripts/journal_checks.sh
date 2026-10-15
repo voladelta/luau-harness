@@ -103,7 +103,7 @@ check "the interrupted command did not complete" "$([ -e $W/survived ] && echo D
 
 # --- 5. model/LLM and chunk activity is logged end-to-end (scripted model)
 newws h
-echo 'require("std/checkpoint").enabled = false' > $W/.harness/init.luau
+echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
 MOCK_REPLIES='["```luau\nwrite(\"x.txt\",\"1\")\n```","done"]' python3 scripts/mock_llm.py 8769 & MOCK=$!
 sleep 1; echo go > $T/p.txt
 OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8769 --key-env OPENROUTER_API_KEY >/dev/null

@@ -31,7 +31,7 @@ for key in ("HX_MODEL", "HX_API", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
 passed = 0
 
 
-def workspace(name, init='require("std/checkpoint").enabled = false\n'):
+def workspace(name, init='require("std/recheck").enabled = false\n'):
     path = BASE / name
     path.mkdir(parents=True, exist_ok=True)
     (path / ".harness").mkdir(exist_ok=True)
@@ -542,7 +542,7 @@ def compaction_and_recovery():
         {"code": 'assert(x==42); print("AFTER_TWO")' + pad},
         "done",
     ]
-    init = 'require("std/checkpoint").enabled=false\nrequire("std/compact").keep_recent_tokens=40\n'
+    init = 'require("std/recheck").enabled=false\nrequire("std/compact").keep_recent_tokens=40\n'
     path = workspace("compaction", init)
     with provider(lambda body, i: sequence[i]) as (url, calls):
         report = json.loads(start(path, url, "--context-window", "40000", "--max-output", "1000").stdout)

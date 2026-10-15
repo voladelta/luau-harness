@@ -1,4 +1,4 @@
-//! Module resolution, package manifests, lockfile and grants.
+//! Module resolution, package manifests, the lockfile (approvals and grants) and staging.
 //!
 //! `require("pkg")` loads `init.luau`; `require("pkg/mod")` loads `mod.luau`. Lookup order:
 //!   1. `<ws>/.harness/override/<pkg>/<mod>.luau`   user override of any module (e.g. the printer), no rebuild needed
@@ -35,7 +35,7 @@ pub const EMBEDDED: &[(&str, &str, &str)] = &[
     ("std", "authoring.luau", include_str!("../stdlib/std/authoring.luau")),
     ("std", "vision.luau", include_str!("../stdlib/std/vision.luau")),
     ("std", "compact.luau", include_str!("../stdlib/std/compact.luau")),
-    ("std", "checkpoint.luau", include_str!("../stdlib/std/checkpoint.luau")),
+    ("std", "recheck.luau", include_str!("../stdlib/std/recheck.luau")),
     ("std", "system.md", include_str!("../prompts/system.md")),
 ];
 
@@ -79,6 +79,7 @@ pub struct PkgInfo {
 /// `hx test DIR` mounts the package under test here so it can be required without being installed.
 pub static TEST_PKG: std::sync::OnceLock<(String, PathBuf)> = std::sync::OnceLock::new();
 
+/// `hx.lock`: one record per approved package: the exact content approved and the capabilities granted to it.
 #[derive(Debug, Deserialize, serde::Serialize, Default)]
 struct Lockfile {
     #[serde(default)]
@@ -90,12 +91,17 @@ struct LockEntry {
     name: String,
     version: String,
     hash: String,
+    /// capability -> granted scopes (`"*"` grants every scope)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    grants: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, serde::Serialize, Default)]
-struct Grants {
-    #[serde(default)]
-    grant: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+impl LockEntry {
+    /// The first requested capability scope this entry does not grant.
+    fn ungranted<'a>(&self, requested: &'a BTreeMap<String, Vec<String>>) -> Option<(&'a str, &'a str)> {
+        requested.iter().flat_map(|(cap, scopes)| scopes.iter().map(move |s| (cap.as_str(), s.as_str())))
+            .find(|(cap, s)| !self.grants.get(*cap).is_some_and(|g| g.iter().any(|x| x == s || x == "*")))
+    }
 }
 
 pub struct Resolver {
@@ -176,7 +182,6 @@ impl Registry {
             }
             for info in resolver.list_packages() {
                 let lock: Lockfile = read_toml(&root.join("hx.lock"))?;
-                let grants: Grants = read_toml(&root.join(".harness/grants.toml"))?;
                 let (dir, _) = resolver.locate(&info.name)?;
                 let files = match frozen_files(&dir) {
                     Ok(files) => files,
@@ -199,12 +204,9 @@ impl Registry {
                     hash.update(bytes); hash.update([0]);
                 }
                 let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-                anyhow::ensure!(lock.package.iter().any(|p| p.name == info.name && p.hash == digest && p.version == man.package.version),
-                    "package {} changed while its approved snapshot was captured", info.name);
-                for (cap, scopes) in &man.capabilities {
-                    for scope in scopes { anyhow::ensure!(grants.grant.get(&info.name).and_then(|g| g.get(cap)).is_some_and(|g| g.iter().any(|s| s == scope || s == "*")),
-                        "package {} requests ungranted {cap}.{scope}", info.name); }
-                }
+                let entry = lock.package.iter().find(|p| p.name == info.name && p.hash == digest && p.version == man.package.version)
+                    .with_context(|| format!("package {} changed while its approved snapshot was captured", info.name))?;
+                if let Some((cap, scope)) = entry.ungranted(&man.capabilities) { bail!("package {} requests ungranted {cap}.{scope}", info.name); }
                 registry.capabilities.insert(info.name.clone(), man.capabilities.clone());
                 let mut info = info;
                 info.version = man.package.version.clone(); info.kind = man.package.kind.clone().unwrap_or_default();
@@ -456,26 +458,19 @@ impl Resolver {
 
     fn verify(&self, pkg: &str, dir: &Path, man: &Manifest) -> Result<()> {
         let lock: Lockfile = read_toml(&self.root.join("hx.lock"))?;
-        let entry = lock.package.iter().find(|e| e.name == pkg);
-        let hash = if entry.is_some() { hash_dir(dir)? } else { String::new() }; // unlocked: skip hashing (~/.agents/skills can be large)
-        match entry {
-            None => bail!("package {pkg} is not locked; review it, then run `hx approve {pkg}`"),
-            Some(e) if e.hash != hash || e.version != man.package.version => bail!(
+        let Some(entry) = lock.package.iter().find(|e| e.name == pkg) else {
+            bail!("package {pkg} is not locked; review it, then run `hx approve {pkg}`")
+        };
+        let hash = hash_dir(dir)?; // only for locked packages: ~/.agents/skills can be large
+        if entry.hash != hash || entry.version != man.package.version {
+            bail!(
                 "package {pkg} changed since it was approved (locked {}…, now {}…); review it and run `hx approve {pkg}` again",
-                &e.hash[..8.min(e.hash.len())],
+                &entry.hash[..8.min(entry.hash.len())],
                 &hash[..8]
-            ),
-            Some(_) => {}
+            );
         }
-        let grants: Grants = read_toml(&self.harness().join("grants.toml"))?;
-        let granted = grants.grant.get(pkg);
-        for (cap, scopes) in &man.capabilities {
-            for s in scopes {
-                let ok = granted.and_then(|g| g.get(cap)).is_some_and(|g| g.iter().any(|x| x == s || x == "*"));
-                if !ok {
-                    bail!("package {pkg} requests capability {cap}={s} which has not been granted; run `hx approve {pkg}`");
-                }
-            }
+        if let Some((cap, s)) = entry.ungranted(&man.capabilities) {
+            bail!("package {pkg} requests capability {cap}={s} which has not been granted in hx.lock; run `hx approve {pkg}`");
         }
         Ok(())
     }
@@ -523,12 +518,19 @@ impl Resolver {
         }
     }
 
+    // ---------------------------------------------------------------------------------------------------------------
+    // Staging: everything the agent proposes waits under .harness/staged/ until the user accepts it there.
+    //   <pkg>/                  a package (an agent-written tool): accepted into .harness/pkgs/<pkg>, locked and granted
+    //   std/<module>/new.luau   a replacement for a built-in module: accepted into .harness/override/, rollback-able
+    // Nothing staged is active, and nothing the agent can call accepts.
+    // ---------------------------------------------------------------------------------------------------------------
     pub fn staged_dir(&self) -> PathBuf {
         self.harness().join("staged")
     }
 
-    /// Write a package into the staging area (replacing a previous staging of the same name). Not active until accepted.
+    /// Stage a package (replacing a previous staging of the same name).
     pub fn stage(&self, name: &str, files: &[(String, String)]) -> Result<PathBuf> {
+        anyhow::ensure!(name != "std", "std is the built-in package; stage a replacement for one of its modules instead");
         let dir = self.staged_dir().join(name);
         let _ = std::fs::remove_dir_all(&dir);
         for (rel, text) in files {
@@ -539,17 +541,62 @@ impl Resolver {
         Ok(dir)
     }
 
+    /// Stage a replacement for a built-in module (replacing a previous staging of it), recording the module it was
+    /// written against.
+    pub fn stage_module(&self, module: &str, source: &str, reason: &str) -> Result<PathBuf> {
+        Self::module_file(module)?;
+        if source.trim().is_empty() || source.len() > 200_000 {
+            bail!("a module replacement needs 1 byte to 200 KB of Luau source");
+        }
+        let base = crate::eventlog::sha_bytes(self.effective_source(module)?.as_bytes());
+        let dir = self.staged_dir().join(module);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("new.luau"), source)?;
+        std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&serde_json::json!({"reason": reason, "base_sha": base}))?)?;
+        Ok(dir)
+    }
+
+    /// Everything staged: packages, then module replacements as `std/<module>`.
     pub fn list_staged(&self) -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(self.staged_dir()).map(|rd| rd.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
-        v.sort();
+        let dirs = |d: PathBuf| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d).map(|rd| rd.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
+            v.sort();
+            v
+        };
+        let mut v: Vec<String> = dirs(self.staged_dir()).into_iter().filter(|n| n != "std").collect();
+        v.extend(dirs(self.staged_dir().join("std")).into_iter().map(|m| format!("std/{m}")));
         v
     }
 
-    /// What a human reviews before accepting: manifest, capabilities, source, tests.
-    pub fn review(&self, name: &str) -> Result<String> {
+    /// The staging directory of NAME: a package name or `std/<module>`, never a path out of the staging area.
+    fn staged(&self, name: &str) -> Result<PathBuf> {
+        let valid = if name.contains('/') { Self::module_file(name).is_ok() } else { !name.is_empty() && !name.starts_with('.') && name != "std" };
         let dir = self.staged_dir().join(name);
-        if !dir.is_dir() {
+        if !valid || !dir.is_dir() {
             bail!("nothing staged as {name:?} (see `hx staged`)");
+        }
+        Ok(dir)
+    }
+
+    fn is_module(name: &str) -> bool {
+        name.contains('/')
+    }
+
+    /// What the user reviews before accepting: a package's manifest, source and tests; or a module replacement's
+    /// reason, structural check and diff against the module in force.
+    pub fn review(&self, name: &str) -> Result<String> {
+        let dir = self.staged(name)?;
+        if Self::is_module(name) {
+            let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)?;
+            let new = std::fs::read_to_string(dir.join("new.luau"))?;
+            let check = self.check_module(name, &new).unwrap_or_else(|e| format!("FAILS: {e}"));
+            let current = self.effective_source(name)?;
+            let mut diff = std::process::Command::new("diff").args(["-u", "--label", "current", "--label", "staged", "-"]).arg(dir.join("new.luau"))
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn()?;
+            std::io::Write::write_all(&mut diff.stdin.take().unwrap(), current.as_bytes())?;
+            let diff = diff.wait_with_output()?;
+            return Ok(format!("== staged module {name} ==\nreason: {}\ncheck: {check}\n\n{}", meta["reason"].as_str().unwrap_or(""), String::from_utf8_lossy(&diff.stdout)));
         }
         let mut out = format!("== staged package {name} ==\n");
         for rel in ["hx.toml", "init.luau", "types.d.luau"] {
@@ -565,12 +612,12 @@ impl Resolver {
         Ok(out)
     }
 
-    /// `hx accept NAME`: activate a staged package: move it into pkgs/, lock its hash, grant the capabilities it requests.
-    /// Only the user's CLI can reach this; no primitive exposes it.
+    /// `hx accept NAME`: activate what is staged as NAME. A package moves into pkgs/ and is locked and granted the
+    /// capabilities it requests; a module replacement becomes the override. Only the user's CLI reaches this.
     pub fn accept(&self, name: &str) -> Result<String> {
-        let from = self.staged_dir().join(name);
-        if !from.is_dir() {
-            bail!("nothing staged as {name:?} (see `hx staged`)");
+        let from = self.staged(name)?;
+        if Self::is_module(name) {
+            return self.accept_module(name, &from);
         }
         let to = self.harness().join("pkgs").join(name);
         std::fs::create_dir_all(self.harness().join("pkgs"))?;
@@ -579,14 +626,15 @@ impl Resolver {
         self.approve(name)
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
-    // Harness-module upgrades (AC5): propose -> check -> gate (eval) -> accept (user) -> rollback.
-    // A proposal is staged under .harness/proposals/<id>/ by the core; nothing is active until `hx upgrade accept`.
-    // ---------------------------------------------------------------------------------------------------------------
+    pub fn reject(&self, name: &str) -> Result<()> {
+        std::fs::remove_dir_all(self.staged(name)?)?;
+        Ok(())
+    }
+
     fn module_file(module: &str) -> Result<(String, String)> {
         let (pkg, m) = split_name(module);
         if pkg != "std" || m.is_empty() || !m.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
-            bail!("only built-in harness modules can be upgraded, e.g. std/printer (got {module:?})");
+            bail!("only built-in harness modules can be replaced, e.g. std/printer (got {module:?})");
         }
         if Self::embedded(pkg, &file_for(m)).is_none() {
             bail!("no built-in module {module}");
@@ -605,45 +653,9 @@ impl Resolver {
         Ok(std::fs::read_to_string(self.override_path(module)?).unwrap_or_else(|_| Self::embedded(&pkg, &file_for(&m)).unwrap().to_string()))
     }
 
-    pub fn proposals_dir(&self) -> PathBuf {
-        self.harness().join("proposals")
-    }
-
-    pub fn propose(&self, module: &str, source: &str, reason: &str) -> Result<String> {
-        Self::module_file(module)?;
-        if source.trim().is_empty() || source.len() > 200_000 {
-            bail!("a proposal needs 1 byte to 200 KB of Luau source");
-        }
+    /// Structural check: the replacement loads, returns a table, and keeps every export of the module in force.
+    fn check_module(&self, module: &str, new: &str) -> Result<String> {
         let base = self.effective_source(module)?;
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        let id = format!("{ts}-{}", &crate::eventlog::sha_bytes(source.as_bytes())[..8]);
-        let dir = self.proposals_dir().join(&id);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("base.luau"), &base)?;
-        std::fs::write(dir.join("new.luau"), source)?;
-        let meta = serde_json::json!({"id": id, "module": module, "reason": reason, "base_sha": crate::eventlog::sha_bytes(base.as_bytes()), "new_sha": crate::eventlog::sha_bytes(source.as_bytes()), "created": ts});
-        std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
-        Ok(id)
-    }
-
-    pub fn list_proposals(&self) -> Vec<serde_json::Value> {
-        let mut v: Vec<serde_json::Value> = std::fs::read_dir(self.proposals_dir())
-            .map(|rd| rd.flatten().filter_map(|e| std::fs::read_to_string(e.path().join("meta.json")).ok().and_then(|t| serde_json::from_str(&t).ok())).collect())
-            .unwrap_or_default();
-        v.sort_by_key(|m| m["created"].as_u64().unwrap_or(0));
-        v
-    }
-
-    fn proposal_meta(&self, id: &str) -> Result<(PathBuf, serde_json::Value)> {
-        let dir = self.proposals_dir().join(id);
-        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).map_err(|_| anyhow!("no proposal {id:?} (see `hx upgrade list`)"))?)?;
-        Ok((dir, meta))
-    }
-
-    /// Structural check: the candidate loads, returns a table, and keeps every export of the module it replaces.
-    pub fn check_proposal(&self, id: &str) -> Result<String> {
-        let (dir, meta) = self.proposal_meta(id)?;
-        let (base, new) = (std::fs::read_to_string(dir.join("base.luau"))?, std::fs::read_to_string(dir.join("new.luau"))?);
         let lua = mlua::Lua::new();
         // the candidate is model-written and runs in the user's CLI: bound its time and memory like a session chunk
         lua.set_memory_limit(256 << 20)?;
@@ -658,7 +670,7 @@ impl Resolver {
         // `base:<this module>` gets the REAL current module, so a wrapper that copies it keeps its exports.
         let proxy: mlua::Table = lua.load(r#"return setmetatable({}, { __index = function() return function() return nil end end, __call = function() return nil end })"#).eval()?;
         let make_env = |base: Option<mlua::Table>| -> Result<mlua::Table> {
-            let (proxy, module) = (proxy.clone(), meta["module"].as_str().unwrap_or("").to_string());
+            let (proxy, module) = (proxy.clone(), module.to_string());
             let req = lua.create_function(move |_, name: String| -> mlua::Result<mlua::Value> {
                 match &base {
                     Some(b) if name == format!("base:{module}") => Ok(mlua::Value::Table(b.clone())),
@@ -680,7 +692,7 @@ impl Resolver {
             }
         };
         let b = load("current module", &base, make_env(None)?)?;
-        let n = load("proposed module", &new, make_env(Some(b.clone()))?)?;
+        let n = load("staged module", new, make_env(Some(b.clone()))?)?;
         let mut missing = vec![];
         for pair in b.pairs::<String, mlua::Value>() {
             let (k, _) = pair?;
@@ -690,16 +702,9 @@ impl Resolver {
         }
         if !missing.is_empty() {
             missing.sort();
-            bail!("the proposed {} drops exports that other modules use: {}", meta["module"].as_str().unwrap_or("module"), missing.join(", "));
+            bail!("the staged {module} drops exports that other modules use: {}", missing.join(", "));
         }
         Ok("loads, returns a table, keeps every export".into())
-    }
-
-    pub fn show_proposal(&self, id: &str) -> Result<String> {
-        let (dir, meta) = self.proposal_meta(id)?;
-        let diff = std::process::Command::new("diff").args(["-u", "--label", "current", "--label", "proposed"]).arg(dir.join("base.luau")).arg(dir.join("new.luau")).output()?;
-        let gate = std::fs::read_to_string(dir.join("gate.json")).unwrap_or_else(|_| "(gate not run: `python3 eval/gate.py ...`)".into());
-        Ok(format!("proposal {id} for {}\nreason: {}\n\n{}\n\ngate: {gate}", meta["module"].as_str().unwrap_or("?"), meta["reason"].as_str().unwrap_or(""), String::from_utf8_lossy(&diff.stdout)))
     }
 
     fn versions_dir(&self, module: &str) -> PathBuf {
@@ -713,33 +718,18 @@ impl Resolver {
         Ok(())
     }
 
-    /// Activate a proposal. Requires a passing gate report for THIS exact candidate, unless forced.
-    pub fn accept_upgrade(&self, id: &str, force: bool) -> Result<String> {
-        let (dir, meta) = self.proposal_meta(id)?;
-        let module = meta["module"].as_str().unwrap_or("").to_string();
+    fn accept_module(&self, module: &str, dir: &Path) -> Result<String> {
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)?;
         let new = std::fs::read_to_string(dir.join("new.luau"))?;
-        let sha = crate::eventlog::sha_bytes(new.as_bytes());
-        if sha != meta["new_sha"].as_str().unwrap_or("") {
-            bail!("the staged candidate was modified after it was proposed");
-        }
-        // The candidate replaces the whole module and its gate compared it with the module in force at proposal time:
-        // if that module has changed since (another upgrade, a rollback), accepting would silently drop the change.
-        let current = crate::eventlog::sha_bytes(self.effective_source(&module)?.as_bytes());
+        // The replacement covers the whole module and was written against the module in force when it was staged: if
+        // that module has changed since (another accept, a rollback), accepting would silently drop the change.
+        let current = crate::eventlog::sha_bytes(self.effective_source(module)?.as_bytes());
         if Some(current.as_str()) != meta["base_sha"].as_str() {
-            bail!("{module} has changed since this proposal was made; propose the change again against the current module");
+            bail!("{module} has changed since this replacement was staged; stage it again against the current module");
         }
-        self.check_proposal(id)?;
-        if !force {
-            let gate: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("gate.json")).map_err(|_| anyhow!("the eval gate has not been run for this proposal (python3 eval/gate.py --proposal {id} ...)"))?)?;
-            if gate["candidate_sha"].as_str() != Some(sha.as_str()) {
-                bail!("the gate report is for a different candidate; rerun the gate");
-            }
-            if gate["pass"].as_bool() != Some(true) {
-                bail!("the eval gate FAILED for this proposal: {}", gate["reason"].as_str().unwrap_or("regression"));
-            }
-        }
-        let target = self.override_path(&module)?;
-        let vdir = self.versions_dir(&module);
+        self.check_module(module, &new)?;
+        let target = self.override_path(module)?;
+        let vdir = self.versions_dir(module);
         std::fs::create_dir_all(&vdir)?;
         // Each accept saves what it replaces: NNNN.luau holds the previous override, NNNN.none records that there was none.
         let n = std::fs::read_dir(&vdir).map(|rd| rd.count()).unwrap_or(0) + 1;
@@ -749,11 +739,13 @@ impl Resolver {
         }
         std::fs::create_dir_all(target.parent().unwrap())?;
         std::fs::write(&target, &new)?;
-        self.log_upgrade(serde_json::json!({"action": if force { "accept(force)" } else { "accept" }, "module": module, "proposal": id, "new_sha": sha, "version": n}))?;
-        Ok(format!("activated {module} (version {n}); undo with `hx upgrade rollback {module}`"))
+        std::fs::remove_dir_all(dir)?;
+        self.log_upgrade(serde_json::json!({"action": "accept", "module": module, "reason": meta["reason"], "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "version": n}))?;
+        Ok(format!("activated {module} (version {n}); undo with `hx rollback {module}`"))
     }
 
-    pub fn rollback_upgrade(&self, module: &str) -> Result<String> {
+    /// `hx rollback MODULE`: restore what the last accepted replacement of MODULE replaced.
+    pub fn rollback(&self, module: &str) -> Result<String> {
         let target = self.override_path(module)?;
         let vdir = self.versions_dir(module);
         let mut files: Vec<_> = std::fs::read_dir(&vdir).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
@@ -770,11 +762,6 @@ impl Resolver {
         Ok(format!("rolled back {module} to {}", if files.is_empty() { "the built-in module" } else { "the previous version" }))
     }
 
-    pub fn reject(&self, name: &str) -> Result<()> {
-        std::fs::remove_dir_all(self.staged_dir().join(name))?;
-        Ok(())
-    }
-
     /// `hx approve <pkg>`: record the lock entry and grant exactly the capabilities the manifest requests.
     pub fn approve(&self, pkg: &str) -> Result<String> {
         let (dir, man) = self.locate(pkg)?;
@@ -782,14 +769,9 @@ impl Resolver {
         let lock_path = self.root.join("hx.lock");
         let mut entries = read_toml::<Lockfile>(&lock_path)?.package;
         entries.retain(|e| e.name != pkg);
-        entries.push(LockEntry { name: pkg.into(), version: man.package.version.clone(), hash: hash.clone() });
+        entries.push(LockEntry { name: pkg.into(), version: man.package.version.clone(), hash: hash.clone(), grants: man.capabilities.clone() });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         std::fs::write(&lock_path, toml::to_string(&Lockfile { package: entries })?)?;
-        let gpath = self.harness().join("grants.toml");
-        std::fs::create_dir_all(self.harness())?;
-        let mut g: Grants = read_toml(&gpath)?;
-        g.grant.insert(pkg.into(), man.capabilities.clone());
-        std::fs::write(&gpath, toml::to_string(&g)?)?;
         Ok(format!("approved {pkg} {} ({}…) from {} with capabilities {:?}", man.package.version, &hash[..8], dir.display(), man.capabilities))
     }
 }
@@ -847,7 +829,7 @@ mod tests {
         assert!(msg.starts_with("approved foo 1.0"), "{msg}");
         let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
         assert!(lock.contains("name = \"foo\"") && lock.contains("version = \"1.0\""), "{lock}");
-        assert!(std::fs::read_to_string(root.join(".harness/grants.toml")).unwrap().contains("[grant.foo]\nfs = [\"read\"]"));
+        assert!(lock.contains("[package.grants]\nfs = [\"read\"]"), "{lock}");
         assert!(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap()).is_ok());
         // any content change invalidates the lock
         std::fs::write(dir.join("init.luau"), "return { x = 2 }\n").unwrap();
@@ -868,11 +850,13 @@ mod tests {
         let r = Resolver::new(root.clone());
         r.approve("foo").unwrap();
         let man = Resolver::read_manifest("foo", &dir).unwrap();
-        std::fs::write(root.join(".harness/grants.toml"), "[grant.foo]\nfs = [\"write\"]\n").unwrap();
+        let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
+        let with = |grants: &str| std::fs::write(root.join("hx.lock"), lock.replace("[package.grants]\nfs = [\"read\"]\n", grants)).unwrap();
+        with("[package.grants]\nfs = [\"write\"]\n");
         assert!(err(r.verify("foo", &dir, &man)).contains("capability fs=read which has not been granted"));
-        std::fs::write(root.join(".harness/grants.toml"), "").unwrap();
+        with("");
         assert!(err(r.verify("foo", &dir, &man)).contains("not been granted"));
-        std::fs::write(root.join(".harness/grants.toml"), "[grant.foo]\nfs = [\"*\"]\n").unwrap();
+        with("[package.grants]\nfs = [\"*\"]\n");
         assert!(r.verify("foo", &dir, &man).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -960,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn only_builtin_modules_can_be_upgraded() {
+    fn only_builtin_modules_can_be_replaced() {
         assert!(Resolver::module_file("std/printer").is_ok());
         for bad in ["std", "std/", "foo/printer", "std/../x", "std/Printer", "std/nope"] {
             assert!(Resolver::module_file(bad).is_err(), "{bad}");
@@ -968,72 +952,91 @@ mod tests {
     }
 
     #[test]
-    fn proposal_must_load_return_a_table_and_keep_exports() {
-        let root = ws("check");
+    fn staged_names_cannot_leave_the_staging_area() {
+        let root = ws("names");
         let r = Resolver::new(root.clone());
-        assert!(err(r.propose("std/printer", " ", "")).contains("1 byte to 200 KB"));
-        let check = |src: &str| r.check_proposal(&r.propose("std/printer", src, "").unwrap());
-        assert!(err(check("return {")).contains("does not compile"));
-        assert!(err(check("error('boom')")).contains("fails when loaded"));
-        assert!(err(check("return 1")).contains("must return a table"));
-        assert!(err(check("return {}")).contains("drops exports"));
-        // a wrapper that copies `base:` keeps every export
-        assert!(check("local b = require('base:std/printer')\nlocal m = {}\nfor k, v in b do m[k] = v end\nreturn m\n").is_ok());
-        assert!(err(r.check_proposal("nope")).contains("no proposal"));
-        // model-written code runs in the user's CLI: a loop or a memory bomb must fail the check, not hang it
-        assert!(err(check("while true do end")).contains("fails when loaded"));
-        assert!(err(check("local t = {} for i = 1, 1e9 do t[i] = string.rep('x', 1024) .. i end return t")).contains("fails when loaded"));
+        write(root.join(".harness/pkgs/real/hx.toml"), "[package]\nversion = \"1\"\n");
+        for bad in ["", ".", "..", "../pkgs/real", "std", "std/../../pkgs/real", "a/b"] {
+            assert!(err(r.reject(bad)).contains("nothing staged"), "{bad}");
+        }
+        assert!(root.join(".harness/pkgs/real/hx.toml").is_file());
+        assert!(err(r.stage("std", &[])).contains("built-in package"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn upgrade_accept_refuses_a_proposal_whose_base_is_no_longer_in_force() {
+    fn staged_module_must_load_return_a_table_and_keep_exports() {
+        let root = ws("check");
+        let r = Resolver::new(root.clone());
+        assert!(err(r.stage_module("std/printer", " ", "")).contains("1 byte to 200 KB"));
+        assert!(err(r.stage_module("other/x", "return {}", "")).contains("only built-in"));
+        let check = |src: &str| {
+            r.stage_module("std/printer", src, "").unwrap();
+            assert_eq!(r.list_staged(), vec!["std/printer"]);
+            let review = r.review("std/printer").unwrap();
+            let accepted = r.accept("std/printer");
+            if let Ok(_) = &accepted { r.rollback("std/printer").unwrap(); }
+            (review, accepted)
+        };
+        for (src, why) in [("return {", "does not compile"), ("error('boom')", "fails when loaded"), ("return 1", "must return a table"), ("return {}", "drops exports"),
+            // model-written code runs in the user's CLI: a loop or a memory bomb must fail the check, not hang it
+            ("while true do end", "fails when loaded"), ("local t = {} for i = 1, 1e9 do t[i] = string.rep('x', 1024) .. i end return t", "fails when loaded")] {
+            let (review, accepted) = check(src);
+            assert!(review.contains("check: FAILS") && review.contains(why), "{src}: {review}");
+            assert!(err(accepted).contains(why), "{src}");
+        }
+        // a wrapper that copies `base:` keeps every export
+        let (review, accepted) = check("local b = require('base:std/printer')\nlocal m = {}\nfor k, v in b do m[k] = v end\nreturn m\n");
+        assert!(review.contains("check: loads, returns a table, keeps every export") && review.contains("+++ staged"), "{review}");
+        assert!(accepted.is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn module_accept_refuses_a_replacement_whose_base_is_no_longer_in_force() {
         let root = ws("stale");
         let r = Resolver::new(root.clone());
         let builtin = r.effective_source("std/printer").unwrap();
-        let a = r.propose("std/printer", &format!("{builtin}\n-- A\n"), "").unwrap();
-        let b = r.propose("std/printer", &format!("{builtin}\n-- B\n"), "").unwrap();
-        r.accept_upgrade(&a, true).unwrap();
-        // B was made against the built-in module; accepting it now would silently drop A
-        assert!(err(r.accept_upgrade(&b, true)).contains("changed since this proposal was made"));
-        assert!(r.effective_source("std/printer").unwrap().ends_with("-- A\n"));
+        r.stage_module("std/printer", &format!("{builtin}\n-- A\n"), "").unwrap();
+        r.accept("std/printer").unwrap();
+        // staged against A, then A is rolled back: accepting now would silently drop the rollback
+        r.stage_module("std/printer", &format!("{builtin}\n-- A\n-- B\n"), "").unwrap();
+        r.rollback("std/printer").unwrap();
+        assert!(err(r.accept("std/printer")).contains("changed since this replacement was staged"));
+        assert_eq!(r.effective_source("std/printer").unwrap(), builtin);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn upgrade_accept_needs_a_passing_gate_and_rolls_back() {
+    fn module_accept_activates_stacks_and_rolls_back() {
         let root = ws("upgrade");
         let r = Resolver::new(root.clone());
         let builtin = r.effective_source("std/printer").unwrap();
         let new = format!("{builtin}\n-- v2\n");
-        let id = r.propose("std/printer", &new, "test").unwrap();
-        assert_eq!(r.list_proposals()[0]["reason"], "test");
-        let dir = r.proposals_dir().join(&id);
-        let sha = crate::eventlog::sha_bytes(new.as_bytes());
-        assert!(err(r.accept_upgrade(&id, false)).contains("gate has not been run"));
-        std::fs::write(dir.join("gate.json"), r#"{"candidate_sha": "other", "pass": true}"#).unwrap();
-        assert!(err(r.accept_upgrade(&id, false)).contains("different candidate"));
-        std::fs::write(dir.join("gate.json"), format!(r#"{{"candidate_sha": "{sha}", "pass": false, "reason": "slower"}}"#)).unwrap();
-        assert!(err(r.accept_upgrade(&id, false)).contains("FAILED for this proposal: slower"));
-        std::fs::write(dir.join("gate.json"), format!(r#"{{"candidate_sha": "{sha}", "pass": true}}"#)).unwrap();
-        assert!(r.accept_upgrade(&id, false).unwrap().contains("version 1"));
+        r.stage_module("std/printer", &new, "test").unwrap();
+        r.stage("tool", &[("hx.toml".into(), "[package]\nversion = \"1\"\n".into())]).unwrap();
+        assert_eq!(r.list_staged(), vec!["tool", "std/printer"]);
+        assert!(r.review("std/printer").unwrap().contains("reason: test"));
+        assert!(r.accept("std/printer").unwrap().contains("version 1"));
         assert_eq!(r.effective_source("std/printer").unwrap(), new);
-        // a second (forced, gate-less) upgrade stacks on the first
+        assert_eq!(r.list_staged(), vec!["tool"]);
+        // a second replacement stacks on the first
         let newer = format!("{new}-- v3\n");
-        let id2 = r.propose("std/printer", &newer, "").unwrap();
-        assert!(r.accept_upgrade(&id2, true).unwrap().contains("version 2"));
+        r.stage_module("std/printer", &newer, "").unwrap();
+        assert!(r.accept("std/printer").unwrap().contains("version 2"));
         assert_eq!(r.effective_source("std/printer").unwrap(), newer);
-        // a candidate edited after proposing is refused even when forced
-        std::fs::write(r.proposals_dir().join(&id2).join("new.luau"), "return {}\n").unwrap();
-        assert!(err(r.accept_upgrade(&id2, true)).contains("modified after it was proposed"));
+        // rejecting a staged replacement leaves the module in force alone
+        r.stage_module("std/printer", "return {}", "").unwrap();
+        r.reject("std/printer").unwrap();
+        assert!(err(r.accept("std/printer")).contains("nothing staged"));
         let log = std::fs::read_to_string(root.join(".harness/upgrades.jsonl")).unwrap();
-        assert!(log.contains("\"accept\"") && log.contains("\"accept(force)\""));
-        assert!(r.rollback_upgrade("std/printer").unwrap().ends_with("the previous version"));
+        assert_eq!(log.matches("\"accept\"").count(), 2);
+        assert!(r.rollback("std/printer").unwrap().ends_with("the previous version"));
         assert_eq!(r.effective_source("std/printer").unwrap(), new);
-        assert!(r.rollback_upgrade("std/printer").unwrap().ends_with("the built-in module"));
+        assert!(r.rollback("std/printer").unwrap().ends_with("the built-in module"));
         assert_eq!(r.effective_source("std/printer").unwrap(), builtin);
         assert!(!root.join(".harness/override/std/printer.luau").exists());
-        assert!(err(r.rollback_upgrade("std/printer")).contains("nothing to roll back"));
+        assert!(err(r.rollback("std/printer")).contains("nothing to roll back"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

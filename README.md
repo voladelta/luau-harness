@@ -28,9 +28,9 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Recovery | `--resume` restores explicit saved data and controller state into a fresh VM; old effectful chunks are never replayed |
 | Budgets | Shared admission thresholds reserve each request's priced upper bound (the whole remaining allowance when no price is known); an absolute deadline includes downtime |
 | Compaction | On by default (`std/compact`): from 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; recent messages and Luau globals stay; one compact-and-retry on a context-overflow error |
-| Checkpoint | On by default (`std/checkpoint`): the system prompt warns that the first final answer will be checked, and before it is accepted the model is sent back once to name the root cause, list the other cases it implies, test each and re-check the task's requirements; off with `require("std/checkpoint").enabled = false` in `.harness/init.luau` |
+| Recheck | On by default (`std/recheck`): the system prompt warns that the first final answer will be checked, and before it is accepted the model is sent back once to name the root cause, list the other cases it implies, test each and re-check the task's requirements. It adds turns on every run and can hurt build tasks; off with `require("std/recheck").enabled = false` in `.harness/init.luau` |
 | Overridable harness | Pure controller, prompt, printer and hooks are Luau in `stdlib/std/`; overrides apply to new runs |
-| Extensions | Immutable approved packages, isolated method calls with copied data, MCP servers, staged proposals requiring your review |
+| Extensions | Immutable approved packages, isolated method calls with copied data, MCP servers, agent-staged tools and module replacements that wait for your review |
 | Any provider | OpenAI Chat Completions or Responses API; any compatible base URL (OpenRouter by default) |
 | Claude plan | `--api claude-sdk --model haiku\|sonnet\|opus`: drives the `claude` CLI over stream-json (as the Agent SDK does), so calls use your Claude login and plan limits, no API key; hx's `luau` tool is a native tool of an in-process SDK MCP server, so tool calls are structured (no text protocol); images are sent as base64 blocks |
 
@@ -60,44 +60,6 @@ def test_timeout():
 ]==])
 print(sh("python -m pytest -q 2>&1 | tail -15").stdout)
 ```
-
-## Results
-
-These measurements describe the earlier heap-replay runtime. Runtime v2 has not been benchmarked; the tables are retained as historical evidence, not performance claims for this redesign.
-
-Frozen suite: 15 multi-file Python tasks (bug fixes, features, refactors over five small codebases), graded by hidden tests. Fresh tokens are input + cache writes + output. Measured 2026-10-10.
-
-| System | Model | Pass | Fresh tokens/task | Turns | $/task |
-|---|---|---|---|---|---|
-| hx | Haiku 5.5, medium effort | 45/45 (3 runs) | 6.4k | 3.5 | 0.0019 |
-| hx | DeepSeek V4.1 Flash | 45/45 (3 runs) | 6.4k | 4.5 | 0.0041 |
-| Claude Code, lean prompt | Haiku 5.5, medium effort | 15/15 (1 run) | 13.4k | 10.8 | 0.0045 (API-equivalent) |
-
-Caveats:
-- The Claude Code baseline is one run per task; identical hx runs varied by up to 1.34x in fresh tokens.
-- On Sonnet 5.5 at low effort the gap is smaller: 4.7k vs 5.7k fresh tokens per task, because Sonnet needs few turns either way.
-- Part of the system prompt was tuned after reading frozen-task traces. On a separate unseen suite of 5 tasks, hx passed 5/5 on both models (DeepSeek 6.1k, Haiku 5.1k fresh tokens per task).
-- Claude Code ran without a sandbox; hx ran with it.
-- Re-checked 2026-10-13 on the Claude plan (`--api claude-sdk`, after output tokens became exact): 5 bug tasks, Haiku 5.5 medium, one run each. Both passed 5/5; medians per task were 3.7k vs 7.0k fresh tokens, 770 vs 2,074 output tokens, 3 vs 6 turns, hx first.
-
-Rerun with `python3 eval/run.py` (see `--help`).
-
-### Checkpoint on hard tasks
-
-Terminal-Bench 4.0 tasks, run on the macOS host with hx on Sonnet 5.5 at medium effort (Claude plan), graded by each task's own tests in its verifier container. "Checkpoint" is the `std/checkpoint` pack (opt-in when these runs were made, on by default since). Runs the Claude plan's usage limit cut off are excluded, not counted as failures.
-
-| Task | Without checkpoint | With checkpoint |
-|---|---|---|
-| mvcc-lsm-compaction | 1/20 solved, 0.76 of tests | 13/20 solved, 0.92 of tests (two-tailed Fisher p=0.0001) |
-| risk-scorer-replay | 0/1 solved (3/5 tests) | 2/2 solved |
-| hof-topology-interpenetration | 0/1 solved (37/38 tests) | 2/2 solved |
-
-Caveats:
-- mvcc is the only pre-registered comparison (20 runs per arm, interleaved); risk and hof are leads from a few runs. Setup, method and task notes: `eval/tb4/README.md`. Opus 5.5 at low and medium effort solved mvcc 0/12, in both hx and Claude Code.
-- The checkpoint does not help when a task hinges on a convention its text does not state: production-planning failed 18/20 tests with and without it.
-- The checkpoint adds turns, and so cost, on every run, including easy ones.
-- It can hurt build tasks: on react-lead-form (Sonnet 5.5 medium) base solved 6/6 and the checkpoint 1/6, through fragile tests left in the project and late edits that broke the main path. Turn it off for such work.
-- With the heads-up line in the system prompt (added 2026-10-14), Opus 5.5 low solved mvcc 5/5 (pre-registered; the check alone never got Opus to a solve).
 
 ## Installation
 
@@ -164,8 +126,8 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | `hx approve PKG` | Lock a project package's or skill's hash and grant the capabilities it requests |
 | `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and whether each is approved |
 | `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
-| `hx staged` / `hx accept NAME` / `hx reject NAME` | Review agent-promoted tools |
-| `hx upgrade propose\|list\|show\|check\|accept\|rollback` | Harness-module upgrade flow |
+| `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
+| `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
 | `hx log verify FILE` | Check a log's hash chain; exit 0 ok, 1 tampered, 3 unknown outcomes |
 
 `hx run` flags:
@@ -268,11 +230,13 @@ MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `all
 | Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (no `hx.toml`; project shadows global) | `hx approve NAME` (`hx skills` lists them); its directory becomes read-only readable |
 | MCP server | `.harness/mcp.toml` | On the next run |
 | Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Staged without execution; you review, run `hx test DIR`, accept it, and start a new run |
-| Harness-module upgrade | `hx upgrade propose MODULE FILE` | `python3 eval/gate.py --proposal ID --model M` must pass, then `hx upgrade accept ID` |
+| Agent-written module replacement | `propose_module("std/MODULE", source, {reason})` (with `--pack std/authoring`) | Staged; `hx accept std/MODULE` shows the reason, a structural check (it loads and keeps every export) and the diff, then makes it the override. `hx rollback std/MODULE` undoes it |
 
-**Workspace trust.** `.harness/{policy,grants,mcp}.toml`, `.harness/init.luau`, `.harness/override/` and `hx.lock` live in the repo, so whoever wrote the repo could widen the sandbox, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model). Any edit makes it untrusted again; `hx approve`/`accept`/`upgrade accept` keep an already trusted workspace trusted. A workspace without such files needs nothing. `HX_TRUST=1` in hx's environment trusts the workspace for one launch (tests, throwaway eval copies).
+**Approvals.** `hx.lock` is the single approval record: per package, the approved version, its content hash and the capabilities granted to it (`[package.grants]`, where `"*"` grants every scope). Workspaces from before this format kept grants in `.harness/grants.toml`, which hx no longer reads: run `hx approve NAME` again for each package that requests capabilities.
 
-A package that is unapproved, or changed since approval, is invisible to a new run. Each approved package call uses a fresh VM and dispatch-time capability checks. Imports are restricted to that package; function references and host handles cannot cross its boundary. Accepted changes apply to future runs, with no hot reload. Nothing the agent can call approves source. Every upgrade accept and rollback is appended to `.harness/upgrades.jsonl`; `hx upgrade rollback MODULE` undoes one.
+**Workspace trust.** `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/` and `hx.lock` live in the repo, so whoever wrote the repo could widen the sandbox, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model). Any edit makes it untrusted again; `hx approve`/`accept`/`rollback` keep an already trusted workspace trusted. A workspace without such files needs nothing. `HX_TRUST=1` in hx's environment trusts the workspace for one launch (tests, throwaway copies).
+
+A package that is unapproved, or changed since approval, is invisible to a new run. Each approved package call uses a fresh VM and dispatch-time capability checks. Imports are restricted to that package; function references and host handles cannot cross its boundary. Accepted changes apply to future runs, with no hot reload. Nothing the agent can call approves source. Every module accept and rollback is appended to `.harness/upgrades.jsonl`.
 
 ## Security model
 
@@ -300,9 +264,6 @@ cargo test --release
 | `src/` | Rust supervisor, pure controller boundary, VMs, isolated packages, batches, policy, journal/checkpoints, MCP, model adapters and CLI |
 | `stdlib/std/` | The built-in `std` package (loop, prompt, printer, hooks, feedback, MCP binding), embedded in the binary |
 | `prompts/system.md` | System prompt |
-| `eval/` | Eval runner, report, upgrade gate, task generators |
-| `tasks/`, `tasks-unseen/` | 15 frozen tasks (hashed in `tasks/MANIFEST.sha256`) and 5 unseen tasks |
-| `tasks-hard/` | 9 harder tasks over four larger codebases (300 to 860 lines each), scored by the share of hidden tests passed |
 | `scripts/` | Check suites and mock servers |
 
 ## Limitations
@@ -312,7 +273,7 @@ cargo test --release
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
 - **Only Chat Completions was verified live** (OpenRouter and Enclave); the Responses API is tested against a mock.
 - **Compaction and finish review are heuristics.** Summary quality and review quality depend on the model. Context size is configured, not detected. Resume restores it automatically. Disable compaction with `require("std/compact").enabled = false` in `.harness/init.luau` before starting a new run.
-- **Small benchmark.** The published results cover 20 small Python tasks, which every tested configuration passes, so they measure efficiency rather than quality. A harder 9-task suite (`tasks-hard/`) exists but has no published results yet, and results on large repositories are not measured.
+- **No benchmark.** hx ships without an eval suite; its checks cover behavior, not task success or token efficiency.
 - **Recovery is explicit.** Arbitrary globals, closures and scratch files are not durable. A killed command's unrecorded output is lost; its external effect may already have happened. There is no exactly-once remote execution or rollback guarantee.
 - **Budgets are admission thresholds.** Request-byte allowances are not exact token counts, provider costs may be unavailable, and cancellation cannot stop remote billing already accepted. Runtime v2 has scripted validation, not new live-provider or performance measurements.
 

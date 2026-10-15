@@ -8,7 +8,7 @@
 local hooks = require("std/hooks")
 local prompt = require("std/prompt")
 local compact = require("std/compact")
-local checkpoint = require("std/checkpoint")
+local recheck = require("std/recheck")
 local M = {}
 
 local function code_of(call)
@@ -31,7 +31,7 @@ function M.init(cfg)
 	return {
 		phase = { kind = "ready", compact = "auto" }, max_turns = cfg.max_turns, task_text = cfg.task_message, messages = { { role = "user", content = cfg.task_message } },
 		report = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" },
-		bad = 0, no_call = 0, checkpoint_asked = false, last_tokens = 0, compact_failures = 0,
+		bad = 0, no_call = 0, recheck_asked = false, last_tokens = 0, compact_failures = 0,
 		retried = false, hook_state = {},
 	}
 end
@@ -151,9 +151,9 @@ function M.step(s, event)
 			end
 			local fin = hooks.emit("before_finish", { action = "accept", text = text, turn = s.report.turns })
 			local follow = if fin.action == "continue" then fin.message else nil
-			if not follow and checkpoint.enabled and not s.checkpoint_asked then
-				s.checkpoint_asked = true
-				follow = checkpoint.message
+			if not follow and recheck.enabled and not s.recheck_asked then
+				s.recheck_asked = true
+				follow = recheck.message
 			end
 			if follow then
 				table.insert(s.messages, { role = "assistant", content = text, raw = resp.raw })

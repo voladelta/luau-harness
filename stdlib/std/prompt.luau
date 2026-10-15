@@ -14,8 +14,8 @@ end
 
 function M.system(): string
 	local sections = { M.sandbox(hx.asset("std/system.md"), hx.net, #hx.mcp_servers() > 0) }
-	local checkpoint = require("std/checkpoint")
-	if checkpoint.enabled then table.insert(sections, "# Finish review\n" .. checkpoint.headsup) end
+	local recheck = require("std/recheck")
+	if recheck.enabled then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
 	if hx.prompt_contributions and hx.prompt_contributions ~= "" then table.insert(sections, hx.prompt_contributions) end
 	return table.concat(sections, "\n\n")
 end
