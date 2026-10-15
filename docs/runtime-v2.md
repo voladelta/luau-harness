@@ -46,11 +46,13 @@ Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB
 
 Every mutating effect records a synced intent before its executor runs. Outcomes include full argument hashes and result receipts. A global mutation permit serializes mutations; sealed read batches may run concurrently. Subagents and packages retain or reduce their caller's authority.
 
-There is at most one application-level dispatch attempt for an operation ID. The HTTP and Claude adapters do not automatically retry lost generations. A provider that answers without a generation is different: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 429, 5xx or malformed 200 body gets one new request under a new operation ID (honouring `Retry-After`, capped at 30 s). Any other failed attempt stays reserved as uncertain billing, so under a dollar threshold a 500, 502 or 504 still needs owner billing reconciliation before the run can continue. Underlying services and the Claude CLI may have their own internal behavior; hx does not establish exactly-once remote execution.
+There is at most one application-level dispatch attempt for an operation ID. A provider that answers without a generation is classified: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 429, 5xx or malformed 200 body gets one new request under a new operation ID (honouring `Retry-After`, capped at 30 s). A failed attempt that may have been billed (a lost response, a 500, 502 or 504) is charged at its reservation when that reservation is a real bound (`"bounded": true`: a priced model, or no dollar threshold), recorded as a `billing` record with `"source": "hx"`; a lost response then gets one new request under a new operation ID. An unbounded reservation (a dollar threshold without a known price) stays reserved as uncertain billing until the owner reconciles it. Underlying services and the Claude CLI may have their own internal behavior; hx does not establish exactly-once remote execution.
 
 An intent without an outcome is uncertain. Local `write` and `edit` settle themselves on resume or branch: each journals the hash of the content it is about to produce (`expect`) and replaces the file atomically (temp file, fsync, rename), so the file holds either its old content or exactly that. hx records a `resolution` with `"by": "hx"` and its evidence: `complete` when the file's hash matches, `abandon` when no `expect` was journaled or the file holds its previous content. An unreadable file is left for the owner.
 
-Other mutations (`sh`, MCP calls) can act outside the workspace, so resume allows inspection but blocks new mutations until the owner reconciles them:
+An interrupted `sh` that ran under Seatbelt with the network off, and was not an approval-gated command, could only change the workspace and the run's temp dir. hx records `unknown_local` (`"by": "hx"`): it may have run partly or fully, and the recovery turn inspects the workspace before repeating it.
+
+Other mutations (`sh` under `--yolo` or with network, MCP calls) can act outside the workspace, so resume allows inspection but blocks new mutations until the owner reconciles them:
 
 ```bash
 hx log verify .harness/log/RUN.jsonl
@@ -60,7 +62,7 @@ hx recover .harness/log/RUN.jsonl OP --decision abandon --yes
 
 Record a decision based on the actual external state; it dispatches nothing and is final. After `abandon`, the resumed agent sees the receipts and can issue the operation again if it is still needed.
 
-Uncertain model calls retain budget reservations. After checking provider usage, the owner can settle one explicitly:
+Uncertain model calls with unbounded reservations retain them. After checking provider usage, the owner can settle one explicitly:
 
 ```bash
 hx recover .harness/log/RUN.jsonl OP --decision billing --tokens 1234 --cost 0.02 --yes
@@ -139,9 +141,9 @@ Compaction and finish review remain heuristics. A successful checkpoint proves a
 
 ## Budgets and validation
 
-One journal-backed ledger accounts for the root and all descendants. Admission atomically reserves an allowance; successful receipts settle it. Under a dollar threshold, one outstanding request reserves the remaining allowance because hx has no universal per-request price bound; other requests (concurrent subagents) wait for it to settle instead of failing. Only settled usage and uncertain reservations, which never settle by themselves, stop admission. Token allowances use request bytes plus the configured output cap. Both limits are documented admission thresholds, not exact tokenizer or billing ceilings. Reservations from uncertain requests survive restarts.
+One journal-backed ledger accounts for the root and all descendants. Admission atomically reserves an allowance; successful receipts settle it. Under a dollar threshold, launch looks up the model's price in the endpoint's `/models` list (OpenRouter publishes it) and freezes it in the manifest. Each request then reserves its upper bound: every request byte as an input token at the higher of the prompt and cache-write prices, plus the full output cap, plus any per-request fee. Concurrent subagents are admitted side by side while bounds fit. A subagent on a different model, or a run whose endpoint has no price, falls back to reserving the whole remaining allowance per request; other requests wait for it to settle instead of failing. Only settled usage and unbounded uncertain reservations stop admission. Token allowances use request bytes plus the configured output cap. Both limits are documented admission thresholds, not exact tokenizer or billing ceilings. Reservations from uncertain requests survive restarts.
 
-A 4xx answer, including a context rejection, releases its reservation, so a definite context rejection can trigger one compaction and a new request under any threshold. Transport loss and failed 5xx attempts retain their reservations; transport loss is never automatically retried.
+A 4xx answer, including a context rejection, releases its reservation, so a definite context rejection can trigger one compaction and a new request under any threshold. Transport loss and failed 5xx attempts are charged at bounded reservations and otherwise retain them.
 
 The absolute run deadline includes downtime. It is checked before admission and interrupts local VM/process/model work where possible. Cancellation cannot revoke a request already accepted by a remote service.
 

@@ -27,7 +27,7 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
 }
 
 /// Replace a file's content all at once (temp file, fsync, rename), after journaling the content's hash. A crash leaves
-/// the old or the new file, never a torn one, so resume can tell which from the disk (`supervisor::reconcile_local_writes`).
+/// the old or the new file, never a torn one, so resume can tell which from the disk (`supervisor::reconcile`).
 fn replace_file(sup: &crate::supervisor::Supervisor, intent: Option<u64>, p: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     if let Some(id) = intent { sup.expect(id, p, &crate::eventlog::sha_bytes(bytes))?; }

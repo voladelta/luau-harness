@@ -48,28 +48,49 @@ impl Manifest {
     }
 }
 
-/// Settle crash-interrupted `write`/`edit` intents from the files. Each replaces its file atomically after journaling an
-/// `expect` record, so: no record means the file was never touched; otherwise the file's hash says whether it landed.
-/// Returns how many intents were settled; an unreadable file is left for the owner.
-pub fn reconcile_local_writes(log: &EventLog, records: &[Value]) -> Result<usize> {
+/// Settle what the evidence settles without the owner, after a crash:
+/// - `write`/`edit` replace their file atomically after journaling an `expect` record, so no record means the file was
+///   never touched; otherwise the file's hash says whether it landed. An unreadable file is left for the owner.
+/// - `sh` that ran under Seatbelt with the network off and no approval-gated command could only write inside the
+///   workspace and the run's temp dir, which the recovery turn can inspect: `unknown_local`.
+/// - A model request whose reservation is a real bound (`bounded`) is charged at that bound.
+/// Returns how many records were written.
+pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Result<usize> {
     let closed: std::collections::BTreeSet<u64> = records.iter()
         .filter(|r| matches!(r["kind"].as_str(), Some("outcome" | "resolution"))).filter_map(|r| r["of"].as_u64()).collect();
+    let confined = manifest.policy.enabled && !manifest.policy.net;
     let mut settled = 0;
-    for intent in records.iter().filter(|r| r["kind"] == "intent" && matches!(r["tool"].as_str(), Some("write" | "edit"))) {
+    for intent in records.iter().filter(|r| r["kind"] == "intent") {
         let Some(id) = intent["seq"].as_u64().filter(|id| !closed.contains(id)) else { continue };
-        let (decision, evidence) = match records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
-            None => ("abandon", "interrupted before the file was touched"),
-            Some(e) => match std::fs::read(e["path"].as_str().unwrap_or_default()) {
-                Ok(bytes) if eventlog::sha_bytes(&bytes) == e["sha256"] => ("complete", "the file holds the intended content"),
-                Ok(_) => ("abandon", "the file holds its previous content"),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => ("abandon", "the file was never created"),
-                Err(_) => continue,
+        let (decision, evidence) = match intent["tool"].as_str() {
+            Some("write" | "edit") => match records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
+                None => ("abandon", "interrupted before the file was touched"),
+                Some(e) => match std::fs::read(e["path"].as_str().unwrap_or_default()) {
+                    Ok(bytes) if eventlog::sha_bytes(&bytes) == e["sha256"] => ("complete", "the file holds the intended content"),
+                    Ok(_) => ("abandon", "the file holds its previous content"),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => ("abandon", "the file was never created"),
+                    Err(_) => continue,
+                },
             },
+            Some("sh") if confined && intent["class"] == "local_write" => ("unknown_local",
+                "sandboxed with no network: it may have run, partly or fully, but could only change the workspace and the run's temp dir; inspect them before repeating it"),
+            _ => continue,
         };
         log.write("resolution", json!({"of": id, "decision": decision, "tool": intent["tool"], "args_sha": intent["args_sha"], "by": "hx", "evidence": evidence}), true)?;
         settled += 1;
     }
+    for intent in records.iter().filter(|r| r["kind"] == "model_intent" && r["bounded"] == true) {
+        let Some(id) = intent["seq"].as_u64() else { continue };
+        if records.iter().any(|r| r["of"] == id && eventlog::settles_model(r)) { continue; }
+        log.write("billing", bound_billing(id, intent["reserved_tokens"].as_u64().unwrap_or(0), intent["reserved_cost"].as_f64().unwrap_or(0.0)), true)?;
+        settled += 1;
+    }
     Ok(settled)
+}
+
+/// A lost response's usage, charged at its reservation's bound.
+fn bound_billing(of: u64, tokens: u64, cost: f64) -> Value {
+    json!({"of": of, "tokens": tokens, "cost": cost, "source": "hx", "evidence": "response lost; charged at the request's reserved upper bound"})
 }
 
 fn binary_sha() -> Result<String> { Ok(eventlog::sha_bytes(&std::fs::read(std::env::current_exe()?)?)) }
@@ -111,7 +132,7 @@ pub struct Usage {
 struct Ledger {
     usage: Usage,
     // In-flight and uncertain generations remain reserved until a receipt, a definite rejection or owner reconciliation.
-    pending: BTreeMap<u64, (u64, f64)>,
+    pending: BTreeMap<u64, (u64, f64, bool)>,
     // The subset of `pending` whose request is still running and will settle on its own.
     inflight: std::collections::BTreeSet<u64>,
 }
@@ -154,7 +175,7 @@ impl Supervisor {
         let path = policy.log.path.as_deref().context("resume needs a journal")?;
         let manifest = Manifest::load(path)?;
         let mut records = eventlog::load(path)?;
-        if reconcile_local_writes(&policy.log, &records)? > 0 { records = eventlog::load(path)?; }
+        if reconcile(&policy.log, &records, &manifest)? > 0 { records = eventlog::load(path)?; }
         let mut ledger = Ledger::default();
         let mut unresolved = BTreeMap::new();
         let mut checkpoint = None;
@@ -165,7 +186,7 @@ impl Supervisor {
                 Some("intent") if r["class"] != "read" => { unresolved.insert(seq, r.clone()); },
                 Some("outcome") => { unresolved.remove(&r["of"].as_u64().context("outcome missing operation ID")?); },
                 Some("resolution") => { unresolved.remove(&r["of"].as_u64().context("resolution missing operation ID")?); },
-                Some("model_intent") => { ledger.pending.insert(seq, (r["reserved_tokens"].as_u64().context("missing reservation")?, r["reserved_cost"].as_f64().context("missing reservation")?)); },
+                Some("model_intent") => { ledger.pending.insert(seq, (r["reserved_tokens"].as_u64().context("missing reservation")?, r["reserved_cost"].as_f64().context("missing reservation")?, r["bounded"] == true)); },
                 Some("llm") if r.get("error").is_some() && r["billing_uncertain"] == false => {
                     ledger.pending.remove(&r["of"].as_u64().context("model receipt missing operation ID")?);
                 },
@@ -199,7 +220,7 @@ impl Supervisor {
         crate::values::validate(&durable)?;
         let restored = checkpoint.map(|c| c["controller"].clone());
         let recovery = Some(json!({"receipts": receipts, "log_directory":path.parent(), "uncertain_operations": unresolved.values().cloned().collect::<Vec<_>>(),
-            "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone. durable.get() contains only committed data. Old chunks were NOT executed. Inspect receipts before doing further work. Uncertain mutations require the owner's `hx recover` decision."}));
+            "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work: a resolution `unknown_local` means a sandboxed `sh` may have run, so check the workspace before repeating it. Uncertain mutations require the owner's `hx recover` decision. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them."}));
         policy.log.write("resume", json!({"format": FORMAT, "checkpoint": frontier}), true)?;
         // The registry is restored from bytes in the protected journal, never from the workspace.
         let mut registry = manifest.registry.clone();
@@ -292,7 +313,9 @@ impl Supervisor {
         let pending_tokens: u64 = ledger.pending.values().map(|v| v.0).sum();
         let pending_cost: f64 = ledger.pending.values().map(|v| v.1).sum();
         // This is a conservative admission allowance, not a tokenizer or provider billing guarantee.
-        let tokens = (serde_json::to_vec(req)?.len() as u64).saturating_add(req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output));
+        let bytes = serde_json::to_vec(req)?.len() as u64;
+        let max_output = req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output);
+        let tokens = bytes.saturating_add(max_output);
         let over_tokens = budget.max_tokens.is_some_and(|m| used.saturating_add(pending_tokens) >= m);
         let over_cost = budget.max_cost.is_some_and(|m| ledger.usage.cost + pending_cost >= m);
         if (over_tokens || over_cost) && !ledger.inflight.is_empty() { return Ok(None); }
@@ -304,25 +327,37 @@ impl Supervisor {
             self.policy.log.write("budget", json!({"reason":"budget_exceeded: cost admission threshold reached (including uncertain requests)","depth":depth}), true)?;
             bail!("budget_exceeded: cost admission threshold reached (including uncertain requests)");
         }
-        // Without a defensible per-request dollar bound, one outstanding request reserves the remaining allowance;
-        // concurrent requests queue behind it above.
-        let cost = budget.max_cost.map(|m| (m - ledger.usage.cost - pending_cost).max(0.0)).unwrap_or(0.0);
+        // A priced model reserves its request's upper bound, so concurrent requests run side by side. Without a price
+        // there is no defensible per-request dollar bound: one outstanding request reserves the remaining allowance and
+        // concurrent requests queue behind it above. `bounded` says the reservation is a real bound, so a lost response
+        // can be charged at it instead of waiting on the owner.
+        let remaining = budget.max_cost.map(|m| (m - ledger.usage.cost - pending_cost).max(0.0));
+        let (cost, bounded) = match (remaining, cfg.price) {
+            (Some(r), Some(p)) => (p.bound(bytes, max_output).min(r), true),
+            (Some(r), None) => (r, false),
+            (None, _) => (0.0, true),
+        };
         let seq = self.policy.log.write("model_intent", json!({"model": cfg.model, "depth": depth,
-            "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens, "reserved_cost": cost}), true)?;
-        ledger.pending.insert(seq, (tokens, cost));
+            "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens, "reserved_cost": cost, "bounded": bounded}), true)?;
+        ledger.pending.insert(seq, (tokens, cost, bounded));
         ledger.inflight.insert(seq);
         Ok(Some(seq))
     }
 
-    /// A failed request: a definite rejection releases its reservation; otherwise it stays reserved as uncertain billing.
-    pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, unbilled: bool, depth: usize) -> Result<()> {
-        let result = self.policy.log.write("llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "billing_uncertain": !unbilled}), true);
+    /// A failed request: a definite rejection releases its reservation; a possibly billed one with a bounded reservation
+    /// is charged at that bound; otherwise it stays reserved as uncertain billing. Returns whether the reservation closed.
+    pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, unbilled: bool, depth: usize) -> Result<bool> {
+        let bounded = self.ledger.lock().unwrap().pending.get(&op).copied().filter(|p| p.2 && !unbilled);
+        let result = self.policy.log.write("llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "billing_uncertain": !unbilled}), true)
+            .and_then(|_| bounded.map(|(tokens, cost, _)| self.policy.log.write("billing", bound_billing(op, tokens, cost), true)).transpose());
         let mut l = self.ledger.lock().unwrap();
         l.inflight.remove(&op);
-        if unbilled && result.is_ok() { l.pending.remove(&op); }
+        let closed = result.is_ok() && (unbilled || bounded.is_some());
+        if closed { l.pending.remove(&op); }
+        if let (Ok(_), Some((tokens, cost, _))) = (&result, bounded) { l.usage.input += tokens; l.usage.cost += cost; l.usage.calls += 1; }
         drop(l);
         self.settled.notify_waiters();
-        result.map(|_| ())
+        result.map(|_| closed)
     }
 
     pub fn settle_model(&self, op: u64, cfg: &LlmCfg, reply: &Reply, depth: usize) -> Result<()> {

@@ -21,6 +21,41 @@ pub struct LlmCfg {
     pub cache_key: Option<String>,
     /// OpenRouter only: restrict routing to these upstream providers, no fallbacks (keeps a prompt cache on one provider)
     pub provider_only: Vec<String>,
+    /// this model's price, looked up at launch when a dollar threshold is set; bounds each request's reservation
+    #[serde(default)]
+    pub price: Option<Price>,
+}
+
+/// USD per token (and per request), from the endpoint's model list.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub request: f64,
+}
+
+impl Price {
+    /// An upper bound on one request's cost: every request byte billed as an input token at the higher of the prompt and
+    /// cache-write prices, plus the full output cap.
+    pub fn bound(&self, request_bytes: u64, max_output: u64) -> f64 {
+        request_bytes as f64 * self.input + max_output as f64 * self.output + self.request
+    }
+}
+
+/// The model's price from `{base}/models` (OpenRouter publishes `pricing` there). None when the endpoint has no
+/// usable price for it, e.g. a router with variable pricing.
+pub async fn fetch_price(cfg: &LlmCfg) -> Option<Price> {
+    if cfg.api == "claude-sdk" { return None; }
+    let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok()?;
+    let list: Value = http.get(format!("{base}/models")).bearer_auth(cfg.key().ok()?).send().await.ok()?
+        .error_for_status().ok()?.json().await.ok()?;
+    let model = list["data"].as_array()?.iter().find(|m| m["id"] == cfg.model.as_str())?;
+    let num = |k: &str| {
+        let v = &model["pricing"][k];
+        v.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| v.as_f64()).filter(|p| p.is_finite() && *p >= 0.0)
+    };
+    Some(Price { input: num("prompt")?.max(num("input_cache_write").unwrap_or(0.0)), output: num("completion")?, request: num("request").unwrap_or(0.0) })
 }
 
 /// The provider answered but returned no usable generation. A transport loss is a plain error instead: only then is

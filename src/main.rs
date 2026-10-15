@@ -68,7 +68,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
         "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
-        "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume and need no decision.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
+        "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, sandboxed offline sh is settled as unknown_local, and bounded model reservations are charged at their bound; none needs a decision.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
@@ -272,6 +272,7 @@ fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
         context_window: parsed(args, "--context-window")?,
         cache_key: Some(session),
         provider_only: list_arg(args, "--provider-only"),
+        price: None,
     })
 }
 
@@ -288,7 +289,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         let inherited = arg(args, "--branch").map(|path| -> Result<_> {
             let journal = eventlog::EventLog::reopen(Path::new(&path))?;
             let manifest = supervisor::Manifest::inspect(Path::new(&path))?;
-            supervisor::reconcile_local_writes(&journal, &eventlog::load(Path::new(&path))?)?;
+            supervisor::reconcile(&journal, &eventlog::load(Path::new(&path))?, &manifest)?;
             let recovery = eventlog::verify(Path::new(&path))?;
             anyhow::ensure!(recovery.unknown.is_empty() && recovery.unknown_models.is_empty(), "reconcile uncertain operations and model billing before branching");
             let records = eventlog::load(Path::new(&path))?;
@@ -301,9 +302,13 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             Some(path) => std::fs::read_to_string(path)?,
             None => inherited.as_ref().map(|(_, m, _)| m.task.clone()).ok_or_else(|| usage("--prompt-file required for a new run"))?,
         };
-        let cfg = llm_cfg(args, policy.log.session.clone())?;
+        let mut cfg = llm_cfg(args, policy.log.session.clone())?;
         let max_turns = parsed(args, "--max-turns")?.unwrap_or(200);
         let budget = policy::Budget { max_cost: parsed(args, "--max-cost")?, max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
+        if budget.max_cost.or(policy.budget.max_cost).is_some() {
+            cfg.price = llm::fetch_price(&cfg).await;
+            if cfg.price.is_none() { eprintln!("hx: note: no price found for {}; each request reserves the whole remaining dollar allowance", cfg.model); }
+        }
         let branch = inherited.as_ref().map(|(parent, manifest, state)| supervisor::Branch {
             parent: parent.path.clone().unwrap(),
             durable: state.as_ref().map(|s| s["durable"].clone())

@@ -52,7 +52,8 @@ impl Host {
     pub fn child_with(&self, model: Option<String>, reasoning: Option<String>, principal: Principal) -> Arc<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let mut llm = self.llm.clone();
-        if let Some(model) = model { llm.model = model; }
+        // The launch-time price is for the run's model; another model's requests fall back to the unpriced reservation.
+        if let Some(model) = model.filter(|m| *m != llm.model) { llm.model = model; llm.price = None; }
         if reasoning.is_some() { llm.reasoning = reasoning; }
         Arc::new(Self { llm, workspace: self.workspace.clone(), policy: self.policy.clone(), supervisor: self.supervisor.clone(),
             principal, durable: Arc::new(Mutex::new(json!({}))), lane: format!("{}/{}", self.lane, NEXT.fetch_add(1, Ordering::Relaxed)),
@@ -106,13 +107,15 @@ impl Host {
                 Ok(reply) => { self.supervisor.settle_model(op, &self.llm, &reply, self.depth)?; return Ok(reply); },
                 Err(error) => error,
             };
-            // Only an answer without a generation is classified. A lost response may have been billed: it keeps its
-            // reservation and is never dispatched again.
+            // An answer without a generation is classified. A lost response may have been billed: when its reservation
+            // was a real bound it is charged at that bound and a new request may follow; otherwise it stays reserved for
+            // the owner. The lost operation itself is never dispatched again.
             let answered = error.downcast_ref::<llm::Answered>();
-            self.supervisor.fail_model(op, &self.llm, &error.to_string(), answered.is_some_and(|a| a.unbilled()), self.depth)?;
-            match answered.filter(|a| !retried && a.retryable()) {
-                Some(a) => {
-                    let wait = a.retry_after.unwrap_or(2.0).clamp(1.0, 30.0);
+            let closed = self.supervisor.fail_model(op, &self.llm, &error.to_string(), answered.is_some_and(|a| a.unbilled()), self.depth)?;
+            let retry = match answered { Some(a) => a.retryable().then_some(a.retry_after), None => closed.then_some(None) };
+            match retry.filter(|_| !retried) {
+                Some(after) => {
+                    let wait = after.unwrap_or(2.0).clamp(1.0, 30.0);
                     if self.supervisor.remaining().is_some_and(|r| r.as_secs_f64() <= wait) { return Err(error); }
                     self.log(&format!("### MODEL RETRY\n{error}"));
                     tokio::time::sleep(Duration::from_secs_f64(wait)).await;

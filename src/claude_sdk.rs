@@ -438,7 +438,7 @@ mod tests {
     async fn live_image_reaches_the_model() {
         // 16x16 solid red PNG
         let png = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=";
-        let cfg = LlmCfg { model: "haiku".into(), api: "claude-sdk".into(), base_url: None, key_env: None, reasoning: None, max_output: 200, context_window: None, cache_key: None, provider_only: vec![] };
+        let cfg = LlmCfg { model: "haiku".into(), api: "claude-sdk".into(), base_url: None, key_env: None, reasoning: None, max_output: 200, context_window: None, cache_key: None, provider_only: vec![], price: None };
         let m1 = json!({"role": "user", "content": "What single color fills the attached image? Answer with one word.", "images": [{"mime": "image/png", "data": png}]});
         let r = chat(&cfg, &json!({"system": "Answer briefly.", "messages": [m1.clone()]})).await.unwrap();
         println!("turn 1: {}", r.text);

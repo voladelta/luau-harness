@@ -69,13 +69,27 @@ def body_text(body):
 
 
 @contextlib.contextmanager
-def provider(reply):
+def provider(reply, price=None):
+    """A scripted endpoint. With `price` (USD per token, OpenRouter-style strings), `/models` lists the mock model."""
     requests = []
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
+
+        def do_GET(self):
+            if price is None or not self.path.endswith("/models"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = json.dumps({"data": [{"id": "other", "pricing": {"prompt": "1", "completion": "1"}},
+                                        {"id": "mock", "pricing": price}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -408,13 +422,97 @@ print("CHILDREN_OK")'''
 
 
 def no_transport_retry():
+    # Under an unpriced dollar threshold the lost request reserved the whole allowance: it is never redispatched and
+    # stays reserved for the owner, across resume.
     path = workspace("transport")
     with provider(lambda body, i: None) as (url, calls):
-        result = start(path, url, "--max-tokens", "100", ok=False)
+        result = start(path, url, "--max-cost", "0.01", ok=False)
         assert result.returncode and len(calls) == 1, (result.stderr, calls)
         report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
         assert "budget_exceeded" in report["stopped"] and len(calls) == 1, report
-        assert report["budget"]["reserved_tokens"] > 0
+        assert report["budget"]["reserved_cost"] > 0
+        assert "UNKNOWN BILLING" in run(path, "log", "verify", str(journal(path)), ok=False).stdout
+
+
+PRICE = {"prompt": "0.000001", "completion": "0.000002", "input_cache_write": "0.00000125"}
+
+
+def bounded_lost_response():
+    # A token-bounded or priced reservation is charged at its bound, and one new request continues the run.
+    for name, flags, price in [("tokens", ("--max-tokens", "1000000"), None), ("priced", ("--max-cost", "1"), PRICE)]:
+        path = workspace(f"lost-{name}")
+        with provider(lambda body, i: None if i == 0 else "done", price) as (url, calls):
+            report = json.loads(start(path, url, *flags).stdout)
+            assert report["finished"] and len(calls) >= 2 and calls[0] == calls[1], (name, report)
+            assert report["budget"]["reserved_cost"] == 0 and report["budget"]["reserved_tokens"] == 0, (name, report)
+            log = records(journal(path))
+            intent = next(r for r in log if r["kind"] == "model_intent")
+            assert intent["bounded"] is True and (price is None or 0 < intent["reserved_cost"] < 0.1), (name, intent)
+            billing = [r for r in log if r["kind"] == "billing"]
+            assert [(r["of"], r["source"], r["cost"]) for r in billing] == [(intent["seq"], "hx", intent["reserved_cost"])], billing
+            assert report["cost_usd"] >= intent["reserved_cost"], report
+    # A crash after the lost response's record, before its charge, is charged on resume.
+    path = workspace("lost-crash")
+    with provider(lambda body, i: None, PRICE) as (url, calls):
+        control = workspace("lost-crash-control")
+        start(control, url, "--max-cost", "1", ok=False)
+        lost = next(r for r in records(journal(control)) if r["kind"] == "llm")
+    with provider(lambda body, i: None if i == 0 else "done", PRICE) as (url, calls):
+        start(path, url, "--max-cost", "1", env={"HX_TEST_CRASH_AFTER_RECORD": str(lost["seq"])}, ok=False)
+        report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
+        assert report["finished"] and report["budget"]["reserved_cost"] == 0, report
+        assert [r["source"] for r in records(journal(path)) if r["kind"] == "billing"] == ["hx"]
+
+
+def priced_children_run_concurrently():
+    # Priced reservations are bounds, so two children's requests are admitted side by side under a dollar threshold.
+    path = workspace("priced-concurrent")
+    parent_code = '''local r=batch({{op="agent",args={"CHILD ONE"}},{op="agent",args={"CHILD TWO"}}})
+for _, c in r do assert(c.ok and c.value.finished, c.error) end
+print("CHILDREN_OK")'''
+    active, peak = [0], [0]
+    gate = threading.Lock()
+    def answer(body, index):
+        first = not any(m.get("role") == "assistant" for m in body.get("messages", []))
+        if task_text(body).startswith("CHILD"):
+            with gate:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.4)
+            with gate:
+                active[0] -= 1
+            return tool('print("child")') if first else "child done"
+        return tool(parent_code) if first else "parent done"
+    with provider(answer, PRICE) as (url, calls):
+        report = json.loads(start(path, url, "--max-cost", "1").stdout)
+        assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 6, report
+        assert peak[0] == 2, peak
+        intents = [r for r in records(journal(path)) if r["kind"] == "model_intent"]
+        assert all(r["bounded"] and r["reserved_cost"] < 0.5 for r in intents), intents
+
+
+def sandboxed_sh_settles():
+    # Sandboxed, no network: an interrupted sh is settled by hx as unknown_local and mutations continue on resume.
+    # With the network on it could have acted elsewhere, so it waits for the owner. The crash precedes the command,
+    # so this runs where Seatbelt is unavailable too.
+    code = 'print(sh("printf x >> again.txt").code)'
+    for name, flags, settled in [("offline", (), True), ("online", ("--net",), False)]:
+        with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
+            control = workspace(f"sh-{name}-control")
+            start(control, url, *flags, ok=False)
+            intent = next(r for r in records(journal(control)) if r["kind"] == "intent" and r["tool"] == "sh")
+        path = workspace(f"sh-{name}")
+        answer = lambda body, i: tool(code) if i == 0 else tool('write("after.txt","ok")') if i == 1 else "done"
+        with provider(answer) as (url, _):
+            start(path, url, *flags, env={"HX_TEST_CRASH_AFTER_RECORD": str(intent["seq"])}, ok=False)
+            report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
+            resolutions = [(r["decision"], r.get("by")) for r in records(journal(path)) if r["kind"] == "resolution"]
+            if settled:
+                assert resolutions[0] == ("unknown_local", "hx") and report["uncertain_operations"] == [], (resolutions, report)
+                assert (path / "after.txt").read_text() == "ok", report
+            else:
+                assert not resolutions and report["uncertain_operations"] == [intent["seq"]], (resolutions, report)
+                assert not (path / "after.txt").exists()
 
 
 def billing_reconciliation():
@@ -612,7 +710,8 @@ def review_branch_and_revocation():
 
     path = workspace("revoked-owner-reconciliation")
     with provider(lambda body, i: None) as (url, calls):
-        assert start(path, url, ok=False).returncode
+        # An unpriced dollar threshold: the lost request's reservation is not a bound, so only the owner can settle it.
+        assert start(path, url, "--max-cost", "0.01", ok=False).returncode
         log = journal(path)
         op = next(r["seq"] for r in records(log) if r["kind"] == "model_intent")
         result = run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY", ok=False)
@@ -703,6 +802,9 @@ if __name__ == "__main__":
     check("rate limits retry once; definite rejections release reservations", model_status_codes)
     check("concurrent children queue under a cost cap instead of failing", concurrent_children_under_cost_cap)
     check("lost model response is not retried; reservation survives resume", no_transport_retry)
+    check("bounded lost responses are charged at their bound and the run continues", bounded_lost_response)
+    check("priced reservations let concurrent children run side by side", priced_children_run_concurrently)
+    check("sandboxed offline sh settles itself; networked sh waits for the owner", sandboxed_sh_settles)
     check("owner billing reconciliation settles exactly one reservation", billing_reconciliation)
     check("compaction replaces previous summaries and checkpoints explicit state", compaction_and_recovery)
     check("MCP transport loss stays uncertain without redispatch (stdio and HTTP)", mcp_transport_uncertainty)

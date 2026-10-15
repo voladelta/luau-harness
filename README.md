@@ -26,7 +26,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Sandbox (macOS) | `sh` runs under Seatbelt: writes confined to the project and a temp dir, no network, no API keys in the environment |
 | Approval gate | `git push`, publish, `ssh` and other external commands need the user's approval; nothing the model writes can approve |
 | Recovery | `--resume` restores explicit saved data and controller state into a fresh VM; old effectful chunks are never replayed |
-| Budgets | Shared admission thresholds reserve for work in flight and uncertain provider requests; an absolute deadline includes downtime |
+| Budgets | Shared admission thresholds reserve each request's priced upper bound (the whole remaining allowance when no price is known); an absolute deadline includes downtime |
 | Compaction | On by default (`std/compact`): from 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; recent messages and Luau globals stay; one compact-and-retry on a context-overflow error |
 | Checkpoint | On by default (`std/checkpoint`): the system prompt warns that the first final answer will be checked, and before it is accepted the model is sent back once to name the root cause, list the other cases it implies, test each and re-check the task's requirements; off with `require("std/checkpoint").enabled = false` in `.harness/init.luau` |
 | Overridable harness | Pure controller, prompt, printer and hooks are Luau in `stdlib/std/`; overrides apply to new runs |
@@ -208,7 +208,7 @@ Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open networ
 
 Every admitted effect passes a Rust capability check and lands in the journal. Control hooks can deny or transform commands; they cannot grant authority. A controller-hook failure stops its transition. Observer failures are diagnostic.
 
-Inside the VM the model also has `agent(task)`, `batch{...}` for independent reads/searches/read-only subagents, `durable.get/set` for saved data, and `vars()` to list live variables. Shared-state `parallel` closures are removed. The full API is in [prompts/system.md](prompts/system.md); ownership, guarantees and migration details are in [Runtime v2](docs/runtime-v2.md).
+Inside the VM the model also has `agent(task)`, `batch{...}` for independent reads/searches/read-only subagents, `durable.get/set` for saved data (taught in the recovery notice, since the restored conversation covers most of it), and `vars()` to list live variables. The full API is in [prompts/system.md](prompts/system.md); ownership, guarantees and migration details are in [Runtime v2](docs/runtime-v2.md).
 
 ## Configuration
 
@@ -285,10 +285,10 @@ A package that is unapproved, or changed since approval, is invisible to a new r
 
 `hx run --resume LOG` restores frozen settings and the latest committed controller state and `durable` data into fresh VMs. Ordinary globals and functions are lost. It supplies receipts from interrupted work to a recovery turn and never reruns old chunks to reconstruct memory.
 
-- An effect with an intent but no outcome is uncertain. `write` and `edit` replace files atomically, so resume settles them from the file's hash. For `sh` and MCP calls, new mutations are blocked until the owner records a decision with `hx recover`.
+- An effect with an intent but no outcome is uncertain. `write` and `edit` replace files atomically, so resume settles them from the file's hash. A sandboxed `sh` in a run without network could only change the workspace and temp dir, so resume settles it as `unknown_local` and the recovery turn inspects the workspace. For `sh` under `--yolo` or with network, and for MCP calls, new mutations are blocked until the owner records a decision with `hx recover`.
 - Resume uses the original manifest, including the standard library, even if workspace modules or the binary changed; `--branch LOG` selects new configuration explicitly.
 - An OS lock prevents simultaneous resume.
-- Model adapters never retry lost responses; those keep their reservations until owner billing reconciliation. A 4xx or 503 answer releases its reservation, and a 408, 429, 5xx or malformed 200 gets one more request.
+- A lost response is never redispatched. When its reservation was a real bound (a priced model, or no dollar threshold) hx charges it at that bound and sends one new request; otherwise it keeps its reservation until owner billing reconciliation. A 4xx or 503 answer releases its reservation, and a 408, 429, 5xx or malformed 200 gets one more request.
 - The log stores file contents and command output as blobs in `.harness/log/blobs/`. Treat it as sensitive.
 
 ## Development
