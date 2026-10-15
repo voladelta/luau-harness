@@ -26,6 +26,24 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { root.join(p) }
 }
 
+/// Replace a file's content all at once (temp file, fsync, rename), after journaling the content's hash. A crash leaves
+/// the old or the new file, never a torn one, so resume can tell which from the disk (`supervisor::reconcile_local_writes`).
+fn replace_file(sup: &crate::supervisor::Supervisor, intent: Option<u64>, p: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(id) = intent { sup.expect(id, p, &crate::eventlog::sha_bytes(bytes))?; }
+    let name = p.file_name().ok_or_else(|| anyhow::anyhow!("not a file path"))?.to_string_lossy();
+    let tmp = p.with_file_name(format!(".{name}.hx-tmp-{}", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        if let Ok(meta) = std::fs::metadata(p) { file.set_permissions(meta.permissions())?; }
+        file.sync_all()?;
+        std::fs::rename(&tmp, p)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    Ok(result?)
+}
+
 pub fn opt_str(o: &Option<Table>, k: &str) -> Option<String> {
     o.as_ref().and_then(|t| t.get::<Option<String>>(k).ok().flatten())
 }
@@ -80,7 +98,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let (offset, limit) = (opt_num(&opts, "offset"), opt_num(&opts, "limit"));
         let args = json!({"path": &path, "offset": offset, "limit": limit});
         let pol = f.pol.clone();
-        match f.sync(lua, "read", Class::Read, args, || {
+        match f.sync(lua, "read", Class::Read, args, |_| {
             let p = pol.check_read(&path).map_err(|e| rt(format!("read {path}: {e}")))?;
             let meta = std::fs::metadata(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
             if meta.is_dir() {
@@ -113,12 +131,13 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let bytes = content.as_bytes().to_vec();
         let args = json!({"path": &path, "bytes": bytes.len(), "sha256": crate::eventlog::sha_bytes(&bytes)});
         let pol = f.pol.clone();
-        match f.sync(lua, "write", Class::LocalWrite, args, || {
+        let sup = f.supervisor.clone();
+        match f.sync(lua, "write", Class::LocalWrite, args, |intent| {
             let p = pol.check_write(&path).map_err(|e| rt(format!("write {path}: {e}")))?;
             if let Some(dir) = p.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| rt(format!("write {path}: {e}")))?;
             }
-            std::fs::write(&p, &bytes).map_err(|e| rt(format!("write {path}: {e}")))?;
+            replace_file(&sup, intent, &p, &bytes).map_err(|e| rt(format!("write {path}: {e}")))?;
             Ok(Ret::Num(bytes.len() as f64))
         })? {
             Ret::Num(n) => Ok(n as i64),
@@ -134,7 +153,8 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let all = opt_bool(&opts, "all");
         let args = json!({"path": &path, "old_sha": crate::eventlog::sha_bytes(old.as_bytes()), "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "old_bytes": old.len(), "new_bytes": new.len(), "all": all});
         let pol = f.pol.clone();
-        match f.sync(lua, "edit", Class::LocalWrite, args, || {
+        let sup = f.supervisor.clone();
+        match f.sync(lua, "edit", Class::LocalWrite, args, |intent| {
             let p = pol.check_write(&path).map_err(|e| rt(format!("edit {path}: {e}")))?;
             // edit reads the file, and whether `old` matched would reveal its content
             if pol.enabled && crate::policy::is_secret(&p) {
@@ -151,7 +171,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             if n > 1 && !all {
                 return Err(rt(format!("edit_not_unique: text matches {n} times in {path}; include more surrounding lines or pass {{all=true}}")));
             }
-            std::fs::write(&p, text.replace(&old, &new)).map_err(|e| rt(format!("edit {path}: {e}")))?;
+            replace_file(&sup, intent, &p, text.replace(&old, &new).as_bytes()).map_err(|e| rt(format!("edit {path}: {e}")))?;
             let (a, b) = (new.lines().count() * n, old.lines().count() * n);
             Ok(Ret::Str(format!("ok: {n} replacement{}, +{a}/-{b} lines", if n == 1 { "" } else { "s" })))
         })? {
@@ -253,7 +273,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let base = opt_str(&opts, "path").unwrap_or_else(|| ".".into());
         let args = json!({"pattern": &pat, "path": &base, "glob": opt_str(&opts, "glob"), "max": opt_num(&opts, "max"), "ignore_case": opt_bool(&opts, "ignore_case"), "literal": opt_bool(&opts, "literal")});
         let pol = f.pol.clone();
-        match f.sync(lua, "search", Class::Read, args, || {
+        match f.sync(lua, "search", Class::Read, args, |_| {
             pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
             Ok(match search(&pol.workspace, &pat, &opts, pol.enabled)? {
                 Ok((rows, truncated)) => Ret::Rows { rows, truncated },

@@ -220,6 +220,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Whether a record closes a model request's reservation: a receipt, a definite rejection, or an owner's billing decision.
+pub fn settles_model(r: &Value) -> bool {
+    match r["kind"].as_str() {
+        Some("billing") => true,
+        Some("llm") => r.get("error").is_none() || r["billing_uncertain"] == false,
+        _ => false,
+    }
+}
+
 /// Verify the hash chain and list effects whose outcome is unknown.
 pub fn verify(path: &Path) -> Result<Report> {
     let text = read_text(path)?;
@@ -246,8 +255,7 @@ fn verify_text(text: &str) -> Result<Report> {
                 intents.remove(&v["of"].as_u64().unwrap_or(0));
             }
             Some("model_intent") => { models.insert(v["seq"].as_u64().unwrap_or(0)); }
-            Some("llm") if v.get("error").is_none() => { models.remove(&v["of"].as_u64().unwrap_or(0)); }
-            Some("billing") => { models.remove(&v["of"].as_u64().unwrap_or(0)); }
+            _ if settles_model(&v) => { models.remove(&v["of"].as_u64().unwrap_or(0)); }
             _ => {}
         }
     }
@@ -379,7 +387,7 @@ mod open_tests {
         let lua = mlua::Lua::new();
         let mut executed = false;
         for _ in 0..2 {
-            let result = fx.sync(&lua, "write", crate::policy::Class::LocalWrite, json!({}), || {
+            let result = fx.sync(&lua, "write", crate::policy::Class::LocalWrite, json!({}), |_| {
                 executed = true;
                 Ok(crate::effects::Ret::Num(0.0))
             });
@@ -399,7 +407,7 @@ mod open_tests {
         let lua = mlua::Lua::new();
         let mut executions = 0;
         for _ in 0..2 {
-            let result = fx.sync(&lua, "write", crate::policy::Class::LocalWrite, json!({}), || {
+            let result = fx.sync(&lua, "write", crate::policy::Class::LocalWrite, json!({}), |_| {
                 executions += 1;
                 Ok(crate::effects::Ret::Str("result".into()))
             });

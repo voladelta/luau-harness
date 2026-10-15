@@ -94,19 +94,32 @@ impl Host {
 
     pub async fn chat(&self, req: &Value) -> Result<Reply> {
         crate::controller::validate_request(req)?;
-        let op = self.supervisor.reserve_model(&self.llm, req, self.depth)?;
-        let call = llm::chat(&self.http, &self.llm, &self.key, req);
-        let result = match self.supervisor.remaining() {
-            Some(remaining) => tokio::time::timeout(remaining, call).await.map_err(|_| anyhow::anyhow!("budget_exceeded: absolute run deadline reached during model request")).and_then(|r| r),
-            None => call.await,
-        };
-        match result {
-            Ok(reply) => { self.supervisor.settle_model(op, &self.llm, &reply, self.depth)?; Ok(reply) },
-            Err(error) => {
-                // Keep its reservation: an HTTP/transport error does not establish that no generation was billed.
-                self.policy.log.write("llm", json!({"of": op, "depth": self.depth, "model": self.llm.model, "error": error.to_string(), "billing_uncertain": true}), true)?;
-                Err(error)
-            },
+        let mut retried = false;
+        loop {
+            let op = self.supervisor.reserve_model(&self.llm, req, self.depth).await?;
+            let call = llm::chat(&self.http, &self.llm, &self.key, req);
+            let result = match self.supervisor.remaining() {
+                Some(remaining) => tokio::time::timeout(remaining, call).await.map_err(|_| anyhow::anyhow!("budget_exceeded: absolute run deadline reached during model request")).and_then(|r| r),
+                None => call.await,
+            };
+            let error = match result {
+                Ok(reply) => { self.supervisor.settle_model(op, &self.llm, &reply, self.depth)?; return Ok(reply); },
+                Err(error) => error,
+            };
+            // Only an answer without a generation is classified. A lost response may have been billed: it keeps its
+            // reservation and is never dispatched again.
+            let answered = error.downcast_ref::<llm::Answered>();
+            self.supervisor.fail_model(op, &self.llm, &error.to_string(), answered.is_some_and(|a| a.unbilled()), self.depth)?;
+            match answered.filter(|a| !retried && a.retryable()) {
+                Some(a) => {
+                    let wait = a.retry_after.unwrap_or(2.0).clamp(1.0, 30.0);
+                    if self.supervisor.remaining().is_some_and(|r| r.as_secs_f64() <= wait) { return Err(error); }
+                    self.log(&format!("### MODEL RETRY\n{error}"));
+                    tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                    retried = true;
+                },
+                None => return Err(error),
+            }
         }
     }
 

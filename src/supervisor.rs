@@ -1,5 +1,5 @@
 //! One owner for admission, immutable run configuration, receipts, and recovery.
-use crate::{eventlog::{self}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
+use crate::{eventlog::{self, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,8 +30,10 @@ pub struct Branch { pub parent: std::path::PathBuf, pub durable: Value }
 
 impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
+        // Luau modules and the prompt are restored from the manifest's registry, and FORMAT pins the journal's shape, so a
+        // rebuilt binary resumes the same workflow. A changed host primitive surfaces as an error, never a replayed effect.
         let manifest = Self::inspect(path)?;
-        anyhow::ensure!(manifest.binary_sha == binary_sha()?, "runtime changed since this run; resume with the original binary or use --branch LOG");
+        if manifest.binary_sha != binary_sha()? { eprintln!("hx: note: this binary differs from the one that started the run"); }
         Ok(manifest)
     }
 
@@ -44,6 +46,30 @@ impl Manifest {
         anyhow::ensure!(manifest.format == FORMAT, "unsupported run format {}", manifest.format);
         Ok(manifest)
     }
+}
+
+/// Settle crash-interrupted `write`/`edit` intents from the files. Each replaces its file atomically after journaling an
+/// `expect` record, so: no record means the file was never touched; otherwise the file's hash says whether it landed.
+/// Returns how many intents were settled; an unreadable file is left for the owner.
+pub fn reconcile_local_writes(log: &EventLog, records: &[Value]) -> Result<usize> {
+    let closed: std::collections::BTreeSet<u64> = records.iter()
+        .filter(|r| matches!(r["kind"].as_str(), Some("outcome" | "resolution"))).filter_map(|r| r["of"].as_u64()).collect();
+    let mut settled = 0;
+    for intent in records.iter().filter(|r| r["kind"] == "intent" && matches!(r["tool"].as_str(), Some("write" | "edit"))) {
+        let Some(id) = intent["seq"].as_u64().filter(|id| !closed.contains(id)) else { continue };
+        let (decision, evidence) = match records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
+            None => ("abandon", "interrupted before the file was touched"),
+            Some(e) => match std::fs::read(e["path"].as_str().unwrap_or_default()) {
+                Ok(bytes) if eventlog::sha_bytes(&bytes) == e["sha256"] => ("complete", "the file holds the intended content"),
+                Ok(_) => ("abandon", "the file holds its previous content"),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => ("abandon", "the file was never created"),
+                Err(_) => continue,
+            },
+        };
+        log.write("resolution", json!({"of": id, "decision": decision, "tool": intent["tool"], "args_sha": intent["args_sha"], "by": "hx", "evidence": evidence}), true)?;
+        settled += 1;
+    }
+    Ok(settled)
 }
 
 fn binary_sha() -> Result<String> { Ok(eventlog::sha_bytes(&std::fs::read(std::env::current_exe()?)?)) }
@@ -66,11 +92,10 @@ impl Principal {
     pub fn read_only(&self) -> Self {
         match self {
             Self::Agent { .. } => Self::Agent { read_only: true },
-            Self::Package { name, caps, active } => {
+            Self::Package { name, active, .. } => {
                 let mut restricted = BTreeMap::new();
                 if self.allows("fs", "read") { restricted.insert("fs".into(), vec!["read".into()]); }
                 if self.allows("llm", "agent") { restricted.insert("llm".into(), vec!["agent".into()]); }
-                let _ = caps;
                 Self::Package { name: name.clone(), caps: restricted, active: active.clone() }
             },
         }
@@ -85,8 +110,10 @@ pub struct Usage {
 #[derive(Default)]
 struct Ledger {
     usage: Usage,
-    // In-flight and uncertain generations remain reserved until a receipt or trusted billing reconciliation.
+    // In-flight and uncertain generations remain reserved until a receipt, a definite rejection or owner reconciliation.
     pending: BTreeMap<u64, (u64, f64)>,
+    // The subset of `pending` whose request is still running and will settle on its own.
+    inflight: std::collections::BTreeSet<u64>,
 }
 
 pub struct Supervisor {
@@ -95,7 +122,7 @@ pub struct Supervisor {
     pub manifest: Option<Manifest>,
     ledger: Mutex<Ledger>,
     unresolved: Mutex<BTreeMap<u64, Value>>,
-    retry: Mutex<BTreeMap<u64, Value>>,
+    settled: tokio::sync::Notify,
     pub mutations: Arc<tokio::sync::Semaphore>,
     pub durable: Arc<Mutex<Value>>,
     pub restored: Option<Value>,
@@ -115,37 +142,33 @@ impl Supervisor {
         let blob = policy.log.blob(&serde_json::to_vec(&manifest)?)?;
         policy.log.write("manifest", json!({"format": FORMAT, "blob": blob}), true)?;
         Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), ledger: Mutex::new(Ledger::default()),
-            unresolved: Mutex::new(BTreeMap::new()), retry: Mutex::new(BTreeMap::new()), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None }))
+            unresolved: Mutex::new(BTreeMap::new()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None }))
     }
 
     pub fn ephemeral(policy: Arc<Policy>, registry: Arc<Registry>) -> Arc<Self> {
-        Arc::new(Self { policy, registry, manifest: None, ledger: Mutex::new(Ledger::default()), unresolved: Mutex::new(BTreeMap::new()), retry: Mutex::new(BTreeMap::new()), mutations: Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(Self { policy, registry, manifest: None, ledger: Mutex::new(Ledger::default()), unresolved: Mutex::new(BTreeMap::new()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)),
             durable: Arc::new(Mutex::new(json!({}))), restored: None, recovery: None })
     }
 
     pub fn resume(policy: Arc<Policy>) -> Result<Arc<Self>> {
         let path = policy.log.path.as_deref().context("resume needs a journal")?;
         let manifest = Manifest::load(path)?;
-        let records = eventlog::load(path)?;
+        let mut records = eventlog::load(path)?;
+        if reconcile_local_writes(&policy.log, &records)? > 0 { records = eventlog::load(path)?; }
         let mut ledger = Ledger::default();
         let mut unresolved = BTreeMap::new();
-        let mut retry = BTreeMap::new();
         let mut checkpoint = None;
         let mut frontier = 0;
         for r in &records {
             let seq = r["seq"].as_u64().context("missing record sequence")?;
             match r["kind"].as_str() {
-                Some("intent") if r["class"] != "read" => {
-                    unresolved.insert(seq, r.clone());
-                    if let Some(id) = r["retry_of"].as_u64() { retry.remove(&id); }
-                },
+                Some("intent") if r["class"] != "read" => { unresolved.insert(seq, r.clone()); },
                 Some("outcome") => { unresolved.remove(&r["of"].as_u64().context("outcome missing operation ID")?); },
-                Some("resolution") => {
-                    let id = r["of"].as_u64().context("resolution missing operation ID")?;
-                    unresolved.remove(&id);
-                    if r["decision"] == "retry" { retry.insert(id, r.clone()); } else { retry.remove(&id); }
-                },
+                Some("resolution") => { unresolved.remove(&r["of"].as_u64().context("resolution missing operation ID")?); },
                 Some("model_intent") => { ledger.pending.insert(seq, (r["reserved_tokens"].as_u64().context("missing reservation")?, r["reserved_cost"].as_f64().context("missing reservation")?)); },
+                Some("llm") if r.get("error").is_some() && r["billing_uncertain"] == false => {
+                    ledger.pending.remove(&r["of"].as_u64().context("model receipt missing operation ID")?);
+                },
                 Some("llm") if r.get("error").is_none() => {
                     ledger.pending.remove(&r["of"].as_u64().context("model receipt missing operation ID")?);
                     ledger.usage.input += r["input"].as_u64().unwrap_or(0);
@@ -182,7 +205,7 @@ impl Supervisor {
         let mut registry = manifest.registry.clone();
         registry.materialize_skills(&policy.log)?;
         Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), ledger: Mutex::new(ledger),
-            unresolved: Mutex::new(unresolved), retry: Mutex::new(retry), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery }))
+            unresolved: Mutex::new(unresolved), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery }))
     }
 
     pub fn check(&self) -> Result<()> {
@@ -215,7 +238,7 @@ impl Supervisor {
             anyhow::ensure!(principal.allows(cap, scope), "capability_denied: {} lacks {cap}.{scope} for {tool}", principal.name());
         }
         if class != Class::Read && !self.unresolved.lock().unwrap().is_empty() {
-            bail!("unknown_outcome: unresolved mutations block new mutations; inspect receipts and ask the owner to run `hx recover LOG OP --decision complete|abandon|retry --yes`");
+            bail!("unknown_outcome: unresolved mutations block new mutations; inspect receipts and ask the owner to run `hx recover LOG OP --decision complete|abandon --yes`");
         }
         Ok(())
     }
@@ -227,20 +250,17 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Consume a trusted retry decision only after its new linked intent is durable.
     pub fn intent(&self, tool: &str, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal) -> Result<u64> {
-        let mut retry = self.retry.lock().unwrap();
-        let link = retry.first_key_value().map(|(id, r)| (*id, r));
-        if let Some((_, r)) = link {
-            anyhow::ensure!(r["tool"] == tool && r["args_sha"] == args_sha,
-                "recovery retry is authorized only for the original tool and exact arguments; complete that retry or record another owner decision");
-        }
-        let retry_of = link.map(|(id, _)| id);
-        let id = self.policy.log.write("intent", json!({"tool":tool, "class":class.name(), "args":args,
-            "args_sha":args_sha, "depth":depth, "principal":principal.name(), "retry_of":retry_of,
-            "summary":args.to_string().chars().take(300).collect::<String>()}), true)?;
-        if let Some(old) = retry_of { retry.remove(&old); }
-        Ok(id)
+        self.policy.log.write("intent", json!({"tool":tool, "class":class.name(), "args":args,
+            "args_sha":args_sha, "depth":depth, "principal":principal.name(),
+            "summary":args.to_string().chars().take(300).collect::<String>()}), true)
+    }
+
+    /// Record the file content a local write is about to produce, before it touches the file. With atomic replacement
+    /// the file then holds either its old content or exactly this, so recovery can read the outcome off the disk.
+    pub fn expect(&self, intent: u64, path: &Path, sha: &str) -> Result<()> {
+        self.policy.log.write("expect", json!({"of": intent, "path": path, "sha256": sha}), true)?;
+        Ok(())
     }
 
     pub fn uncertain(&self, id: u64, tool: &str, args: &Value, message: &str) -> Result<()> {
@@ -252,7 +272,19 @@ impl Supervisor {
 
     pub fn uncertain_operations(&self) -> Vec<u64> { self.unresolved.lock().unwrap().keys().copied().collect() }
 
-    pub fn reserve_model(&self, cfg: &LlmCfg, req: &Value, depth: usize) -> Result<u64> {
+    /// Admit one model request. A request that only the reservations of running requests keep out waits for them to
+    /// settle instead of failing; uncertain reservations never settle by themselves, so they still stop admission.
+    pub async fn reserve_model(&self, cfg: &LlmCfg, req: &Value, depth: usize) -> Result<u64> {
+        loop {
+            let settled = self.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if let Some(seq) = self.try_reserve_model(cfg, req, depth)? { return Ok(seq); }
+            settled.await;
+        }
+    }
+
+    fn try_reserve_model(&self, cfg: &LlmCfg, req: &Value, depth: usize) -> Result<Option<u64>> {
         self.check()?;
         let mut ledger = self.ledger.lock().unwrap();
         let budget = self.manifest.as_ref().map(|m| &m.budget).unwrap_or(&self.policy.budget);
@@ -261,31 +293,55 @@ impl Supervisor {
         let pending_cost: f64 = ledger.pending.values().map(|v| v.1).sum();
         // This is a conservative admission allowance, not a tokenizer or provider billing guarantee.
         let tokens = (serde_json::to_vec(req)?.len() as u64).saturating_add(req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output));
-        if budget.max_tokens.is_some_and(|m| used.saturating_add(pending_tokens) >= m) {
+        let over_tokens = budget.max_tokens.is_some_and(|m| used.saturating_add(pending_tokens) >= m);
+        let over_cost = budget.max_cost.is_some_and(|m| ledger.usage.cost + pending_cost >= m);
+        if (over_tokens || over_cost) && !ledger.inflight.is_empty() { return Ok(None); }
+        if over_tokens {
             self.policy.log.write("budget", json!({"reason":"budget_exceeded: token admission threshold reached","depth":depth}), true)?;
             bail!("budget_exceeded: token admission threshold reached");
         }
-        if budget.max_cost.is_some_and(|m| ledger.usage.cost + pending_cost >= m) {
+        if over_cost {
             self.policy.log.write("budget", json!({"reason":"budget_exceeded: cost admission threshold reached (including uncertain requests)","depth":depth}), true)?;
             bail!("budget_exceeded: cost admission threshold reached (including uncertain requests)");
         }
-        // Without a defensible per-request dollar bound, permit only one outstanding request under a cost threshold.
+        // Without a defensible per-request dollar bound, one outstanding request reserves the remaining allowance;
+        // concurrent requests queue behind it above.
         let cost = budget.max_cost.map(|m| (m - ledger.usage.cost - pending_cost).max(0.0)).unwrap_or(0.0);
         let seq = self.policy.log.write("model_intent", json!({"model": cfg.model, "depth": depth,
             "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens, "reserved_cost": cost}), true)?;
         ledger.pending.insert(seq, (tokens, cost));
-        Ok(seq)
+        ledger.inflight.insert(seq);
+        Ok(Some(seq))
+    }
+
+    /// A failed request: a definite rejection releases its reservation; otherwise it stays reserved as uncertain billing.
+    pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, unbilled: bool, depth: usize) -> Result<()> {
+        let result = self.policy.log.write("llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "billing_uncertain": !unbilled}), true);
+        let mut l = self.ledger.lock().unwrap();
+        l.inflight.remove(&op);
+        if unbilled && result.is_ok() { l.pending.remove(&op); }
+        drop(l);
+        self.settled.notify_waiters();
+        result.map(|_| ())
     }
 
     pub fn settle_model(&self, op: u64, cfg: &LlmCfg, reply: &Reply, depth: usize) -> Result<()> {
-        let blob = self.policy.log.blob(&serde_json::to_vec(reply)?)?;
-        self.policy.log.write("llm", json!({"of": op, "model": cfg.model, "depth": depth, "reply": blob, "input": reply.input,
-            "cache_read": reply.cache_read, "cache_write": reply.cache_write, "output": reply.output, "cost": reply.cost, "finish": reply.finish}), true)?;
+        let written = (|| -> Result<()> {
+            let blob = self.policy.log.blob(&serde_json::to_vec(reply)?)?;
+            self.policy.log.write("llm", json!({"of": op, "model": cfg.model, "depth": depth, "reply": blob, "input": reply.input,
+                "cache_read": reply.cache_read, "cache_write": reply.cache_write, "output": reply.output, "cost": reply.cost, "finish": reply.finish}), true)?;
+            Ok(())
+        })();
         let mut l = self.ledger.lock().unwrap();
-        l.pending.remove(&op);
-        l.usage.input += reply.input; l.usage.cache_write += reply.cache_write; l.usage.cache_read += reply.cache_read;
-        l.usage.output += reply.output; l.usage.cost += reply.cost; l.usage.calls += 1;
-        Ok(())
+        l.inflight.remove(&op);
+        if written.is_ok() {
+            l.pending.remove(&op);
+            l.usage.input += reply.input; l.usage.cache_write += reply.cache_write; l.usage.cache_read += reply.cache_read;
+            l.usage.output += reply.output; l.usage.cost += reply.cost; l.usage.calls += 1;
+        }
+        drop(l);
+        self.settled.notify_waiters();
+        written
     }
 
     pub fn usage(&self) -> Usage { self.ledger.lock().unwrap().usage.clone() }

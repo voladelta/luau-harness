@@ -309,41 +309,102 @@ def branch_saved_state():
         assert any(r["kind"] == "branch" for r in records(Path(report["log"])))
 
 
-def unknown_retry():
-    path = workspace("retry")
-    code = 'print(sh("printf x >> retry.txt").code)'
+def unknown_abandon():
+    # --yolo runs sh without Seatbelt, so this check also runs where the sandbox is unavailable.
+    path = workspace("abandon")
+    code = 'print(sh("printf x >> again.txt").code)'
     with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
         # Obtain the actual journal position of this operation from a control run.
-        control = workspace("retry-control")
-        start(control, url)
+        control = workspace("abandon-control")
+        start(control, url, "--yolo")
         intent = next(r for r in records(journal(control)) if r["kind"] == "intent" and r["tool"] == "sh")
-    with provider(lambda body, i: tool(code) if i == 0 or not (path / "retry.txt").exists() else "done") as (url, _):
-        start(path, url, env={"HX_TEST_CRASH_AFTER_RECORD": str(intent["seq"])}, ok=False)
+    with provider(lambda body, i: tool(code) if i == 0 or not (path / "again.txt").exists() else "done") as (url, _):
+        start(path, url, "--yolo", env={"HX_TEST_CRASH_AFTER_RECORD": str(intent["seq"])}, ok=False)
         log = journal(path)
         original = next(r for r in records(log) if r["kind"] == "intent" and r["tool"] == "sh")
-        assert not (path / "retry.txt").exists()
-        run(path, "recover", str(log), str(original["seq"]), "--decision", "retry", "--yes")
+        assert f"UNKNOWN OUTCOME: #{original['seq']} sh" in run(path, "log", "verify", str(log), ok=False).stdout
+        refused = run(path, "recover", str(log), str(original["seq"]), "--decision", "retry", "--yes", ok=False)
+        assert refused.returncode and "complete, abandon or billing" in refused.stderr
+        run(path, "recover", str(log), str(original["seq"]), "--decision", "abandon", "--yes")
+        again = run(path, "recover", str(log), str(original["seq"]), "--decision", "complete", "--yes", ok=False)
+        assert again.returncode and "already resolved" in again.stderr
         report = json.loads(run(path, "run", "--resume", str(log)).stdout)
         assert report["finished"] and report["luau_errors"] == 0, report
-        assert (path / "retry.txt").read_text() == "x"
-        linked = [r for r in records(log) if r["kind"] == "intent" and r.get("retry_of") == original["seq"]]
-        assert len(linked) == 1
+        assert (path / "again.txt").read_text() == "x"
 
-    path = workspace("retry-cancel")
-    def cancel_answer(body, index):
-        if "Recovered into a fresh Luau VM" in body_text(body):
-            return tool('write("different.txt","allowed")') if not (path / "different.txt").exists() else "done"
-        return tool(code)
-    with provider(cancel_answer) as (url, calls):
-        assert start(path, url, env={"HX_TEST_CRASH_AFTER_RECORD": str(intent["seq"])}, ok=False).returncode
-        log = journal(path)
-        original = next(r for r in records(log) if r["kind"] == "intent" and r["tool"] == "sh")
-        run(path, "recover", str(log), str(original["seq"]), "--decision", "retry", "--yes")
-        run(path, "recover", str(log), str(original["seq"]), "--decision", "abandon", "--yes")
-        report = json.loads(run(path, "run", "--resume", str(log)).stdout)
-        assert report["finished"] and report["luau_errors"] == 0 and (path / "different.txt").exists(), report
-        assert not (path / "retry.txt").exists()
-        assert [r["decision"] for r in records(log) if r["kind"] == "resolution"] == ["retry", "abandon"]
+
+def local_write_reconciliation():
+    code = 'write("note.txt","new"); print(edit("note.txt","new","newer"))'
+    with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
+        control = workspace("reconcile-control", "")
+        (control / "note.txt").write_text("old")
+        start(control, url)
+        assert (control / "note.txt").read_text() == "newer"
+        log = records(journal(control))
+    write_intent = next(r for r in log if r["kind"] == "intent" and r["tool"] == "write")
+    expect = next(r for r in log if r["kind"] == "expect" and r["of"] == write_intent["seq"])
+    edit_expect = next(r for r in log if r["kind"] == "expect" and r["of"] != write_intent["seq"])
+    cases = [  # (crash after record, content to plant before resume, expected decision)
+        (write_intent["seq"], None, "abandon"),       # before the file is touched
+        (expect["seq"], None, "abandon"),             # expectation journaled, rename never happened
+        (expect["seq"], "new", "complete"),           # rename landed, outcome record lost
+        (edit_expect["seq"], "newer", "complete"),
+    ]
+    for number, plant, decision in cases:
+        path = workspace(f"reconcile-{number}-{plant}", "")
+        (path / "note.txt").write_text("old")
+        with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, calls):
+            assert start(path, url, env={"HX_TEST_CRASH_AFTER_RECORD": str(number)}, ok=False).returncode
+            assert not list(path.glob(".note.txt.hx-tmp-*")) or plant is None
+            if plant is not None:
+                (path / "note.txt").write_text(plant)
+            report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
+            assert report["finished"] and report["uncertain_operations"] == [], (number, report)
+            resolutions = [r for r in records(journal(path)) if r["kind"] == "resolution"]
+            assert [(r["decision"], r["by"]) for r in resolutions] == [(decision, "hx")], (number, resolutions)
+
+
+def model_status_codes():
+    # A rate limit is retried once and releases its reservation: nothing was generated.
+    path = workspace("status-429")
+    with provider(lambda body, i: {"status": 429, "error": "slow down"} if i == 0 else "done") as (url, calls):
+        report = json.loads(start(path, url, "--max-cost", "0.01").stdout)
+        assert report["finished"] and calls[0] == calls[1] and report["budget"]["reserved_cost"] == 0, report
+        failed = [r for r in records(journal(path)) if r["kind"] == "llm" and "error" in r]
+        assert [r["billing_uncertain"] for r in failed] == [False], failed
+    # A definite rejection releases the reservation, so the run is not left blocked behind it.
+    path = workspace("status-400")
+    with provider(lambda body, i: {"status": 400, "error": "bad request"} if i == 0 else "done") as (url, calls):
+        start(path, url, "--max-cost", "0.01", ok=False)
+        assert len(calls) == 1
+        report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
+        assert report["finished"] and report["budget"]["reserved_cost"] == 0, report
+        assert "UNKNOWN BILLING" not in run(path, "log", "verify", str(journal(path)), ok=False).stdout
+    # A server error may follow a billed generation: one retry, and every failed attempt stays reserved.
+    path = workspace("status-500")
+    with provider(lambda body, i: {"status": 502, "error": "upstream"}) as (url, calls):
+        start(path, url, "--max-tokens", "1000000", ok=False)
+        assert len(calls) == 2
+        failed = [r for r in records(journal(path)) if r["kind"] == "llm"]
+        assert [r["billing_uncertain"] for r in failed] == [True, True], failed
+
+
+def concurrent_children_under_cost_cap():
+    # Concurrent requests queue behind the one holding the remaining allowance instead of failing admission.
+    path = workspace("concurrent-cap")
+    parent_code = '''local r=batch({{op="agent",args={"CHILD ONE"}},{op="agent",args={"CHILD TWO"}}})
+for _, c in r do assert(c.ok and c.value.finished, c.error) end
+print("CHILDREN_OK")'''
+    def answer(body, index):
+        first = not any(m.get("role") == "assistant" for m in body.get("messages", []))
+        if task_text(body).startswith("CHILD"):
+            time.sleep(0.15)
+            return tool('print("child")') if first else "child done"
+        return tool(parent_code) if first else "parent done"
+    with provider(answer) as (url, calls):
+        report = json.loads(start(path, url, "--max-cost", "0.05").stdout)
+        assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 6, report
+        assert report["budget"]["reserved_cost"] == 0, report
 
 
 def no_transport_retry():
@@ -637,7 +698,10 @@ if __name__ == "__main__":
     check("sealed batches reject mutations and preserve result order", batch_checks)
     check("read-only descendants cannot regain package authority; concurrent reservations", readonly_descendants_and_budget)
     check("explicit branches inherit only committed data and select a new manifest", branch_saved_state)
-    check("owner-authorized retries have one linked new operation ID", unknown_retry)
+    check("owner abandon unblocks a resumed run; retry is no longer a decision", unknown_abandon)
+    check("crash-interrupted write/edit settle from the files without the owner", local_write_reconciliation)
+    check("rate limits retry once; definite rejections release reservations", model_status_codes)
+    check("concurrent children queue under a cost cap instead of failing", concurrent_children_under_cost_cap)
     check("lost model response is not retried; reservation survives resume", no_transport_retry)
     check("owner billing reconciliation settles exactly one reservation", billing_reconciliation)
     check("compaction replaces previous summaries and checkpoints explicit state", compaction_and_recovery)
