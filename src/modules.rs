@@ -240,8 +240,7 @@ impl Registry {
     }
 
     pub fn materialize_skills(&mut self, log: &crate::eventlog::EventLog) -> Result<()> {
-        let Some(dir) = log.dir() else { return Ok(()); };
-        let base = dir.join("registry").join(&log.session);
+        let base = log.dir().join("registry").join(&log.session);
         for package in &mut self.packages {
             if package.kind != "skill" { continue; }
             let target = base.join(&package.name);
@@ -742,9 +741,12 @@ impl Resolver {
         let target = self.override_path(&module)?;
         let vdir = self.versions_dir(&module);
         std::fs::create_dir_all(&vdir)?;
+        // Each accept saves what it replaces: NNNN.luau holds the previous override, NNNN.none records that there was none.
         let n = std::fs::read_dir(&vdir).map(|rd| rd.count()).unwrap_or(0) + 1;
-        let previous = std::fs::read_to_string(&target).unwrap_or_else(|_| "<<none>>".to_string());
-        std::fs::write(vdir.join(format!("{n:04}.luau")), &previous)?;
+        match std::fs::read_to_string(&target) {
+            Ok(previous) => std::fs::write(vdir.join(format!("{n:04}.luau")), previous)?,
+            Err(_) => std::fs::write(vdir.join(format!("{n:04}.none")), "")?,
+        }
         std::fs::create_dir_all(target.parent().unwrap())?;
         std::fs::write(&target, &new)?;
         self.log_upgrade(serde_json::json!({"action": if force { "accept(force)" } else { "accept" }, "module": module, "proposal": id, "new_sha": sha, "version": n}))?;
@@ -757,11 +759,11 @@ impl Resolver {
         let mut files: Vec<_> = std::fs::read_dir(&vdir).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
         files.sort();
         let Some(last) = files.pop() else { bail!("nothing to roll back for {module}") };
-        let previous = std::fs::read_to_string(&last)?;
-        if previous == "<<none>>" {
-            let _ = std::fs::remove_file(&target);
-        } else {
-            std::fs::write(&target, previous)?;
+        let previous = if last.extension().is_some_and(|e| e == "none") { None } else { Some(std::fs::read_to_string(&last)?) };
+        // Older versions marked "no override" with this text inside a .luau file.
+        match previous.filter(|p| p != "<<none>>") {
+            Some(previous) => std::fs::write(&target, previous)?,
+            None => { let _ = std::fs::remove_file(&target); },
         }
         std::fs::remove_file(&last)?;
         self.log_upgrade(serde_json::json!({"action": "rollback", "module": module}))?;

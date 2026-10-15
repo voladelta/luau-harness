@@ -163,25 +163,23 @@ impl Host {
             let mut event = if self.depth == 0 {
                 self.supervisor.recovery.as_ref().map(|r| json!({"kind": "recover", "message": serde_json::to_string_pretty(r).unwrap()})).unwrap_or_else(|| json!({"kind":"next"}))
             } else { json!({"kind":"next"}) };
+            let mut compacting = false;
             loop {
                 self.policy.log.check()?;
                 let previous_messages = state["messages"].as_array().cloned().unwrap_or_default();
-                let compacting = state["phase"] == "compact";
-                let compact_cut = state["compact_cut"].as_u64().unwrap_or(2);
                 // A controller transition starts from frozen source and explicit data, just like a package call.
                 // Captured Lua locals cannot become a second, uncheckpointed workflow state store.
                 let controller = Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs)?;
                 let (next_state, mut command) = controller.step(&state, &event)?;
                 anyhow::ensure!(next_state.is_object(), "controller state must be an object");
                 crate::controller::command(&command)?;
-                if next_state["phase"] == "finished" {
-                    crate::controller::command(&json!({"kind":"finish","report":next_state["report"]}))?;
-                }
                 state = next_state;
-                if compacting {
+                // The trace reads only commands and the conversation, never the controller's private state.
+                if std::mem::take(&mut compacting) {
                     let failed = event["kind"] == "model_error" || event["reply"]["text"].as_str().unwrap_or("").trim().is_empty();
+                    let kept = state["messages"].as_array().map_or(0, Vec::len).saturating_sub(1);
                     if failed { self.log("### COMPACT FAILED"); }
-                    else { self.log(&format!("### COMPACT\nsummarized {} messages, kept {}, summary committed", compact_cut.saturating_sub(2), previous_messages.len().saturating_sub(compact_cut as usize).saturating_add(1))); }
+                    else { self.log(&format!("### COMPACT\nsummarized {} messages, kept {kept}, summary committed", previous_messages.len().saturating_sub(kept + 1))); }
                 }
                 if let Some(messages) = state["messages"].as_array() {
                     for (i, message) in messages.iter().enumerate() {
@@ -194,9 +192,10 @@ impl Host {
                 if command["kind"] == "model" && command["purpose"] == "agent" {
                     let request = vm.prepare_request(&command["request"])?;
                     // Image notifications and other data-only additions belong to the controller checkpoint too.
-                    if state["phase"] == "model" { state["messages"] = request["messages"].clone(); }
+                    state["messages"] = request["messages"].clone();
                     command["request"] = request;
                 }
+                compacting = command["kind"] == "model" && command["purpose"] == "compact";
                 let command = crate::controller::command(&command)?;
                 self.supervisor.checkpoint(&self.lane, &state, &self.durable.lock().unwrap())?;
                 match command {

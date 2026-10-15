@@ -314,7 +314,7 @@ impl Vm {
                     }
                     let args = serde_json::json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": turns, "model": model, "effort": effort});
                     // A subagent records an intent and receipt; recovery never redispatches it.
-                    let ret = afx.run(&lua, "agent", Class::LocalWrite, args, || async {
+                    let ret = afx.run(&lua, crate::supervisor::Tool::Agent, Class::LocalWrite, args, || async {
                         let child = h.child_with(model.clone(), effort.clone(), afx.principal.clone());
                         child.log(&format!("### SUBAGENT (depth {}, model {}, effort {})\n{task}", child.depth, child.llm.model, child.llm.reasoning.as_deref().unwrap_or("default")));
                         let rep = child.run_task(task.clone(), turns).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
@@ -342,7 +342,7 @@ impl Vm {
             g.set("__mcp_list", lua.create_async_function(move |lua, server: String| {
                 let (fx, m) = (lfx.clone(), lm.clone());
                 async move {
-                    let ret = fx.run(&lua, "mcp_list", Class::Read, json!({"server": server}), || async {
+                    let ret = fx.run(&lua, crate::supervisor::Tool::McpList, Class::Read, json!({"server": server}), || async {
                         let r = m.request(&server, "tools/list", json!({})).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
                         Ok(Ret::Json(r["tools"].clone()))
                     }).await?;
@@ -357,7 +357,7 @@ impl Vm {
                     let class = if m.is_read_only(&server, &tool) { Class::Read } else { Class::External };
                     let text = args_json.to_string();
                     let a = json!({"server": server, "tool": tool, "args": args_json});
-                    let ret = fx.run(&lua, "mcp_call", class, a, || async {
+                    let ret = fx.run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
                         let cmd = format!("mcp {server}.{tool} {}", text.chars().take(500).collect::<String>());
                         if let Err(why) = fx.pol.approve(&cmd, class).await {
                             return Err(mlua::Error::runtime(format!("approval_required: {why}")));
@@ -465,7 +465,7 @@ impl Vm {
             let max = max.unwrap_or(1024).clamp(64, 2048);
             let pol = vfx.pol.clone();
             let mut live: Option<crate::prims::ViewImage> = None;
-            vfx.sync(lua, "view", Class::Read, json!({"path": &path, "max": max}), |_| {
+            vfx.sync(lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), |_| {
                 let v = crate::prims::load_view_image(&pol, &path, max).map_err(mlua::Error::runtime)?;
                 let meta = json!({"sha256": v.sha256, "width": v.width, "height": v.height}).to_string();
                 live = Some(v);
@@ -527,7 +527,7 @@ impl Vm {
             async move {
                 let def = defs.lock().unwrap().get(&name).cloned().ok_or_else(|| mlua::Error::runtime(format!("promote: no tool named {name:?}; define it with deftool() first")))?;
                 let args = json!({"name": name, "source_sha": crate::eventlog::sha_bytes(def.source.as_bytes()), "tests_sha": crate::eventlog::sha_bytes(def.tests.as_bytes())});
-                let ret = fx.run(&lua, "promote", Class::LocalWrite, args, || async {
+                let ret = fx.run(&lua, crate::supervisor::Tool::Promote, Class::LocalWrite, args, || async {
                     if def.tests.trim().is_empty() {
                         return Ok(Ret::Json(json!({"ok": false, "message": "a tool must have tests to be promoted: pass opts.tests to deftool()"})));
                     }
@@ -555,7 +555,7 @@ impl Vm {
             async move {
                 let reason = opt_string(&opts, "reason");
                 let args = json!({"module": module, "source_sha": crate::eventlog::sha_bytes(source.as_bytes()), "reason": reason});
-                let ret = fx.run(&lua, "propose_module", Class::LocalWrite, args, || async {
+                let ret = fx.run(&lua, crate::supervisor::Tool::ProposeModule, Class::LocalWrite, args, || async {
                     Ok(match res.propose(&module, &source, &reason) {
                         Ok(id) => Ret::Json(json!({"ok": true, "id": id, "message": format!("proposal {id} staged. It is NOT active: it must pass the eval gate and the user must run `hx upgrade accept {id}`.")})),
                         Err(e) => Ret::Json(json!({"ok": false, "message": e.to_string()})),

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run every check suite (none needs an API key). Build first: cargo build --release
+# Run every check suite (none needs an API key). Builds the release binary first, so the suites never test a stale one.
 cd "$(dirname "$0")/.."
+cargo build --release --quiet || exit 1
 H=target/release/hx; rc=0
 run_check() {
   local name=$1 out summary; shift
@@ -10,7 +11,7 @@ run_check() {
   printf '%-16s %s\n' "$name:" "${summary:-$(echo "$out" | tail -1)}"
 }
 run_check "std unit tests" "$H" test stdlib/std
-for s in p2_checks p1_checks sandbox_checks budget_checks caps_checks p4_checks; do
+for s in harness_checks journal_checks sandbox_checks budget_checks caps_checks extension_checks; do
   run_check "$s" scripts/$s.sh
 done
 for s in mcp_checks upgrade_checks llm_checks vision_checks compact_checks trust_checks; do run_check "$s" scripts/$s.sh; done

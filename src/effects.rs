@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use crate::supervisor::{Principal, Supervisor};
+use crate::supervisor::{Principal, Supervisor, Tool};
 
 pub fn rt(msg: impl Into<String>) -> mlua::Error {
     mlua::Error::runtime(msg.into())
@@ -58,7 +58,7 @@ pub struct Effects {
 /// What one effect call is, for the log records around it.
 #[derive(Clone, Copy)]
 struct Call<'a> {
-    tool: &'a str,
+    tool: Tool,
     class: Class,
     args: &'a Value,
     sha: &'a str,
@@ -118,7 +118,7 @@ impl Effects {
             Err(e) => Ret::Err(err_text(e)),
         };
         let mut r = self.base(sha);
-        r["tool"] = json!(tool);
+        r["tool"] = json!(tool.name());
         r["ok"] = json!(res.is_ok());
         r["ms"] = json!(ms);
         r["ret"] = ret.to_json(self.log()).map_err(|e| rt(e.to_string()))?;
@@ -131,7 +131,7 @@ impl Effects {
         match intent {
             Some(id) => {
                 r["of"] = json!(id);
-                self.log().write("outcome", r, false)
+                self.supervisor.record("outcome", r, false)
             }
             None => {
                 r["class"] = json!(class.name());
@@ -144,9 +144,9 @@ impl Effects {
 
     /// Authorize and record one synchronous effect.
     /// `f` receives the durable intent's ID (None for reads).
-    pub fn sync(&self, _lua: &Lua, tool: &str, class: Class, args: Value, f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
+    pub fn sync(&self, _lua: &Lua, tool: Tool, class: Class, args: Value, f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
-        let _permit = if class != Class::Read && tool != "agent" {
+        let _permit = if class != Class::Read && tool != Tool::Agent {
             Some(self.supervisor.mutations.clone().try_acquire_owned().map_err(|_| rt("another mutation is in progress"))?)
         } else { None };
         let sha = args_sha(&args);
@@ -159,13 +159,13 @@ impl Effects {
     }
 
     /// Authorize and record one asynchronous effect (sh, agent).
-    pub async fn run<F, Fut>(&self, lua: &Lua, tool: &str, class: Class, args: Value, f: F) -> mlua::Result<Ret>
+    pub async fn run<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = mlua::Result<Ret>>,
     {
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
-        let _permit = if class != Class::Read && tool != "agent" {
+        let _permit = if class != Class::Read && tool != Tool::Agent {
             Some(self.supervisor.mutations.clone().acquire_owned().await.map_err(mlua::Error::external)?)
         } else { None };
         self.supervisor.check().map_err(mlua::Error::external)?;

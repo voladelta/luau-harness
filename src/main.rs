@@ -49,7 +49,7 @@ GLOBAL FLAGS:
     --workspace DIR   workspace root (default: .)
     --yolo            no sandbox, network, path limits or approval gate; .harness/ stays read-only (prints a warning)
     --net | --no-net  allow or deny network access
-    --approval MODE   approval mode
+    --approval MODE   deny (default) or prompt: what happens to a command that needs approval
     --resume LOG      resume from an event log
     -h, --help        show help (also `hx <command> --help`)
     -V, --version     show version
@@ -187,7 +187,7 @@ async fn real_main() -> Result<()> {
         eprintln!("warning: --yolo: no sandbox, network open, no path limits, no approval gate (.harness/ and hx.lock stay read-only)");
     }
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
-    let mk_policy = || -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval"), arg(&args, "--resume").map(PathBuf::from).as_deref(), net_flag(&args))?)) };
+    let mk_policy = || -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), net_flag(&args))?)) };
     match args[0].as_str() {
         "exec" => {
             trust::warn_if_untrusted(&workspace);
@@ -310,7 +310,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             if cfg.price.is_none() { eprintln!("hx: note: no price found for {}; each request reserves the whole remaining dollar allowance", cfg.model); }
         }
         let branch = inherited.as_ref().map(|(parent, manifest, state)| supervisor::Branch {
-            parent: parent.path.clone().unwrap(),
+            parent: parent.path.clone(),
             durable: state.as_ref().map(|s| s["durable"].clone())
                 .or_else(|| manifest.branch.as_ref().map(|b| b.durable.clone())).unwrap_or_else(|| serde_json::json!({})),
         });
@@ -336,7 +336,7 @@ fn cmd_recover(args: &[String]) -> Result<()> {
     let records = eventlog::load(path)?;
     if decision == "billing" {
         anyhow::ensure!(records.iter().any(|r| r["seq"] == id && r["kind"] == "model_intent"), "not a model operation ID");
-        anyhow::ensure!(!records.iter().any(|r| r["of"] == id && eventlog::settles_model(r)), "model operation already settled");
+        anyhow::ensure!(eventlog::Books::of(&records)?.reservations.contains_key(&id), "model operation already settled");
         let tokens: u64 = parsed(args, "--tokens")?.ok_or_else(|| usage("billing requires --tokens"))?;
         let cost: f64 = parsed(args, "--cost")?.ok_or_else(|| usage("billing requires --cost"))?;
         anyhow::ensure!(cost.is_finite() && cost >= 0.0, "billing cost must be finite and nonnegative");

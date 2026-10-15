@@ -98,7 +98,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let (offset, limit) = (opt_num(&opts, "offset"), opt_num(&opts, "limit"));
         let args = json!({"path": &path, "offset": offset, "limit": limit});
         let pol = f.pol.clone();
-        match f.sync(lua, "read", Class::Read, args, |_| {
+        match f.sync(lua, crate::supervisor::Tool::Read, Class::Read, args, |_| {
             let p = pol.check_read(&path).map_err(|e| rt(format!("read {path}: {e}")))?;
             let meta = std::fs::metadata(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
             if meta.is_dir() {
@@ -132,7 +132,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let args = json!({"path": &path, "bytes": bytes.len(), "sha256": crate::eventlog::sha_bytes(&bytes)});
         let pol = f.pol.clone();
         let sup = f.supervisor.clone();
-        match f.sync(lua, "write", Class::LocalWrite, args, |intent| {
+        match f.sync(lua, crate::supervisor::Tool::Write, Class::LocalWrite, args, |intent| {
             let p = pol.check_write(&path).map_err(|e| rt(format!("write {path}: {e}")))?;
             if let Some(dir) = p.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| rt(format!("write {path}: {e}")))?;
@@ -154,7 +154,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let args = json!({"path": &path, "old_sha": crate::eventlog::sha_bytes(old.as_bytes()), "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "old_bytes": old.len(), "new_bytes": new.len(), "all": all});
         let pol = f.pol.clone();
         let sup = f.supervisor.clone();
-        match f.sync(lua, "edit", Class::LocalWrite, args, |intent| {
+        match f.sync(lua, crate::supervisor::Tool::Edit, Class::LocalWrite, args, |intent| {
             let p = pol.check_write(&path).map_err(|e| rt(format!("edit {path}: {e}")))?;
             // edit reads the file, and whether `old` matched would reveal its content
             if pol.enabled && crate::policy::is_secret(&p) {
@@ -189,7 +189,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             let pol = f.pol.clone();
             let class = pol.classify_sh(&cmd);
             let args = json!({"cmd": &cmd, "cwd": opt_str(&opts, "cwd"), "timeout": opt_num(&opts, "timeout")});
-            let ret = f.run(&lua, "sh", class, args, || async {
+            let ret = f.run(&lua, crate::supervisor::Tool::Sh, class, args, || async {
                 if let Err(why) = pol.approve(&cmd, class).await {
                     return Err(rt(format!("approval_required: {why}")));
                 }
@@ -273,7 +273,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let base = opt_str(&opts, "path").unwrap_or_else(|| ".".into());
         let args = json!({"pattern": &pat, "path": &base, "glob": opt_str(&opts, "glob"), "max": opt_num(&opts, "max"), "ignore_case": opt_bool(&opts, "ignore_case"), "literal": opt_bool(&opts, "literal")});
         let pol = f.pol.clone();
-        match f.sync(lua, "search", Class::Read, args, |_| {
+        match f.sync(lua, crate::supervisor::Tool::Search, Class::Read, args, |_| {
             pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
             Ok(match search(&pol.workspace, &pat, &opts, pol.enabled)? {
                 Ok((rows, truncated)) => Ret::Rows { rows, truncated },
@@ -411,7 +411,7 @@ mod receipt_tests {
         let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None).unwrap());
-        let path = pol.log.path.clone().unwrap();
+        let path = pol.log.path.clone();
         let prefix = format!(": #{}\n", "x".repeat(2100));
         let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));
         let changed = format!("print(sh({:?}).code)", format!("{prefix}echo changed"));

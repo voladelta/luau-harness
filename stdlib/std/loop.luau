@@ -1,4 +1,10 @@
 -- Pure controller: all durable workflow state is passed in and returned. Rust dispatches commands.
+-- `s.phase` is a tagged table; each kind carries only the data that is valid in it:
+--   { kind = "ready", compact = "auto" | "skip" | "force", overflow = error? }  overflow only with "force"
+--   { kind = "model" }                       waiting for the agent's reply
+--   { kind = "compact", cut = n, overflow = error? }  waiting for a summary of messages before `cut`
+--   { kind = "run", calls = {...}, index = n }  working through one reply's tool calls
+--   { kind = "finished" }
 local hooks = require("std/hooks")
 local prompt = require("std/prompt")
 local compact = require("std/compact")
@@ -9,25 +15,24 @@ local function code_of(call)
 	return if type(call.input) == "table" and type(call.input.code) == "string" then call.input.code else nil
 end
 
-local function ready(s)
+local function ready(s, compact, overflow)
 	for _, message in s.notifications or {} do table.insert(s.messages, message) end
 	s.notifications = nil
-	s.phase = "ready"
-	s.current = nil
+	s.phase = { kind = "ready", compact = compact or "auto", overflow = overflow }
 	return s, { kind = "next" }
 end
 
 local function finish(s)
-	s.phase = "finished"
+	s.phase = { kind = "finished" }
 	return s, { kind = "finish", report = s.report }
 end
 
 function M.init(cfg)
 	return {
-		phase = "ready", max_turns = cfg.max_turns, task_text = cfg.task_message, messages = { { role = "user", content = cfg.task_message } },
+		phase = { kind = "ready", compact = "auto" }, max_turns = cfg.max_turns, task_text = cfg.task_message, messages = { { role = "user", content = cfg.task_message } },
 		report = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" },
 		bad = 0, no_call = 0, checkpoint_asked = false, last_tokens = 0, compact_failures = 0,
-		compacted_retry = false, hook_state = {},
+		retried = false, hook_state = {},
 	}
 end
 
@@ -36,7 +41,7 @@ local function save_hook_state(s)
 end
 
 local function next_call(s)
-	local cur = s.current
+	local cur = s.phase
 	local c = cur.calls[cur.index]
 	if not c then return ready(s) end
 	local code = code_of(c)
@@ -50,7 +55,6 @@ local function next_call(s)
 		local pre = hooks.emit("before_run", { code = code })
 		if pre.deny then error_text = "Blocked by a project hook: " .. tostring(pre.deny)
 		else
-			s.phase = "run"
 			return s, { kind = "run", code = pre.code }
 		end
 	end
@@ -64,74 +68,65 @@ function M.step(s, event)
 	save_hook_state(s)
 	if event.kind == "recover" then
 		-- Close every pending tool call with receipts, never dispatch its old code again.
-		if s.current then
-			for i = s.current.index, #s.current.calls do
-				table.insert(s.messages, { role = "tool", id = s.current.calls[i].id,
+		local phase = s.phase
+		if phase.kind == "run" then
+			for i = phase.index, #phase.calls do
+				table.insert(s.messages, { role = "tool", id = phase.calls[i].id,
 					content = "Interrupted by a crash. This chunk was NOT rerun. Consult the recovery receipts in the next user message." })
 			end
 		end
-		if s.phase ~= "finished" then
-			s.compacted_retry = false
-			s.pending_overflow = nil
-			s.force_compact = false
-			s.last_tokens = 0
-			s.skip_compact = true
-			table.insert(s.messages, { role = "user", content = event.message })
-			return ready(s)
-		end
-		return finish(s)
+		if phase.kind == "finished" then return finish(s) end
+		s.retried = false
+		s.last_tokens = 0
+		table.insert(s.messages, { role = "user", content = event.message })
+		return ready(s, "skip")
 	elseif event.kind == "run_result" then
-		assert(s.phase == "run", "unexpected chunk result")
+		assert(s.phase.kind == "run", "unexpected chunk result")
 		local res = hooks.emit("after_run", event.result)
 		s.report.code_turns += 1
 		if type(res.error) == "string" then s.report.luau_errors += 1 end
 		s.notifications = s.notifications or {}
 		for _, message in event.notifications or {} do table.insert(s.notifications, message) end
 		table.insert(s.report.ops_per_turn, res.ops)
-		table.insert(s.messages, { role = "tool", id = s.current.calls[s.current.index].id, content = res.feedback })
-		s.current.index += 1
+		table.insert(s.messages, { role = "tool", id = s.phase.calls[s.phase.index].id, content = res.feedback })
+		s.phase.index += 1
 		return next_call(s)
 	elseif event.kind == "model_error" then
 		if event.error:find("budget_exceeded", 1, true) then
 			s.report.stopped = event.error
 			return finish(s)
 		end
-		if s.phase == "compact" then
-			if s.pending_overflow then error("compaction failed after context overflow: " .. s.pending_overflow, 0) end
+		if s.phase.kind == "compact" then
+			if s.phase.overflow then error("compaction failed after context overflow: " .. s.phase.overflow, 0) end
 			s.compact_failures += 1
-			s.skip_compact = true
-			return ready(s)
+			return ready(s, "skip")
 		end
 		local recovery = hooks.emit("model_error", { error = event.error, messages = s.messages })
-		if recovery.retry and not s.compacted_retry then
-			s.compacted_retry = true
+		if recovery.retry and not s.retried then
+			s.retried = true
 			return ready(s)
 		end
-		if event.safe_context_rejection and compact.enabled and not s.compacted_retry and compact.overflow(event.error) then
-			s.force_compact = true
-			s.compacted_retry = true
-			s.pending_overflow = event.error
-			return ready(s)
+		if event.safe_context_rejection and compact.enabled and not s.retried and compact.overflow(event.error) then
+			s.retried = true
+			return ready(s, "force", event.error)
 		end
-		error(if s.compacted_retry then "the model call failed again after one compact-and-retry: " .. event.error else event.error, 0)
+		error(if s.retried then "the model call failed again after one compact-and-retry: " .. event.error else event.error, 0)
 	elseif event.kind == "model_reply" then
-		if s.phase == "compact" then
+		if s.phase.kind == "compact" then
 			local text = event.reply.text or ""
 			if text:match("^%s*$") then
-				if s.pending_overflow then error("compaction returned no summary after: " .. s.pending_overflow, 0) end
+				if s.phase.overflow then error("compaction returned no summary after: " .. s.phase.overflow, 0) end
 				s.compact_failures += 1
 			else
-				local kept = table.move(s.messages, s.compact_cut, #s.messages, 1, {})
+				local kept = table.move(s.messages, s.phase.cut, #s.messages, 1, {})
 				s.previous_summary = text
 				s.messages = { { role = "user", content = compact.wrap(s.task_text, text) } }
 				table.move(kept, 1, #kept, 2, s.messages)
 				s.last_tokens = 0
-				s.pending_overflow = nil
 			end
-			s.skip_compact = true
-			return ready(s)
+			return ready(s, "skip")
 		end
-		assert(s.phase == "model", "unexpected model reply")
+		assert(s.phase.kind == "model", "unexpected model reply")
 		local resp = event.reply
 		s.report.turns += 1
 		s.last_tokens = (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0) + (resp.output or 0)
@@ -170,16 +165,17 @@ function M.step(s, event)
 			return finish(s)
 		end
 		s.bad = 0
-		s.compacted_retry = false
+		s.retried = false
 		table.insert(s.messages, { role = "assistant", content = text, calls = calls, raw = resp.raw })
-		s.current = { calls = calls, index = 1 }
+		s.phase = { kind = "run", calls = calls, index = 1 }
 		return next_call(s)
 	elseif event.kind == "next_call" then
 		return next_call(s)
 	end
 
-	if s.phase == "finished" then return finish(s) end
-	assert(s.phase == "ready", "unexpected controller event")
+	if s.phase.kind == "finished" then return finish(s) end
+	local phase = s.phase
+	assert(phase.kind == "ready", "unexpected controller event")
 	if s.report.turns >= s.max_turns then
 		s.report.stopped = "max_turns: " .. s.max_turns
 		return finish(s)
@@ -188,20 +184,16 @@ function M.step(s, event)
 	local info = hx.model_info()
 	local window = if type(info.context_window) == "number" then info.context_window else compact.context_window
 	local max_output = info.max_output or 16384
-	if compact.enabled and s.compact_failures < 2 and not s.skip_compact and (s.force_compact or s.last_tokens >= compact.trigger(window, max_output)) then
+	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" and (phase.compact == "force" or s.last_tokens >= compact.trigger(window, max_output)) then
 		local limit = compact.trigger(window, max_output)
 		local cut = compact.find_cut(s.messages, 2, math.min(compact.keep_recent_tokens, math.floor((if limit > 0 then limit else window) / 4)), compact.scale(s.last_tokens, req.system, s.messages))
 		if cut then
-			s.compact_cut = cut
-			s.phase = "compact"
-			s.force_compact = false
+			s.phase = { kind = "compact", cut = cut, overflow = phase.overflow }
 			return s, { kind = "model", request = compact.request(s.messages, cut, s.previous_summary), purpose = "compact" }
 		end
-		if s.pending_overflow then error(s.pending_overflow, 0) end
+		if phase.overflow then error(phase.overflow, 0) end
 	end
-	s.skip_compact = false
-	s.force_compact = false
-	s.phase = "model"
+	s.phase = { kind = "model" }
 	return s, { kind = "model", request = req, purpose = "agent" }
 end
 

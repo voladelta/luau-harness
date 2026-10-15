@@ -11,12 +11,4 @@ M.enabled = true
 M.message = "Before this answer is accepted: state the root cause you fixed in one sentence, then list the other situations where that same cause could fire beyond the reported one (other inputs, orderings, repeats, sizes and edge values). Write a deterministic test for each, run all the checks, and fix the code if any of them fail. Then re-read the task and confirm that every requirement it states still holds; fix anything that no longer does. Then give your final answer."
 M.headsup = "- When you first try to finish, you will be asked to state the root cause you fixed, list the other situations where it could fire, and show a passing test for each. Plan so that your first answer already meets this."
 
--- Insert the heads-up after the real-check Finishing bullet (where it was measured), or append it to a custom prompt.
-function M.with_headsup(system: string): string
-	if string.find(system, M.headsup, 1, true) then
-		return system
-	end
-	return system .. "\n\n# Finish review\n" .. M.headsup
-end
-
 return M

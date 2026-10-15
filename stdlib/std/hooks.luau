@@ -1,5 +1,5 @@
 -- Hook registry. A hook may transform a payload (return the new payload) or deny (return { deny = "reason" }).
--- Hooks never approve anything: approval belongs to the core gate (P1), which no Luau code can reach.
+-- Hooks never approve anything: approval belongs to the Rust gate, which no Luau code can reach.
 local M = {}
 M.state = {} -- controller supplies this serialized store on every transition; use it instead of captured counters
 

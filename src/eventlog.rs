@@ -4,7 +4,9 @@
 //! editing or deleting any earlier line breaks the chain (`hx log verify`). Effects that change the world are written
 //! write-ahead: an `intent` record (flushed and synced) BEFORE the effect, an `outcome` record (`of` = the intent's
 //! seq) after. An intent with no outcome is an UNKNOWN outcome: the process died mid-effect, and a human decides.
-use anyhow::Result;
+use crate::supervisor::Usage;
+use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -12,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 struct Inner {
-    file: Option<std::fs::File>,
+    file: std::fs::File,
     seq: u64,
     prev: String,
 }
@@ -21,7 +23,7 @@ pub struct EventLog {
     inner: Mutex<Inner>,
     failure: Mutex<Option<String>>,
     pub session: String,
-    pub path: Option<PathBuf>,
+    pub path: PathBuf,
     /// test hook: SIGKILL this process right after the Nth record is on disk (HX_TEST_CRASH_AFTER_RECORD)
     crash_after: Option<u64>,
     // A separate inode survives torn-tail repair. The lock is released only when the run drops its journal.
@@ -60,7 +62,7 @@ impl EventLog {
             }
         };
         let _writer_lock = Some(lock_writer(&path)?);
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file: Some(file), seq: 0, prev: "genesis".into() }), failure: Mutex::new(None), session, path: Some(path), crash_after: crash_hook(), _writer_lock, owner_reconciliation: false }))
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: "genesis".into() }), failure: Mutex::new(None), session, path, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false }))
     }
 
     /// Continue an existing log after a crash: restore seq and the hash chain, drop a torn final line. A malformed line
@@ -92,11 +94,7 @@ impl EventLog {
         }
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
         let session = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file: Some(file), seq, prev }), failure: Mutex::new(None), session, path: Some(path.to_path_buf()), crash_after: crash_hook(), _writer_lock, owner_reconciliation }))
-    }
-
-    pub fn off() -> Arc<EventLog> {
-        Arc::new(EventLog { inner: Mutex::new(Inner { file: None, seq: 0, prev: String::new() }), failure: Mutex::new(None), session: "off".into(), path: None, crash_after: None, _writer_lock: None, owner_reconciliation: false })
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev }), failure: Mutex::new(None), session, path: path.to_path_buf(), crash_after: crash_hook(), _writer_lock, owner_reconciliation }))
     }
 
     /// Audit failures are fatal to the run, even if Luau catches the returned error.
@@ -107,7 +105,7 @@ impl EventLog {
     }
 
     pub fn check(&self) -> Result<()> {
-        if !self.owner_reconciliation && self.path.as_ref().is_some_and(|p| p.with_extension("revoked").exists()) {
+        if !self.owner_reconciliation && self.path.with_extension("revoked").exists() {
             return Err(self.fail("run revoked by its owner"));
         }
         match self.failure.lock().unwrap().as_ref() {
@@ -116,25 +114,22 @@ impl EventLog {
         }
     }
 
-    pub fn dir(&self) -> Option<PathBuf> {
-        self.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
+    pub fn dir(&self) -> &Path {
+        self.path.parent().expect("a journal path has a parent directory")
     }
-
 
     /// Store `bytes` content-addressed next to the log (write-once) and return its sha256.
     pub fn blob(&self, bytes: &[u8]) -> Result<String> {
         self.check()?;
         let h = sha_bytes(bytes);
-        if let Some(d) = self.dir() {
-            let dir = d.join("blobs");
-            std::fs::create_dir_all(&dir).map_err(|e| self.fail(format!("event log blob: {e}")))?;
-            let f = dir.join(&h);
-            if !f.exists() {
-                // atomic: a crash mid-write must not leave a truncated blob under its final name
-                write_atomic(&f, bytes).map_err(|e| self.fail(format!("event log blob: {e}")))?;
-            } else {
-                read_blob(&d, &h).map_err(|e| self.fail(e))?;
-            }
+        let dir = self.dir().join("blobs");
+        std::fs::create_dir_all(&dir).map_err(|e| self.fail(format!("event log blob: {e}")))?;
+        let f = dir.join(&h);
+        if !f.exists() {
+            // atomic: a crash mid-write must not leave a truncated blob under its final name
+            write_atomic(&f, bytes).map_err(|e| self.fail(format!("event log blob: {e}")))?;
+        } else {
+            read_blob(self.dir(), &h).map_err(|e| self.fail(e))?;
         }
         Ok(h)
     }
@@ -154,18 +149,14 @@ impl EventLog {
             }
         }
         let line = serde_json::to_string(&obj).unwrap_or_default();
-        if let Some(f) = g.file.as_mut() {
-            f.write_all(format!("{line}\n").as_bytes()).map_err(|e| self.fail(format!("event log write: {e}")))?;
-            f.flush().map_err(|e| self.fail(format!("event log flush: {e}")))?;
-            if sync {
-                f.sync_data().map_err(|e| self.fail(format!("event log sync: {e}")))?;
-            }
+        g.file.write_all(format!("{line}\n").as_bytes()).map_err(|e| self.fail(format!("event log write: {e}")))?;
+        g.file.flush().map_err(|e| self.fail(format!("event log flush: {e}")))?;
+        if sync {
+            g.file.sync_data().map_err(|e| self.fail(format!("event log sync: {e}")))?;
         }
         g.prev = sha_bytes(line.as_bytes());
         if self.crash_after == Some(seq) {
-            if let Some(f) = g.file.as_mut() {
-                let _ = f.sync_data();
-            }
+            let _ = g.file.sync_data();
             unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
         }
         Ok(seq)
@@ -220,12 +211,65 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Whether a record closes a model request's reservation: a receipt, a definite rejection, or an owner's billing decision.
-pub fn settles_model(r: &Value) -> bool {
-    match r["kind"].as_str() {
-        Some("billing") => true,
-        Some("llm") => r.get("error").is_none() || r["billing_uncertain"] == false,
-        _ => false,
+/// A model request's admission reservation, held until a receipt, a definite rejection or a billing decision.
+#[derive(Clone, Copy)]
+pub struct Reservation { pub tokens: u64, pub cost: f64, pub bounded: bool, pub running: bool }
+
+/// What the journal says about spend and open effects. The live supervisor, resume, reconciliation, `hx log verify` and
+/// `hx recover` all build it with `Books::apply`, so they cannot disagree about what is open.
+#[derive(Default)]
+pub struct Books {
+    pub usage: Usage,
+    pub reservations: BTreeMap<u64, Reservation>,
+    // Mutating intents without an outcome or resolution; `uncertain` is the subset whose effect may or may not have acted.
+    pub open: BTreeMap<u64, Value>,
+    pub uncertain: std::collections::BTreeSet<u64>,
+}
+
+impl Books {
+    /// The books a journal's records add up to.
+    pub fn of(records: &[Value]) -> Result<Self> {
+        let mut books = Self::default();
+        for r in records { books.apply(r["seq"].as_u64().context("missing record sequence")?, r["kind"].as_str().unwrap_or_default(), r)?; }
+        Ok(books)
+    }
+
+    pub fn apply(&mut self, seq: u64, kind: &str, r: &Value) -> Result<()> {
+        let of = || r["of"].as_u64().with_context(|| format!("{kind} record missing operation ID"));
+        match kind {
+            "intent" if r["class"] != "read" => { self.open.insert(seq, r.clone()); },
+            "outcome" | "resolution" => { let id = of()?; self.open.remove(&id); self.uncertain.remove(&id); },
+            "uncertain" => { self.uncertain.insert(of()?); },
+            "model_intent" => { self.reservations.insert(seq, Reservation { tokens: r["reserved_tokens"].as_u64().context("missing reservation")?,
+                cost: r["reserved_cost"].as_f64().context("missing reservation")?, bounded: r["bounded"] == true, running: true }); },
+            "llm" if r.get("error").is_none() => {
+                self.reservations.remove(&of()?);
+                let u = &mut self.usage;
+                u.input += r["input"].as_u64().unwrap_or(0); u.cache_write += r["cache_write"].as_u64().unwrap_or(0);
+                u.cache_read += r["cache_read"].as_u64().unwrap_or(0); u.output += r["output"].as_u64().unwrap_or(0);
+                u.cost += r["cost"].as_f64().unwrap_or(0.0); u.calls += 1;
+            },
+            "llm" if r["billing_uncertain"] == false => { self.reservations.remove(&of()?); },
+            "llm" => { if let Some(res) = self.reservations.get_mut(&of()?) { res.running = false; } },
+            "billing" => {
+                self.reservations.remove(&of()?);
+                self.usage.input += r["tokens"].as_u64().context("billing decision missing tokens")?;
+                self.usage.cost += r["cost"].as_f64().context("billing decision missing cost")?;
+                self.usage.calls += 1;
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+
+    /// After a crash nothing is running: every open effect is uncertain and every reservation waits on a decision.
+    pub fn crashed(&mut self) {
+        self.uncertain.extend(self.open.keys().copied());
+        for res in self.reservations.values_mut() { res.running = false; }
+    }
+
+    pub fn reserved(&self) -> (u64, f64) {
+        self.reservations.values().fold((0, 0.0), |(t, c), r| (t + r.tokens, c + r.cost))
     }
 }
 
@@ -238,8 +282,7 @@ pub fn verify(path: &Path) -> Result<Report> {
 fn verify_text(text: &str) -> Result<Report> {
     let records = parse(text).map_err(|n| anyhow::anyhow!("line {n} is not valid JSON"))?.0;
     let mut prev = "genesis".to_string();
-    let mut intents: std::collections::BTreeMap<u64, (String, String)> = Default::default();
-    let mut models = std::collections::BTreeSet::new();
+    let mut books = Books::default();
     let (mut n, mut bad) = (0, None);
     for (i, (line, v)) in records.into_iter().enumerate() {
         if v["prev"].as_str() != Some(prev.as_str()) && bad.is_none() {
@@ -247,19 +290,11 @@ fn verify_text(text: &str) -> Result<Report> {
         }
         prev = sha_bytes(line.as_bytes());
         n += 1;
-        match v["kind"].as_str() {
-            Some("intent") => {
-                intents.insert(v["seq"].as_u64().unwrap_or(0), (v["tool"].as_str().unwrap_or("?").into(), v["summary"].as_str().unwrap_or("").into()));
-            }
-            Some("outcome" | "resolution") => {
-                intents.remove(&v["of"].as_u64().unwrap_or(0));
-            }
-            Some("model_intent") => { models.insert(v["seq"].as_u64().unwrap_or(0)); }
-            _ if settles_model(&v) => { models.remove(&v["of"].as_u64().unwrap_or(0)); }
-            _ => {}
-        }
+        // Verification reports what it can; a malformed record is the chain check's business, not a reason to stop.
+        let _ = books.apply(v["seq"].as_u64().unwrap_or(0), v["kind"].as_str().unwrap_or_default(), &v);
     }
-    Ok(Report { records: n, chain_ok: bad.is_none(), bad_line: bad, unknown: intents.into_iter().map(|(s, (t, d))| (s, t, d)).collect(), unknown_models: models.into_iter().collect() })
+    let unknown = books.open.iter().map(|(&s, v)| (s, v["tool"].as_str().unwrap_or("?").into(), v["summary"].as_str().unwrap_or("").into())).collect();
+    Ok(Report { records: n, chain_ok: bad.is_none(), bad_line: bad, unknown, unknown_models: books.reservations.keys().copied().collect() })
 }
 
 fn crash_hook() -> Option<u64> {
@@ -302,7 +337,7 @@ mod open_tests {
         for i in 0..3 {
             log.write("note", json!({"i": i}), false).unwrap();
         }
-        log.path.clone().unwrap()
+        log.path.clone()
     }
 
     #[test]
@@ -379,15 +414,15 @@ mod open_tests {
         let path = three_records("write-failure");
         let mut pol = crate::policy::Policy::new(path.parent().unwrap(), true, None, None, None).unwrap();
         pol.log = Arc::new(EventLog {
-            inner: Mutex::new(Inner { file: Some(std::fs::File::open(&path).unwrap()), seq: 0, prev: "genesis".into() }),
+            inner: Mutex::new(Inner { file: std::fs::File::open(&path).unwrap(), seq: 0, prev: "genesis".into() }),
             failure: Mutex::new(None),
-            session: "read-only".into(), path: Some(path.clone()), crash_after: None, _writer_lock: None, owner_reconciliation: false,
+            session: "read-only".into(), path: path.clone(), crash_after: None, _writer_lock: None, owner_reconciliation: false,
         });
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
         let lua = mlua::Lua::new();
         let mut executed = false;
         for _ in 0..2 {
-            let result = fx.sync(&lua, "write", crate::policy::Class::LocalWrite, json!({}), |_| {
+            let result = fx.sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
                 executed = true;
                 Ok(crate::effects::Ret::Num(0.0))
             });
@@ -401,13 +436,13 @@ mod open_tests {
     fn failed_outcome_blob_keeps_an_unknown_intent_and_blocks_later_effects() {
         let path = three_records("blob-failure");
         let pol = crate::policy::Policy::new(path.parent().unwrap(), true, None, None, None).unwrap();
-        let log_path = pol.log.path.clone().unwrap();
+        let log_path = pol.log.path.clone();
         std::fs::write(log_path.parent().unwrap().join("blobs"), "not a directory").unwrap();
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
         let lua = mlua::Lua::new();
         let mut executions = 0;
         for _ in 0..2 {
-            let result = fx.sync(&lua, "write", crate::policy::Class::LocalWrite, json!({}), |_| {
+            let result = fx.sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
                 executions += 1;
                 Ok(crate::effects::Ret::Str("result".into()))
             });

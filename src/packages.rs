@@ -23,12 +23,12 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
         g.set("agent", lua.create_async_function(move |lua, (task, opts): (String, Option<Table>)| {
             let (host, fx) = (host.clone(), afx.clone());
             async move {
-                fx.supervisor.authorize(&fx.principal, "agent", crate::policy::Class::LocalWrite).map_err(mlua::Error::external)?;
+                fx.supervisor.authorize(&fx.principal, crate::supervisor::Tool::Agent, crate::policy::Class::LocalWrite).map_err(mlua::Error::external)?;
                 if host.depth >= host.max_depth { return Err(mlua::Error::runtime("agent depth limit reached")); }
                 let model = prims::opt_str(&opts, "model"); let effort = prims::opt_str(&opts, "effort");
                 let turns = opts.as_ref().and_then(|o| o.get::<Option<usize>>("max_turns").ok().flatten()).unwrap_or(12);
                 let child = host.child_with(model.clone(), effort.clone(), fx.principal.clone());
-                let ret = fx.run(&lua, "agent", crate::policy::Class::LocalWrite, serde_json::json!({"task":task, "max_turns":turns, "model":model, "effort":effort}), || async {
+                let ret = fx.run(&lua, crate::supervisor::Tool::Agent, crate::policy::Class::LocalWrite, serde_json::json!({"task":task, "max_turns":turns, "model":model, "effort":effort}), || async {
                     let rep = child.run_task(task, turns).await.map_err(mlua::Error::external)?;
                     Ok(crate::effects::Ret::Json(rep))
                 }).await?;
@@ -38,7 +38,7 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     } else {
         let fx = fx.clone();
         g.set("agent", lua.create_function(move |_, _: MultiValue| -> mlua::Result<()> {
-            fx.supervisor.authorize(&fx.principal, "agent", crate::policy::Class::LocalWrite).map_err(mlua::Error::external)?;
+            fx.supervisor.authorize(&fx.principal, crate::supervisor::Tool::Agent, crate::policy::Class::LocalWrite).map_err(mlua::Error::external)?;
             Err(mlua::Error::runtime("agent requires hx run"))
         })?)?;
     }

@@ -283,21 +283,14 @@ A package that is unapproved, or changed since approval, is invisible to a new r
 
 ## Checkpoints and resume
 
-`hx run --resume LOG` restores frozen settings and the latest committed controller state and `durable` data into fresh VMs. Ordinary globals and functions are lost. It supplies receipts from interrupted work to a recovery turn and never reruns old chunks to reconstruct memory.
-
-- An effect with an intent but no outcome is uncertain. `write` and `edit` replace files atomically, so resume settles them from the file's hash. A sandboxed `sh` in a run without network could only change the workspace and temp dir, so resume settles it as `unknown_local` and the recovery turn inspects the workspace. For `sh` under `--yolo` or with network, and for MCP calls, new mutations are blocked until the owner records a decision with `hx recover`.
-- Resume uses the original manifest, including the standard library, even if workspace modules or the binary changed; `--branch LOG` selects new configuration explicitly.
-- An OS lock prevents simultaneous resume.
-- A lost response is never redispatched. When its reservation was a real bound (a priced model, or no dollar threshold) hx charges it at that bound and sends one new request; otherwise it keeps its reservation until owner billing reconciliation. A 4xx or 503 answer releases its reservation, and a 408, 429, 5xx or malformed 200 gets one more request.
-- The log stores file contents and command output as blobs in `.harness/log/blobs/`. Treat it as sensitive.
+`hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs; it never reruns old chunks, and ordinary globals are lost. Interrupted local `write`/`edit` and sandboxed offline `sh` settle themselves from the evidence; other uncertain effects and unbounded model reservations wait for `hx recover`. `--branch LOG` starts a new run with new settings and the inherited saved data. The log stores file contents and command output as blobs in `.harness/log/blobs/`, so treat it as sensitive. The full rules are in [Runtime v2](docs/runtime-v2.md).
 
 ## Development
 
-Build first: every check uses `target/release/hx`, and none needs an API key (model runs use a scripted mock).
+Every check uses `target/release/hx`, and none needs an API key (model runs use a scripted mock).
 
 ```bash
-cargo build --release
-scripts/all_checks.sh        # every suite
+scripts/all_checks.sh        # builds, then runs every suite
 hx test stdlib/std           # Luau unit tests
 cargo test --release
 ```

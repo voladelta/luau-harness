@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P1 checks: event log (hash chain, write-ahead intents), approval gate, crash consistency. No API key needed.
+# Journal checks: event log (hash chain, write-ahead intents), approval gate, crash consistency. No API key needed.
 set -u
 cd "$(dirname "$0")/.."
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust

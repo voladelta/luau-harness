@@ -60,8 +60,7 @@ struct ApprovalSection {
     /// commands the USER pre-approves (substring match; an irreversible command needs an exact full-command match)
     #[serde(default)]
     allow: Vec<String>,
-    /// "deny" (default, headless) or "prompt" (ask on the terminal)
-    mode: Option<String>,
+    mode: Option<ApprovalMode>,
 }
 #[derive(Deserialize, Default)]
 struct FsSection {
@@ -76,21 +75,36 @@ struct NetSection {
     allow: bool,
 }
 
+/// What happens to a command that needs approval and is not pre-approved in `policy.toml`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Refuse it (the headless default).
+    Deny,
+    /// Ask on the terminal.
+    Prompt,
+}
+
+impl std::str::FromStr for ApprovalMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "deny" => Ok(Self::Deny),
+            "prompt" => Ok(Self::Prompt),
+            _ => anyhow::bail!("approval mode must be deny or prompt (got {s:?})"),
+        }
+    }
+}
+
+/// The live policy: the frozen settings a run's manifest records, plus its journal.
 pub struct Policy {
-    pub enabled: bool,
-    pub workspace: PathBuf,
-    pub tmp: PathBuf,
-    pub read_roots: Vec<PathBuf>,
-    pub write_roots: Vec<PathBuf>,
-    pub protected: Vec<PathBuf>,
-    pub net: bool,
-    pub gpu: bool,
+    cfg: Snapshot,
     pub log: Arc<EventLog>,
-    ask: Vec<String>,
-    allow: Vec<String>,
-    pub mode: String,
-    pub budget: Budget,
-    pub packs: Vec<String>,
+}
+
+impl std::ops::Deref for Policy {
+    type Target = Snapshot;
+    fn deref(&self) -> &Snapshot { &self.cfg }
 }
 
 #[derive(Clone, Debug, serde::Serialize, Deserialize)]
@@ -105,7 +119,7 @@ pub struct Snapshot {
     pub gpu: bool,
     pub ask: Vec<String>,
     pub allow: Vec<String>,
-    pub mode: String,
+    pub mode: ApprovalMode,
     pub budget: Budget,
     pub packs: Vec<String>,
 }
@@ -171,7 +185,7 @@ fn normalize(p: &Path) -> PathBuf {
 impl Policy {
     /// `enabled = false` is `--yolo`: no Seatbelt confinement, path roots or approval gate. Protected paths (`.harness/`,
     /// `hx.lock`, the trust store) stay read-only to the model, so a yolo run cannot rewrite config later runs apply.
-    pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<String>, resume: Option<&Path>, net: Option<bool>) -> Result<Policy> {
+    pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, net: Option<bool>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
         if let Some(path) = resume {
             // Lock before reading any recovery state or repairing the log. Mutable workspace configuration is never
@@ -179,12 +193,9 @@ impl Policy {
             let log = EventLog::reopen(path)?;
             let manifest = crate::supervisor::Manifest::load(path)?;
             anyhow::ensure!(manifest.policy.workspace == workspace, "resume workspace differs from the saved run");
-            let s = manifest.policy;
-            validate_scratch(&s.tmp)?;
-            std::fs::create_dir_all(&s.tmp)?;
-            let mut p = Policy { enabled: s.enabled, workspace: s.workspace, tmp: s.tmp, read_roots: s.read_roots,
-                write_roots: s.write_roots, protected: s.protected, net: s.net, gpu: s.gpu, log,
-                ask: s.ask, allow: s.allow, mode: s.mode, budget: s.budget, packs: s.packs };
+            let mut p = manifest.policy;
+            validate_scratch(&p.tmp)?;
+            std::fs::create_dir_all(&p.tmp)?;
             // A journal may have been moved since launch. Its actual files and artifacts remain model-read-only.
             let actual = std::fs::canonicalize(path)?;
             p.protected.extend([actual.clone(), actual.with_extension("lock"), actual.with_extension("revoked"),
@@ -192,14 +203,14 @@ impl Policy {
             // Newly introduced aliases must not turn frozen protected paths into writable paths.
             let aliases: Vec<_> = p.protected.iter().filter_map(canon).collect();
             p.protected.extend(aliases);
-            p.log.check()?;
-            return Ok(p);
+            log.check()?;
+            return Ok(Policy { cfg: p, log });
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
-        let mut p = Policy { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], net: false, gpu: false, log: EventLog::off(), ask: vec![], allow: vec![], mode: "deny".into(), budget: Budget::default(), packs: vec![] };
+        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], net: false, gpu: false, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
@@ -247,20 +258,15 @@ impl Policy {
             }
         }
         // The audit log is independent of the sandbox: `--yolo` drops confinement, not the record of what ran.
-        p.log = EventLog::open(&workspace.join(".harness/log"))?;
-        p.log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "sandbox": enabled,
+        let log = EventLog::open(&workspace.join(".harness/log"))?;
+        log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "sandbox": enabled,
             "net": p.net, "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
-        Ok(p)
+        Ok(Policy { cfg: p, log })
     }
 
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot { enabled: self.enabled, workspace: self.workspace.clone(), tmp: self.tmp.clone(),
-            read_roots: self.read_roots.clone(), write_roots: self.write_roots.clone(), protected: self.protected.clone(),
-            net: self.net, gpu: self.gpu, ask: self.ask.clone(), allow: self.allow.clone(), mode: self.mode.clone(),
-            budget: self.budget.clone(), packs: self.packs.clone() }
-    }
+    pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
 
     /// Effect class of a shell command.
     pub fn classify_sh(&self, cmd: &str) -> Class {
@@ -283,7 +289,7 @@ impl Policy {
         if preapproved {
             return Ok("policy-allow");
         }
-        if self.mode == "prompt" {
+        if self.mode == ApprovalMode::Prompt {
             let msg = format!("\n[approval needed] {} command:\n  {cmd}\napprove? [y/N] ", class.name());
             let yes = tokio::task::spawn_blocking(move || {
                 use std::io::{BufRead, Write};
@@ -493,7 +499,7 @@ mod tests {
         std::fs::write(victim.join("sentinel"), "KEEP").unwrap();
         let log = EventLog::open(&dir.join("log")).unwrap();
         log.write("session", json!({"workspace": dir, "tmp": victim}), true).unwrap();
-        let result = Policy::new(&dir, true, None, log.path.as_deref(), None);
+        let result = Policy::new(&dir, true, None, Some(&log.path), None);
         let accepted = result.is_ok();
         drop(result);
         assert!(victim.join("sentinel").exists(), "Policy::drop deleted unrelated data");

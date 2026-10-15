@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P4 (extension system) checks, no API key: skills, tool packages, agent-written tools (deftool/promote/accept),
+# Extension checks, no API key: skills, tool packages, agent-written tools (deftool/promote/accept),
 # no self-approval, frozen extensions with live session state. Build first: cargo build --release
 set -u
 cd "$(dirname "$0")/.."

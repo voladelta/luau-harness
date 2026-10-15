@@ -1,5 +1,5 @@
 //! One owner for admission, immutable run configuration, receipts, and recovery.
-use crate::{eventlog::{self, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
+use crate::{eventlog::{self, Books, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -56,12 +56,10 @@ impl Manifest {
 /// - A model request whose reservation is a real bound (`bounded`) is charged at that bound.
 /// Returns how many records were written.
 pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Result<usize> {
-    let closed: std::collections::BTreeSet<u64> = records.iter()
-        .filter(|r| matches!(r["kind"].as_str(), Some("outcome" | "resolution"))).filter_map(|r| r["of"].as_u64()).collect();
+    let books = Books::of(records)?;
     let confined = manifest.policy.enabled && !manifest.policy.net;
     let mut settled = 0;
-    for intent in records.iter().filter(|r| r["kind"] == "intent") {
-        let Some(id) = intent["seq"].as_u64().filter(|id| !closed.contains(id)) else { continue };
+    for (&id, intent) in &books.open {
         let (decision, evidence) = match intent["tool"].as_str() {
             Some("write" | "edit") => match records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
                 None => ("abandon", "interrupted before the file was touched"),
@@ -79,10 +77,8 @@ pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Resu
         log.write("resolution", json!({"of": id, "decision": decision, "tool": intent["tool"], "args_sha": intent["args_sha"], "by": "hx", "evidence": evidence}), true)?;
         settled += 1;
     }
-    for intent in records.iter().filter(|r| r["kind"] == "model_intent" && r["bounded"] == true) {
-        let Some(id) = intent["seq"].as_u64() else { continue };
-        if records.iter().any(|r| r["of"] == id && eventlog::settles_model(r)) { continue; }
-        log.write("billing", bound_billing(id, intent["reserved_tokens"].as_u64().unwrap_or(0), intent["reserved_cost"].as_f64().unwrap_or(0.0)), true)?;
+    for (&id, reservation) in books.reservations.iter().filter(|(_, r)| r.bounded) {
+        log.write("billing", bound_billing(id, reservation.tokens, reservation.cost), true)?;
         settled += 1;
     }
     Ok(settled)
@@ -94,6 +90,31 @@ fn bound_billing(of: u64, tokens: u64, cost: f64) -> Value {
 }
 
 fn binary_sha() -> Result<String> { Ok(eventlog::sha_bytes(&std::fs::read(std::env::current_exe()?)?)) }
+
+/// Every effect a principal can ask for, and the capability it needs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tool { Read, Search, View, Write, Edit, Sh, Agent, McpList, McpCall, Promote, ProposeModule }
+
+impl Tool {
+    /// The name journal records carry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read", Self::Search => "search", Self::View => "view", Self::Write => "write", Self::Edit => "edit",
+            Self::Sh => "sh", Self::Agent => "agent", Self::McpList => "mcp_list", Self::McpCall => "mcp_call",
+            Self::Promote => "promote", Self::ProposeModule => "propose_module",
+        }
+    }
+
+    fn capability(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Read | Self::Search | Self::View => ("fs", "read"),
+            Self::Write | Self::Edit | Self::Promote | Self::ProposeModule => ("fs", "write"),
+            Self::Sh => ("proc", "sh"),
+            Self::Agent => ("llm", "agent"),
+            Self::McpList | Self::McpCall => ("mcp", "call"),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum Principal {
@@ -128,21 +149,11 @@ pub struct Usage {
     pub input: u64, pub cache_write: u64, pub cache_read: u64, pub output: u64, pub cost: f64, pub calls: u64,
 }
 
-#[derive(Default)]
-struct Ledger {
-    usage: Usage,
-    // In-flight and uncertain generations remain reserved until a receipt, a definite rejection or owner reconciliation.
-    pending: BTreeMap<u64, (u64, f64, bool)>,
-    // The subset of `pending` whose request is still running and will settle on its own.
-    inflight: std::collections::BTreeSet<u64>,
-}
-
 pub struct Supervisor {
     pub policy: Arc<Policy>,
     pub registry: Arc<Registry>,
     pub manifest: Option<Manifest>,
-    ledger: Mutex<Ledger>,
-    unresolved: Mutex<BTreeMap<u64, Value>>,
+    books: Mutex<Books>,
     settled: tokio::sync::Notify,
     pub mutations: Arc<tokio::sync::Semaphore>,
     pub durable: Arc<Mutex<Value>>,
@@ -162,56 +173,26 @@ impl Supervisor {
         crate::values::validate(&durable)?;
         let blob = policy.log.blob(&serde_json::to_vec(&manifest)?)?;
         policy.log.write("manifest", json!({"format": FORMAT, "blob": blob}), true)?;
-        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), ledger: Mutex::new(Ledger::default()),
-            unresolved: Mutex::new(BTreeMap::new()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None }))
+        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None }))
     }
 
     pub fn ephemeral(policy: Arc<Policy>, registry: Arc<Registry>) -> Arc<Self> {
-        Arc::new(Self { policy, registry, manifest: None, ledger: Mutex::new(Ledger::default()), unresolved: Mutex::new(BTreeMap::new()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(Self { policy, registry, manifest: None, books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)),
             durable: Arc::new(Mutex::new(json!({}))), restored: None, recovery: None })
     }
 
     pub fn resume(policy: Arc<Policy>) -> Result<Arc<Self>> {
-        let path = policy.log.path.as_deref().context("resume needs a journal")?;
+        let path = policy.log.path.as_path();
         let manifest = Manifest::load(path)?;
         let mut records = eventlog::load(path)?;
         if reconcile(&policy.log, &records, &manifest)? > 0 { records = eventlog::load(path)?; }
-        let mut ledger = Ledger::default();
-        let mut unresolved = BTreeMap::new();
-        let mut checkpoint = None;
-        let mut frontier = 0;
-        for r in &records {
-            let seq = r["seq"].as_u64().context("missing record sequence")?;
-            match r["kind"].as_str() {
-                Some("intent") if r["class"] != "read" => { unresolved.insert(seq, r.clone()); },
-                Some("outcome") => { unresolved.remove(&r["of"].as_u64().context("outcome missing operation ID")?); },
-                Some("resolution") => { unresolved.remove(&r["of"].as_u64().context("resolution missing operation ID")?); },
-                Some("model_intent") => { ledger.pending.insert(seq, (r["reserved_tokens"].as_u64().context("missing reservation")?, r["reserved_cost"].as_f64().context("missing reservation")?, r["bounded"] == true)); },
-                Some("llm") if r.get("error").is_some() && r["billing_uncertain"] == false => {
-                    ledger.pending.remove(&r["of"].as_u64().context("model receipt missing operation ID")?);
-                },
-                Some("llm") if r.get("error").is_none() => {
-                    ledger.pending.remove(&r["of"].as_u64().context("model receipt missing operation ID")?);
-                    ledger.usage.input += r["input"].as_u64().unwrap_or(0);
-                    ledger.usage.cache_write += r["cache_write"].as_u64().unwrap_or(0);
-                    ledger.usage.cache_read += r["cache_read"].as_u64().unwrap_or(0);
-                    ledger.usage.output += r["output"].as_u64().unwrap_or(0);
-                    ledger.usage.cost += r["cost"].as_f64().unwrap_or(0.0);
-                    ledger.usage.calls += 1;
-                },
-                Some("billing") => {
-                    ledger.pending.remove(&r["of"].as_u64().context("billing decision missing operation ID")?);
-                    ledger.usage.input += r["tokens"].as_u64().context("billing decision missing tokens")?;
-                    ledger.usage.cost += r["cost"].as_f64().context("billing decision missing cost")?;
-                    ledger.usage.calls += 1;
-                },
-                Some("checkpoint") if r["lane"] == "root" => {
-                    let data = eventlog::read_blob(path.parent().unwrap(), r["blob"].as_str().context("missing checkpoint blob")?)?;
-                    checkpoint = Some(serde_json::from_slice::<Value>(&data)?); frontier = seq;
-                },
-                _ => {},
-            }
-        }
+        let mut books = Books::of(&records)?;
+        books.crashed();
+        let (frontier, checkpoint) = match records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root") {
+            Some(r) => (r["seq"].as_u64().context("missing record sequence")?,
+                Some(serde_json::from_slice::<Value>(&eventlog::read_blob(path.parent().unwrap(), r["blob"].as_str().context("missing checkpoint blob")?)?)?)),
+            None => (0, None),
+        };
         let receipts: Vec<_> = records.iter().filter(|r| r["seq"].as_u64().unwrap_or(0) > frontier && matches!(r["kind"].as_str(), Some("chunk_begin" | "intent" | "outcome" | "call" | "llm" | "model_intent" | "resolution" | "uncertain" | "billing")))
             .cloned().collect();
         let mut durable = checkpoint.as_ref().map(|c| c["durable"].clone())
@@ -219,14 +200,13 @@ impl Supervisor {
         if !durable.is_object() { bail!("invalid durable checkpoint"); }
         crate::values::validate(&durable)?;
         let restored = checkpoint.map(|c| c["controller"].clone());
-        let recovery = Some(json!({"receipts": receipts, "log_directory":path.parent(), "uncertain_operations": unresolved.values().cloned().collect::<Vec<_>>(),
+        let recovery = Some(json!({"receipts": receipts, "log_directory":path.parent(), "uncertain_operations": books.open.values().cloned().collect::<Vec<_>>(),
             "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work: a resolution `unknown_local` means a sandboxed `sh` may have run, so check the workspace before repeating it. Uncertain mutations require the owner's `hx recover` decision. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them."}));
         policy.log.write("resume", json!({"format": FORMAT, "checkpoint": frontier}), true)?;
         // The registry is restored from bytes in the protected journal, never from the workspace.
         let mut registry = manifest.registry.clone();
         registry.materialize_skills(&policy.log)?;
-        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), ledger: Mutex::new(ledger),
-            unresolved: Mutex::new(unresolved), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery }))
+        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(books), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery }))
     }
 
     pub fn check(&self) -> Result<()> {
@@ -239,26 +219,14 @@ impl Supervisor {
         self.manifest.as_ref().and_then(|m| m.deadline).map(|d| std::time::Duration::from_secs_f64((d - now()).max(0.0)))
     }
 
-    pub fn authorize(&self, principal: &Principal, tool: &str, class: Class) -> Result<()> {
+    pub fn authorize(&self, principal: &Principal, tool: Tool, class: Class) -> Result<()> {
         self.check()?;
         if let Principal::Package { active, .. } = principal {
             anyhow::ensure!(active.load(Ordering::Acquire), "capability_denied: package initialization must be pure");
         }
-        let need = match tool {
-            "read" | "search" | "view" => Some(("fs", "read")),
-            "write" | "edit" => Some(("fs", "write")),
-            "sh" => Some(("proc", "sh")),
-            "agent" => Some(("llm", "agent")),
-            "mcp_list" | "mcp_call" => Some(("mcp", "call")),
-            "nd" => None,
-            "tree" => Some(("fs", "read")),
-            "promote" | "propose_module" => Some(("fs", "write")),
-            _ => bail!("unregistered effect: {tool}"),
-        };
-        if let Some((cap, scope)) = need {
-            anyhow::ensure!(principal.allows(cap, scope), "capability_denied: {} lacks {cap}.{scope} for {tool}", principal.name());
-        }
-        if class != Class::Read && !self.unresolved.lock().unwrap().is_empty() {
+        let (cap, scope) = tool.capability();
+        anyhow::ensure!(principal.allows(cap, scope), "capability_denied: {} lacks {cap}.{scope} for {}", principal.name(), tool.name());
+        if class != Class::Read && !self.books.lock().unwrap().uncertain.is_empty() {
             bail!("unknown_outcome: unresolved mutations block new mutations; inspect receipts and ask the owner to run `hx recover LOG OP --decision complete|abandon --yes`");
         }
         Ok(())
@@ -271,8 +239,8 @@ impl Supervisor {
         Ok(())
     }
 
-    pub fn intent(&self, tool: &str, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal) -> Result<u64> {
-        self.policy.log.write("intent", json!({"tool":tool, "class":class.name(), "args":args,
+    pub fn intent(&self, tool: Tool, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal) -> Result<u64> {
+        self.record("intent", json!({"tool":tool.name(), "class":class.name(), "args":args,
             "args_sha":args_sha, "depth":depth, "principal":principal.name(),
             "summary":args.to_string().chars().take(300).collect::<String>()}), true)
     }
@@ -284,14 +252,23 @@ impl Supervisor {
         Ok(())
     }
 
-    pub fn uncertain(&self, id: u64, tool: &str, args: &Value, message: &str) -> Result<()> {
-        let record = json!({"of":id, "tool":tool, "args":args, "error":message});
-        self.policy.log.write("uncertain", record.clone(), true)?;
-        self.unresolved.lock().unwrap().insert(id, record);
+    pub fn uncertain(&self, id: u64, tool: Tool, args: &Value, message: &str) -> Result<()> {
+        self.record("uncertain", json!({"of":id, "tool":tool.name(), "args":args, "error":message}), true)?;
         Ok(())
     }
 
-    pub fn uncertain_operations(&self) -> Vec<u64> { self.unresolved.lock().unwrap().keys().copied().collect() }
+    pub fn uncertain_operations(&self) -> Vec<u64> { self.books.lock().unwrap().uncertain.iter().copied().collect() }
+
+    /// Append a journal record and apply it to the books under one lock, so the live books are the journal's fold.
+    pub fn record(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
+        self.record_in(&mut self.books.lock().unwrap(), kind, fields, sync)
+    }
+
+    fn record_in(&self, books: &mut Books, kind: &str, fields: Value, sync: bool) -> Result<u64> {
+        let seq = self.policy.log.write(kind, fields.clone(), sync)?;
+        books.apply(seq, kind, &fields)?;
+        Ok(seq)
+    }
 
     /// Admit one model request. A request that only the reservations of running requests keep out waits for them to
     /// settle instead of failing; uncertain reservations never settle by themselves, so they still stop admission.
@@ -307,18 +284,17 @@ impl Supervisor {
 
     fn try_reserve_model(&self, cfg: &LlmCfg, req: &Value, depth: usize) -> Result<Option<u64>> {
         self.check()?;
-        let mut ledger = self.ledger.lock().unwrap();
+        let mut books = self.books.lock().unwrap();
         let budget = self.manifest.as_ref().map(|m| &m.budget).unwrap_or(&self.policy.budget);
-        let used = ledger.usage.input + ledger.usage.cache_write + ledger.usage.output;
-        let pending_tokens: u64 = ledger.pending.values().map(|v| v.0).sum();
-        let pending_cost: f64 = ledger.pending.values().map(|v| v.1).sum();
+        let used = books.usage.input + books.usage.cache_write + books.usage.output;
+        let (pending_tokens, pending_cost) = books.reserved();
         // This is a conservative admission allowance, not a tokenizer or provider billing guarantee.
         let bytes = serde_json::to_vec(req)?.len() as u64;
         let max_output = req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output);
         let tokens = bytes.saturating_add(max_output);
         let over_tokens = budget.max_tokens.is_some_and(|m| used.saturating_add(pending_tokens) >= m);
-        let over_cost = budget.max_cost.is_some_and(|m| ledger.usage.cost + pending_cost >= m);
-        if (over_tokens || over_cost) && !ledger.inflight.is_empty() { return Ok(None); }
+        let over_cost = budget.max_cost.is_some_and(|m| books.usage.cost + pending_cost >= m);
+        if (over_tokens || over_cost) && books.reservations.values().any(|r| r.running) { return Ok(None); }
         if over_tokens {
             self.policy.log.write("budget", json!({"reason":"budget_exceeded: token admission threshold reached","depth":depth}), true)?;
             bail!("budget_exceeded: token admission threshold reached");
@@ -331,62 +307,56 @@ impl Supervisor {
         // there is no defensible per-request dollar bound: one outstanding request reserves the remaining allowance and
         // concurrent requests queue behind it above. `bounded` says the reservation is a real bound, so a lost response
         // can be charged at it instead of waiting on the owner.
-        let remaining = budget.max_cost.map(|m| (m - ledger.usage.cost - pending_cost).max(0.0));
+        let remaining = budget.max_cost.map(|m| (m - books.usage.cost - pending_cost).max(0.0));
         let (cost, bounded) = match (remaining, &cfg.price) {
             (Some(r), Some(p)) => (p.bound(bytes, max_output).min(r), true),
             (Some(r), None) => (r, false),
             (None, _) => (0.0, true),
         };
-        let seq = self.policy.log.write("model_intent", json!({"model": cfg.model, "depth": depth,
+        let seq = self.record_in(&mut books, "model_intent", json!({"model": cfg.model, "depth": depth,
             "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens, "reserved_cost": cost, "bounded": bounded}), true)?;
-        ledger.pending.insert(seq, (tokens, cost, bounded));
-        ledger.inflight.insert(seq);
         Ok(Some(seq))
     }
 
     /// A failed request: a definite rejection releases its reservation; a possibly billed one with a bounded reservation
     /// is charged at that bound; otherwise it stays reserved as uncertain billing. Returns whether the reservation closed.
     pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, unbilled: bool, depth: usize) -> Result<bool> {
-        let bounded = self.ledger.lock().unwrap().pending.get(&op).copied().filter(|p| p.2 && !unbilled);
-        let result = self.policy.log.write("llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "billing_uncertain": !unbilled}), true)
-            .and_then(|_| bounded.map(|(tokens, cost, _)| self.policy.log.write("billing", bound_billing(op, tokens, cost), true)).transpose());
-        let mut l = self.ledger.lock().unwrap();
-        l.inflight.remove(&op);
-        let closed = result.is_ok() && (unbilled || bounded.is_some());
-        if closed { l.pending.remove(&op); }
-        if let (Ok(_), Some((tokens, cost, _))) = (&result, bounded) { l.usage.input += tokens; l.usage.cost += cost; l.usage.calls += 1; }
-        drop(l);
+        let mut books = self.books.lock().unwrap();
+        let bound = books.reservations.get(&op).copied().filter(|r| r.bounded && !unbilled);
+        let result = self.record_in(&mut books, "llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "billing_uncertain": !unbilled}), true)
+            .and_then(|_| bound.map(|r| self.record_in(&mut books, "billing", bound_billing(op, r.tokens, r.cost), true)).transpose());
+        Self::stop_running(&mut books, op);
+        drop(books);
         self.settled.notify_waiters();
-        result.map(|_| closed)
+        result.map(|_| unbilled || bound.is_some())
     }
 
     pub fn settle_model(&self, op: u64, cfg: &LlmCfg, reply: &Reply, depth: usize) -> Result<()> {
-        let written = (|| -> Result<()> {
-            let blob = self.policy.log.blob(&serde_json::to_vec(reply)?)?;
-            self.policy.log.write("llm", json!({"of": op, "model": cfg.model, "depth": depth, "reply": blob, "input": reply.input,
-                "cache_read": reply.cache_read, "cache_write": reply.cache_write, "output": reply.output, "cost": reply.cost, "finish": reply.finish}), true)?;
-            Ok(())
-        })();
-        let mut l = self.ledger.lock().unwrap();
-        l.inflight.remove(&op);
-        if written.is_ok() {
-            l.pending.remove(&op);
-            l.usage.input += reply.input; l.usage.cache_write += reply.cache_write; l.usage.cache_read += reply.cache_read;
-            l.usage.output += reply.output; l.usage.cost += reply.cost; l.usage.calls += 1;
-        }
-        drop(l);
+        let mut books = self.books.lock().unwrap();
+        let written = self.policy.log.blob(&serde_json::to_vec(reply)?).and_then(|blob| self.record_in(&mut books, "llm", json!({"of": op, "model": cfg.model,
+            "depth": depth, "reply": blob, "input": reply.input, "cache_read": reply.cache_read, "cache_write": reply.cache_write,
+            "output": reply.output, "cost": reply.cost, "finish": reply.finish}), true));
+        Self::stop_running(&mut books, op);
+        drop(books);
         self.settled.notify_waiters();
-        written
+        written.map(|_| ())
     }
 
-    pub fn usage(&self) -> Usage { self.ledger.lock().unwrap().usage.clone() }
+    /// A request whose receipt could not be journaled is no longer running but stays reserved: the journal failure is
+    /// fatal to admission, and resume treats the reservation as uncertain.
+    fn stop_running(books: &mut Books, op: u64) {
+        if let Some(r) = books.reservations.get_mut(&op) { r.running = false; }
+    }
+
+    pub fn usage(&self) -> Usage { self.books.lock().unwrap().usage.clone() }
 
     pub fn budget_status(&self) -> Value {
-        let l = self.ledger.lock().unwrap();
+        let books = self.books.lock().unwrap();
+        let (reserved_tokens, reserved_cost) = books.reserved();
         let b = self.manifest.as_ref().map(|m| &m.budget).unwrap_or(&self.policy.budget);
-        json!({"cost": l.usage.cost, "max_cost": b.max_cost, "tokens": l.usage.input + l.usage.cache_write + l.usage.output,
-            "max_tokens": b.max_tokens, "reserved_tokens": l.pending.values().map(|v| v.0).sum::<u64>(),
-            "reserved_cost": l.pending.values().map(|v| v.1).sum::<f64>(), "max_wall": b.max_wall_secs,
+        json!({"cost": books.usage.cost, "max_cost": b.max_cost, "tokens": books.usage.input + books.usage.cache_write + books.usage.output,
+            "max_tokens": b.max_tokens, "reserved_tokens": reserved_tokens,
+            "reserved_cost": reserved_cost, "max_wall": b.max_wall_secs,
             "deadline": self.manifest.as_ref().and_then(|m| m.deadline), "mode": "admission_threshold"})
     }
 }
