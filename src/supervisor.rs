@@ -332,7 +332,7 @@ impl Supervisor {
         // concurrent requests queue behind it above. `bounded` says the reservation is a real bound, so a lost response
         // can be charged at it instead of waiting on the owner.
         let remaining = budget.max_cost.map(|m| (m - ledger.usage.cost - pending_cost).max(0.0));
-        let (cost, bounded) = match (remaining, cfg.price) {
+        let (cost, bounded) = match (remaining, &cfg.price) {
             (Some(r), Some(p)) => (p.bound(bytes, max_output).min(r), true),
             (Some(r), None) => (r, false),
             (None, _) => (0.0, true),

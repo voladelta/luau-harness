@@ -27,18 +27,30 @@ pub struct LlmCfg {
 }
 
 /// USD per token (and per request), from the endpoint's model list.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Price {
-    pub input: f64,
-    pub output: f64,
+    /// the base price and each listed override (long-context and time-of-day tiers)
+    pub tiers: Vec<Tier>,
     pub request: f64,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Tier {
+    /// the tier applies from this many prompt tokens (0: always possible, e.g. a time-of-day tier)
+    pub min_prompt_tokens: u64,
+    /// the highest of the prompt and cache-write prices
+    pub input: f64,
+    pub output: f64,
+}
+
 impl Price {
-    /// An upper bound on one request's cost: every request byte billed as an input token at the higher of the prompt and
-    /// cache-write prices, plus the full output cap.
+    /// An upper bound on one request's cost: every request byte billed as an input token, plus the full output cap, at
+    /// the highest tier the request could fall in. A request has no more prompt tokens than bytes, so a tier whose
+    /// threshold exceeds the byte count cannot apply.
     pub fn bound(&self, request_bytes: u64, max_output: u64) -> f64 {
-        request_bytes as f64 * self.input + max_output as f64 * self.output + self.request
+        let (input, output) = self.tiers.iter().filter(|t| t.min_prompt_tokens <= request_bytes)
+            .fold((0.0_f64, 0.0_f64), |(i, o), t| (i.max(t.input), o.max(t.output)));
+        request_bytes as f64 * input + max_output as f64 * output + self.request
     }
 }
 
@@ -48,14 +60,53 @@ pub async fn fetch_price(cfg: &LlmCfg) -> Option<Price> {
     if cfg.api == "claude-sdk" { return None; }
     let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok()?;
-    let list: Value = http.get(format!("{base}/models")).bearer_auth(cfg.key().ok()?).send().await.ok()?
-        .error_for_status().ok()?.json().await.ok()?;
+    // OpenRouter's model list is public; send the key when there is one, for endpoints that require it.
+    let mut get = http.get(format!("{base}/models"));
+    if let Ok(key) = cfg.key() { get = get.bearer_auth(key); }
+    let list: Value = get.send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
     let model = list["data"].as_array()?.iter().find(|m| m["id"] == cfg.model.as_str())?;
-    let num = |k: &str| {
-        let v = &model["pricing"][k];
-        v.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| v.as_f64()).filter(|p| p.is_finite() && *p >= 0.0)
+    price_of(&model["pricing"])
+}
+
+/// Each tier's prices, an override inheriting what it does not list from the base. A negative price means variable: None.
+fn price_of(pricing: &Value) -> Option<Price> {
+    let num = |t: &Value, k: &str| -> Option<Option<f64>> {
+        let v = &t[k];
+        match v.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| v.as_f64()).filter(|p| p.is_finite()) {
+            Some(p) if p < 0.0 => None,
+            other => Some(other.or_else(|| { let b = &pricing[k]; b.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| b.as_f64()) })),
+        }
     };
-    Some(Price { input: num("prompt")?.max(num("input_cache_write").unwrap_or(0.0)), output: num("completion")?, request: num("request").unwrap_or(0.0) })
+    let tier = |t: &Value| -> Option<Tier> {
+        let input = [num(t, "prompt")?, num(t, "input_cache_write")?, num(t, "input_cache_write_1h")?];
+        Some(Tier { min_prompt_tokens: t["min_prompt_tokens"].as_u64().unwrap_or(0),
+            input: input[0]?.max(input[1].unwrap_or(0.0)).max(input[2].unwrap_or(0.0)), output: num(t, "completion")?? })
+    };
+    let tiers = std::iter::once(pricing).chain(pricing["overrides"].as_array().into_iter().flatten()).map(tier).collect::<Option<Vec<_>>>()?;
+    Some(Price { tiers, request: num(pricing, "request")?.unwrap_or(0.0) })
+}
+
+#[cfg(test)]
+mod price_tests {
+    use super::*;
+
+    #[test]
+    fn price_tiers_inherit_the_base_and_bound_by_reachable_tiers() {
+        let haiku = json!({"prompt": "0.0000001", "completion": "0.0000005", "input_cache_write": "0.000000125", "input_cache_write_1h": "0.0000002",
+            "overrides": [{"min_prompt_tokens": 100000, "prompt": "0.0000005", "completion": "0.0000025", "input_cache_write_1h": "0.000001"}]});
+        let p = price_of(&haiku).unwrap();
+        assert_eq!(p.tiers, vec![Tier { min_prompt_tokens: 0, input: 0.0000002, output: 0.0000005 },
+            Tier { min_prompt_tokens: 100000, input: 0.000001, output: 0.0000025 }]);
+        // a short request cannot reach the long-context tier; a long one can
+        assert!((p.bound(1000, 1000) - (1000.0 * 0.0000002 + 1000.0 * 0.0000005)).abs() < 1e-12);
+        assert!((p.bound(200000, 1000) - (200000.0 * 0.000001 + 1000.0 * 0.0000025)).abs() < 1e-12);
+        // a time-of-day tier has no threshold, so it always counts
+        let peak = price_of(&json!({"prompt": "0.000001", "completion": "0.000002", "request": "0.01",
+            "overrides": [{"utc_days": ["monday"], "prompt": "0.000002", "completion": "0.000004"}]})).unwrap();
+        assert!((peak.bound(10, 10) - (10.0 * 0.000002 + 10.0 * 0.000004 + 0.01)).abs() < 1e-12);
+        assert_eq!(price_of(&json!({"prompt": "-1", "completion": "-1"})), None);
+        assert_eq!(price_of(&json!({"prompt": "0.000001"})), None);
+    }
 }
 
 /// The provider answered but returned no usable generation. A transport loss is a plain error instead: only then is
