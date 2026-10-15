@@ -556,8 +556,8 @@ impl Vm {
                 let reason = opt_string(&opts, "reason");
                 let args = json!({"module": module, "source_sha": crate::eventlog::sha_bytes(source.as_bytes()), "reason": reason});
                 let ret = fx.run(&lua, crate::supervisor::Tool::ProposeModule, Class::LocalWrite, args, || async {
-                    Ok(match res.propose(&module, &source, &reason) {
-                        Ok(id) => Ret::Json(json!({"ok": true, "id": id, "message": format!("proposal {id} staged. It is NOT active: it must pass the eval gate and the user must run `hx upgrade accept {id}`.")})),
+                    Ok(match res.stage_module(&module, &source, &reason) {
+                        Ok(_) => Ret::Json(json!({"ok": true, "message": format!("staged a replacement for {module}. It is NOT active: the user reviews it and runs `hx accept {module}`; it applies to new runs.")})),
                         Err(e) => Ret::Json(json!({"ok": false, "message": e.to_string()})),
                     })
                 }).await?;

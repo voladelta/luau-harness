@@ -1,18 +1,18 @@
 //! Workspace trust (like `direnv allow`). Everything hx treats as user-owned config lives inside the workspace:
-//! `.harness/{policy,grants,mcp}.toml`, `.harness/init.luau`, `.harness/override/` and `hx.lock`. The model cannot
+//! `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/` and `hx.lock`. The model cannot
 //! write them, but whoever wrote the repo can, so a cloned repo could widen the sandbox, start MCP commands or
 //! pre-approve its own packages and skills. hx therefore uses that config only when the user has trusted its exact
 //! content: `hx trust` records a hash per workspace in `~/.config/hx/trust.toml` (outside every repo, protected from
 //! the model). Untrusted config is ignored as if absent; a workspace with none of these files needs no trust.
-//! `HX_TRUST=1` in hx's own environment trusts the workspace for that launch (tests, throwaway eval copies).
+//! `HX_TRUST=1` in hx's own environment trusts the workspace for that launch (tests, throwaway copies).
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Config files whose content trust covers (paths relative to the workspace), plus whole trees: module overrides and
-/// the saved versions `hx upgrade rollback` restores. (`.harness/proposals` is not covered: `hx upgrade accept` shows
-/// the diff and asks, and the agent writes proposals itself.)
-const FILES: [&str; 5] = [".harness/policy.toml", ".harness/grants.toml", ".harness/mcp.toml", ".harness/init.luau", "hx.lock"];
+/// the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
+/// asks, and the agent stages there itself.)
+const FILES: [&str; 4] = [".harness/policy.toml", ".harness/mcp.toml", ".harness/init.luau", "hx.lock"];
 const TREES: [&str; 2] = [".harness/override", ".harness/versions"];
 
 /// `$XDG_CONFIG_HOME/hx` or `~/.config/hx`.
@@ -150,7 +150,7 @@ pub fn record(ws: &Path) -> Result<Option<String>> {
     Ok(Some(h))
 }
 
-/// For commands the user runs that change the config themselves (`hx approve`, `accept`, `upgrade accept|rollback`):
+/// For commands the user runs that change the config themselves (`hx approve`, `accept`, `rollback`):
 /// keep a trusted workspace trusted, but never let them bless config the user has not trusted yet.
 pub struct Retrust {
     ws: PathBuf,

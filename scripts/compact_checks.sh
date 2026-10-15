@@ -35,7 +35,7 @@ Q() { PYTHONPATH=$T python3 -c "from q import *; $1"; }
 
 mock() { MOCK_REPLIES="$1" MOCK_LOG="$2" python3 scripts/mock_llm.py $3 & MP=$!; sleep 1; }  # replies-json log port
 unmock() { kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=""; }
-newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf 'require("std/compact").keep_recent_tokens = 40\nrequire("std/checkpoint").enabled = false\n' > $W/.harness/init.luau; }
+newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf 'require("std/compact").keep_recent_tokens = 40\nrequire("std/recheck").enabled = false\n' > $W/.harness/init.luau; }
 off() { echo 'require("std/compact").enabled = false' >> $W/.harness/init.luau; }  # the pack is on by default
 run() { # workspace port trace extra-flags...   (stdout/stderr in $T/out, $T/err; status is hx's)
   OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:$2 --key-env OPENROUTER_API_KEY \
@@ -121,7 +121,7 @@ check "6c enabled = false: no summarizer request, no summary in any request" "$(
 # ---- 6b. real-model shape: reasoning (echoed back in raw) dominates the context, and keep_recent is the default ----
 S6r=$(R 'R1 = "r" * 6000; dump(*[dict(C("t%d = %d" % (i, i), 30000 if i == 8 else 3000 * i), reasoning=R1) for i in range(1, 9)], S("SUMMARY-R"), C("print(t1)", 2000), S("done"))')
 W=$T/a6r; mkdir -p $W/.harness; echo 'require("std/compact").keep_recent_tokens = 5000' > $W/.harness/init.luau
-echo 'require("std/checkpoint").enabled = false' >> $W/.harness/init.luau
+echo 'require("std/recheck").enabled = false' >> $W/.harness/init.luau
 mock "$S6r" $T/a6r.req 8814; run $W 8814 $T/a6r.tr --pack std/compact; rc=$?; unmock
 check "6b reasoning-heavy turns: the compaction summarizes most of the history, keeping a short tail" "$rc $(field finished) $(grep -A1 '^### COMPACT$' $T/a6r.tr | tail -1 | sed -E 's/summarized ([0-9]+) messages, kept ([0-9]+),.*/\1 \2/')" "0 True 12 4"
 

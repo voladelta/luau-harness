@@ -66,7 +66,7 @@ check "tampered package refused on second require" "$($H test $W/probe --workspa
 # 6. hooks can deny, subagents run, usage aggregates (scripted model)
 W2=$T/ws2; mkdir -p $W2/.harness; echo hi > $W2/readme.txt
 cat > $W2/.harness/init.luau <<'LUA'
-require("std/checkpoint").enabled = false -- this scenario tests hooks and shared usage
+require("std/recheck").enabled = false -- this scenario tests hooks and shared usage
 require("std/hooks").on("before_run", function(p)
 	if p.code:find("rm -rf", 1, true) then return { deny = "no rm -rf here" } end
 end)
@@ -81,7 +81,7 @@ check "usage aggregated across subagent (5 llm calls)" "$(python3 -c "import jso
 # 6b. a before_finish hook can send the model back to work once
 W4=$T/ws4; mkdir -p $W4/.harness
 cat > $W4/.harness/init.luau <<'LUA'
-require("std/checkpoint").enabled = false -- isolate the custom before_finish hook
+require("std/recheck").enabled = false -- isolate the custom before_finish hook
 local hooks = require("std/hooks")
 hooks.on("before_finish", function(p)
 	if hooks.state.asked then return { action = "accept" } end
@@ -95,21 +95,21 @@ sleep 1
 OPENROUTER_API_KEY=x $H run --workspace $W4 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace4.txt > $T/rep4.json
 check "before_finish continues once" "$(python3 -c "import json;r=json.load(open('$T/rep4.json'));print(r['llm_calls'], r['final_answer'])")" "3 Checked: final answer."
 
-# 6d. checkpoint is on by default and sends the model back exactly once
+# 6d. recheck is on by default and sends the model back exactly once
 W6=$T/ws6; mkdir -p $W6
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
 MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
 sleep 1
 OPENROUTER_API_KEY=x $H run --workspace $W6 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace6.txt > $T/rep6.json
-check "default checkpoint continues once" "$(python3 -c "import json;r=json.load(open('$T/rep6.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace6.txt)" "3 Checked: final answer. 1"
+check "default recheck continues once" "$(python3 -c "import json;r=json.load(open('$T/rep6.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace6.txt)" "3 Checked: final answer. 1"
 
 W7=$T/ws7; mkdir -p $W7/.harness
-echo 'require("std/checkpoint").enabled = false' > $W7/.harness/init.luau
+echo 'require("std/recheck").enabled = false' > $W7/.harness/init.luau
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
 MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
 sleep 1
 OPENROUTER_API_KEY=x $H run --workspace $W7 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace7.txt > $T/rep7.json
-check "checkpoint opt-out accepts the first final answer" "$(python3 -c "import json;r=json.load(open('$T/rep7.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace7.txt)" "2 First answer. 0"
+check "recheck opt-out accepts the first final answer" "$(python3 -c "import json;r=json.load(open('$T/rep7.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace7.txt)" "2 First answer. 0"
 
 # 6c. Lost or malformed generations are not automatically retried (and retain reservations).
 HX_CHECK_FILTER="lost model response" python3 scripts/redesign_checks.py >/dev/null

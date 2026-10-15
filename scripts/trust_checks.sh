@@ -83,7 +83,7 @@ check "store reached through a symlinked path is still protected" "$(XDG_CONFIG_
 fresh roll; printf '[budget]\nmax_tokens = 1000000\n' > $W/.harness/policy.toml; $H trust --workspace $W --yes >/dev/null
 mkdir -p $W/.harness/versions/std__printer; echo 'return { top = function() return "[planted]" end }' > $W/.harness/versions/std__printer/0001.luau
 check "a planted saved version revokes trust" "$($H exec --workspace $W 'print(1)' 2>&1 | grep -c 'ignoring untrusted')" "1"
-$H upgrade rollback std/printer --workspace $W >/dev/null 2>&1
+$H rollback std/printer --workspace $W >/dev/null 2>&1
 check "rollback does not bless planted content" "$(x 'print({1})' | head -1 | grep -c planted)" "0"
 # HX_TRUST=1 with approve does not persist trust
 fresh envp; printf '[net]\nallow = true\n' > $W/.harness/policy.toml; mkdir -p $W/.agents/skills/k; printf -- '---\ndescription: k\n---\nk\n' > $W/.agents/skills/k/SKILL.md

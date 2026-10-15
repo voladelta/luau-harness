@@ -1,10 +1,8 @@
--- Checkpoint pack: before the first final answer is accepted, send the model back once to test the cases its fix implies.
--- Default pack (installed by std/loop; off with `require("std/checkpoint").enabled = false` in .harness/init.luau); it
--- costs extra turns on every run. On Terminal-Bench 4.0 mvcc-lsm-compaction (Sonnet 5.5, medium) it lifted the solved rate from
--- 1/20 to 13/20; the wording below is the one that was measured, so change it only with a new measurement.
+-- Recheck pack: before the first final answer is accepted, send the model back once to test the cases its fix implies.
+-- Default pack (installed by std/loop; off with `require("std/recheck").enabled = false` in .harness/init.luau); it
+-- costs extra turns on every run. The wording below was tuned against measured runs, so change it with care.
 -- The pack also puts a heads-up in the system prompt's Finishing section, so the first answer is planned to meet the
--- check: with it, Opus 5.5 low solved mvcc 5/5 pre-registered (6/7 with the pilot and a later check run), where the
--- check alone never got Opus to a solve.
+-- check instead of being sent back.
 local M = {}
 
 M.enabled = true

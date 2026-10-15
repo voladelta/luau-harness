@@ -12,7 +12,7 @@ MOCK_REPLIES='["```luau\nprint(7)\n```","all done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/r
 sleep 1; echo go > $T/p.txt
 for api in openai responses; do
   W=$T/$api; mkdir -p $W/.harness; : > $T/req.log
-  echo 'require("std/checkpoint").enabled = false' > $W/.harness/init.luau
+  echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
   out=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --api $api --base-url http://127.0.0.1:8795/openrouter --key-env K 2>&1 | tail -1)
   check "$api: run finishes with the model's answer" "$(python3 -c "import sys,json;r=json.loads(sys.argv[1]);print(r['finished'], r['final_answer'], r['turns'])" "$out" 2>/dev/null)" "True all done 2"
   check "$api: request carries no provider restriction" "$(grep -c '"provider"' $T/req.log | tr -d ' ')" "0"
@@ -20,7 +20,7 @@ done
 # --- caching: markers per API, cache key, provider pin
 runq() { # api model extra... -> request log of one run
   local api=$1 model=$2; shift 2; W=$T/c-$RANDOM; mkdir -p $W/.harness; : > $T/req.log
-  echo 'require("std/checkpoint").enabled = false' > $W/.harness/init.luau
+  echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
   K=x $H run --workspace $W --prompt-file $T/p.txt --model $model --api $api --base-url http://127.0.0.1:8795 --key-env K "$@" >/dev/null 2>&1
 }
 has() { grep -c "$1" $T/req.log | tr -d ' ' | sed 's/^0$/no/; s/^[1-9][0-9]*$/yes/'; }
@@ -34,7 +34,7 @@ check "unknown api is refused" "$(K=x $H run --workspace $T/openai --prompt-file
 mockrun() { # replies-json api -> "finished|final_answer|turns|code_turns|truncated_turns"
   MOCK_REPLIES="$1" MOCK_BY_LEN=1 MOCK_LOG=$T/tool.log python3 scripts/mock_llm.py 8796 & local m=$!; sleep 1; : > $T/tool.log
   W=$T/m-$RANDOM; mkdir -p $W/.harness
-  echo 'require("std/checkpoint").enabled = false' > $W/.harness/init.luau
+  echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
   local o; o=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --api ${2:-openai} --base-url http://127.0.0.1:8796 --key-env K 2>&1 | tail -1)
   kill $m 2>/dev/null; wait $m 2>/dev/null
   python3 -c "import sys,json;r=json.loads(sys.argv[1]);print('|'.join(str(r[k]) for k in ('finished','final_answer','turns','code_turns','truncated_turns')))" "$o" 2>/dev/null

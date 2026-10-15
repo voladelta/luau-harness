@@ -98,7 +98,7 @@ impl Controller {
         if registry.sources.contains_key("project/init") { require.call::<Table>("project/init")?; }
         // Controller packs are trusted pure std modules. Agent-facing packs are installed in the agent VM instead.
         for name in packs {
-            if matches!(name.as_str(), "std/packages" | "std/mcp" | "std/authoring" | "std/vision" | "std/checkpoint" | "std/compact") { continue; }
+            if matches!(name.as_str(), "std/packages" | "std/mcp" | "std/authoring" | "std/vision" | "std/recheck" | "std/compact") { continue; }
             let module: Table = require.call(name.as_str())?;
             if let Ok(install) = module.get::<Function>("install") {
                 let ctx = lua.create_table()?; ctx.set("hooks", require.call::<Table>("std/hooks")?)?;

@@ -1,1 +1,0 @@
-Before you start, recall how mature systems or libraries that solve the same problem handle it, and which edge cases they are known to have gotten wrong. Use what you recall to guide your investigation and the cases you test.

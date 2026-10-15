@@ -1,7 +1,0 @@
-Before you change files, write a short plan:
-1. Requirements: list each requirement that the task states. For each one, write the check that will show it is met. The check must fail on a wrong result, not only on a crash.
-2. Assumptions: list separately each thing you assume that the task does not state.
-3. Key decision: find the one decision that the other work depends on. Write two or three ways to decide it, choose one, and give the reason.
-Then change the code for one requirement, run its check, and continue with the next requirement.
-
-Before you give your final answer: state the root cause you fixed in one sentence, then list the other situations where that same cause could fire beyond the reported one (other inputs, orderings, repeats, sizes and edge values). Write a deterministic test for each, run all the checks, and fix the code if any of them fail. Then re-read the task and confirm that every requirement it states still holds; fix anything that no longer does.
