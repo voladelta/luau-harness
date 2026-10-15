@@ -9,6 +9,11 @@ mod policy;
 mod prims;
 mod trust;
 mod vm;
+mod supervisor;
+mod controller;
+mod values;
+mod packages;
+mod batch;
 
 use anyhow::{bail, Result};
 use std::io::IsTerminal;
@@ -28,6 +33,8 @@ USAGE:
 COMMANDS:
     exec         run Luau chunks in one session (no API key needed)
     run          run an agent task
+    recover      record an owner's decision about an uncertain operation
+    revoke       stop admitting operations for a run
     test         run a package's tests/*.luau
     approve      lock a project package or skill and grant the capabilities it requests
     skills       list skills in .agents/skills and ~/.agents/skills and whether each is approved
@@ -60,7 +67,9 @@ ENVIRONMENT:
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\nFLAGS:\n    --prompt-file F    task text (not needed with --resume of a log that recorded its task)\n    --model M          model id (or HX_MODEL)\n    --api A            openai (Chat Completions, default) | responses (Responses API) | claude-sdk (the `claude` CLI, uses your Claude plan; --model haiku|sonnet|opus) (or HX_API)\n    --base-url U       API base URL (or HX_BASE_URL)\n    --key-env E        env var holding the API key\n    --reasoning R      reasoning effort\n    --max-output N     max output tokens (default 16384)\n    --context-window N the model's context window in tokens (used by the std/compact pack)\n    --provider-only A,B  OpenRouter (--api openai): route only to these providers, no fallbacks\n    --max-turns N      turn limit (default 200; the report says stopped=max_turns when it is hit)\n    --max-cost X --max-tokens N --max-wall SECS   budgets\n    --trace FILE       write a trace\n    --pack A,B         extra packs\n    --resume LOG       resume from an event log\n\nPrints a JSON report on stdout.\n\nExample:\n    hx run --prompt-file task.md --model claude-sonnet-5-5\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
+        "recover" => "hx recover LOG OP --decision complete|abandon|retry [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nRetry permits only a new operation matching the original tool and argument hash, linked to the old ID.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
+        "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
         "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
@@ -170,6 +179,8 @@ async fn real_main() -> Result<()> {
         std::process::exit(2);
     }
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
+    anyhow::ensure!(!has(&args, "--resume") || args[0] == "run", "--resume is supported only by hx run");
+    anyhow::ensure!(!has(&args, "--branch") || args[0] == "run", "--branch is supported only by hx run");
     // The sandbox, path policy and approval gate are ON by default; `--yolo` is an explicit opt-out (and says so on stderr).
     let sandbox = !has(&args, "--yolo");
     if !sandbox {
@@ -186,6 +197,14 @@ async fn real_main() -> Result<()> {
             trust::warn_if_untrusted(&workspace);
             cmd_run(&args, workspace.clone(), mk_policy()?).await
         }
+        "recover" => cmd_recover(&args),
+        "revoke" => {
+            let path = PathBuf::from(args.get(1).ok_or_else(|| usage("usage: hx revoke LOG"))?);
+            anyhow::ensure!(path.is_file(), "run log does not exist");
+            std::fs::write(path.with_extension("revoked"), "revoked by owner\n")?;
+            println!("revoked {}", path.display());
+            Ok(())
+        },
         "test" => cmd_test(&args, &workspace, mk_policy()?).await,
         "approve" => cmd_approve(&args, &workspace),
         "trust" => cmd_trust(&args, &workspace),
@@ -231,7 +250,7 @@ fn exec_chunks(args: &[String]) -> Vec<&str> {
 
 /// hx exec --workspace DIR 'chunk1' 'chunk2' : run chunks in one session (no API key needed; used for testing)
 async fn cmd_exec(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
-    let vm = vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None, None)?;
+    let vm = vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?;
     let mut packs = vec!["std/packages".to_string(), "std/mcp".to_string()];
     packs.extend(list_arg(args, "--pack"));
     vm.install_packs(&packs).await?;
@@ -258,21 +277,78 @@ fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
 
 /// hx run --workspace DIR --prompt-file F --model M [--api openai --base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
 async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy>) -> Result<()> {
-    let replay = arg(args, "--resume").map(|p| effects::load_replay(Path::new(&p))).transpose()?;
-    let task = match (replay.as_ref().and_then(|r| r.task.clone()), arg(args, "--prompt-file")) {
-        (Some(t), _) => t,
-        (None, Some(f)) => std::fs::read_to_string(f)?,
-        (None, None) => bail!("--prompt-file required (or --resume LOG for a log that recorded its task)"),
+    let _ = workspace;
+    let trace = arg(args, "--trace").map(PathBuf::from);
+    let host = if has(args, "--resume") {
+        for flag in ["--branch", "--prompt-file", "--model", "--api", "--base-url", "--key-env", "--reasoning", "--max-output", "--context-window", "--provider-only", "--max-turns", "--max-cost", "--max-tokens", "--max-wall", "--pack", "--yolo", "--net", "--no-net", "--approval"] {
+            anyhow::ensure!(!has(args, flag), "{flag} cannot override a resumed manifest; use --branch LOG for a new configuration");
+        }
+        host::Host::resume(policy, trace)?
+    } else {
+        let inherited = arg(args, "--branch").map(|path| -> Result<_> {
+            let journal = eventlog::EventLog::reopen(Path::new(&path))?;
+            let manifest = supervisor::Manifest::inspect(Path::new(&path))?;
+            let recovery = eventlog::verify(Path::new(&path))?;
+            anyhow::ensure!(recovery.unknown.is_empty() && recovery.unknown_models.is_empty(), "reconcile uncertain operations and model billing before branching");
+            let records = eventlog::load(Path::new(&path))?;
+            let state = records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
+                .map(|r| eventlog::read_blob(Path::new(&path).parent().unwrap(), r["blob"].as_str().unwrap())).transpose()?
+                .map(|b| serde_json::from_slice::<serde_json::Value>(&b)).transpose()?;
+            Ok((journal, manifest, state))
+        }).transpose()?;
+        let task = match arg(args, "--prompt-file") {
+            Some(path) => std::fs::read_to_string(path)?,
+            None => inherited.as_ref().map(|(_, m, _)| m.task.clone()).ok_or_else(|| usage("--prompt-file required for a new run"))?,
+        };
+        let cfg = llm_cfg(args, policy.log.session.clone())?;
+        let max_turns = parsed(args, "--max-turns")?.unwrap_or(200);
+        let budget = policy::Budget { max_cost: parsed(args, "--max-cost")?, max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
+        let branch = inherited.as_ref().map(|(parent, manifest, state)| supervisor::Branch {
+            parent: parent.path.clone().unwrap(),
+            durable: state.as_ref().map(|s| s["durable"].clone())
+                .or_else(|| manifest.branch.as_ref().map(|b| b.durable.clone())).unwrap_or_else(|| serde_json::json!({})),
+        });
+        let host = host::Host::start(cfg, policy, task, max_turns, trace, budget, list_arg(args, "--pack"), branch)?;
+        if let Some((parent, _, _)) = inherited {
+            host.policy.log.write("branch", serde_json::json!({"parent":parent.path}), true)?;
+        }
+        host
     };
-    let cfg = llm_cfg(args, policy.log.session.clone())?;
-    let max_turns = parsed(args, "--max-turns")?.unwrap_or(200);
-    let budget = policy::Budget { max_cost: parsed(args, "--max-cost")?, max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
-    let host = host::Host::new(cfg, workspace, policy, max_turns, arg(args, "--trace").map(PathBuf::from), budget, list_arg(args, "--pack"))?;
-    if let Some(r) = replay {
-        host.set_replay(r);
-    }
+    let task = host.supervisor.manifest.as_ref().unwrap().task.clone();
+    let max_turns = host.max_turns;
     let report = host.run_task(task, max_turns).await?;
     println!("{}", serde_json::to_string(&report)?);
+    Ok(())
+}
+
+fn cmd_recover(args: &[String]) -> Result<()> {
+    let path = Path::new(args.get(1).ok_or_else(|| usage("usage: hx recover LOG OP --decision complete|abandon|retry"))?);
+    let id: u64 = args.get(2).ok_or_else(|| usage("missing operation ID"))?.parse()?;
+    let decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?;
+    anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon" | "retry" | "billing"), "decision must be complete, abandon, retry or billing");
+    let log = eventlog::EventLog::reconcile(path)?;
+    let records = eventlog::load(path)?;
+    if decision == "billing" {
+        anyhow::ensure!(records.iter().any(|r| r["seq"] == id && r["kind"] == "model_intent"), "not a model operation ID");
+        anyhow::ensure!(!records.iter().any(|r| r["of"] == id && (r["kind"] == "billing" || (r["kind"] == "llm" && r.get("error").is_none()))), "model operation already settled");
+        let tokens: u64 = parsed(args, "--tokens")?.ok_or_else(|| usage("billing requires --tokens"))?;
+        let cost: f64 = parsed(args, "--cost")?.ok_or_else(|| usage("billing requires --cost"))?;
+        anyhow::ensure!(cost.is_finite() && cost >= 0.0, "billing cost must be finite and nonnegative");
+        if !has(args, "--yes") { confirm(&format!("Assert {tokens} tokens and ${cost} of usage for uncertain generation {id}?"))?; }
+        log.write("billing", serde_json::json!({"of":id,"tokens":tokens,"cost":cost,"source":"owner"}), true)?;
+        println!("recorded billing for {id}; no request was dispatched");
+        return Ok(());
+    }
+    let intent = records.iter().find(|r| r["seq"] == id && r["kind"] == "intent").ok_or_else(|| usage("not a mutating operation ID"))?;
+    anyhow::ensure!(!records.iter().any(|r| r["kind"] == "outcome" && r["of"] == id), "operation already has an outcome");
+    if let Some(previous) = records.iter().rev().find(|r| r["kind"] == "resolution" && r["of"] == id) {
+        anyhow::ensure!(previous["decision"] == "retry" && decision != "retry"
+            && !records.iter().any(|r| r["kind"] == "intent" && r["retry_of"] == id),
+            "operation already resolved; only an undispatched retry can be completed or abandoned");
+    }
+    if !has(args, "--yes") { confirm(&format!("Record {decision} for operation {id}? This is your assertion about its external state."))?; }
+    log.write("resolution", serde_json::json!({"of":id, "decision":decision, "tool":intent["tool"], "args_sha":intent["args_sha"]}), true)?;
+    println!("recorded {decision} for {id}; no operation was executed");
     Ok(())
 }
 
@@ -289,7 +365,7 @@ async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>
     {
         let _ = modules::TEST_PKG.set((name, dir.clone()));
     }
-    let vm = vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None, None)?;
+    let vm = vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?;
     let (pass, fail, report) = vm.run_tests(&dir).await?;
     print!("{report}");
     println!("{pass} passed, {fail} failed");
@@ -395,10 +471,11 @@ fn cmd_log_verify(args: &[String]) -> Result<()> {
     for (seq, tool, summary) in &r.unknown {
         println!("UNKNOWN OUTCOME: #{seq} {tool}: {summary}");
     }
+    for seq in &r.unknown_models { println!("UNKNOWN BILLING: #{seq} model request"); }
     if !r.chain_ok {
         std::process::exit(1);
     }
-    if !r.unknown.is_empty() {
+    if !r.unknown.is_empty() || !r.unknown_models.is_empty() {
         std::process::exit(3);
     }
     Ok(())

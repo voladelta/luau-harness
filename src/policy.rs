@@ -46,7 +46,7 @@ struct PacksSection {
 
 /// Limits for one run, shared with every subagent. None = unlimited. Cost needs a provider that reports it
 /// (OpenRouter, Enclave); tokens (input + cache writes + output) work everywhere.
-#[derive(Deserialize, Default, Clone, Debug)]
+#[derive(Deserialize, serde::Serialize, Default, Clone, Debug, PartialEq)]
 pub struct Budget {
     pub max_cost: Option<f64>,
     pub max_tokens: Option<u64>,
@@ -88,6 +88,23 @@ pub struct Policy {
     pub log: Arc<EventLog>,
     ask: Vec<String>,
     allow: Vec<String>,
+    pub mode: String,
+    pub budget: Budget,
+    pub packs: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+pub struct Snapshot {
+    pub enabled: bool,
+    pub workspace: PathBuf,
+    pub tmp: PathBuf,
+    pub read_roots: Vec<PathBuf>,
+    pub write_roots: Vec<PathBuf>,
+    pub protected: Vec<PathBuf>,
+    pub net: bool,
+    pub gpu: bool,
+    pub ask: Vec<String>,
+    pub allow: Vec<String>,
     pub mode: String,
     pub budget: Budget,
     pub packs: Vec<String>,
@@ -156,12 +173,30 @@ impl Policy {
     /// `hx.lock`, the trust store) stay read-only to the model, so a yolo run cannot rewrite config later runs apply.
     pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<String>, resume: Option<&Path>, net: Option<bool>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
-        // a resumed run reuses the logged scratch path: replayed output that printed it must match byte for byte, or the
-        // replay diverges (the directory itself starts empty again; its files are not part of the replay)
-        let tmp = match resume.and_then(logged_tmp) {
-            Some(t) => t,
-            None => std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos())),
-        };
+        if let Some(path) = resume {
+            // Lock before reading any recovery state or repairing the log. Mutable workspace configuration is never
+            // consulted for a resumed run: the exact authority approved at launch is part of its manifest.
+            let log = EventLog::reopen(path)?;
+            let manifest = crate::supervisor::Manifest::load(path)?;
+            anyhow::ensure!(manifest.policy.workspace == workspace, "resume workspace differs from the saved run");
+            let s = manifest.policy;
+            validate_scratch(&s.tmp)?;
+            std::fs::create_dir_all(&s.tmp)?;
+            let mut p = Policy { enabled: s.enabled, workspace: s.workspace, tmp: s.tmp, read_roots: s.read_roots,
+                write_roots: s.write_roots, protected: s.protected, net: s.net, gpu: s.gpu, log,
+                ask: s.ask, allow: s.allow, mode: s.mode, budget: s.budget, packs: s.packs };
+            // A journal may have been moved since launch. Its actual files and artifacts remain model-read-only.
+            let actual = std::fs::canonicalize(path)?;
+            p.protected.extend([actual.clone(), actual.with_extension("lock"), actual.with_extension("revoked"),
+                actual.parent().unwrap().join("blobs"), actual.parent().unwrap().join("registry")]);
+            // Newly introduced aliases must not turn frozen protected paths into writable paths.
+            let aliases: Vec<_> = p.protected.iter().filter_map(canon).collect();
+            p.protected.extend(aliases);
+            p.log.check()?;
+            return Ok(p);
+        }
+        let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
+        let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
         let mut p = Policy { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], net: false, gpu: false, log: EventLog::off(), ask: vec![], allow: vec![], mode: "deny".into(), budget: Budget::default(), packs: vec![] };
@@ -178,6 +213,10 @@ impl Policy {
         if let Some(d) = crate::trust::store_dir_canonical() {
             p.protected.push(d);
         }
+        // check_write resolves aliases before comparing. Protect the resolved configuration too, including an
+        // untrusted workspace's symlinked .harness or hx.lock and --yolo runs without root confinement.
+        let canonical_protected: Vec<_> = p.protected.iter().filter_map(canon).collect();
+        p.protected.extend(canonical_protected);
         let trusted = crate::trust::is_trusted(&workspace);
         if let Some(t) = std::fs::read_to_string(workspace.join(".harness/policy.toml")).ok().filter(|_| trusted) {
             let f: PolicyFile = toml::from_str(&t).map_err(|e| anyhow::anyhow!("bad .harness/policy.toml: {e}"))?;
@@ -208,19 +247,19 @@ impl Policy {
             }
         }
         // The audit log is independent of the sandbox: `--yolo` drops confinement, not the record of what ran.
-        match resume {
-            Some(path) => {
-                p.log = EventLog::reopen(path)?;
-                p.log.write("resume", json!({"sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
-            }
-            None => {
-                p.log = EventLog::open(&workspace.join(".harness/log"))?;
-                p.log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "sandbox": enabled, "net": p.net, "approval_mode": p.mode}), true);
-            }
-        }
+        p.log = EventLog::open(&workspace.join(".harness/log"))?;
+        p.log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "sandbox": enabled,
+            "net": p.net, "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
         Ok(p)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot { enabled: self.enabled, workspace: self.workspace.clone(), tmp: self.tmp.clone(),
+            read_roots: self.read_roots.clone(), write_roots: self.write_roots.clone(), protected: self.protected.clone(),
+            net: self.net, gpu: self.gpu, ask: self.ask.clone(), allow: self.allow.clone(), mode: self.mode.clone(),
+            budget: self.budget.clone(), packs: self.packs.clone() }
     }
 
     /// Effect class of a shell command.
@@ -388,40 +427,25 @@ impl Policy {
     }
 }
 
-/// The scratch directory a logged session used: the `tmp` field of its `session` record, or, for logs written before
-/// that field existed, the first `<temp dir>/hx-<pid>-<nanos>` path that appears in the log.
-fn logged_tmp(log: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(log).ok()?;
-    for line in text.lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if v["kind"] == "session" {
-                if let Some(t) = v["tmp"].as_str() {
-                    return Some(PathBuf::from(t));
-                }
-                break;
-            }
-        }
+/// A logged path is not authority to remove arbitrary directories on shutdown. Scratch paths must be direct,
+/// non-symlink children of this user's system temp directory with the exact name generated by Policy::new.
+fn validate_scratch(path: &Path) -> Result<()> {
+    let base = std::fs::canonicalize(std::env::temp_dir())?;
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let valid_name = name.strip_prefix("hx-").and_then(|s| s.split_once('-')).is_some_and(|(pid, nanos)| {
+        !pid.is_empty() && !nanos.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && nanos.bytes().all(|b| b.is_ascii_digit())
+            && pid.parse::<u32>().is_ok_and(|p| p > 0) && nanos.parse::<u32>().is_ok_and(|n| n < 1_000_000_000)
+    });
+    anyhow::ensure!(valid_name && path.parent() == Some(base.as_path()), "invalid recorded scratch directory: {}", path.display());
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        anyhow::ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "invalid recorded scratch directory: {}", path.display());
     }
-    let base = std::fs::canonicalize(std::env::temp_dir()).ok()?.join("hx-");
-    let base = base.to_string_lossy();
-    let mut rest = text.as_str();
-    while let Some(i) = rest.find(base.as_ref()) {
-        let tail = &rest[i + base.len()..];
-        let n: usize = tail.char_indices().find(|(_, c)| !(c.is_ascii_digit() || *c == '-')).map(|(i, _)| i).unwrap_or(tail.len());
-        let id = &tail[..n];
-        if let Some((pid, nanos)) = id.split_once('-') {
-            if !pid.is_empty() && !nanos.is_empty() && !nanos.contains('-') {
-                return Some(PathBuf::from(format!("{base}{id}")));
-            }
-        }
-        rest = &rest[i + base.len()..];
-    }
-    None
+    Ok(())
 }
 
 impl Drop for Policy {
     fn drop(&mut self) {
-        self.log.write("session_end", json!({}), true);
+        let _ = self.log.write("session_end", json!({}), true);
         let _ = std::fs::remove_dir_all(&self.tmp);
     }
 }
@@ -460,6 +484,37 @@ fn toolchain_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_cannot_adopt_and_delete_an_unrelated_scratch_directory() {
+        let dir = std::env::temp_dir().join(format!("hx-policy-scratch-test-{}", std::process::id()));
+        let victim = dir.join("unrelated");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("sentinel"), "KEEP").unwrap();
+        let log = EventLog::open(&dir.join("log")).unwrap();
+        log.write("session", json!({"workspace": dir, "tmp": victim}), true).unwrap();
+        let result = Policy::new(&dir, true, None, log.path.as_deref(), None);
+        let accepted = result.is_ok();
+        drop(result);
+        assert!(victim.join("sentinel").exists(), "Policy::drop deleted unrelated data");
+        assert!(!accepted, "an arbitrary logged path is not an owned scratch directory");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scratch_validation_rejects_symlinks_nested_and_invalid_names() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let scratch = base.join(format!("hx-{}-999999999", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(validate_scratch(&scratch).is_ok());
+        for invalid in [scratch.join("child"), base.join("hx-0-1"), base.join("hx-1-1000000000"), base.join("hx-1-1-extra"), PathBuf::from("hx-1-1")] {
+            assert!(validate_scratch(&invalid).is_err(), "{}", invalid.display());
+        }
+        std::fs::remove_dir(&scratch).unwrap();
+        std::os::unix::fs::symlink(&base, &scratch).unwrap();
+        assert!(validate_scratch(&scratch).is_err());
+        std::fs::remove_file(scratch).unwrap();
+    }
 
     #[test]
     fn normalize_resolves_dots_lexically() {

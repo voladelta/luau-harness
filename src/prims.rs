@@ -1,5 +1,5 @@
-//! Native primitives: read, write, edit, sh, search (+ the non-determinism recorder). Every effect goes through
-//! `Effects` (live or replayed) and every path through `Policy`; `sh` runs under Seatbelt.
+//! Native primitives: read, write, edit, sh and search. Every effect goes through
+//! `Effects` and every path through `Policy`; `sh` runs under Seatbelt.
 use crate::effects::{rt, Effects, Ret};
 use crate::policy::Class;
 use anyhow::Result;
@@ -36,13 +36,13 @@ fn opt_bool(o: &Option<Table>, k: &str) -> bool {
     o.as_ref().and_then(|t| t.get::<Option<bool>>(k).ok().flatten()).unwrap_or(false)
 }
 pub fn bad(r: Ret) -> mlua::Error {
-    rt(format!("replay: unexpected recorded result {r:?}"))
+    rt(format!("unexpected native result {r:?}"))
 }
 
-/// A recorded `Ret::Json` as a Lua value (anything else is a replay mismatch).
+/// Copy a structured native result into Lua data.
 pub fn json_value(lua: &Lua, r: Ret) -> mlua::Result<Value> {
     match r {
-        Ret::Json(v) => mlua::LuaSerdeExt::to_value(lua, &v),
+        Ret::Json(v) => crate::values::copy_in(lua, &v),
         r => Err(bad(r)),
     }
 }
@@ -72,23 +72,6 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
     // tmpdir() -> the run's private scratch directory (writable; the only writable place besides the project).
     let tmp = pol.tmp.to_string_lossy().to_string();
     g.set("tmpdir", lua.create_function(move |_, ()| Ok(tmp.clone()))?)?;
-
-    // __nd_value(kind, live) -> the recorded value on replay, else `live` (recorded). Wraps os.time/clock/date/math.random.
-    let f = fx.clone();
-    g.set("__nd_value", lua.create_function(move |lua, (kind, live): (String, Value)| {
-        let r = match &live {
-            Value::Number(n) => Ret::Num(*n),
-            Value::Integer(i) => Ret::Num(*i as f64),
-            Value::String(s) => Ret::Str(s.to_string_lossy().to_string()),
-            _ => Ret::Nil,
-        };
-        match f.sync(lua, "nd", Class::Read, json!({"kind": kind}), || Ok(r))? {
-            Ret::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => Ok(Value::Integer(n as i64)),
-            Ret::Num(n) => Ok(Value::Number(n)),
-            Ret::Str(s) => Ok(Value::String(lua.create_string(&s)?)),
-            _ => Ok(Value::Nil),
-        }
-    })?)?;
 
     // read(path, {offset=1, limit=n}) -> string. offset/limit are in lines.
     let (f, o) = (fx.clone(), ops.clone());
@@ -185,7 +168,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             o.fetch_add(1, Ordering::Relaxed);
             let pol = f.pol.clone();
             let class = pol.classify_sh(&cmd);
-            let args = json!({"cmd": cmd.chars().take(2000).collect::<String>(), "cwd": opt_str(&opts, "cwd"), "timeout": opt_num(&opts, "timeout")});
+            let args = json!({"cmd": &cmd, "cwd": opt_str(&opts, "cwd"), "timeout": opt_num(&opts, "timeout")});
             let ret = f.run(&lua, "sh", class, args, || async {
                 if let Err(why) = pol.approve(&cmd, class).await {
                     return Err(rt(format!("approval_required: {why}")));
@@ -398,6 +381,34 @@ fn user_process_count() -> u64 {
 
 /// Kills the whole process group of an `sh` command when dropped.
 struct GroupKill(i32);
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shell_receipt_identity_includes_the_command_after_character_2000() {
+        let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None).unwrap());
+        let path = pol.log.path.clone().unwrap();
+        let prefix = format!(": #{}\n", "x".repeat(2100));
+        let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));
+        let changed = format!("print(sh({:?}).code)", format!("{prefix}echo changed"));
+        let vm = crate::vm::Vm::new(pol.clone(), Duration::from_secs(5), 32 << 20, None).unwrap();
+        let control = vm.session.run(&original).await;
+        assert!(control.error.is_none(), "{:?}", control.error);
+        assert_eq!(control.output, "0\n", "the control shell command must actually execute successfully");
+        let result = vm.session.run(&changed).await;
+        assert!(result.error.is_none());
+        let records = crate::eventlog::load(&path).unwrap();
+        let intents: Vec<_> = records.iter().filter(|r| r["kind"] == "intent" && r["tool"] == "sh").collect();
+        assert_eq!(intents.len(), 2);
+        assert_ne!(intents[0]["args_sha"], intents[1]["args_sha"], "full command suffix participates in operation identity");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 impl Drop for GroupKill {
     fn drop(&mut self) {
         unsafe { libc::killpg(self.0, libc::SIGKILL) };

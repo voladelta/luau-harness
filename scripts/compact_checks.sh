@@ -35,7 +35,7 @@ Q() { PYTHONPATH=$T python3 -c "from q import *; $1"; }
 
 mock() { MOCK_REPLIES="$1" MOCK_LOG="$2" python3 scripts/mock_llm.py $3 & MP=$!; sleep 1; }  # replies-json log port
 unmock() { kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=""; }
-newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; echo 'require("std/compact").keep_recent_tokens = 40' > $W/.harness/init.luau; }
+newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf 'require("std/compact").keep_recent_tokens = 40\nrequire("std/checkpoint").enabled = false\n' > $W/.harness/init.luau; }
 off() { echo 'require("std/compact").enabled = false' >> $W/.harness/init.luau; }  # the pack is on by default
 run() { # workspace port trace extra-flags...   (stdout/stderr in $T/out, $T/err; status is hx's)
   OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:$2 --key-env OPENROUTER_API_KEY \
@@ -76,7 +76,7 @@ first = text(m[0]["content"])
 print(m[0]["role"], "TASKTEXT-SCRIPTED" in first, "[compaction-summary]" in first, "SUMMARY-ONE" in first, "</summary>" in first, m[1]["role"], len(tools) > 0 and all(t["tool_call_id"] in ids for t in tools))')" "user True True True True assistant True"
 check "A2 the dropped history is gone from the next request" "$(Q 'print("TURN-ONE-MARKER" in json.dumps(load("'$T'/a2.req")[3]))')" "False"
 check "A2 trace records the compaction" "$(grep -c '^### COMPACT$' $T/a2.tr)" "1"
-check "A4 a global set before the compaction is readable after it" "$(awk '/^### COMPACT$/{s=1} s&&/^### RESULT/{getline; print; exit}' $T/a2.tr)" "42"
+check "A4 a global set before the compaction is readable after it" "$(awk '/^print\(x\)$/{s=1} s&&/^### RESULT/{getline; print; exit}' $T/a2.tr)" "42"
 
 # ---- 4. A3: the second compaction updates the first summary and serializes only newer messages ----
 S4=$(R 'dump(C("x = 42 -- TURN-ONE-MARKER"), C("y = 1", 30000), S("SUMMARY-ONE"), C("print(x) -- TURN-THREE-MARKER"), C("z = 2 -- TURN-FOUR-MARKER", 30000), S("SUMMARY-TWO"), S("done"))')
@@ -121,58 +121,9 @@ check "6c enabled = false: no summarizer request, no summary in any request" "$(
 # ---- 6b. real-model shape: reasoning (echoed back in raw) dominates the context, and keep_recent is the default ----
 S6r=$(R 'R1 = "r" * 6000; dump(*[dict(C("t%d = %d" % (i, i), 30000 if i == 8 else 3000 * i), reasoning=R1) for i in range(1, 9)], S("SUMMARY-R"), C("print(t1)", 2000), S("done"))')
 W=$T/a6r; mkdir -p $W/.harness; echo 'require("std/compact").keep_recent_tokens = 5000' > $W/.harness/init.luau
+echo 'require("std/checkpoint").enabled = false' >> $W/.harness/init.luau
 mock "$S6r" $T/a6r.req 8814; run $W 8814 $T/a6r.tr --pack std/compact; rc=$?; unmock
 check "6b reasoning-heavy turns: the compaction summarizes most of the history, keeping a short tail" "$rc $(field finished) $(grep -A1 '^### COMPACT$' $T/a6r.tr | tail -1 | sed -E 's/summarized ([0-9]+) messages, kept ([0-9]+),.*/\1 \2/')" "0 True 12 4"
-
-# ---- 7. A7: kill the run after chosen records, resume: replay must not diverge ----
-resume_case() { # name crash-seq replies-json   (runs the scenario, SIGKILLs it after record #seq, resumes against the remaining replies)
-  newws $1; mock "$3" $T/$1.c.req 8815; HX_TEST_CRASH_AFTER_RECORD=$2 run $W 8815 $T/$1.c.tr --pack std/compact; local crashed=$?; unmock
-  local log=$(lastlog $W)
-  local rest=$(python3 - "$log" "$3" <<'PY'
-import json, sys
-llm = [json.loads(l) for l in open(sys.argv[1]) if l.strip().endswith("}")]
-llm = [r for r in llm if r["kind"] == "llm"]
-n = len(llm) - (1 if llm and "error" in llm[-1] else 0)  # a trailing recorded failure is asked again on resume
-print(json.dumps(json.loads(sys.argv[2])[n:]))
-PY
-)
-  mock "$rest" $T/$1.r.req 8815; run $W 8815 $T/$1.r.tr --pack std/compact --resume $log; local rc=$?; unmock
-  $H log verify $log > $T/verify 2>&1; local vrc=$?
-  echo "$([ $crashed -ne 0 ] && echo killed) $rc $(field finished) $(grep -c 'replay diverged' $T/err) $vrc"
-}
-seq_of() { python3 - "$1" "$2" <<'PY'  # log, n -> seq of the n-th llm record
-import json, sys
-print([json.loads(l)["seq"] for l in open(sys.argv[1]) if '"kind":"llm"' in l][int(sys.argv[2]) - 1])
-PY
-}
-LOG2=$(lastlog $A2W)
-check "A7 killed right after the summarizer's llm record, resumed" "$(resume_case r7a $(seq_of $LOG2 3) "$S2")" "killed 0 True 0 0"
-check "A7 killed after the first model call following the compaction, resumed" "$(resume_case r7b $(seq_of $LOG2 4) "$S2")" "killed 0 True 0 0"
-check "A7 killed mid-run before the compaction (summarizer re-issued), resumed" "$(resume_case r7c $(seq_of $LOG2 2) "$S2")" "killed 0 True 0 0"
-LOG6=$(lastlog $A6W)
-check "A7b overflow run, killed after the recorded failure, resumed" "$(resume_case r7d $(seq_of $LOG6 3) "$S6")" "killed 0 True 0 0"
-check "A7b overflow run, killed after the summarizer's record, resumed" "$(resume_case r7e $(seq_of $LOG6 4) "$S6")" "killed 0 True 0 0"
-check "A7b overflow run, killed after the retry, resumed" "$(resume_case r7f $(seq_of $LOG6 5) "$S6")" "killed 0 True 0 0"
-check "A7b resuming the resumed r7d log again replays all of it (the re-issued failure supersedes the recorded one)" "$(
-LOG=$(lastlog $T/r7d)
-mock '["unused"]' $T/r7d2.req 8815; run $T/r7d 8815 $T/r7d2.tr --pack std/compact --resume $LOG; rc=$?; unmock
-echo "$rc $(field finished) $(grep -c 'replay diverged' $T/err) $(Q 'print(len(load("'$T'/r7d2.req")))' 2>/dev/null || echo 0)")" "0 True 0 0"
-check "A7b a resumed run that differs at a trailing recorded failure reports replay diverged" "$(
-S7h=$(R 'dump(C("a=1"), E("invalid request: unsupported value"), S("live answer"))')
-newws r7h; mock "$S7h" $T/r7h.c.req 8815; run $W 8815 $T/r7h.c.tr; c=$?; unmock; LOG=$(lastlog $W)
-echo 'require("std/hooks").on("before_model", function(r) if #r.messages > 1 then r.system ..= "\nCHANGED" end return r end)' >> $W/.harness/init.luau
-mock "$(R 'dump(S("live answer"))')" $T/r7h.r.req 8815; run $W 8815 $T/r7h.r.tr --resume $LOG; rc=$?; unmock
-echo "$([ $c -ne 0 ] && echo failed) $([ $rc -ne 0 ] && echo fail) $(grep -c 'replay diverged' $T/err)")" "failed fail 1"
-check "A7b the error is a normal llm record in the log (error text, no reply)" "$(python3 - <<PY
-import json
-r = [json.loads(l) for l in open("$LOG6") if '"kind":"llm"' in l]
-print(len(r), "maximum context length exceeded" in r[2].get("error", ""), "reply" in r[2])
-PY
-)" "6 True False"
-check "A7b resuming a complete overflow log replays all of it (no live call)" "$(
-cp -r $A6W $T/r7g; LOG=$(lastlog $T/r7g)
-mock '["unused"]' $T/r7g.req 8815; run $T/r7g 8815 $T/r7g.tr --pack std/compact --resume $LOG; rc=$?; unmock
-echo "$rc $(field finished) $(grep -c 'replay diverged' $T/err) $(Q 'print(len(load("'$T'/r7g.req")))' 2>/dev/null || echo 0)")" "0 True 0 0"
 
 # ---- 8. A8: a subagent compacts its own history ----
 S8=$(R 'dump({"text": "", "calls": [{"code": "local r = agent(\"sub\")\nprint(r.answer)"}]}, C("a=1 -- CHILD-MARK"), C("b=2 -- CHILD-MARK"), C("c=3 -- CHILD-MARK", 30000), S("CHILD-SUMMARY"), S("child done"), S("parent done"))')

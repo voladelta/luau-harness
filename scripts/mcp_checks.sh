@@ -111,7 +111,7 @@ check "http: sandbox-only keys are refused on a url server" "$(hx 'print(1)' | g
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
 check "http/sse-split: 3-byte chunks, server request with our id, no final blank line" "$(hx 'print(mcp.web.add{a = 6, b = 7})' | head -1)" "13"
 touch $T/expire
-check "http: session expiry (404) re-initializes and the call succeeds on retry" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'session expired.*true.*3')" "1"
+check "http: lost mutation response stays uncertain and blocks another mutation" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'session expired.*unknown_outcome.*unresolved mutations')" "1"
 kill $SRV; wait $SRV 2>/dev/null
 (export NEED_HEADER="authorization:Bearer other-key" ECHO_KEY=1; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP json) & SRV=$!; sleep 1
 out=$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end))' | head -1)

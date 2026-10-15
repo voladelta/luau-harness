@@ -16,35 +16,7 @@ function M.with_headsup(system: string): string
 	if string.find(system, M.headsup, 1, true) then
 		return system
 	end
-	local anchor = "\n- Do not re-read a file"
-	local at = string.find(system, anchor, 1, true)
-	if at then
-		return string.sub(system, 1, at) .. M.headsup .. string.sub(system, at)
-	end
-	return system .. "\n\n" .. M.headsup
-end
-
-local installed = false
-
-function M.install(ctx)
-	if installed or not M.enabled then
-		return
-	end
-	installed = true
-	ctx.hooks.on("before_model", function(req)
-		if type(req.system) == "string" then
-			req.system = M.with_headsup(req.system)
-		end
-		return req
-	end)
-	local asked = false
-	ctx.hooks.on("before_finish", function(_)
-		if asked then
-			return nil
-		end
-		asked = true
-		return { continue_with = M.message }
-	end)
+	return system .. "\n\n# Finish review\n" .. M.headsup
 end
 
 return M

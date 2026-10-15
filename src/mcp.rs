@@ -28,7 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, serde::Serialize, Debug, Clone, Default)]
 pub struct ServerCfg {
     #[serde(default)]
     pub command: String,
@@ -54,6 +54,14 @@ pub struct ServerCfg {
 struct File {
     #[serde(default)]
     server: BTreeMap<String, ServerCfg>,
+}
+
+pub fn snapshot(root: &std::path::Path) -> Result<BTreeMap<String, ServerCfg>> {
+    let path = root.join(".harness/mcp.toml");
+    if !path.exists() { return Ok(BTreeMap::new()); }
+    let file: File = toml::from_str(&std::fs::read_to_string(path)?)?;
+    for (name, cfg) in &file.server { validate(name, cfg)?; }
+    Ok(file.server)
 }
 
 /// The server process is gone or stopped answering: the cached connection must be dropped.
@@ -176,23 +184,10 @@ pub fn glob(pat: &str, s: &str) -> bool {
 }
 
 impl Mcp {
-    /// None when there is no `.harness/mcp.toml` (the common case: zero cost).
-    pub fn load(pol: Arc<Policy>) -> Result<Option<Arc<Mcp>>> {
-        let path = pol.workspace.join(".harness/mcp.toml");
-        let Ok(text) = std::fs::read_to_string(&path) else { return Ok(None) };
-        if !crate::trust::is_trusted(&pol.workspace) {
-            return Ok(None); // an untrusted mcp.toml starts nothing
-        }
-        let f: File = toml::from_str(&text).map_err(|e| anyhow!("bad .harness/mcp.toml: {e}"))?;
-        if f.server.is_empty() {
-            return Ok(None);
-        }
-        for (n, c) in &f.server {
-            validate(n, c)?;
-        }
-        Ok(Some(Arc::new(Mcp { servers: f.server, pol, conns: Mutex::new(HashMap::new()) })))
+    pub fn frozen(pol: Arc<Policy>, servers: BTreeMap<String, ServerCfg>) -> Result<Option<Arc<Mcp>>> {
+        for (name, cfg) in &servers { validate(name, cfg)?; }
+        Ok((!servers.is_empty()).then(|| Arc::new(Mcp { servers, pol, conns: Mutex::new(HashMap::new()) })))
     }
-
     pub fn is_read_only(&self, server: &str, tool: &str) -> bool {
         self.servers.get(server).is_some_and(|c| c.read_only_tools.iter().any(|p| glob(p, tool)))
     }
@@ -267,7 +262,7 @@ impl Mcp {
             secrets.push(val);
         }
         // no redirects: reqwest would forward a custom auth header (x-api-key) to another host
-        let mut client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        let mut client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never());
         if cfg.url.as_deref().is_some_and(|u| u.starts_with("http://")) {
             client = client.no_proxy(); // localhost only (validated): never hand the key to a proxy in cleartext
         }

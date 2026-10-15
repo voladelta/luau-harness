@@ -1,7 +1,7 @@
 -- Default pack (installed by std/loop; off with `require("std/compact").enabled = false` in .harness/init.luau): keeps a
 -- long run inside the model's context window.
--- When the last reply's context reaches the threshold (see M.threshold), the next model call is preceded by one summarizer
--- call (through hx.llm: logged, budgeted, replayable). Older messages are replaced by a structured summary; the task message
+-- When the last reply's context reaches the threshold (see M.trigger), the next model call is preceded by one summarizer
+-- command dispatched by the Rust supervisor. Older messages are replaced by a structured summary; the task message
 -- and the most recent messages stay verbatim; the Luau session (globals) is untouched. A context-overflow error from the model
 -- triggers one compaction and a retry of the same turn (the loop's model_error event).
 -- Below the threshold the pack adds nothing to the requests. It never writes files.
@@ -246,102 +246,21 @@ function M.serialize(messages, from: number, to: number): string
 	return table.concat(parts, "\n\n")
 end
 
-local function limits()
-	local info = if hx.model_info then hx.model_info() else {}
-	-- an unset --context-window reaches Luau as a null sentinel (truthy userdata), so test the type
-	local w, mo = info.context_window, info.max_output
-	return if type(w) == "number" then w else M.context_window, if type(mo) == "number" then mo else 16384
+-- Pure request construction. The supervisor performs the model call and checkpoints its result.
+function M.request(messages, cut, previous)
+	local body = "<conversation>\n" .. M.serialize(messages, 2, cut - 1) .. "\n</conversation>\n\n"
+	if previous then body ..= "<previous-summary>\n" .. previous .. "\n</previous-summary>\n\n" .. UPDATE_PROMPT
+	else body ..= SUMMARY_PROMPT end
+	return { system = SUMMARIZER_SYSTEM, messages = { { role = "user", content = body .. "\n" .. VM_NOTE } },
+		max_tokens = math.floor(M.reserve_tokens * 4 / 5) }
 end
 
-local installed = false -- once per session: the loop installs the pack and `--pack std/compact` may name it again
+function M.wrap(task, summary) return task .. "\n\n" .. SUMMARY_PREFIX .. summary .. SUMMARY_SUFFIX end
 
-function M.install(ctx)
-	if installed or not M.enabled then
-		return
-	end
-	installed = true
-	local task_text -- the first user message (task + file listing), re-sent verbatim after every compaction
-	local prev -- the previous summary, once a compaction happened
-	local last_tokens = 0 -- context size reported by the last reply
-	local system = "" -- the system prompt of the last request (for M.scale)
-	local failures, disabled = 0, false
-
-	-- Replace messages[2 .. cut-1] by a summary, in place. Returns true when the messages were replaced.
-	local function compact(messages): boolean
-		local window, max_output = limits()
-		task_text = task_text or messages[1].content
-		-- keep a quarter of the threshold at most, so a compaction always frees most of the room up to the next one
-		local limit = M.trigger(window, max_output)
-		local keep = math.min(M.keep_recent_tokens, math.floor((if limit > 0 then limit else window) / 4))
-		local cut = M.find_cut(messages, 2, keep, M.scale(last_tokens, system, messages))
-		if not cut then
-			hx.log("### COMPACT SKIPPED\nnothing old enough to summarize (" .. #messages .. " messages)")
-			return false
-		end
-		local body = "<conversation>\n" .. M.serialize(messages, 2, cut - 1) .. "\n</conversation>\n\n"
-		if prev then
-			body ..= "<previous-summary>\n" .. prev .. "\n</previous-summary>\n\n" .. UPDATE_PROMPT
-		else
-			body ..= SUMMARY_PROMPT
-		end
-		body ..= "\n\n" .. VM_NOTE
-		local ok, resp = pcall(hx.llm, {
-			system = SUMMARIZER_SYSTEM,
-			messages = { { role = "user", content = body } },
-			max_tokens = math.floor(M.reserve_tokens * 4 / 5),
-		})
-		local summary = if ok then (resp.text or ""):match("^%s*(.-)%s*$") else ""
-		if not ok or summary == "" then
-			failures += 1
-			disabled = failures >= MAX_FAILURES
-			hx.log("### COMPACT FAILED\n" .. (if ok then "the summarizer returned no text" else tostring(resp)) .. "\nfailure " .. failures .. " of " .. MAX_FAILURES .. (if disabled then "; compaction is off for the rest of the run" else ""))
-			return false
-		end
-		prev = summary
-		local kept = table.move(messages, cut, #messages, 1, {})
-		table.clear(messages)
-		table.insert(messages, { role = "user", content = task_text .. "\n\n" .. SUMMARY_PREFIX .. summary .. SUMMARY_SUFFIX })
-		table.move(kept, 1, #kept, 2, messages)
-		hx.log("### COMPACT\nsummarized " .. (cut - 2) .. " messages, kept " .. #kept .. ", context was " .. last_tokens .. " tokens, summary " .. #summary .. " chars")
-		last_tokens = 0 -- the next reply reports the new size
-		return true
-	end
-
-	ctx.hooks.on("after_model", function(payload)
-		local u = payload.usage
-		if u then
-			last_tokens = (u.input or 0) + (u.cache_read or 0) + (u.cache_write or 0) + (u.output or 0)
-		end
-		return payload
-	end)
-
-	ctx.hooks.on("before_model", function(req)
-		system = req.system or ""
-		if not disabled and last_tokens > 0 then
-			local window, max_output = limits()
-			local limit = M.trigger(window, max_output)
-			if limit > 0 and last_tokens >= limit then
-				compact(req.messages)
-			end
-		end
-		return req
-	end)
-
-	ctx.hooks.on("model_error", function(ev)
-		if disabled then
-			return ev
-		end
-		local err = string.lower(ev.error or "")
-		for _, pattern in OVERFLOW do
-			if err:find(pattern, 1, true) then
-				if compact(ev.messages) then
-					return { retry = true }
-				end
-				break
-			end
-		end
-		return ev
-	end)
+function M.overflow(message)
+	local lower = message:lower()
+	for _, pattern in OVERFLOW do if lower:find(pattern, 1, true) then return true end end
+	return false
 end
 
 return M

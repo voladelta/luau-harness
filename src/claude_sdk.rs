@@ -308,7 +308,7 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
     let tools: Vec<Value> = req["tools"].as_array().cloned().unwrap_or_default();
     let tools_list = mcp_tools(&tools);
     let system = req["system"].as_str().unwrap_or("");
-    let max_tokens = req["max_tokens"].as_u64().unwrap_or(cfg.max_output);
+    let max_tokens = req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output);
     let msgs: Vec<Value> = req["messages"].as_array().cloned().unwrap_or_default();
     let keys = msg_keys(&msgs);
     if keys.is_empty() {
@@ -357,16 +357,8 @@ pub async fn chat(cfg: &LlmCfg, req: &Value) -> Result<Reply> {
     };
     proc.seen = keys.clone();
 
-    let seg = match drive(&mut proc, &tools_list).await {
-        // a stalled call: drop (and kill) the child and ask again from a replay of the whole conversation
-        Err(e) if e.to_string().starts_with(STALL) => {
-            drop(proc);
-            proc = fresh(cfg, system, max_tokens, &tools, sys_sha, &msgs).await?;
-            proc.seen = keys;
-            drive(&mut proc, &tools_list).await.map_err(|e2| anyhow::anyhow!("{e2} (after one retry on a fresh child: {e})"))?
-        }
-        r => r?,
-    };
+    // A stalled child may already have generated billable output. Recovery belongs to the supervisor.
+    let seg = drive(&mut proc, &tools_list).await?;
     let mut out = Reply { finish: Some("stop".into()), ..Default::default() };
     if let Some(result) = &seg.result {
         if result["is_error"].as_bool().unwrap_or(false) || result["subtype"].as_str() != Some("success") {

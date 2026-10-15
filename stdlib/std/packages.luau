@@ -4,10 +4,8 @@
 --                          if any, and where its other files are (agent skills from .agents/skills or ~/.agents/skills too)
 --   skills(query?)         -> { {name, description} }: search approved skills by name and description (best first).
 --                          Skills are NOT listed in the prompt: the model searches or loads one when the user names it.
---   deftool / promote      (the std/authoring pack) agent-written tools: usable at once with only the capabilities they
---                          declare; activated for later sessions only when the user reviews them and runs `hx accept`
---   refresh_extensions()   hot reload: drop cached tool modules so edited/newly accepted packages are picked up;
---                          session variables are untouched
+--   deftool / promote      (the std/authoring pack) inactive source definitions, staged without execution;
+--                          activated in future runs after the user reviews, tests and accepts them
 local M = {}
 
 local function strip_frontmatter(text: string): string
@@ -16,7 +14,7 @@ local function strip_frontmatter(text: string): string
 end
 
 local function find(name: string)
-	for _, p in hx.packages() do -- always fresh: a package accepted mid-session shows up on the next call
+	for _, p in hx.packages() do -- the approved package list is frozen for this run
 		if p.name == name then
 			return p
 		end
@@ -90,7 +88,7 @@ function M.install(ctx)
 			end
 			error("no installed skill named " .. string.format("%q", name) .. (if #near > 0 then "; closest: " .. table.concat(near, ", ") else ""), 2)
 		end
-		local text = strip_frontmatter(read(p.dir .. "/SKILL.md"))
+		local text = strip_frontmatter(hx.skill_asset(name, "SKILL.md"))
 		local ok, mod = pcall(require, name)
 		local module = if ok then mod else nil
 		if not ok and not tostring(mod):find("module not found", 1, true) then
@@ -107,18 +105,6 @@ function M.install(ctx)
 			})
 		end
 		return { name = name, text = text, module = module, dir = p.dir, files = p.files }
-	end)
-
-	hx.expose("refresh_extensions", function()
-		local n = 0
-		for _, p in hx.packages() do
-			if rawget(tools, p.name) ~= nil or p.kind == "skill" then
-				reload(p.name)
-				rawset(tools, p.name, nil)
-				n += 1
-			end
-		end
-		return "refreshed " .. n .. " extension(s)"
 	end)
 
 	ctx.hooks.on("before_model", function(req)

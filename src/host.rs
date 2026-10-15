@@ -1,261 +1,231 @@
-//! Host: shared state for one harness run (model client, usage totals, trace), and subagent spawning.
-use crate::effects::{LlmRec, ReplayData};
-use crate::llm::{self, LlmCfg, Reply};
-use crate::policy::Policy;
-use crate::vm::Vm;
-use anyhow::Result;
+//! Model adapter and supervised agent/controller execution. Descendants share one admission ledger.
+use crate::{controller::Controller, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, Supervisor}, vm::Vm};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
-use std::future::Future;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-#[derive(Default)]
-pub struct Usage {
-    pub input: u64,
-    pub cache_write: u64,
-    pub cache_read: u64,
-    pub output: u64,
-    pub cost: f64,
-    pub calls: u64,
-}
+use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
 
 pub struct Host {
     pub llm: LlmCfg,
     pub workspace: PathBuf,
     pub policy: Arc<Policy>,
+    pub supervisor: Arc<Supervisor>,
+    pub principal: Principal,
+    pub durable: Arc<Mutex<Value>>,
+    pub lane: String,
     pub max_turns: usize,
     pub depth: usize,
     pub max_depth: usize,
-    pub usage: Arc<Mutex<Usage>>,
     pub http: reqwest::Client,
     pub trace: Arc<Mutex<Option<std::fs::File>>>,
     pub key: String,
-    pub budget: crate::policy::Budget,
     pub packs: Vec<String>,
-    pub started: Instant,
-    /// resume: queues for the top-level VM, the logged model replies, and where the blobs live
-    replay: Mutex<Option<ReplayData>>,
-    replay_llm: Mutex<VecDeque<LlmRec>>,
-    replay_dir: Mutex<Option<PathBuf>>,
 }
 
 impl Host {
-    pub fn new(llm: LlmCfg, workspace: PathBuf, policy: Arc<Policy>, max_turns: usize, trace: Option<PathBuf>, budget_flags: crate::policy::Budget, packs: Vec<String>) -> Result<Arc<Host>> {
-        // flags (the launching user) beat policy.toml
-        let pb = policy.budget.clone();
-        let policy_budget = crate::policy::Budget { max_cost: budget_flags.max_cost.or(pb.max_cost), max_tokens: budget_flags.max_tokens.or(pb.max_tokens), max_wall_secs: budget_flags.max_wall_secs.or(pb.max_wall_secs) };
-        let key = llm.key()?;
-        let all_packs: Vec<String> = packs.into_iter().chain(policy.packs.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    pub fn start(llm: LlmCfg, policy: Arc<Policy>, task: String, max_turns: usize, trace: Option<PathBuf>, flags: Budget, mut packs: Vec<String>, branch: Option<crate::supervisor::Branch>) -> Result<Arc<Self>> {
+        let pb = &policy.budget;
+        let budget = Budget { max_cost: flags.max_cost.or(pb.max_cost), max_tokens: flags.max_tokens.or(pb.max_tokens), max_wall_secs: flags.max_wall_secs.or(pb.max_wall_secs) };
+        for limit in [budget.max_cost, budget.max_wall_secs].into_iter().flatten() {
+            anyhow::ensure!(limit.is_finite() && limit >= 0.0, "budgets must be finite and nonnegative");
+        }
+        for pack in &policy.packs { if !packs.contains(pack) { packs.push(pack.clone()); } }
+        llm.key()?; // Reject missing credentials before committing a new run manifest.
+        let supervisor = Supervisor::start(policy, llm, task, max_turns, packs, budget, branch)?;
+        Self::from_supervisor(supervisor, trace)
+    }
+
+    pub fn resume(policy: Arc<Policy>, trace: Option<PathBuf>) -> Result<Arc<Self>> {
+        Self::from_supervisor(Supervisor::resume(policy)?, trace)
+    }
+
+    fn from_supervisor(supervisor: Arc<Supervisor>, trace: Option<PathBuf>) -> Result<Arc<Self>> {
+        let m = supervisor.manifest.as_ref().context("missing run manifest")?;
+        let key = m.model.key()?;
         let file = trace.map(std::fs::File::create).transpose()?;
-        Ok(Arc::new(Host {
-            llm,
-            workspace,
-            policy,
-            max_turns,
-            depth: 0,
-            max_depth: 2,
-            usage: Arc::new(Mutex::new(Usage::default())),
-            http: reqwest::Client::builder().timeout(Duration::from_secs(300)).build()?,
-            trace: Arc::new(Mutex::new(file)),
-            key,
-            budget: policy_budget,
-            packs: all_packs,
-            started: Instant::now(),
-            replay: Mutex::new(None),
-            replay_llm: Mutex::new(VecDeque::new()),
-            replay_dir: Mutex::new(None),
-        }))
+        Ok(Arc::new(Self { llm: m.model.clone(), workspace: m.policy.workspace.clone(), policy: supervisor.policy.clone(),
+            principal: Principal::Agent { read_only: false }, durable: supervisor.durable.clone(), lane: "root".into(),
+            max_turns: m.max_turns, depth: 0, max_depth: 2,
+            http: reqwest::Client::builder().timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?,
+            trace: Arc::new(Mutex::new(file)), key, packs: m.packs.clone(), supervisor }))
     }
 
-    /// Resume from a crashed run's log: the loop re-runs against the recorded model replies and effect results.
-    pub fn set_replay(&self, mut rd: ReplayData) {
-        *self.replay_llm.lock().unwrap() = std::mem::take(&mut rd.llm);
-        *self.replay_dir.lock().unwrap() = Some(rd.dir.clone());
-        *self.replay.lock().unwrap() = Some(rd);
-    }
-
-    pub fn child(&self) -> Arc<Host> {
-        self.child_with(None, None)
-    }
-
-    /// A subagent host, optionally on another model or reasoning effort of the same API (e.g. a lead on opus hands
-    /// exploration to haiku at low effort). Usage, trace, budget and policy stay shared with the parent.
-    pub fn child_with(&self, model: Option<String>, reasoning: Option<String>) -> Arc<Host> {
+    pub fn child_with(&self, model: Option<String>, reasoning: Option<String>, principal: Principal) -> Arc<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         let mut llm = self.llm.clone();
-        if let Some(m) = model {
-            llm.model = m;
-        }
-        if reasoning.is_some() {
-            llm.reasoning = reasoning;
-        }
-        Arc::new(Host {
-            llm,
-            workspace: self.workspace.clone(),
-            policy: self.policy.clone(),
-            max_turns: self.max_turns,
-            depth: self.depth + 1,
-            max_depth: self.max_depth,
-            usage: self.usage.clone(),
-            http: self.http.clone(),
-            trace: self.trace.clone(),
-            key: self.key.clone(),
-            budget: self.budget.clone(),
-            packs: self.packs.clone(),
-            started: self.started,
-            replay: Mutex::new(None),
-            replay_llm: Mutex::new(VecDeque::new()),
-            replay_dir: Mutex::new(None),
-        })
+        if let Some(model) = model { llm.model = model; }
+        if reasoning.is_some() { llm.reasoning = reasoning; }
+        Arc::new(Self { llm, workspace: self.workspace.clone(), policy: self.policy.clone(), supervisor: self.supervisor.clone(),
+            principal, durable: Arc::new(Mutex::new(json!({}))), lane: format!("{}/{}", self.lane, NEXT.fetch_add(1, Ordering::Relaxed)),
+            max_turns: self.max_turns, depth: self.depth + 1, max_depth: self.max_depth, http: self.http.clone(), trace: self.trace.clone(),
+            key: self.key.clone(), packs: self.packs.clone() })
     }
 
     pub fn log(&self, line: &str) {
-        if let Some(f) = self.trace.lock().unwrap().as_mut() {
-            let pad = "  ".repeat(self.depth);
-            let _ = writeln!(f, "{}", line.lines().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n"));
-        }
+        if let Some(file) = self.trace.lock().unwrap().as_mut() { let _ = writeln!(file, "{line}"); }
     }
 
-    /// Err(reason) when a limit is already used up. Checked before every LIVE model call (replayed replies are free).
-    pub fn check_budget(&self) -> std::result::Result<(), String> {
-        let u = self.usage.lock().unwrap();
-        let b = &self.budget;
-        if let Some(m) = b.max_cost.filter(|m| u.cost >= *m) {
-            return Err(format!("budget_exceeded: cost ${:.4} reached the ${m:.4} limit", u.cost));
-        }
-        let tokens = u.input + u.cache_write + u.output;
-        if let Some(m) = b.max_tokens.filter(|m| tokens >= *m) {
-            return Err(format!("budget_exceeded: {tokens} tokens reached the {m} token limit"));
-        }
-        let wall = self.started.elapsed().as_secs_f64();
-        if let Some(m) = b.max_wall_secs.filter(|m| wall >= *m) {
-            return Err(format!("budget_exceeded: wall clock {wall:.0}s reached the {m:.0}s limit"));
-        }
-        Ok(())
-    }
-
-    /// Used and limit for each budget, for modules (`hx.budget()`).
-    pub fn budget_status(&self) -> Value {
-        let u = self.usage.lock().unwrap();
-        json!({"cost": u.cost, "max_cost": self.budget.max_cost, "tokens": u.input + u.cache_write + u.output, "max_tokens": self.budget.max_tokens, "wall": self.started.elapsed().as_secs_f64(), "max_wall": self.budget.max_wall_secs})
-    }
-
-    /// The model and its limits, for modules (`hx.model_info()`). `context_window` is null unless `--context-window` was given.
+    pub fn budget_status(&self) -> Value { self.supervisor.budget_status() }
     pub fn model_info(&self) -> Value {
-        json!({"model": self.llm.model, "context_window": self.llm.context_window, "max_output": self.llm.max_output})
+        json!({"model": self.llm.model, "context_window": self.llm.context_window, "max_output": self.llm.max_output,
+            "net": !self.policy.enabled || self.policy.net})
+    }
+
+    fn report(&self, mut report: Value, wall_secs: f64) -> Value {
+        let usage = self.supervisor.usage();
+        report["model"] = json!(self.llm.model);
+        report["input_tokens"] = json!(usage.input);
+        report["cache_creation_tokens"] = json!(usage.cache_write);
+        report["cache_read_tokens"] = json!(usage.cache_read);
+        report["output_tokens"] = json!(usage.output);
+        report["cost_usd"] = json!(usage.cost);
+        report["llm_calls"] = json!(usage.calls);
+        report["wall_secs"] = json!(wall_secs);
+        report["budget"] = self.budget_status();
+        report["log"] = json!(self.policy.log.path);
+        let uncertain = self.supervisor.uncertain_operations();
+        if !uncertain.is_empty() {
+            report["finished"] = json!(false);
+            if report.get("stopped").is_none() { report["stopped"] = json!("unknown_outcome: owner reconciliation required"); }
+        }
+        report["uncertain_operations"] = json!(uncertain);
+        if report["ops_per_turn"] == json!({}) { report["ops_per_turn"] = json!([]); }
+        report
     }
 
     pub async fn chat(&self, req: &Value) -> Result<Reply> {
-        let req_sha = crate::eventlog::sha_bytes(serde_json::to_string(req)?.as_bytes());
-        let logged = {
-            let mut q = self.replay_llm.lock().unwrap();
-            let mut logged = q.pop_front();
-            // Skip a recorded failure that the run never got past: the LAST model record for this same request (the run
-            // stopped there, so ask the API again; a different request still reports `replay diverged` below) or one
-            // followed by the same request (an earlier resume asked again; its newer record wins). The std loop never
-            // re-sends an identical request after a failure, so neither case drops a real recovery. A package that retries an
-            // identical `hx.llm` request after a failure would see the success on replay without the failure first.
-            while logged.as_ref().is_some_and(|rec| rec.rec.get("error").is_some() && q.front().map_or(rec.req_sha == req_sha, |next| next.req_sha == rec.req_sha)) {
-                logged = q.pop_front();
-            }
-            logged
+        crate::controller::validate_request(req)?;
+        let op = self.supervisor.reserve_model(&self.llm, req, self.depth)?;
+        let call = llm::chat(&self.http, &self.llm, &self.key, req);
+        let result = match self.supervisor.remaining() {
+            Some(remaining) => tokio::time::timeout(remaining, call).await.map_err(|_| anyhow::anyhow!("budget_exceeded: absolute run deadline reached during model request")).and_then(|r| r),
+            None => call.await,
         };
-        let r = if let Some(rec) = logged {
-            // replay: the model's earlier reply is returned as-is (no API call, no new log record)
-            if rec.req_sha != req_sha {
-                anyhow::bail!("replay diverged: the request to the model differs from the logged one (was the prompt, a module or the printer changed since the crash?)");
-            }
-            let v = &rec.rec;
-            if let Some(e) = v["error"].as_str() {
-                // a model call that failed in the original run (e.g. a context overflow the loop then recovered from)
-                anyhow::bail!("{e}");
-            }
-            let dir = self.replay_dir.lock().unwrap().clone().unwrap_or_default();
-            let body: Value = serde_json::from_slice(&crate::eventlog::read_blob(&dir, v["reply"].as_str().unwrap_or(""))?)?;
-            Reply {
-                text: body["text"].as_str().unwrap_or("").to_string(),
-                calls: body["calls"].as_array().cloned().unwrap_or_default(),
-                raw: body["raw"].as_str().unwrap_or("").to_string(),
-                finish: v["finish"].as_str().map(String::from),
-                input: v["input"].as_u64().unwrap_or(0),
-                cache_read: v["cache_read"].as_u64().unwrap_or(0),
-                cache_write: v["cache_write"].as_u64().unwrap_or(0),
-                output: v["output"].as_u64().unwrap_or(0),
-                cost: v["cost"].as_f64().unwrap_or(0.0),
-            }
-        } else {
-            if let Err(why) = self.check_budget() {
-                self.policy.log.write("budget", json!({"depth": self.depth, "reason": why}), true);
-                anyhow::bail!(why);
-            }
-            let r = match llm::chat(&self.http, &self.llm, &self.key, req).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // record the failure so replay issues the same sequence of model calls (the loop may recover and go on)
-                    self.policy.log.write("llm", json!({"model": self.llm.model, "depth": self.depth, "req_sha": req_sha, "error": e.to_string()}), true);
-                    return Err(e);
-                }
-            };
-            // the reply blob holds everything the loop reads: the text, the tool calls and the raw assistant message
-            let reply = self.policy.log.blob(json!({"text": r.text, "calls": r.calls, "raw": r.raw}).to_string().as_bytes());
-            self.policy.log.write("llm", json!({"model": self.llm.model, "depth": self.depth, "req_sha": req_sha, "reply": reply, "input": r.input, "cache_read": r.cache_read, "cache_write": r.cache_write, "output": r.output, "cost": r.cost, "finish": r.finish}), true);
-            r
-        };
-        let mut u = self.usage.lock().unwrap();
-        u.input += r.input;
-        u.cache_write += r.cache_write;
-        u.cache_read += r.cache_read;
-        u.output += r.output;
-        u.cost += r.cost;
-        u.calls += 1;
-        Ok(r)
+        match result {
+            Ok(reply) => { self.supervisor.settle_model(op, &self.llm, &reply, self.depth)?; Ok(reply) },
+            Err(error) => {
+                // Keep its reservation: an HTTP/transport error does not establish that no generation was billed.
+                self.policy.log.write("llm", json!({"of": op, "depth": self.depth, "model": self.llm.model, "error": error.to_string(), "billing_uncertain": true}), true)?;
+                Err(error)
+            },
+        }
     }
 
-    /// Run the std loop (or its project override) for `task` in a fresh VM. Boxed: subagents recurse through here.
     pub fn run_task(self: Arc<Self>, task: String, max_turns: usize) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> {
         Box::pin(async move {
-            let t0 = Instant::now();
-            let replay = self.replay.lock().unwrap().take();
-            if replay.is_none() && self.depth == 0 {
-                let blob = self.policy.log.blob(task.as_bytes());
-                self.policy.log.write("task", json!({"blob": blob, "max_turns": max_turns, "model": self.llm.model, "depth": 0}), true);
+            self.policy.log.check()?;
+            if self.depth == 0 {
+                if let Some(state) = self.supervisor.restored.as_ref().filter(|s| s["phase"] == "finished") {
+                    crate::controller::command(&json!({"kind":"finish","report":state["report"]}))?;
+                    return Ok(self.report(state["report"].clone(), 0.0));
+                }
             }
-            let vm = Vm::new(self.policy.clone(), Duration::from_secs(120), 512 << 20, Some(self.clone()), replay.map(|r| (r.queues, r.dir)))?;
-            let mut rep = vm.run_loop(&task, max_turns, &self.packs).await?;
-            let u = self.usage.lock().unwrap();
-            rep["model"] = json!(self.llm.model);
-            rep["input_tokens"] = json!(u.input);
-            rep["cache_creation_tokens"] = json!(u.cache_write);
-            rep["cache_read_tokens"] = json!(u.cache_read);
-            rep["output_tokens"] = json!(u.output);
-            rep["cost_usd"] = json!(u.cost);
-            rep["llm_calls"] = json!(u.calls);
-            rep["wall_secs"] = json!(t0.elapsed().as_secs_f64());
-            Ok(rep)
+            if let Err(error) = self.supervisor.check() {
+                if !error.to_string().starts_with("budget_exceeded:") { return Err(error); }
+                let report = json!({"turns":0,"code_turns":0,"luau_errors":0,"truncated_turns":0,"ops_per_turn":[],
+                    "finished":false,"final_answer":"","stopped":error.to_string()});
+                self.policy.log.write("budget", json!({"reason":error.to_string(),"depth":self.depth}), true)?;
+                self.supervisor.checkpoint(&self.lane, &json!({"phase":"finished","report":report}), &self.durable.lock().unwrap())?;
+                return Ok(self.report(report, 0.0));
+            }
+            let t0 = Instant::now();
+            let vm = Vm::new(self.policy.clone(), Duration::from_secs(120), 512 << 20, Some(self.clone()))?;
+            let mut packs = vec!["std/packages".into(), "std/mcp".into()];
+            for name in &self.packs {
+                if matches!(name.as_str(), "std/vision" | "std/authoring") && !packs.contains(name) { packs.push(name.clone()); }
+            }
+            vm.install_packs(&packs).await?;
+            let controller = Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs)?;
+            let mut state = if self.depth == 0 {
+                match &self.supervisor.restored {
+                    Some(state) => state.clone(),
+                    None => controller.init(&json!({"max_turns": max_turns,
+                        "task_message": format!("{task}\n\n[files in the working directory]\n{}", file_tree(&self.workspace))}))?,
+                }
+            } else {
+                controller.init(&json!({"max_turns": max_turns, "task_message": task}))?
+            };
+            let mut event = if self.depth == 0 {
+                self.supervisor.recovery.as_ref().map(|r| json!({"kind": "recover", "message": serde_json::to_string_pretty(r).unwrap()})).unwrap_or_else(|| json!({"kind":"next"}))
+            } else { json!({"kind":"next"}) };
+            loop {
+                self.policy.log.check()?;
+                let previous_messages = state["messages"].as_array().cloned().unwrap_or_default();
+                let compacting = state["phase"] == "compact";
+                let compact_cut = state["compact_cut"].as_u64().unwrap_or(2);
+                // A controller transition starts from frozen source and explicit data, just like a package call.
+                // Captured Lua locals cannot become a second, uncheckpointed workflow state store.
+                let controller = Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs)?;
+                let (next_state, mut command) = controller.step(&state, &event)?;
+                anyhow::ensure!(next_state.is_object(), "controller state must be an object");
+                crate::controller::command(&command)?;
+                if next_state["phase"] == "finished" {
+                    crate::controller::command(&json!({"kind":"finish","report":next_state["report"]}))?;
+                }
+                state = next_state;
+                if compacting {
+                    let failed = event["kind"] == "model_error" || event["reply"]["text"].as_str().unwrap_or("").trim().is_empty();
+                    if failed { self.log("### COMPACT FAILED"); }
+                    else { self.log(&format!("### COMPACT\nsummarized {} messages, kept {}, summary committed", compact_cut.saturating_sub(2), previous_messages.len().saturating_sub(compact_cut as usize).saturating_add(1))); }
+                }
+                if let Some(messages) = state["messages"].as_array() {
+                    for (i, message) in messages.iter().enumerate() {
+                        if previous_messages.get(i) != Some(message) && matches!(message["role"].as_str(), Some("user" | "tool")) {
+                            let label = if message["role"] == "tool" { "RESULT" } else { "HARNESS" };
+                            self.log(&format!("### {label}\n{}", message["content"].as_str().unwrap_or("")));
+                        }
+                    }
+                }
+                if command["kind"] == "model" && command["purpose"] == "agent" {
+                    let request = vm.prepare_request(&command["request"])?;
+                    // Image notifications and other data-only additions belong to the controller checkpoint too.
+                    if state["phase"] == "model" { state["messages"] = request["messages"].clone(); }
+                    command["request"] = request;
+                }
+                let command = crate::controller::command(&command)?;
+                self.supervisor.checkpoint(&self.lane, &state, &self.durable.lock().unwrap())?;
+                match command {
+                    crate::controller::Command::Next => event = json!({"kind":"next"}),
+                    crate::controller::Command::NextCall => event = json!({"kind":"next_call"}),
+                    crate::controller::Command::Model { request, .. } => {
+                        match self.chat(&request).await {
+                            Ok(reply) => {
+                                self.log(&format!("### MODEL\n{}", reply.text));
+                                event = json!({"kind":"model_reply", "reply":reply});
+                            },
+                            Err(error) => {
+                                let message = error.to_string();
+                                let safe_context_rejection = ["API 400 ", "API 413 ", "API 422 "].iter().any(|prefix| message.starts_with(prefix));
+                                event = json!({"kind":"model_error", "error":message, "safe_context_rejection":safe_context_rejection});
+                            },
+                        }
+                    },
+                    crate::controller::Command::Run { code } => {
+                        self.supervisor.check()?;
+                        self.log(&format!("### CODE\n{code}"));
+                        self.policy.log.write("chunk_begin", json!({"lane":self.lane, "depth":self.depth, "code":code}), true)?;
+                        let result = vm.run_chunk(&code).await?;
+                        let notifications = vm.prepare_request(&json!({"system":"", "messages":[], "tools":[]}))?;
+                        event = json!({"kind":"run_result", "result": result, "notifications":notifications["messages"]});
+                    },
+                    crate::controller::Command::Finish { report } => {
+                        return Ok(self.report(Value::Object(report), t0.elapsed().as_secs_f64()));
+                    },
+                }
+            }
         })
     }
 }
 
-/// One line per file (gitignore-aware) so the model need not spend a turn on `ls`.
-pub fn file_tree(root: &Path) -> String {
+/// A bounded, gitignore-aware listing used only to initialize the controller's saved conversation.
+pub fn file_tree(root: &std::path::Path) -> String {
     let mut out = Vec::new();
-    for e in ignore::WalkBuilder::new(root).require_git(false).sort_by_file_path(|a, b| a.cmp(b)).build().flatten() {
-        if !e.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let rel = e.path().strip_prefix(root).unwrap_or(e.path()).to_string_lossy().to_string();
-        if rel.contains("__pycache__") || rel.starts_with(".git/") || rel.starts_with(".harness/") {
-            continue;
-        }
-        let lines = std::fs::read_to_string(e.path()).map(|t| t.lines().count()).unwrap_or(0);
+    for entry in ignore::WalkBuilder::new(root).require_git(false).sort_by_file_path(|a,b| a.cmp(b)).build().flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
+        let rel = entry.path().strip_prefix(root).unwrap_or(entry.path()).to_string_lossy().to_string();
+        if rel.contains("__pycache__") || rel.starts_with(".git/") || rel.starts_with(".harness/") { continue; }
+        let lines = std::fs::read_to_string(entry.path()).map(|t| t.lines().count()).unwrap_or(0);
         out.push(format!("{rel} ({lines} lines)"));
-        if out.len() >= 80 {
-            out.push("…".into());
-            break;
-        }
+        if out.len() >= 80 { out.push("…".into()); break; }
     }
     out.join("\n")
 }

@@ -20,7 +20,6 @@ function M.edit() return edit("a.txt", "hello", "pwn") end
 function M.sh() return sh("echo hi > y.txt; echo done").stdout end
 function M.search() return #search("hello") end
 function M.agent() return agent("x") end
-function M.llm() return hx.llm({}) end
 function M.getfenv() return getfenv(0) end
 function M.setfenv() return setfenv(1, {}) end
 function M.loadstring() return loadstring("return 1")() end
@@ -38,9 +37,8 @@ local m = require("reader")
 local function denied(f) local ok, e = pcall(f) return (not ok) and tostring(e):find("capability_denied", 1, true) ~= nil end
 local function absent(f) local ok = pcall(f) return not ok end
 test.case("granted read works", function() test.eq(m.read_ok(), "hello\n"); test.eq(m.search(), 1) end)
-test.case("write/edit/sh/agent/llm are denied with a clear error", function()
+test.case("write/edit/sh/agent are denied with a clear error", function()
 	test.ok(denied(m.write), "write"); test.ok(denied(m.edit), "edit"); test.ok(denied(m.sh), "sh"); test.ok(denied(m.agent), "agent")
-	test.ok(absent(m.llm), "hx.llm")
 end)
 test.case("nothing was written or executed", function()
 	test.eq(sh("test -e x.txt -o -e y.txt; echo $?").stdout, "1\n")
@@ -51,7 +49,7 @@ test.case("escape hatches do not exist", function()
 	test.ok(absent(m.globals), "_G")
 end)
 test.case("builtin libraries are read-only", function() test.ok(absent(m.poison), "string.rep = nil"); test.eq(type(string.rep), "function") end)
-test.case("std modules are reachable (the harness API)", function() test.eq(m.require_std(), "function") end)
+test.case("privileged std modules cannot be imported", function() test.ok(denied(m.require_std)) end)
 LUA
 mk runner 'fs = ["read"]
 proc = ["sh"]'

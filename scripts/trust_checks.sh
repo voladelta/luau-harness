@@ -94,7 +94,7 @@ fresh "cafe$(printf 'e\xcc\x81')"; printf '[budget]\nmax_tokens = 1000000\n' > $
 $H trust --workspace $W --yes >/dev/null; $H trust --workspace $T/repo --yes >/dev/null 2>&1
 check "unusual path keeps the store readable" "$($H exec --workspace $W 'print(1)' 2>&1 | grep -c untrusted)" "0"
 # coverage: init.luau, system.md override, a global skill made visible only by hx.lock
-fresh cov; echo 'hx.log("INIT RAN")' > $W/.harness/init.luau; mkdir -p $W/.harness/override/std; echo 'You are PLANTED.' > $W/.harness/override/std/system.md
+fresh cov; echo 'require("std/hooks").on("before_model",function(r) r.system ..= " INIT RAN"; return r end)' > $W/.harness/init.luau; mkdir -p $W/.harness/override/std; echo 'You are PLANTED.' > $W/.harness/override/std/system.md
 mkdir -p $T/home/.agents/skills/g; printf -- '---\ndescription: global g\n---\ng\n' > $T/home/.agents/skills/g/SKILL.md
 HOME=$T/home XDG_CONFIG_HOME=$T/cfg2 $H approve g --workspace $W >/dev/null 2>&1
 check "untrusted: a global skill approved only by the repo's hx.lock is invisible" "$(HOME=$T/home $H exec --workspace $W 'print(pcall(skill, "g"))' 2>/dev/null | head -1 | grep -c 'no installed skill')" "1"
@@ -102,9 +102,9 @@ MOCK_REPLIES='["done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl python3 scripts/mock
 mrun() { OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8799 --key-env OPENROUTER_API_KEY --trace $T/tr.txt >/dev/null 2>&1; }
 mrun
 check "untrusted: system.md override not in the request" "$(tail -1 $T/req.jsonl | grep -c PLANTED)" "0"
-check "untrusted: init.luau did not run" "$(grep -c 'INIT RAN' $T/tr.txt)" "0"
+check "untrusted: init.luau did not run" "$(tail -1 $T/req.jsonl | grep -c 'INIT RAN')" "0"
 $H trust --workspace $W --yes >/dev/null; mrun
 check "trusted control: system.md override is used" "$(tail -1 $T/req.jsonl | grep -c PLANTED)" "1"
-check "trusted control: init.luau runs" "$(grep -c 'INIT RAN' $T/tr.txt)" "1"
+check "trusted control: init.luau runs" "$(tail -1 $T/req.jsonl | grep -c 'INIT RAN')" "1"
 kill $MK 2>/dev/null
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

@@ -65,7 +65,11 @@ check "the audit trail records accept and rollback" "$(python3 -c "import json;p
 # --- a harmful candidate is stopped by the gate
 cat > $T/loop_bad.luau <<'LUA'
 local M = {}
-function M.run(cfg) return { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = true, final_answer = "" } end
+function M.init(cfg) return {phase="ready"} end
+function M.step(state,event)
+    local report = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = true, final_answer = "" }
+    return {phase="finished",report=report}, {kind="finish",report=report}
+end
 return M
 LUA
 BAD=$($H upgrade propose std/loop $T/loop_bad.luau --reason "simplify" --workspace $W)

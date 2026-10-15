@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # P4 (extension system) checks, no API key: skills, tool packages, agent-written tools (deftool/promote/accept),
-# no self-approval, hot reload with session state. Build first: cargo build --release
+# no self-approval, frozen extensions with live session state. Build first: cargo build --release
 set -u
 cd "$(dirname "$0")/.."
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
@@ -43,7 +43,7 @@ check "tool package: tools.slug.run works after approval" "$(x 'print(tools.slug
 out=$(x 'local s = skill("release") print(s.text) print(s.module.checklist()[1], s.name)')
 check "skill: text without frontmatter" "$(echo "$out" | sed -n 1p)" "Steps: 1. bump version 2. tag it."
 check "skill: runnable Luau module" "$(echo "$out" | sed -n 3p)" "bump	release"
-B=$T/bws; mkdir -p $B/.harness/pkgs/broken  # own workspace: a third package in $W would change the hot-reload count
+B=$T/bws; mkdir -p $B/.harness/pkgs/broken  # keep this broken package isolated from the other fixtures
 printf '[package]\nname = "broken"\nversion = "0.1.0"\nkind = "skill"\ndescription = "a skill whose module does not compile"\n' > $B/.harness/pkgs/broken/hx.toml
 printf -- '---\nname: broken\ndescription: a skill whose module does not compile\n---\nStill readable.\n' > $B/.harness/pkgs/broken/SKILL.md
 echo 'return { go = function() return 1 end' > $B/.harness/pkgs/broken/init.luau; $H approve broken --workspace $B >/dev/null
@@ -71,56 +71,27 @@ check "prompt says how to search and load skills" "$(echo "$s" | grep -c 'skills
 E=$T/empty; mkdir -p $E; run $E
 check "no extensions installed: the prompt is unchanged" "$(system_of_last | grep -c 'Installed extensions')" "0"
 
-# --- agent-written tools: usable immediately, only with the capabilities they declare
-check "authoring is opt-in: without --pack std/authoring there is no deftool/promote/propose_module" "$(x 'print(type(deftool), type(promote), type(propose_module))' | head -1)" "nil	nil	nil"
-echo "secret" > $W/data.txt
-out=$(xt 'deftool("peek", [==[
-return { run = function() return read("data.txt") end }
-]==], { doc = "reads a file" })
-print(pcall(tools.peek.run))')
-check "deftool: a tool without declared caps cannot read files" "$(echo "$out" | head -1 | grep -c 'capability_denied')" "1"
-out=$(xt 'deftool("peek", [==[
-return { run = function() return read("data.txt") end }
-]==], { caps = { fs = { "read" } } })
-print(tools.peek.run())')
-check "deftool: declaring fs.read lets it read" "$(echo "$out" | head -1)" "secret"
-check "deftool: defined tools do not show up in vars()" "$(xt 'deftool("t1", "return {}") x = 1 print(vars().tools, vars().deftool, vars().x)' | head -1)" "nil	nil	1"
-
-TOOL='deftool("shout", [==[
-local M = {}
-function M.run(s) return s:upper() .. "!" end
-return M
-]==], { doc = "shouts", signature = "shout.run(s: string): string",
-  tests = [==[
-local m = require("shout")
-test.case("shouts", function() test.eq(m.run("hi"), "HI!") end)
-]==] })'
-out=$(xt "$TOOL"$'\nprint(tools.shout.run("a"))\nlocal r = promote("shout")\nprint(r.ok)\nprint(r.message)')
-check "deftool: usable at once in the session" "$(echo "$out" | sed -n 1p)" "A!"
-check "promote: tests pass => staged" "$(echo "$out" | sed -n 2p)" "true"
-check "promote: tells the agent a human must accept" "$(echo "$out" | sed -n 3p | grep -c 'hx accept shout')" "1"
-check "staged but NOT installed" "$([ -d $W/.harness/staged/shout ] && [ ! -d $W/.harness/pkgs/shout ] && echo yes || echo no)" "yes"
-check "a new session does not see the staged tool" "$(x 'print(tools.shout)' | head -1)" "nil"
-check "hx staged lists it" "$($H staged --workspace $W | head -1)" "shout"
+# --- Definitions stay inactive; promotion never executes unapproved source or tests.
+check "authoring remains opt-in" "$(x 'print(type(deftool),type(promote))' | head -1)" "nil	nil"
+out=$(xt 'local d=deftool("peek", [==[write("unapproved.txt","bad"); return {}]==], {caps={fs={"write"}}}); print(d.active,tools.peek)')
+check "definition does not execute or activate" "$(echo "$out" | head -1) $([ -e $W/unapproved.txt ] && echo bad || echo safe)" "false	nil safe"
+check "definitions do not pollute vars" "$(xt 'deftool("t1","return {}"); x=1; print(vars().tools,vars().deftool,vars().x)' | head -1)" "nil	nil	1"
+TOOL='deftool("shout", [==[return {run=function(s) return s:upper() .. "!" end}]==], {
+ signature="shout.run(s: string): string",doc="shouts",tests=[==[
+ local m=require("shout");test.case("shouts",function() test.eq(m.run("hi"),"HI!") end)
+ ]==]})'
+out=$(xt "$TOOL"$'\nlocal r=promote("shout"); print(r.ok,r.tested); print(r.message)')
+check "promotion stages without execution" "$(echo "$out" | head -1)" "true	false"
+check "promotion explains owner testing and acceptance" "$(echo "$out" | grep -c 'hx accept shout')" "1"
+check "staged source is not installed" "$([ -d $W/.harness/staged/shout ] && [ ! -d $W/.harness/pkgs/shout ] && echo yes || echo no)" "yes"
+check "a new session cannot see staged source" "$(x 'print(tools.shout)' | head -1)" "nil"
+check "owner can run staged tests" "$($H test $W/.harness/staged/shout --workspace $W | tail -1)" "1 passed, 0 failed"
 $H accept shout --yes --workspace $W >/dev/null 2>&1
-check "after the user runs hx accept, a new session can use it" "$(x 'print(tools.shout.run("ok"))' | head -1)" "OK!"
-check "accepted tool is locked in hx.lock" "$(grep -c 'name = "shout"' $W/hx.lock)" "1"
-
-out=$(xt 'deftool("bad", "return { run = function() return 1 end }", { tests = [==[
-local m = require("bad")
-test.case("fails", function() test.eq(m.run(), 2) end)
-]==] })
-local r = promote("bad") print(r.ok, r.message)')
-check "promote: failing tests => refused, nothing staged" "$(echo "$out" | head -1)$([ -d $W/.harness/staged/bad ] && echo STAGED)" "false	the tool's tests failed; nothing was staged"
-out=$(xt 'deftool("untested", "return {}") local r = promote("untested") print(r.ok, r.message)')
-check "promote: no tests => refused" "$(echo "$out" | head -1 | grep -c 'must have tests')" "1"
-out=$(xt 'deftool("greedy", [==[
-return { run = function() return sh("echo x").stdout end }
-]==], { tests = [==[
-test.case("runs", function() local m = require("greedy") test.eq(m.run(), "x\n") end)
-]==] })
-local r = promote("greedy") print(r.ok)')
-check "promote: a tool that needs a capability it did not declare fails its own tests" "$(echo "$out" | head -1)" "false"
+check "accepted source is available to a new run" "$(x 'print(tools.shout.run("ok"))' | head -1)" "OK!"
+out=$(xt 'deftool("bad","return {}",{tests=[==[write("unapproved-test.txt","bad")]==]}); local r=promote("bad"); print(r.ok,r.tested)')
+check "unapproved tests are not executed by promotion" "$(echo "$out" | head -1) $([ -e $W/unapproved-test.txt ] && echo bad || echo safe)" "true	false safe"
+out=$(xt 'deftool("untested","return {}"); local r=promote("untested"); print(r.ok,r.message)')
+check "promotion still requires submitted tests" "$(echo "$out" | head -1 | grep -c 'must have tests')" "1"
 
 # --- the agent cannot approve or install anything itself
 check "cannot write into .harness/pkgs" "$(x 'print(pcall(write, ".harness/pkgs/evil/hx.toml", "x"))' | head -1 | grep -c protected)" "1"
@@ -128,17 +99,17 @@ check "cannot write into .harness/staged" "$(x 'print(pcall(write, ".harness/sta
 check "no accept/approve function exists for the agent" "$(x 'print(type(accept), type(approve), type(hx), type(require))' | head -1)" "nil	nil	nil	nil"
 check "sh cannot activate a tool either" "$(x 'sh("mkdir -p .harness/pkgs/evil && echo x > .harness/pkgs/evil/hx.toml")' >/dev/null; [ -e $W/.harness/pkgs/evil ] && echo CREATED || echo blocked)" "blocked"
 
-# --- hot reload keeps the session: user edits + re-approves a tool while a session is running
+# --- extensions stay frozen when a user edits and re-approves a tool during a session
 ( x 'counter = 7
 print(tools.slug.run("A B"))
-sh("sleep 4243", { timeout = 4 })' 'print(counter, refresh_extensions(), tools.slug.run("A B"))' > $T/hot.out ) &
+sh("sleep 4243", { timeout = 4 })' 'print(counter, tools.slug.run("A B"))' > $T/hot.out ) &
 HP=$!
 sleep 2
 echo 'return { run = function(s) return (s:lower():gsub("[^%w]+", "_")) end }' > $W/.harness/pkgs/slug/init.luau
 $H approve slug --workspace $W >/dev/null
 wait $HP
-check "hot reload: before the edit the old code runs" "$(sed -n 1p $T/hot.out)" "a-b"
-check "hot reload: session variable survives and the new code is live" "$(grep -v '^$' $T/hot.out | tail -1)" "7	refreshed 2 extension(s)	a_b"
+check "frozen extensions: original source runs before the edit" "$(sed -n 1p $T/hot.out)" "a-b"
+check "frozen run: session variable and original source survive approval changes" "$(grep -v '^$' $T/hot.out | tail -1)" "7	a-b"
 
 # --- agent skills: <ws>/.agents/skills and ~/.agents/skills (no hx.toml, locked by `hx approve`, read-only outside the ws)
 A=$T/aws; FH=$T/home; mkdir -p $A/.agents/skills/vid $FH/.agents/skills/vid/references $FH/.agents/skills/craft/references

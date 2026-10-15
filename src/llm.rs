@@ -3,9 +3,8 @@
 //! restricts the model or the upstream provider.
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
-use std::time::Duration;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct LlmCfg {
     pub model: String,
     /// "openai" | "responses" | "claude-sdk"
@@ -24,7 +23,7 @@ pub struct LlmCfg {
     pub provider_only: Vec<String>,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Reply {
     pub text: String,
     /// tool calls the model made: [{id, name, input, error?}]; `input` is the parsed arguments object, `error` is set when they
@@ -171,7 +170,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     // (OpenRouter honours them for Anthropic/Gemini and ignores them elsewhere, where caching is automatic); the Responses
     // API has no markers and caches automatically. OpenAI-style requests also carry `prompt_cache_key`.
     let cache = !responses;
-    let max_tokens = req["max_tokens"].as_u64().unwrap_or(cfg.max_output);
+    let max_tokens = req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output);
     let msgs: Vec<Value> = req["messages"].as_array().cloned().unwrap_or_default();
     let tools: Vec<Value> = req["tools"].as_array().cloned().unwrap_or_default();
     let sys_block = if cache { json!({"type": "text", "text": system, "cache_control": cache_marker()}) } else { json!({"type": "text", "text": system}) };
@@ -201,40 +200,14 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     };
     let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
     let url = if responses { format!("{base}/responses") } else { format!("{base}/chat/completions") };
-    let mut resp: Option<Value> = None;
-    let mut last = String::new();
-    for attempt in 0..6u32 {
-        let r = http.post(&url).json(&body);
-        let r = r.bearer_auth(key);
-        match r.send().await {
-            Ok(r) if r.status().is_success() => {
-                // A 200 is not yet a reply: the body can be cut off (a dropped connection, the client timeout during a
-                // long generation), not JSON, or an `{"error": ...}` object (OpenRouter, when an upstream provider fails
-                // mid-request). All of those are retried like a 5xx instead of ending the run.
-                match r.text().await {
-                    Ok(t) => match serde_json::from_str::<Value>(&t) {
-                        Ok(v) if v.get("error").is_some() && v.get("choices").is_none() && v.get("output").is_none() => {
-                            last = format!("error body: {}", v["error"]);
-                        }
-                        Ok(v) => {
-                            resp = Some(v);
-                            break;
-                        }
-                        Err(e) => last = format!("undecodable body ({e}): {}", t.chars().take(200).collect::<String>()),
-                    },
-                    Err(e) => last = format!("body read failed: {e}"),
-                }
-            }
-            Ok(r) if matches!(r.status().as_u16(), 429 | 500 | 502 | 503 | 529) => last = format!("API {}", r.status()),
-            Ok(r) => bail!("API {}: {}", r.status(), r.text().await.unwrap_or_default()),
-            Err(e) if e.is_timeout() || e.is_connect() => last = format!("request failed: {e}"),
-            Err(e) => bail!("API request failed: {e}"),
-        }
-        if attempt < 5 {
-            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-        }
-    }
-    let Some(resp) = resp else { bail!("API unavailable after retries (last: {last})") };
+    // Generation can be billable even when its response is lost. The supervisor owns admission and recovery;
+    // neither this adapter nor reqwest may silently dispatch a second attempt.
+    let response = http.post(&url).bearer_auth(key).json(&body).send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() { bail!("API {status}: {text}"); }
+    let resp: Value = serde_json::from_str(&text)?;
+    if resp.get("error").is_some() { bail!("API error: {}", resp["error"]); }
 
     let u = &resp["usage"];
     let mut out = Reply::default();

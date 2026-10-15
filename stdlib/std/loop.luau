@@ -1,143 +1,208 @@
--- The agent loop (L2). The model has one tool, luau(code): the harness runs each call in the persistent session and returns
--- what it printed. A reply with no tool call is the final answer. Replace this module per project
--- (.harness/override/std/loop.luau) to change the loop.
-local feedback = require("std/feedback")
+-- Pure controller: all durable workflow state is passed in and returned. Rust dispatches commands.
 local hooks = require("std/hooks")
 local prompt = require("std/prompt")
-
+local compact = require("std/compact")
+local checkpoint = require("std/checkpoint")
 local M = {}
 
-local function code_of(call): string?
-	local input = call.input
-	return if type(input) == "table" and type(input.code) == "string" then input.code else nil
+local function code_of(call)
+	return if type(call.input) == "table" and type(call.input.code) == "string" then call.input.code else nil
 end
 
--- cfg: { task: string, max_turns: number }
--- returns a report: { turns, code_turns, luau_errors, truncated_turns, ops_per_turn, finished, final_answer }
-function M.run(cfg)
-	local ok, err = pcall(require, "project/init")
-	if not ok and not tostring(err):find("no project init", 1, true) then
-		hx.log("project init failed: " .. tostring(err)) -- a broken init must not stop the run
+local function ready(s)
+	for _, message in s.notifications or {} do table.insert(s.messages, message) end
+	s.notifications = nil
+	s.phase = "ready"
+	s.current = nil
+	return s, { kind = "next" }
+end
+
+local function finish(s)
+	s.phase = "finished"
+	return s, { kind = "finish", report = s.report }
+end
+
+function M.init(cfg)
+	return {
+		phase = "ready", max_turns = cfg.max_turns, task_text = cfg.task_message, messages = { { role = "user", content = cfg.task_message } },
+		report = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" },
+		bad = 0, no_call = 0, checkpoint_asked = false, last_tokens = 0, compact_failures = 0,
+		compacted_retry = false, hook_state = {},
+	}
+end
+
+local function save_hook_state(s)
+	hooks.state = s.hook_state
+end
+
+local function next_call(s)
+	local cur = s.current
+	local c = cur.calls[cur.index]
+	if not c then return ready(s) end
+	local code = code_of(c)
+	local error_text
+	if c.name ~= "luau" then
+		error_text = "error: the only tool is luau(code)."
+	elseif not code then
+		s.report.truncated_turns += 1
+		error_text = prompt.cut_call
+	else
+		local pre = hooks.emit("before_run", { code = code })
+		if pre.deny then error_text = "Blocked by a project hook: " .. tostring(pre.deny)
+		else
+			s.phase = "run"
+			return s, { kind = "run", code = pre.code }
+		end
 	end
-	require("std/packages").install({ hooks = hooks })
-	require("std/mcp").install({ hooks = hooks })
-	require("std/compact").install({ hooks = hooks }) -- adds nothing to requests until the context nears the window
-	require("std/checkpoint").install({ hooks = hooks }) -- one self-check before the first final answer
-	for _, name in cfg.packs or {} do
-		require(name).install({ hooks = hooks })
-	end
-	local rep = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" }
-	local messages = { { role = "user", content = prompt.task_message(cfg.task) } }
-	hx.log("### TASK\n" .. messages[1].content)
-	local bad, no_call = 0, 0
-	local retried = false -- one compact-and-retry per turn after a model_error hook asks for it
+	table.insert(s.report.ops_per_turn, 0)
+	table.insert(s.messages, { role = "tool", id = c.id, content = error_text })
+	cur.index += 1
+	return s, { kind = "next_call" }
+end
 
-	while rep.turns < cfg.max_turns do
-		local req = hooks.emit("before_model", { system = prompt.system(), messages = messages, tools = prompt.tools })
-		local called, resp = pcall(hx.llm, req)
-		if not called then
-			if tostring(resp):find("budget_exceeded", 1, true) then
-				rep.stopped = tostring(resp):match("budget_exceeded:[^\n]*") or "budget_exceeded"
-				hx.log("### STOPPED\n" .. rep.stopped)
-				break
+function M.step(s, event)
+	save_hook_state(s)
+	if event.kind == "recover" then
+		-- Close every pending tool call with receipts, never dispatch its old code again.
+		if s.current then
+			for i = s.current.index, #s.current.calls do
+				table.insert(s.messages, { role = "tool", id = s.current.calls[i].id,
+					content = "Interrupted by a crash. This chunk was NOT rerun. Consult the recovery receipts in the next user message." })
 			end
-			-- a hook (std/compact) may fix the cause, e.g. shrink an overflowing context, and ask for the same turn again
-			local ev = if retried then nil else hooks.emit("model_error", { error = tostring(resp), messages = messages })
-			if ev and ev.retry then
-				retried = true
-				continue -- rep.turns was not incremented; before_model runs again
-			end
-			error(if retried then "the model call failed again after one compact-and-retry: " .. tostring(resp) else resp, 0)
 		end
-		retried = false
-		rep.turns += 1
-		local usage = { input = resp.input or 0, cache_read = resp.cache_read or 0, cache_write = resp.cache_write or 0, output = resp.output or 0 }
-		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish, usage = usage })
-		local text, calls = reply.text, resp.calls
-		local summary = text
-		for _, c in calls do
-			summary ..= "\n[tool call " .. c.name .. "]\n" .. (code_of(c) or tostring(c.error))
+		if s.phase ~= "finished" then
+			s.compacted_retry = false
+			s.pending_overflow = nil
+			s.force_compact = false
+			s.last_tokens = 0
+			s.skip_compact = true
+			table.insert(s.messages, { role = "user", content = event.message })
+			return ready(s)
 		end
-		hx.log("### MODEL (turn " .. rep.turns .. ")\n" .. summary)
-		local cut = resp.finish == "length"
-
-		if #calls == 0 then
-			if text:match("^%s*$") or cut then
-				-- A truncated or empty reply is not a final answer: ask again instead of ending the run.
-				rep.truncated_turns += 1
-				bad += 1
-				if bad > 3 then
-					break
-				end
-				-- keep only a preview of a cut-off reply: re-sending a runaway (often a repetition loop) costs tokens and can
-				-- push the model into repeating itself
-				local preview = if text:match("^%s*$") then "(empty reply)" elseif #text > 1500 then text:sub(1, 1500) .. "\n…[reply cut off here]" else text
-				table.insert(messages, { role = "assistant", content = preview })
-				hx.log("### HARNESS\n" .. prompt.nudge_cut)
-				table.insert(messages, { role = "user", content = prompt.nudge_cut })
-				continue
-			end
-			if rep.code_turns == 0 and no_call < 2 then
-				-- A "final answer" before any code ran: push the model to start working.
-				no_call += 1
-				rep.truncated_turns += 1
-				table.insert(messages, { role = "assistant", content = text, raw = resp.raw })
-				hx.log("### HARNESS\n" .. prompt.nudge_no_call)
-				table.insert(messages, { role = "user", content = prompt.nudge_no_call })
-				continue
-			end
-			-- a project hook may ask for more work before the answer is accepted (e.g. a final self-check)
-			local fin = hooks.emit("before_finish", { text = text, turn = rep.turns })
-			if fin and fin.continue_with then
-				table.insert(messages, { role = "assistant", content = text, raw = resp.raw })
-				hx.log("### HARNESS\n" .. fin.continue_with)
-				table.insert(messages, { role = "user", content = fin.continue_with })
-				continue
-			end
-			rep.finished = true
-			rep.final_answer = text
-			break
+		return finish(s)
+	elseif event.kind == "run_result" then
+		assert(s.phase == "run", "unexpected chunk result")
+		local res = hooks.emit("after_run", event.result)
+		s.report.code_turns += 1
+		if type(res.error) == "string" then s.report.luau_errors += 1 end
+		s.notifications = s.notifications or {}
+		for _, message in event.notifications or {} do table.insert(s.notifications, message) end
+		table.insert(s.report.ops_per_turn, res.ops)
+		table.insert(s.messages, { role = "tool", id = s.current.calls[s.current.index].id, content = res.feedback })
+		s.current.index += 1
+		return next_call(s)
+	elseif event.kind == "model_error" then
+		if event.error:find("budget_exceeded", 1, true) then
+			s.report.stopped = event.error
+			return finish(s)
 		end
-		bad = 0
-
-		table.insert(messages, { role = "assistant", content = text, calls = calls, raw = resp.raw })
-		-- every call id gets exactly one result, in order
-		for _, c in calls do
-			local code = code_of(c)
-			local fb
-			if c.name ~= "luau" then
-				fb = "error: unknown tool " .. tostring(c.name) .. "; the only tool is luau(code)."
-				table.insert(rep.ops_per_turn, 0)
-			elseif code == nil then
-				rep.truncated_turns += 1
-				fb = if cut then prompt.cut_call else "error: the luau tool needs a string argument `code` (" .. tostring(c.error or "missing") .. ")."
-				table.insert(rep.ops_per_turn, 0)
+		if s.phase == "compact" then
+			if s.pending_overflow then error("compaction failed after context overflow: " .. s.pending_overflow, 0) end
+			s.compact_failures += 1
+			s.skip_compact = true
+			return ready(s)
+		end
+		local recovery = hooks.emit("model_error", { error = event.error, messages = s.messages })
+		if recovery.retry and not s.compacted_retry then
+			s.compacted_retry = true
+			return ready(s)
+		end
+		if event.safe_context_rejection and compact.enabled and not s.compacted_retry and compact.overflow(event.error) then
+			s.force_compact = true
+			s.compacted_retry = true
+			s.pending_overflow = event.error
+			return ready(s)
+		end
+		error(if s.compacted_retry then "the model call failed again after one compact-and-retry: " .. event.error else event.error, 0)
+	elseif event.kind == "model_reply" then
+		if s.phase == "compact" then
+			local text = event.reply.text or ""
+			if text:match("^%s*$") then
+				if s.pending_overflow then error("compaction returned no summary after: " .. s.pending_overflow, 0) end
+				s.compact_failures += 1
 			else
-				local pre = hooks.emit("before_run", { code = code })
-				if pre.deny then
-					fb = "Blocked by a project hook: " .. tostring(pre.deny) .. "\n"
-					table.insert(rep.ops_per_turn, 0)
-				else
-					local res = hx.run(pre.code)
-					res = hooks.emit("after_run", res)
-					rep.code_turns += 1
-					if res.error then
-						rep.luau_errors += 1
-					end
-					table.insert(rep.ops_per_turn, res.ops)
-					fb = feedback.compose(res, pre.code)
-				end
+				local kept = table.move(s.messages, s.compact_cut, #s.messages, 1, {})
+				s.previous_summary = text
+				s.messages = { { role = "user", content = compact.wrap(s.task_text, text) } }
+				table.move(kept, 1, #kept, 2, s.messages)
+				s.last_tokens = 0
+				s.pending_overflow = nil
 			end
-			hx.log("### RESULT\n" .. fb)
-			table.insert(messages, { role = "tool", id = c.id, content = fb })
+			s.skip_compact = true
+			return ready(s)
 		end
+		assert(s.phase == "model", "unexpected model reply")
+		local resp = event.reply
+		s.report.turns += 1
+		s.last_tokens = (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0) + (resp.output or 0)
+		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish, usage = {
+			input = resp.input, output = resp.output, cache_read = resp.cache_read, cache_write = resp.cache_write } })
+		local text, calls = reply.text, resp.calls or {}
+		if #calls == 0 then
+			if text:match("^%s*$") or resp.finish == "length" then
+				s.bad += 1
+				s.report.truncated_turns += 1
+				if s.bad > 3 then return finish(s) end
+				table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
+				table.insert(s.messages, { role = "user", content = prompt.nudge_cut })
+				return ready(s)
+			end
+			if s.report.code_turns == 0 and s.no_call < 2 then
+				s.no_call += 1
+				s.report.truncated_turns += 1
+				table.insert(s.messages, { role = "assistant", content = text, raw = resp.raw })
+				table.insert(s.messages, { role = "user", content = prompt.nudge_no_call })
+				return ready(s)
+			end
+			local fin = hooks.emit("before_finish", { action = "accept", text = text, turn = s.report.turns })
+			local follow = if fin.action == "continue" then fin.message else nil
+			if not follow and checkpoint.enabled and not s.checkpoint_asked then
+				s.checkpoint_asked = true
+				follow = checkpoint.message
+			end
+			if follow then
+				table.insert(s.messages, { role = "assistant", content = text, raw = resp.raw })
+				table.insert(s.messages, { role = "user", content = follow })
+				return ready(s)
+			end
+			s.report.finished = true
+			s.report.final_answer = text
+			return finish(s)
+		end
+		s.bad = 0
+		s.compacted_retry = false
+		table.insert(s.messages, { role = "assistant", content = text, calls = calls, raw = resp.raw })
+		s.current = { calls = calls, index = 1 }
+		return next_call(s)
+	elseif event.kind == "next_call" then
+		return next_call(s)
 	end
-	if not rep.finished and not rep.stopped and rep.turns >= cfg.max_turns then
-		-- out of turns is not a failure of the task: say so, so a report can tell a cut-off run from a wrong answer
-		rep.stopped = "max_turns: " .. cfg.max_turns
-		hx.log("### STOPPED\n" .. rep.stopped)
+
+	if s.phase == "finished" then return finish(s) end
+	assert(s.phase == "ready", "unexpected controller event")
+	if s.report.turns >= s.max_turns then
+		s.report.stopped = "max_turns: " .. s.max_turns
+		return finish(s)
 	end
-	return rep
+	local req = hooks.emit("before_model", { system = prompt.system(), messages = s.messages, tools = prompt.tools })
+	local info = hx.model_info()
+	local window = if type(info.context_window) == "number" then info.context_window else compact.context_window
+	local max_output = info.max_output or 16384
+	if compact.enabled and s.compact_failures < 2 and not s.skip_compact and (s.force_compact or s.last_tokens >= compact.trigger(window, max_output)) then
+		local limit = compact.trigger(window, max_output)
+		local cut = compact.find_cut(s.messages, 2, math.min(compact.keep_recent_tokens, math.floor((if limit > 0 then limit else window) / 4)), compact.scale(s.last_tokens, req.system, s.messages))
+		if cut then
+			s.compact_cut = cut
+			s.phase = "compact"
+			s.force_compact = false
+			return s, { kind = "model", request = compact.request(s.messages, cut, s.previous_summary), purpose = "compact" }
+		end
+		if s.pending_overflow then error(s.pending_overflow, 0) end
+	end
+	s.skip_compact = false
+	s.force_compact = false
+	s.phase = "model"
+	return s, { kind = "model", request = req, purpose = "agent" }
 end
 
 return M
