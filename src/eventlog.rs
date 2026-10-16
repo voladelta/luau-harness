@@ -81,6 +81,7 @@ impl EventLog {
         let text = read_text(path)?;
         let report = verify_text(&text)?;
         anyhow::ensure!(report.chain_ok, "{}: hash chain broken at line {}; not resuming a damaged log", path.display(), report.bad_line.unwrap_or(0));
+        anyhow::ensure!(report.recovery_error.is_none(), "invalid recovery accounting: {}", report.recovery_error.as_deref().unwrap_or_default());
         let (records, torn) = parse(&text).map_err(|n| anyhow::anyhow!("{}: line {n} is not valid JSON; not resuming a damaged log", path.display()))?;
         let (mut seq, mut prev) = (0u64, "genesis".to_string());
         for (line, v) in &records {
@@ -138,6 +139,10 @@ impl EventLog {
     pub fn write(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
         anyhow::ensure!(!self.owner_reconciliation || matches!(kind, "resolution" | "billing"), "owner reconciliation can only record resolutions or billing");
         self.check()?;
+        Books::validate(kind, &fields).map_err(|e| self.fail(format!("invalid journal record: {e}")))?;
+        if !fields.as_object().is_some_and(|fields| ["seq", "prev", "kind", "session", "ts_ms"].iter().all(|key| !fields.contains_key(*key))) {
+            return Err(self.fail("journal fields cannot replace record metadata"));
+        }
         let mut g = self.inner.lock().unwrap();
         self.check()?; // another writer may have failed while this one waited for the file
         g.seq += 1;
@@ -170,6 +175,7 @@ pub struct Report {
     /// (seq, tool, summary) for every intent without an outcome
     pub unknown: Vec<(u64, String, String)>,
     pub unknown_models: Vec<u64>,
+    pub recovery_error: Option<String>,
 }
 
 /// One complete record: its line exactly as written (the hash chain covers it) and the parsed value.
@@ -201,14 +207,8 @@ fn parse(text: &str) -> std::result::Result<(Vec<Record<'_>>, bool), usize> {
 }
 
 /// Write `bytes` to `path` through a temp file and a rename, so readers see the old or the new content, never a part.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, path)
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    crate::atomic_file::replace_trusted(path, bytes)
 }
 
 /// A model request's admission reservation, held until a receipt, a definite rejection or a billing decision.
@@ -234,7 +234,33 @@ impl Books {
         Ok(books)
     }
 
+    /// Validate all fallible fields before changing any ledger state.
+    pub fn validate(kind: &str, r: &Value) -> Result<()> {
+        if matches!(kind, "outcome" | "resolution" | "uncertain" | "llm" | "billing") {
+            anyhow::ensure!(r["of"].as_u64().is_some_and(|id| id > 0), "{kind} record missing operation ID");
+        }
+        let cost = |field: &str| -> Result<()> {
+            anyhow::ensure!(r[field].as_f64().is_some_and(|v| v.is_finite() && v >= 0.0), "{kind} record missing or invalid {field}");
+            Ok(())
+        };
+        match kind {
+            "model_intent" => {
+                anyhow::ensure!(r["reserved_tokens"].as_u64().is_some(), "missing reservation tokens");
+                anyhow::ensure!(r["bounded"].is_boolean(), "missing reservation bound flag");
+                cost("reserved_cost")?;
+            },
+            "billing" => {
+                anyhow::ensure!(r["tokens"].as_u64().is_some(), "billing decision missing tokens");
+                cost("cost")?;
+            },
+            "llm" if r.get("error").is_none() => { cost("cost")?; },
+            _ => {},
+        }
+        Ok(())
+    }
+
     pub fn apply(&mut self, seq: u64, kind: &str, r: &Value) -> Result<()> {
+        Self::validate(kind, r)?;
         let of = || r["of"].as_u64().with_context(|| format!("{kind} record missing operation ID"));
         match kind {
             "intent" if r["class"] != "read" => { self.open.insert(seq, r.clone()); },
@@ -284,17 +310,25 @@ fn verify_text(text: &str) -> Result<Report> {
     let mut prev = "genesis".to_string();
     let mut books = Books::default();
     let (mut n, mut bad) = (0, None);
+    let mut recovery_error = None;
     for (i, (line, v)) in records.into_iter().enumerate() {
         if v["prev"].as_str() != Some(prev.as_str()) && bad.is_none() {
             bad = Some(i + 1);
         }
         prev = sha_bytes(line.as_bytes());
         n += 1;
-        // Verification reports what it can; a malformed record is the chain check's business, not a reason to stop.
-        let _ = books.apply(v["seq"].as_u64().unwrap_or(0), v["kind"].as_str().unwrap_or_default(), &v);
+        if recovery_error.is_none() {
+            let apply = (|| -> Result<()> {
+                let seq = v["seq"].as_u64().context("missing record sequence")?;
+                anyhow::ensure!(seq == n as u64, "record sequence must be consecutive");
+                let kind = v["kind"].as_str().context("missing record kind")?;
+                books.apply(seq, kind, &v)
+            })();
+            if let Err(error) = apply { recovery_error = Some(format!("line {}: {error}", i + 1)); }
+        }
     }
     let unknown = books.open.iter().map(|(&s, v)| (s, v["tool"].as_str().unwrap_or("?").into(), v["summary"].as_str().unwrap_or("").into())).collect();
-    Ok(Report { records: n, chain_ok: bad.is_none(), bad_line: bad, unknown, unknown_models: books.reservations.keys().copied().collect() })
+    Ok(Report { records: n, chain_ok: bad.is_none(), bad_line: bad, unknown, unknown_models: books.reservations.keys().copied().collect(), recovery_error })
 }
 
 fn crash_hook() -> Option<u64> {
@@ -313,6 +347,7 @@ pub fn load(path: &Path) -> Result<Vec<Value>> {
     let text = read_text(path)?;
     let report = verify_text(&text)?;
     anyhow::ensure!(report.chain_ok, "{}: hash chain broken at line {}", path.display(), report.bad_line.unwrap_or(0));
+    anyhow::ensure!(report.recovery_error.is_none(), "invalid recovery accounting: {}", report.recovery_error.as_deref().unwrap_or_default());
     let records = parse(&text).map_err(|n| anyhow::anyhow!("{}: line {n} is not valid JSON", path.display()))?.0;
     Ok(records.into_iter().map(|(_, v)| v).collect())
 }
@@ -320,6 +355,48 @@ pub fn load(path: &Path) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod open_tests {
     use super::*;
+
+    #[test]
+    fn malformed_accounting_does_not_partially_update_books() {
+        let mut books = Books::default();
+        books.apply(1, "model_intent", &json!({"reserved_tokens": 10, "reserved_cost": 1.0, "bounded": true})).unwrap();
+        assert!(books.apply(2, "billing", &json!({"of": 1, "tokens": 8})).is_err());
+        assert_eq!(books.reserved(), (10, 1.0));
+        assert_eq!(books.usage.input, 0);
+        assert_eq!(books.usage.calls, 0);
+    }
+
+    #[test]
+    fn invalid_accounting_is_rejected_before_append_and_stops_admission() {
+        let path = three_records("invalid-append");
+        let log = EventLog::reopen(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(log.write("billing", json!({"of": 1, "tokens": 8}), true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(log.check().is_err());
+        assert!(log.write("note", json!({}), false).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn intact_chain_does_not_hide_invalid_accounting_or_sequence() {
+        for (tag, fields) in [("invalid-books", json!({"seq": 4, "kind": "billing", "tokens": 8})),
+                              ("invalid-sequence", json!({"seq": 5, "kind": "note"}))] {
+            let path = three_records(tag);
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            let mut record = fields;
+            record["prev"] = json!(sha_bytes(text.lines().last().unwrap().as_bytes()));
+            text.push_str(&format!("{record}\n"));
+            std::fs::write(&path, &text).unwrap();
+            let report = verify(&path).unwrap();
+            assert!(report.chain_ok);
+            assert!(report.recovery_error.is_some());
+            assert!(EventLog::reopen(&path).is_err());
+            assert!(load(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
 
     #[test]
     fn two_sessions_in_the_same_second_get_distinct_logs() {

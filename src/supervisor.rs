@@ -310,7 +310,7 @@ impl Supervisor {
 
     fn record_in(&self, books: &mut Books, kind: &str, fields: Value, sync: bool) -> Result<u64> {
         let seq = self.policy.log.write(kind, fields.clone(), sync)?;
-        books.apply(seq, kind, &fields)?;
+        books.apply(seq, kind, &fields).map_err(|e| self.policy.log.fail(format!("journal ledger update failed: {e}")))?;
         Ok(seq)
     }
 

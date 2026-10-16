@@ -1,4 +1,5 @@
 mod claude_sdk;
+mod atomic_file;
 mod effects;
 mod eventlog;
 mod host;
@@ -79,7 +80,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate it. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
-        "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 tampered, 3 unknown outcomes.\n",
+        "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 corrupt chain or invalid recovery accounting, 3 unknown outcomes.\n",
         _ => return None,
     })
 }
@@ -506,7 +507,8 @@ fn cmd_log_verify(args: &[String]) -> Result<()> {
         println!("UNKNOWN OUTCOME: #{seq} {tool}: {summary}");
     }
     for seq in &r.unknown_models { println!("UNKNOWN BILLING: #{seq} model request"); }
-    if !r.chain_ok {
+    if let Some(error) = &r.recovery_error { println!("INVALID RECOVERY ACCOUNTING: {error}"); }
+    if !r.chain_ok || r.recovery_error.is_some() {
         std::process::exit(1);
     }
     if !r.unknown.is_empty() || !r.unknown_models.is_empty() {

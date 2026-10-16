@@ -245,7 +245,7 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
 
 // A mutation with an unreadable response may have happened. Keep its intent open for owner reconciliation.
 fn unusable(class: Class, message: impl AsRef<str>) -> mlua::Error {
-    mlua::Error::runtime(if class == Class::Read { message.as_ref().to_string() } else { format!("unknown_outcome: {}", message.as_ref()) })
+    if class == Class::Read { mlua::Error::runtime(message.as_ref()) } else { crate::effects::unknown(message.as_ref()) }
 }
 
 fn redact(value: &mut serde_json::Value, key: &str) {

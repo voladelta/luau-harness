@@ -354,7 +354,7 @@ impl Vm {
                             return Err(mlua::Error::runtime(format!("approval_required: {why}")));
                         }
                         let r = m.request(&server, "tools/call", json!({"name": tool, "arguments": args_json})).await
-                            .map_err(|e| mlua::Error::runtime(if class == Class::Read { e.to_string() } else { format!("unknown_outcome: MCP request failed; the server may have acted: {e}") }))?;
+                            .map_err(|e| if class == Class::Read { mlua::Error::runtime(e.to_string()) } else { crate::effects::unknown(format!("MCP request failed; the server may have acted: {e}")) })?;
                         Ok(Ret::Json(r))
                     }).await?;
                     prims::json_value(&lua, ret)

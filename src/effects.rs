@@ -13,6 +13,33 @@ pub fn rt(msg: impl Into<String>) -> mlua::Error {
     mlua::Error::runtime(msg.into())
 }
 
+/// An effect may have acted, so its durable intent must remain unresolved.
+#[derive(Debug)]
+pub struct UnknownOutcome(pub String);
+impl std::fmt::Display for UnknownOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "unknown_outcome: {}", self.0) }
+}
+impl std::error::Error for UnknownOutcome {}
+
+pub fn unknown(message: impl Into<String>) -> mlua::Error {
+    mlua::Error::external(UnknownOutcome(message.into()))
+}
+
+pub fn effect_error(error: anyhow::Error) -> mlua::Error {
+    match error.downcast::<UnknownOutcome>() {
+        Ok(error) => mlua::Error::external(error),
+        Err(error) => mlua::Error::external(error),
+    }
+}
+
+fn is_unknown(error: &mlua::Error) -> bool {
+    match error {
+        mlua::Error::ExternalError(error) => error.downcast_ref::<UnknownOutcome>().is_some(),
+        mlua::Error::CallbackError { cause, .. } | mlua::Error::WithContext { cause, .. } => is_unknown(cause),
+        _ => false,
+    }
+}
+
 /// The recorded result of one effect.
 #[derive(Clone, Debug)]
 pub enum Ret {
@@ -109,7 +136,7 @@ impl Effects {
         let Call { tool, class, args, sha } = *c;
         if let (Some(id), Err(error)) = (intent, res) {
             let message = err_text(error);
-            if message.starts_with("unknown_outcome:") {
+            if is_unknown(error) {
                 return self.supervisor.uncertain(id, tool, args, &message).map_err(mlua::Error::external);
             }
         }
@@ -149,6 +176,7 @@ impl Effects {
         let _permit = if class != Class::Read && tool != Tool::Agent {
             Some(self.supervisor.mutations.clone().try_acquire_owned().map_err(|_| rt("another mutation is in progress"))?)
         } else { None };
+        self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
         let sha = args_sha(&args);
         let t0 = std::time::Instant::now();
         let call = Call { tool, class, args: &args, sha: &sha };
@@ -168,7 +196,8 @@ impl Effects {
         let _permit = if class != Class::Read && tool != Tool::Agent {
             Some(self.supervisor.mutations.clone().acquire_owned().await.map_err(mlua::Error::external)?)
         } else { None };
-        self.supervisor.check().map_err(mlua::Error::external)?;
+        // State may change while queued behind another mutation.
+        self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
         let sha = args_sha(&args);
         let t0 = std::time::Instant::now();
         let _wait = self.awaiting(lua);
@@ -177,7 +206,7 @@ impl Effects {
         let res = {
             match self.supervisor.remaining() {
                 Some(remaining) => tokio::time::timeout(remaining, f()).await
-                    .unwrap_or_else(|_| Err(rt("unknown_outcome: absolute run deadline interrupted this effect; it may have acted"))),
+                    .unwrap_or_else(|_| Err(unknown("absolute run deadline interrupted this effect; it may have acted"))),
                 None => f().await,
             }
         };
@@ -225,5 +254,58 @@ impl Drop for WaitGuard {
                 w.remove(&self.key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn effects(tag: &str) -> (Arc<Effects>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hx-effects-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = Policy::new(&dir, true, None, None, None).unwrap();
+        (Effects::new(Arc::new(pol), 0, Arc::default()), dir)
+    }
+
+    #[tokio::test]
+    async fn queued_mutation_rechecks_uncertain_state_before_dispatch() {
+        let (fx, dir) = effects("queued");
+        let lua = Lua::new();
+        let permit = fx.supervisor.mutations.clone().acquire_owned().await.unwrap();
+        let id = fx.supervisor.intent(Tool::McpCall, Class::External, &json!({}), "hash", 0, &fx.principal).unwrap();
+        let executed = std::cell::Cell::new(false);
+        let queued = fx.run(&lua, Tool::Sh, Class::LocalWrite, json!({}), || async {
+            executed.set(true);
+            Ok(Ret::Num(1.0))
+        });
+        tokio::pin!(queued);
+        tokio::select! {
+            biased;
+            _ = &mut queued => panic!("mutation must wait for its permit"),
+            _ = tokio::task::yield_now() => {},
+        }
+        fx.supervisor.uncertain(id, Tool::McpCall, &json!({}), "lost response").unwrap();
+        drop(permit);
+        assert!(queued.await.is_err());
+        assert!(!executed.get());
+        assert!(fx.sync(&lua, Tool::Read, Class::Read, json!({}), |_| Ok(Ret::Num(0.0))).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn uncertainty_uses_error_type_instead_of_message_text() {
+        let (fx, dir) = effects("typed");
+        let lua = Lua::new();
+        let result = fx.sync(&lua, Tool::Write, Class::LocalWrite, json!({}), |_| Err(rt("unknown_outcome: ordinary error text")));
+        assert!(result.is_err());
+        assert!(fx.supervisor.uncertain_operations().is_empty());
+        let result = fx.sync(&lua, Tool::Write, Class::LocalWrite, json!({}), |_| Err(unknown("response lost")));
+        assert!(result.is_err());
+        assert_eq!(fx.supervisor.uncertain_operations().len(), 1);
+        assert_eq!(crate::eventlog::verify(&fx.log().path).unwrap().unknown.len(), 1);
+        drop(fx);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

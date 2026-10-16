@@ -28,20 +28,9 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
 
 /// Replace a file's content all at once (temp file, fsync, rename), after journaling the content's hash. A crash leaves
 /// the old or the new file, never a torn one, so resume can tell which from the disk (`supervisor::reconcile`).
-fn replace_file(sup: &crate::supervisor::Supervisor, intent: Option<u64>, p: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
+fn replace_file(sup: &crate::supervisor::Supervisor, intent: Option<u64>, p: &Path, target: &crate::atomic_file::Target, bytes: &[u8]) -> Result<()> {
     if let Some(id) = intent { sup.expect(id, p, &crate::eventlog::sha_bytes(bytes))?; }
-    let name = p.file_name().ok_or_else(|| anyhow::anyhow!("not a file path"))?.to_string_lossy();
-    let tmp = p.with_file_name(format!(".{name}.hx-tmp-{}", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        if let Ok(meta) = std::fs::metadata(p) { file.set_permissions(meta.permissions())?; }
-        file.sync_all()?;
-        std::fs::rename(&tmp, p)
-    })();
-    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
-    Ok(result?)
+    target.replace(bytes)
 }
 
 pub fn opt_str(o: &Option<Table>, k: &str) -> Option<String> {
@@ -134,10 +123,8 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let sup = f.supervisor.clone();
         match f.sync(lua, crate::supervisor::Tool::Write, Class::LocalWrite, args, |intent| {
             let p = pol.check_write(&path).map_err(|e| rt(format!("write {path}: {e}")))?;
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| rt(format!("write {path}: {e}")))?;
-            }
-            replace_file(&sup, intent, &p, &bytes).map_err(|e| rt(format!("write {path}: {e}")))?;
+            let target = crate::atomic_file::Target::open(&p, true).map_err(mlua::Error::external)?;
+            replace_file(&sup, intent, &p, &target, &bytes).map_err(crate::effects::effect_error)?;
             Ok(Ret::Num(bytes.len() as f64))
         })? {
             Ret::Num(n) => Ok(n as i64),
@@ -160,7 +147,8 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             if pol.enabled && crate::policy::is_secret(&p) {
                 return Err(rt(format!("edit {path}: policy: a credential file cannot be read")));
             }
-            let text = std::fs::read_to_string(&p).map_err(|e| rt(format!("edit {path}: {e}")))?;
+            let target = crate::atomic_file::Target::open(&p, false).map_err(mlua::Error::external)?;
+            let text = target.read_to_string().map_err(|e| rt(format!("edit {path}: {e}")))?;
             if old.is_empty() {
                 return Err(rt(format!("edit {path}: `old` is empty")));
             }
@@ -171,7 +159,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             if n > 1 && !all {
                 return Err(rt(format!("edit_not_unique: text matches {n} times in {path}; include more surrounding lines or pass {{all=true}}")));
             }
-            replace_file(&sup, intent, &p, text.replace(&old, &new).as_bytes()).map_err(|e| rt(format!("edit {path}: {e}")))?;
+            replace_file(&sup, intent, &p, &target, text.replace(&old, &new).as_bytes()).map_err(crate::effects::effect_error)?;
             let (a, b) = (new.lines().count() * n, old.lines().count() * n);
             Ok(Ret::Str(format!("ok: {n} replacement{}, +{a}/-{b} lines", if n == 1 { "" } else { "s" })))
         })? {

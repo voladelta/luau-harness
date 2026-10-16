@@ -128,7 +128,7 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
 | `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
-| `hx log verify FILE` | Check a log's hash chain; exit 0 ok, 1 tampered, 3 unknown outcomes |
+| `hx log verify FILE` | Check a log's hash chain and recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
 
 `hx run` flags:
 
