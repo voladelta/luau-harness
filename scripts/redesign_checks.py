@@ -449,10 +449,10 @@ def bounded_lost_response():
             assert report["budget"]["reserved_cost"] == 0 and report["budget"]["reserved_tokens"] == 0, (name, report)
             log = records(journal(path))
             intent = next(r for r in log if r["kind"] == "model_intent")
-            assert intent["bounded"] is True and intent["billing_bound"] == intent["reserved_cost"] and 0 < intent["reserved_cost"] < 0.1, (name, intent)
+            assert intent["reserved_cost"]["kind"] == "upper_bound" and 0 < intent["reserved_cost"]["usd"] < 0.1, (name, intent)
             billing = [r for r in log if r["kind"] == "billing"]
-            assert [(r["of"], r["source"], r["cost"]) for r in billing] == [(intent["seq"], "hx", intent["reserved_cost"])], billing
-            assert report["cost_usd"] >= intent["reserved_cost"], report
+            assert [(r["of"], r["source"], r["cost"]) for r in billing] == [(intent["seq"], "hx", intent["reserved_cost"]["usd"])], billing
+            assert report["cost_usd"] >= intent["reserved_cost"]["usd"], report
     # A crash after the lost response's record, before its charge, is charged on resume.
     path = workspace("lost-crash")
     with provider(lambda body, i: None, PRICE) as (url, calls):
@@ -474,7 +474,7 @@ def unknown_billing_without_cost_threshold():
             log = journal(path)
             saved = records(log)
             intent = next(r for r in saved if r["kind"] == "model_intent")
-            assert len(calls) == 1 and intent["billing_bound"] is None and intent["bounded"] is False
+            assert len(calls) == 1 and intent["reserved_cost"] == {"kind":"allowance","usd":0.0}
             assert not any(r["kind"] == "billing" for r in saved)
             assert "UNKNOWN BILLING" in run(path, "log", "verify", str(log), ok=False).stdout
             run(path, "recover", str(log), str(intent["seq"]), "--decision", "billing", "--tokens", "15", "--cost", "0.002", "--yes")
@@ -519,7 +519,7 @@ print("CHILDREN_OK")'''
         assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 6, report
         assert peak[0] == 2, peak
         intents = [r for r in records(journal(path)) if r["kind"] == "model_intent"]
-        assert all(r["bounded"] and r["reserved_cost"] < 0.5 for r in intents), intents
+        assert all(r["reserved_cost"]["kind"] == "upper_bound" and r["reserved_cost"]["usd"] < 0.5 for r in intents), intents
 
 
 def sandboxed_sh_settles():
@@ -894,26 +894,18 @@ def cli_preflight():
     assert not Path("absent.lock").exists()
 
 
-def legacy_checkpoint_resume():
-    path = workspace("legacy-checkpoint")
-    with provider(lambda body, i: tool('durable.set("saved",7)') if i == 0 else "done") as (url, calls):
+def unsupported_run_format():
+    path = workspace("unsupported-format")
+    with provider(lambda body, i: "done") as (url, calls):
         start(path, url)
         log = journal(path)
         saved = records(log)
         manifest = next(r for r in saved if r["kind"] == "manifest")
         content = json.loads((log.parent / "blobs" / manifest["blob"]).read_text())
-        assert content["format"] == 3, content["format"]
-        manifest["format"] = 2
-        content["format"] = 2
-        final = next(r for r in reversed(saved) if r["kind"] == "checkpoint")
-        checkpoint = json.loads((log.parent / "blobs" / final["blob"]).read_text())
-        legacy = {"controller": {"phase": {"kind": "finished"}, "report": checkpoint["report"]},
-                  "durable": checkpoint["durable"]}
-        for record, blob in ((manifest, content), (final, legacy)):
-            data = json.dumps(blob).encode()
-            record["blob"] = hashlib.sha256(data).hexdigest()
-            (log.parent / "blobs" / record["blob"]).write_bytes(data)
-        # Build the old-format fixture with a valid hash chain; corruption refusal is tested separately.
+        content["format"] = manifest["format"] = 0
+        data = json.dumps(content).encode()
+        manifest["blob"] = hashlib.sha256(data).hexdigest()
+        (log.parent / "blobs" / manifest["blob"]).write_bytes(data)
         previous, lines = "genesis", []
         for record in saved:
             record["prev"] = previous
@@ -922,15 +914,11 @@ def legacy_checkpoint_resume():
             previous = hashlib.sha256(line.encode()).hexdigest()
         log.write_text("\n".join(lines) + "\n")
         count = len(calls)
-        restored = json.loads(run(path, "run", "--resume", str(log)).stdout)
-        assert restored["finished"] and restored["final_answer"] == "done" and len(calls) == count, restored
-        branch = json.loads(run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url,
-                                "--key-env", "HX_TEST_KEY").stdout)
-        assert branch["finished"], branch
-        branch_log = Path(branch["log"])
-        first = next(r for r in records(branch_log) if r["kind"] == "manifest")
-        branched = json.loads((branch_log.parent / "blobs" / first["blob"]).read_text())
-        assert branched["format"] == 3 and branched["branch"]["durable"]["saved"] == 7, (branched["format"], branched["branch"]["durable"])
+        for flag in ("--resume", "--branch"):
+            refused = run(path, "run", flag, str(log), ok=False)
+            assert refused.returncode and "unsupported run format 0" in refused.stderr, refused.stderr
+            assert len(calls) == count
+
 
 
 def agent_option_validation():
@@ -996,7 +984,7 @@ if __name__ == "__main__":
     check("completed runs retain their answer after deadlines, including custom controllers", completed_deadline_resume)
     check("controller-only transitions and CPU loops obey the absolute deadline", controller_deadlines)
     check("invalid CLI options fail before opening a journal", cli_preflight)
-    check("format-2 checkpoints resume and branch into format-3 runs", legacy_checkpoint_resume)
+    check("unsupported run formats fail before resume or branch dispatch", unsupported_run_format)
     check("session, package and batch agents reject invalid options before dispatch", agent_option_validation)
     check("corrupt artifacts fail before dispatch", corrupt_artifacts)
     print(f"{passed} passed; artifacts: {BASE}")

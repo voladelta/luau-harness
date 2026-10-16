@@ -213,7 +213,24 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
 /// A model request's admission reservation, held until a receipt, a definite rejection or a billing decision.
 #[derive(Clone, Copy)]
-pub struct Reservation { pub tokens: u64, pub cost: f64, pub billing_bound: Option<f64>, pub running: bool }
+pub struct Reservation { pub tokens: u64, pub cost: ReservationCost, pub running: bool }
+
+/// A price bound can settle unknown billing; an admission allowance cannot.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "usd", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReservationCost { UpperBound(f64), Allowance(f64) }
+
+impl ReservationCost {
+    pub fn amount(self) -> f64 { match self { Self::UpperBound(usd) | Self::Allowance(usd) => usd } }
+
+    pub fn upper_bound(self) -> Option<f64> { match self { Self::UpperBound(usd) => Some(usd), Self::Allowance(_) => None } }
+
+    fn load(value: &Value) -> Result<Self> {
+        let cost: Self = serde_json::from_value(value.clone()).context("invalid cost reservation")?;
+        anyhow::ensure!(cost.amount().is_finite() && cost.amount() >= 0.0, "invalid reserved cost");
+        Ok(cost)
+    }
+}
 
 /// What the journal says about spend and open effects. The live supervisor, resume, reconciliation, `hx log verify` and
 /// `hx recover` all build it with `Books::apply`, so they cannot disagree about what is open.
@@ -246,15 +263,7 @@ impl Books {
         match kind {
             "model_intent" => {
                 anyhow::ensure!(r["reserved_tokens"].as_u64().is_some(), "missing reservation tokens");
-                anyhow::ensure!(r["bounded"].is_boolean(), "missing reservation bound flag");
-                cost("reserved_cost")?;
-                if let Some(bound) = r.get("billing_bound") {
-                    if !bound.is_null() {
-                        cost("billing_bound")?;
-                        anyhow::ensure!(bound == &r["reserved_cost"], "billing bound must equal the full reservation");
-                    }
-                    anyhow::ensure!(r["bounded"] == !bound.is_null(), "inconsistent reservation bound flag");
-                }
+                ReservationCost::load(&r["reserved_cost"])?;
             },
             "billing" => {
                 anyhow::ensure!(r["tokens"].as_u64().is_some(), "billing decision missing tokens");
@@ -274,9 +283,7 @@ impl Books {
             "outcome" | "resolution" => { let id = of()?; self.open.remove(&id); self.uncertain.remove(&id); },
             "uncertain" => { self.uncertain.insert(of()?); },
             "model_intent" => { self.reservations.insert(seq, Reservation { tokens: r["reserved_tokens"].as_u64().context("missing reservation")?,
-                cost: r["reserved_cost"].as_f64().context("missing reservation")?,
-                // Old `bounded: true` could describe a clipped allowance or an unpriced zero, not a billing bound.
-                billing_bound: r["billing_bound"].as_f64(), running: true }); },
+                cost: ReservationCost::load(&r["reserved_cost"])?, running: true }); },
             "llm" if r.get("error").is_none() => {
                 self.reservations.remove(&of()?);
                 let u = &mut self.usage;
@@ -304,7 +311,7 @@ impl Books {
     }
 
     pub fn reserved(&self) -> (u64, f64) {
-        self.reservations.values().fold((0, 0.0), |(t, c), r| (t + r.tokens, c + r.cost))
+        self.reservations.values().fold((0, 0.0), |(t, c), r| (t + r.tokens, c + r.cost.amount()))
     }
 }
 
@@ -366,28 +373,26 @@ mod open_tests {
     use super::*;
 
     #[test]
-    fn legacy_bound_flags_are_not_billing_evidence() {
+    fn cost_reservations_have_one_validated_kind_and_amount() {
         let mut books = Books::default();
-        books.apply(1, "model_intent", &json!({"reserved_tokens":10,"reserved_cost":0.01,"bounded":true})).unwrap();
-        assert_eq!(books.reservations[&1].billing_bound, None);
-        let known = json!({"reserved_tokens":10,"reserved_cost":2.0,"bounded":true,"billing_bound":2.0});
-        books.apply(2, "model_intent", &known).unwrap();
-        assert_eq!(books.reservations[&2].billing_bound, Some(2.0));
-        for invalid in [json!(1.0), json!(-1.0), json!("2.0")] {
-            let mut record = known.clone();
-            record["billing_bound"] = invalid;
-            assert!(books.apply(3, "model_intent", &record).is_err());
+        for (id, kind, amount) in [(1, "upper_bound", 2.0), (2, "allowance", 1.0)] {
+            books.apply(id, "model_intent", &json!({"reserved_tokens":10,
+                "reserved_cost":{"kind":kind,"usd":amount}})).unwrap();
         }
-        let mut record = known;
-        record["bounded"] = json!(false);
-        assert!(books.apply(3, "model_intent", &record).is_err());
+        assert_eq!(books.reservations[&1].cost.upper_bound(), Some(2.0));
+        assert_eq!(books.reservations[&2].cost.upper_bound(), None);
+        assert_eq!(books.reserved(), (20, 3.0));
+        for invalid in [json!(1.0), json!({"kind":"upper_bound"}), json!({"kind":"upper_bound","usd":-1.0}),
+                        json!({"kind":"unknown","usd":2.0}), json!({"kind":"allowance","usd":"2.0"})] {
+            assert!(books.apply(3, "model_intent", &json!({"reserved_tokens":10,"reserved_cost":invalid})).is_err());
+        }
         assert_eq!(books.reservations.len(), 2);
     }
 
     #[test]
     fn malformed_accounting_does_not_partially_update_books() {
         let mut books = Books::default();
-        books.apply(1, "model_intent", &json!({"reserved_tokens": 10, "reserved_cost": 1.0, "bounded": true})).unwrap();
+        books.apply(1, "model_intent", &json!({"reserved_tokens":10,"reserved_cost":{"kind":"allowance","usd":1.0}})).unwrap();
         assert!(books.apply(2, "billing", &json!({"of": 1, "tokens": 8})).is_err());
         assert_eq!(books.reserved(), (10, 1.0));
         assert_eq!(books.usage.input, 0);

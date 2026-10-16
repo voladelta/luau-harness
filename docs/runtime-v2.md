@@ -29,7 +29,7 @@ controller.step(saved state, event) → new state, command
 
 Controller transitions and package invocations start in fresh VMs. Mutable captured locals cannot become an additional workflow state store. The controller has pure builtins, frozen module imports, model metadata and diagnostic output; it cannot read files, execute processes, approve operations or invoke a provider.
 
-Each checkpoint has a Rust-owned lifecycle: `running` carries opaque controller state and durable data; `finished` carries the validated final report and durable data. A `finish` command commits terminal status independently of the controller's private fields. Resuming a finished run returns its saved report even after its execution deadline. New runs use journal format 3, which older binaries refuse. Format-2 runs remain readable; once resumed with this binary, keep using it or a newer compatible reader.
+Each checkpoint has a Rust-owned lifecycle: `running` carries opaque controller state and durable data; `finished` carries the validated final report and durable data. A `finish` command commits terminal status independently of the controller's private fields. Resuming a finished run returns its saved report even after its execution deadline. Saved runs use journal format 4. Only the current format is supported; there are no migrations for older experimental runs.
 
 ## Durable data
 
@@ -48,7 +48,7 @@ Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB
 
 Every mutating effect records a synced intent before its executor runs. Outcomes include full argument hashes and result receipts. A global mutation permit serializes mutations; sealed read batches may run concurrently. Subagents and packages retain or reduce their caller's authority.
 
-There is at most one application-level dispatch attempt for an operation ID. A provider that answers without a generation is classified: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 429, 5xx or malformed 200 body gets one new request under a new operation ID (honouring `Retry-After`, capped at 30 s). A failed attempt that may have been billed (a lost response, a 500, 502 or 504) is charged at its reservation when that reservation has an explicit price bound (`"billing_bound"`: a finite nonnegative amount), recorded as a `billing` record with `"source": "hx"`; a lost response then gets one new request under a new operation ID. An unpriced reservation stays open as uncertain billing until the owner reconciles it, even without a dollar threshold; zero reserved dollars do not mean a request was free. Underlying services and the Claude CLI may have their own internal behavior; hx does not establish exactly-once remote execution.
+There is at most one application-level dispatch attempt for an operation ID. A provider that answers without a generation is classified: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 429, 5xx or malformed 200 body gets one new request under a new operation ID (honouring `Retry-After`, capped at 30 s). A failed attempt that may have been billed (a lost response, a 500, 502 or 504) is charged at its reservation when that reservation has a price bound (`"reserved_cost": {"kind": "upper_bound", "usd": amount}`), recorded as a `billing` record with `"source": "hx"`; a lost response then gets one new request under a new operation ID. An unpriced reservation stays open as uncertain billing until the owner reconciles it, even without a dollar threshold; zero reserved dollars do not mean a request was free. Underlying services and the Claude CLI may have their own internal behavior; hx does not establish exactly-once remote execution.
 
 An intent without an outcome is uncertain. Local `write` and `edit` settle themselves on resume or branch: each journals the hash of the content it is about to produce (`expect`) and replaces the file atomically (temp file, fsync, rename), so the file holds either its old content or exactly that. hx records a `resolution` with `"by": "hx"` and its evidence: `complete` when the file's hash matches, `abandon` when no `expect` was journaled or the file holds its previous content. An unreadable file is left for the owner.
 
@@ -64,7 +64,7 @@ hx recover .harness/log/RUN.jsonl OP --decision abandon --yes
 
 Record a decision based on the actual external state; it dispatches nothing and is final. After `abandon`, the resumed agent sees the receipts and can issue the operation again if it is still needed.
 
-Uncertain model calls without an explicit price bound retain their reservations. Legacy open reservations with only a `"bounded"` flag also require owner reconciliation: older writers could clip their claimed bound to the remaining allowance or record an unpriced zero. Previously settled billing records remain historical assertions. After checking provider usage, the owner can settle one explicitly:
+Uncertain model calls with an admission allowance (`"reserved_cost": {"kind": "allowance", "usd": amount}`) retain their reservations. The amount controls admission and is not evidence of a charge. After checking provider usage, the owner can settle one explicitly:
 
 ```bash
 hx recover .harness/log/RUN.jsonl OP --decision billing --tokens 1234 --cost 0.02 --yes

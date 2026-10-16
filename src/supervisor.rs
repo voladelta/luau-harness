@@ -1,11 +1,11 @@
 //! One owner for admission, immutable run configuration, receipts, and recovery.
-use crate::{eventlog::{self, Books, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
+use crate::{eventlog::{self, Books, EventLog, ReservationCost}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-pub const FORMAT: u64 = 3;
+pub const FORMAT: u64 = 4;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,18 +45,7 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub fn load(bytes: &[u8]) -> Result<Self> {
-        let value: Value = serde_json::from_slice(bytes)?;
-        let checkpoint: Self = if value.get("status").is_some() {
-            serde_json::from_value(value)?
-        } else {
-            // Compatibility with format-2 checkpoints written before the host owned terminal status.
-            // Only this migration adapter knows the old standard controller's phase representation.
-            let controller = value.get("controller").context("checkpoint missing controller")?;
-            let run = if controller["phase"] == "finished" || controller["phase"]["kind"] == "finished" {
-                RunState::Finished { report: controller["report"].as_object().context("checkpoint missing finish report")?.clone() }
-            } else { RunState::Running { controller: controller.clone() } };
-            Self { run, durable: value.get("durable").context("checkpoint missing durable data")?.clone() }
-        };
+        let checkpoint: Self = serde_json::from_slice(bytes)?;
         anyhow::ensure!(checkpoint.durable.is_object(), "invalid durable checkpoint");
         crate::values::validate(&checkpoint.durable)?;
         match &checkpoint.run {
@@ -85,7 +74,7 @@ impl Manifest {
             .context("this journal has no manifest record; start a new run")?;
         let bytes = eventlog::read_blob(path.parent().context("log has no parent")?, record["blob"].as_str().context("manifest blob missing")?)?;
         let manifest: Self = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(matches!(manifest.format, 2 | FORMAT), "unsupported run format {}", manifest.format);
+        anyhow::ensure!(manifest.format == FORMAT, "unsupported run format {}", manifest.format);
         Ok(manifest)
     }
 }
@@ -95,7 +84,7 @@ impl Manifest {
 ///   never touched; otherwise the file's hash says whether it landed. An unreadable file is left for the owner.
 /// - `sh` that ran under Seatbelt with the network off and no approval-gated command could only write inside the
 ///   workspace and the run's temp dir, which the recovery turn can inspect: `unknown_local`.
-/// - A model request with an explicit billing bound is charged at that bound. Legacy bound flags are not evidence.
+/// - A model request with a price bound is charged at that bound.
 ///
 /// Returns how many records were written.
 pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Result<usize> {
@@ -121,7 +110,7 @@ pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Resu
         settled += 1;
     }
     for (&id, reservation) in &books.reservations {
-        if let Some(bound) = reservation.billing_bound {
+        if let Some(bound) = reservation.cost.upper_bound() {
             log.write("billing", bound_billing(id, reservation.tokens, bound), true)?;
             settled += 1;
         }
@@ -366,11 +355,12 @@ impl Supervisor {
         // concurrent requests queue behind it above. Admission allowance is not billing evidence: only an explicit,
         // unclipped price bound can settle a lost response, even when there is no dollar threshold.
         let remaining = budget.max_cost.map(|m| (m - books.usage.cost - pending_cost).max(0.0));
-        let billing_bound = cfg.price.as_ref().map(|p| p.bound(bytes, max_output));
-        let cost = billing_bound.unwrap_or(remaining.unwrap_or(0.0));
+        let cost = match &cfg.price {
+            Some(price) => ReservationCost::UpperBound(price.bound(bytes, max_output)),
+            None => ReservationCost::Allowance(remaining.unwrap_or(0.0)),
+        };
         let seq = self.record_in(&mut books, "model_intent", json!({"model": cfg.model, "depth": depth,
-            "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens, "reserved_cost": cost,
-            "billing_bound": billing_bound, "bounded": billing_bound.is_some()}), true)?;
+            "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens, "reserved_cost": cost}), true)?;
         Ok(Some(seq))
     }
 
@@ -379,7 +369,7 @@ impl Supervisor {
     pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, unbilled: bool, depth: usize) -> Result<bool> {
         let mut books = self.books.lock().unwrap();
         let bound = books.reservations.get(&op).filter(|_| !unbilled)
-            .and_then(|r| r.billing_bound.map(|cost| (r.tokens, cost)));
+            .and_then(|r| r.cost.upper_bound().map(|cost| (r.tokens, cost)));
         let result = self.record_in(&mut books, "llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "billing_uncertain": !unbilled}), true)
             .and_then(|_| bound.map(|(tokens, cost)| self.record_in(&mut books, "billing", bound_billing(op, tokens, cost), true)).transpose());
         Self::stop_running(&mut books, op);
@@ -439,7 +429,7 @@ mod checkpoint_tests {
                 Budget { max_cost: limit, ..Budget::default() }, None).unwrap();
             let op = supervisor.reserve_model(&cfg, &json!({}), 0).await.unwrap();
             let bound = cfg.price.as_ref().map(|p| p.bound(2, 100));
-            assert_eq!(supervisor.books.lock().unwrap().reservations[&op].billing_bound, bound);
+            assert_eq!(supervisor.books.lock().unwrap().reservations[&op].cost.upper_bound(), bound);
             assert_eq!(supervisor.fail_model(op, &cfg, "lost response", false, 0).unwrap(), priced);
             let replay = Books::of(&eventlog::load(&supervisor.policy.log.path).unwrap()).unwrap();
             if let Some(bound) = bound {
@@ -461,25 +451,6 @@ mod checkpoint_tests {
         crate::llm::Price { tiers: vec![crate::llm::Tier { min_prompt_tokens: 0, input: 0.001, output: 0.001 }], request: 0.0 }
     }
 
-    #[test]
-    fn legacy_open_reservations_require_owner_billing_on_resume() {
-        let dir = std::env::temp_dir().join(format!("hx-legacy-billing-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
-        let cfg = model();
-        let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![], Budget::default(), None).unwrap();
-        let op = supervisor.record("model_intent", json!({"reserved_tokens":10,"reserved_cost":0.01,"bounded":true}), true).unwrap();
-        let records = eventlog::load(&supervisor.policy.log.path).unwrap();
-        assert_eq!(reconcile(&supervisor.policy.log, &records, supervisor.manifest.as_ref().unwrap()).unwrap(), 0);
-        assert!(!supervisor.fail_model(op, &cfg, "lost response", false, 0).unwrap());
-        assert!(supervisor.books.lock().unwrap().reservations.contains_key(&op));
-        supervisor.record("billing", json!({"of":op,"tokens":15,"cost":0.02,"source":"owner"}), true).unwrap();
-        assert!(supervisor.books.lock().unwrap().reservations.is_empty());
-        assert_eq!(supervisor.usage().cost, 0.02);
-        drop(supervisor);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[tokio::test]
     async fn queued_model_admission_expires_without_a_settlement() {
         let dir = std::env::temp_dir().join(format!("hx-admission-deadline-{}", std::process::id()));
@@ -498,17 +469,17 @@ mod checkpoint_tests {
     }
 
     #[test]
-    fn old_checkpoints_migrate_without_losing_reports_or_saved_data() {
-        for phase in [json!("finished"), json!({"kind":"finished"})] {
-            let bytes = serde_json::to_vec(&json!({"controller":{"phase":phase,
-                "report":{"finished":true,"final_answer":"done"}}, "durable":{"saved":7}})).unwrap();
-            let checkpoint = Checkpoint::load(&bytes).unwrap();
-            assert_eq!(checkpoint.durable["saved"], 7);
-            let RunState::Finished { report } = checkpoint.run else { panic!("lost terminal status") };
-            assert_eq!(report["final_answer"], "done");
-        }
-        let checkpoint = Checkpoint::load(br#"{"controller":{"custom":3},"durable":{}}"#).unwrap();
+    fn checkpoints_require_explicit_lifecycle_and_valid_data() {
+        let checkpoint = Checkpoint::load(br#"{"status":"running","controller":{"custom":3},"durable":{"saved":7}}"#).unwrap();
+        assert_eq!(checkpoint.durable["saved"], 7);
         assert!(matches!(checkpoint.run, RunState::Running { controller } if controller["custom"] == 3));
-        assert!(Checkpoint::load(br#"{"status":"finished","report":{"finished":true},"durable":{}}"#).is_err());
+        for invalid in [
+            br#"{"controller":{},"durable":{}}"#.as_slice(),
+            br#"{"status":"finished","report":{"finished":true},"durable":{}}"#,
+            br#"{"status":"running","controller":[],"durable":{}}"#,
+            br#"{"status":"running","controller":{},"durable":[]}"#,
+        ] {
+            assert!(Checkpoint::load(invalid).is_err());
+        }
     }
 }
