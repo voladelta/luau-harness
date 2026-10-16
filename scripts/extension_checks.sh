@@ -3,6 +3,7 @@
 # no self-approval, frozen extensions with live session state. Build first: cargo build --release
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $MOCK 2>/dev/null; pkill -f "sleep 4243" 2>/dev/null' EXIT
@@ -57,7 +58,7 @@ check "restoring the approved content brings it back" "$(x 'print(tools.slug.run
 
 # --- the prompt shows installed extensions (and nothing when there are none)
 MOCK_REPLIES='["done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl python3 scripts/mock_llm.py 8796 & MOCK=$!
-sleep 1; echo go > $T/p.txt
+wait_for_port 8796 || exit 1; echo go > $T/p.txt
 run() { OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8796 --key-env OPENROUTER_API_KEY >/dev/null 2>&1; }
 system_of_last() { python3 -c "
 import json
@@ -102,11 +103,12 @@ check "sh cannot activate a tool either" "$(x 'sh("mkdir -p .harness/pkgs/evil &
 # --- extensions stay frozen when a user edits and re-approves a tool during a session
 ( x 'counter = 7
 print(tools.slug.run("A B"))
-sh("sleep 4243", { timeout = 4 })' 'print(counter, tools.slug.run("A B"))' > $T/hot.out ) &
+sh("touch extension-ready; while [ ! -e .harness/proceed ]; do sleep 0.01; done", { timeout = 5 })' 'print(counter, tools.slug.run("A B"))' > $T/hot.out ) &
 HP=$!
-sleep 2
+wait_for_file "$W/extension-ready" || exit 1
 echo 'return { run = function(s) return (s:lower():gsub("[^%w]+", "_")) end }' > $W/.harness/pkgs/slug/init.luau
 $H approve slug --workspace $W >/dev/null
+touch "$W/.harness/proceed"
 wait $HP
 check "frozen extensions: original source runs before the edit" "$(sed -n 1p $T/hot.out)" "a-b"
 check "frozen run: session variable and original source survive approval changes" "$(grep -v '^$' $T/hot.out | tail -1)" "7	a-b"

@@ -200,6 +200,7 @@ pub struct Vm {
     pub lua: Lua,
     pub session: Session,
     modenv: Table,
+    tool_prompt: String,
     #[cfg(test)]
     effects: Arc<Effects>,
 }
@@ -484,7 +485,7 @@ impl Vm {
         hx.set("asset", lua.create_function(move |_, name: String| {
             rroot.asset(&name).map_err(mlua::Error::external)
         })?)?;
-        if let Some(h) = host {
+        if let Some(h) = host.clone() {
             let bh = h.clone();
             hx.set("budget", lua.create_function(move |lua, ()| crate::values::copy_in(lua, &bh.budget_status()))?)?;
             let mh = h.clone();
@@ -561,7 +562,12 @@ impl Vm {
         }
         hx.set("authoring", authoring)?;
         modenv.set("hx", hx)?;
-        Ok(Vm { lua, session, modenv, #[cfg(test)] effects: fx })
+        let lines = crate::tools::install(&lua, &session.env, supervisor, host, fx.clone())?;
+        for name in registry.tools.keys() {
+            if !session.env.raw_get::<Value>(name.as_str())?.is_nil() { exposed.lock().unwrap().insert(name.clone()); }
+        }
+        let tool_prompt = if lines.is_empty() { String::new() } else { format!("\n\n# Local tools (user-configured)\n{}", lines.join("\n")) };
+        Ok(Vm { lua, session, modenv, tool_prompt, #[cfg(test)] effects: fx })
     }
 
     /// Install packs (`require(name).install(ctx)`) the way the loop does, for `hx exec --pack`.
@@ -613,7 +619,9 @@ impl Vm {
         let req = crate::values::copy_in(&self.lua, request)?;
         let prepare = self.lua.load("local request = ...; return require('std/hooks').emit('before_model', request)")
             .set_environment(self.modenv.clone()).into_function()?;
-        Ok(crate::values::copy_out(prepare.call(req)?)?)
+        let mut request = crate::values::copy_out(prepare.call(req)?)?;
+        if let Some(system) = request["system"].as_str() { request["system"] = json!(format!("{system}{}", self.tool_prompt)); }
+        Ok(request)
     }
 
     /// Run every tests/*.luau file of a package directory; returns (passed, failed, report).

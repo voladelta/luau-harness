@@ -2,6 +2,7 @@
 # Harness checks: std tests, module overrides, sealed batches, package locks, hooks and subagents (no API key needed). Run after `cargo build --release`.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); trap 'rm -rf "$T"; kill $MOCK 2>/dev/null' EXIT
@@ -72,7 +73,7 @@ require("std/hooks").on("before_run", function(p)
 end)
 LUA
 MOCK_REPLIES='["```luau\nsh(\"rm -rf /tmp/zzz-hx\")\n```","```luau\nlocal r = agent(\"sub\")\nprint(\"sub said: \" .. r.answer)\n```","```luau\nprint(1)\n```","SUB-ANSWER","All done."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-sleep 1; echo go > $T/p.txt
+wait_for_port 8768 || exit 1; echo go > $T/p.txt
 OPENROUTER_API_KEY=x $H run --workspace $W2 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace.txt > $T/rep.json
 check "hook denied rm -rf" "$(grep -c 'no rm -rf here' $T/trace.txt)" "1"
 check "subagent answer reached parent" "$(grep -c "sub said: SUB-ANSWER" $T/trace.txt)" "1"
@@ -91,7 +92,7 @@ end)
 LUA
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
 MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-sleep 1
+wait_for_port 8768 || exit 1
 OPENROUTER_API_KEY=x $H run --workspace $W4 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace4.txt > $T/rep4.json
 check "before_finish continues once" "$(python3 -c "import json;r=json.load(open('$T/rep4.json'));print(r['llm_calls'], r['final_answer'])")" "3 Checked: final answer."
 
@@ -99,7 +100,7 @@ check "before_finish continues once" "$(python3 -c "import json;r=json.load(open
 W6=$T/ws6; mkdir -p $W6
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
 MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-sleep 1
+wait_for_port 8768 || exit 1
 OPENROUTER_API_KEY=x $H run --workspace $W6 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace6.txt > $T/rep6.json
 check "default recheck continues once" "$(python3 -c "import json;r=json.load(open('$T/rep6.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace6.txt)" "3 Checked: final answer. 1"
 
@@ -107,7 +108,7 @@ W7=$T/ws7; mkdir -p $W7/.harness
 echo 'require("std/recheck").enabled = false' > $W7/.harness/init.luau
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
 MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-sleep 1
+wait_for_port 8768 || exit 1
 OPENROUTER_API_KEY=x $H run --workspace $W7 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace7.txt > $T/rep7.json
 check "recheck opt-out accepts the first final answer" "$(python3 -c "import json;r=json.load(open('$T/rep7.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace7.txt)" "2 First answer. 0"
 

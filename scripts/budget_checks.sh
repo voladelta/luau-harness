@@ -2,6 +2,7 @@
 # Budget checks (scripted model: every call costs 10+5 tokens and $0.001). No API key needed.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M1 $M2 2>/dev/null' EXIT
@@ -11,7 +12,7 @@ CHUNKS='["```luau\nprint(1)\n```","```luau\nprint(2)\n```","```luau\nprint(3)\n`
 MOCK_REPLIES="$CHUNKS" MOCK_BY_LEN=1 python3 scripts/mock_llm.py 8791 & M1=$!
 SUB='["```luau\nlocal r = agent(\"sub\")\nprint(r.answer)\n```","```luau\nprint(1)\n```","```luau\nprint(2)\n```","```luau\nprint(3)\n```","done","done"]'
 MOCK_REPLIES="$SUB" python3 scripts/mock_llm.py 8792 & M2=$!
-sleep 1; echo go > $T/p.txt
+wait_for_port 8791 || exit 1; wait_for_port 8792 || exit 1; echo go > $T/p.txt
 run() { # port, workspace, extra flags...
   local port=$1 ws=$2; shift 2
   OPENROUTER_API_KEY=x $H run --workspace $ws --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:$port --key-env OPENROUTER_API_KEY "$@" 2>/dev/null | tail -1

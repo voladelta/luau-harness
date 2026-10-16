@@ -1,5 +1,5 @@
 //! Workspace trust (like `direnv allow`). Everything hx treats as user-owned config lives inside the workspace:
-//! `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/` and `hx.lock`. The model cannot
+//! `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/{override,tools}/` and `hx.lock`. The model cannot
 //! write them, but whoever wrote the repo can, so a cloned repo could widen the sandbox, start MCP commands or
 //! pre-approve its own packages and skills. hx therefore uses that config only when the user has trusted its exact
 //! content: `hx trust` records a hash per workspace in `~/.config/hx/trust.toml` (outside every repo, protected from
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
 /// asks, and the agent stages there itself.)
 const FILES: [&str; 4] = [".harness/policy.toml", ".harness/mcp.toml", ".harness/init.luau", "hx.lock"];
-const TREES: [&str; 2] = [".harness/override", ".harness/versions"];
+const TREES: [&str; 3] = [".harness/override", ".harness/versions", ".harness/tools"];
 
 /// `$XDG_CONFIG_HOME/hx` or `~/.config/hx`.
 pub fn store_dir() -> Option<PathBuf> {

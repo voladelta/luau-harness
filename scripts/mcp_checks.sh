@@ -2,6 +2,7 @@
 # MCP client checks (no API key): binding, schema signatures, approval gate, sandboxed server, env scrubbing, prompt index.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 R=$PWD; H=$R/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T" "$HOME/hx-mcp-escape.txt"; kill $MOCK $LISTEN 2>/dev/null' EXIT
@@ -52,7 +53,7 @@ check "the model cannot rewrite mcp.toml" "$(x 'print(pcall(write, ".harness/mcp
 
 # --- the model sees generated signatures
 MOCK_REPLIES='["done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl python3 scripts/mock_llm.py 8797 & MOCK=$!
-sleep 1; echo go > $T/p.txt
+wait_for_port 8797 || exit 1; echo go > $T/p.txt
 OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8797 --key-env OPENROUTER_API_KEY >/dev/null 2>&1
 sysmsg=$(python3 -c "
 import json
@@ -74,7 +75,7 @@ hcfg() { # url, extra mcp.toml lines
 }
 hx() { WEB_KEY=sk-web-secret $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
 for mode in json sse; do
-  (export NEED_HEADER="x-api-key:sk-web-secret" SESSION=1 HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP $mode) & SRV=$!; sleep 1; : > $HL
+  (export NEED_HEADER="x-api-key:sk-web-secret" SESSION=1 HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP $mode) & SRV=$!; wait_for_port "$HP" || exit 1; : > $HL
   hcfg "http://127.0.0.1:$HP/mcp" 'headers_env = { "x-api-key" = "WEB_KEY" }'
   check "http/$mode: tool call works with header auth" "$(hx 'print(mcp.web.add{a = 2, b = 3})' | head -1)" "5"
   check "http/$mode: read-only tool runs, tool error is a Luau error" "$(hx 'print(mcp.web.read_note{name="a"}); print(pcall(mcp.web.boom, {}))' | tr '\n' ' ' | grep -c 'note:a.*mcp tool error (web.boom): boom')" "1"
@@ -87,7 +88,7 @@ print(bool(c) and all(x.get('mcp-session-id') for x in c) and all(x.get('mcp-pro
   check "http/$mode: wrong auth scheme surfaces HTTP 401" "$(hx 'print(pcall(mcp.web.add, {a=1,b=1}))' | head -1 | grep -c 'HTTP 401')" "1"
   kill $SRV; wait $SRV 2>/dev/null
 done
-(export NEED_HEADER="authorization:Bearer sk-web-secret" HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP json) & SRV=$!; sleep 1
+(export NEED_HEADER="authorization:Bearer sk-web-secret" HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP json) & SRV=$!; wait_for_port "$HP" || exit 1
 check "http: bearer_env sends Authorization: Bearer" "$(hx 'print(mcp.web.add{a = 4, b = 5})' | head -1)" "9"
 hcfg "http://127.0.0.1:$HP/redir" 'bearer_env = "WEB_KEY"'
 check "http: a redirect is not followed" "$(hx 'print(pcall(mcp.web.add, {a=1,b=2}))' | head -1 | grep -c 'redirects are not followed')" "1"
@@ -107,13 +108,13 @@ hcfg "https://example.com/mcp" 'net = true'
 check "http: sandbox-only keys are refused on a url server" "$(hx 'print(1)' | grep -c 'do not apply')" "1"
 
 # --- HTTP edge cases: split SSE stream, server request id collision, echoed secret, session expiry
-(export SESSION=1 EXPIRE=$T/expire HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP sse-split) & SRV=$!; sleep 1; : > $HL
+(export SESSION=1 EXPIRE=$T/expire HDR_LOG=$HL; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP sse-split) & SRV=$!; wait_for_port "$HP" || exit 1; : > $HL
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
 check "http/sse-split: 3-byte chunks, server request with our id, no final blank line" "$(hx 'print(mcp.web.add{a = 6, b = 7})' | head -1)" "13"
 touch $T/expire
 check "http: lost mutation response stays uncertain and blocks another mutation" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'session expired.*unknown_outcome.*unresolved mutations')" "1"
 kill $SRV; wait $SRV 2>/dev/null
-(export NEED_HEADER="authorization:Bearer other-key" ECHO_KEY=1; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP json) & SRV=$!; sleep 1
+(export NEED_HEADER="authorization:Bearer other-key" ECHO_KEY=1; cd $T; exec python3 $R/scripts/mcp_http_server.py $HP json) & SRV=$!; wait_for_port "$HP" || exit 1
 out=$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end))' | head -1)
 check "http: a 401 body that echoes the secret is scrubbed" "$(echo "$out" | grep -c 'sk-web-secret')" "0"
 check "http: ...and the status is still reported" "$(echo "$out" | grep -c 'HTTP 401.*\*\*\*')" "1"

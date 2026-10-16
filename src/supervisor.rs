@@ -135,7 +135,7 @@ fn binary_sha() -> Result<String> { Ok(eventlog::sha_bytes(&std::fs::read(std::e
 
 /// Every effect a principal can ask for, and the capability it needs.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Tool { Read, Search, View, Write, Edit, Sh, Agent, McpList, McpCall, Promote, ProposeModule }
+pub enum Tool { Read, Search, View, Write, Edit, Sh, Agent, McpList, McpCall, Promote, ProposeModule, Http }
 
 impl Tool {
     /// The name journal records carry.
@@ -144,6 +144,7 @@ impl Tool {
             Self::Read => "read", Self::Search => "search", Self::View => "view", Self::Write => "write", Self::Edit => "edit",
             Self::Sh => "sh", Self::Agent => "agent", Self::McpList => "mcp_list", Self::McpCall => "mcp_call",
             Self::Promote => "promote", Self::ProposeModule => "propose_module",
+            Self::Http => "http",
         }
     }
 
@@ -154,6 +155,7 @@ impl Tool {
             Self::Sh => ("proc", "sh"),
             Self::Agent => ("llm", "agent"),
             Self::McpList | Self::McpCall => ("mcp", "call"),
+            Self::Http => ("http", "request"),
         }
     }
 }

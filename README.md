@@ -225,6 +225,7 @@ MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `all
 | Kind | Where | How it becomes active |
 |---|---|---|
 | Module override | `.harness/override/std/<mod>.luau` | On a new run; `require("base:std/<mod>")` wraps the original. Invalid controller code stops the run |
+| Local tool | `.harness/tools/NAME.lua` or `NAME.luau` | `hx trust`; loads on a new run as `NAME.method(...)` after validation and credential checks |
 | Tool package | `.harness/pkgs/NAME/` with `hx.toml`, `kind = "tool"` | `hx approve NAME`; model calls `tools.NAME.fn(...)` |
 | Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx approve NAME`; model calls `skill("NAME")` (or finds it with `skills("words")`; skills are not listed in the prompt) |
 | Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (no `hx.toml`; project shadows global) | `hx approve NAME` (`hx skills` lists them); its directory becomes read-only readable |
@@ -234,9 +235,57 @@ MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `all
 
 **Approvals.** `hx.lock` is the single approval record: per package, the approved version, its content hash and the capabilities granted to it (`[package.grants]`, where `"*"` grants every scope). Workspaces from before this format kept grants in `.harness/grants.toml`, which hx no longer reads: run `hx approve NAME` again for each package that requests capabilities.
 
-**Workspace trust.** `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/` and `hx.lock` live in the repo, so whoever wrote the repo could widen the sandbox, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model). Any edit makes it untrusted again; `hx approve`/`accept`/`rollback` keep an already trusted workspace trusted. A workspace without such files needs nothing. `HX_TRUST=1` in hx's environment trusts the workspace for one launch (tests, throwaway copies).
+**Workspace trust.** `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/` and `hx.lock` live in the repo, so whoever wrote the repo could widen the sandbox, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model). Any edit makes it untrusted again; `hx approve`/`accept`/`rollback` keep an already trusted workspace trusted. A workspace without such files needs nothing. `HX_TRUST=1` in hx's environment trusts the workspace for one launch (tests, throwaway copies).
 
 A package that is unapproved, or changed since approval, is invisible to a new run. Each approved package call uses a fresh VM and dispatch-time capability checks. Imports are restricted to that package; function references and host handles cannot cross its boundary. Accepted changes apply to future runs, with no hot reload. Nothing the agent can call approves source. Every module accept and rollback is appended to `.harness/upgrades.jsonl`.
+
+### Single-file tools
+
+Drop a file in `.harness/tools/`, then review it with `hx trust`. Its file name is the namespace, using lowercase letters, digits and underscores, starting with a letter. A file returns a definition:
+
+```lua
+-- .harness/tools/greeting.lua
+return {
+    tools = {
+        hello = {
+            signature = "hello(name: string): string",
+            description = "Greet someone by name.",
+            run = function(name) return "Hello, " .. name end,
+        },
+    },
+}
+```
+
+The model can call `greeting.hello("Ada")`. All methods need a signature, description and `run` function. Successful registrations contribute their signatures to the model prompt. Invalid definitions, missing credentials, reserved names and namespace collisions reject the whole file with a warning; other tools still load. Both `.lua` and `.luau` use Luau syntax. Defining the same namespace in both files rejects both.
+
+Registration is pure and limited to one second and 16 MiB. Each method call runs the frozen source in a fresh isolated VM with copied arguments and results; mutable locals do not persist between calls. For filesystem, shell or agent access, declare `capabilities = { fs = {"read", "write"}, proc = {"sh"}, llm = {"agent"} }`, requesting only what you need. Workspace trust grants those declarations; the existing path, sandbox, budget and approval checks still apply. Local tools cannot import privileged harness modules.
+
+HTTP tools declare named, fixed endpoints in `http`, then call `http("endpoint", args)` inside a method. Each endpoint accepts `url`, `method` (default `GET`), `secret` (optional credential name), `header` (default `Authorization`, value sent verbatim), and `read_only` (default `false`). GET arguments become encoded query parameters; other methods send JSON. The return value is decoded JSON. HTTP errors raise with their status and a bounded response excerpt. Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects.
+
+Endpoint declarations grant access to those URLs independently of shell `--net`. Mark endpoints `read_only = true` only when they read data; other endpoints use the existing approval gate, matched as `http NAMESPACE.ENDPOINT`. HTTP calls use the supervisor's authorization, run deadline and journal. Credentials are attached by Rust and never returned to tool code or saved in the run manifest. Credentials echoed in responses are redacted before journaling.
+
+### TinyFish search and fetch
+
+Install the included [TinyFish tool](examples/tools/tinyfish.lua):
+
+```sh
+mkdir -p .harness/tools
+cp examples/tools/tinyfish.lua .harness/tools/tinyfish.lua
+export TINYFISH_API_KEY='your-key'
+hx trust
+hx exec 'print(tinyfish.search{query="Luau embedding", include_domains="luau.org"})'
+hx exec 'local r=tinyfish.fetch{urls={"https://luau.org"}}; print(r.results, r.errors)'
+```
+
+The adapter uses TinyFish's documented [Search API](https://docs.tinyfish.ai/search-api/reference) and [Fetch API](https://docs.tinyfish.ai/fetch-api/reference), preserves their response objects, and supports the documented filter and extraction options. Fetch accepts 1–10 URLs; check `errors` even when some results succeed.
+
+Credential lookup checks, in order:
+
+1. A nonblank environment variable.
+2. `.harness/secrets.toml` in the workspace.
+3. `$XDG_CONFIG_HOME/hx/secrets.toml`, or `~/.config/hx/secrets.toml`.
+
+Secrets files contain top-level string assignments, for example `TINYFISH_API_KEY = "your-key"`. Blank values fall through to the next source. Without a usable key, the entire `tinyfish` registration fails and its methods stay unavailable. Secrets files are blocked from sandboxed reads, searches and shell commands; keep them out of version control. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
 
 ## Security model
 
@@ -254,10 +303,13 @@ A package that is unapproved, or changed since approval, is invisible to a new r
 Every check uses `target/release/hx`, and none needs an API key (model runs use a scripted mock).
 
 ```bash
-scripts/all_checks.sh        # builds, then runs every suite
+scripts/all_checks.sh        # builds, then runs every offline suite; five-minute deadline
+scripts/all_checks.sh --jobs 2  # reduce concurrent suites (default: 4)
 hx test stdlib/std           # Luau unit tests
 cargo test --release
 ```
+
+The runner prints each suite's elapsed time and a total. Independent suites run concurrently; suites sharing mock ports run sequentially, and the process-cap sandbox suite runs alone. Mock startup waits for readiness instead of sleeping. Stalled suites fail with a diagnostic and their process groups are stopped; reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
 
 | Path | Contents |
 |---|---|

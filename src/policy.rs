@@ -153,7 +153,7 @@ const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/System", "/Library", "
 const GPU_RULES: &str = "(allow iokit-open)\n(allow iokit-get-properties)\n(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name-regex #\"^com\\.apple\\.(metal|gpu|iosurface|CARenderServer|cvmsServ)\"))\n(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/C/com\\.apple\\.(metal|gpuarchiver)\"))\n";
 /// Credential files no model-reachable read may open, even inside a read root (e.g. `~/.cargo/credentials.toml`): `read`,
 /// `search` and `view` refuse them and the Seatbelt profile denies them to `sh`.
-const SECRET_FILES: &[&str] = &["credentials", "credentials.toml", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519"];
+const SECRET_FILES: &[&str] = &["credentials", "credentials.toml", "secrets.toml", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519"];
 
 /// Is `path` (by file name) one of the credential files in SECRET_FILES?
 pub fn is_secret(path: &Path) -> bool {

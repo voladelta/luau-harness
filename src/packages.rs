@@ -15,6 +15,10 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     let deadline = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(30))));
     let fx = Effects::supervised(supervisor.clone(), principal.clone(), host.as_ref().map(|h| h.depth).unwrap_or(0), deadline.clone());
     prims::install(&lua, fx.clone(), Arc::new(AtomicUsize::new(0))).map_err(mlua::Error::external)?;
+    if let Some(name) = package.strip_prefix("tool:") {
+        let def = registry.tools.get(name).ok_or_else(|| mlua::Error::runtime("tool not in frozen registry"))?;
+        crate::tools::install_http(&lua, fx.clone(), name.to_string(), def.clone())?;
+    }
     let g = lua.globals();
     g.set("__emit", lua.create_function(|_, _: String| Ok(()))?)?;
     g.set("__format", lua.create_function(|_, value: Value| value.to_string())?)?;
@@ -72,7 +76,11 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
         let result = lua.load(&src.text).set_name(format!("=package:{name}")).set_environment(e.clone()).eval::<Table>();
         initialization.store(previous, Ordering::Release);
         progress.lock().unwrap().remove(&name);
-        let module = result?;
+        let mut module = result?;
+        if name == p && let Some(tool) = p.strip_prefix("tool:") {
+            let def = r.tools.get(tool).ok_or_else(|| mlua::Error::runtime("tool not in frozen registry"))?;
+            module = crate::tools::exports(lua, module, def)?;
+        }
         l.raw_set(name.as_str(), module.clone())?;
         Ok(module)
     })?;

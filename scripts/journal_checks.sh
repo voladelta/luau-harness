@@ -2,6 +2,7 @@
 # Journal checks: event log (hash chain, write-ahead intents), approval gate, crash consistency. No API key needed.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; pkill -f "sleep 4242" 2>/dev/null; kill $MOCK 2>/dev/null' EXIT
@@ -107,8 +108,8 @@ check "sh cannot edit policy.toml either" "$out" "untouched"
 
 # --- 4. crash consistency: killed mid-effect => unknown outcome, never silently lost
 newws g
-$H exec --workspace $W 'sh("sleep 4242; touch survived")' >/dev/null 2>&1 & P=$!
-sleep 2; kill -9 $P 2>/dev/null; wait $P 2>/dev/null; pkill -f "sleep 4242" 2>/dev/null
+$H exec --workspace $W 'sh("touch child-ready; sleep 4242; touch survived")' >/dev/null 2>&1 & P=$!
+wait_for_file "$W/child-ready" || exit 1; kill -9 $P 2>/dev/null; wait $P 2>/dev/null; pkill -f "sleep 4242" 2>/dev/null
 L=$(lastlog); out=$($H log verify $L); rc=$?
 check "killed mid-effect: chain intact" "$(echo "$out" | head -1 | grep -c intact)" "1"
 check "killed mid-effect: reported as UNKNOWN OUTCOME (exit 3)" "$(echo "$out" | grep -c 'UNKNOWN OUTCOME.*sh')$rc" "13"
@@ -118,7 +119,7 @@ check "the interrupted command did not complete" "$([ -e $W/survived ] && echo D
 newws h
 echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
 MOCK_REPLIES='["```luau\nwrite(\"x.txt\",\"1\")\n```","done"]' python3 scripts/mock_llm.py 8769 & MOCK=$!
-sleep 1; echo go > $T/p.txt
+wait_for_port 8769 || exit 1; echo go > $T/p.txt
 OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:8769 --key-env OPENROUTER_API_KEY >/dev/null
 L=$(lastlog); check "run log has llm + chunk + write records, chain intact" "$(python3 - "$L" <<'PY'
 import json,sys,collections

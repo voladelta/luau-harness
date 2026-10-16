@@ -5,6 +5,7 @@
 # Window 40000, max output 1000 => threshold min(38000, 40000-1000-16384) = 22616; a reply with prompt_tokens 30000 crosses it.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); MP=""; trap 'rm -rf "$T"; kill $MP 2>/dev/null' EXIT
@@ -33,7 +34,7 @@ PY
 R() { PYTHONPATH=$T python3 -c "from r import *; $1"; }   # R 'dump(C("x=1"), S("done"))' -> JSON list
 Q() { PYTHONPATH=$T python3 -c "from q import *; $1"; }
 
-mock() { MOCK_REPLIES="$1" MOCK_LOG="$2" python3 scripts/mock_llm.py $3 & MP=$!; sleep 1; }  # replies-json log port
+mock() { MOCK_REPLIES="$1" MOCK_LOG="$2" python3 scripts/mock_llm.py $3 & MP=$!; wait_for_port "$3" || exit 1; }  # replies-json log port
 unmock() { kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=""; }
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf 'require("std/compact").keep_recent_tokens = 40\nrequire("std/recheck").enabled = false\n' > $W/.harness/init.luau; }
 off() { echo 'require("std/compact").enabled = false' >> $W/.harness/init.luau; }  # the pack is on by default

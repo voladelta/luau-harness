@@ -121,6 +121,10 @@ pub struct Source {
 /// An immutable, approved byte snapshot. Runtime resolution never goes back to mutable workspace files.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Registry {
+    #[serde(default)]
+    pub tools: BTreeMap<String, crate::tools::Definition>,
+    #[serde(default)]
+    pub tool_errors: BTreeMap<String, String>,
     pub sources: BTreeMap<String, Source>,
     pub assets: BTreeMap<String, Vec<u8>>,
     pub packages: Vec<PkgInfo>,
@@ -225,6 +229,7 @@ impl Registry {
                 registry.packages.push(info);
             }
             registry.mcp = crate::mcp::snapshot(root)?;
+            crate::tools::capture(root, &mut registry)?;
         }
         // Explicit developer test invocation is the sole unapproved package mount. It is never restored into a run.
         if let Some((name, dir)) = TEST_PKG.get().filter(|(name, _)| name != "std") {
@@ -659,7 +664,8 @@ impl Resolver {
         let lua = mlua::Lua::new();
         // the candidate is model-written and runs in the user's CLI: bound its time and memory like a session chunk
         lua.set_memory_limit(256 << 20)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let allowance = if cfg!(test) { std::time::Duration::from_millis(200) } else { std::time::Duration::from_secs(10) };
+        let deadline = std::time::Instant::now() + allowance;
         lua.set_interrupt(move |_| {
             if std::time::Instant::now() > deadline {
                 return Err(mlua::Error::runtime("time limit exceeded (infinite loop?)"));

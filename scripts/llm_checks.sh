@@ -3,13 +3,14 @@
 # server, and an openrouter-looking URL does not restrict the upstream provider. No API key needed.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M 2>/dev/null' EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 MOCK_REPLIES='["```luau\nprint(7)\n```","all done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.log python3 scripts/mock_llm.py 8795 & M=$!
-sleep 1; echo go > $T/p.txt
+wait_for_port 8795 || exit 1; echo go > $T/p.txt
 for api in openai responses; do
   W=$T/$api; mkdir -p $W/.harness; : > $T/req.log
   echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
@@ -32,7 +33,7 @@ runq openai any/model --provider-only anthropic,google; check "--provider-only p
 check "unknown api is refused" "$(K=x $H run --workspace $T/openai --prompt-file $T/p.txt --model m --api anthropic --base-url http://127.0.0.1:8795 --key-env K 2>&1 | grep -c 'unknown --api')" "1"
 # --- native tool calling: the loop answers every call id, per wire format; bad calls get an error result, not a crash
 mockrun() { # replies-json api -> "finished|final_answer|turns|code_turns|truncated_turns"
-  MOCK_REPLIES="$1" MOCK_BY_LEN=1 MOCK_LOG=$T/tool.log python3 scripts/mock_llm.py 8796 & local m=$!; sleep 1; : > $T/tool.log
+  MOCK_REPLIES="$1" MOCK_BY_LEN=1 MOCK_LOG=$T/tool.log python3 scripts/mock_llm.py 8796 & local m=$!; wait_for_port 8796 || return 1; : > $T/tool.log
   W=$T/m-$RANDOM; mkdir -p $W/.harness
   echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
   local o; o=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --api ${2:-openai} --base-url http://127.0.0.1:8796 --key-env K 2>&1 | tail -1)

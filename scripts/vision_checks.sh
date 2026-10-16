@@ -3,6 +3,7 @@
 # Chat Completions and Responses; completed resume does not reread images; without the pack nothing changes.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M 2>/dev/null' EXIT
@@ -12,7 +13,7 @@ W=$T/ws; mkdir -p $W
 ffmpeg -v error -f lavfi -i testsrc=size=1600x900 -frames:v 1 $W/frame.png
 REPLIES='["```luau\nlocal r = view(\"frame.png\")\nprint(r[1].width, r[1].height)\n```","done"]'
 MOCK_REPLIES="$REPLIES" MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl python3 scripts/mock_llm.py 8797 & M=$!
-sleep 1; echo go > $T/p.txt
+wait_for_port 8797 || exit 1; echo go > $T/p.txt
 run() { OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api $2 --base-url http://127.0.0.1:8797 --key-env OPENROUTER_API_KEY "${@:3}" 2>/dev/null; }
 img_parts() { python3 -c "
 import json
