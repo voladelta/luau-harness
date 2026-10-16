@@ -57,7 +57,20 @@ PY
 )" "yes"
 
 # --- 2. tampering is detected
-cp $L $T/tampered.jsonl; sed -i '' '3s/"tool": "write"/"tool": "wrote"/;3s/"tool":"write"/"tool":"wrote"/' $T/tampered.jsonl
+python3 - "$L" "$T/tampered.jsonl" <<'PY'
+import json,sys
+lines=open(sys.argv[1]).read().splitlines()
+for i,line in enumerate(lines):
+    record=json.loads(line)
+    if record.get("kind")=="intent" and record.get("tool")=="write":
+        record["tool"]="wrote"
+        lines[i]=json.dumps(record,separators=(",",":"))
+        assert lines[i]!=line and i+1<len(lines), "tamper a record covered by the next record's hash"
+        break
+else:
+    raise AssertionError("no write intent to tamper with")
+open(sys.argv[2],"w").write("\n".join(lines)+"\n")
+PY
 $H log verify $T/tampered.jsonl >/dev/null 2>&1; check "edited record breaks the chain (exit 1)" "$?" "1"
 python3 - "$L" "$T/deleted.jsonl" <<'PY'
 import sys

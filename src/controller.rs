@@ -69,8 +69,7 @@ impl Controller {
         let env = lua.create_table()?;
         let mt = lua.create_table()?; mt.set("__index", g.clone())?; env.set_metatable(Some(mt))?;
         let loaded = lua.create_table()?;
-        let cell: Arc<std::sync::Mutex<Option<Function>>> = Arc::default();
-        let (r, e, l, c) = (registry.clone(), env.clone(), loaded, cell.clone());
+        let (r, e, l) = (registry.clone(), env.clone(), loaded);
         let require = lua.create_function(move |lua, name: String| {
             if let Ok(Value::Table(t)) = l.raw_get::<Value>(name.as_str()) { return Ok(t); }
             let source = r.resolve(&name).map_err(mlua::Error::external)?;
@@ -78,10 +77,8 @@ impl Controller {
             let value: Value = lua.load(&source.text).set_name(format!("=controller:{name}")).set_environment(e.clone()).eval()?;
             let module = match value { Value::Table(t) => t, Value::Nil if name == "project/init" => lua.create_table()?, _ => return Err(mlua::Error::runtime("controller modules must return a table")) };
             l.raw_set(name.as_str(), module.clone())?;
-            let _ = &c;
             Ok(module)
         })?;
-        *cell.lock().unwrap() = Some(require.clone());
         env.set("require", require.clone())?;
         let hx = lua.create_table()?;
         let r = registry.clone();

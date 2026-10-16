@@ -1,5 +1,5 @@
 //! Model adapter and supervised agent/controller execution. Descendants share one admission ledger.
-use crate::{controller::Controller, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, Supervisor}, vm::Vm};
+use crate::{controller::Controller, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, RunState, Supervisor}, vm::Vm};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
@@ -19,6 +19,33 @@ pub struct Host {
     pub trace: Arc<Mutex<Option<std::fs::File>>>,
     pub key: String,
     pub packs: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AgentOptions {
+    #[serde(default = "default_agent_turns")]
+    pub max_turns: usize,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+fn default_agent_turns() -> usize { 12 }
+
+impl AgentOptions {
+    pub fn parse(value: Value) -> Result<Self> {
+        let options: Self = serde_json::from_value(if value.is_null() { json!({}) } else { value })
+            .context("invalid agent options")?;
+        if let Some(effort) = &options.effort {
+            anyhow::ensure!(matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max"),
+                "agent: effort must be low, medium, high, xhigh or max (got {effort:?})");
+        }
+        Ok(options)
+    }
+
+    pub fn from_lua(options: Option<mlua::Table>) -> mlua::Result<Self> {
+        let value = options.map(|t| crate::values::copy_out(mlua::Value::Table(t))).transpose()?.unwrap_or(Value::Null);
+        Self::parse(value).map_err(mlua::Error::external)
+    }
 }
 
 impl Host {
@@ -49,16 +76,17 @@ impl Host {
             trace: Arc::new(Mutex::new(file)), key, packs: m.packs.clone(), supervisor }))
     }
 
-    pub fn child_with(&self, model: Option<String>, reasoning: Option<String>, principal: Principal) -> Arc<Self> {
+    pub fn child(&self, options: &AgentOptions, principal: Principal) -> Result<Arc<Self>> {
+        anyhow::ensure!(self.depth < self.max_depth, "agent depth limit ({}) reached", self.max_depth);
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let mut llm = self.llm.clone();
         // The launch-time price is for the run's model; another model's requests fall back to the unpriced reservation.
-        if let Some(model) = model.filter(|m| *m != llm.model) { llm.model = model; llm.price = None; }
-        if reasoning.is_some() { llm.reasoning = reasoning; }
-        Arc::new(Self { llm, workspace: self.workspace.clone(), policy: self.policy.clone(), supervisor: self.supervisor.clone(),
+        if let Some(model) = options.model.as_ref().filter(|m| **m != llm.model) { llm.model = model.clone(); llm.price = None; }
+        if options.effort.is_some() { llm.reasoning = options.effort.clone(); }
+        Ok(Arc::new(Self { llm, workspace: self.workspace.clone(), policy: self.policy.clone(), supervisor: self.supervisor.clone(),
             principal, durable: Arc::new(Mutex::new(json!({}))), lane: format!("{}/{}", self.lane, NEXT.fetch_add(1, Ordering::Relaxed)),
             max_turns: self.max_turns, depth: self.depth + 1, max_depth: self.max_depth, http: self.http.clone(), trace: self.trace.clone(),
-            key: self.key.clone(), packs: self.packs.clone() })
+            key: self.key.clone(), packs: self.packs.clone() }))
     }
 
     pub fn log(&self, line: &str) {
@@ -130,9 +158,8 @@ impl Host {
         Box::pin(async move {
             self.policy.log.check()?;
             if self.depth == 0 {
-                if let Some(state) = self.supervisor.restored.as_ref().filter(|s| s["phase"] == "finished") {
-                    crate::controller::command(&json!({"kind":"finish","report":state["report"]}))?;
-                    return Ok(self.report(state["report"].clone(), 0.0));
+                if let Some(RunState::Finished { report }) = &self.supervisor.restored {
+                    return Ok(self.report(Value::Object(report.clone()), 0.0));
                 }
             }
             if let Err(error) = self.supervisor.check() {
@@ -140,7 +167,7 @@ impl Host {
                 let report = json!({"turns":0,"code_turns":0,"luau_errors":0,"truncated_turns":0,"ops_per_turn":[],
                     "finished":false,"final_answer":"","stopped":error.to_string()});
                 self.policy.log.write("budget", json!({"reason":error.to_string(),"depth":self.depth}), true)?;
-                self.supervisor.checkpoint(&self.lane, &json!({"phase":"finished","report":report}), &self.durable.lock().unwrap())?;
+                self.supervisor.checkpoint(&self.lane, RunState::Finished { report: report.as_object().unwrap().clone() }, &self.durable.lock().unwrap())?;
                 return Ok(self.report(report, 0.0));
             }
             let t0 = Instant::now();
@@ -153,7 +180,8 @@ impl Host {
             let controller = Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs)?;
             let mut state = if self.depth == 0 {
                 match &self.supervisor.restored {
-                    Some(state) => state.clone(),
+                    Some(RunState::Running { controller }) => controller.clone(),
+                    Some(RunState::Finished { .. }) => unreachable!("finished runs returned above"),
                     None => controller.init(&json!({"max_turns": max_turns,
                         "task_message": format!("{task}\n\n[files in the working directory]\n{}", file_tree(&self.workspace))}))?,
                 }
@@ -197,7 +225,11 @@ impl Host {
                 }
                 compacting = command["kind"] == "model" && command["purpose"] == "compact";
                 let command = crate::controller::command(&command)?;
-                self.supervisor.checkpoint(&self.lane, &state, &self.durable.lock().unwrap())?;
+                let saved = match &command {
+                    crate::controller::Command::Finish { report } => RunState::Finished { report: report.clone() },
+                    _ => RunState::Running { controller: state.clone() },
+                };
+                self.supervisor.checkpoint(&self.lane, saved, &self.durable.lock().unwrap())?;
                 match command {
                     crate::controller::Command::Next => event = json!({"kind":"next"}),
                     crate::controller::Command::NextCall => event = json!({"kind":"next_call"}),

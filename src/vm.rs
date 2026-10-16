@@ -301,23 +301,13 @@ impl Vm {
             g.set("agent", lua.create_async_function(move |lua, (task, opts): (String, Option<Table>)| {
                 let (h, afx) = (h.clone(), afx.clone());
                 async move {
-                    if h.depth >= h.max_depth {
-                        return Err(mlua::Error::runtime(format!("agent depth limit ({}) reached", h.max_depth)));
-                    }
-                    let turns = opts.as_ref().and_then(|o| o.get::<Option<usize>>("max_turns").ok().flatten()).unwrap_or(12);
-                    let model = opts.as_ref().and_then(|o| o.get::<Option<String>>("model").ok().flatten());
-                    let effort = opts.as_ref().and_then(|o| o.get::<Option<String>>("effort").ok().flatten());
-                    if let Some(e) = &effort {
-                        if !["low", "medium", "high", "xhigh", "max"].contains(&e.as_str()) {
-                            return Err(mlua::Error::runtime(format!("agent: effort must be low, medium, high, xhigh or max (got {e:?})")));
-                        }
-                    }
-                    let args = serde_json::json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": turns, "model": model, "effort": effort});
+                    let options = crate::host::AgentOptions::from_lua(opts)?;
+                    let child = h.child(&options, afx.principal.clone()).map_err(mlua::Error::external)?;
+                    let args = serde_json::json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": options.max_turns, "model": options.model, "effort": options.effort});
                     // A subagent records an intent and receipt; recovery never redispatches it.
                     let ret = afx.run(&lua, crate::supervisor::Tool::Agent, Class::LocalWrite, args, || async {
-                        let child = h.child_with(model.clone(), effort.clone(), afx.principal.clone());
                         child.log(&format!("### SUBAGENT (depth {}, model {}, effort {})\n{task}", child.depth, child.llm.model, child.llm.reasoning.as_deref().unwrap_or("default")));
-                        let rep = child.run_task(task.clone(), turns).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                        let rep = child.run_task(task.clone(), options.max_turns).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
                         Ok(Ret::Agent { answer: rep["final_answer"].as_str().unwrap_or("").to_string(), finished: rep["finished"].as_bool().unwrap_or(false), turns: rep["turns"].as_u64().unwrap_or(0) })
                     }).await?;
                     match ret {

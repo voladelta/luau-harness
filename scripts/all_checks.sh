@@ -2,6 +2,7 @@
 # Run every check suite (none needs an API key). Builds the release binary first, so the suites never test a stale one.
 cd "$(dirname "$0")/.."
 cargo build --release --quiet || exit 1
+cargo test --release --quiet || exit 1
 H=target/release/hx; rc=0
 run_check() {
   local name=$1 out summary; shift

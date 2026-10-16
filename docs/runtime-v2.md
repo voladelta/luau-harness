@@ -29,6 +29,8 @@ controller.step(saved state, event) → new state, command
 
 Controller transitions and package invocations start in fresh VMs. Mutable captured locals cannot become an additional workflow state store. The controller has pure builtins, frozen module imports, model metadata and diagnostic output; it cannot read files, execute processes, approve operations or invoke a provider.
 
+Each checkpoint has a Rust-owned lifecycle: `running` carries opaque controller state and durable data; `finished` carries the validated final report and durable data. A `finish` command commits terminal status independently of the controller's private fields. Resuming a finished run returns its saved report even after its execution deadline. New runs use journal format 3, which older binaries refuse. Format-2 runs remain readable; once resumed with this binary, keep using it or a newer compatible reader.
+
 ## Durable data
 
 ```luau

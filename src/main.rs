@@ -136,11 +136,17 @@ fn list_arg(args: &[String], name: &str) -> Vec<String> {
 }
 
 /// A numeric flag: None when absent, a usage error when present but not a number (a mistyped `--max-cost` must not
-/// silently run without a budget).
+/// silently run without a budget). A flag present without a following value (last argument, or next token is a flag)
+/// is also a usage error.
 fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>> {
-    match arg(args, name) {
+    let pos = args.iter().position(|a| a == name);
+    match pos {
         None => Ok(None),
-        Some(v) => v.parse().map(Some).map_err(|_| usage(&format!("{name}: expected a number, got {v:?}"))),
+        Some(i) => match args.get(i + 1) {
+            None => Err(usage(&format!("{name} requires a value"))),
+            Some(v) if v.starts_with("--") => Err(usage(&format!("{name} requires a value"))),
+            Some(v) => v.parse().map(Some).map_err(|_| usage(&format!("{name}: expected a number, got {v:?}"))),
+        },
     }
 }
 
@@ -153,6 +159,66 @@ fn net_flag(args: &[String]) -> Option<bool> {
     } else {
         None
     }
+}
+
+#[derive(Clone, Copy)]
+enum FlagKind { Switch, Text, Unsigned, Positive, Amount }
+
+/// One flag schema for preflight validation and exec's separation of flags from code.
+fn flag_kind(command: &str, name: &str) -> Option<FlagKind> {
+    use FlagKind::*;
+    Some(match (command, name) {
+        (_, "--workspace" | "--approval") => Text,
+        (_, "--yolo" | "--net" | "--no-net") => Switch,
+        ("run" | "exec", "--pack") => Text,
+        ("run", "--resume" | "--branch" | "--prompt-file" | "--model" | "--api" | "--base-url" | "--key-env" | "--reasoning" | "--provider-only" | "--trace") => Text,
+        ("run", "--max-turns" | "--max-tokens") | ("recover", "--tokens") => Unsigned,
+        ("run", "--max-output" | "--context-window") => Positive,
+        ("run", "--max-cost" | "--max-wall") | ("recover", "--cost") => Amount,
+        ("recover", "--decision") => Text,
+        ("recover" | "trust" | "accept", "--yes") => Switch,
+        _ => return None,
+    })
+}
+
+/// Reject malformed options before opening a journal, starting an MCP server, or contacting a provider.
+fn validate_args(args: &[String]) -> Result<()> {
+    let command = args[0].as_str();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut it = args.iter().skip(1);
+    while let Some(name) = it.next() {
+        if !name.starts_with("--") { continue; }
+        // A quoted Luau chunk may start with a multiline comment.
+        if command == "exec" && name.chars().any(char::is_whitespace) { continue; }
+        let kind = flag_kind(command, name).ok_or_else(|| usage(&format!("unknown option {name} for hx {command}")))?;
+        if !seen.insert(name.as_str()) { return Err(usage(&format!("{name} may only be supplied once"))); }
+        if matches!(kind, FlagKind::Switch) { continue; }
+        let value = it.next().filter(|v| !v.starts_with("--")).ok_or_else(|| usage(&format!("{name} requires a value")))?;
+        match kind {
+            FlagKind::Unsigned | FlagKind::Positive => {
+                let number = value.parse::<u64>().map_err(|_| usage(&format!("{name}: expected a nonnegative integer, got {value:?}")))?;
+                if matches!(kind, FlagKind::Positive) && number == 0 { return Err(usage(&format!("{name} must be positive"))); }
+            },
+            FlagKind::Amount => {
+                let number = value.parse::<f64>().map_err(|_| usage(&format!("{name}: expected a number, got {value:?}")))?;
+                if !number.is_finite() || number < 0.0 { return Err(usage(&format!("{name} must be finite and nonnegative"))); }
+            },
+            _ => {},
+        }
+    }
+    if seen.contains("--net") && seen.contains("--no-net") { return Err(usage("--net and --no-net are mutually exclusive")); }
+    if seen.contains("--resume") {
+        if let Some(flag) = seen.iter().find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace")) {
+            return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
+        }
+    }
+    if let Some(api) = arg(args, "--api") {
+        if !matches!(api.as_str(), "openai" | "responses" | "claude-sdk") { return Err(usage(&format!("unknown --api {api:?} (expected openai, responses or claude-sdk)"))); }
+    }
+    if let Some(mode) = arg(args, "--approval") {
+        mode.parse::<policy::ApprovalMode>().map_err(|e| usage(&e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Top-level help, version, or `<command> --help`: printed, and the caller is done.
@@ -178,9 +244,8 @@ async fn real_main() -> Result<()> {
         eprintln!("Error: unknown command `{}`\n\nRun `hx --help` for usage.", args[0]);
         std::process::exit(2);
     }
+    validate_args(&args)?;
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
-    anyhow::ensure!(!has(&args, "--resume") || args[0] == "run", "--resume is supported only by hx run");
-    anyhow::ensure!(!has(&args, "--branch") || args[0] == "run", "--branch is supported only by hx run");
     // The sandbox, path policy and approval gate are ON by default; `--yolo` is an explicit opt-out (and says so on stderr).
     let sandbox = !has(&args, "--yolo");
     if !sandbox {
@@ -237,12 +302,10 @@ fn exec_chunks(args: &[String]) -> Vec<&str> {
     let mut out = vec![];
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--workspace" | "--pack" | "--approval" | "--resume" => {
-                it.next();
-            }
-            "--net" | "--no-net" | "--yolo" => {}
-            c => out.push(c),
+        match flag_kind("exec", a) {
+            Some(FlagKind::Switch) => {},
+            Some(_) => { it.next(); },
+            None => out.push(a.as_str()),
         }
     }
     out
@@ -281,9 +344,6 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
     let _ = workspace;
     let trace = arg(args, "--trace").map(PathBuf::from);
     let host = if has(args, "--resume") {
-        for flag in ["--branch", "--prompt-file", "--model", "--api", "--base-url", "--key-env", "--reasoning", "--max-output", "--context-window", "--provider-only", "--max-turns", "--max-cost", "--max-tokens", "--max-wall", "--pack", "--yolo", "--net", "--no-net", "--approval"] {
-            anyhow::ensure!(!has(args, flag), "{flag} cannot override a resumed manifest; use --branch LOG for a new configuration");
-        }
         host::Host::resume(policy, trace)?
     } else {
         let inherited = arg(args, "--branch").map(|path| -> Result<_> {
@@ -295,7 +355,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             let records = eventlog::load(Path::new(&path))?;
             let state = records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
                 .map(|r| eventlog::read_blob(Path::new(&path).parent().unwrap(), r["blob"].as_str().unwrap())).transpose()?
-                .map(|b| serde_json::from_slice::<serde_json::Value>(&b)).transpose()?;
+                .map(|b| supervisor::Checkpoint::load(&b)).transpose()?;
             Ok((journal, manifest, state))
         }).transpose()?;
         let task = match arg(args, "--prompt-file") {
@@ -311,7 +371,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         }
         let branch = inherited.as_ref().map(|(parent, manifest, state)| supervisor::Branch {
             parent: parent.path.clone(),
-            durable: state.as_ref().map(|s| s["durable"].clone())
+            durable: state.as_ref().map(|s| s.durable.clone())
                 .or_else(|| manifest.branch.as_ref().map(|b| b.durable.clone())).unwrap_or_else(|| serde_json::json!({})),
         });
         let host = host::Host::start(cfg, policy, task, max_turns, trace, budget, list_arg(args, "--pack"), branch)?;
@@ -464,7 +524,7 @@ mod tests {
 
     #[test]
     fn exec_chunks_skip_global_flags_and_their_values() {
-        let a = argv("exec --workspace /w print(1) --pack a,b --net print(2) --approval auto --yolo --resume l.jsonl --no-net print(3)");
+        let a = argv("exec --workspace /w print(1) --pack a,b --net print(2) --approval prompt --yolo --no-net print(3)");
         assert_eq!(exec_chunks(&a), vec!["print(1)", "print(2)", "print(3)"]);
         assert!(exec_chunks(&argv("exec")).is_empty());
     }
@@ -478,6 +538,13 @@ mod tests {
         assert_eq!(parsed::<u32>(&a, "--max-tokens").unwrap(), None);
         let e = parsed::<f64>(&a, "--max-cost").unwrap_err();
         assert!(e.is::<Usage>() && e.to_string().contains("--max-cost"), "a mistyped budget is a usage error, not unlimited: {e}");
+        // A flag present without a following value (last arg or next token is a flag) is also a usage error.
+        let a2 = argv("run --model m --max-cost");
+        let e2 = parsed::<f64>(&a2, "--max-cost").unwrap_err();
+        assert!(e2.is::<Usage>() && e2.to_string().contains("requires a value"), "missing value (last arg): {e2}");
+        let a3 = argv("run --max-cost --net");
+        let e3 = parsed::<f64>(&a3, "--max-cost").unwrap_err();
+        assert!(e3.is::<Usage>() && e3.to_string().contains("requires a value"), "missing value (next is flag): {e3}");
         assert_eq!(net_flag(&a), Some(true));
         assert_eq!(net_flag(&argv("run --no-net")), Some(false));
         assert_eq!(net_flag(&argv("run")), None);

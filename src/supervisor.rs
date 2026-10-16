@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-pub const FORMAT: u64 = 2;
+pub const FORMAT: u64 = 3;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,6 +28,48 @@ pub struct Manifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Branch { pub parent: std::path::PathBuf, pub durable: Value }
 
+/// Host-owned lifecycle, independent of the customizable controller's private state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RunState {
+    Running { controller: Value },
+    Finished { report: serde_json::Map<String, Value> },
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Checkpoint {
+    #[serde(flatten)]
+    pub run: RunState,
+    pub durable: Value,
+}
+
+impl Checkpoint {
+    pub fn load(bytes: &[u8]) -> Result<Self> {
+        let value: Value = serde_json::from_slice(bytes)?;
+        let checkpoint: Self = if value.get("status").is_some() {
+            serde_json::from_value(value)?
+        } else {
+            // Compatibility with format-2 checkpoints written before the host owned terminal status.
+            // Only this migration adapter knows the old standard controller's phase representation.
+            let controller = value.get("controller").context("checkpoint missing controller")?;
+            let run = if controller["phase"] == "finished" || controller["phase"]["kind"] == "finished" {
+                RunState::Finished { report: controller["report"].as_object().context("checkpoint missing finish report")?.clone() }
+            } else { RunState::Running { controller: controller.clone() } };
+            Self { run, durable: value.get("durable").context("checkpoint missing durable data")?.clone() }
+        };
+        anyhow::ensure!(checkpoint.durable.is_object(), "invalid durable checkpoint");
+        crate::values::validate(&checkpoint.durable)?;
+        match &checkpoint.run {
+            RunState::Running { controller } => {
+                anyhow::ensure!(controller.is_object(), "controller state must be an object");
+                crate::values::validate(controller)?;
+            },
+            RunState::Finished { report } => { crate::controller::command(&json!({"kind":"finish", "report":report}))?; },
+        }
+        Ok(checkpoint)
+    }
+}
+
 impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
         // Luau modules and the prompt are restored from the manifest's registry, and FORMAT pins the journal's shape, so a
@@ -43,7 +85,7 @@ impl Manifest {
             .context("this journal has no manifest record; start a new run")?;
         let bytes = eventlog::read_blob(path.parent().context("log has no parent")?, record["blob"].as_str().context("manifest blob missing")?)?;
         let manifest: Self = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(manifest.format == FORMAT, "unsupported run format {}", manifest.format);
+        anyhow::ensure!(matches!(manifest.format, 2 | FORMAT), "unsupported run format {}", manifest.format);
         Ok(manifest)
     }
 }
@@ -157,7 +199,7 @@ pub struct Supervisor {
     settled: tokio::sync::Notify,
     pub mutations: Arc<tokio::sync::Semaphore>,
     pub durable: Arc<Mutex<Value>>,
-    pub restored: Option<Value>,
+    pub restored: Option<RunState>,
     pub recovery: Option<Value>,
 }
 
@@ -190,16 +232,16 @@ impl Supervisor {
         books.crashed();
         let (frontier, checkpoint) = match records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root") {
             Some(r) => (r["seq"].as_u64().context("missing record sequence")?,
-                Some(serde_json::from_slice::<Value>(&eventlog::read_blob(path.parent().unwrap(), r["blob"].as_str().context("missing checkpoint blob")?)?)?)),
+                Some(Checkpoint::load(&eventlog::read_blob(path.parent().unwrap(), r["blob"].as_str().context("missing checkpoint blob")?)?)?)),
             None => (0, None),
         };
         let receipts: Vec<_> = records.iter().filter(|r| r["seq"].as_u64().unwrap_or(0) > frontier && matches!(r["kind"].as_str(), Some("chunk_begin" | "intent" | "outcome" | "call" | "llm" | "model_intent" | "resolution" | "uncertain" | "billing")))
             .cloned().collect();
-        let mut durable = checkpoint.as_ref().map(|c| c["durable"].clone())
+        let mut durable = checkpoint.as_ref().map(|c| c.durable.clone())
             .or_else(|| manifest.branch.as_ref().map(|b| b.durable.clone())).unwrap_or_else(|| json!({}));
         if !durable.is_object() { bail!("invalid durable checkpoint"); }
         crate::values::validate(&durable)?;
-        let restored = checkpoint.map(|c| c["controller"].clone());
+        let restored = checkpoint.map(|c| c.run);
         let recovery = Some(json!({"receipts": receipts, "log_directory":path.parent(), "uncertain_operations": books.open.values().cloned().collect::<Vec<_>>(),
             "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work: a resolution `unknown_local` means a sandboxed `sh` may have run, so check the workspace before repeating it. Uncertain mutations require the owner's `hx recover` decision. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them."}));
         policy.log.write("resume", json!({"format": FORMAT, "checkpoint": frontier}), true)?;
@@ -232,9 +274,9 @@ impl Supervisor {
         Ok(())
     }
 
-    pub fn checkpoint(&self, lane: &str, controller: &Value, durable: &Value) -> Result<()> {
+    pub fn checkpoint(&self, lane: &str, run: RunState, durable: &Value) -> Result<()> {
         self.policy.log.check()?;
-        let blob = self.policy.log.blob(&serde_json::to_vec(&json!({"controller": controller, "durable": durable}))?)?;
+        let blob = self.policy.log.blob(&serde_json::to_vec(&Checkpoint { run, durable: durable.clone() })?)?;
         self.policy.log.write("checkpoint", json!({"lane": lane, "blob": blob}), true)?;
         Ok(())
     }
@@ -358,5 +400,25 @@ impl Supervisor {
             "max_tokens": b.max_tokens, "reserved_tokens": reserved_tokens,
             "reserved_cost": reserved_cost, "max_wall": b.max_wall_secs,
             "deadline": self.manifest.as_ref().and_then(|m| m.deadline), "mode": "admission_threshold"})
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn old_checkpoints_migrate_without_losing_reports_or_saved_data() {
+        for phase in [json!("finished"), json!({"kind":"finished"})] {
+            let bytes = serde_json::to_vec(&json!({"controller":{"phase":phase,
+                "report":{"finished":true,"final_answer":"done"}}, "durable":{"saved":7}})).unwrap();
+            let checkpoint = Checkpoint::load(&bytes).unwrap();
+            assert_eq!(checkpoint.durable["saved"], 7);
+            let RunState::Finished { report } = checkpoint.run else { panic!("lost terminal status") };
+            assert_eq!(report["final_answer"], "done");
+        }
+        let checkpoint = Checkpoint::load(br#"{"controller":{"custom":3},"durable":{}}"#).unwrap();
+        assert!(matches!(checkpoint.run, RunState::Running { controller } if controller["custom"] == 3));
+        assert!(Checkpoint::load(br#"{"status":"finished","report":{"finished":true},"durable":{}}"#).is_err());
     }
 }

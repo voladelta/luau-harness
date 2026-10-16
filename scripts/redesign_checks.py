@@ -771,8 +771,115 @@ def deadline():
         time.sleep(2.1)
         assert not (path / "late.txt").exists()
         count = len(calls)
-        resumed = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
-        assert not resumed["finished"] and "deadline" in resumed["stopped"] and len(calls) == count, resumed
+        for _ in range(2):
+            resumed = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
+            assert not resumed["finished"] and "deadline" in resumed["stopped"] and len(calls) == count, resumed
+
+
+def completed_deadline_resume():
+    for custom in (False, True):
+        path = workspace(f"completed-deadline-{custom}")
+        if custom:
+            override = path / ".harness/override/std"
+            override.mkdir(parents=True)
+            # Neither phase nor report belongs to this controller's state. Resume must use the host's finish receipt.
+            (override / "loop.luau").write_text('''return {
+init=function() return {private_counter=0} end,
+step=function(s,e)
+    assert(e.kind=="next", "finished controller must not run on recovery")
+    return {private_counter=1}, {kind="finish", report={finished=true,final_answer="custom done",turns=0}}
+end}''')
+        with provider(lambda body, i: tool('print("checked")') if i == 0 else "done") as (url, calls):
+            first = json.loads(start(path, url, "--max-wall", "2").stdout)
+            assert first["finished"], first
+            log = journal(path)
+            saved = records(log)
+            last = next(r for r in reversed(saved) if r["kind"] == "checkpoint")
+            checkpoint = json.loads((log.parent / "blobs" / last["blob"]).read_text())
+            assert checkpoint["status"] == "finished" and "controller" not in checkpoint, checkpoint
+            manifest = next(r for r in saved if r["kind"] == "manifest")
+            deadline = json.loads((log.parent / "blobs" / manifest["blob"]).read_text())["deadline"]
+            time.sleep(max(0, deadline - time.time()) + 0.1)
+            count = len(calls)
+            for _ in range(2):
+                restored = json.loads(run(path, "run", "--resume", str(log)).stdout)
+                assert restored["finished"] and restored["final_answer"] == first["final_answer"], restored
+                assert len(calls) == count
+
+
+def cli_preflight():
+    for index, flags in enumerate([
+        ["--max-cost"], ["--max-cost", "--net"], ["--workspace"], ["--model"],
+        ["--max-cost", "NaN"], ["--max-wall", "-1"], ["--max-output", "0"],
+        ["--max-toknes", "10"], ["--net", "--no-net"],
+        ["--max-cost", "1", "--max-cost", "2"], ["--resume", "absent.jsonl", "--model", "mock"],
+        ["--api", "typo"],
+    ]):
+        path = workspace(f"cli-preflight-{index}")
+        # Keep the invalid flag last when appropriate: run() appends --workspace and would mask that regression.
+        result = subprocess.run([str(HX), "run", "--workspace", str(path), *flags], env=ENV,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 2, (flags, result.returncode, result.stderr)
+        assert not (path / ".harness/log").exists(), (flags, "invalid invocation opened a journal")
+    assert not Path("absent.lock").exists()
+
+
+def legacy_checkpoint_resume():
+    path = workspace("legacy-checkpoint")
+    with provider(lambda body, i: tool('durable.set("saved",7)') if i == 0 else "done") as (url, calls):
+        start(path, url)
+        log = journal(path)
+        saved = records(log)
+        manifest = next(r for r in saved if r["kind"] == "manifest")
+        content = json.loads((log.parent / "blobs" / manifest["blob"]).read_text())
+        assert content["format"] == 3, content["format"]
+        manifest["format"] = 2
+        content["format"] = 2
+        final = next(r for r in reversed(saved) if r["kind"] == "checkpoint")
+        checkpoint = json.loads((log.parent / "blobs" / final["blob"]).read_text())
+        legacy = {"controller": {"phase": {"kind": "finished"}, "report": checkpoint["report"]},
+                  "durable": checkpoint["durable"]}
+        for record, blob in ((manifest, content), (final, legacy)):
+            data = json.dumps(blob).encode()
+            record["blob"] = hashlib.sha256(data).hexdigest()
+            (log.parent / "blobs" / record["blob"]).write_bytes(data)
+        # Build the old-format fixture with a valid hash chain; corruption refusal is tested separately.
+        previous, lines = "genesis", []
+        for record in saved:
+            record["prev"] = previous
+            line = json.dumps(record, separators=(",", ":"))
+            lines.append(line)
+            previous = hashlib.sha256(line.encode()).hexdigest()
+        log.write_text("\n".join(lines) + "\n")
+        count = len(calls)
+        restored = json.loads(run(path, "run", "--resume", str(log)).stdout)
+        assert restored["finished"] and restored["final_answer"] == "done" and len(calls) == count, restored
+        branch = json.loads(run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url,
+                                "--key-env", "HX_TEST_KEY").stdout)
+        assert branch["finished"], branch
+        branch_log = Path(branch["log"])
+        first = next(r for r in records(branch_log) if r["kind"] == "manifest")
+        branched = json.loads((branch_log.parent / "blobs" / first["blob"]).read_text())
+        assert branched["format"] == 3 and branched["branch"]["durable"]["saved"] == 7, (branched["format"], branched["branch"]["durable"])
+
+
+def agent_option_validation():
+    path = workspace("agent-options")
+    package = path / ".harness/pkgs/child"
+    package.mkdir(parents=True)
+    (package / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nllm=["agent"]\n')
+    (package / "init.luau").write_text('return {run=function(opts) return agent("child",opts) end}')
+    run(path, "approve", "child")
+    code = '''for _, opts in {{effort="turbo"}, {model=7}, {max_turns="many"}, {max_turns=-1}} do
+    assert(not pcall(agent,"child",opts))
+    assert(not pcall(tools.child.run,opts))
+    assert(not pcall(batch,{{op="read",args={"task.md"}},{op="agent",args={"child",opts}}}))
+end
+print("OPTIONS_VALIDATED")'''
+    with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, calls):
+        report = json.loads(start(path, url).stdout)
+        assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 2, report
+        assert not any(r.get("tool") in ("read", "agent") for r in records(journal(path)))
 
 
 def corrupt_artifacts():
@@ -814,5 +921,9 @@ if __name__ == "__main__":
     check("controller has no ambient effect authority", controller_no_authority)
     check("single writer and owner revocation", single_writer_and_revocation)
     check("absolute deadline cancels local work and includes downtime", deadline)
+    check("completed runs retain their answer after deadlines, including custom controllers", completed_deadline_resume)
+    check("invalid CLI options fail before opening a journal", cli_preflight)
+    check("format-2 checkpoints resume and branch into format-3 runs", legacy_checkpoint_resume)
+    check("session, package and batch agents reject invalid options before dispatch", agent_option_validation)
     check("corrupt artifacts fail before dispatch", corrupt_artifacts)
     print(f"{passed} passed; artifacts: {BASE}")
