@@ -180,8 +180,9 @@ impl Registry {
             }
             for entry in std::fs::read_dir(root.join(".harness/pkgs")).into_iter().flatten().flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if let Ok(man) = Resolver::read_manifest(&name, &entry.path()) {
-                    if let Err(error) = resolver.verify(&name, &entry.path(), &man) { registry.rejected.insert(name, error.to_string()); }
+                if let Ok(man) = Resolver::read_manifest(&name, &entry.path())
+                    && let Err(error) = resolver.verify(&name, &entry.path(), &man) {
+                    registry.rejected.insert(name, error.to_string());
                 }
             }
             for info in resolver.list_packages() {
@@ -981,7 +982,7 @@ mod tests {
             assert_eq!(r.list_staged(), vec!["std/printer"]);
             let review = r.review("std/printer").unwrap();
             let accepted = r.accept("std/printer");
-            if let Ok(_) = &accepted { r.rollback("std/printer").unwrap(); }
+            if accepted.is_ok() { r.rollback("std/printer").unwrap(); }
             (review, accepted)
         };
         for (src, why) in [("return {", "does not compile"), ("error('boom')", "fails when loaded"), ("return 1", "must return a table"), ("return {}", "drops exports"),

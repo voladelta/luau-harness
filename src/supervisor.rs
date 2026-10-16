@@ -96,6 +96,7 @@ impl Manifest {
 /// - `sh` that ran under Seatbelt with the network off and no approval-gated command could only write inside the
 ///   workspace and the run's temp dir, which the recovery turn can inspect: `unknown_local`.
 /// - A model request whose reservation is a real bound (`bounded`) is charged at that bound.
+///
 /// Returns how many records were written.
 pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Result<usize> {
     let books = Books::of(records)?;

@@ -390,32 +390,6 @@ fn user_process_count() -> u64 {
 /// Kills the whole process group of an `sh` command when dropped.
 struct GroupKill(i32);
 
-#[cfg(test)]
-mod receipt_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn shell_receipt_identity_includes_the_command_after_character_2000() {
-        let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None).unwrap());
-        let path = pol.log.path.clone();
-        let prefix = format!(": #{}\n", "x".repeat(2100));
-        let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));
-        let changed = format!("print(sh({:?}).code)", format!("{prefix}echo changed"));
-        let vm = crate::vm::Vm::new(pol.clone(), Duration::from_secs(5), 32 << 20, None).unwrap();
-        let control = vm.session.run(&original).await;
-        assert!(control.error.is_none(), "{:?}", control.error);
-        assert_eq!(control.output, "0\n", "the control shell command must actually execute successfully");
-        let result = vm.session.run(&changed).await;
-        assert!(result.error.is_none());
-        let records = crate::eventlog::load(&path).unwrap();
-        let intents: Vec<_> = records.iter().filter(|r| r["kind"] == "intent" && r["tool"] == "sh").collect();
-        assert_eq!(intents.len(), 2);
-        assert_ne!(intents[0]["args_sha"], intents[1]["args_sha"], "full command suffix participates in operation identity");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
@@ -469,4 +443,31 @@ pub fn load_view_image(pol: &crate::policy::Policy, path: &str, max: u32) -> std
         (buf.into_inner(), d)
     };
     Ok(ViewImage { width: ow, height: oh, orig: (w, h), mime, data_b64: base64::engine::general_purpose::STANDARD.encode(out), sha256 })
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shell_receipt_identity_includes_the_command_after_character_2000() {
+        let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None).unwrap());
+        let path = pol.log.path.clone();
+        let prefix = format!(": #{}\n", "x".repeat(2100));
+        let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));
+        let changed = format!("print(sh({:?}).code)", format!("{prefix}echo changed"));
+        let vm = crate::vm::Vm::new(pol.clone(), Duration::from_secs(5), 32 << 20, None).unwrap();
+        let control = vm.session.run(&original).await;
+        assert!(control.error.is_none(), "{:?}", control.error);
+        assert_eq!(control.output, "0\n", "the control shell command must actually execute successfully");
+        let result = vm.session.run(&changed).await;
+        assert!(result.error.is_none());
+        let records = crate::eventlog::load(&path).unwrap();
+        let intents: Vec<_> = records.iter().filter(|r| r["kind"] == "intent" && r["tool"] == "sh").collect();
+        assert_eq!(intents.len(), 2);
+        assert_ne!(intents[0]["args_sha"], intents[1]["args_sha"], "full command suffix participates in operation identity");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

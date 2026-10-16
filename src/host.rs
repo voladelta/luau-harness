@@ -4,6 +4,15 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
 
+pub struct StartOptions {
+    pub task: String,
+    pub max_turns: usize,
+    pub trace: Option<PathBuf>,
+    pub budget: Budget,
+    pub packs: Vec<String>,
+    pub branch: Option<crate::supervisor::Branch>,
+}
+
 pub struct Host {
     pub llm: LlmCfg,
     pub workspace: PathBuf,
@@ -49,7 +58,8 @@ impl AgentOptions {
 }
 
 impl Host {
-    pub fn start(llm: LlmCfg, policy: Arc<Policy>, task: String, max_turns: usize, trace: Option<PathBuf>, flags: Budget, mut packs: Vec<String>, branch: Option<crate::supervisor::Branch>) -> Result<Arc<Self>> {
+    pub fn start(llm: LlmCfg, policy: Arc<Policy>, options: StartOptions) -> Result<Arc<Self>> {
+        let StartOptions { task, max_turns, trace, budget: flags, mut packs, branch } = options;
         let pb = &policy.budget;
         let budget = Budget { max_cost: flags.max_cost.or(pb.max_cost), max_tokens: flags.max_tokens.or(pb.max_tokens), max_wall_secs: flags.max_wall_secs.or(pb.max_wall_secs) };
         for limit in [budget.max_cost, budget.max_wall_secs].into_iter().flatten() {
@@ -157,10 +167,8 @@ impl Host {
     pub fn run_task(self: Arc<Self>, task: String, max_turns: usize) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> {
         Box::pin(async move {
             self.policy.log.check()?;
-            if self.depth == 0 {
-                if let Some(RunState::Finished { report }) = &self.supervisor.restored {
-                    return Ok(self.report(Value::Object(report.clone()), 0.0));
-                }
+            if self.depth == 0 && let Some(RunState::Finished { report }) = &self.supervisor.restored {
+                return Ok(self.report(Value::Object(report.clone()), 0.0));
             }
             if let Err(error) = self.supervisor.check() {
                 if !error.to_string().starts_with("budget_exceeded:") { return Err(error); }

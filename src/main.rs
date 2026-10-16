@@ -209,13 +209,12 @@ fn validate_args(args: &[String]) -> Result<()> {
         }
     }
     if seen.contains("--net") && seen.contains("--no-net") { return Err(usage("--net and --no-net are mutually exclusive")); }
-    if seen.contains("--resume") {
-        if let Some(flag) = seen.iter().find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace")) {
-            return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
-        }
+    if seen.contains("--resume")
+        && let Some(flag) = seen.iter().find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace")) {
+        return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
     }
-    if let Some(api) = arg(args, "--api") {
-        if !matches!(api.as_str(), "openai" | "responses" | "claude-sdk") { return Err(usage(&format!("unknown --api {api:?} (expected openai, responses or claude-sdk)"))); }
+    if let Some(api) = arg(args, "--api") && !matches!(api.as_str(), "openai" | "responses" | "claude-sdk") {
+        return Err(usage(&format!("unknown --api {api:?} (expected openai, responses or claude-sdk)")));
     }
     if let Some(mode) = arg(args, "--approval") {
         mode.parse::<policy::ApprovalMode>().map_err(|e| usage(&e.to_string()))?;
@@ -376,7 +375,9 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             durable: state.as_ref().map(|s| s.durable.clone())
                 .or_else(|| manifest.branch.as_ref().map(|b| b.durable.clone())).unwrap_or_else(|| serde_json::json!({})),
         });
-        let host = host::Host::start(cfg, policy, task, max_turns, trace, budget, list_arg(args, "--pack"), branch)?;
+        let host = host::Host::start(cfg, policy, host::StartOptions {
+            task, max_turns, trace, budget, packs: list_arg(args, "--pack"), branch,
+        })?;
         if let Some((parent, _, _)) = inherited {
             host.policy.log.write("branch", serde_json::json!({"parent":parent.path}), true)?;
         }

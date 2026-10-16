@@ -101,8 +101,14 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
 
 pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str, caller: Arc<Effects>) -> mlua::Result<Table> {
     let (_worker, module, _active) = worker(supervisor.clone(), host.clone(), package)?;
-    fn exports(lua: &Lua, source: Table, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str,
-        path: Vec<String>, stack: &mut HashSet<usize>, caller: Arc<Effects>, limit: &mut values::Limit) -> mlua::Result<Table> {
+    struct ExportContext<'a> {
+        supervisor: Arc<Supervisor>,
+        host: Option<Arc<Host>>,
+        package: &'a str,
+        caller: Arc<Effects>,
+    }
+    fn exports(lua: &Lua, source: Table, ctx: &ExportContext<'_>,
+        path: Vec<String>, stack: &mut HashSet<usize>, limit: &mut values::Limit) -> mlua::Result<Table> {
         if path.len() > 64 { return Err(mlua::Error::runtime("package exports exceed 64 levels")); }
         limit.charge(64, 1)?;
         if source.metatable().is_some() || !stack.insert(source.to_pointer() as usize) { return Err(mlua::Error::runtime("package exports must be acyclic plain tables")); }
@@ -121,7 +127,7 @@ pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, pa
             let mut route = path.clone(); route.push(name.clone());
             let value = match value {
                 Value::Function(_) => {
-                    let (s, h, p, caller) = (supervisor.clone(), host.clone(), package.to_string(), caller.clone());
+                    let (s, h, p, caller) = (ctx.supervisor.clone(), ctx.host.clone(), ctx.package.to_string(), ctx.caller.clone());
                     Value::Function(lua.create_async_function(move |lua, args: MultiValue| {
                         let (s, h, p, route, caller) = (s.clone(), h.clone(), p.clone(), route.clone(), caller.clone());
                         async move {
@@ -139,7 +145,7 @@ pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, pa
                         }
                     })?)
                 },
-                Value::Table(t) => Value::Table(exports(lua, t, supervisor.clone(), host.clone(), package, route, stack, caller.clone(), limit)?),
+                Value::Table(t) => Value::Table(exports(lua, t, ctx, route, stack, limit)?),
                 value => {
                     let data = values::copy_out(value)?;
                     limit.charge(serde_json::to_vec(&data).map_err(mlua::Error::external)?.len(), 0)?;
@@ -151,5 +157,6 @@ pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, pa
         stack.remove(&(source.to_pointer() as usize));
         Ok(out)
     }
-    exports(lua, module, supervisor, host, package, Vec::new(), &mut HashSet::new(), caller, &mut values::Limit::default())
+    let ctx = ExportContext { supervisor, host, package, caller };
+    exports(lua, module, &ctx, Vec::new(), &mut HashSet::new(), &mut values::Limit::default())
 }
