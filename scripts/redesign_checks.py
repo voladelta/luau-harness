@@ -110,6 +110,7 @@ def provider(reply, price=None):
                 text = answer.get("text", "")
                 usage = {"input_tokens": answer.get("tokens", 10), "output_tokens": 5, "cost": 0.001}
                 if self.path.endswith("responses"):
+                    usage.update(answer.get("usage", {}))
                     output = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
                     output += [{"type": "function_call", "call_id": f"c{index}_{i}", "name": c.get("name", "luau"),
                                 "arguments": c.get("arguments", json.dumps({"code": c.get("code", "")}))} for i, c in enumerate(calls)]
@@ -121,6 +122,7 @@ def provider(reply, price=None):
                             "name": c.get("name", "luau"), "arguments": c.get("arguments", json.dumps({"code": c.get("code", "")}))}}
                             for i, c in enumerate(calls)]
                     usage = {"prompt_tokens": usage["input_tokens"], "completion_tokens": 5, "cost": 0.001}
+                    usage.update(answer.get("usage", {}))
                     data = json.dumps({"choices": [{"message": message, "finish_reason": "tool_calls" if calls else "stop"}], "usage": usage}).encode()
                 self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -438,8 +440,8 @@ PRICE = {"prompt": "0.000001", "completion": "0.000002", "input_cache_write": "0
 
 
 def bounded_lost_response():
-    # A token-bounded or priced reservation is charged at its bound, and one new request continues the run.
-    for name, flags, price in [("tokens", ("--max-tokens", "1000000"), None), ("priced", ("--max-cost", "1"), PRICE)]:
+    # Only a genuine price bound can settle dollar billing; one new request then continues the run.
+    for name, flags, price in [("priced", ("--max-cost", "1"), PRICE)]:
         path = workspace(f"lost-{name}")
         with provider(lambda body, i: None if i == 0 else "done", price) as (url, calls):
             report = json.loads(start(path, url, *flags).stdout)
@@ -447,7 +449,7 @@ def bounded_lost_response():
             assert report["budget"]["reserved_cost"] == 0 and report["budget"]["reserved_tokens"] == 0, (name, report)
             log = records(journal(path))
             intent = next(r for r in log if r["kind"] == "model_intent")
-            assert intent["bounded"] is True and (price is None or 0 < intent["reserved_cost"] < 0.1), (name, intent)
+            assert intent["bounded"] is True and intent["billing_bound"] == intent["reserved_cost"] and 0 < intent["reserved_cost"] < 0.1, (name, intent)
             billing = [r for r in log if r["kind"] == "billing"]
             assert [(r["of"], r["source"], r["cost"]) for r in billing] == [(intent["seq"], "hx", intent["reserved_cost"])], billing
             assert report["cost_usd"] >= intent["reserved_cost"], report
@@ -462,6 +464,35 @@ def bounded_lost_response():
         report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
         assert report["finished"] and report["budget"]["reserved_cost"] == 0, report
         assert [r["source"] for r in records(journal(path)) if r["kind"] == "billing"] == ["hx"]
+
+
+def unknown_billing_without_cost_threshold():
+    for name, flags in [("tokens", ("--max-tokens", "1000000")), ("unlimited", ())]:
+        path = workspace(f"unknown-billing-{name}")
+        with provider(lambda body, i: None if i == 0 else "done") as (url, calls):
+            start(path, url, *flags, ok=False)
+            log = journal(path)
+            saved = records(log)
+            intent = next(r for r in saved if r["kind"] == "model_intent")
+            assert len(calls) == 1 and intent["billing_bound"] is None and intent["bounded"] is False
+            assert not any(r["kind"] == "billing" for r in saved)
+            assert "UNKNOWN BILLING" in run(path, "log", "verify", str(log), ok=False).stdout
+            run(path, "recover", str(log), str(intent["seq"]), "--decision", "billing", "--tokens", "15", "--cost", "0.002", "--yes")
+            report = json.loads(run(path, "run", "--resume", str(log)).stdout)
+            assert report["finished"] and len(calls) >= 2, report
+            assert abs(report["cost_usd"] - (0.002 + 0.001 * (len(calls) - 1))) < 1e-12, report
+
+
+def cached_token_budget():
+    for api in ("openai", "responses"):
+        path = workspace(f"cached-budget-{api}")
+        prefix = "prompt" if api == "openai" else "input"
+        usage = {f"{prefix}_tokens": 100, f"{prefix}_tokens_details": {"cached_tokens":90,"cache_write_tokens":9},
+                 "completion_tokens" if api == "openai" else "output_tokens": 1}
+        with provider(lambda body, i: {"code":"print(1)","usage":usage}) as (url, calls):
+            report = json.loads(start(path, url, "--api", api, "--max-tokens", "100").stdout)
+            assert len(calls) == 1 and report["budget"]["tokens"] == 101, report
+            assert not report["finished"] and "token admission threshold" in report["stopped"], report
 
 
 def priced_children_run_concurrently():
@@ -566,8 +597,8 @@ def compaction_and_recovery():
 
 def mcp_transport_uncertainty():
     tools = [{"name": "mutate", "description": "test mutation", "inputSchema": {"type": "object"}}]
-    for transport in ("stdio", "http"):
-        path = workspace("mcp-" + transport)
+    for transport, oversized in (("stdio", False), ("http", False), ("stdio", True), ("http", True)):
+        path = workspace("mcp-" + transport + ("-oversized" if oversized else ""))
         server = None
         thread = None
         if transport == "stdio":
@@ -585,6 +616,9 @@ for line in sys.stdin:
  else: r={}
  print(json.dumps({"jsonrpc":"2.0","id":m["id"],"result":r}),flush=True)
 ''')
+            if oversized:
+                script.write_text(script.read_text().replace('  os._exit(0)',
+                    '  for _ in range(257): sys.stdout.write("x"*65536); sys.stdout.flush()\n  os._exit(0)'))
             config = f'[server.demo]\ncommand="python3"\nargs=[{json.dumps(str(script))}]\n'
         else:
             class McpHandler(BaseHTTPRequestHandler):
@@ -595,6 +629,16 @@ for line in sys.stdin:
                     if method == "tools/call":
                         target = path / "mcp-calls.txt"
                         target.write_text((target.read_text() if target.exists() else "") + "x")
+                        if oversized:
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.end_headers()
+                            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                                for _ in range(257):
+                                    self.wfile.write(b"10000\r\n" + b"x" * 65536 + b"\r\n")
+                                self.wfile.write(b"0\r\n\r\n")
+                            return
                         self.connection.shutdown(socket.SHUT_RDWR)
                         self.connection.close()
                         return
@@ -768,6 +812,8 @@ def deadline():
         started = time.monotonic()
         result = start(path, url, "--max-wall", "0.6", ok=False)
         assert time.monotonic() - started < 2
+        report = json.loads(result.stdout)
+        assert not report["finished"] and "turns" not in report, report
         time.sleep(2.1)
         assert not (path / "late.txt").exists()
         count = len(calls)
@@ -805,6 +851,30 @@ end}''')
                 restored = json.loads(run(path, "run", "--resume", str(log)).stdout)
                 assert restored["finished"] and restored["final_answer"] == first["final_answer"], restored
                 assert len(calls) == count
+
+
+def controller_deadlines():
+    for name, source in [
+        ("next", 'return {init=function() return {} end, step=function(s,e) return s,{kind="next"} end}'),
+        ("next_call", 'return {init=function() return {} end, step=function(s,e) return s,{kind="next_call"} end}'),
+        ("step", 'return {init=function() return {} end, step=function() print("IN_CONTROLLER"); while true do end end}'),
+        ("init", 'return {init=function() print("IN_CONTROLLER"); while true do end end}'),
+        ("load", 'print("IN_CONTROLLER"); while true do end'),
+    ]:
+        path = workspace(f"controller-deadline-{name}")
+        override = path / ".harness/override/std"
+        override.mkdir(parents=True)
+        (override / "loop.luau").write_text(source)
+        with provider(lambda body, i: "unused") as (url, calls):
+            started = time.monotonic()
+            result = start(path, url, "--max-wall", "0.3")
+            assert time.monotonic() - started < 2
+            report = json.loads(result.stdout)
+            assert not report["finished"] and "absolute run deadline" in report["stopped"] and not calls, report
+            if name in ("step", "init", "load"):
+                assert "IN_CONTROLLER" in result.stderr, result.stderr
+            restored = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
+            assert restored["stopped"] == report["stopped"] and not calls, restored
 
 
 def cli_preflight():
@@ -910,11 +980,13 @@ if __name__ == "__main__":
     check("concurrent children queue under a cost cap instead of failing", concurrent_children_under_cost_cap)
     check("lost model response is not retried; reservation survives resume", no_transport_retry)
     check("bounded lost responses are charged at their bound and the run continues", bounded_lost_response)
+    check("unknown billing without a dollar threshold requires owner evidence", unknown_billing_without_cost_threshold)
+    check("cached reads and writes count toward the total token budget", cached_token_budget)
     check("priced reservations let concurrent children run side by side", priced_children_run_concurrently)
     check("sandboxed offline sh settles itself; networked sh waits for the owner", sandboxed_sh_settles)
     check("owner billing reconciliation settles exactly one reservation", billing_reconciliation)
     check("compaction replaces previous summaries and checkpoints explicit state", compaction_and_recovery)
-    check("MCP transport loss stays uncertain without redispatch (stdio and HTTP)", mcp_transport_uncertainty)
+    check("MCP lost and oversized mutation responses stay uncertain without redispatch", mcp_transport_uncertainty)
     check("control hook failure prevents dispatch", control_hook_error)
     check("review regressions: hook/command validation, bounded copies, native arrays", review_boundary_regressions)
     check("review regressions: branch startup crashes and revoked reconciliation", review_branch_and_revocation)
@@ -922,6 +994,7 @@ if __name__ == "__main__":
     check("single writer and owner revocation", single_writer_and_revocation)
     check("absolute deadline cancels local work and includes downtime", deadline)
     check("completed runs retain their answer after deadlines, including custom controllers", completed_deadline_resume)
+    check("controller-only transitions and CPU loops obey the absolute deadline", controller_deadlines)
     check("invalid CLI options fail before opening a journal", cli_preflight)
     check("format-2 checkpoints resume and branch into format-3 runs", legacy_checkpoint_resume)
     check("session, package and batch agents reject invalid options before dispatch", agent_option_validation)

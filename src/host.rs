@@ -166,108 +166,122 @@ impl Host {
 
     pub fn run_task(self: Arc<Self>, task: String, max_turns: usize) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> {
         Box::pin(async move {
-            self.policy.log.check()?;
-            if self.depth == 0 && let Some(RunState::Finished { report }) = &self.supervisor.restored {
-                return Ok(self.report(Value::Object(report.clone()), 0.0));
-            }
-            if let Err(error) = self.supervisor.check() {
-                if !error.to_string().starts_with("budget_exceeded:") { return Err(error); }
-                let report = json!({"turns":0,"code_turns":0,"luau_errors":0,"truncated_turns":0,"ops_per_turn":[],
-                    "finished":false,"final_answer":"","stopped":error.to_string()});
+            let started = Instant::now();
+            let result = self.clone().execute_task(task, max_turns).await;
+            if result.is_err() && let Err(error) = self.supervisor.check()
+                && error.to_string().starts_with("budget_exceeded:") {
+                // Controller state is opaque; unavailable workflow counters must not masquerade as zero.
+                let report = json!({"finished":false,"final_answer":"","stopped":error.to_string()});
                 self.policy.log.write("budget", json!({"reason":error.to_string(),"depth":self.depth}), true)?;
                 self.supervisor.checkpoint(&self.lane, RunState::Finished { report: report.as_object().unwrap().clone() }, &self.durable.lock().unwrap())?;
-                return Ok(self.report(report, 0.0));
+                return Ok(self.report(report, started.elapsed().as_secs_f64()));
             }
-            let t0 = Instant::now();
-            let vm = Vm::new(self.policy.clone(), Duration::from_secs(120), 512 << 20, Some(self.clone()))?;
-            let mut packs = vec!["std/packages".into(), "std/mcp".into()];
-            for name in &self.packs {
-                if matches!(name.as_str(), "std/vision" | "std/authoring") && !packs.contains(name) { packs.push(name.clone()); }
+            result
+        })
+    }
+
+    fn controller(&self) -> Result<Controller> {
+        Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs,
+            self.supervisor.manifest.as_ref().and_then(|m| m.deadline))
+    }
+
+    async fn execute_task(self: Arc<Self>, task: String, max_turns: usize) -> Result<Value> {
+        self.policy.log.check()?;
+        if self.depth == 0 && let Some(RunState::Finished { report }) = &self.supervisor.restored {
+            return Ok(self.report(Value::Object(report.clone()), 0.0));
+        }
+        self.supervisor.check()?;
+        let t0 = Instant::now();
+        let vm = Vm::new(self.policy.clone(), Duration::from_secs(120), 512 << 20, Some(self.clone()))?;
+        let mut packs = vec!["std/packages".into(), "std/mcp".into()];
+        for name in &self.packs {
+            if matches!(name.as_str(), "std/vision" | "std/authoring") && !packs.contains(name) { packs.push(name.clone()); }
+        }
+        vm.install_packs(&packs).await?;
+        let controller = self.controller()?;
+        let mut state = if self.depth == 0 {
+            match &self.supervisor.restored {
+                Some(RunState::Running { controller }) => controller.clone(),
+                Some(RunState::Finished { .. }) => unreachable!("finished runs returned above"),
+                None => controller.init(&json!({"max_turns": max_turns,
+                    "task_message": format!("{task}\n\n[files in the working directory]\n{}", file_tree(&self.workspace))}))?,
             }
-            vm.install_packs(&packs).await?;
-            let controller = Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs)?;
-            let mut state = if self.depth == 0 {
-                match &self.supervisor.restored {
-                    Some(RunState::Running { controller }) => controller.clone(),
-                    Some(RunState::Finished { .. }) => unreachable!("finished runs returned above"),
-                    None => controller.init(&json!({"max_turns": max_turns,
-                        "task_message": format!("{task}\n\n[files in the working directory]\n{}", file_tree(&self.workspace))}))?,
-                }
-            } else {
-                controller.init(&json!({"max_turns": max_turns, "task_message": task}))?
-            };
-            let mut event = if self.depth == 0 {
-                self.supervisor.recovery.as_ref().map(|r| json!({"kind": "recover", "message": serde_json::to_string_pretty(r).unwrap()})).unwrap_or_else(|| json!({"kind":"next"}))
-            } else { json!({"kind":"next"}) };
-            let mut compacting = false;
-            loop {
-                self.policy.log.check()?;
-                let previous_messages = state["messages"].as_array().cloned().unwrap_or_default();
-                // A controller transition starts from frozen source and explicit data, just like a package call.
-                // Captured Lua locals cannot become a second, uncheckpointed workflow state store.
-                let controller = Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs)?;
-                let (next_state, mut command) = controller.step(&state, &event)?;
-                anyhow::ensure!(next_state.is_object(), "controller state must be an object");
-                crate::controller::command(&command)?;
-                state = next_state;
-                // The trace reads only commands and the conversation, never the controller's private state.
-                if std::mem::take(&mut compacting) {
-                    let failed = event["kind"] == "model_error" || event["reply"]["text"].as_str().unwrap_or("").trim().is_empty();
-                    let kept = state["messages"].as_array().map_or(0, Vec::len).saturating_sub(1);
-                    if failed { self.log("### COMPACT FAILED"); }
-                    else { self.log(&format!("### COMPACT\nsummarized {} messages, kept {kept}, summary committed", previous_messages.len().saturating_sub(kept + 1))); }
-                }
-                if let Some(messages) = state["messages"].as_array() {
-                    for (i, message) in messages.iter().enumerate() {
-                        if previous_messages.get(i) != Some(message) && matches!(message["role"].as_str(), Some("user" | "tool")) {
-                            let label = if message["role"] == "tool" { "RESULT" } else { "HARNESS" };
-                            self.log(&format!("### {label}\n{}", message["content"].as_str().unwrap_or("")));
-                        }
+        } else {
+            controller.init(&json!({"max_turns": max_turns, "task_message": task}))?
+        };
+        let mut event = if self.depth == 0 {
+            self.supervisor.recovery.as_ref().map(|r| json!({"kind": "recover", "message": serde_json::to_string_pretty(r).unwrap()})).unwrap_or_else(|| json!({"kind":"next"}))
+        } else { json!({"kind":"next"}) };
+        let mut compacting = false;
+        loop {
+            self.supervisor.check()?;
+            let previous_messages = state["messages"].as_array().cloned().unwrap_or_default();
+            // A controller transition starts from frozen source and explicit data, just like a package call.
+            // Captured Lua locals cannot become a second, uncheckpointed workflow state store.
+            let controller = self.controller()?;
+            let (next_state, mut command) = controller.step(&state, &event)?;
+            self.supervisor.check()?;
+            anyhow::ensure!(next_state.is_object(), "controller state must be an object");
+            crate::controller::command(&command)?;
+            state = next_state;
+            // The trace reads only commands and the conversation, never the controller's private state.
+            if std::mem::take(&mut compacting) {
+                let failed = event["kind"] == "model_error" || event["reply"]["text"].as_str().unwrap_or("").trim().is_empty();
+                let kept = state["messages"].as_array().map_or(0, Vec::len).saturating_sub(1);
+                if failed { self.log("### COMPACT FAILED"); }
+                else { self.log(&format!("### COMPACT\nsummarized {} messages, kept {kept}, summary committed", previous_messages.len().saturating_sub(kept + 1))); }
+            }
+            if let Some(messages) = state["messages"].as_array() {
+                for (i, message) in messages.iter().enumerate() {
+                    if previous_messages.get(i) != Some(message) && matches!(message["role"].as_str(), Some("user" | "tool")) {
+                        let label = if message["role"] == "tool" { "RESULT" } else { "HARNESS" };
+                        self.log(&format!("### {label}\n{}", message["content"].as_str().unwrap_or("")));
                     }
                 }
-                if command["kind"] == "model" && command["purpose"] == "agent" {
-                    let request = vm.prepare_request(&command["request"])?;
-                    // Image notifications and other data-only additions belong to the controller checkpoint too.
-                    state["messages"] = request["messages"].clone();
-                    command["request"] = request;
-                }
-                compacting = command["kind"] == "model" && command["purpose"] == "compact";
-                let command = crate::controller::command(&command)?;
-                let saved = match &command {
-                    crate::controller::Command::Finish { report } => RunState::Finished { report: report.clone() },
-                    _ => RunState::Running { controller: state.clone() },
-                };
-                self.supervisor.checkpoint(&self.lane, saved, &self.durable.lock().unwrap())?;
-                match command {
-                    crate::controller::Command::Next => event = json!({"kind":"next"}),
-                    crate::controller::Command::NextCall => event = json!({"kind":"next_call"}),
-                    crate::controller::Command::Model { request, .. } => {
-                        match self.chat(&request).await {
-                            Ok(reply) => {
-                                self.log(&format!("### MODEL\n{}", reply.text));
-                                event = json!({"kind":"model_reply", "reply":reply});
-                            },
-                            Err(error) => {
-                                let message = error.to_string();
-                                let safe_context_rejection = ["API 400 ", "API 413 ", "API 422 "].iter().any(|prefix| message.starts_with(prefix));
-                                event = json!({"kind":"model_error", "error":message, "safe_context_rejection":safe_context_rejection});
-                            },
-                        }
-                    },
-                    crate::controller::Command::Run { code } => {
-                        self.supervisor.check()?;
-                        self.log(&format!("### CODE\n{code}"));
-                        self.policy.log.write("chunk_begin", json!({"lane":self.lane, "depth":self.depth, "code":code}), true)?;
-                        let result = vm.run_chunk(&code).await?;
-                        let notifications = vm.prepare_request(&json!({"system":"", "messages":[], "tools":[]}))?;
-                        event = json!({"kind":"run_result", "result": result, "notifications":notifications["messages"]});
-                    },
-                    crate::controller::Command::Finish { report } => {
-                        return Ok(self.report(Value::Object(report), t0.elapsed().as_secs_f64()));
-                    },
-                }
             }
-        })
+            if command["kind"] == "model" && command["purpose"] == "agent" {
+                let request = vm.prepare_request(&command["request"])?;
+                // Image notifications and other data-only additions belong to the controller checkpoint too.
+                state["messages"] = request["messages"].clone();
+                command["request"] = request;
+            }
+            compacting = command["kind"] == "model" && command["purpose"] == "compact";
+            let command = crate::controller::command(&command)?;
+            self.supervisor.check()?;
+            let saved = match &command {
+                crate::controller::Command::Finish { report } => RunState::Finished { report: report.clone() },
+                _ => RunState::Running { controller: state.clone() },
+            };
+            self.supervisor.checkpoint(&self.lane, saved, &self.durable.lock().unwrap())?;
+            match command {
+                crate::controller::Command::Next => event = json!({"kind":"next"}),
+                crate::controller::Command::NextCall => event = json!({"kind":"next_call"}),
+                crate::controller::Command::Model { request, .. } => {
+                    match self.chat(&request).await {
+                        Ok(reply) => {
+                            self.log(&format!("### MODEL\n{}", reply.text));
+                            event = json!({"kind":"model_reply", "reply":reply});
+                        },
+                        Err(error) => {
+                            let message = error.to_string();
+                            let safe_context_rejection = ["API 400 ", "API 413 ", "API 422 "].iter().any(|prefix| message.starts_with(prefix));
+                            event = json!({"kind":"model_error", "error":message, "safe_context_rejection":safe_context_rejection});
+                        },
+                    }
+                },
+                crate::controller::Command::Run { code } => {
+                    self.supervisor.check()?;
+                    self.log(&format!("### CODE\n{code}"));
+                    self.policy.log.write("chunk_begin", json!({"lane":self.lane, "depth":self.depth, "code":code}), true)?;
+                    let result = vm.run_chunk(&code).await?;
+                    let notifications = vm.prepare_request(&json!({"system":"", "messages":[], "tools":[]}))?;
+                    event = json!({"kind":"run_result", "result": result, "notifications":notifications["messages"]});
+                },
+                crate::controller::Command::Finish { report } => {
+                    return Ok(self.report(Value::Object(report), t0.elapsed().as_secs_f64()));
+                },
+            }
+        }
     }
 }
 

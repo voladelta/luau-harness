@@ -45,7 +45,7 @@ struct PacksSection {
 }
 
 /// Limits for one run, shared with every subagent. None = unlimited. Cost needs a provider that reports it
-/// (OpenRouter, Enclave); tokens (input + cache writes + output) work everywhere.
+/// (OpenRouter, Enclave); tokens (input + cache reads + cache writes + output) work everywhere.
 #[derive(Deserialize, serde::Serialize, Default, Clone, Debug, PartialEq)]
 pub struct Budget {
     pub max_cost: Option<f64>,

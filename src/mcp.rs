@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
@@ -144,6 +144,47 @@ fn sse_event_end(buf: &[u8]) -> Option<usize> {
 }
 
 const MAX_BODY: usize = 16 << 20;
+
+/// One byte allowance for the whole response, including ignored notifications and HTTP error bodies.
+/// Check before appending; neither a missing Content-Length nor draining SSE events resets the allowance.
+struct ResponseBudget { remaining: usize }
+
+impl ResponseBudget {
+    fn new() -> Self { Self { remaining: MAX_BODY } }
+
+    fn consume(&mut self, bytes: usize) -> Result<()> {
+        self.remaining = self.remaining.checked_sub(bytes)
+            .ok_or_else(|| anyhow::Error::new(ConnLost("MCP response too large".into())))?;
+        Ok(())
+    }
+
+    fn append(&mut self, buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+        self.consume(bytes.len())?;
+        buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn line(&mut self, reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        // One sentinel byte distinguishes an exact-sized frame from an oversized, newline-free stream.
+        reader.take(self.remaining as u64 + 1).read_until(b'\n', &mut bytes).await
+            .map_err(|e| anyhow::Error::new(ConnLost(format!("MCP stdio read failed: {e}"))))?;
+        self.consume(bytes.len())?;
+        Ok(bytes)
+    }
+
+    async fn body(&mut self, response: &mut reqwest::Response) -> Result<Vec<u8>> {
+        if response.content_length().is_some_and(|n| n > self.remaining as u64) {
+            return Err(anyhow::Error::new(ConnLost("MCP response too large".into())));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await
+            .map_err(|e| anyhow::Error::new(ConnLost(format!("MCP response read failed: {}", e.without_url()))))? {
+            self.append(&mut bytes, &chunk)?;
+        }
+        Ok(bytes)
+    }
+}
 
 /// The JSON-RPC response with this id among the SSE events in `buf` (server requests and notifications are skipped).
 fn sse_response(buf: &[u8], id: u64) -> Option<Value> {
@@ -293,23 +334,27 @@ impl Mcp {
         let id = c.next_id;
         c.next_id += 1;
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string() + "\n";
-        c.stdin.write_all(line.as_bytes()).await?;
-        c.stdin.flush().await?;
-        loop {
-            let mut buf = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(60), c.out.read_line(&mut buf)).await.map_err(|_| anyhow::Error::new(ConnLost(format!("MCP server did not answer {method} within 60s"))))??;
-            if n == 0 {
-                return Err(anyhow::Error::new(ConnLost(format!("MCP server exited while handling {method}"))));
+        let work = async {
+            c.stdin.write_all(line.as_bytes()).await?;
+            c.stdin.flush().await?;
+            let mut budget = ResponseBudget::new();
+            loop {
+                let buf = budget.line(&mut c.out).await?;
+                if buf.is_empty() {
+                    return Err(anyhow::Error::new(ConnLost(format!("MCP server exited while handling {method}"))));
+                }
+                let Ok(v) = serde_json::from_slice::<Value>(&buf) else { continue };
+                if v["id"].as_u64() != Some(id) {
+                    continue; // notifications and server->client requests are ignored
+                }
+                if let Some(e) = v.get("error") {
+                    bail!("MCP error: {}", e["message"].as_str().unwrap_or("unknown"));
+                }
+                return Ok(v["result"].clone());
             }
-            let Ok(v) = serde_json::from_str::<Value>(buf.trim()) else { continue };
-            if v["id"].as_u64() != Some(id) {
-                continue; // notifications and server->client requests are ignored
-            }
-            if let Some(e) = v.get("error") {
-                bail!("MCP error: {}", e["message"].as_str().unwrap_or("unknown"));
-            }
-            return Ok(v["result"].clone());
-        }
+        };
+        tokio::time::timeout(Duration::from_secs(60), work).await
+            .map_err(|_| anyhow::Error::new(ConnLost(format!("MCP server did not answer {method} within 60s"))))?
     }
 
     async fn http_request(h: &mut Http, method: &str, params: Value) -> Result<Value> {
@@ -343,6 +388,7 @@ impl Mcp {
         }
         let work = async {
             let mut resp = req.send().await.map_err(|e| lost(h, format!("MCP http request failed: {}", e.without_url())))?;
+            let mut budget = ResponseBudget::new();
             let status = resp.status();
             if let Some(s) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
                 h.session = Some(s.to_string());
@@ -351,7 +397,8 @@ impl Mcp {
                 return Err(lost(h, "MCP session expired (HTTP 404)".into()));
             }
             if !status.is_success() {
-                let body: String = Self::scrub(h, resp.text().await.unwrap_or_default()).chars().take(200).collect();
+                let bytes = budget.body(&mut resp).await?;
+                let body: String = Self::scrub(h, String::from_utf8_lossy(&bytes).into_owned()).chars().take(200).collect();
                 let hint = if status.is_redirection() { " (redirects are not followed)" } else if status.as_u16() == 401 || status.as_u16() == 403 { " (check the credentials)" } else { "" };
                 bail!("{}", Self::scrub(h, format!("MCP server returned HTTP {}{hint}: {body}", status.as_u16())));
             }
@@ -368,10 +415,7 @@ impl Mcp {
                         }
                         return Err(lost(h, "MCP stream ended without a response".into()));
                     };
-                    buf.extend_from_slice(&chunk);
-                    if buf.len() > MAX_BODY {
-                        return Err(lost(h, "MCP response too large".into()));
-                    }
+                    budget.append(&mut buf, &chunk)?;
                     while let Some(end) = sse_event_end(&buf) {
                         let ev: Vec<u8> = buf.drain(..end).collect();
                         if let Some(v) = sse_response(&ev, id) {
@@ -380,10 +424,9 @@ impl Mcp {
                     }
                 }
             }
-            if resp.content_length().is_some_and(|n| n > MAX_BODY as u64) {
-                return Err(lost(h, "MCP response too large".into()));
-            }
-            let v: Value = resp.json().await.map_err(|e| lost(h, format!("MCP server sent an unreadable response: {}", e.without_url())))?;
+            let bytes = budget.body(&mut resp).await?;
+            let v: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| lost(h, "MCP server sent an unreadable response".into()))?;
             if v.get("method").is_some() || v["id"].as_u64() != Some(id) {
                 return Err(lost(h, "MCP server answered a different request id".into()));
             }
@@ -410,7 +453,74 @@ impl Mcp {
 
 #[cfg(test)]
 mod tests {
-    use super::glob;
+    use super::*;
+
+    #[tokio::test]
+    async fn stdio_limit_covers_newline_free_output_and_ignored_frames() {
+        let bytes = vec![b'x'; MAX_BODY + 1];
+        let mut reader = bytes.as_slice();
+        let error = ResponseBudget::new().line(&mut reader).await.unwrap_err();
+        assert!(error.is::<ConnLost>());
+        assert!(error.to_string().contains("too large"));
+
+        let mut budget = ResponseBudget { remaining: 8 };
+        let mut reader = &b"ping\npong\n"[..];
+        assert_eq!(budget.line(&mut reader).await.unwrap(), b"ping\n");
+        assert!(budget.line(&mut reader).await.unwrap_err().is::<ConnLost>());
+        let mut budget = ResponseBudget { remaining: 5 };
+        assert_eq!(budget.line(&mut &b"done\n"[..]).await.unwrap(), b"done\n");
+    }
+
+    async fn chunked_http(status: u16, content_type: &str, body: Vec<u8>) -> Result<Value> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let headers = format!("HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).await.unwrap();
+            let mut socket = reader.into_inner();
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            for chunk in body.chunks(8192) {
+                if socket.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await.is_err()
+                    || socket.write_all(chunk).await.is_err() || socket.write_all(b"\r\n").await.is_err() { return; }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        let mut http = Http { client: reqwest::Client::builder().no_proxy().build().unwrap(), url,
+            headers: Default::default(), secrets: vec![], session: None, version: None, next_id: 1 };
+        let result = Mcp::http_request(&mut http, "tools/list", json!({})).await;
+        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn chunked_json_and_error_bodies_are_bounded_before_decoding() {
+        assert_eq!(chunked_http(200, "application/json", br#"{"id":1,"result":{"ok":true}}"#.to_vec()).await.unwrap(), json!({"ok":true}));
+        for status in [200, 502] {
+            let error = chunked_http(status, "application/json", vec![b' '; MAX_BODY + 1]).await.unwrap_err();
+            assert!(error.is::<ConnLost>() && error.to_string().contains("too large"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_notifications_cannot_reset_the_response_allowance() {
+        let mut body = Vec::new();
+        let event = format!("data: {{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"padding\":\"{}\"}}\n\n", "x".repeat(8192));
+        while body.len() <= MAX_BODY { body.extend_from_slice(event.as_bytes()); }
+        body.extend_from_slice(b"data: {\"id\":1,\"result\":{}}\n\n");
+        let error = chunked_http(200, "text/event-stream", body).await.unwrap_err();
+        assert!(error.is::<ConnLost>() && error.to_string().contains("too large"), "{error}");
+    }
 
     #[test]
     fn glob_matches_only_where_wildcards_allow() {

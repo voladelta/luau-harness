@@ -52,7 +52,7 @@ pub fn command(value: &Json) -> Result<Command> {
 pub struct Controller { lua: Lua, module: Table }
 
 impl Controller {
-    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, packs: &[String]) -> Result<Self> {
+    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, packs: &[String], run_deadline: Option<f64>) -> Result<Self> {
         let lua = Lua::new();
         let g = lua.globals();
         g.set("print", lua.create_function(|_, args: MultiValue| { eprintln!("{}", args.into_iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t")); Ok(()) })?)?;
@@ -62,6 +62,9 @@ impl Controller {
         let deadline = Arc::new(std::sync::Mutex::new(Instant::now() + Duration::from_secs(10)));
         let d = deadline.clone();
         lua.set_interrupt(move |_| {
+            if run_deadline.is_some_and(|d| crate::supervisor::now() >= d) {
+                return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached during controller execution"));
+            }
             if Instant::now() >= *d.lock().unwrap() { return Err(mlua::Error::runtime("controller time budget exceeded")); }
             Ok(mlua::VmState::Continue)
         });
