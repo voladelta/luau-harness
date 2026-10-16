@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Responses successes include "error": null, as real providers do.
 # LLM client checks (also: loop nudge on garbled tool-call markup): each wire format (chat completions, responses) completes a run against a scripted
 # server, and an openrouter-looking URL does not restrict the upstream provider. No API key needed.
 set -u

@@ -319,7 +319,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     let answered = |message: String| Answered { status: status.as_u16(), message, retry_after };
     if !status.is_success() { return Err(answered(format!("API {status}: {text}")).into()); }
     let resp: Value = serde_json::from_str(&text).map_err(|e| answered(format!("API returned a malformed body: {e}")))?;
-    if resp.get("error").is_some() { return Err(answered(format!("API error: {}", resp["error"])).into()); }
+    if resp.get("error").is_some_and(|error| !error.is_null()) { return Err(answered(format!("API error: {}", resp["error"])).into()); }
 
     let u = &resp["usage"];
     let mut out = Reply::default();
