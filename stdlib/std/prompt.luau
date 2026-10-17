@@ -27,7 +27,10 @@ M.tools = {
 		description = "Run Luau code in the persistent session. Returns what the code printed, the value of the last expression (after =>) and any error with traceback. Global variables persist across calls.",
 		parameters = {
 			type = "object",
-			properties = { code = { type = "string", description = "The Luau source to run." } },
+			properties = {
+				description = { type = "string", description = "Brief description of the action being taken." },
+				code = { type = "string", description = "The Luau source to run." },
+			},
 			required = { "code" },
 		},
 	},
