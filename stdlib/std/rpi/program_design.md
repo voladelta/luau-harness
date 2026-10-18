@@ -1,0 +1,6 @@
+# Program design and implementation outline
+Refine the system design into concrete code shape: files, functions, data structures, interfaces and ordered implementation steps. Explain compatibility, errors and migration where relevant. Specify meaningful validation against acceptance requirements; avoid tests that merely mirror implementation. Define canonical check commands that can be rerun independently.
+
+In stage.submit add `checks={{id="check-id",command="exact shell command",cwd=".",timeout=120,requirements={"requirement-id"}}}`. Use cwd relative to the workspace. Commands, cwd and timeout are frozen and verification must invoke them exactly via sh(command,{cwd=cwd,timeout=timeout}). Include an explicit empty checks array only when there truly are no automated checks and explain why. No shell or workspace mutations during design. Include the implementation outline in the document.
+
+Keep the design document concise, structured, and focused on interfaces, data structures, and frozen check commands. Strictly adhere to the requirements; do not add unwanted features or speculate. Do NOT output massive verbatim code listings or full file dumps inside the design document; save the actual coding for the implementation stage.

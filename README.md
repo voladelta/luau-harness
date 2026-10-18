@@ -25,6 +25,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Code mode | One `luau` tool; globals persist across turns; `read`, `write`, `edit`, `sh`, `search` (ripgrep engine, embedded) |
 | Sandbox (macOS) | `sh` runs under Seatbelt: writes confined to the project and a temp dir, no network, no API keys in the environment |
 | Approval gate | `git push`, publish, `ssh` and other external commands need the user's approval; nothing the model writes can approve |
+| RPI workflow | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds durable owner review gates |
 | Recovery | `--resume` restores explicit saved data and controller state into a fresh VM; old effectful chunks are never replayed |
 | Budgets | Shared admission thresholds reserve each request's priced upper bound (the whole remaining allowance when no price is known); an absolute deadline includes downtime |
 | Compaction | On by default (`std/compact`): from 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; recent messages and Luau globals stay; one compact-and-retry on a context-overflow error |
@@ -116,6 +117,7 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | Command | What it does |
 |---|---|
 | `hx run` | Run an agent task; prints a JSON report |
+| `hx review LOG --gate ID --decision approve` | Record an RPI review decision; resume separately to continue |
 | `hx run --resume LOG` | Restore the saved manifest and latest checkpoint; no repeated launch flags |
 | `hx run --branch LOG --model M` | Start a new run using current approved configuration and inherited saved data |
 | `hx recover LOG OP --decision complete\|abandon --yes` | Record an owner's decision about an uncertain mutation; never executes it |
@@ -135,6 +137,8 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | Flag | Default | Meaning |
 |---|---|---|
 | `--prompt-file F` | | Task text (not needed with `--resume` if the log recorded it) |
+| `--rpi` | off | Activate the bundled RPI workflow in automatic mode |
+| `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
 | `--model M` | `HX_MODEL` | Model id |
 | `--api A` | `openai` (`HX_API`) | `openai` (Chat Completions), `responses`, or `claude-sdk` (the `claude` CLI and your Claude plan; `--model haiku\|sonnet\|opus`) |
 | `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
@@ -149,6 +153,30 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | `--trace FILE` | | Write a readable trace |
 
 Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open network, no path limits and no approval gate; `.harness/` and `hx.lock` stay read-only; prints a warning), `--net` / `--no-net`, `--approval prompt` (ask on the terminal instead of refusing). Every command takes `--help`.
+
+## Research, design and implementation
+
+Use `--rpi` to carry a task through separate research-questions, research, system-design, program-design, implementation and verification stages. Each stage starts with a fresh agent session and receives the relevant immutable documents. Verification failures trigger repair and fresh verification, with at most three repair cycles across the run. This is a bundled Luau workflow adapted from [HumanLayer RPI](stdlib/std/rpi/PROVENANCE.md); activate it with `--rpi`, not `--pack std/rpi`.
+
+```bash
+hx run --rpi --prompt-file task.md --model MODEL
+hx run --rpi --manual --prompt-file task.md --model MODEL
+```
+
+> **Repository Requirement:** `--rpi` strictly requires the workspace to be an initialized Git repository (with a `.git` root) and an appropriate `.gitignore`. The harness uses Git's inventory (`git ls-files --exclude-standard`) to track source modifications without being invalidated by compiled build outputs (`build/`, `target/`, `*.o`). Unversioned directories will be rejected at launch with an explicit error.
+
+Automatic mode makes reasonable choices and proceeds. It pauses when essential information, an owner action or mandatory manual validation is missing. Manual mode also pauses after research questions, research, system design and program design, and for final acceptance. Review pauses return `finished:false` and the gate identity. Paused resume performs no model work until you record a valid decision:
+
+```bash
+hx review .harness/log/RUN.jsonl --gate GATE_ID --decision approve
+hx run --resume .harness/log/RUN.jsonl
+```
+
+Use `--decision revise --input-file feedback.md` to revise a reviewed document, or `--decision answer --input-file answers.md` for an input gate. A validation input gate can also allow `--decision waive --input-file reason.md`; the waiver applies only to that gate's listed checks and stays distinct from passing checks. Use the actions allowed by the reported gate. `hx review` records the decision; it does not execute the task. Final acceptance needs no model call.
+
+Documents appear under `.agents/artifacts/rpi-RUN_ID/`. They are views of journal-backed artifacts; edit requests belong in review feedback. Resume restores frozen workflow mode, sources and budgets, so do not repeat `--rpi` or `--manual` with `--resume`. A branch chooses its workflow anew and does not inherit approvals. All stages share the run's limits; review downtime counts toward its deadline.
+
+Research and design stages can inspect source and approved read-only web tools but cannot execute shell or change the project. Implementation, verification and repair use the run's ordinary permissions. Verification checks exact planned commands, successful receipts and a bounded source inventory; this does not establish a hermetic build or protect against every concurrent external writer. See [runtime details](docs/runtime-v2.md#rpi-workflow).
 
 ## How it works
 

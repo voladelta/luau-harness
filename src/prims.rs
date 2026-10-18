@@ -238,15 +238,16 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                 let grace = Duration::from_secs(2);
                 let so = tokio::time::timeout(grace, out_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
                 let se = tokio::time::timeout(grace, err_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-                Ok(Ret::Sh { stdout: so, stderr: se, code: status.map(|c| c as i64), timed_out })
+                Ok(Ret::Sh { stdout: so, stderr: se, code: status.map(|c| c as i64), timed_out, operation_id:None })
             }).await?;
             match ret {
-                Ret::Sh { stdout, stderr, code, timed_out } => {
+                Ret::Sh { stdout, stderr, code, timed_out, operation_id } => {
                     let t = lua.create_table()?;
                     t.set("stdout", lua.create_string(&stdout)?)?;
                     t.set("stderr", lua.create_string(&stderr)?)?;
                     t.set("code", code.unwrap_or(-1))?;
                     t.set("timed_out", timed_out)?;
+                    t.set("operation_id", operation_id)?;
                     Ok(t)
                 }
                 r => Err(bad(r)),
@@ -263,7 +264,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let pol = f.pol.clone();
         match f.sync(lua, crate::supervisor::Tool::Search, Class::Read, args, |_| {
             pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-            Ok(match search(&pol.workspace, &pat, &opts, pol.enabled)? {
+            Ok(match search(&pol.workspace, &pat, &opts, pol.enabled, f.supervisor.workflow_epoch().is_some())? {
                 Ok((rows, truncated)) => Ret::Rows { rows, truncated },
                 Err((kind, message, hint)) => Ret::SearchErr { kind: kind.into(), message, hint: hint.into() },
             })
@@ -306,7 +307,7 @@ impl Sink for Collect<'_> {
 
 // search(pattern, {path=".", glob="*.rs", max=200, ignore_case=false, literal=false}). With `skip_secrets` (the policy is on),
 // credential files are not searched, as `read` refuses them.
-fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool) -> mlua::Result<Result<(Rows, bool), SearchErr>> {
+fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, workflow: bool) -> mlua::Result<Result<(Rows, bool), SearchErr>> {
     let literal = opt_bool(opts, "literal");
     if !literal {
         for tok in ["(?=", "(?!", "(?<=", "(?<!"] {
@@ -342,6 +343,15 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool) -> m
     let cap = opt_num(opts, "max").map(|m| m.max(1.0) as usize).unwrap_or(DEFAULT_HITS);
     let mut wb = WalkBuilder::new(&base);
     wb.follow_links(false).require_git(false).sort_by_file_path(|a, b| a.cmp(b));
+    if workflow {
+        wb.parents(false);
+        let project=root.to_path_buf();
+        let explicit=base.strip_prefix(root).unwrap_or(&base).to_path_buf();
+        wb.filter_entry(move |entry| {
+            let relative=entry.path().strip_prefix(&project).unwrap_or(entry.path());
+            [".harness/log", ".agents/artifacts"].iter().all(|runtime|explicit.starts_with(runtime) || !relative.starts_with(runtime))
+        });
+    }
     if let Some(glob) = opt_str(opts, "glob") {
         let mut ob = OverrideBuilder::new(&base);
         if let Err(e) = ob.add(&glob) {

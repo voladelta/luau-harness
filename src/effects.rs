@@ -45,7 +45,7 @@ fn is_unknown(error: &mlua::Error) -> bool {
 pub enum Ret {
     Num(f64),
     Str(String),
-    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool },
+    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, operation_id: Option<u64> },
     Rows { rows: Vec<(String, i64, String)>, truncated: bool },
     SearchErr { kind: String, message: String, hint: String },
     Agent { answer: String, finished: bool, turns: u64 },
@@ -59,7 +59,7 @@ impl Ret {
         Ok(match self {
             Ret::Num(v) => json!({"t": "num", "v": v}),
             Ret::Str(s) => json!({"t": "str", "blob": log.blob(s.as_bytes())?}),
-            Ret::Sh { stdout, stderr, code, timed_out } => json!({"t": "sh", "stdout": log.blob(stdout)?, "stderr": log.blob(stderr)?, "code": code, "timed_out": timed_out}),
+            Ret::Sh { stdout, stderr, code, timed_out, .. } => json!({"t": "sh", "stdout": log.blob(stdout)?, "stderr": log.blob(stderr)?, "code": code, "timed_out": timed_out}),
             Ret::Rows { rows, truncated } => json!({"t": "rows", "blob": log.blob(serde_json::to_string(rows).unwrap_or_default().as_bytes())?, "n": rows.len(), "truncated": truncated}),
             Ret::SearchErr { kind, message, hint } => json!({"t": "searcherr", "kind": kind, "message": message, "hint": hint}),
             Ret::Agent { answer, finished, turns } => json!({"t": "agent", "answer": log.blob(answer.as_bytes())?, "finished": finished, "turns": turns}),
@@ -74,6 +74,7 @@ pub struct Effects {
     pub depth: usize,
     pub supervisor: Arc<Supervisor>,
     pub principal: Principal,
+    pub stage_epoch: Option<u64>,
     /// The chunk's time budget guards against Luau loops, not waiting: time spent awaiting an effect moves it forward.
     pub deadline: Arc<Mutex<Option<std::time::Instant>>>,
     /// Luau threads (by pointer) awaiting an effect, with a count per thread; the interrupt skips only those threads,
@@ -115,7 +116,7 @@ impl Effects {
     }
 
     pub fn supervised(supervisor: Arc<Supervisor>, principal: Principal, depth: usize, deadline: Arc<Mutex<Option<std::time::Instant>>>) -> Arc<Self> {
-        Arc::new(Self { pol: supervisor.policy.clone(), depth, supervisor, principal, deadline, waiting: Arc::default() })
+        Arc::new(Self { pol: supervisor.policy.clone(), stage_epoch:supervisor.workflow_epoch(), depth, supervisor, principal, deadline, waiting: Arc::default() })
     }
 
     pub fn log(&self) -> &Arc<EventLog> {
@@ -149,6 +150,7 @@ impl Effects {
         r["ok"] = json!(res.is_ok());
         r["ms"] = json!(ms);
         r["ret"] = ret.to_json(self.log()).map_err(|e| rt(e.to_string()))?;
+        self.supervisor.workflow_effect_metadata(tool, &mut r).map_err(mlua::Error::external)?;
         if let Ret::Err(m) = &ret {
             r["detail"] = json!({"error": m.chars().take(300).collect::<String>()});
             if m.starts_with("approval_required") {
@@ -172,15 +174,18 @@ impl Effects {
     /// Authorize and record one synchronous effect.
     /// `f` receives the durable intent's ID (None for reads).
     pub fn sync(&self, _lua: &Lua, tool: Tool, class: Class, args: Value, f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
+        self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
         let _permit = if class != Class::Read && tool != Tool::Agent {
             Some(self.supervisor.mutations.clone().try_acquire_owned().map_err(|_| rt("another mutation is in progress"))?)
         } else { None };
+        self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
         let sha = args_sha(&args);
         let t0 = std::time::Instant::now();
         let call = Call { tool, class, args: &args, sha: &sha };
         let intent = self.begin(&call)?;
+        let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
         let res = f(intent);
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
         res
@@ -192,24 +197,28 @@ impl Effects {
         F: FnOnce() -> Fut,
         Fut: Future<Output = mlua::Result<Ret>>,
     {
+        self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
         let _permit = if class != Class::Read && tool != Tool::Agent {
             Some(self.supervisor.mutations.clone().acquire_owned().await.map_err(mlua::Error::external)?)
         } else { None };
         // State may change while queued behind another mutation.
+        self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
         let sha = args_sha(&args);
         let t0 = std::time::Instant::now();
         let _wait = self.awaiting(lua);
         let call = Call { tool, class, args: &args, sha: &sha };
         let intent = self.begin(&call)?;
-        let res = {
+        let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
+        let mut res = {
             match self.supervisor.remaining() {
                 Some(remaining) => tokio::time::timeout(remaining, f()).await
                     .unwrap_or_else(|_| Err(unknown("absolute run deadline interrupted this effect; it may have acted"))),
                 None => f().await,
             }
         };
+        if let Ok(Ret::Sh {operation_id,..}) = &mut res { *operation_id = intent; }
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
         res
     }

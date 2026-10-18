@@ -271,12 +271,31 @@ impl Vm {
         g.set("batch", lua.create_async_function(move |lua, input: Value| {
             let (s, h, fx) = (bs.clone(), bh.clone(), bfx.clone());
             async move {
+                s.authorize_stage(fx.stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
+                let _active = crate::workflow_runtime::EffectGuard::new(&s);
                 let operations = crate::values::copy_out(input)?;
                 let _wait = fx.awaiting(&lua);
-                let results = crate::batch::run(s, h, operations).await.map_err(mlua::Error::external)?;
+                let results = crate::batch::run(s.clone(), h, operations).await.map_err(mlua::Error::external)?;
                 crate::values::copy_in(&lua, &results)
             }
         })?)?;
+        if host.as_ref().is_some_and(|h|h.is_workflow_root()) {
+            let stage = lua.create_table()?;
+            let frame = supervisor.workflow.lock().unwrap().clone().unwrap();
+            if let Some(active) = &frame.active_stage {
+                stage.set("id",active.id.clone())?;
+                stage.set("name",active.name.clone())?;
+                stage.set("checks",crate::values::copy_in(&lua,&serde_json::to_value(&frame.check_plan).map_err(mlua::Error::external)?)?)?;
+            }
+            let owner = supervisor.clone();
+            let epoch = supervisor.workflow_epoch();
+            stage.set("submit",lua.create_function(move |_,value:Value| {
+                let payload=crate::values::copy_out(value)?;
+                owner.submit_stage(epoch,payload).map_err(mlua::Error::external)
+            })?)?;
+            stage.set_readonly(true);
+            g.set("stage",stage)?;
+        }
         let saved = host.as_ref().map(|h| h.durable.clone()).unwrap_or_else(|| supervisor.durable.clone());
         let durable = lua.create_table()?;
         let data = saved.clone();
@@ -286,7 +305,10 @@ impl Vm {
                 None => Ok(Value::Nil),
             }
         })?)?;
+        let stage_owner=supervisor.clone();
+        let stage_epoch=supervisor.workflow_epoch();
         durable.set("set", lua.create_function(move |_, (key, value): (String, Value)| {
+            stage_owner.authorize_stage(stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
             let value = crate::values::copy_out(value)?;
             let mut saved = saved.lock().unwrap();
             let mut candidate = saved.clone();

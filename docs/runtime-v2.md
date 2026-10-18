@@ -1,6 +1,6 @@
 # Runtime v2: explicit authority and recovery
 
-The agent uses one persistent Luau VM for a live run. Rust owns the frozen run manifest, operation admission, journal, budgets and checkpoints. Recovery creates a fresh agent VM; it never executes historical chunks to rebuild memory.
+The agent uses a persistent Luau VM for an ordinary live run. RPI stages each use a fresh agent VM. Rust owns the frozen run manifest, operation admission, journal, budgets and checkpoints. Recovery creates a fresh agent VM; it never executes historical chunks to rebuild memory.
 
 ```text
 controller.step(saved state, event) → new state, command
@@ -29,7 +29,7 @@ controller.step(saved state, event) → new state, command
 
 Controller transitions and package invocations start in fresh VMs. Mutable captured locals cannot become an additional workflow state store. The controller has pure builtins, frozen module imports, model metadata and diagnostic output; it cannot read files, execute processes, approve operations or invoke a provider.
 
-Each checkpoint has a Rust-owned lifecycle: `running` carries opaque controller state and durable data; `finished` carries the validated final report and durable data. A `finish` command commits terminal status independently of the controller's private fields. Resuming a finished run returns its saved report even after its execution deadline. Saved runs use journal format 4. Only the current format is supported; there are no migrations for older experimental runs.
+Each checkpoint has a Rust-owned lifecycle: `running` carries opaque controller state and durable data; `awaiting_review` carries a durable owner gate; `finished` carries the validated final report and durable data. A `finish` command commits terminal status independently of the controller's private fields. Resuming a finished run returns its saved report even after its execution deadline. Workflow runs add optional frozen configuration and execution-frame fields. Existing format-4 runs without those fields retain the ordinary worker path and frozen sources; earlier experimental formats have no migration.
 
 ## Durable data
 
@@ -145,6 +145,50 @@ Control hooks fail the transition on error. Finish hooks return explicit `accept
 
 Compaction and finish review remain heuristics. A successful checkpoint proves a transition was committed, not that the model's reasoning or code is correct.
 
+## RPI workflow
+
+`hx run --rpi` selects the bundled `std/rpi` controller for the root. `--manual` requires `--rpi`; both are launch-only flags. Importing a module or enabling `std/rpi` as a pack does not activate the workflow. Ordinary runs and descendants continue through `std/loop`.
+
+The fixed route is research questions → research → system design → program design and outline → implementation → verification. Failed verification enters repair and then fresh verification. A repair can return to its owning system/program design; it still counts toward the run-wide maximum of three cycles. Stage policy and prompts live in Luau; the host supplies generic boundaries, submission authority, artifact storage and review lifecycle.
+
+The `std/loop.advance` adapter returns commands, prose candidates, native submissions or terminal stops. Only candidates and submission corrections may continue through `std/loop.continue`; a terminal worker cannot be revived. RPI disables the optional recheck heuristic explicitly. Plain prose never completes an RPI stage. Three submission correction attempts stop that stage honestly. Root turn counts and all existing admission budgets span fresh workers.
+
+### Submission and handoff
+
+During a root stage, the agent can call `stage.submit` inside the Luau tool. The payload contains outcome (`complete`, `needs_input` or `blocked`), the full Markdown document, summary, evidence and stage-specific fields. Program design supplies a structured check plan; verification cites actual numeric shell operation IDs and explicit findings. Descendants and isolated package invocations cannot submit for the root.
+
+The host validates the generic payload and successful-chunk provenance, stores document bytes in a content-addressed blob and gives the controller a submission ID. Effects after submission and a second submission in that chunk are refused; remaining calls from the same model reply are discarded. A chunk error invalidates its prepared submission. Printed text, hook output and saved data cannot manufacture native provenance.
+
+The pure controller returns one generic `boundary`: seal a submission and start a stage, pause at a gate, or finish. The host commits the new controller state, execution frame, artifact references, lifecycle and pending delivery together. Administrative delivery is incorporated before admitting new work. A crash before commit leaves the previous boundary authoritative; a crash after commit restores the pending delivery. Recovery never replays the old chunk.
+
+A new stage replaces the root agent VM and worker transcript. The host supplies verified artifact documents for the declared input refs, workspace metadata and the immutable ordered owner-input ledger. Latest explicit owner feedback takes precedence over earlier assumptions. The outer controller's `messages` and nested worker transcript are synchronized so image additions survive worker transitions. Stage-local state and hooks reset; run accounting and user durable data remain separate.
+
+### Stage permissions
+
+An `inspect` stage ceiling applies during research and design, transitively to child agents and packages. It permits existing authorized reads, searches, views, agents and MCP listing; HTTP/MCP calls must have a trusted read classification. It denies shell, project writes/edits and module promotion regardless of command text. This ceiling intersects existing principals and grants; batch descendants keep their stricter read-only policy. Workspace stages retain ordinary policy. Artifact control writes are confined host bookkeeping rather than expanded project authority.
+
+### Owner gates and immutable documents
+
+Manual mode gates research questions, research, system design, program design and final acceptance. Automatic mode omits those routine reviews but still creates real input gates for essential missing information or mandatory human validation. Pauses report `finished:false`; resuming an unanswered gate makes no provider call. Review decisions are owner CLI actions:
+
+```bash
+hx review .harness/log/RUN.jsonl --gate GATE_ID --decision approve
+hx review .harness/log/RUN.jsonl --gate GATE_ID --decision revise --input-file feedback.md
+hx review .harness/log/RUN.jsonl --gate GATE_ID --decision answer --input-file answers.md
+hx review .harness/log/RUN.jsonl --gate GATE_ID --decision waive --input-file reason.md
+hx run --resume .harness/log/RUN.jsonl
+```
+
+Each gate declares its allowed decisions and exact artifact/check scope. Revision creates a new artifact version and invalidates downstream dependencies. An input answer resumes the relevant work; an arbitrary answer does not establish a passing check. Explicit waivers remain separate from passing evidence. Final acceptance commits without another model call, including after the execution deadline, subject to the host's source freshness and revocation checks. Resuming executable work still requires the run's existing budgets and deadline. Review decisions are recorded and consumed durably; recording one never dispatches work.
+
+Artifacts are immutable host records with dependency refs and content hashes. `.agents/artifacts/rpi-RUN_ID/` contains readable projections, starting with `01-request.md`. Missing or edited projections are regenerated from canonical blobs and never become approved inputs. A projection failure does not change canonical authority. Resume restores the frozen workflow and rejects new launch configuration. A branch starts a new workflow with distinct artifacts and no inherited approvals.
+
+### Verification scope
+
+Program design freezes check IDs, exact commands, cwd, timeout and requirement mappings. Verification evidence must identify successful same-stage shell receipts matching those invocations. Failed exit status, timeout, substituted commands, missing receipts and source changes cannot satisfy a planned check. Re-verification requires fresh receipts. Source/check inventory observations bind verification and final acceptance to the declared bounded project scope: Git tracked and nonignored files where available, or a bounded file walk, with explicit check inputs. Runtime logs and artifact projections are excluded. This is an observation of that inventory, not a hermetic build or a guarantee against all external races; ignored build outputs and external dependencies require deliberate check/input coverage.
+
+Adapted phase instructions and the upstream MIT notice are embedded with the binary; [provenance](../stdlib/std/rpi/PROVENANCE.md) records the pinned source and adaptation. There is no startup download or independent plugin installation. Trusted overrides affect new runs while generic host lifecycle, policy and provenance checks remain enforced.
+
 ## Budgets and validation
 
 One journal-backed ledger accounts for the root and all descendants. Admission atomically reserves an allowance; successful receipts settle it. Under a dollar threshold, launch looks up the model's price in the endpoint's `/models` list (OpenRouter publishes it) and freezes it in the manifest. Each request then reserves its full upper bound, even when it exceeds the remaining allowance: every request byte as an input token at the highest of the prompt and cache-write prices, plus the full output cap, plus any per-request fee, at the highest pricing tier the request could reach. OpenRouter's `overrides` tiers count: time-of-day tiers always, long-context tiers only once the request's bytes reach their `min_prompt_tokens`, since a request has no more tokens than bytes. A model with variable pricing (a negative price, as `openrouter/auto` lists) is unpriced. The lookup needs no key. Concurrent subagents are admitted side by side while bounds fit. A subagent on a different model, or a run whose endpoint has no price, falls back to reserving the whole remaining allowance per request; other requests wait for it to settle instead of failing. Only settled usage and unbounded uncertain reservations stop admission. Token allowances use request bytes plus the configured output cap. Settled token usage includes ordinary input, cache reads, cache writes and output; reasoning is already included in output. Both limits are documented admission thresholds, not exact tokenizer or billing ceilings. Reservations from uncertain requests survive restarts.
@@ -155,4 +199,4 @@ The absolute run deadline includes downtime. It is checked before admission and 
 
 MCP responses have a 16 MiB received-byte limit per request across stdio, HTTP JSON, SSE events and HTTP error bodies. Ignored notifications count toward the same allowance. Oversized responses close the connection; a mutation whose response is lost remains uncertain and is never automatically redispatched.
 
-Run `cargo test`, `hx test stdlib/std`, and `python3 scripts/redesign_checks.py` after building. The acceptance suite uses local scripted providers, injects crashes at actual journal boundaries, resumes repeatedly, checks dispatch counts and committed state, and exercises capabilities, concurrency, revocation, corruption and deadlines. It does not prove model-answer correctness, physical power-loss durability, exhaustive filesystem races, or live-provider behavior.
+Run `cargo test`, `hx test stdlib/std`, `python3 scripts/redesign_checks.py`, and `python3 scripts/rpi_checks.py` after building. The acceptance suite uses local scripted providers, injects crashes at actual journal boundaries, resumes repeatedly, checks dispatch counts and committed state, and exercises capabilities, concurrency, revocation, corruption and deadlines. It does not prove model-answer correctness, physical power-loss durability, exhaustive filesystem races, or live-provider behavior.

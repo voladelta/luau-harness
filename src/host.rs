@@ -11,6 +11,7 @@ pub struct StartOptions {
     pub budget: Budget,
     pub packs: Vec<String>,
     pub branch: Option<crate::supervisor::Branch>,
+    pub workflow: Option<crate::workflow::WorkflowConfig>,
 }
 
 pub struct Host {
@@ -59,7 +60,7 @@ impl AgentOptions {
 
 impl Host {
     pub fn start(llm: LlmCfg, policy: Arc<Policy>, options: StartOptions) -> Result<Arc<Self>> {
-        let StartOptions { task, max_turns, trace, budget: flags, mut packs, branch } = options;
+        let StartOptions { task, max_turns, trace, budget: flags, mut packs, branch, workflow } = options;
         let pb = &policy.budget;
         let budget = Budget { max_cost: flags.max_cost.or(pb.max_cost), max_tokens: flags.max_tokens.or(pb.max_tokens), max_wall_secs: flags.max_wall_secs.or(pb.max_wall_secs) };
         for limit in [budget.max_cost, budget.max_wall_secs].into_iter().flatten() {
@@ -67,7 +68,7 @@ impl Host {
         }
         for pack in &policy.packs { if !packs.contains(pack) { packs.push(pack.clone()); } }
         llm.key()?; // Reject missing credentials before committing a new run manifest.
-        let supervisor = Supervisor::start(policy, llm, task, max_turns, packs, budget, branch)?;
+        let supervisor = Supervisor::start_workflow(policy, llm, task, max_turns, packs, budget, branch, workflow)?;
         Self::from_supervisor(supervisor, trace)
     }
 
@@ -77,7 +78,7 @@ impl Host {
 
     fn from_supervisor(supervisor: Arc<Supervisor>, trace: Option<PathBuf>) -> Result<Arc<Self>> {
         let m = supervisor.manifest.as_ref().context("missing run manifest")?;
-        let key = m.model.key()?;
+        let key = if matches!(&supervisor.restored,Some(RunState::Finished{..}|RunState::AwaitingReview{..})) {m.model.key().unwrap_or_default()} else {m.model.key()?};
         let file = trace.map(std::fs::File::create).transpose()?;
         Ok(Arc::new(Self { llm: m.model.clone(), workspace: m.policy.workspace.clone(), policy: supervisor.policy.clone(),
             principal: Principal::Agent { read_only: false }, durable: supervisor.durable.clone(), lane: "root".into(),
@@ -109,7 +110,7 @@ impl Host {
             "net": !self.policy.enabled || self.policy.net})
     }
 
-    fn report(&self, mut report: Value, wall_secs: f64) -> Value {
+    pub(crate) fn report(&self, mut report: Value, wall_secs: f64) -> Value {
         let usage = self.supervisor.usage();
         report["model"] = json!(self.llm.model);
         report["input_tokens"] = json!(usage.input);
@@ -127,6 +128,15 @@ impl Host {
             if report.get("stopped").is_none() { report["stopped"] = json!("unknown_outcome: owner reconciliation required"); }
         }
         report["uncertain_operations"] = json!(uncertain);
+        if self.is_workflow_root() {
+            report["workflow"]=json!("rpi");
+            if report.get("status").is_none() {report["status"]=json!(if report["finished"]==true {"completed"} else {"stopped"});}
+            if let Some(frame)=self.supervisor.workflow.lock().unwrap().as_ref() {
+                if report.get("stage").is_none() {report["stage"]=json!(frame.active_stage.as_ref().map(|s|&s.name));}
+                report["root_model_admissions"]=json!(frame.root_turns);
+                report["artifact_directory"]=json!(self.workspace.join(".agents/artifacts").join(format!("rpi-{}",self.policy.log.session)));
+            }
+        }
         if report["ops_per_turn"] == json!({}) { report["ops_per_turn"] = json!([]); }
         report
     }
@@ -134,9 +144,10 @@ impl Host {
     pub async fn chat(&self, req: &Value) -> Result<Reply> {
         crate::controller::validate_request(req)?;
         let mut retried = false;
+        let key = if self.key.is_empty() {self.llm.key()?} else {self.key.clone()};
         loop {
             let op = self.supervisor.reserve_model(&self.llm, req, self.depth).await?;
-            let call = llm::chat(&self.http, &self.llm, &self.key, req);
+            let call = llm::chat(&self.http, &self.llm, &key, req);
             let result = match self.supervisor.remaining() {
                 Some(remaining) => tokio::time::timeout(remaining, call).await.map_err(|_| anyhow::anyhow!("budget_exceeded: absolute run deadline reached during model request")).and_then(|r| r),
                 None => call.await,
@@ -180,115 +191,141 @@ impl Host {
         })
     }
 
-    fn controller(&self) -> Result<Controller> {
+    pub(crate) fn controller(&self) -> Result<Controller> {
         Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs,
-            self.supervisor.manifest.as_ref().and_then(|m| m.deadline))
+            self.supervisor.manifest.as_ref().and_then(|m| m.deadline), if self.is_workflow_root() {"std/rpi"} else {"std/loop"})
     }
 
     async fn execute_task(self: Arc<Self>, task: String, max_turns: usize) -> Result<Value> {
         self.policy.log.check()?;
+        let workflow=self.is_workflow_root();
+        self.project_workflow_artifacts()?;
         if self.depth == 0 && let Some(RunState::Finished { report }) = &self.supervisor.restored {
             return Ok(self.report(Value::Object(report.clone()), 0.0));
         }
-        self.supervisor.check()?;
+        let owner_event = if workflow && let Some(RunState::AwaitingReview{report,..})=&self.supervisor.restored {
+            match self.resume_owner_decision() {
+                Ok(Some(event))=>Some(event),
+                Ok(None)=>return Ok(self.workflow_pause_report(report)),
+                Err(error) if error.to_string().starts_with("budget_exceeded")=>return Ok(self.workflow_pause_report(report)),
+                Err(error)=>return Err(error),
+            }
+        } else {None};
+        if owner_event.is_none() {self.supervisor.check()?;}
         let t0 = Instant::now();
-        let vm = Vm::new(self.policy.clone(), Duration::from_secs(120), 512 << 20, Some(self.clone()))?;
-        let mut packs = vec!["std/packages".into(), "std/mcp".into()];
-        for name in &self.packs {
-            if matches!(name.as_str(), "std/vision" | "std/authoring") && !packs.contains(name) { packs.push(name.clone()); }
-        }
-        vm.install_packs(&packs).await?;
-        let controller = self.controller()?;
+        let administrative = owner_event.is_some();
+        let controller = if administrative {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
         let mut state = if self.depth == 0 {
             match &self.supervisor.restored {
-                Some(RunState::Running { controller }) => controller.clone(),
+                Some(RunState::Running { controller }|RunState::AwaitingReview{controller,..}) => controller.clone(),
                 Some(RunState::Finished { .. }) => unreachable!("finished runs returned above"),
-                None => controller.init(&json!({"max_turns": max_turns,
+                None => controller.init(&json!({"max_turns": max_turns,"workflow":self.supervisor.manifest.as_ref().and_then(|m|m.workflow.as_ref()),
                     "task_message": format!("{task}\n\n[files in the working directory]\n{}", file_tree(&self.workspace))}))?,
             }
-        } else {
-            controller.init(&json!({"max_turns": max_turns, "task_message": task}))?
-        };
-        let mut event = if self.depth == 0 {
-            self.supervisor.recovery.as_ref().map(|r| json!({"kind": "recover", "message": serde_json::to_string_pretty(r).unwrap()})).unwrap_or_else(|| json!({"kind":"next"}))
-        } else { json!({"kind":"next"}) };
-        let mut compacting = false;
+        } else {controller.init(&json!({"max_turns": max_turns, "task_message": task}))?};
+        let mut recovery = if self.depth==0 {self.supervisor.recovery.as_ref().map(|r|json!({"kind":"recover","message":serde_json::to_string_pretty(r).unwrap()}))} else {None};
+        let pending=if workflow {self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f|f.pending_event.clone())} else {None};
+        let mut event=owner_event.or(pending).or_else(||recovery.take()).unwrap_or_else(||json!({"kind":"next"}));
+        let mut vm:Option<Vm>=None;
+        let mut compacting=false;
         loop {
-            self.supervisor.check()?;
-            let previous_messages = state["messages"].as_array().cloned().unwrap_or_default();
-            // A controller transition starts from frozen source and explicit data, just like a package call.
-            // Captured Lua locals cannot become a second, uncheckpointed workflow state store.
-            let controller = self.controller()?;
-            let (next_state, mut command) = controller.step(&state, &event)?;
-            self.supervisor.check()?;
-            anyhow::ensure!(next_state.is_object(), "controller state must be an object");
+            let admin=workflow && matches!(event["kind"].as_str(),Some("owner_decision"|"boundary_ready"));
+            if admin {self.policy.log.check()?;} else {self.supervisor.check()?;}
+            let previous_messages=state["messages"].as_array().cloned().unwrap_or_default();
+            let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
+            let (next_state,mut command)=controller.step(&state,&event)?;
+            ensure_object(&next_state)?;
             crate::controller::command(&command)?;
-            state = next_state;
-            // The trace reads only commands and the conversation, never the controller's private state.
+            state=next_state;
+            if workflow && event["kind"]=="run_result" && command["kind"]!="boundary" {self.supervisor.finish_stage_chunk(false);}
+            if workflow && admin {self.supervisor.workflow.lock().unwrap().as_mut().unwrap().pending_event=None;}
             if std::mem::take(&mut compacting) {
-                let failed = event["kind"] == "model_error" || event["reply"]["text"].as_str().unwrap_or("").trim().is_empty();
-                let kept = state["messages"].as_array().map_or(0, Vec::len).saturating_sub(1);
-                if failed { self.log("### COMPACT FAILED"); }
-                else { self.log(&format!("### COMPACT\nsummarized {} messages, kept {kept}, summary committed", previous_messages.len().saturating_sub(kept + 1))); }
+                let failed=event["kind"]=="model_error" || event["reply"]["text"].as_str().unwrap_or("").trim().is_empty();
+                let kept=state["messages"].as_array().map_or(0,Vec::len).saturating_sub(1);
+                self.log(&if failed {"### COMPACT FAILED".into()} else {format!("### COMPACT\nsummarized {} messages, kept {kept}, summary committed",previous_messages.len().saturating_sub(kept+1))});
             }
-            if let Some(messages) = state["messages"].as_array() {
-                for (i, message) in messages.iter().enumerate() {
-                    if previous_messages.get(i) != Some(message) && matches!(message["role"].as_str(), Some("user" | "tool")) {
-                        let label = if message["role"] == "tool" { "RESULT" } else { "HARNESS" };
-                        self.log(&format!("### {label}\n{}", message["content"].as_str().unwrap_or("")));
+            if let Some(messages)=state["messages"].as_array() {
+                for (i,message) in messages.iter().enumerate() {
+                    if previous_messages.get(i)!=Some(message) && matches!(message["role"].as_str(),Some("user"|"tool")) {
+                        self.log(&format!("### {}\n{}",if message["role"]=="tool" {"RESULT"} else {"HARNESS"},message["content"].as_str().unwrap_or("")));
                     }
                 }
             }
-            if command["kind"] == "model" && command["purpose"] == "agent" {
-                let request = vm.prepare_request(&command["request"])?;
-                // Image notifications and other data-only additions belong to the controller checkpoint too.
-                state["messages"] = request["messages"].clone();
-                command["request"] = request;
+            if command["kind"]=="model" || command["kind"]=="run" {
+                self.supervisor.check()?;
+                if vm.is_none() {
+                    let fresh=Vm::new(self.policy.clone(),Duration::from_secs(120),512<<20,Some(self.clone()))?;
+                    let mut packs=vec!["std/packages".into(),"std/mcp".into()];
+                    for name in &self.packs {if matches!(name.as_str(),"std/vision"|"std/authoring") && !packs.contains(name) {packs.push(name.clone());}}
+                    fresh.install_packs(&packs).await?;vm=Some(fresh);
+                }
             }
-            compacting = command["kind"] == "model" && command["purpose"] == "compact";
-            let command = crate::controller::command(&command)?;
-            self.supervisor.check()?;
-            let saved = match &command {
-                crate::controller::Command::Finish { report } => RunState::Finished { report: report.clone() },
-                _ => RunState::Running { controller: state.clone() },
+            if command["kind"]=="model" && command["purpose"]=="agent" {
+                let request=vm.as_ref().unwrap().prepare_request(&command["request"])?;
+                state["messages"]=request["messages"].clone();
+                if workflow {state["worker"]["messages"]=request["messages"].clone();}
+                command["request"]=request;
+            }
+            compacting=command["kind"]=="model" && command["purpose"]=="compact";
+            let command=crate::controller::command(&command)?;
+            let saved=match &command {
+                crate::controller::Command::Boundary{id,submission,next}=>self.apply_boundary(crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()},&state)?,
+                crate::controller::Command::Finish{report}=>{anyhow::ensure!(!workflow,"RPI must finish through a durable workflow boundary");RunState::Finished{report:report.clone()}},
+                _=>RunState::Running{controller:state.clone()},
             };
-            self.supervisor.checkpoint(&self.lane, saved, &self.durable.lock().unwrap())?;
+            if workflow && matches!(&command,crate::controller::Command::Model{..}) {
+                let at_limit={
+                    let mut store=self.supervisor.workflow.lock().unwrap();
+                    let frame=store.as_mut().unwrap();
+                    if frame.root_turns >= self.max_turns as u64 {true} else {frame.root_turns+=1;false}
+                };
+                if at_limit {
+                    let report=json!({"finished":false,"final_answer":"","status":"stopped","workflow":"rpi","stopped":"max_turns: run-wide model admission limit reached"});
+                    self.supervisor.checkpoint(&self.lane,RunState::Finished{report:report.as_object().unwrap().clone()},&self.durable.lock().unwrap())?;
+                    return Ok(self.report(report,t0.elapsed().as_secs_f64()));
+                }
+            }
+            self.supervisor.checkpoint(&self.lane,saved.clone(),&self.durable.lock().unwrap())?;
+            if let crate::controller::Command::Boundary{..}=&command {
+                vm=None;self.project_workflow_artifacts()?;
+                match saved {
+                    RunState::Finished{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
+                    RunState::AwaitingReview{report,..}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
+                    _=>{event=self.supervisor.workflow.lock().unwrap().as_ref().unwrap().pending_event.clone().context("boundary delivery missing")?;continue;},
+                }
+            }
             match command {
-                crate::controller::Command::Next => event = json!({"kind":"next"}),
-                crate::controller::Command::NextCall => event = json!({"kind":"next_call"}),
-                crate::controller::Command::Model { request, .. } => {
+                crate::controller::Command::Next=>event=recovery.take().unwrap_or_else(||json!({"kind":"next"})),
+                crate::controller::Command::NextCall=>event=json!({"kind":"next_call"}),
+                crate::controller::Command::Model{request,..}=>{
                     match self.chat(&request).await {
-                        Ok(reply) => {
-                            self.log(&format!("### MODEL\n{}", reply.text));
-                            event = json!({"kind":"model_reply", "reply":reply});
-                        },
-                        Err(error) => {
-                            let message = error.to_string();
-                            let safe_context_rejection = ["API 400 ", "API 413 ", "API 422 "].iter().any(|prefix| message.starts_with(prefix));
-                            event = json!({"kind":"model_error", "error":message, "safe_context_rejection":safe_context_rejection});
-                        },
+                        Ok(reply)=>{self.log(&format!("### MODEL\n{}",reply.text));event=json!({"kind":"model_reply","reply":reply});},
+                        Err(error)=>{let message=error.to_string();let safe_context_rejection=["API 400 ","API 413 ","API 422 "].iter().any(|p|message.starts_with(p));event=json!({"kind":"model_error","error":message,"safe_context_rejection":safe_context_rejection});},
                     }
                 },
-                crate::controller::Command::Run { code } => {
-                    self.supervisor.check()?;
-                    self.log(&format!("### CODE\n{code}"));
-                    self.policy.log.write("chunk_begin", json!({"lane":self.lane, "depth":self.depth, "code":code}), true)?;
-                    let result = vm.run_chunk(&code).await?;
-                    let notifications = vm.prepare_request(&json!({"system":"", "messages":[], "tools":[]}))?;
-                    event = json!({"kind":"run_result", "result": result, "notifications":notifications["messages"]});
+                crate::controller::Command::Run{code}=>{
+                    self.supervisor.check()?;self.log(&format!("### CODE\n{code}"));
+                    self.policy.log.write("chunk_begin",json!({"lane":self.lane,"depth":self.depth,"code":code}),true)?;
+                    let mut result=vm.as_ref().unwrap().run_chunk(&code).await?;
+                    if workflow {
+                        if let Some(submission)=self.supervisor.finish_stage_chunk(result["error"].is_null()) {result["submission"]=submission;}
+                        if result["error"].as_str().is_some_and(|e|e.contains("stage.submit") || e.contains("submission")) {result["submission_error"]=json!(true);}
+                    }
+                    let notifications=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"tools":[]}))?;
+                    event=json!({"kind":"run_result","result":result,"notifications":notifications["messages"]});
                 },
-                crate::controller::Command::Finish { report } => {
-                    return Ok(self.report(Value::Object(report), t0.elapsed().as_secs_f64()));
-                },
+                crate::controller::Command::Finish{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
+                crate::controller::Command::Boundary{..}=>unreachable!(),
             }
         }
     }
+
 }
 
 /// A bounded, gitignore-aware listing used only to initialize the controller's saved conversation.
 pub fn file_tree(root: &std::path::Path) -> String {
     let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(root).require_git(false).sort_by_file_path(|a,b| a.cmp(b)).build().flatten() {
+    for entry in ignore::WalkBuilder::new(root).require_git(false).parents(false).sort_by_file_path(|a,b| a.cmp(b)).build().flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
         let rel = entry.path().strip_prefix(root).unwrap_or(entry.path()).to_string_lossy().to_string();
         if rel.contains("__pycache__") || rel.starts_with(".git/") || rel.starts_with(".harness/") { continue; }
@@ -298,3 +335,5 @@ pub fn file_tree(root: &std::path::Path) -> String {
     }
     out.join("\n")
 }
+
+fn ensure_object(value:&Value)->Result<()> {anyhow::ensure!(value.is_object(),"controller state must be an object");Ok(())}

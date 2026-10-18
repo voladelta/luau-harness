@@ -237,6 +237,7 @@ impl ReservationCost {
 #[derive(Default)]
 pub struct Books {
     pub usage: Usage,
+    pub model_admissions: u64,
     pub reservations: BTreeMap<u64, Reservation>,
     // Mutating intents without an outcome or resolution; `uncertain` is the subset whose effect may or may not have acted.
     pub open: BTreeMap<u64, Value>,
@@ -282,7 +283,7 @@ impl Books {
             "intent" if r["class"] != "read" => { self.open.insert(seq, r.clone()); },
             "outcome" | "resolution" => { let id = of()?; self.open.remove(&id); self.uncertain.remove(&id); },
             "uncertain" => { self.uncertain.insert(of()?); },
-            "model_intent" => { self.reservations.insert(seq, Reservation { tokens: r["reserved_tokens"].as_u64().context("missing reservation")?,
+            "model_intent" => { self.model_admissions += 1; self.reservations.insert(seq, Reservation { tokens: r["reserved_tokens"].as_u64().context("missing reservation")?,
                 cost: ReservationCost::load(&r["reserved_cost"])?, running: true }); },
             "llm" if r.get("error").is_none() => {
                 self.reservations.remove(&of()?);

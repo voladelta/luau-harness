@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 # runtime state written by hx itself (event logs and blobs contain file contents and command output)
 .harness/
+.agents/

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-pub const FORMAT: u64 = 4;
+pub const FORMAT: u64 = 5;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,6 +23,8 @@ pub struct Manifest {
     pub registry: Registry,
     #[serde(default)]
     pub branch: Option<Branch>,
+    #[serde(default)]
+    pub workflow: Option<crate::workflow::WorkflowConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,6 +35,7 @@ pub struct Branch { pub parent: std::path::PathBuf, pub durable: Value }
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunState {
     Running { controller: Value },
+    AwaitingReview { controller: Value, report: serde_json::Map<String, Value> },
     Finished { report: serde_json::Map<String, Value> },
 }
 
@@ -41,6 +44,8 @@ pub struct Checkpoint {
     #[serde(flatten)]
     pub run: RunState,
     pub durable: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<crate::workflow::ExecutionFrame>,
 }
 
 impl Checkpoint {
@@ -49,7 +54,7 @@ impl Checkpoint {
         anyhow::ensure!(checkpoint.durable.is_object(), "invalid durable checkpoint");
         crate::values::validate(&checkpoint.durable)?;
         match &checkpoint.run {
-            RunState::Running { controller } => {
+            RunState::Running { controller } | RunState::AwaitingReview { controller, .. } => {
                 anyhow::ensure!(controller.is_object(), "controller state must be an object");
                 crate::values::validate(controller)?;
             },
@@ -74,7 +79,9 @@ impl Manifest {
             .context("this journal has no manifest record; start a new run")?;
         let bytes = eventlog::read_blob(path.parent().context("log has no parent")?, record["blob"].as_str().context("manifest blob missing")?)?;
         let manifest: Self = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(manifest.format == FORMAT, "unsupported run format {}", manifest.format);
+        anyhow::ensure!(manifest.format == FORMAT || manifest.format == 4, "unsupported run format {}", manifest.format);
+        anyhow::ensure!(manifest.format != 4 || manifest.workflow.is_none(), "legacy format cannot contain a workflow");
+        if let Some(config)=&manifest.workflow {config.validate()?;}
         Ok(manifest)
     }
 }
@@ -201,26 +208,35 @@ pub struct Supervisor {
     pub durable: Arc<Mutex<Value>>,
     pub restored: Option<RunState>,
     pub recovery: Option<Value>,
+    pub workflow: Mutex<Option<crate::workflow::ExecutionFrame>>,
+    pub active_effects: std::sync::atomic::AtomicUsize,
 }
 
 impl Supervisor {
+    #[cfg(test)]
     pub fn start(policy: Arc<Policy>, model: LlmCfg, task: String, max_turns: usize, packs: Vec<String>, budget: Budget, branch: Option<Branch>) -> Result<Arc<Self>> {
+        Self::start_workflow(policy,model,task,max_turns,packs,budget,branch,None)
+    }
+
+    pub fn start_workflow(policy: Arc<Policy>, model: LlmCfg, task: String, max_turns: usize, packs: Vec<String>, budget: Budget, branch: Option<Branch>, workflow: Option<crate::workflow::WorkflowConfig>) -> Result<Arc<Self>> {
+        if let Some(config)=&workflow {config.validate()?;}
+        anyhow::ensure!(!packs.iter().any(|p|p == "std/rpi" || p.starts_with("std/rpi/")),"RPI requires --rpi, not a configured pack");
         let mut registry = Registry::capture(&policy.workspace)?;
         registry.materialize_skills(&policy.log)?;
         let manifest = Manifest { format: FORMAT, runtime: env!("CARGO_PKG_VERSION").into(), binary_sha: binary_sha()?,
             task, model, max_turns, packs, deadline: budget.max_wall_secs.map(|s| now() + s), budget,
-            policy: policy.snapshot(), registry: registry.clone(), branch };
+            policy: policy.snapshot(), registry: registry.clone(), branch, workflow: workflow.clone() };
         let durable = manifest.branch.as_ref().map(|b| b.durable.clone()).unwrap_or_else(|| json!({}));
         anyhow::ensure!(durable.is_object(), "invalid branch durable data");
         crate::values::validate(&durable)?;
         let blob = policy.log.blob(&serde_json::to_vec(&manifest)?)?;
         policy.log.write("manifest", json!({"format": FORMAT, "blob": blob}), true)?;
-        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None }))
+        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None, workflow:Mutex::new(workflow.map(|_|crate::workflow::ExecutionFrame::default())),active_effects:std::sync::atomic::AtomicUsize::new(0) }))
     }
 
     pub fn ephemeral(policy: Arc<Policy>, registry: Arc<Registry>) -> Arc<Self> {
         Arc::new(Self { policy, registry, manifest: None, books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)),
-            durable: Arc::new(Mutex::new(json!({}))), restored: None, recovery: None })
+            durable: Arc::new(Mutex::new(json!({}))), restored: None, recovery: None, workflow:Mutex::new(None),active_effects:std::sync::atomic::AtomicUsize::new(0) })
     }
 
     pub fn resume(policy: Arc<Policy>) -> Result<Arc<Self>> {
@@ -241,6 +257,7 @@ impl Supervisor {
             .or_else(|| manifest.branch.as_ref().map(|b| b.durable.clone())).unwrap_or_else(|| json!({}));
         if !durable.is_object() { bail!("invalid durable checkpoint"); }
         crate::values::validate(&durable)?;
+        let workflow = checkpoint.as_ref().and_then(|c|c.workflow.clone()).or_else(||manifest.workflow.as_ref().map(|_|crate::workflow::ExecutionFrame::default()));
         let restored = checkpoint.map(|c| c.run);
         let recovery = Some(json!({"receipts": receipts, "log_directory":path.parent(), "uncertain_operations": books.open.values().cloned().collect::<Vec<_>>(),
             "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work: a resolution `unknown_local` means a sandboxed `sh` may have run, so check the workspace before repeating it. Uncertain mutations require the owner's `hx recover` decision. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them."}));
@@ -248,7 +265,7 @@ impl Supervisor {
         // The registry is restored from bytes in the protected journal, never from the workspace.
         let mut registry = manifest.registry.clone();
         registry.materialize_skills(&policy.log)?;
-        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(books), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery }))
+        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(books), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery,workflow:Mutex::new(workflow),active_effects:std::sync::atomic::AtomicUsize::new(0) }))
     }
 
     pub fn check(&self) -> Result<()> {
@@ -276,15 +293,17 @@ impl Supervisor {
 
     pub fn checkpoint(&self, lane: &str, run: RunState, durable: &Value) -> Result<()> {
         self.policy.log.check()?;
-        let blob = self.policy.log.blob(&serde_json::to_vec(&Checkpoint { run, durable: durable.clone() })?)?;
+        let blob = self.policy.log.blob(&serde_json::to_vec(&Checkpoint { run, durable: durable.clone(), workflow: if lane == "root" {self.workflow.lock().unwrap().clone()} else {None} })?)?;
         self.policy.log.write("checkpoint", json!({"lane": lane, "blob": blob}), true)?;
         Ok(())
     }
 
     pub fn intent(&self, tool: Tool, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal) -> Result<u64> {
-        self.record("intent", json!({"tool":tool.name(), "class":class.name(), "args":args,
+        let mut fields = json!({"tool":tool.name(), "class":class.name(), "args":args,
             "args_sha":args_sha, "depth":depth, "principal":principal.name(),
-            "summary":args.to_string().chars().take(300).collect::<String>()}), true)
+            "summary":args.to_string().chars().take(300).collect::<String>()});
+        self.workflow_effect_metadata(tool, &mut fields)?;
+        self.record("intent", fields, true)
     }
 
     /// Record the file content a local write is about to produce, before it touches the file. With atomic replacement
@@ -332,6 +351,9 @@ impl Supervisor {
     fn try_reserve_model(&self, cfg: &LlmCfg, req: &Value, depth: usize) -> Result<Option<u64>> {
         self.check()?;
         let mut books = self.books.lock().unwrap();
+        if let Some(manifest)=self.manifest.as_ref().filter(|m|m.workflow.is_some()) {
+            anyhow::ensure!(books.model_admissions < manifest.max_turns as u64,"budget_exceeded: run-wide max_turns admission threshold reached (including descendants and retries)");
+        }
         let budget = self.manifest.as_ref().map(|m| &m.budget).unwrap_or(&self.policy.budget);
         let used = books.usage.total_tokens();
         let (pending_tokens, pending_cost) = books.reserved();

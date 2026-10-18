@@ -12,10 +12,10 @@ function M.sandbox(text: string, net: boolean, has_mcp: boolean): string
 	return text .. "\n\n# Runtime access\n" .. line
 end
 
-function M.system(): string
+function M.system(options): string
 	local sections = { M.sandbox(hx.asset("std/system.md"), hx.net, #hx.mcp_servers() > 0) }
 	local recheck = require("std/recheck")
-	if recheck.enabled then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
+	if recheck.enabled and (not options or options.recheck ~= false) then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
 	if hx.prompt_contributions and hx.prompt_contributions ~= "" then table.insert(sections, hx.prompt_contributions) end
 	return table.concat(sections, "\n\n")
 end

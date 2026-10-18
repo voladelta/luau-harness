@@ -6,7 +6,7 @@
 local M = {}
 
 M.enabled = false
-M.message = "Before this answer is accepted: state the root cause you fixed in one sentence, then list the other situations where that same cause could fire beyond the reported one (other inputs, orderings, repeats, sizes and edge values). Write a deterministic test for each, run all the checks, and fix the code if any of them fail. Then re-read the task and confirm that every requirement it states still holds; fix anything that no longer does. Then give your final answer."
-M.headsup = "- When you first try to finish, you will be asked to state the root cause you fixed, list the other situations where it could fire, and show a passing test for each. Plan so that your first answer already meets this."
+M.message = "Before this answer is accepted: state the root cause you fixed in one sentence, and confirm that your solution strictly obeys the task contract, prompt, and plan/design. Do NOT explore or add unwanted features, speculative extras, or unrequested refactors. Do NOT fix unrelated bugs. Verify that all required checks pass and every stated requirement holds. Then give your final answer."
+M.headsup = "- When you first try to finish, you will be asked to state the root cause you fixed and confirm that you strictly adhered to the task contract and design without adding unwanted features or wandering out of scope."
 
 return M

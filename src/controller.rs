@@ -12,6 +12,7 @@ pub enum Command {
     NextCall,
     Model { request: Json, purpose: Option<String> },
     Run { code: String },
+    Boundary { id: String, submission: Option<String>, next: crate::workflow::BoundaryNext },
     Finish { report: serde_json::Map<String, Json> },
 }
 
@@ -34,13 +35,25 @@ pub fn validate_request(request: &Json) -> Result<()> {
     Ok(())
 }
 
+fn normalize_lists(value: &mut Json) {
+    if let Some(object)=value.as_object_mut() {
+        for (key,value) in object.iter_mut() {
+            if matches!(key.as_str(),"inputs"|"artifacts"|"questions"|"check_ids"|"decisions") && value.as_object().is_some_and(|v|v.is_empty()) { *value=serde_json::json!([]); }
+            else {normalize_lists(value);}
+        }
+    } else if let Some(array)=value.as_array_mut() { for value in array {normalize_lists(value);} }
+}
+
 pub fn command(value: &Json) -> Result<Command> {
-    let command: Command = serde_json::from_value(value.clone()).map_err(|e| anyhow::anyhow!("invalid controller command: {e}"))?;
+    let mut value=value.clone();
+    if value["kind"]=="boundary" { normalize_lists(&mut value); }
+    let command: Command = serde_json::from_value(value).map_err(|e| anyhow::anyhow!("invalid controller command: {e}"))?;
     match &command {
         Command::Model { request, purpose } => {
             anyhow::ensure!(matches!(purpose.as_deref(), None | Some("agent" | "compact")), "invalid model command purpose");
             validate_request(request)?;
         },
+        Command::Boundary {id,submission,next} => { crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()}.validate()?; },
         Command::Finish { report } => {
             anyhow::ensure!(report.get("finished").is_some_and(Json::is_boolean) && report.get("final_answer").is_some_and(Json::is_string), "finish report needs finished and final_answer");
         },
@@ -52,7 +65,7 @@ pub fn command(value: &Json) -> Result<Command> {
 pub struct Controller { lua: Lua, module: Table }
 
 impl Controller {
-    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, packs: &[String], run_deadline: Option<f64>) -> Result<Self> {
+    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, packs: &[String], run_deadline: Option<f64>, entrypoint: &str) -> Result<Self> {
         let lua = Lua::new();
         let g = lua.globals();
         g.set("print", lua.create_function(|_, args: MultiValue| { eprintln!("{}", args.into_iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t")); Ok(()) })?)?;
@@ -105,7 +118,7 @@ impl Controller {
                 install.call::<()>(ctx)?;
             }
         }
-        let module: Table = require.call("std/loop")?;
+        let module: Table = require.call(entrypoint)?;
         // Each transition gets a fresh interrupt deadline; no controller can hang effect admission.
         module.set("__deadline", lua.create_function(move |_, ()| { *deadline.lock().unwrap() = Instant::now() + Duration::from_secs(10); Ok(()) })?)?;
         Ok(Self { lua, module })

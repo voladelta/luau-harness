@@ -99,7 +99,8 @@ def main():
     for name in ("compact", "harness", "journal", "budget", "caps", "upgrade", "trust"):
         groups.append([(name + "_checks", ["bash", f"scripts/{name}_checks.sh"])])
     groups += [[("redesign", ["python3", "scripts/redesign_checks.py"])],
-               [("custom_tools", ["python3", "scripts/custom_tool_checks.py"])]]
+               [("custom_tools", ["python3", "scripts/custom_tool_checks.py"])] ,
+               [("rpi", ["python3", "scripts/rpi_checks.py"])]]
 
     def group(checks):
         return [run(name, command) for name, command in checks]

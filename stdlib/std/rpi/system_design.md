@@ -1,0 +1,2 @@
+# System design
+Read the request and research. Define desired behavior, requirements, boundaries, interfaces, invariants and failure behavior. Compare material alternatives and give reasons for the chosen approach. Make assumptions explicit. Keep the design elegant and consistent with the repository. Include acceptance requirements with stable IDs so checks can map to them. Do not implement or run shell. Submit a technical system-design document.

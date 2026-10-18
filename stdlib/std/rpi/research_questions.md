@@ -1,0 +1,4 @@
+# Research questions
+Perform a lightweight scope pass using the request, supplied source index and relevant project files. Usually one batched inspection is enough here; full investigation belongs to the research stage that follows. Submit 2–7 concise neutral questions about the current system, boundaries, constraints and verification paths, with useful project/source pointers. Do not prescribe implementation choices or turn desired behavior into a claim about current behavior.
+
+For a greenfield project, explicitly record that no implementation exists. Questions can identify which project constraints, conventions or external interfaces need research; unavailable runtime details can remain assumptions for implementation to validate. Avoid extending this stage into runtime discovery or exhaustive source research. Submit the numbered question document; no workspace changes.

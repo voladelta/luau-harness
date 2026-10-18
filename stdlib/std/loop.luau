@@ -11,6 +11,13 @@ local compact = require("std/compact")
 local recheck = require("std/recheck")
 local M = {}
 
+local function copy_data(value)
+	if type(value) ~= "table" then return value end
+	local result = {}
+	for key, item in value do result[key] = copy_data(item) end
+	return result
+end
+
 local function code_of(call)
 	return if type(call.input) == "table" and type(call.input.code) == "string" then call.input.code else nil
 end
@@ -64,7 +71,8 @@ local function next_call(s)
 	return s, { kind = "next_call" }
 end
 
-function M.step(s, event)
+local function step(s, event, options)
+	options = options or {}
 	save_hook_state(s)
 	if event.kind == "recover" then
 		-- Close every pending tool call with receipts, never dispatch its old code again.
@@ -82,6 +90,7 @@ function M.step(s, event)
 		return ready(s, "skip")
 	elseif event.kind == "run_result" then
 		assert(s.phase.kind == "run", "unexpected chunk result")
+		local native_submission = if options.submissions and type(event.result.error) ~= "string" and type(event.result.submission) == "table" then copy_data(event.result.submission) else nil
 		local res = hooks.emit("after_run", event.result)
 		s.report.code_turns += 1
 		if type(res.error) == "string" then s.report.luau_errors += 1 end
@@ -90,6 +99,16 @@ function M.step(s, event)
 		table.insert(s.report.ops_per_turn, res.ops)
 		table.insert(s.messages, { role = "tool", id = s.phase.calls[s.phase.index].id, content = res.feedback })
 		s.phase.index += 1
+		if native_submission then
+			-- Native control data is captured before hooks; never execute trailing calls.
+			-- Close their protocol slots so rejected phase data can continue this transcript.
+			for i = s.phase.index, #s.phase.calls do
+				table.insert(s.messages, { role = "tool", id = s.phase.calls[i].id,
+					content = "Skipped: stage.submit ended this reply; this call was not executed." })
+			end
+			s.phase = { kind = "submitted" }
+			return s, { kind = "submission", submission = native_submission }
+		end
 		return next_call(s)
 	elseif event.kind == "model_error" then
 		if event.error:find("budget_exceeded", 1, true) then
@@ -135,14 +154,20 @@ function M.step(s, event)
 		local text, calls = reply.text, resp.calls or {}
 		if #calls == 0 then
 			if text:match("^%s*$") or resp.finish == "length" then
+				if options.submissions then
+					s.report.truncated_turns += 1
+					table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
+					s.phase = { kind = "candidate" }
+					return s, { kind = "candidate", text = text }
+				end
 				s.bad += 1
 				s.report.truncated_turns += 1
-				if s.bad > 3 then return finish(s) end
+				if s.bad > 3 then s.report.stopped = "protocol: repeated empty or truncated replies"; return finish(s) end
 				table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
 				table.insert(s.messages, { role = "user", content = prompt.nudge_cut })
 				return ready(s)
 			end
-			if s.report.code_turns == 0 and s.no_call < 2 then
+			if not options.submissions and s.report.code_turns == 0 and s.no_call < 2 then
 				s.no_call += 1
 				s.report.truncated_turns += 1
 				table.insert(s.messages, { role = "assistant", content = text, raw = resp.raw })
@@ -151,7 +176,7 @@ function M.step(s, event)
 			end
 			local fin = hooks.emit("before_finish", { action = "accept", text = text, turn = s.report.turns })
 			local follow = if fin.action == "continue" then fin.message else nil
-			if not follow and recheck.enabled and not s.recheck_asked then
+			if not follow and options.recheck ~= false and recheck.enabled and not s.recheck_asked then
 				s.recheck_asked = true
 				follow = recheck.message
 			end
@@ -159,6 +184,11 @@ function M.step(s, event)
 				table.insert(s.messages, { role = "assistant", content = text, raw = resp.raw })
 				table.insert(s.messages, { role = "user", content = follow })
 				return ready(s)
+			end
+			if options.submissions then
+				table.insert(s.messages, { role = "assistant", content = text, raw = resp.raw })
+				s.phase = { kind = "candidate" }
+				return s, { kind = "candidate", text = text }
 			end
 			s.report.finished = true
 			s.report.final_answer = text
@@ -180,7 +210,7 @@ function M.step(s, event)
 		s.report.stopped = "max_turns: " .. s.max_turns
 		return finish(s)
 	end
-	local req = hooks.emit("before_model", { system = prompt.system(), messages = s.messages, tools = prompt.tools })
+	local req = hooks.emit("before_model", { system = prompt.system(options), messages = s.messages, tools = prompt.tools })
 	local info = hx.model_info()
 	local window = if type(info.context_window) == "number" then info.context_window else compact.context_window
 	local max_output = info.max_output or 16384
@@ -195,6 +225,26 @@ function M.step(s, event)
 	end
 	s.phase = { kind = "model" }
 	return s, { kind = "model", request = req, purpose = "agent" }
+end
+
+-- Explicit worker protocol. Stopped states cannot be resumed through continue.
+function M.advance(s, event, options)
+	local state, outcome = step(s, event, options)
+	if outcome.kind == "candidate" or outcome.kind == "submission" then return state, outcome end
+	if outcome.kind == "finish" then
+		return state, { kind = "stopped", reason = state.report.stopped or "worker stopped", report = state.report }
+	end
+	return state, { kind = "command", command = outcome }
+end
+
+function M.continue(s, message)
+	assert(s.phase.kind == "candidate" or s.phase.kind == "submitted", "cannot continue a stopped or active worker")
+	table.insert(s.messages, { role = "user", content = message })
+	return ready(s)
+end
+
+function M.step(s, event)
+	return step(s, event, {})
 end
 
 return M

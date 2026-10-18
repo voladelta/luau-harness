@@ -16,6 +16,8 @@ mod values;
 mod packages;
 mod batch;
 mod tools;
+mod workflow;
+mod workflow_runtime;
 
 use anyhow::{bail, Result};
 use std::io::IsTerminal;
@@ -35,6 +37,7 @@ USAGE:
 COMMANDS:
     exec         run Luau chunks in one session (no API key needed)
     run          run an agent task
+    review       record an RPI review decision without executing work
     recover      record an owner's decision about an uncertain operation
     revoke       stop admitting operations for a run
     test         run a package's tests/*.luau
@@ -69,7 +72,8 @@ ENVIRONMENT:
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n    --rpi              research, design, implement, verify and repair automatically\n    --manual           require RPI artifact review (requires --rpi)\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
+        "review" => "hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]\n\nRecords a decision only; continue with hx run --resume LOG.\n",
         "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, sandboxed offline sh is settled as unknown_local, and bounded model reservations are charged at their bound; none needs a decision.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
@@ -177,7 +181,8 @@ fn flag_kind(command: &str, name: &str) -> Option<FlagKind> {
         ("run", "--max-turns" | "--max-tokens") | ("recover", "--tokens") => Unsigned,
         ("run", "--max-output" | "--context-window") => Positive,
         ("run", "--max-cost" | "--max-wall") | ("recover", "--cost") => Amount,
-        ("recover", "--decision") => Text,
+        ("recover", "--decision") | ("review", "--decision" | "--gate" | "--input-file") => Text,
+        ("run", "--rpi" | "--manual") => Switch,
         ("recover" | "trust" | "accept", "--yes") => Switch,
         _ => return None,
     })
@@ -212,6 +217,13 @@ fn validate_args(args: &[String]) -> Result<()> {
     if seen.contains("--resume")
         && let Some(flag) = seen.iter().find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace")) {
         return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
+    }
+    if seen.contains("--manual") && !seen.contains("--rpi") { return Err(usage("--manual requires --rpi")); }
+    if list_arg(args, "--pack").iter().any(|p| p == "std/rpi" || p.starts_with("std/rpi/")) {
+        return Err(usage("RPI must be activated explicitly with --rpi, not --pack"));
+    }
+    if command == "review" && (args.get(1).is_none_or(|s| s.starts_with("--")) || arg(args,"--gate").is_none() || arg(args,"--decision").is_none()) {
+        return Err(usage("usage: hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]"));
     }
     if let Some(api) = arg(args, "--api") && !matches!(api.as_str(), "openai" | "responses" | "claude-sdk") {
         return Err(usage(&format!("unknown --api {api:?} (expected openai, responses or claude-sdk)")));
@@ -264,6 +276,7 @@ async fn real_main() -> Result<()> {
             cmd_run(&args, workspace.clone(), mk_policy()?).await
         }
         "recover" => cmd_recover(&args),
+        "review" => workflow_runtime::review(Path::new(&args[1]), &arg(&args,"--gate").unwrap(), &arg(&args,"--decision").unwrap(), arg(&args,"--input-file").as_deref().map(Path::new)),
         "revoke" => {
             let path = PathBuf::from(args.get(1).ok_or_else(|| usage("usage: hx revoke LOG"))?);
             anyhow::ensure!(path.is_file(), "run log does not exist");
@@ -375,8 +388,16 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             durable: state.as_ref().map(|s| s.durable.clone())
                 .or_else(|| manifest.branch.as_ref().map(|b| b.durable.clone())).unwrap_or_else(|| serde_json::json!({})),
         });
+        if has(args, "--rpi") {
+            anyhow::ensure!(
+                workflow::git_inventory(&policy.workspace)?.is_some(),
+                "--rpi requires a Git repository at workspace root ({}); initialize git with a .gitignore first",
+                policy.workspace.display()
+            );
+        }
         let host = host::Host::start(cfg, policy, host::StartOptions {
             task, max_turns, trace, budget, packs: list_arg(args, "--pack"), branch,
+            workflow: has(args,"--rpi").then(|| workflow::WorkflowConfig { name:"rpi".into(),version:1,mode:if has(args,"--manual") {"manual"} else {"auto"}.into(),max_repairs:3 }),
         })?;
         if let Some((parent, _, _)) = inherited {
             host.policy.log.write("branch", serde_json::json!({"parent":parent.path}), true)?;
