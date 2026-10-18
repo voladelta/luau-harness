@@ -23,7 +23,7 @@ VERIFIER_IMAGE='tb4-mvcc-verifier:latest'
 def save(path,data):path.write_text(json.dumps(data,indent=2)+'\n')
 
 
-def prepare(run):
+def prepare(run, args=None):
     if not (TASK/'environment/app').is_dir():raise SystemExit('Missing benchmark checkout: '+str(TASK))
     run.mkdir(parents=True,exist_ok=False)
     shutil.copytree(TASK/'environment/app',run/'ws')
@@ -42,12 +42,15 @@ def prepare(run):
         'Validate both published visibility and every still-publishable future version, including tombstones. '
         'Add meaningful regressions that compile and fail against the original implementation, '
         'then pass after repair. Avoid keeping all obsolete history.\n')
+    model = getattr(args, 'model', 'deepseek-flash') if args else 'deepseek-flash'
+    api = getattr(args, 'api', None) or ('responses' if 'deepseek' in model else 'openai')
+    base_url = getattr(args, 'base_url', None) or ('https://api.deepseek.com' if 'deepseek' in model else 'https://openrouter.ai/api/v1')
     save(run/'case.json',{'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'baseline':str(TASK/'environment/app'),'task_commit':subprocess.check_output(
             ['git','rev-parse','HEAD'],cwd=TASK,text=True).strip(),
         'baseline_source':'original task, not a previous generated solution',
         'verifier_image':VERIFIER_IMAGE,'verifier_source':str(TASK/'tests'),
-        'model':'deepseek-flash','api':'responses','base_url':'https://api.deepseek.com'})
+        'model':model,'api':api,'base_url':base_url})
     print('Prepared: '+str(run),flush=True)
 
 
@@ -74,12 +77,17 @@ def verify(run):
 
 
 def run_agent(run,args):
-    if not os.environ.get('DEEPSEEK_API_KEY'):raise SystemExit('DEEPSEEK_API_KEY is missing')
+    model = args.model
+    api = args.api or ('responses' if 'deepseek' in model else 'openai')
+    base_url = args.base_url or ('https://api.deepseek.com' if 'deepseek' in model else 'https://openrouter.ai/api/v1')
+    key_env = args.key_env or ('DEEPSEEK_API_KEY' if 'deepseek' in model else 'OPENROUTER_API_KEY')
+    if not os.environ.get(key_env):raise SystemExit(f'{key_env} is missing')
+    context_window = str(args.context_window or (1048576 if 'deepseek' in model else 1000000))
     argv=[str(Path(args.hx).resolve()),'run','--rpi','--workspace',str(run/'ws'),
-        '--prompt-file',str(run/'prompt.md'),'--model','deepseek-flash','--api','responses',
-        '--base-url','https://api.deepseek.com','--key-env','DEEPSEEK_API_KEY','--reasoning',args.reasoning,
+        '--prompt-file',str(run/'prompt.md'),'--model',model,'--api',api,
+        '--base-url',base_url,'--key-env',key_env,'--reasoning',args.reasoning,
         '--max-cost',str(args.max_cost),'--max-wall',str(args.max_wall),
-        '--max-turns','200','--max-output','16384','--context-window','1048576','--trace',str(run/'trace.md')]
+        '--max-turns','200','--max-output','16384','--context-window',context_window,'--trace',str(run/'trace.md')]
     if args.max_tokens is not None:
         argv.extend(['--max-tokens',str(args.max_tokens)])
     save(run/'launch.json',{'argv':argv,'harness_commit':subprocess.check_output(
@@ -110,6 +118,11 @@ def main():
     p.add_argument('--task-dir',type=Path,default=TASK)
     p.add_argument('--verifier-image',default=VERIFIER_IMAGE)
     p.add_argument('--hx',default=str(ROOT/'target/release/hx'))
+    p.add_argument('--model',default='deepseek-flash')
+    p.add_argument('--api',default=None)
+    p.add_argument('--base-url',default=None)
+    p.add_argument('--key-env',default=None)
+    p.add_argument('--context-window',type=int,default=None)
     p.add_argument('--max-cost',type=float,default=2.0)
     p.add_argument('--max-tokens',type=int,default=None)
     p.add_argument('--max-wall',type=int,default=900)
@@ -119,7 +132,7 @@ def main():
     VERIFIER_IMAGE=args.verifier_image
     if args.action!='prepare' and args.run_dir is None:p.error('--run-dir required for run/verify')
     run=(args.run_dir or CACHE/'runs'/('mvcc-native-rpi-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))).resolve()
-    if args.action=='prepare':prepare(run)
+    if args.action=='prepare':prepare(run,args)
     elif args.action=='run':run_agent(run,args)
     else:verify(run)
 
