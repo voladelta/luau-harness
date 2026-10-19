@@ -44,6 +44,29 @@ Values are copied at both boundaries. The accepted values are finite numbers, st
 
 Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB encoded-size bound. Shared subtrees count for every copied occurrence. The entire durable store has the same limits; rejected updates preserve its previous contents.
 
+## Compaction history
+
+Root agents can retrieve the public conversation removed by successful, recorded compactions:
+
+```luau
+local page = history({q="earlier failure", limit=5})
+for _, entry in page.entries do print(entry.id, entry.snippet) end
+-- Continue searches with the same q and before=page.next, even on an empty page.
+local entry = history({id="h:428:m:17"})
+print(entry.text)
+-- Continue long entries with offset=entry.next_offset.
+```
+
+Search is a case-sensitive literal match over complete rendered entries. Listing defaults to five entries (maximum twenty), examines newest entries first and presents each page chronologically. Summary entries are labeled `kind="compaction"` and contain the bare summarizer output. Message entries preserve saved content and tool-call inputs; provider replay/reasoning fields and media payloads are excluded. This is the saved public transcript, so output shortened before entering the conversation cannot be recovered.
+
+Reads return at most 4096 UTF-8-safe text bytes (`bytes` can lower this). Offsets are zero-based byte offsets; offsets inside a character fail. Serialized responses are capped at 12 KiB, including escaping. List snippets are at most 200 bytes. A search examines at most 128 entries and charges at most 64 MiB of checkpoint source bytes per call, including cache hits. Follow `next` until absent; `scan_complete=false` means more candidates remain, even if the page has no matches. Cursors bind the run, query and initial archive frontier.
+
+The archive covers only recorded root compactions in this run, including earlier RPI stages and before resume. It excludes live messages, un-compacted remainders of retired stages, child lanes, branch-parent journals and native operation receipts. Children and isolated package VMs have no `history` global. No supported archive records returns `status="unavailable"`; an available archive without matches returns `status="ok"` with empty entries. Legacy journals remain resumable without backfilling history or changing their frozen modules and notices.
+
+Successful compaction emits an internal `next` command with `archive={kind="compaction",cut=old_cut}`. Rust validates the source conversation, summary and retained suffix before commit. The same synced checkpoint record commits both the new state and a versioned archive descriptor referencing the preceding root checkpoint. Entry IDs derive from that record's sequence and source message ordinal, so identical messages remain distinct and IDs survive resume. Custom controllers that discard context without this directive do not create archive entries.
+
+Checkpoint blobs remain the only authoritative bodies. A disposable descriptor index is rebuilt from the verified journal and grows with recorded compactions; a cache holds at most 8 MiB of encoded source bodies. Retrieval runs in a blocking worker with deadline checks, read authority and workflow admission. Missing, corrupt or individually oversized sources (over 64 MiB) fail explicitly. Lookup never replays historical chunks.
+
 ## Dispatch and uncertainty
 
 Every mutating effect records a synced intent before its executor runs. Outcomes include full argument hashes and result receipts. A global mutation permit serializes mutations; sealed read batches may run concurrently. Subagents and packages retain or reduce their caller's authority.

@@ -37,7 +37,10 @@ search(pattern: string, opts?: {path: string?, glob: string?, max: number?, igno
 tmpdir(): string                                                       -- private scratch directory for temporary files
 print(...)                                                             -- prints values as summaries (see below)
 batch({{op="read", args={"file"}}, {op="search", args={"pattern"}}})      -- independent read/search/read-only-agent operations; results {ok,value|error} in input order
+history(opts?: {q: string?, before: string?, limit: number?, id: string?, offset: number?, bytes: number?}): table
+                                                                       -- hx run root only; recorded compactions, including earlier stages; excludes live messages and un-compacted stage remainders
 ```
+- Find omitted text with `p=history({q="literal text"})`; print each `p.entries[i].snippet`. Read an entry with `e=history({id=p.entries[1].id})`; print `e.text`. Follow `p.next` via `history({q="literal text",before=p.next})` or `e.next_offset` via `history({id=e.id,offset=e.next_offset})`. Search is case-sensitive/literal. Defaults: 5 entries, 4096-byte text pages; unavailable archives return `status="unavailable"`. History cannot restore output already truncated before compaction.
 - `search` raises a table error `{kind, message, hint}`. Catch it with `pcall`. `kind == "unsupported_regex"` means the pattern has a lookaround or backreference. Search for the fixed part and filter in Luau.
 - A failing `sh` does not raise. Check `.code` on every command result; investigate failures before moving on.
 - Read an existing file with `read` before editing it to inspect context unless you just created or edited it in this session.

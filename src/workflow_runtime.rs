@@ -53,7 +53,7 @@ impl Supervisor {
             ensure!(
                 matches!(
                     tool,
-                    Tool::Read | Tool::Search | Tool::View | Tool::Agent | Tool::McpList
+                    Tool::Read | Tool::Search | Tool::History | Tool::View | Tool::Agent | Tool::McpList
                 ) || matches!(tool, Tool::Http | Tool::McpCall) && class == Class::Read,
                 "stage inspect access denies {}",
                 tool.name()

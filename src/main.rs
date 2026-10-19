@@ -3,6 +3,7 @@ mod atomic_file;
 mod effects;
 mod eventlog;
 mod host;
+mod history;
 mod llm;
 mod mcp;
 mod modules;

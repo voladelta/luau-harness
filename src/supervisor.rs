@@ -134,13 +134,13 @@ fn binary_sha() -> Result<String> { Ok(eventlog::sha_bytes(&std::fs::read(std::e
 
 /// Every effect a principal can ask for, and the capability it needs.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Tool { Read, Search, View, Write, Edit, Sh, Agent, McpList, McpCall, Promote, ProposeModule, Http }
+pub enum Tool { Read, Search, History, View, Write, Edit, Sh, Agent, McpList, McpCall, Promote, ProposeModule, Http }
 
 impl Tool {
     /// The name journal records carry.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Read => "read", Self::Search => "search", Self::View => "view", Self::Write => "write", Self::Edit => "edit",
+            Self::Read => "read", Self::Search => "search", Self::History => "history", Self::View => "view", Self::Write => "write", Self::Edit => "edit",
             Self::Sh => "sh", Self::Agent => "agent", Self::McpList => "mcp_list", Self::McpCall => "mcp_call",
             Self::Promote => "promote", Self::ProposeModule => "propose_module",
             Self::Http => "http",
@@ -149,7 +149,7 @@ impl Tool {
 
     fn capability(self) -> (&'static str, &'static str) {
         match self {
-            Self::Read | Self::Search | Self::View => ("fs", "read"),
+            Self::Read | Self::Search | Self::History | Self::View => ("fs", "read"),
             Self::Write | Self::Edit | Self::Promote | Self::ProposeModule => ("fs", "write"),
             Self::Sh => ("proc", "sh"),
             Self::Agent => ("llm", "agent"),
@@ -199,6 +199,7 @@ impl Usage {
 }
 
 pub struct Supervisor {
+    pub history: crate::history::History,
     pub policy: Arc<Policy>,
     pub registry: Arc<Registry>,
     pub manifest: Option<Manifest>,
@@ -231,11 +232,11 @@ impl Supervisor {
         crate::values::validate(&durable)?;
         let blob = policy.log.blob(&serde_json::to_vec(&manifest)?)?;
         policy.log.write("manifest", json!({"format": FORMAT, "blob": blob}), true)?;
-        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None, workflow:Mutex::new(workflow.map(|_|crate::workflow::ExecutionFrame::default())),active_effects:std::sync::atomic::AtomicUsize::new(0) }))
+        Ok(Arc::new(Self { policy, history: crate::history::History::default(), registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None, workflow:Mutex::new(workflow.map(|_|crate::workflow::ExecutionFrame::default())),active_effects:std::sync::atomic::AtomicUsize::new(0) }))
     }
 
     pub fn ephemeral(policy: Arc<Policy>, registry: Arc<Registry>) -> Arc<Self> {
-        Arc::new(Self { policy, registry, manifest: None, books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(Self { policy, history: crate::history::History::default(), registry, manifest: None, books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)),
             durable: Arc::new(Mutex::new(json!({}))), restored: None, recovery: None, workflow:Mutex::new(None),active_effects:std::sync::atomic::AtomicUsize::new(0) })
     }
 
@@ -265,7 +266,7 @@ impl Supervisor {
         // The registry is restored from bytes in the protected journal, never from the workspace.
         let mut registry = manifest.registry.clone();
         registry.materialize_skills(&policy.log)?;
-        Ok(Arc::new(Self { policy, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(books), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery,workflow:Mutex::new(workflow),active_effects:std::sync::atomic::AtomicUsize::new(0) }))
+        Ok(Arc::new(Self { policy, history: crate::history::History::restore(&records)?, registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(books), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(std::mem::take(&mut durable))), restored, recovery,workflow:Mutex::new(workflow),active_effects:std::sync::atomic::AtomicUsize::new(0) }))
     }
 
     pub fn check(&self) -> Result<()> {
@@ -292,9 +293,16 @@ impl Supervisor {
     }
 
     pub fn checkpoint(&self, lane: &str, run: RunState, durable: &Value) -> Result<()> {
+        self.checkpoint_archived(lane, run, durable, None)
+    }
+
+    pub fn checkpoint_archived(&self, lane: &str, run: RunState, durable: &Value, archive: Option<crate::history::Archive>) -> Result<()> {
         self.policy.log.check()?;
         let blob = self.policy.log.blob(&serde_json::to_vec(&Checkpoint { run, durable: durable.clone(), workflow: if lane == "root" {self.workflow.lock().unwrap().clone()} else {None} })?)?;
-        self.policy.log.write("checkpoint", json!({"lane": lane, "blob": blob}), true)?;
+        let mut fields = json!({"lane": lane, "blob": blob});
+        if let Some(archive) = &archive { fields["archive"] = serde_json::to_value(archive)?; }
+        let seq = self.policy.log.write("checkpoint", fields, true)?;
+        if lane == "root" { self.history.committed(crate::history::CheckpointRef {seq,blob}, archive)?; }
         Ok(())
     }
 

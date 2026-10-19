@@ -107,6 +107,7 @@ impl Host {
     pub fn budget_status(&self) -> Value { self.supervisor.budget_status() }
     pub fn model_info(&self) -> Value {
         json!({"model": self.llm.model, "context_window": self.llm.context_window, "max_output": self.llm.max_output,
+            "history": self.depth == 0,
             "net": !self.policy.enabled || self.policy.net})
     }
 
@@ -232,6 +233,8 @@ impl Host {
             let admin=workflow && matches!(event["kind"].as_str(),Some("owner_decision"|"boundary_ready"));
             if admin {self.policy.log.check()?;} else {self.supervisor.check()?;}
             let previous_messages=state["messages"].as_array().cloned().unwrap_or_default();
+            let was_compacting = compacting;
+            let source_stage = self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f| f.active_stage.as_ref().map(|s| s.id.clone()));
             let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
             let (next_state,mut command)=controller.step(&state,&event)?;
             ensure_object(&next_state)?;
@@ -268,6 +271,13 @@ impl Host {
             }
             compacting=command["kind"]=="model" && command["purpose"]=="compact";
             let command=crate::controller::command(&command)?;
+            let archive = if let crate::controller::Command::Next {archive:Some(directive)} = &command {
+                anyhow::ensure!(self.depth == 0, "history_archive_invalid: only root history is supported");
+                anyhow::ensure!(was_compacting && event["kind"] == "model_reply" && event["reply"]["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                    "history_archive_invalid: no successful compaction reply");
+                anyhow::ensure!(crate::history::summary(&state) == event["reply"]["text"].as_str(), "history_archive_invalid: summary differs from reply");
+                Some(self.supervisor.history.prepare(directive, &previous_messages, &state, source_stage, self.policy.log.dir())?)
+            } else {None};
             let saved=match &command {
                 crate::controller::Command::Boundary{id,submission,next}=>self.apply_boundary(crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()},&state)?,
                 crate::controller::Command::Finish{report}=>{anyhow::ensure!(!workflow,"RPI must finish through a durable workflow boundary");RunState::Finished{report:report.clone()}},
@@ -285,7 +295,7 @@ impl Host {
                     return Ok(self.report(report,t0.elapsed().as_secs_f64()));
                 }
             }
-            self.supervisor.checkpoint(&self.lane,saved.clone(),&self.durable.lock().unwrap())?;
+            self.supervisor.checkpoint_archived(&self.lane,saved.clone(),&self.durable.lock().unwrap(),archive)?;
             if let crate::controller::Command::Boundary{..}=&command {
                 vm=None;self.project_workflow_artifacts()?;
                 match saved {
@@ -295,7 +305,7 @@ impl Host {
                 }
             }
             match command {
-                crate::controller::Command::Next=>event=recovery.take().unwrap_or_else(||json!({"kind":"next"})),
+                crate::controller::Command::Next{..}=>event=recovery.take().unwrap_or_else(||json!({"kind":"next"})),
                 crate::controller::Command::NextCall=>event=json!({"kind":"next_call"}),
                 crate::controller::Command::Model{request,..}=>{
                     match self.chat(&request).await {

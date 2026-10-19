@@ -255,7 +255,10 @@ function M.request(messages, cut, previous)
 		max_tokens = math.floor(M.reserve_tokens * 4 / 5) }
 end
 
-function M.wrap(task, summary) return task .. "\n\n" .. SUMMARY_PREFIX .. summary .. SUMMARY_SUFFIX end
+function M.wrap(task, summary, history)
+	local notice = if history then '\nMessages removed by recorded compactions are available in this root lane: history({q="literal text"}), then history({id="entry-id"}). Print entry.text; follow next (resend q) or next_offset for more. Un-compacted retired RPI stages and other lanes are outside this archive.\n' else ""
+	return task .. "\n\n" .. SUMMARY_PREFIX .. summary .. SUMMARY_SUFFIX .. notice
+end
 
 function M.overflow(message)
 	local lower = message:lower()

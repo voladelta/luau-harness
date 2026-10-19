@@ -133,17 +133,21 @@ local function step(s, event, options)
 	elseif event.kind == "model_reply" then
 		if s.phase.kind == "compact" then
 			local text = event.reply.text or ""
+			local archive_cut = s.phase.cut
+			local archive_enabled = hx.model_info().history == true
 			if text:match("^%s*$") then
 				if s.phase.overflow then error("compaction returned no summary after: " .. s.phase.overflow, 0) end
 				s.compact_failures += 1
 			else
 				local kept = table.move(s.messages, s.phase.cut, #s.messages, 1, {})
 				s.previous_summary = text
-				s.messages = { { role = "user", content = compact.wrap(s.task_text, text) } }
+				s.messages = { { role = "user", content = compact.wrap(s.task_text, text, archive_enabled) } }
 				table.move(kept, 1, #kept, 2, s.messages)
 				s.last_tokens = 0
 			end
-			return ready(s, "skip")
+			local next_state, command = ready(s, "skip")
+			if archive_enabled and not text:match("^%s*$") then command.archive = {kind="compaction", cut=archive_cut} end
+			return next_state, command
 		end
 		assert(s.phase.kind == "model", "unexpected model reply")
 		local resp = event.reply

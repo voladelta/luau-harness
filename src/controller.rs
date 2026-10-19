@@ -8,7 +8,7 @@ use std::{sync::Arc, time::{Duration, Instant}};
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    Next,
+    Next { archive: Option<crate::history::Directive> },
     NextCall,
     Model { request: Json, purpose: Option<String> },
     Run { code: String },
