@@ -57,76 +57,89 @@ fn data<T: serde::de::DeserializeOwned + Default>(table: &Table, key: &str) -> R
     }
 }
 
-pub fn encode_path_segment(value: &str) -> Result<String, &'static str> {
-    if value.is_empty() {
-        return Err("URL path parameter cannot be empty");
-    }
-    if value == "." || value.contains("..") {
-        return Err("URL path parameter cannot contain '..'");
-    }
+/// Percent-encode one path-segment value. With '/' encoded, only a whole "." or ".." could traverse.
+fn encode_path_segment(value: &str) -> Result<String, &'static str> {
+    if matches!(value, "" | "." | "..") { return Err("URL path parameter cannot be empty, '.' or '..'"); }
     let mut encoded = String::with_capacity(value.len() * 3);
     for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' || b == b':' {
-            encoded.push(b as char);
-        } else {
-            use std::fmt::Write;
-            write!(&mut encoded, "%{:02X}", b).unwrap();
-        }
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b':') { encoded.push(b as char); }
+        else { use std::fmt::Write; write!(&mut encoded, "%{b:02X}").unwrap(); }
     }
     Ok(encoded)
 }
 
-pub fn validate_endpoint_url(url_str: &str, has_secret: bool) -> Result<reqwest::Url> {
-    ensure!(!url_str.contains('?') && !url_str.contains('#'), "endpoint URL cannot contain query or fragment");
-    ensure!(url_str.starts_with("https://") || url_str.starts_with("http://"), "endpoint must be an HTTP(S) URL");
-    let scheme_end = url_str.find("://").unwrap() + 3;
-    let path_start = url_str[scheme_end..].find('/').map(|i| scheme_end + i).unwrap_or(url_str.len());
-    let authority = &url_str[scheme_end..path_start];
-    ensure!(!authority.contains('{') && !authority.contains('}'), "endpoint origin cannot contain placeholders: {url_str}");
+enum Segment { Literal(String), Param(String) }
 
-    let base_origin_str = format!("{}/", &url_str[..path_start]);
-    let base_url = reqwest::Url::parse(&base_origin_str).context("invalid endpoint origin URL")?;
-    ensure!(matches!(base_url.scheme(), "https" | "http"), "endpoint must be an HTTP(S) URL");
-    ensure!(base_url.host_str().is_some() && !base_url.host_str().unwrap().is_empty(), "endpoint must have a valid host");
-    ensure!(base_url.username().is_empty() && base_url.password().is_none(), "endpoint cannot contain credentials in URL");
-    if has_secret {
-        ensure!(base_url.scheme() == "https" || matches!(base_url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "authenticated endpoints require HTTPS (except loopback)");
-    }
+/// An endpoint URL is a fixed origin plus path segments. Values fill whole segments and are set as a path, so they cannot reach the origin.
+struct Template { base: reqwest::Url, segments: Vec<Segment> }
 
-    let path = &url_str[path_start..];
-    ensure!(!path.contains("/../") && !path.ends_with("/..") && path != "/..", "endpoint URL cannot contain '..'");
-    let mut in_placeholder = false;
-    let mut placeholder_name = String::new();
-    let mut dummy_path = String::new();
-
-    for c in path.chars() {
-        if c == '{' {
-            ensure!(!in_placeholder, "nested '{{' in endpoint URL path");
-            in_placeholder = true;
-            placeholder_name.clear();
-        } else if c == '}' {
-            ensure!(in_placeholder, "unmatched '}}' in endpoint URL path");
-            in_placeholder = false;
-            ensure!(
-                !placeholder_name.is_empty() && placeholder_name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-                "invalid placeholder '{{{placeholder_name}}}' in endpoint URL"
-            );
-            dummy_path.push_str("segment");
-        } else if in_placeholder {
-            placeholder_name.push(c);
-        } else {
-            dummy_path.push(c);
+fn template(url: &str) -> Result<Template> {
+    ensure!(!url.contains(['?', '#']), "endpoint URL cannot contain query or fragment");
+    let authority = url.find("://").map(|i| i + 3).context("endpoint must be an HTTP(S) URL")?;
+    let (origin, path) = url.split_at(url[authority..].find('/').map_or(url.len(), |i| authority + i));
+    ensure!(!origin.contains(['{', '}']), "endpoint origin cannot contain placeholders: {url}");
+    let base = reqwest::Url::parse(origin).context("invalid endpoint URL")?;
+    ensure!(matches!(base.scheme(), "https" | "http") && base.host_str().is_some_and(|h| !h.is_empty()) && base.username().is_empty() && base.password().is_none(),
+        "endpoint must be an HTTP(S) URL without credentials, query or fragment");
+    let segments = path.split('/').skip(1).map(|s| {
+        if let Some(name) = s.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            ensure!(!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'), "invalid placeholder {s:?} in endpoint URL (a placeholder is a whole path segment)");
+            return Ok(Segment::Param(name.into()));
         }
+        ensure!(!s.contains('\\'), "endpoint URL path cannot contain '\\'");
+        ensure!(!s.contains(['{', '}']), "invalid placeholder {s:?} in endpoint URL (a placeholder is a whole path segment)");
+        ensure!(!matches!(s.to_ascii_lowercase().as_str(), "." | ".." | "%2e" | "%2e%2e" | ".%2e" | "%2e."), "endpoint URL cannot contain dot segments");
+        Ok(Segment::Literal(s.into()))
+    }).collect::<Result<_>>()?;
+    Ok(Template { base, segments })
+}
+
+impl Template {
+    /// Fill placeholders from `args` and remove those keys; the rest become the query or body.
+    fn url(&self, args: &mut serde_json::Map<String, serde_json::Value>) -> mlua::Result<reqwest::Url> {
+        let mut path = String::new();
+        for segment in &self.segments {
+            path.push('/');
+            match segment {
+                Segment::Literal(s) => path.push_str(s),
+                Segment::Param(name) => {
+                    let value = match args.get(name) {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => v.to_string(),
+                        Some(_) => return Err(mlua::Error::runtime("URL parameters must be strings, numbers or booleans")),
+                        None => return Err(mlua::Error::runtime(format!("missing required URL parameter '{name}'"))),
+                    };
+                    path.push_str(&encode_path_segment(&value).map_err(mlua::Error::runtime)?);
+                },
+            }
+        }
+        for segment in &self.segments { if let Segment::Param(name) = segment { args.remove(name); } }
+        let mut url = self.base.clone();
+        url.set_path(&path);
+        Ok(url)
     }
-    ensure!(!in_placeholder, "unclosed '{{' in endpoint URL path");
+}
 
-    let dummy_full_url = format!("{}{}", &url_str[..path_start], dummy_path);
-    let dummy_parsed = reqwest::Url::parse(&dummy_full_url).context("invalid endpoint URL path")?;
-    ensure!(dummy_parsed.origin() == base_url.origin(), "endpoint URL altered origin");
-    ensure!(dummy_parsed.username().is_empty() && dummy_parsed.password().is_none(), "endpoint URL cannot contain credentials");
-    ensure!(dummy_parsed.query().is_none() && dummy_parsed.fragment().is_none(), "endpoint URL cannot contain query or fragment");
-
-    Ok(base_url)
+/// Pure codecs for tool code, so tools never hand-roll them: `json.encode/decode` and `base64.decode` (bytes for `write`).
+pub fn install_codecs(lua: &Lua) -> mlua::Result<()> {
+    let json = lua.create_table()?;
+    json.set("encode", lua.create_function(|_, value: Value| serde_json::to_string(&values::copy_out(value)?).map_err(mlua::Error::external))?)?;
+    json.set("decode", lua.create_function(|lua, text: mlua::LuaString| {
+        let value: serde_json::Value = serde_json::from_slice(&text.as_bytes()).map_err(|e| mlua::Error::runtime(format!("invalid JSON: {e}")))?;
+        values::validate(&value)?;
+        values::copy_in(lua, &value)
+    })?)?;
+    json.set_readonly(true);
+    lua.globals().set("json", json)?;
+    let b64 = lua.create_table()?;
+    b64.set("decode", lua.create_function(|lua, text: String| {
+        use base64::Engine;
+        let text: String = text.split_ascii_whitespace().collect();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(text).map_err(|e| mlua::Error::runtime(format!("invalid base64: {e}")))?;
+        lua.create_string(bytes)
+    })?)?;
+    b64.set_readonly(true);
+    lua.globals().set("base64", b64)
 }
 
 pub fn definition(table: &Table) -> Result<Definition> {
@@ -140,12 +153,12 @@ pub fn definition(table: &Table) -> Result<Definition> {
     }
     for (name, endpoint) in &http {
         ensure!(identifier(name), "invalid endpoint name {name:?}");
-        let base_url = validate_endpoint_url(&endpoint.url, endpoint.secret.is_some())?;
+        let base = template(&endpoint.url)?.base;
         ensure!(matches!(endpoint.method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE"), "unsupported HTTP method");
         reqwest::header::HeaderName::from_bytes(endpoint.header.as_bytes())?;
         if let Some(secret) = &endpoint.secret {
             ensure!(!secret.is_empty() && secret.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'), "invalid secret name");
-            ensure!(base_url.scheme() == "https" || matches!(base_url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "authenticated endpoints require HTTPS (except loopback)");
+            ensure!(base.scheme() == "https" || matches!(base.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "authenticated endpoints require HTTPS (except loopback)");
         }
     }
     if !http.is_empty() { capabilities.insert("http".into(), vec!["request".into()]); }
@@ -210,6 +223,7 @@ pub fn credentials(root: &Path, def: &Definition) -> Result<()> {
         if let Some(name) = &endpoint.secret {
             let value = secret(root, name)?;
             reqwest::header::HeaderValue::from_str(&value).map_err(|_| anyhow::anyhow!("credential {name} is not a valid HTTP header value"))?;
+            ensure!(!endpoint.bearer || !value.starts_with("Bearer "), "credential {name} must be the bare token: bearer = true adds the \"Bearer \" prefix");
         }
     }
     Ok(())
@@ -263,7 +277,7 @@ pub fn exports(lua: &Lua, table: Table, expected: &Definition) -> mlua::Result<T
 }
 
 pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definition) -> mlua::Result<()> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).user_agent("openrouter-tool/1.0 (luau-harness)").redirect(reqwest::redirect::Policy::none())
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).user_agent(concat!("hx/", env!("CARGO_PKG_VERSION"))).redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never()).build().map_err(mlua::Error::external)?;
     lua.globals().set("http", lua.create_async_function(move |lua, (endpoint, args): (String, Value)| {
         let (fx, client, namespace, def) = (fx.clone(), client.clone(), namespace.clone(), def.clone());
@@ -272,56 +286,8 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
             let mut args = values::copy_out(args)?;
             if !args.is_object() { return Err(mlua::Error::runtime("http arguments must be an object")); }
             let key = spec.secret.as_ref().map(|name| secret(&fx.pol.workspace, name)).transpose().map_err(mlua::Error::external)?;
-            let base_url = validate_endpoint_url(&spec.url, spec.secret.is_some()).map_err(mlua::Error::external)?;
-            let expected_origin = base_url.origin();
             let orig_args = args.clone();
-            let mut url_str = spec.url.clone();
-            if url_str.contains('{') {
-                if let Some(obj) = args.as_object_mut() {
-                    let mut placeholders = Vec::new();
-                    let mut in_p = false;
-                    let mut cur = String::new();
-                    for c in spec.url.chars() {
-                        if c == '{' {
-                            in_p = true;
-                            cur.clear();
-                        } else if c == '}' {
-                            in_p = false;
-                            placeholders.push(cur.clone());
-                        } else if in_p {
-                            cur.push(c);
-                        }
-                    }
-                    let mut seen = std::collections::BTreeSet::new();
-                    for name in placeholders {
-                        if !seen.insert(name.clone()) { continue; }
-                        let placeholder = format!("{{{name}}}");
-                        let v = obj.remove(&name).ok_or_else(|| mlua::Error::runtime(format!("missing required URL parameter '{name}'")))?;
-                        let val_str = match v {
-                            serde_json::Value::String(s) => s,
-                            serde_json::Value::Number(n) => n.to_string(),
-                            serde_json::Value::Bool(b) => b.to_string(),
-                            _ => return Err(mlua::Error::runtime("URL parameters must be strings, numbers or booleans")),
-                        };
-                        let encoded_segment = encode_path_segment(&val_str).map_err(mlua::Error::runtime)?;
-                        url_str = url_str.replace(&placeholder, &encoded_segment);
-                    }
-                }
-            }
-            if url_str.contains('{') || url_str.contains('}') {
-                return Err(mlua::Error::runtime("unresolved placeholder in URL"));
-            }
-            let mut url = reqwest::Url::parse(&url_str).map_err(mlua::Error::external)?;
-            if url.origin() != expected_origin {
-                return Err(mlua::Error::runtime(format!(
-                    "request URL origin {} does not match fixed endpoint origin {}",
-                    url.origin().ascii_serialization(),
-                    expected_origin.ascii_serialization()
-                )));
-            }
-            if !url.username().is_empty() || url.password().is_some() {
-                return Err(mlua::Error::runtime("request URL cannot contain credentials"));
-            }
+            let mut url = template(&spec.url).map_err(mlua::Error::external)?.url(args.as_object_mut().unwrap())?;
             if spec.method == "GET" {
                 let query = args.as_object().unwrap().iter().map(|(k, v)| {
                     let value = match v { serde_json::Value::String(s) => s.clone(), serde_json::Value::Bool(_) | serde_json::Value::Number(_) => v.to_string(), _ => return Err(mlua::Error::runtime("GET parameters must be strings, numbers or booleans")) };
@@ -332,12 +298,8 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
             let mut request = client.request(spec.method.parse().map_err(mlua::Error::external)?, url);
             if spec.method != "GET" { request = request.json(&args); }
             if let Some(key) = &key {
-                let formatted = if spec.bearer {
-                    if key.starts_with("Bearer ") { key.clone() } else { format!("Bearer {key}") }
-                } else {
-                    key.clone()
-                };
-                let mut header = reqwest::header::HeaderValue::from_str(&formatted).map_err(|_| mlua::Error::runtime("invalid credential header value"))?;
+                let value = if spec.bearer { format!("Bearer {key}") } else { key.clone() };
+                let mut header = reqwest::header::HeaderValue::from_str(&value).map_err(|_| mlua::Error::runtime("invalid credential header value"))?;
                 header.set_sensitive(true);
                 request = request.header(&spec.header, header);
             }
@@ -362,20 +324,14 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
                     let message = format!("HTTP {}: {}", status.as_u16(), excerpt.chars().take(1000).collect::<String>());
                     return Err(if status.is_client_error() { mlua::Error::runtime(message) } else { unusable(class, message) });
                 }
+                // Raw bodies cross the data boundary as UTF-8 text, or base64 for media and non-UTF-8 bytes.
                 let mut result = if spec.raw {
-                    let ct = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-                    let is_text = (ct.starts_with("text/") || ct.contains("json") || ct.contains("yaml") || ct.contains("markdown") || ct.is_empty())
-                        && !ct.starts_with("audio/") && !ct.starts_with("image/") && !ct.starts_with("video/")
-                        && std::str::from_utf8(&body).is_ok();
-                    if is_text {
-                        json!({"text": String::from_utf8_lossy(&body).into_owned(), "media_type": ct})
-                    } else {
-                        use base64::Engine;
-                        let media_type = if ct.is_empty() { "application/octet-stream" } else { ct };
-                        json!({
-                            "base64": base64::engine::general_purpose::STANDARD.encode(&body),
-                            "media_type": media_type
-                        })
+                    use base64::Engine;
+                    let ct = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream");
+                    let media = ["audio/", "image/", "video/"].iter().any(|p| ct.starts_with(p));
+                    match std::str::from_utf8(&body) {
+                        Ok(text) if !media => json!({"text": text, "media_type": ct}),
+                        _ => json!({"base64": base64::engine::general_purpose::STANDARD.encode(&body), "media_type": ct}),
                     }
                 } else {
                     serde_json::from_str(&text).map_err(|_| unusable(class, "HTTP response is not valid JSON"))?
@@ -434,48 +390,33 @@ pub fn install(lua: &Lua, env: &Table, supervisor: Arc<crate::supervisor::Superv
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_origin_equality() {
-        let u1 = reqwest::Url::parse("https://openrouter.ai/").unwrap();
-        let u2 = reqwest::Url::parse("https://openrouter.ai/a/b/c?x=1#frag").unwrap();
-        assert_eq!(u1.origin(), u2.origin());
+    fn url(template_url: &str, args: serde_json::Value) -> mlua::Result<String> {
+        let mut args = args.as_object().unwrap().clone();
+        Ok(template(template_url).unwrap().url(&mut args)?.to_string())
     }
 
     #[test]
-    fn test_validate_endpoint_url_rejects_host_placeholders() {
-        assert!(validate_endpoint_url("https://{host}/api", false).is_err());
-        assert!(validate_endpoint_url("https://{host}:8080/api", false).is_err());
-        assert!(validate_endpoint_url("https://api.{domain}.com/v1", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai:{port}/api", false).is_err());
-        assert!(validate_endpoint_url("https://{user}@{host}/api", false).is_err());
+    fn template_rejects_origin_placeholders_queries_and_partial_segments() {
+        for bad in ["https://{host}/api", "https://{host}:8080/api", "https://api.{domain}.com/v1", "https://openrouter.ai:{port}/api", "https://{user}@{host}/api",
+            "https://u:p@openrouter.ai/api", "ftp://openrouter.ai/x", "openrouter.ai/x", "https://openrouter.ai/api?q={search}", "https://openrouter.ai/api#frag",
+            "https://openrouter.ai/{a/b}/foo", "https://openrouter.ai/{}/foo", "https://openrouter.ai/{unclosed", "https://openrouter.ai/foo}bar",
+            "https://openrouter.ai/{nested{p}}", "https://openrouter.ai/v{id}", "https://openrouter.ai/../foo", "https://openrouter.ai/%2E%2E/foo", r"https://openrouter.ai/a\..\b"] {
+            assert!(template(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
-    fn test_validate_endpoint_url_rejects_queries_and_fragments() {
-        assert!(validate_endpoint_url("https://openrouter.ai/api?q={search}", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai/api#frag", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai/api#{frag}", false).is_err());
-    }
-
-    #[test]
-    fn test_validate_endpoint_url_rejects_invalid_placeholders() {
-        assert!(validate_endpoint_url("https://openrouter.ai/{a/b}/foo", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai/{}/foo", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai/{unclosed", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai/foo}bar", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai/{nested{p}}", false).is_err());
-        assert!(validate_endpoint_url("https://openrouter.ai/../foo", false).is_err());
-    }
-
-    #[test]
-    fn test_validate_endpoint_url_accepts_valid_endpoints() {
-        assert!(validate_endpoint_url("https://openrouter.ai/api/v1/credits", false).is_ok());
-        assert!(validate_endpoint_url("https://openrouter.ai/{provider}/{model_id}/llms.txt", true).is_ok());
-        assert!(validate_endpoint_url("https://openrouter.ai/api/v1/videos/{job_id}", true).is_ok());
-        assert!(validate_endpoint_url("http://127.0.0.1:8080/api", true).is_ok());
-        assert!(validate_endpoint_url("http://localhost:3000/{id}", true).is_ok());
-        // Non-loopback HTTP with secret is rejected
-        assert!(validate_endpoint_url("http://insecure.example.com/api", true).is_err());
+    fn template_fills_whole_segments_and_keeps_the_origin() {
+        assert_eq!(url("https://openrouter.ai/api/v1/credits", json!({})).unwrap(), "https://openrouter.ai/api/v1/credits");
+        assert_eq!(url("https://openrouter.ai", json!({})).unwrap(), "https://openrouter.ai/");
+        assert_eq!(url("http://127.0.0.1:8080/{id}/{id}", json!({"id": 7})).unwrap(), "http://127.0.0.1:8080/7/7");
+        assert_eq!(url("https://openrouter.ai/{provider}/{model_id}/llms.txt", json!({"provider": "qwen", "model_id": "a/../b"})).unwrap(),
+            "https://openrouter.ai/qwen/a%2F..%2Fb/llms.txt");
+        assert_eq!(url("https://openrouter.ai/{p}", json!({"p": "//evil.example/@u?x#f"})).unwrap(), "https://openrouter.ai/%2F%2Fevil.example%2F%40u%3Fx%23f");
+        let mut args = json!({"job_id": "j1", "q": "keep"}).as_object().unwrap().clone();
+        template("https://openrouter.ai/videos/{job_id}").unwrap().url(&mut args).unwrap();
+        assert_eq!(serde_json::Value::Object(args), json!({"q": "keep"}));
+        for bad in [json!({}), json!({"p": {}}), json!({"p": ".."}), json!({"p": ""})] { assert!(url("https://openrouter.ai/{p}", bad).is_err()); }
     }
 
     #[test]
@@ -483,17 +424,9 @@ mod tests {
         assert_eq!(encode_path_segment("gpt-4o").unwrap(), "gpt-4o");
         assert_eq!(encode_path_segment("claude-3.5-sonnet").unwrap(), "claude-3.5-sonnet");
         assert_eq!(encode_path_segment("laguna-s-2.1:free").unwrap(), "laguna-s-2.1:free");
-        assert_eq!(encode_path_segment("foo/bar").unwrap(), "foo%2Fbar");
-        assert_eq!(encode_path_segment("@evil.com").unwrap(), "%40evil.com");
-        assert_eq!(encode_path_segment("?key=val").unwrap(), "%3Fkey%3Dval");
-        assert_eq!(encode_path_segment("#frag").unwrap(), "%23frag");
+        assert_eq!(encode_path_segment("v1..2").unwrap(), "v1..2");
         assert_eq!(encode_path_segment("foo bar").unwrap(), "foo%20bar");
         assert_eq!(encode_path_segment(r"foo\bar").unwrap(), "foo%5Cbar");
-
-        assert!(encode_path_segment("").is_err());
-        assert!(encode_path_segment(".").is_err());
-        assert!(encode_path_segment("..").is_err());
-        assert!(encode_path_segment("foo/../bar").is_err());
-        assert!(encode_path_segment("../../etc/passwd").is_err());
+        for bad in ["", ".", ".."] { assert!(encode_path_segment(bad).is_err()); }
     }
 }

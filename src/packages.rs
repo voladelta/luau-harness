@@ -18,6 +18,7 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     if let Some(name) = package.strip_prefix("tool:") {
         let def = registry.tools.get(name).ok_or_else(|| mlua::Error::runtime("tool not in frozen registry"))?;
         crate::tools::install_http(&lua, fx.clone(), name.to_string(), def.clone())?;
+        crate::tools::install_codecs(&lua)?;
     }
     let g = lua.globals();
     g.set("__emit", lua.create_function(|_, _: String| Ok(()))?)?;

@@ -281,7 +281,7 @@ The model can call `greeting.hello("Ada")`. All methods need a signature, descri
 
 Registration is pure and limited to one second and 16 MiB. Each method call runs the frozen source in a fresh isolated VM with copied arguments and results; mutable locals do not persist between calls. For filesystem, shell or agent access, declare `capabilities = { fs = {"read", "write"}, proc = {"sh"}, llm = {"agent"} }`, requesting only what you need. Workspace trust grants those declarations; the existing path, sandbox, budget and approval checks still apply. Local tools cannot import privileged harness modules.
 
-HTTP tools declare named, fixed endpoints in `http`, then call `http("endpoint", args)` inside a method. Each endpoint accepts `url`, `method` (default `GET`), `secret` (optional credential name), `header` (default `Authorization`, value sent verbatim), and `read_only` (default `false`). GET arguments become encoded query parameters; other methods send JSON. The return value is decoded JSON. HTTP errors raise with their status and a bounded response excerpt. Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects.
+HTTP tools declare named, fixed endpoints in `http`, then call `http("endpoint", args)` inside a method. Each endpoint accepts `url`, `method` (default `GET`), `secret` (optional credential name), `header` (default `Authorization`, value sent verbatim), `bearer` (default `false`; sends `Bearer <secret>`, so store the bare token), `raw` (default `false`), and `read_only` (default `false`). A `{name}` placeholder fills one whole path segment (`/videos/{job_id}`, not `/v{id}`) from the argument of that name, percent-encoded; the origin is fixed. Remaining GET arguments become encoded query parameters; other methods send JSON. The return value is decoded JSON, or for `raw` endpoints `{text, media_type}` (UTF-8 bodies) or `{base64, media_type}` (audio, image, video and other bytes). Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose bytes can go straight to `write`. HTTP errors raise with their status and a bounded response excerpt. Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects.
 
 Endpoint declarations grant access to those URLs independently of shell `--net`. Mark endpoints `read_only = true` only when they read data; other endpoints use the existing approval gate, matched as `http NAMESPACE.ENDPOINT`. HTTP calls use the supervisor's authorization, run deadline and journal. Credentials are attached by Rust and never returned to tool code or saved in the run manifest. Credentials echoed in responses are redacted before journaling.
 
@@ -330,8 +330,8 @@ hx exec 'print(openrouter.text{model="deepseek/deepseek-chat-v3.1", prompt="Hell
   - `openrouter.help{model="..."}` fetches on-demand model guides (`https://openrouter.ai/{provider}/{model-id}/llms.txt`) and root documentation (`https://openrouter.ai/docs/llms.txt`) with a 24-hour local cache (`force=true` bypasses).
 - **Multi-modal generation**:
   - `openrouter.text{model, prompt|messages}`: Chat completions text generation.
-  - `openrouter.image{model, prompt, ...}`: Text-to-image generation with optional `save_to`.
-  - `openrouter.sound{model, input, ...}`: Text-to-speech audio synthesis with optional `save_to`.
+  - `openrouter.image{model, prompt, ...}`: Text-to-image generation; `save_to` writes every image (`name.png`, `name-2.png`, ...), returns the paths as a list and drops the base64 from the result. A failed write raises.
+  - `openrouter.sound{model, input, ...}`: Text-to-speech audio synthesis; `save_to` writes the audio and omits base64 from the result. A failed write raises.
   - `openrouter.video{model, prompt, ...}` and `openrouter.poll_video{job_id}`: Video generation submission and job polling.
 
 ## Security model

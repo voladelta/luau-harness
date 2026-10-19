@@ -13,288 +13,22 @@
 -- - Audio: https://openrouter.ai/api/v1/audio/speech
 -- - Videos: https://openrouter.ai/api/v1/videos
 
-local b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local b64_lookup = {}
-for i = 1, #b64_chars do
-	b64_lookup[string.byte(b64_chars, i)] = i - 1
-end
-b64_lookup[string.byte("-")] = 62
-b64_lookup[string.byte("_")] = 63
+local ORIGIN = "https://openrouter.ai"
 
-local function base64_decode(data)
-	if type(data) ~= "string" or #data == 0 then return "" end
-	data = data:gsub("%s+", "")
-	local len = #data
-	local out = {}
-	local byte_buf = {}
-	local i = 1
-	while i <= len do
-		local c1 = b64_lookup[string.byte(data, i)]
-		local c2 = b64_lookup[string.byte(data, i + 1)]
-		local b3 = string.byte(data, i + 2)
-		local b4 = string.byte(data, i + 3)
-		local c3 = b3 and b64_lookup[b3]
-		local c4 = b4 and b64_lookup[b4]
-		if not c1 or not c2 then break end
-
-		byte_buf[#byte_buf + 1] = bit32.bor(bit32.lshift(c1, 2), bit32.rshift(c2, 4))
-		if c3 then
-			byte_buf[#byte_buf + 1] = bit32.bor(bit32.lshift(bit32.band(c2, 0x0f), 4), bit32.rshift(c3, 2))
-			if c4 then
-				byte_buf[#byte_buf + 1] = bit32.bor(bit32.lshift(bit32.band(c3, 0x03), 6), c4)
-			end
-		end
-
-		if #byte_buf >= 2046 then
-			out[#out + 1] = string.char(table.unpack(byte_buf))
-			byte_buf = {}
-		end
-		i = i + 4
+-- Every endpoint shares the origin and the bearer key; only path, method and flags differ.
+local function endpoint(path, method, flags)
+	local spec = { url = ORIGIN .. path, method = method, secret = "OPENROUTER_API_KEY", bearer = true }
+	for k, v in pairs(flags or {}) do
+		spec[k] = v
 	end
-	if #byte_buf > 0 then
-		out[#out + 1] = string.char(table.unpack(byte_buf))
-	end
-	return table.concat(out)
+	return spec
 end
 
-local json = {}
-
-function json.parse(str)
-	local pos = 1
-	local len = #str
-	local function skip_whitespace()
-		while pos <= len do
-			local b = string.byte(str, pos)
-			if b == 32 or b == 9 or b == 10 or b == 13 then
-				pos = pos + 1
-			else
-				break
-			end
-		end
-	end
-
-	local parse_val
-	local function parse_str()
-		pos = pos + 1
-		local chunks = {}
-		local chunk_start = pos
-		while pos <= len do
-			local b = string.byte(str, pos)
-			if b == 34 then
-				if pos > chunk_start then
-					chunks[#chunks + 1] = str:sub(chunk_start, pos - 1)
-				end
-				pos = pos + 1
-				return table.concat(chunks)
-			elseif b == 92 then
-				if pos > chunk_start then
-					chunks[#chunks + 1] = str:sub(chunk_start, pos - 1)
-				end
-				local esc = string.byte(str, pos + 1)
-				if not esc then error("unterminated escape in string") end
-				if esc == 34 then
-					chunks[#chunks + 1] = '"'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 92 then
-					chunks[#chunks + 1] = '\\'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 47 then
-					chunks[#chunks + 1] = '/'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 98 then
-					chunks[#chunks + 1] = '\b'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 102 then
-					chunks[#chunks + 1] = '\f'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 110 then
-					chunks[#chunks + 1] = '\n'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 114 then
-					chunks[#chunks + 1] = '\r'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 116 then
-					chunks[#chunks + 1] = '\t'
-					pos = pos + 2
-					chunk_start = pos
-				elseif esc == 117 then
-					local hex = str:sub(pos + 2, pos + 5)
-					if #hex ~= 4 or not hex:match("^%x%x%x%x$") then
-						error("invalid unicode escape")
-					end
-					local cp = tonumber(hex, 16)
-					pos = pos + 6
-					if cp >= 0xD800 and cp <= 0xDBFF then
-						local low_hex = str:sub(pos + 2, pos + 5)
-						local low = low_hex:match("^%x%x%x%x$") and tonumber(low_hex, 16)
-						if str:sub(pos, pos + 1) ~= "\\u" or not low or low < 0xDC00 or low > 0xDFFF then
-							error("invalid unicode surrogate pair")
-						end
-						cp = 0x10000 + (cp - 0xD800) * 0x400 + low - 0xDC00
-						pos = pos + 6
-					elseif cp >= 0xDC00 and cp <= 0xDFFF then
-						error("unpaired unicode surrogate")
-					end
-					chunks[#chunks + 1] = utf8.char(cp)
-					chunk_start = pos
-				else
-					error("invalid string escape")
-				end
-			else
-				pos = pos + 1
-			end
-		end
-		error("unterminated string")
-	end
-
-	local function parse_num()
-		local s = pos
-		while pos <= len do
-			local b = string.byte(str, pos)
-			if (b >= 48 and b <= 57) or b == 43 or b == 45 or b == 46 or b == 101 or b == 69 then
-				pos = pos + 1
-			else
-				break
-			end
-		end
-		local n = tonumber(str:sub(s, pos - 1))
-		if not n then error("invalid number") end
-		return n
-	end
-
-	local function parse_arr()
-		pos = pos + 1
-		local arr = {}
-		skip_whitespace()
-		if string.byte(str, pos) == 93 then
-			pos = pos + 1
-			return arr
-		end
-		while pos <= len do
-			arr[#arr + 1] = parse_val()
-			skip_whitespace()
-			local b = string.byte(str, pos)
-			if b == 93 then
-				pos = pos + 1
-				return arr
-			elseif b == 44 then
-				pos = pos + 1
-			else
-				error("expected , or ] in array")
-			end
-		end
-		error("unterminated array")
-	end
-
-	local function parse_obj()
-		pos = pos + 1
-		local obj = {}
-		skip_whitespace()
-		if string.byte(str, pos) == 125 then
-			pos = pos + 1
-			return obj
-		end
-		while pos <= len do
-			skip_whitespace()
-			if string.byte(str, pos) ~= 34 then error("expected string key in object") end
-			local key = parse_str()
-			skip_whitespace()
-			if string.byte(str, pos) ~= 58 then error("expected : in object") end
-			pos = pos + 1
-			obj[key] = parse_val()
-			skip_whitespace()
-			local b = string.byte(str, pos)
-			if b == 125 then
-				pos = pos + 1
-				return obj
-			elseif b == 44 then
-				pos = pos + 1
-			else
-				error("expected , or } in object")
-			end
-		end
-		error("unterminated object")
-	end
-
-	parse_val = function()
-		skip_whitespace()
-		if pos > len then error("unexpected EOF") end
-		local b = string.byte(str, pos)
-		if b == 34 then
-			return parse_str()
-		elseif b == 123 then
-			return parse_obj()
-		elseif b == 91 then
-			return parse_arr()
-		elseif (b >= 48 and b <= 57) or b == 45 then
-			return parse_num()
-		elseif str:sub(pos, pos + 3) == "true" then
-			pos = pos + 4
-			return true
-		elseif str:sub(pos, pos + 4) == "false" then
-			pos = pos + 5
-			return false
-		elseif str:sub(pos, pos + 3) == "null" then
-			pos = pos + 4
-			return nil
-		else
-			error("unexpected character: " .. str:sub(pos, pos))
-		end
-	end
-
-	local value = parse_val()
-	skip_whitespace()
-	if pos <= len then error("unexpected trailing JSON content") end
-	return value
-end
-
-local function quote_json(value)
-	return '"' .. value:gsub('[%z\1-\31\\"]', function(char)
-		if char == '"' then return '\\"' end
-		if char == '\\' then return '\\\\' end
-		return string.format("\\u%04x", string.byte(char))
-	end) .. '"'
-end
-
-function json.encode(val)
-	local t = type(val)
-	if t == "nil" then
-		return "null"
-	elseif t == "boolean" then
-		return tostring(val)
-	elseif t == "number" then
-		return tostring(val)
-	elseif t == "string" then
-		return quote_json(val)
-	elseif t == "table" then
-		local len = #val
-		if len > 0 then
-			local parts = {}
-			for i = 1, len do
-				parts[#parts + 1] = json.encode(val[i])
-			end
-			return "[" .. table.concat(parts, ",") .. "]"
-		else
-			local has_keys = false
-			local parts = {}
-			for k, v in pairs(val) do
-				has_keys = true
-				parts[#parts + 1] = quote_json(tostring(k)) .. ":" .. json.encode(v)
-			end
-			if not has_keys then
-				return "[]"
-			end
-			return "{" .. table.concat(parts, ",") .. "}"
-		end
-	end
-	return "null"
+-- save_to for the first file, save_to with -2, -3 ... before the extension for the rest.
+local function numbered(path, i)
+	if i == 1 then return path end
+	local stem, ext = path:match("^(.-)(%.[^./]*)$")
+	return stem and (stem .. "-" .. i .. ext) or (path .. "-" .. i)
 end
 
 local function read_cache(path, force)
@@ -305,9 +39,9 @@ local function read_cache(path, force)
 	end
 	local nl = raw:find("\n")
 	if not nl then return nil end
-	local ts = tonumber(raw:sub(1, nl - 1))
-	if not ts then return nil end
-	if (os.time() - ts) < 86400 then
+	local age = os.time() - (tonumber(raw:sub(1, nl - 1)) or -1)
+	-- A timestamp from the future (clock skew, hand edit) is stale, not valid forever.
+	if age >= 0 and age < 86400 then
 		return raw:sub(nl + 1)
 	end
 	return nil
@@ -323,72 +57,15 @@ return {
 		fs = { "read", "write" },
 	},
 	http = {
-		credits = {
-			url = "https://openrouter.ai/api/v1/credits",
-			method = "GET",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			read_only = true,
-		},
-		models = {
-			url = "https://openrouter.ai/api/v1/models",
-			method = "GET",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			read_only = true,
-		},
-		model_help = {
-			url = "https://openrouter.ai/{provider}/{model_id}/llms.txt",
-			method = "GET",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			raw = true,
-			read_only = true,
-		},
-		docs_index = {
-			url = "https://openrouter.ai/docs/llms.txt",
-			method = "GET",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			raw = true,
-			read_only = true,
-		},
-		chat = {
-			url = "https://openrouter.ai/api/v1/chat/completions",
-			method = "POST",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			read_only = false,
-		},
-		images = {
-			url = "https://openrouter.ai/api/v1/images",
-			method = "POST",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			read_only = false,
-		},
-		speech = {
-			url = "https://openrouter.ai/api/v1/audio/speech",
-			method = "POST",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			raw = true,
-			read_only = false,
-		},
-		videos = {
-			url = "https://openrouter.ai/api/v1/videos",
-			method = "POST",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			read_only = false,
-		},
-		poll_video = {
-			url = "https://openrouter.ai/api/v1/videos/{job_id}",
-			method = "GET",
-			secret = "OPENROUTER_API_KEY",
-			bearer = true,
-			read_only = true,
-		},
+		credits = endpoint("/api/v1/credits", "GET", { read_only = true }),
+		models = endpoint("/api/v1/models", "GET", { read_only = true }),
+		model_help = endpoint("/{provider}/{model_id}/llms.txt", "GET", { raw = true, read_only = true }),
+		docs_index = endpoint("/docs/llms.txt", "GET", { raw = true, read_only = true }),
+		chat = endpoint("/api/v1/chat/completions", "POST"),
+		images = endpoint("/api/v1/images", "POST"),
+		speech = endpoint("/api/v1/audio/speech", "POST", { raw = true }),
+		videos = endpoint("/api/v1/videos", "POST"),
+		poll_video = endpoint("/api/v1/videos/{job_id}", "GET", { read_only = true }),
 	},
 	tools = {
 		credits = {
@@ -418,7 +95,7 @@ return {
 				local model_list
 
 				if cached_str then
-					local ok, parsed = pcall(json.parse, cached_str)
+					local ok, parsed = pcall(json.decode, cached_str)
 					if ok and type(parsed) == "table" and type(parsed.data) == "table" then
 						model_list = parsed
 					end
@@ -632,7 +309,7 @@ return {
 		},
 		image = {
 			signature = "image(args: {model: string, prompt: string, aspect_ratio: string?, resolution: string?, n: number?, seed: number?, input_references: table?, save_to: string?}): table",
-			description = "Generate images via OpenRouter Images API (e.g. 'qwen/qwen-image-2.1-turbo', 'black-forest-labs/flux-1-schnell'). Supports aspect_ratio ('16:9','1:1'), resolution ('1K','2K'), n (1..6). If save_to is provided, decodes base64 and saves binary image bytes to disk.",
+			description = "Generate images via OpenRouter Images API (e.g. 'qwen/qwen-image-2.1-turbo', 'black-forest-labs/flux-1-schnell'). Supports aspect_ratio ('16:9','1:1'), resolution ('1K','2K'), n (1..6). If save_to is given, saves every image (save_to, then name-2.ext, ...) and returns saved_to as a list of paths with b64_json removed; a failed write raises.",
 			run = function(args)
 				assert(type(args) == "table" and type(args.model) == "string" and args.model:match("%S"), "openrouter.image requires a model")
 				assert(type(args.prompt) == "string" and args.prompt:match("%S"), "openrouter.image requires a prompt")
@@ -646,25 +323,28 @@ return {
 					input_references = args.input_references,
 				}
 				local res = http("images", payload)
-				local saved_path = nil
-				if args.save_to and res.data and res.data[1] and res.data[1].b64_json then
-					local decoded = base64_decode(res.data[1].b64_json)
-					local ok, _ = pcall(write, args.save_to, decoded)
-					if ok then
-						saved_path = args.save_to
+				local images = res.data or {}
+				local saved_to = nil
+				if args.save_to then
+					saved_to = {}
+					for i, img in ipairs(images) do
+						assert(img.b64_json, "openrouter.image: response has no b64_json to save")
+						local path = numbered(args.save_to, i)
+						write(path, base64.decode(img.b64_json)) -- raises on failure; never report an unsaved file
+						saved_to[i] = path
+						img.b64_json = nil -- the bytes are on disk; keep megabytes out of the caller's data
 					end
 				end
 				return {
-					images = res.data or {},
+					images = images,
 					usage = res.usage,
-					saved_to = saved_path,
-					raw = res,
+					saved_to = saved_to,
 				}
 			end,
 		},
 		sound = {
 			signature = "sound(args: {model: string, input: string, voice: string?, response_format: string?, speed: number?, save_to: string?}): table",
-			description = "Generate speech audio via OpenRouter Text-to-Speech API (e.g. 'elevenlabs/eleven-v4', 'heygen/heygen-voice-1'). Supports voice, speed, response_format ('mp3','pcm'). If save_to is specified, decodes base64 and saves binary audio bytes to disk.",
+			description = "Generate speech audio via OpenRouter Text-to-Speech API (e.g. 'elevenlabs/eleven-v4', 'heygen/heygen-voice-1'). Supports voice, speed, response_format ('mp3','pcm'). If save_to is given, saves the audio there and omits base64 from the result; a failed write raises.",
 			run = function(args)
 				assert(type(args) == "table" and type(args.model) == "string" and args.model:match("%S"), "openrouter.sound requires a model")
 				assert(type(args.input) == "string" and args.input:match("%S"), "openrouter.sound requires input text")
@@ -676,18 +356,14 @@ return {
 					speed = args.speed,
 				}
 				local res = http("speech", payload)
-				local saved_path = nil
-				if args.save_to and res and res.base64 then
-					local decoded = base64_decode(res.base64)
-					local ok, _ = pcall(write, args.save_to, decoded)
-					if ok then
-						saved_path = args.save_to
-					end
+				if args.save_to then
+					assert(res.base64, "openrouter.sound: response was not audio (" .. tostring(res.media_type) .. ")")
+					write(args.save_to, base64.decode(res.base64)) -- raises on failure
 				end
 				return {
-					base64 = res and res.base64,
-					media_type = res and res.media_type,
-					saved_to = saved_path,
+					base64 = not args.save_to and res.base64 or nil,
+					media_type = res.media_type,
+					saved_to = args.save_to,
 				}
 			end,
 		},

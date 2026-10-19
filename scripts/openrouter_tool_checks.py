@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
@@ -304,8 +305,13 @@ class OpenRouterToolTests(unittest.TestCase):
         catalog = json.loads(raw)
         self.assertIn("😀", catalog["data"][0]["description"])
         # Also accept standard JSON encoders that use UTF-16 surrogate pairs.
+        (self.ws / ".openrouter/models.json").write_text(f"{int(time.time())}\n" + json.dumps(catalog))
+        self.assertEqual(fresh, self.run_code(code, env=env))
+        self.assertEqual(len(CALLS), 1)
+        # A timestamp from the future is stale, not valid forever.
         (self.ws / ".openrouter/models.json").write_text("9999999999\n" + json.dumps(catalog))
         self.assertEqual(fresh, self.run_code(code, env=env))
+        self.assertEqual(len(CALLS), 2)
 
     def test_help_on_demand_and_24h_caching(self):
         """Model-specific help and docs index are fetched on demand and cached 24h."""
@@ -342,7 +348,7 @@ class OpenRouterToolTests(unittest.TestCase):
                 {"id": "test/escape", "name": "Esc Test", "description": "C:\\new_folder\\table.txt"}
             ]
         }
-        (cache_dir / "models.json").write_text(f"9999999999\n{json.dumps(catalog)}")
+        (cache_dir / "models.json").write_text(f"{int(time.time())}\n{json.dumps(catalog)}")
         out = self.run_code(
             'local m = openrouter.models{}; print(m.data[1].description, m.data[1].description:find("\\n") ~= nil)',
             env=env
@@ -350,15 +356,15 @@ class OpenRouterToolTests(unittest.TestCase):
         self.assertIn("C:\\new_folder\\table.txt\tfalse", out)
 
     def test_media_saving_decodes_binary_bytes(self):
-        """save_to decodes base64 and writes valid binary image/audio bytes, returning saved_to only on success."""
+        """save_to writes decoded binary image/audio bytes, keeps base64 out of the result, and raises when the write fails."""
         env = dict(self.env, OPENROUTER_API_KEY="sk-or-test-key")
         # Image generation with save_to
         out_img = self.run_code(
             'local r = openrouter.image{model = "qwen/qwen-image-2.1-turbo", prompt = "a cat", save_to = "cat.png"};'
-            'print(#r.images, r.saved_to)',
+            'print(#r.images, r.saved_to[1], r.images[1].b64_json, r.images[1].media_type)',
             env=env, yolo=True
         )
-        self.assertIn("1\tcat.png", out_img)
+        self.assertIn("1\tcat.png\tnil\timage/png", out_img)
 
         # Inspect binary contents of cat.png on disk
         saved_file = self.ws / "cat.png"
@@ -370,22 +376,23 @@ class OpenRouterToolTests(unittest.TestCase):
         # Sound generation with save_to
         out_sound = self.run_code(
             'local r = openrouter.sound{model = "elevenlabs/eleven-v4", input = "Hello", save_to = "audio.mp3"};'
-            'print(r.media_type, r.saved_to)',
+            'print(r.media_type, r.saved_to, r.base64)',
             env=env, yolo=True
         )
-        self.assertIn("audio/mpeg\taudio.mp3", out_sound)
+        self.assertIn("audio/mpeg\taudio.mp3\tnil", out_sound)
         audio_file = self.ws / "audio.mp3"
         self.assertTrue(audio_file.exists())
         audio_bytes = audio_file.read_bytes()
         self.assertTrue(audio_bytes.startswith(b"\xff\xfb\x90d"))
 
-        # Failed save_to must return saved_to = nil, not report success
+        # A failed save raises instead of returning a result that looks like success
         out_failed = self.run_code(
-            'local r = openrouter.image{model = "qwen/qwen-image-2.1-turbo", prompt = "a cat", save_to = ".harness/forbidden.png"};'
-            'print("Saved:", r.saved_to)',
+            'local ok, err = pcall(function() return openrouter.image{model = "qwen/qwen-image-2.1-turbo", prompt = "a cat", save_to = ".harness/forbidden.png"} end);'
+            'print("Saved:", ok, err)',
             env=env, yolo=True  # .harness write is forbidden even under yolo
         )
-        self.assertIn("Saved:\tnil", out_failed)
+        self.assertIn("Saved:\tfalse", out_failed)
+        self.assertIn("forbidden.png", out_failed)
 
     def test_url_templates_cannot_redirect_credentials_or_origin(self):
         """Host placeholders must be rejected at registration; path segment encoding and fixed origin prevent redirection."""
@@ -411,6 +418,11 @@ class OpenRouterToolTests(unittest.TestCase):
         out2 = self.run_code('print(bad_port)', env=env)
         self.assertIn("registration failed: endpoint origin cannot contain placeholders", out2)
         (self.dir / "bad_port.lua").unlink()
+
+        # 2b. A bearer endpoint takes the bare token; a stored "Bearer ..." is one truth too many
+        env_prefixed = dict(self.env, OPENROUTER_API_KEY="Bearer sk-test")
+        out_prefixed = self.run_code('print(openrouter)', env=env_prefixed)
+        self.assertIn("must be the bare token", out_prefixed)
 
         # 3. Path parameter traversal attempts must fail safely
         env_openrouter = dict(self.env, OPENROUTER_API_KEY="sk-test")
