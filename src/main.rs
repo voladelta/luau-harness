@@ -1,4 +1,3 @@
-mod claude_sdk;
 mod atomic_file;
 mod effects;
 mod eventlog;
@@ -226,8 +225,8 @@ fn validate_args(args: &[String]) -> Result<()> {
     if command == "review" && (args.get(1).is_none_or(|s| s.starts_with("--")) || arg(args,"--gate").is_none() || arg(args,"--decision").is_none()) {
         return Err(usage("usage: hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]"));
     }
-    if let Some(api) = arg(args, "--api") && !matches!(api.as_str(), "openai" | "responses" | "claude-sdk") {
-        return Err(usage(&format!("unknown --api {api:?} (expected openai, responses or claude-sdk)")));
+    if let Some(api) = arg(args, "--api") && !matches!(api.as_str(), "openai" | "responses") {
+        return Err(usage(&format!("unknown --api {api:?} (expected openai or responses)")));
     }
     if let Some(mode) = arg(args, "--approval") {
         mode.parse::<policy::ApprovalMode>().map_err(|e| usage(&e.to_string()))?;

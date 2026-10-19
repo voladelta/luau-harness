@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct LlmCfg {
     pub model: String,
-    /// "openai" | "responses" | "claude-sdk"
+    /// "openai" | "responses"
     pub api: String,
     pub base_url: Option<String>,
     pub key_env: Option<String>,
@@ -96,7 +96,6 @@ pub fn calculate_token_cost(model: &str, price: Option<&Price>, input: u64, cach
 /// The model's price from `{base}/models` (OpenRouter publishes `pricing` there). None when the endpoint has no
 /// usable price for it, e.g. a router with variable pricing.
 pub async fn fetch_price(cfg: &LlmCfg) -> Option<Price> {
-    if cfg.api == "claude-sdk" { return None; }
     let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
     if let Some(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok() {
         let mut get = http.get(format!("{base}/models"));
@@ -207,9 +206,6 @@ pub struct Reply {
 
 impl LlmCfg {
     pub fn key(&self) -> Result<String> {
-        if self.api == "claude-sdk" {
-            return Ok(String::new()); // the claude CLI holds the login
-        }
         let env = self.key_env.clone().unwrap_or_else(|| "OPENROUTER_API_KEY".into());
         std::env::var(&env).map_err(|_| anyhow::anyhow!("{env} not set"))
     }
@@ -324,11 +320,8 @@ fn responses_input(msgs: &[Value]) -> Vec<Value> {
 
 /// `req`: { system?: string, messages: [neutral message], tools?: [{name, description, parameters}], max_tokens?: number }
 pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) -> Result<Reply> {
-    if cfg.api == "claude-sdk" {
-        return crate::claude_sdk::chat(cfg, req).await;
-    }
     if !matches!(cfg.api.as_str(), "openai" | "responses") {
-        bail!("unknown --api {:?} (expected openai, responses or claude-sdk)", cfg.api);
+        bail!("unknown --api {:?} (expected openai or responses)", cfg.api);
     }
     let responses = cfg.api == "responses";
     let system = req["system"].as_str().unwrap_or("");

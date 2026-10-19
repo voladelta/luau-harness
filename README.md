@@ -33,7 +33,6 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Overridable harness | Pure controller, prompt, printer and hooks are Luau in `stdlib/std/`; overrides apply to new runs |
 | Extensions | Immutable approved packages, isolated method calls with copied data, MCP servers, agent-staged tools and module replacements that wait for your review |
 | Any provider | OpenAI Chat Completions or Responses API; any compatible base URL (OpenRouter by default) |
-| Claude plan | `--api claude-sdk --model haiku\|sonnet\|opus`: drives the `claude` CLI over stream-json (as the Agent SDK does), so calls use your Claude login and plan limits, no API key; hx's `luau` tool is a native tool of an in-process SDK MCP server, so tool calls are structured (no text protocol); images are sent as base64 blocks |
 
 ## Quick example
 
@@ -106,12 +105,6 @@ Any model on OpenRouter works the same way, for example `--model deepseek/deepse
 hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1 --key-env EXAMPLE_API_KEY
 ```
 
-With a Claude subscription and the `claude` CLI logged in, no API key is needed:
-
-```bash
-hx run --prompt-file task.md --api claude-sdk --model sonnet
-```
-
 ## Commands
 
 | Command | What it does |
@@ -140,7 +133,7 @@ hx run --prompt-file task.md --api claude-sdk --model sonnet
 | `--rpi` | off | Activate the bundled RPI workflow in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
 | `--model M` | `HX_MODEL` | Model id |
-| `--api A` | `openai` (`HX_API`) | `openai` (Chat Completions), `responses`, or `claude-sdk` (the `claude` CLI and your Claude plan; `--model haiku\|sonnet\|opus`) |
+| `--api A` | `openai` (`HX_API`) | `openai` (Chat Completions) or `responses` |
 | `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
 | `--reasoning R` | | Reasoning effort |
