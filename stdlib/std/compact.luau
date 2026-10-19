@@ -104,10 +104,10 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.]==]
 
-local VM_NOTE = "Note: the Luau session keeps running after this summary: every global variable and helper function defined so far stays available (vars() lists them). The calls that defined them won't appear above, so record in the summary any names worth remembering so they are reused instead of redefined."
+local VM_NOTE = "Luau scope for Critical Context: compaction keeps the running VM. Distinguish user globals assigned without local from chunk-local variables and local functions; do not list locals or builtins as live user state. Record useful globals and what they hold based on the supplied code, noting any uncertainty. For a needed past local, record how to retrieve or recompute its value instead of implying the name is available. The continuing agent can inspect vars(), a name-to-value map of live user globals; the summarizer cannot inspect the VM."
 
 local SUMMARY_PREFIX = "[compaction-summary]\n\nThe conversation history before this point was compacted into the following summary.\nThe retained messages below are authoritative; this summary may lag behind them.\nFiles on disk are current; the file listing in the task above may be out of date.\n\n<summary>\n"
-local SUMMARY_SUFFIX = "\n</summary>"
+local SUMMARY_SUFFIX = "\n</summary>\nLuau scope is unchanged: only globals remain accessible across calls. Check vars() before reusing uncertain names; retrieve or recompute past locals."
 
 -- lowercase substrings of the error text that mean "the request did not fit the context window"
 local OVERFLOW = {
