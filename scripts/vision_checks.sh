@@ -25,7 +25,7 @@ for m in msgs:
     if isinstance(c,list): n+=sum(1 for p in c if p.get('type') in ('image_url','input_image'))
 print(n)"; }
 
-run $W openai --pack std/vision --trace $T/tr1.txt >/dev/null
+run $W completions --pack std/vision --trace $T/tr1.txt >/dev/null
 check "view reports the scaled size" "$(grep -A1 '### RESULT' $T/tr1.txt | sed -n 2p)" "1024	576"
 check "chat: the next request carries one image" "$(img_parts)" "1"
 check "chat: image is a PNG data URL" "$(tail -1 $T/req.jsonl | grep -c 'data:image/png;base64,')" "1"
@@ -35,7 +35,7 @@ b=json.load(sys.stdin); m=b['messages'][-1]; print(m['role'], m['content'][-1].g
 check "the prompt documents view()" "$(tail -1 $T/req.jsonl | grep -c 'view(path')" "1"
 : > $T/req.jsonl; run $W responses --pack std/vision >/dev/null
 check "responses: input_image part" "$(img_parts)" "1"
-: > $T/req.jsonl; run $W openai >/dev/null
+: > $T/req.jsonl; run $W completions >/dev/null
 check "without the pack: no view, no prompt line" "$(tail -1 $T/req.jsonl | grep -c 'view(path')" "0"
 check "without the pack: no images sent" "$(img_parts)" "0"
 check "event log has no pixels anywhere" "$(cat $W/.harness/log/*.jsonl | grep -c 'iVBORw0KGgo')" "0"

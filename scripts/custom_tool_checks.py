@@ -229,7 +229,7 @@ class Tools(unittest.TestCase):
         self.env.pop("HX_MISSING_TEST_CREDENTIAL", None)
         task = self.root / "task.txt"
         task.write_text("Reply done.")
-        self.command("run", "--prompt-file", str(task), "--model", "mock", "--api", "openai", "--base-url", self.base,
+        self.command("run", "--prompt-file", str(task), "--model", "mock", "--api", "completions", "--base-url", self.base,
                      "--key-env", "HX_TEST_MODEL_KEY", "--max-turns", "2", env=dict(self.env, HX_TEST_MODEL_KEY="model-test-key"))
         self.assertGreater(len(CALLS), 0)
         system = CALLS[0][3]["messages"][0]["content"]

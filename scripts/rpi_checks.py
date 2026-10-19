@@ -224,7 +224,7 @@ def native_submission_guards():
             assert value["finished"] and not (path / "escape.txt").exists(), value
             retries = [body for body in calls if stage(body) == "research_questions"]
             assert len(retries) >= 2, "invalid submission chunk advanced without correction"
-            assert any(m.get("role") == "tool" for m in retries[-1].get("messages", []))
+            assert any(m.get("role") == "tool" or m.get("type") == "function_call_output" for m in harness.body_messages(retries[-1]))
 
 
 def crash_delivery():

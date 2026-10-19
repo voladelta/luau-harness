@@ -1,4 +1,4 @@
-//! Provider client, two wire formats, both with native tool calling: OpenAI-compatible Chat Completions (`openai`) and
+//! Provider client, two wire formats, both with native tool calling: OpenAI-compatible Chat Completions (`completions`) and
 //! the Responses API (`responses`). Any model on any compatible endpoint (OpenRouter, Enclave, local) works: nothing here
 //! restricts the model or the upstream provider.
 use anyhow::{bail, Result};
@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct LlmCfg {
     pub model: String,
-    /// "openai" | "responses"
+    /// "responses" | "completions"
     pub api: String,
     pub base_url: Option<String>,
     pub key_env: Option<String>,
@@ -320,8 +320,8 @@ fn responses_input(msgs: &[Value]) -> Vec<Value> {
 
 /// `req`: { system?: string, messages: [neutral message], tools?: [{name, description, parameters}], max_tokens?: number }
 pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) -> Result<Reply> {
-    if !matches!(cfg.api.as_str(), "openai" | "responses") {
-        bail!("unknown --api {:?} (expected openai or responses)", cfg.api);
+    if !matches!(cfg.api.as_str(), "responses" | "completions") {
+        bail!("unknown --api {:?} (expected responses or completions)", cfg.api);
     }
     let responses = cfg.api == "responses";
     let system = req["system"].as_str().unwrap_or("");

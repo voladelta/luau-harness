@@ -39,7 +39,7 @@ unmock() { kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=""; }
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf 'require("std/compact").keep_recent_tokens = 40\nrequire("std/recheck").enabled = false\n' > $W/.harness/init.luau; }
 off() { echo 'require("std/compact").enabled = false' >> $W/.harness/init.luau; }  # the pack is on by default
 run() { # workspace port trace extra-flags...   (stdout/stderr in $T/out, $T/err; status is hx's)
-  OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api openai --base-url http://127.0.0.1:$2 --key-env OPENROUTER_API_KEY \
+  OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$2 --key-env OPENROUTER_API_KEY \
     --context-window 40000 --max-output 1000 --trace $3 "${@:4}" > $T/out 2> $T/err
 }
 field() { python3 -c "import sys,json;r=json.loads(open('$T/out').read().strip().splitlines()[-1]);print(r.get('$1'))" 2>/dev/null; }

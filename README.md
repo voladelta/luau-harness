@@ -32,7 +32,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Recheck | Opt-in (`std/recheck`): the system prompt warns that the first final answer will be checked, and before it is accepted the model is sent back once to name the root cause, list the other cases it implies, test each and re-check the task's requirements. It adds turns when enabled and can hurt build tasks; enable for debugging tasks with `require("std/recheck").enabled = true` in `.harness/init.luau` |
 | Overridable harness | Pure controller, prompt, printer and hooks are Luau in `stdlib/std/`; overrides apply to new runs |
 | Extensions | Immutable approved packages, isolated method calls with copied data, MCP servers, agent-staged tools and module replacements that wait for your review |
-| Any provider | OpenAI Chat Completions or Responses API; any compatible base URL (OpenRouter by default) |
+| Any provider | Responses API or Chat Completions (`completions`); any compatible base URL (OpenRouter by default) |
 
 ## Quick example
 
@@ -133,7 +133,7 @@ hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1
 | `--rpi` | off | Activate the bundled RPI workflow in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
 | `--model M` | `HX_MODEL` | Model id |
-| `--api A` | `openai` (`HX_API`) | `openai` (Chat Completions) or `responses` |
+| `--api A` | `responses` (`HX_API`) | `responses` or `completions` (Chat Completions) |
 | `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
 | `--reasoning R` | | Reasoning effort |
@@ -307,6 +307,32 @@ Credential lookup checks, in order:
 3. `$XDG_CONFIG_HOME/hx/secrets.toml`, or `~/.config/hx/secrets.toml`.
 
 Secrets files contain top-level string assignments, for example `TINYFISH_API_KEY = "your-key"`. Blank values fall through to the next source. Without a usable key, the entire `tinyfish` registration fails and its methods stay unavailable. Secrets files are blocked from sandboxed reads, searches and shell commands; keep them out of version control. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
+
+### OpenRouter multi-modal generation and model discovery
+
+Install the included [OpenRouter tool](examples/tools/openrouter.lua):
+
+```sh
+mkdir -p .harness/tools
+cp examples/tools/openrouter.lua .harness/tools/openrouter.lua
+export OPENROUTER_API_KEY='your-key'
+hx trust
+hx exec 'print(openrouter.credits())'
+hx exec 'print(openrouter.help{model="qwen/qwen-image-2.1-turbo"})'
+hx exec 'print(openrouter.models{output_modalities="video"})'
+hx exec 'print(openrouter.text{model="deepseek/deepseek-chat-v3.1", prompt="Hello OpenRouter!"})'
+```
+
+- **Authentication enforcement**: Registration strictly requires `OPENROUTER_API_KEY` in the environment or secrets file; without it, registration is refused and `openrouter` is `nil`.
+- **Credits balance**: `openrouter.credits()` queries `/api/v1/credits` and returns `{ total_credits, total_usage, remaining_credits }`.
+- **24-hour cache for models & documentation**:
+  - `openrouter.models{...}` discovers, filters, and searches 400+ models from `/api/v1/models` and caches the catalog locally for 24 hours (`force=true` bypasses).
+  - `openrouter.help{model="..."}` fetches on-demand model guides (`https://openrouter.ai/{provider}/{model-id}/llms.txt`) and root documentation (`https://openrouter.ai/docs/llms.txt`) with a 24-hour local cache (`force=true` bypasses).
+- **Multi-modal generation**:
+  - `openrouter.text{model, prompt|messages}`: Chat completions text generation.
+  - `openrouter.image{model, prompt, ...}`: Text-to-image generation with optional `save_to`.
+  - `openrouter.sound{model, input, ...}`: Text-to-speech audio synthesis with optional `save_to`.
+  - `openrouter.video{model, prompt, ...}` and `openrouter.poll_video{job_id}`: Video generation submission and job polling.
 
 ## Security model
 

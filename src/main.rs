@@ -225,8 +225,8 @@ fn validate_args(args: &[String]) -> Result<()> {
     if command == "review" && (args.get(1).is_none_or(|s| s.starts_with("--")) || arg(args,"--gate").is_none() || arg(args,"--decision").is_none()) {
         return Err(usage("usage: hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]"));
     }
-    if let Some(api) = arg(args, "--api") && !matches!(api.as_str(), "openai" | "responses") {
-        return Err(usage(&format!("unknown --api {api:?} (expected openai or responses)")));
+    if let Some(api) = arg(args, "--api") && !matches!(api.as_str(), "responses" | "completions") {
+        return Err(usage(&format!("unknown --api {api:?} (expected responses or completions)")));
     }
     if let Some(mode) = arg(args, "--approval") {
         mode.parse::<policy::ApprovalMode>().map_err(|e| usage(&e.to_string()))?;
@@ -341,7 +341,7 @@ async fn cmd_exec(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
 fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
     Ok(llm::LlmCfg {
         model: arg(args, "--model").or_else(|| std::env::var("HX_MODEL").ok()).ok_or_else(|| anyhow::anyhow!("--model or HX_MODEL required"))?,
-        api: arg(args, "--api").or_else(|| std::env::var("HX_API").ok()).unwrap_or_else(|| "openai".into()),
+        api: arg(args, "--api").or_else(|| std::env::var("HX_API").ok()).unwrap_or_else(|| "responses".into()),
         base_url: arg(args, "--base-url").or_else(|| std::env::var("HX_BASE_URL").ok()),
         key_env: arg(args, "--key-env"),
         reasoning: arg(args, "--reasoning"),
@@ -353,7 +353,7 @@ fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
     })
 }
 
-/// hx run --workspace DIR --prompt-file F --model M [--api openai --base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
+/// hx run --workspace DIR --prompt-file F --model M [--api responses --base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
 async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy>) -> Result<()> {
     let _ = workspace;
     let trace = arg(args, "--trace").map(PathBuf::from);
@@ -577,10 +577,13 @@ mod tests {
 
     #[test]
     fn llm_cfg_reads_flags() {
-        let a = argv("run --model m --api responses --max-output 99 --context-window 1000 --provider-only x,y");
+        let a = argv("run --model m --api completions --max-output 99 --context-window 1000 --provider-only x,y");
         let c = llm_cfg(&a, "s".into()).unwrap();
-        assert_eq!((c.model.as_str(), c.api.as_str(), c.max_output, c.context_window), ("m", "responses", 99, Some(1000)));
+        assert_eq!((c.model.as_str(), c.api.as_str(), c.max_output, c.context_window), ("m", "completions", 99, Some(1000)));
         assert_eq!((c.provider_only, c.cache_key), (vec!["x".to_string(), "y".to_string()], Some("s".to_string())));
+        let a_def = argv("run --model m");
+        let c_def = llm_cfg(&a_def, "s".into()).unwrap();
+        assert_eq!(c_def.api, "responses");
     }
 
     #[test]

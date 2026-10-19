@@ -277,10 +277,20 @@ assert(not pcall(batch,{function() end})); assert(parallel==nil); print("BATCH_O
         assert len(reads) == 1, reads
 
 
+def body_messages(body):
+    return body.get("messages") or body.get("input", [])
+
+
+def has_assistant(body):
+    return any(m.get("role") == "assistant" or m.get("type") == "function_call" for m in body_messages(body))
+
+
 def task_text(body):
-    messages = body.get("messages", [])
-    user = next(m for m in messages if m.get("role") == "user")
-    text = user["content"]
+    messages = body_messages(body)
+    user = next((m for m in messages if m.get("role") == "user"), None)
+    if not user:
+        return ""
+    text = user.get("content", "")
     return text if isinstance(text, str) else "".join(p.get("text", "") for p in text)
 
 
@@ -297,7 +307,7 @@ print("CHILDREN_OK")'''
     child_code = '''assert(not pcall(write,"escape.txt","bad")); assert(not pcall(sh,"echo bad > escape.txt"))
 assert(not pcall(tools.writer.run)); print("READONLY_OK")'''
     def answer(body, index):
-        first = not any(m.get("role") == "assistant" for m in body.get("messages", []))
+        first = not has_assistant(body)
         if task_text(body).startswith("CHILD"):
             return tool(child_code) if first else "child done"
         return tool(parent_code) if first else "parent done"
@@ -412,7 +422,7 @@ def concurrent_children_under_cost_cap():
 for _, c in r do assert(c.ok and c.value.finished, c.error) end
 print("CHILDREN_OK")'''
     def answer(body, index):
-        first = not any(m.get("role") == "assistant" for m in body.get("messages", []))
+        first = not has_assistant(body)
         if task_text(body).startswith("CHILD"):
             time.sleep(0.15)
             return tool('print("child")') if first else "child done"
@@ -484,11 +494,11 @@ def unknown_billing_without_cost_threshold():
 
 
 def cached_token_budget():
-    for api in ("openai", "responses"):
+    for api in ("completions", "responses"):
         path = workspace(f"cached-budget-{api}")
-        prefix = "prompt" if api == "openai" else "input"
+        prefix = "prompt" if api == "completions" else "input"
         usage = {f"{prefix}_tokens": 100, f"{prefix}_tokens_details": {"cached_tokens":90,"cache_write_tokens":9},
-                 "completion_tokens" if api == "openai" else "output_tokens": 1}
+                 "completion_tokens" if api == "completions" else "output_tokens": 1}
         with provider(lambda body, i: {"code":"print(1)","usage":usage}) as (url, calls):
             report = json.loads(start(path, url, "--api", api, "--max-tokens", "100").stdout)
             assert len(calls) == 1 and report["budget"]["tokens"] == 101, report
@@ -504,7 +514,7 @@ print("CHILDREN_OK")'''
     active, peak = [0], [0]
     gate = threading.Lock()
     def answer(body, index):
-        first = not any(m.get("role") == "assistant" for m in body.get("messages", []))
+        first = not has_assistant(body)
         if task_text(body).startswith("CHILD"):
             with gate:
                 active[0] += 1
@@ -724,7 +734,7 @@ assert(#durable.get("1")==#s); print("BOUNDED_OK")'''
     run(path, "approve", "child")
     def answer(body, index):
         if task_text(body).startswith("PACKAGE CHILD"):
-            return "child done" if any(m.get("role") == "assistant" for m in body.get("messages", [])) else tool('print("CHILD")')
+            return "child done" if has_assistant(body) else tool('print("CHILD")')
         return tool('local r=tools.child.run(); durable.set("report",r); assert(r.finished); print("ARRAY_OK")') if index == 0 else "done"
     with provider(answer) as (url, calls):
         report = json.loads(start(path, url).stdout)
@@ -954,7 +964,7 @@ def corrupt_artifacts():
 
 
 if __name__ == "__main__":
-    check("chat protocol, live globals, copied durable state, completed resume", lambda: protocol("openai"))
+    check("chat protocol, live globals, copied durable state, completed resume", lambda: protocol("completions"))
     check("responses protocol and frozen launch settings", lambda: protocol("responses"))
     check("crash recovery never reruns old chunks", crash_boundaries)
     check("workspace edits do not alter a frozen manifest", immutable_manifest)

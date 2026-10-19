@@ -43,7 +43,7 @@ def prepare(run, args=None):
         'Add meaningful regressions that compile and fail against the original implementation, '
         'then pass after repair. Avoid keeping all obsolete history.\n')
     model = getattr(args, 'model', 'deepseek-flash') if args else 'deepseek-flash'
-    api = getattr(args, 'api', None) or ('responses' if 'deepseek' in model else 'openai')
+    api = getattr(args, 'api', None) or ('responses' if 'deepseek' in model else 'completions')
     base_url = getattr(args, 'base_url', None) or ('https://api.deepseek.com' if 'deepseek' in model else 'https://openrouter.ai/api/v1')
     save(run/'case.json',{'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'baseline':str(TASK/'environment/app'),'task_commit':subprocess.check_output(
@@ -78,7 +78,7 @@ def verify(run):
 
 def run_agent(run,args):
     model = args.model
-    api = args.api or ('responses' if 'deepseek' in model else 'openai')
+    api = args.api or ('responses' if 'deepseek' in model else 'completions')
     base_url = args.base_url or ('https://api.deepseek.com' if 'deepseek' in model else 'https://openrouter.ai/api/v1')
     key_env = args.key_env or ('DEEPSEEK_API_KEY' if 'deepseek' in model else 'OPENROUTER_API_KEY')
     if not os.environ.get(key_env):raise SystemExit(f'{key_env} is missing')
