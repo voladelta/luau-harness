@@ -428,7 +428,8 @@ impl Policy {
         }
         s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\") (regex #\"^/dev/fd/\"))\n");
         // Apple's /usr/bin/git shim (xcrun) caches under the system user temp dir regardless of TMPDIR.
-        s.push_str("(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db\"))\n");
+        // Read-only and anchored: a writable prefix match would be a channel shared by every sandboxed process.
+        s.push_str(XCRUN_DB);
         for w in self.write_roots.iter().chain(extra_write) {
             s.push_str(&format!("(allow file-write* (subpath {}))\n", q(w)));
         }
@@ -453,6 +454,10 @@ impl Policy {
     }
 }
 
+/// Apple's tool shims (/usr/bin/git, python3) read a cache in the system user temp dir regardless of TMPDIR. Without
+/// it they still work, more slowly; writing it is never allowed.
+const XCRUN_DB: &str = "(allow file-read* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$\"))\n";
+
 /// Seatbelt profile for an owner's evaluator: no network, reads limited to the system, toolchains and `read`, writes to
 /// `write`. None where Seatbelt is unavailable (the evaluator then runs unconfined, still with a scrubbed environment).
 pub fn evaluator_profile(read: &[PathBuf], write: &[PathBuf]) -> Option<String> {
@@ -467,7 +472,7 @@ pub fn evaluator_profile(read: &[PathBuf], write: &[PathBuf]) -> Option<String> 
         s.push_str(&format!("(allow file-read* (subpath {}))\n", q(&r)));
     }
     s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/\"))\n");
-    s.push_str("(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db\"))\n");
+    s.push_str(XCRUN_DB);
     for w in write {
         s.push_str(&format!("(allow file-write* (subpath {}))\n", q(w)));
     }

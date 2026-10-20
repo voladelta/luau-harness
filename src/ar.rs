@@ -34,8 +34,10 @@ const SHOWN: usize = 40;
 const MAX_ATTEMPTS: usize = 20;
 /// Retries of a child that crashes before any eval (usually provider rate limits).
 const MAX_CRASHES: u32 = 3;
-/// Editable files larger than this in total cannot be scored.
+/// Limits on the editable files of one snapshot: total bytes, file count and directory depth.
 const MAX_SNAPSHOT: usize = 16 << 20;
+const MAX_FILES: usize = 10_000;
+const MAX_DEPTH: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,9 +49,14 @@ pub struct Spec {
     pub eval: String,
     /// Selection evaluator (held-out): used only by the orchestrator to pick fork winners and the final result.
     pub select: Option<String>,
-    /// Directories the evaluators may read (the grader and its data), outside the workspace. `~/` and `$HOME/` expand.
+    /// Directories both evaluators may read (the grader and its search data), outside the workspace. `~/` and
+    /// `$HOME/` expand.
     #[serde(default)]
     pub grader: Vec<String>,
+    /// Directories only the select evaluator may read (held-out data), so code under test in a search evaluation
+    /// can never see them.
+    #[serde(default)]
+    pub holdout: Vec<String>,
     #[serde(default = "Spec::max")]
     pub direction: String,
     #[serde(default = "Spec::timeout")]
@@ -73,16 +80,19 @@ impl Spec {
                 && !matches!(parts[0], ".harness" | ".git"),
                 "ar.toml: editable path {p:?} must be a relative path inside the workspace, outside .harness and .git");
         }
-        for g in spec.grader_roots()? {
-            ensure!(!g.starts_with(workspace), "ar.toml: grader root {} must be outside the workspace", g.display());
+        for g in spec.roots(true)? {
+            ensure!(!g.starts_with(workspace) && !workspace.starts_with(&g),
+                "ar.toml: grader and holdout root {} must not overlap the workspace", g.display());
         }
         ensure!(matches!(spec.direction.as_str(), "max" | "min"), "ar.toml: direction must be max or min");
         ensure!(spec.timeout > 0.0 && spec.min_delta >= 0.0, "ar.toml: timeout must be positive and min_delta nonnegative");
         Ok(spec)
     }
-    fn grader_roots(&self) -> Result<Vec<PathBuf>> {
+    /// Read roots of an evaluator: `grader`, plus `holdout` for the select evaluator.
+    fn roots(&self, holdout: bool) -> Result<Vec<PathBuf>> {
         let home = std::env::var("HOME").unwrap_or_default();
-        self.grader.iter().map(|g| {
+        let extra = if holdout { &self.holdout[..] } else { &[] };
+        self.grader.iter().chain(extra).map(|g| {
             let expanded = g.strip_prefix("~/").or_else(|| g.strip_prefix("$HOME/"))
                 .map(|rest| format!("{home}/{rest}")).unwrap_or_else(|| g.clone());
             std::fs::canonicalize(&expanded).with_context(|| format!("ar.toml: grader root {g}"))
@@ -120,9 +130,13 @@ pub fn load_episode() -> Result<()> {
     Ok(())
 }
 
-/// Paths a child's policy must seal: its autoresearch run.
+/// Paths a child's policy must seal, so that even with --yolo its agent cannot read or change them: every
+/// autoresearch run of the owner's workspace (this run included) and the evaluators' roots.
 pub fn sealed() -> Vec<PathBuf> {
-    EPISODE.get().map(|(e, _)| vec![e.dir.clone()]).unwrap_or_default()
+    let Some((e, _)) = EPISODE.get() else { return vec![] };
+    let mut out = vec![e.dir.parent().unwrap_or(&e.dir).to_path_buf()];
+    out.extend(e.spec.roots(true).unwrap_or_default());
+    out
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,47 +153,76 @@ struct Row {
     improved: bool,
 }
 
-/// Ledger rows. A torn final line (a writer killed mid-append) is ignored; damage anywhere else is an error.
 fn ledger(dir: &Path) -> Result<Vec<Row>> {
-    let Ok(text) = std::fs::read_to_string(dir.join("ledger.jsonl")) else { return Ok(vec![]) };
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let mut rows = vec![];
-    for (i, line) in lines.iter().enumerate() {
-        match serde_json::from_str(line) {
-            Ok(row) => rows.push(row),
-            Err(_) if i + 1 == lines.len() && !text.ends_with('\n') => {}
-            Err(e) => bail!("ledger line {}: {e}", i + 1),
-        }
+    read_lines(&dir.join("ledger.jsonl"))
+}
+
+/// Records of an append-only JSONL file. A torn final line (a writer killed mid-append) is ignored; damage anywhere
+/// else is an error.
+fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Ok(vec![]) };
+    let complete = text.rfind('\n').map_or("", |end| &text[..end]);
+    complete.lines().filter(|l| !l.trim().is_empty()).enumerate()
+        .map(|(i, l)| serde_json::from_str(l).with_context(|| format!("{} line {}", path.display(), i + 1)))
+        .collect()
+}
+
+/// Append one record durably, first dropping a torn final line so the file stays parseable.
+fn append_line<T: Serialize>(path: &Path, record: &T) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(path)?;
+    let text = std::fs::read(path)?;
+    if !text.is_empty() && !text.ends_with(b"\n") {
+        file.set_len(text.iter().rposition(|b| *b == b'\n').map_or(0, |i| i as u64 + 1))?;
     }
-    Ok(rows)
+    writeln!(file, "{}", serde_json::to_string(record)?)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Editable files, path -> bytes.
 type Files = BTreeMap<String, Vec<u8>>;
 
-/// Every regular file under the editable paths of `root`. Symlinks are skipped: they never leave an episode.
+/// Every regular file under the editable paths of `root`, within the snapshot limits. Symlinks and special files are
+/// skipped: they never leave an episode. Names must be UTF-8 so they are recreated exactly.
 fn capture(root: &Path, spec: &Spec) -> Result<Files> {
-    fn walk(path: &Path, rel: &str, out: &mut Files, total: &mut usize) -> Result<()> {
+    fn walk(path: &Path, rel: &str, depth: usize, out: &mut Files, total: &mut usize) -> Result<()> {
         let Ok(meta) = std::fs::symlink_metadata(path) else { return Ok(()) };
-        if meta.file_type().is_symlink() { return Ok(()); }
         if meta.is_dir() {
+            ensure!(depth < MAX_DEPTH, "editable directories nest deeper than {MAX_DEPTH} levels");
             for entry in std::fs::read_dir(path)? {
                 let entry = entry?;
-                walk(&entry.path(), &format!("{rel}/{}", entry.file_name().to_string_lossy()), out, total)?;
+                let name = entry.file_name().into_string().map_err(|n| anyhow::anyhow!("editable file name {n:?} is not UTF-8"))?;
+                walk(&entry.path(), &format!("{rel}/{name}"), depth + 1, out, total)?;
             }
         } else if meta.is_file() {
-            *total += meta.len() as usize;
-            ensure!(*total <= MAX_SNAPSHOT, "editable files exceed {} MiB", MAX_SNAPSHOT >> 20);
-            out.insert(rel.to_string(), std::fs::read(path)?);
+            ensure!(out.len() < MAX_FILES, "editable paths hold more than {MAX_FILES} files");
+            // Read at most what is left of the limit, so a file that keeps growing cannot get past it.
+            let left = MAX_SNAPSHOT - *total;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(path)?, left as u64 + 1), &mut bytes)?;
+            ensure!(bytes.len() <= left, "editable files exceed {} MiB", MAX_SNAPSHOT >> 20);
+            *total += bytes.len();
+            out.insert(rel.to_string(), bytes);
         }
         Ok(())
     }
     let (mut out, mut total) = (BTreeMap::new(), 0);
     for e in &spec.editable {
         let e = e.trim_end_matches('/');
-        walk(&root.join(e), e, &mut out, &mut total)?;
+        walk(&root.join(e), e, 0, &mut out, &mut total)?;
     }
     Ok(out)
+}
+
+/// Kill every process that still has its working directory or an open file under `dir` (agents' and evaluators'
+/// detached leftovers), before the directory is deleted.
+fn reap(dir: &Path) {
+    let Ok(out) = std::process::Command::new("lsof").args(["-t", "+D"]).arg(dir).stderr(std::process::Stdio::null()).output() else { return };
+    let me = std::process::id() as i32;
+    for pid in String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<i32>().ok()).filter(|p| *p != me) {
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+    }
 }
 
 /// Make the editable paths of `root` hold exactly `files`.
@@ -232,7 +275,10 @@ impl Scratch {
     }
 }
 impl Drop for Scratch {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        reap(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Copy the tree `from` to the new path `to` (APFS clones when available).
@@ -248,14 +294,14 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 
 /// Run an evaluator on `files` placed into a fresh copy of the frozen base. Returns (score, valid, se, report).
 /// Failures of the evaluator become invalid results, not errors.
-async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
+async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, holdout: bool) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
     let scratch = Scratch::new("eval")?;
     let tree = scratch.0.join("tree");
     copy_tree(&run.join("base"), &tree)?;
     place(&tree, spec, files)?;
     let tmp = scratch.0.join("tmp");
     std::fs::create_dir(&tmp)?;
-    let mut read = spec.grader_roots()?;
+    let mut read = spec.roots(holdout)?;
     read.push(scratch.0.clone());
     let jail = crate::prims::Jail {
         profile: crate::policy::evaluator_profile(&read, std::slice::from_ref(&scratch.0)),
@@ -291,7 +337,7 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
     let spec = &episode.spec;
     let files = capture(&pol.workspace, spec)?;
     let snap = save_snap(&episode.dir, &files)?;
-    let (score, valid, se, report) = evaluate(spec, &episode.dir, &files, &spec.eval).await?;
+    let (score, valid, se, report) = evaluate(spec, &episode.dir, &files, &spec.eval, false).await?;
     let mut best = best.lock().unwrap();
     let margin = spec.min_delta.max(se.unwrap_or(0.0));
     let improved = valid && spec.better(score.unwrap(), *best, if best.is_some() { margin } else { 0.0 });
@@ -299,10 +345,7 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
     let n = ledger(&episode.dir)?.len() + 1;
     let row = Row { n, lineage: episode.lineage.clone(), episode: episode.label.clone(), note: note.chars().take(300).collect(),
         snap, score, valid, se, improved };
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(episode.dir.join("ledger.jsonl"))?;
-    writeln!(file, "{}", serde_json::to_string(&row)?)?;
-    file.sync_all()?;
+    append_line(&episode.dir.join("ledger.jsonl"), &row)?;
     Ok(json!({"n": n, "score": score, "valid": valid, "se": se, "improved": improved, "best": *best, "report": report}))
 }
 
@@ -338,19 +381,54 @@ fn uncommitted(workspace: &Path, spec: &Spec) -> Result<Vec<String>> {
     Ok(bad)
 }
 
-/// Freeze HEAD's tree (without `.harness`) into `run/base`.
+/// Freeze HEAD's tree (without `.harness`) into `run/base`, byte for byte: blobs are read directly, so export
+/// attributes (`export-ignore`, `export-subst`) cannot change what the evaluator sees. Submodules are not included.
 fn freeze(workspace: &Path, run: &Path) -> Result<String> {
+    use std::io::{BufRead, Read, Write};
     let commit = String::from_utf8(git(workspace, &["rev-parse", "HEAD"])?)?.trim().to_string();
-    let tar = git(workspace, &["archive", "--format=tar", &commit])?;
+    let listing = git(workspace, &["ls-tree", "-r", "-z", "--full-tree", &commit])?;
+    let entries: Vec<(String, String, String)> = listing.split(|b| *b == 0).filter(|e| !e.is_empty()).map(|e| {
+        let e = String::from_utf8(e.to_vec()).map_err(|_| anyhow::anyhow!("non-UTF-8 path in the committed tree"))?;
+        let (meta, path) = e.split_once('\t').context("ls-tree entry")?;
+        let mut parts = meta.split(' ');
+        let (mode, kind, sha) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        Ok((mode.to_string(), if kind == "blob" { sha.to_string() } else { String::new() }, path.to_string()))
+    }).collect::<Result<_>>()?;
     let base = run.join("base");
     std::fs::create_dir_all(&base)?;
-    let mut child = std::process::Command::new("tar").args(["-x", "-f", "-", "-C"]).arg(&base)
-        .stdin(std::process::Stdio::piped()).spawn()?;
-    std::io::Write::write_all(child.stdin.as_mut().unwrap(), &tar)?;
-    drop(child.stdin.take());
-    ensure!(child.wait()?.success(), "could not unpack the frozen tree");
-    let harness = base.join(".harness");
-    if harness.exists() { std::fs::remove_dir_all(harness)?; }
+    let mut child = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "cat-file", "--batch"])
+        .current_dir(workspace).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn()?;
+    let mut input = child.stdin.take().unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    for (mode, sha, path) in entries.iter().filter(|(_, sha, _)| !sha.is_empty()) {
+        if path == ".harness" || path.starts_with(".harness/") {
+            continue;
+        }
+        ensure!(!path.split('/').any(|c| c == ".." || c.is_empty()), "unsafe path {path:?} in the committed tree");
+        writeln!(input, "{sha}")?;
+        input.flush()?;
+        let mut header = String::new();
+        output.read_line(&mut header)?;
+        let size: usize = header.trim().rsplit(' ').next().and_then(|n| n.parse().ok()).context("cat-file header")?;
+        let mut bytes = vec![0; size + 1];
+        output.read_exact(&mut bytes)?;
+        bytes.pop();
+        let target = base.join(path);
+        if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
+        if mode == "120000" {
+            std::os::unix::fs::symlink(String::from_utf8_lossy(&bytes).to_string(), &target)?;
+        } else {
+            std::fs::write(&target, &bytes)?;
+            if mode == "100755" {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+    }
+    drop(input);
+    ensure!(child.wait()?.success(), "git cat-file failed");
     Ok(commit)
 }
 
@@ -445,11 +523,7 @@ impl Orchestrator {
     fn spec(&self) -> &Spec { &self.launch.spec }
 
     fn journal(&self, record: &Record) -> Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("journal.jsonl"))?;
-        writeln!(file, "{}", serde_json::to_string(record)?)?;
-        file.sync_all()?;
-        Ok(())
+        append_line(&self.dir.join("journal.jsonl"), record)
     }
 
     fn lineage(&self, id: &str) -> &Lineage {
@@ -626,7 +700,7 @@ to the reported numbers.\n";
             let (snap, search) = self.best(id, &rows);
             let held = match (&self.spec().select, search) {
                 (Some(cmd), Some(_)) => {
-                    let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &snap)?, cmd).await?;
+                    let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &snap)?, cmd, true).await?;
                     score.filter(|_| valid)
                 }
                 (None, s) => s,
@@ -745,18 +819,18 @@ fn show(v: Option<f64>) -> String {
 
 /// `hx run --ar`: run the schedule over the whole `--max-cost` budget, or continue the run in `resume` (a run directory).
 pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f64)>, resume: Option<PathBuf>) -> Result<()> {
-    ensure!(crate::trust::is_trusted(workspace), "--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first");
+    // A resumed run uses the spec frozen in its sealed launch.json, approved when it started; only a launch reads ar.toml.
     let (dir, launch, records) = match (start, resume) {
         (_, Some(dir)) => {
             let dir = dir.canonicalize().with_context(|| format!("autoresearch run {}", dir.display()))?;
             ensure!(dir.parent() == Some(&workspace.join(".harness/ar").canonicalize()?), "--resume for --ar takes a run directory under .harness/ar");
             let launch: Launch = serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?)?;
             ensure!(!dir.join("report.json").exists(), "autoresearch run {} already finished", dir.display());
-            let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap_or_default();
-            let records = text.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<Result<Vec<Record>, _>>()?;
+            let records = read_lines(&dir.join("journal.jsonl"))?;
             (dir, launch, records)
         }
         (Some((child_args, program, budget)), None) => {
+            ensure!(crate::trust::is_trusted(workspace), "--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first");
             ensure!(crate::workflow::git_inventory(workspace)?.is_some(), "--ar requires a Git repository at the workspace root");
             let spec = Spec::load(workspace)?;
             let schedule = std::env::var("HX_AR_SCHEDULE").unwrap_or_else(|_| "forkflush".into());

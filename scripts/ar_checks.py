@@ -8,6 +8,7 @@ independent review found against the first design: each must now leave the recor
 import base64
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -215,15 +216,23 @@ with harness.provider(explorer, price=PRICE) as (url, _):
     assert journal, "never caught an attempt in flight after the first selection"
     os.killpg(process.pid, signal.SIGKILL)
     process.wait()
+    # Simulate writers killed mid-append, and an owner who edited ar.toml (trust lapses) after launch.
+    for torn in (journal, journal.parent / "ledger.jsonl"):
+        with open(torn, "a") as f:
+            f.write('{"kind": "fini')
+    (path / ".harness/ar.toml").write_text((path / ".harness/ar.toml").read_text() + "# edited after launch\n")
+    untrusted = {k: v for k, v in harness.ENV.items() if k != "HX_TRUST"}
+    untrusted["XDG_CONFIG_HOME"] = str(BASE / "empty-trust-store")
     result = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(journal.parent), "--workspace", str(path)],
-                            env=harness.ENV, capture_output=True, text=True, timeout=600)
+                            env=untrusted, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stderr[-3000:]
 report = report_of(result)
 records = [json.loads(l) for l in journal.read_text().splitlines()]
+rows = ledger(path, report)
 assert any(r["kind"] == "finished" and r.get("interrupted") for r in records), "interrupted charge not journaled"
 assert [s["round"] for s in report["selections"]] == [0, 1, 2, 3] and report["cost_usd"] <= 0.1 + 1e-9
 assert "resumed" in result.stderr
-check("killed search resumes and journals the interrupted charge")
+check("killed search resumes past torn journal and ledger lines, with its frozen spec, and journals the interrupted charge")
 
 # 8. The single-run baseline: one lineage with the whole budget.
 path = workspace("single")
@@ -264,7 +273,86 @@ report = report_of(result)
 assert report["selections"][0]["fallback"] is True and "held-out" in result.stderr, report
 check("an unusable select evaluator falls back to search, recorded")
 
-# 11. Launch validation.
+# 11. No sandboxed process can write a shared xcrun cache path (a channel between episodes); shims still run.
+T = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True).stdout.strip()
+probe = f"{T}xcrun_dbAR{os.getpid()}"
+files = {"x.txt": "0\n", "search.py": f'import json, os\nok = True\ntry:\n    os.makedirs("{probe}e", exist_ok=True)\nexcept OSError:\n    ok = False\nprint(json.dumps({{"score": 1 if not ok else 0}}))'}
+path = workspace("xcrun", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
+code = f'local r = sh("mkdir -p {probe}a 2>&1; echo leak > {probe}a/f 2>&1; /usr/bin/git --version")\nprint(r.stdout)\nreturn ar.eval("probe")'
+with harness.provider(once(code), price=PRICE) as (url, requests):
+    report = report_of(ar(path, url, 0.01, env=SINGLE))
+assert not os.path.exists(probe + "a") and not os.path.exists(probe + "e"), "xcrun prefix is writable"
+assert any("git version" in o for o in outputs(requests)), outputs(requests)
+assert ledger(path, report)[0]["score"] == 1
+check("no sandbox can write the shared xcrun cache prefix; tool shims still work")
+
+# 12. Held-out data is readable by the select evaluator only, never by a search evaluation.
+grader, holdout = BASE / "g-grader", BASE / "g-holdout"
+grader.mkdir()
+holdout.mkdir()
+(grader / "score.sh").write_text('if cat "$1/secret.txt" >/dev/null 2>&1; then echo \'{"score": 1}\'; else echo \'{"score": 0}\'; fi\n')
+(holdout / "secret.txt").write_text("held-out")
+spec = (f'editable = ["x.txt"]\neval = "sh {grader}/score.sh {holdout}"\nselect = "sh {grader}/score.sh {holdout}"\n'
+        f'grader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n')
+path = workspace("holdout", spec=spec)
+with harness.provider(once('return ar.eval("baseline")'), price=PRICE) as (url, _):
+    report = report_of(ar(path, url, 0.01, env=SINGLE))
+assert all(r["score"] == 0 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
+check("held-out roots are readable by select only")
+
+# 13. With --yolo an episode still gets no credentials, no run location, no other runs and no grader roots.
+spec = f'editable = ["x.txt"]\neval = "python3 search.py"\ngrader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n'
+path = workspace("yolo-seal", spec=spec)
+(path / ".harness/ar/old-run").mkdir(parents=True)
+(path / ".harness/ar/old-run/ledger.jsonl").write_text("secret ledger")
+look = (f'local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'; cat {path}/.harness/ar/old-run/ledger.jsonl 2>&1; '
+        f'cat {holdout}/secret.txt 2>&1; echo x >> {grader}/score.sh 2>&1")\nprint(ar.eval("b"))\nreturn "OUT " .. r.stdout')
+with harness.provider(once(look), price=PRICE) as (url, requests):
+    ar(path, url, 0.01, env=SINGLE, extra=["--yolo"])
+outs = [o for o in outputs(requests) if "OUT " in o]
+assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and "secret ledger" not in o and "held-out" not in o for o in outs), outs
+assert (grader / "score.sh").read_text().count("\n") == 1, "grader root was modified"
+check("--yolo episodes get no credentials and cannot read other runs or touch grader roots")
+
+# 14. Detached processes of agents and evaluators are reaped when their scratch copy is deleted.
+spec = 'editable = ["x.txt", "pid.txt"]\neval = "python3 search.py; (setsid sleep 300 >/dev/null 2>&1 & echo $! > /dev/null)"\ntimeout = 30\n'
+files = {"x.txt": "0\n", "pid.txt": "", "search.py": 'import json, subprocess, os\np = subprocess.Popen(["python3", "-c", "import os, time; os.setsid(); time.sleep(300)"], start_new_session=True)\nprint(json.dumps({"score": 0, "report": {"evaluator_daemon": p.pid}}))'}
+path = workspace("reap", files, spec)
+daemon = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    open(\'pid.txt\', \'w\').write(str(os.getpid()))\\n    time.sleep(300)\\nos._exit(0)\\n")\n'
+          'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn ar.eval("daemon")')
+with harness.provider(once(daemon), price=PRICE) as (url, requests):
+    report = report_of(ar(path, url, 0.01, env=SINGLE))
+pids = [int((path / "pid.txt").read_text())]
+pids += [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_daemon=(\d+)", o)]
+assert len(pids) >= 2, (pids, outputs(requests))
+time.sleep(0.5)
+alive = [p for p in pids if subprocess.run(["kill", "-0", str(p)], capture_output=True).returncode == 0]
+assert not alive, f"detached processes survived: {alive}"
+check("detached agent and evaluator processes are reaped")
+
+# 15. Snapshot limits: too many files or too deep a tree is refused per eval, never fatal to the run.
+files = {"pkg/a.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'}
+path = workspace("limits", files, 'editable = ["pkg"]\neval = "python3 search.py"\ntimeout = 30\n')
+code = ('sh("mkdir -p pkg/many && cd pkg/many && seq 1 10001 | xargs touch")\nlocal ok1, e1 = pcall(ar.eval, "many")\n'
+        'sh("rm -rf pkg/many; mkdir -p pkg/$(printf \'d/%.0s\' $(seq 1 40))")\nlocal ok2, e2 = pcall(ar.eval, "deep")\n'
+        'sh("rm -rf pkg/d")\nprint(ar.eval("fine"))\nreturn "E1 " .. tostring(e1) .. " E2 " .. tostring(e2)')
+with harness.provider(once(code), price=PRICE) as (url, requests):
+    report = report_of(ar(path, url, 0.01, env=SINGLE))
+outs = " ".join(outputs(requests))
+assert "more than 10000 files" in outs and "deeper than 32" in outs and report["evals"] >= 1, outs[-2000:]
+check("snapshot file-count and depth limits refuse one eval, not the run")
+
+# 16. The frozen base is the committed tree byte for byte: export attributes do not apply.
+files = {"x.txt": "0\n", ".gitattributes": "hidden.txt export-ignore\nsubst.txt export-subst\n", "hidden.txt": "here\n",
+         "subst.txt": "$Format:%H$\n",
+         "search.py": 'import json\nok = open("hidden.txt").read() == "here\\n" and open("subst.txt").read() == "$Format:%H$\\n"\nprint(json.dumps({"score": 1 if ok else 0}))'}
+path = workspace("attributes", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
+with harness.provider(once('return ar.eval("b")'), price=PRICE) as (url, _):
+    report = report_of(ar(path, url, 0.01, env=SINGLE))
+assert ledger(path, report)[0]["score"] == 1, ledger(path, report)
+check("the frozen base ignores export attributes")
+
+# 17. Launch validation.
 path = workspace("flags")
 base_cmd = [str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"), "--model", "mock"]
 result = subprocess.run(base_cmd, env=harness.ENV, capture_output=True, text=True)

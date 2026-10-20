@@ -345,6 +345,14 @@ impl Jail {
     /// The agent's `sh`: the run's sandbox, or with --yolo the protected-paths profile.
     pub fn agent(pol: &crate::policy::Policy) -> Jail {
         if pol.enabled { Jail { profile: Some(pol.seatbelt_profile()), env: Some(pol.env()) } }
+        else if crate::ar::EPISODE.get().is_some() {
+            // An autoresearch episode never hands credentials or its run's location to the agent, even with --yolo.
+            let env = std::env::vars().filter(|(k, _)| {
+                let k = k.to_ascii_uppercase();
+                !["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"].iter().any(|w| k.contains(w)) && k != "HX_AR_EPISODE"
+            }).collect();
+            Jail { profile: pol.yolo_profile(), env: Some(env) }
+        }
         else { Jail { profile: pol.yolo_profile(), env: None } }
     }
 }

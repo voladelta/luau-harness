@@ -159,7 +159,8 @@ Use `--ar` when the task has a score to optimize. `.harness/ar.toml` names the e
 editable = ["ar/strategy.pine"]
 eval = "$HOME/grader/eval search --file ar/strategy.pine"    # the agent sees these scores
 select = "$HOME/grader/eval select --file ar/strategy.pine"  # held out: only the controller sees these
-grader = ["~/grader"]
+grader = ["~/grader/bin", "~/grader/search"]                 # read-only for both evaluators
+holdout = ["~/grader/select"]                                # read-only for select only
 min_delta = 0.05
 ```
 
