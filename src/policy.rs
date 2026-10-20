@@ -115,6 +115,9 @@ pub struct Snapshot {
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
     pub protected: Vec<PathBuf>,
+    /// Owner state the model may neither read nor write (autoresearch held-out results and snapshots), in any mode.
+    #[serde(default)]
+    pub sealed: Vec<PathBuf>,
     pub net: bool,
     pub gpu: bool,
     pub ask: Vec<String>,
@@ -210,10 +213,11 @@ impl Policy {
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
-        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], net: false, gpu: false, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
+        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], net: false, gpu: false, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
+        p.sealed.push(workspace.join(".harness/ar"));
         for r in SYSTEM_READ {
             if let Some(c) = canon(r) {
                 p.read_roots.push(c);
@@ -228,6 +232,8 @@ impl Policy {
         // untrusted workspace's symlinked .harness or hx.lock and --yolo runs without root confinement.
         let canonical_protected: Vec<_> = p.protected.iter().filter_map(canon).collect();
         p.protected.extend(canonical_protected);
+        let canonical_sealed: Vec<_> = p.sealed.iter().filter_map(canon).collect();
+        p.sealed.extend(canonical_sealed);
         let trusted = crate::trust::is_trusted(&workspace);
         if let Some(t) = std::fs::read_to_string(workspace.join(".harness/policy.toml")).ok().filter(|_| trusted) {
             let f: PolicyFile = toml::from_str(&t).map_err(|e| anyhow::anyhow!("bad .harness/policy.toml: {e}"))?;
@@ -309,6 +315,10 @@ impl Policy {
         ))
     }
 
+    pub fn is_sealed(&self, path: &Path) -> bool {
+        Self::within(path, &self.sealed)
+    }
+
     fn within(path: &Path, roots: &[PathBuf]) -> bool {
         roots.iter().any(|r| path.starts_with(r))
     }
@@ -316,6 +326,9 @@ impl Policy {
     /// Resolve `p` (relative to the workspace) for reading; the canonical path must be inside a read root.
     pub fn check_read(&self, p: &str) -> Result<PathBuf> {
         let full = self.abs(p);
+        if self.is_sealed(&normalize(&full)) || std::fs::canonicalize(&full).is_ok_and(|c| self.is_sealed(&c)) {
+            bail!("policy: {p} is sealed owner state and cannot be read");
+        }
         if !self.enabled {
             return Ok(full);
         }
@@ -398,6 +411,9 @@ impl Policy {
         for p in &self.protected {
             s.push_str(&format!("(deny file-write* (subpath {}))\n", q(p)));
         }
+        for p in &self.sealed {
+            s.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", q(p)));
+        }
         Some(s)
     }
 
@@ -420,6 +436,9 @@ impl Policy {
         s.push_str(&format!("(deny file-read* (regex #\"/({})$\"))\n", names.join("|")));
         for p in &self.protected {
             s.push_str(&format!("(deny file-write* (subpath {}))\n", q(p)));
+        }
+        for p in &self.sealed {
+            s.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", q(p)));
         }
         if self.gpu {
             s.push_str(GPU_RULES);

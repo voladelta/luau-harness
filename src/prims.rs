@@ -213,7 +213,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let pol = f.pol.clone();
         match f.sync(lua, crate::supervisor::Tool::Search, Class::Read, args, |_| {
             pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-            Ok(match search(&pol.workspace, &pat, &opts, pol.enabled, f.supervisor.workflow_epoch().is_some())? {
+            Ok(match search(&pol.workspace, &pat, &opts, pol.enabled, f.supervisor.workflow_epoch().is_some(), &pol.sealed)? {
                 Ok((rows, truncated)) => Ret::Rows { rows, truncated },
                 Err((kind, message, hint)) => Ret::SearchErr { kind: kind.into(), message, hint: hint.into() },
             })
@@ -256,7 +256,7 @@ impl Sink for Collect<'_> {
 
 // search(pattern, {path=".", glob="*.rs", max=200, ignore_case=false, literal=false}). With `skip_secrets` (the policy is on),
 // credential files are not searched, as `read` refuses them.
-fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, workflow: bool) -> mlua::Result<Result<(Rows, bool), SearchErr>> {
+fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, workflow: bool, sealed: &[PathBuf]) -> mlua::Result<Result<(Rows, bool), SearchErr>> {
     let literal = opt_bool(opts, "literal");
     if !literal {
         for tok in ["(?=", "(?!", "(?<=", "(?<!"] {
@@ -322,7 +322,7 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
             continue;
         }
         let path = entry.path();
-        if skip_secrets && crate::policy::is_secret(path) {
+        if (skip_secrets && crate::policy::is_secret(path)) || sealed.iter().any(|s| path.starts_with(s)) {
             continue;
         }
         let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();

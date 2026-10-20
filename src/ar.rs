@@ -23,8 +23,8 @@ const ROUNDS: usize = 3;
 const EXPLORE_SHARE: f64 = 0.06;
 /// Ledger rows shown to an episode.
 const SHOWN: usize = 40;
-/// Flushed restarts within one episode when the agent stops early.
-const MAX_ATTEMPTS: usize = 4;
+/// Flushed restarts within one episode when the agent stops early (a guard; the allowance normally ends it first).
+const MAX_ATTEMPTS: usize = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,8 +192,8 @@ fn restore(workspace: &Path, spec: &Spec, dir: &Path, id: &str) -> Result<()> {
 /// Run an evaluator command; returns (score, valid, se, report). Failures become invalid results, not errors.
 /// Evaluators are the owner's trusted commands (`ar.toml` is covered by `hx trust`) and run outside the agent sandbox,
 /// so the grader and its data can live where agents can neither read nor write them.
-async fn evaluate(pol: &crate::policy::Policy, spec: &Spec, cmd: &str) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
-    let (stdout, stderr, code, timed_out) = crate::prims::shell(None, cmd, pol.workspace.clone(), spec.timeout).await
+async fn evaluate(spec: &Spec, workspace: &Path, cmd: &str) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
+    let (stdout, stderr, code, timed_out) = crate::prims::shell(None, cmd, workspace.to_path_buf(), spec.timeout).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let stdout = String::from_utf8_lossy(&stdout);
     let tail = |s: &str| s.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>();
@@ -219,7 +219,7 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
             spec.editable, bad.join(", "));
     }
     let snap = save_snap(&episode.dir, &capture(&pol.workspace, spec)?)?;
-    let (score, valid, se, report) = evaluate(pol, spec, &spec.eval).await?;
+    let (score, valid, se, report) = evaluate(spec, &pol.workspace, &spec.eval).await?;
     let mut best = best.lock().unwrap();
     let margin = spec.min_delta.max(se.unwrap_or(0.0));
     let improved = valid && spec.better(score.unwrap(), *best, if best.is_some() { margin } else { 0.0 });
@@ -234,75 +234,147 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
     Ok(json!({"n": n, "score": score, "valid": valid, "se": se, "improved": improved, "best": *best, "report": report}))
 }
 
+/// Where a lineage forks from.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+enum Origin { Seed, Winner(usize) }
+
+/// One step of the fixed schedule. The plan is a pure function of the schedule name, so a journal of completed
+/// steps is all a resumed run needs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+enum Step {
+    Fork { id: String, from: Origin },
+    /// `lineage: None` continues the winner of `round`.
+    Episode { lineage: Option<String>, round: usize, label: String, share: f64 },
+    /// Pick the best of `candidates` (or of every round winner when empty) on the select evaluator.
+    Choose { round: usize, candidates: Vec<String> },
+}
+
+/// `forkflush`: the paper's schedule. `single`: one lineage with the whole budget, the baseline it is compared to.
+fn plan(schedule: &str) -> Result<Vec<Step>> {
+    let mut steps = vec![];
+    match schedule {
+        "forkflush" => {
+            let exploit = (1.0 - EXPLORE_SHARE * (K * ROUNDS) as f64) / ROUNDS as f64;
+            for round in 0..ROUNDS {
+                let from = if round == 0 { Origin::Seed } else { Origin::Winner(round - 1) };
+                let ids: Vec<String> = (0..K).map(|k| format!("r{round}b{k}")).collect();
+                for id in &ids {
+                    steps.push(Step::Fork { id: id.clone(), from: from.clone() });
+                    steps.push(Step::Episode { lineage: Some(id.clone()), round, label: id.clone(), share: EXPLORE_SHARE });
+                }
+                steps.push(Step::Choose { round, candidates: ids });
+                steps.push(Step::Episode { lineage: None, round, label: format!("r{round}lead"), share: exploit });
+            }
+            // Leaders keep improving after their round's selection, so the round winners compete once more.
+            steps.push(Step::Choose { round: ROUNDS, candidates: vec![] });
+        }
+        "single" => {
+            steps.push(Step::Fork { id: "s0".into(), from: Origin::Seed });
+            steps.push(Step::Episode { lineage: Some("s0".into()), round: 0, label: "s0".into(), share: 1.0 });
+            steps.push(Step::Choose { round: 0, candidates: vec!["s0".into()] });
+        }
+        _ => bail!("unknown autoresearch schedule {schedule:?} (forkflush or single)"),
+    }
+    Ok(steps)
+}
+
+/// Launch settings, frozen at the start and reused on resume.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Launch {
+    spec: Spec,
+    program: String,
+    child_args: Vec<String>,
+    budget: f64,
+    schedule: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Lineage {
     id: String,
-    parent: Option<usize>,
-    /// Ledger rows of the parent visible to this lineage: n <= fork_at.
+    /// The lineage it forked from, whose ledger rows up to `fork_at` it inherits.
+    parent: Option<String>,
     fork_at: usize,
     start: String,
     start_score: Option<f64>,
 }
 
+/// Journal records: an attempt is `started` before its child runs and `finished` after, so an interrupted attempt is
+/// visible on resume and charged its whole allowance.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Record {
+    Forked { step: usize, lineage: Lineage },
+    Started { step: usize, attempt: usize, allowance: f64 },
+    Finished { step: usize, attempt: usize, cost: f64, evals: usize },
+    EpisodeDone { step: usize },
+    Chosen { step: usize, round: usize, winner: String, candidates: Vec<Value> },
+}
+
 struct Orchestrator {
     workspace: PathBuf,
     dir: PathBuf,
-    spec: Spec,
-    program: String,
-    child_args: Vec<String>,
-    budget: f64,
+    launch: Launch,
     spent: f64,
     lineages: Vec<Lineage>,
-    selections: Vec<Value>,
-    pol: std::sync::Arc<crate::policy::Policy>,
+    winners: BTreeMap<usize, String>,
+    chosen: Vec<Value>,
 }
 
 impl Orchestrator {
-    /// Rows of lineage `i` and its ancestors up to each fork point, in ledger order.
-    fn history(&self, i: usize, rows: &[Row]) -> Vec<Row> {
-        let mut chain = vec![(i, usize::MAX)];
-        let (mut at, mut limit) = (i, usize::MAX);
-        while let Some(p) = self.lineages[at].parent {
-            limit = limit.min(self.lineages[at].fork_at);
-            chain.push((p, limit));
-            at = p;
-        }
-        rows.iter().filter(|r| chain.iter().any(|(l, lim)| self.lineages[*l].id == r.lineage && r.n <= *lim)).cloned().collect()
+    fn spec(&self) -> &Spec { &self.launch.spec }
+
+    fn journal(&self, record: &Record) -> Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("journal.jsonl"))?;
+        writeln!(file, "{}", serde_json::to_string(record)?)?;
+        file.sync_all()?;
+        Ok(())
     }
 
-    /// Best scored state of lineage `i` (its own valid rows, or the state it started from).
-    fn best(&self, i: usize, rows: &[Row]) -> (String, Option<f64>) {
-        let l = &self.lineages[i];
+    fn lineage(&self, id: &str) -> &Lineage {
+        self.lineages.iter().find(|l| l.id == id).expect("lineage forked before use")
+    }
+
+    /// Rows of lineage `id` and its ancestors up to each fork point, in ledger order.
+    fn history(&self, id: &str, rows: &[Row]) -> Vec<Row> {
+        let mut chain = vec![(id.to_string(), usize::MAX)];
+        let (mut at, mut limit) = (self.lineage(id), usize::MAX);
+        while let Some(parent) = &at.parent {
+            limit = limit.min(at.fork_at);
+            chain.push((parent.clone(), limit));
+            at = self.lineage(parent);
+        }
+        rows.iter().filter(|r| chain.iter().any(|(l, lim)| *l == r.lineage && r.n <= *lim)).cloned().collect()
+    }
+
+    /// Best scored state of a lineage: its own valid rows, or the state it started from.
+    fn best(&self, id: &str, rows: &[Row]) -> (String, Option<f64>) {
+        let l = self.lineage(id);
         let mut best = (l.start.clone(), l.start_score);
-        for r in rows.iter().filter(|r| r.lineage == l.id && r.valid) {
-            if self.spec.better(r.score.unwrap(), best.1, 0.0) { best = (r.snap.clone(), r.score); }
+        for r in rows.iter().filter(|r| r.lineage == l.id && r.improved) {
+            best = (r.snap.clone(), r.score);
         }
         best
     }
 
-    fn fork(&mut self, parent: Option<usize>, id: String) -> Result<usize> {
-        let rows = ledger(&self.dir)?;
-        let (start, start_score) = match parent {
-            Some(p) => self.best(p, &rows),
-            None => (save_snap(&self.dir, &capture(&self.workspace, &self.spec)?)?, None),
-        };
-        self.lineages.push(Lineage { id, parent, fork_at: rows.len(), start, start_score });
-        Ok(self.lineages.len() - 1)
-    }
-
-    fn task(&self, i: usize, label: &str, allowance: f64, rows: &[Row]) -> String {
-        let history = self.history(i, rows);
-        let (_, best) = self.best(i, rows);
-        let better = if self.spec.direction == "max" { "higher" } else { "lower" };
-        let mut t = format!("{}\n\n## Autoresearch episode {label}\n\n", self.program.trim_end());
+    fn task(&self, id: &str, label: &str, allowance: f64, rows: &[Row]) -> String {
+        let spec = self.spec();
+        let history = self.history(id, rows);
+        let (_, best) = self.best(id, rows);
+        let better = if spec.direction == "max" { "higher" } else { "lower" };
+        let mut t = format!("{}\n\n## Autoresearch episode {label}\n\n", self.launch.program.trim_end());
         t += &format!("You are one episode of an autoresearch loop. Improve the score by changing only the editable paths: {}. \
-Every other file tracked by Git must stay as committed; put scratch files in tmpdir().\n\n", self.spec.editable.join(", "));
+Every other file tracked by Git must stay as committed; put scratch files in tmpdir().\n\n", spec.editable.join(", "));
         t += &format!("- `ar.eval(\"one-line hypothesis\")` scores the current editable files with the owner's frozen evaluator and returns \
 {{n, score, valid, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count.\n\
-- The host keeps the best scored state of this line of work automatically. Bold changes are safe: you never need to revert by hand.\n\
-- Work in experiments: form a hypothesis, edit, ar.eval, read the report, decide the next step. One idea per eval, so the ledger stays readable.\n\
+- The host keeps the best scored state of this line of work automatically. Bold changes are safe: you never need to revert by hand.\n");
+        if spec.min_delta > 0.0 {
+            t += &format!("- A score counts as an improvement only when it beats the best by more than {}: smaller differences are noise.\n", spec.min_delta);
+        }
+        t += &format!("- Work in experiments: form a hypothesis, edit, ar.eval, read the report, decide the next step. One idea per eval, so the ledger stays readable.\n\
 - This episode has about ${allowance:.2} of model budget. Use it on experiments. Finishing ends the episode; when you stop early, a fresh \
 agent continues from the best state with this ledger.\n");
-        if self.spec.select.is_some() {
+        if spec.select.is_some() {
             t += "- The final result is chosen on held-out data you cannot see. Prefer changes with a reason to generalize over tuning \
 to the reported numbers.\n";
         }
@@ -325,27 +397,43 @@ to the reported numbers.\n";
         t
     }
 
-    /// Run episode `label` of lineage `i` with `allowance` dollars: fresh child runs until it is spent or no progress is possible.
-    async fn episode(&mut self, i: usize, label: &str, allowance: f64) -> Result<()> {
-        let mut used = 0.0;
-        for attempt in 1..=MAX_ATTEMPTS {
-            let remaining = (allowance - used).min(self.budget - self.spent);
+    fn fork(&mut self, step: usize, id: &str, from: &Origin) -> Result<()> {
+        let rows = ledger(&self.dir)?;
+        let (parent, start, start_score) = match from {
+            Origin::Seed => (None, save_snap(&self.dir, &capture(&self.workspace, self.spec())?)?, None),
+            Origin::Winner(round) => {
+                let parent = self.winners[round].clone();
+                let (snap, score) = self.best(&parent, &rows);
+                (Some(parent), snap, score)
+            }
+        };
+        let lineage = Lineage { id: id.into(), parent, fork_at: rows.len(), start, start_score };
+        self.journal(&Record::Forked { step, lineage: lineage.clone() })?;
+        self.lineages.push(lineage);
+        Ok(())
+    }
+
+    /// Fresh child runs on lineage `id` until `allowance` is spent or an attempt makes no eval. `used` and `first`
+    /// carry what earlier (possibly interrupted) attempts of this step already consumed.
+    async fn episode(&mut self, step: usize, id: &str, label: &str, allowance: f64, mut used: f64, first: usize) -> Result<()> {
+        for attempt in first..=MAX_ATTEMPTS {
+            let remaining = (allowance - used).min(self.launch.budget - self.spent);
             if remaining < allowance * 0.15 || remaining <= 0.0 { break; }
             let rows = ledger(&self.dir)?;
-            let (snap, best) = self.best(i, &rows);
-            restore(&self.workspace, &self.spec, &self.dir, &snap)?;
+            let (snap, best) = self.best(id, &rows);
+            restore(&self.workspace, self.spec(), &self.dir, &snap)?;
             let tag = format!("{label}.{attempt}");
-            let episode = Episode { dir: self.dir.clone(), lineage: self.lineages[i].id.clone(), label: tag.clone(), spec: self.spec.clone(), best };
+            let episode = Episode { dir: self.dir.clone(), lineage: id.into(), label: tag.clone(), spec: self.spec().clone(), best };
             let ep_dir = self.dir.join("episodes");
             std::fs::create_dir_all(&ep_dir)?;
             let ep_path = ep_dir.join(format!("{tag}.json"));
             std::fs::write(&ep_path, serde_json::to_vec_pretty(&episode)?)?;
             let task_path = ep_dir.join(format!("{tag}.md"));
-            std::fs::write(&task_path, self.task(i, &tag, remaining, &rows))?;
-            let before = rows.len();
-            eprintln!("hx ar: episode {tag} (lineage {}, ${remaining:.2}, best {})", self.lineages[i].id, show(best));
+            std::fs::write(&task_path, self.task(id, &tag, remaining, &rows))?;
+            self.journal(&Record::Started { step, attempt, allowance: remaining })?;
+            eprintln!("hx ar: episode {tag} (lineage {id}, ${remaining:.2}, best {})", show(best));
             let out = tokio::process::Command::new(std::env::current_exe()?)
-                .arg("run").args(&self.child_args)
+                .arg("run").args(&self.launch.child_args)
                 .arg("--prompt-file").arg(&task_path)
                 .arg("--max-cost").arg(format!("{remaining:.6}"))
                 .env("HX_AR_EPISODE", &ep_path)
@@ -357,39 +445,105 @@ to the reported numbers.\n";
             std::fs::write(ep_dir.join(format!("{tag}.report.json")), serde_json::to_vec_pretty(&report)?)?;
             // An unreported cost is charged as the whole allowance, so a broken child cannot overspend the run.
             let cost = report["cost_usd"].as_f64().unwrap_or(remaining);
+            let evals = ledger(&self.dir)?.iter().filter(|r| r.episode == tag).count();
+            self.journal(&Record::Finished { step, attempt, cost, evals })?;
             used += cost;
             self.spent += cost;
-            let evals = ledger(&self.dir)?.len() - before;
             let end = if report["finished"] == true { "finished" } else { report["stopped"].as_str().unwrap_or("stopped") };
             eprintln!("hx ar: episode {tag}: {evals} evals, ${cost:.3}, {end}");
             if evals == 0 { break; }
         }
-        Ok(())
+        self.journal(&Record::EpisodeDone { step })
     }
 
     /// Held-out score of a snapshot (the search score when there is no select evaluator).
     async fn select(&mut self, snap: &str, search: Option<f64>) -> Result<Option<f64>> {
-        let Some(cmd) = self.spec.select.clone() else { return Ok(search) };
-        restore(&self.workspace, &self.spec, &self.dir, snap)?;
-        let (score, valid, _, _) = evaluate(&self.pol, &self.spec, &cmd).await?;
+        let Some(cmd) = self.spec().select.clone() else { return Ok(search) };
+        restore(&self.workspace, self.spec(), &self.dir, snap)?;
+        let (score, valid, _, _) = evaluate(&self.spec().clone(), &self.workspace, &cmd).await?;
         Ok(score.filter(|_| valid))
     }
 
     /// Pick the lineage whose best state scores best on the select evaluator.
-    async fn choose(&mut self, round: usize, candidates: &[usize]) -> Result<usize> {
+    async fn choose(&mut self, step: usize, round: usize, candidates: &[String]) -> Result<()> {
         let rows = ledger(&self.dir)?;
-        let mut winner: Option<(usize, f64)> = None;
-        let mut scored = vec![];
-        for &i in candidates {
-            let (snap, search) = self.best(i, &rows);
+        let (mut winner, mut scored): (Option<(String, f64)>, Vec<Value>) = (None, vec![]);
+        for id in candidates {
+            let (snap, search) = self.best(id, &rows);
             let held = if search.is_some() { self.select(&snap, search).await? } else { None };
-            scored.push(json!({"lineage": self.lineages[i].id, "snap": snap, "search": search, "select": held}));
-            if let Some(h) = held && self.spec.better(h, winner.map(|w| w.1), 0.0) { winner = Some((i, h)); }
+            scored.push(json!({"lineage": id, "snap": snap, "search": search, "select": held}));
+            if let Some(h) = held && self.spec().better(h, winner.as_ref().map(|w| w.1), 0.0) { winner = Some((id.clone(), h)); }
         }
-        let chosen = winner.map(|w| w.0).unwrap_or(candidates[0]);
-        eprintln!("hx ar: round {round} → {}", self.lineages[chosen].id);
-        self.selections.push(json!({"round": round, "candidates": scored, "winner": self.lineages[chosen].id}));
-        Ok(chosen)
+        let winner = winner.map(|w| w.0).unwrap_or_else(|| candidates[0].clone());
+        eprintln!("hx ar: round {round} → {winner}");
+        let record = Record::Chosen { step, round, winner: winner.clone(), candidates: scored };
+        self.journal(&record)?;
+        self.apply(&record);
+        Ok(())
+    }
+
+    fn apply(&mut self, record: &Record) {
+        match record {
+            Record::Forked { lineage, .. } => self.lineages.push(lineage.clone()),
+            Record::Finished { cost, .. } => self.spent += cost,
+            Record::Chosen { round, winner, candidates, .. } => {
+                self.winners.insert(*round, winner.clone());
+                self.chosen.push(json!({"round": round, "winner": winner, "candidates": candidates}));
+            }
+            Record::Started { .. } | Record::EpisodeDone { .. } => {}
+        }
+    }
+
+    async fn run(&mut self, records: Vec<Record>) -> Result<Value> {
+        let steps = plan(&self.launch.schedule)?;
+        let done = |i: usize| records.iter().any(|r| matches!(r, Record::Forked { step, .. } | Record::EpisodeDone { step } | Record::Chosen { step, .. } if *step == i));
+        for record in &records { self.apply(record); }
+        for (i, step) in steps.iter().enumerate() {
+            if done(i) { continue; }
+            match step {
+                Step::Fork { id, from } => self.fork(i, id, from)?,
+                Step::Episode { lineage, round, label, share } => {
+                    let id = lineage.clone().unwrap_or_else(|| self.winners[round].clone());
+                    // Resume mid-episode: finished attempts count their cost; an interrupted one its whole allowance.
+                    let (mut used, mut next) = (0.0, 1);
+                    for r in &records {
+                        match r {
+                            Record::Started { step, attempt, allowance } if *step == i => {
+                                if !records.iter().any(|f| matches!(f, Record::Finished { step, attempt: a, .. } if *step == i && a == attempt)) {
+                                    used += allowance;
+                                    self.spent += allowance;
+                                }
+                                next = next.max(attempt + 1);
+                            }
+                            Record::Finished { step, cost, .. } if *step == i => used += cost,
+                            _ => {}
+                        }
+                    }
+                    self.episode(i, &id, label, self.launch.budget * share, used, next).await?;
+                }
+                Step::Choose { round, candidates } => {
+                    let candidates = if candidates.is_empty() {
+                        let mut all: Vec<String> = self.winners.values().cloned().collect();
+                        all.dedup();
+                        all
+                    } else { candidates.clone() };
+                    self.choose(i, *round, &candidates).await?;
+                }
+            }
+        }
+        let rows = ledger(&self.dir)?;
+        let last = self.chosen.last().cloned().context("the schedule ends with a selection")?;
+        let winner = last["winner"].as_str().unwrap().to_string();
+        let (snap, search) = self.best(&winner, &rows);
+        restore(&self.workspace, self.spec(), &self.dir, &snap)?;
+        let select = last["candidates"].as_array().and_then(|c| c.iter().find(|c| c["lineage"] == winner.as_str())).map(|c| c["select"].clone());
+        let report = json!({
+            "run": self.dir.file_name().unwrap().to_string_lossy(), "dir": self.dir, "schedule": self.launch.schedule,
+            "winner": winner, "snap": snap, "search": search, "select": select,
+            "evals": rows.len(), "cost_usd": self.spent, "budget_usd": self.launch.budget, "selections": self.chosen,
+        });
+        std::fs::write(self.dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
+        Ok(report)
     }
 }
 
@@ -397,49 +551,39 @@ fn show(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.6}")).unwrap_or_else(|| "none".into())
 }
 
-/// `hx run --ar`: the fork-and-flush schedule over the whole `--max-cost` budget.
-pub async fn orchestrate(args: &[String], workspace: &Path, pol: std::sync::Arc<crate::policy::Policy>, child_args: Vec<String>, program: String, budget: f64) -> Result<()> {
+/// `hx run --ar`: run the schedule over the whole `--max-cost` budget, or continue the run in `resume` (a run directory).
+pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f64)>, resume: Option<PathBuf>) -> Result<()> {
     ensure!(crate::trust::is_trusted(workspace), "--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first");
-    let spec = Spec::load(workspace)?;
     ensure!(crate::workflow::git_inventory(workspace)?.is_some(), "--ar requires a Git repository at the workspace root");
-    let bad = out_of_scope(workspace, &spec)?;
-    ensure!(bad.is_empty(), "--ar starts from committed state: commit or remove changes outside the editable paths: {}", bad.join(", "));
-    let _ = args;
-    let id = format!("{}-{}", chrono_stamp(), std::process::id());
-    let dir = workspace.join(".harness/ar").join(&id);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("spec.json"), serde_json::to_vec_pretty(&spec)?)?;
-    let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, spec, program, child_args, budget, spent: 0.0,
-        lineages: vec![], selections: vec![], pol };
-    let explore = budget * EXPLORE_SHARE;
-    let exploit = (budget - explore * (K * ROUNDS) as f64).max(0.0) / ROUNDS as f64;
-    eprintln!("hx ar: run {id}: ${budget:.2}, {ROUNDS} rounds × {K} branches at ${explore:.2}, leader segments ${exploit:.2}");
-    let mut leader: Option<usize> = None;
-    let mut finalists = vec![];
-    for round in 0..ROUNDS {
-        let mut branches = vec![];
-        for k in 0..K {
-            let i = o.fork(leader, format!("r{round}b{k}"))?;
-            o.episode(i, &format!("r{round}b{k}"), explore).await?;
-            branches.push(i);
+    let (dir, launch, records) = match (start, resume) {
+        (_, Some(dir)) => {
+            let dir = dir.canonicalize().with_context(|| format!("autoresearch run {}", dir.display()))?;
+            ensure!(dir.parent() == Some(&workspace.join(".harness/ar").canonicalize()?), "--resume for --ar takes a run directory under .harness/ar");
+            let launch: Launch = serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?)?;
+            ensure!(!dir.join("report.json").exists(), "autoresearch run {} already finished", dir.display());
+            let text = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap_or_default();
+            let records = text.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<Result<Vec<Record>, _>>()?;
+            (dir, launch, records)
         }
-        let chosen = o.choose(round, &branches).await?;
-        finalists.push(chosen);
-        o.episode(chosen, &format!("r{round}lead"), exploit).await?;
-        leader = Some(chosen);
-    }
-    // Leaders keep improving after their round's selection, so their final states compete once more on held-out data.
-    let rows = ledger(&o.dir)?;
-    finalists.dedup();
-    let winner = o.choose(ROUNDS, &finalists).await?;
-    let (snap, search) = o.best(winner, &rows);
-    restore(&o.workspace, &o.spec, &o.dir, &snap)?;
-    let report = json!({
-        "run": id, "dir": o.dir, "winner": o.lineages[winner].id, "snap": snap, "search": search,
-        "select": o.selections.last().and_then(|s| s["candidates"].as_array().and_then(|c| c.iter().find(|c| c["snap"] == snap.as_str())).map(|c| c["select"].clone())),
-        "evals": rows.len(), "cost_usd": o.spent, "budget_usd": budget, "selections": o.selections,
-    });
-    std::fs::write(o.dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
+        (Some((child_args, program, budget)), None) => {
+            let spec = Spec::load(workspace)?;
+            let schedule = std::env::var("HX_AR_SCHEDULE").unwrap_or_else(|_| "forkflush".into());
+            plan(&schedule)?;
+            let bad = out_of_scope(workspace, &spec)?;
+            ensure!(bad.is_empty(), "--ar starts from committed state: commit or remove changes outside the editable paths: {}", bad.join(", "));
+            let id = format!("{}-{}", chrono_stamp(), std::process::id());
+            let dir = workspace.join(".harness/ar").join(&id);
+            std::fs::create_dir_all(&dir)?;
+            let launch = Launch { spec, program, child_args, budget, schedule };
+            std::fs::write(dir.join("launch.json"), serde_json::to_vec_pretty(&launch)?)?;
+            (dir, launch, vec![])
+        }
+        (None, None) => bail!("--ar needs a program and budget, or --resume RUN_DIR"),
+    };
+    let budget = launch.budget;
+    let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, launch, spent: 0.0, lineages: vec![], winners: BTreeMap::new(), chosen: vec![] };
+    eprintln!("hx ar: run {} ({}, ${budget:.2}){}", o.dir.display(), o.launch.schedule, if records.is_empty() { "" } else { ", resumed" });
+    let report = o.run(records).await?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }

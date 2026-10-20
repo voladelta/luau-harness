@@ -5,7 +5,10 @@ The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and t
 selection must prefer held-out quality over the agent-visible score.
 """
 import json
+import os
+import signal
 import subprocess
+import time
 import redesign_checks as harness
 
 BASE = harness.BASE / "ar"
@@ -44,10 +47,13 @@ def workspace(name, select=True):
     return path
 
 
-def ar(path, url, budget, ok=True):
-    result = subprocess.run([str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"),
-                             "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY", "--yolo",
-                             "--max-cost", str(budget)], env=harness.ENV, capture_output=True, text=True, timeout=600)
+def command(path, url, budget):
+    return [str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"),
+            "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY", "--yolo", "--max-cost", str(budget)]
+
+
+def ar(path, url, budget, ok=True, env=None):
+    result = subprocess.run(command(path, url, budget), env={**harness.ENV, **(env or {})}, capture_output=True, text=True, timeout=600)
     (BASE / f"{path.name}.stderr").write_text(result.stderr)
     if ok:
         assert result.returncode == 0, (result.returncode, result.stdout[-2000:], result.stderr[-4000:])
@@ -76,10 +82,10 @@ def explorer(body, index):
 
 path = workspace("schedule")
 with harness.provider(explorer, price=PRICE) as (url, _):
-    result = ar(path, url, 0.2)
+    result = ar(path, url, 0.1)
 report = json.loads(result.stdout.strip().splitlines()[-1])
 rows = ledger(path, report)
-assert report["cost_usd"] <= 0.2 + 1e-9, report
+assert report["cost_usd"] <= 0.1 + 1e-9, report
 assert report["evals"] == len(rows) and len(rows) >= 15, (report["evals"], len(rows))
 assert all(r["valid"] for r in rows), rows
 lineages = {r["lineage"] for r in rows}
@@ -125,7 +131,64 @@ logs = "".join(p.read_text() for p in (path / ".harness/log").glob("*.jsonl"))
 assert "only the editable paths" in logs and "search.py" in logs, "scope refusal missing from journals"
 check("evaluation refuses changes outside the editable paths")
 
-# 3. Launch validation.
+# 3. Agents cannot read the orchestrator's state (sibling snapshots, held-out scores), even with --yolo.
+def snoop(body, index):
+    if answered(body):
+        return "done"
+    return {"code": 'local r = sh("ls -R .harness/ar; cat .harness/ar/*/ledger.jsonl")\n'
+                    'local ok, e = pcall(read, ".harness/ar/x")\n'
+                    'print(ar.eval("baseline"))\n'
+                    'return {out = r.stdout, err = r.stderr, read = tostring(e)}'}
+
+
+path = workspace("sealed")
+with harness.provider(snoop, price=PRICE) as (url, requests):
+    ar(path, url, 0.05)
+outputs = [item.get("output", "") for body in requests for item in body.get("input", []) if item.get("type") == "function_call_output"]
+assert outputs and all("snaps" not in o and '\\"lineage\\"' not in o and '"lineage"' not in o for o in outputs), outputs
+assert any("sealed" in o for o in outputs), outputs
+check("agents cannot read autoresearch state")
+
+# 4. A killed search resumes from its journal and finishes the same plan; the interrupted attempt is charged.
+path = workspace("resume")
+counter[0] = 0
+with harness.provider(explorer, price=PRICE) as (url, _):
+    process = subprocess.Popen(command(path, url, 0.1), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    deadline = time.time() + 120
+    journal = None
+    while time.time() < deadline:
+        journals = list((path / ".harness/ar").glob("*/journal.jsonl"))
+        if journals and sum(1 for line in journals[0].read_text().splitlines() if '"chosen"' in line) >= 1:
+            journal = journals[0]
+            break
+        time.sleep(0.05)
+    assert journal, "first selection never happened"
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    run_dir = journal.parent
+    subprocess.run(["git", "checkout", "-q", "x.txt"], cwd=path, check=True)
+    result = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(run_dir), "--workspace", str(path)],
+                            env=harness.ENV, capture_output=True, text=True, timeout=600)
+    assert result.returncode == 0, result.stderr[-3000:]
+report = json.loads(result.stdout.strip().splitlines()[-1])
+rows = ledger(path, report)
+assert {f"r{r}b{k}" for r in range(3) for k in range(4)} <= {r["lineage"] for r in rows}
+assert [s["round"] for s in report["selections"]] == [0, 1, 2, 3], report["selections"]
+assert report["cost_usd"] <= 0.1 + 1e-9 and "resumed" in result.stderr, (report["cost_usd"], result.stderr[:300])
+check("killed search resumes from its journal")
+
+# 5. The single-run baseline: one lineage with the whole budget.
+path = workspace("single")
+counter[0] = 0
+with harness.provider(explorer, price=PRICE) as (url, _):
+    result = ar(path, url, 0.05, env={"HX_AR_SCHEDULE": "single"})
+report = json.loads(result.stdout.strip().splitlines()[-1])
+assert report["schedule"] == "single" and {r["lineage"] for r in ledger(path, report)} == {"s0"}, report
+assert len(report["selections"]) == 1 and report["cost_usd"] <= 0.05 + 1e-9, report
+check("single schedule runs one lineage on the whole budget")
+
+# 6. Launch validation.
 path = workspace("flags", select=False)
 result = subprocess.run([str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"),
                          "--model", "mock"], env=harness.ENV, capture_output=True, text=True)
