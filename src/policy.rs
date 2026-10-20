@@ -218,6 +218,7 @@ impl Policy {
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
         p.sealed.push(workspace.join(".harness/ar"));
+        p.sealed.extend(crate::ar::sealed());
         for r in SYSTEM_READ {
             if let Some(c) = canon(r) {
                 p.read_roots.push(c);
@@ -450,6 +451,30 @@ impl Policy {
         }
         s
     }
+}
+
+/// Seatbelt profile for an owner's evaluator: no network, reads limited to the system, toolchains and `read`, writes to
+/// `write`. None where Seatbelt is unavailable (the evaluator then runs unconfined, still with a scrubbed environment).
+pub fn evaluator_profile(read: &[PathBuf], write: &[PathBuf]) -> Option<String> {
+    if !Path::new("/usr/bin/sandbox-exec").exists() {
+        return None;
+    }
+    let q = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""));
+    let mut s = String::from("(version 1)\n(deny default)\n(import \"system.sb\")\n");
+    s.push_str("(allow process-exec*)\n(allow process-fork)\n(allow signal (target same-sandbox))\n(allow sysctl-read)\n(allow file-read-metadata)\n");
+    let roots = SYSTEM_READ.iter().filter_map(canon).chain(toolchain_roots()).chain(read.iter().cloned());
+    for r in roots {
+        s.push_str(&format!("(allow file-read* (subpath {}))\n", q(&r)));
+    }
+    s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/\"))\n");
+    s.push_str("(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db\"))\n");
+    for w in write {
+        s.push_str(&format!("(allow file-write* (subpath {}))\n", q(w)));
+    }
+    let names: Vec<String> = SECRET_FILES.iter().map(|n| n.replace('.', "\\.")).collect();
+    s.push_str(&format!("(deny file-read* (regex #\"/({})$\"))\n", names.join("|")));
+    s.push_str("(deny network*)\n");
+    Some(s)
 }
 
 /// A logged path is not authority to remove arbitrary directories on shutdown. Scratch paths must be direct,

@@ -153,17 +153,17 @@ Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open networ
 
 Use `--rpi` to carry a task through separate research-questions, research, system-design, program-design, implementation and verification stages. Each stage starts with a fresh agent session and receives the relevant immutable documents. Verification failures trigger repair and fresh verification, with at most three repair cycles across the run. This is a bundled Luau workflow adapted from [HumanLayer RPI](stdlib/std/rpi/PROVENANCE.md); activate it with `--rpi`, not `--pack std/rpi`.
 
-Use `--ar` when the task has a score to optimize. `.harness/ar.toml` names the editable paths and the evaluator commands; each prints a JSON line with `score` (and optionally `valid`, `se`, `report`):
+Use `--ar` when the task has a score to optimize. `.harness/ar.toml` names the editable paths, the evaluator commands and the read-only roots they need; each evaluator prints a JSON line with `score` (and optionally `valid`, `se`, `report`):
 
 ```toml
 editable = ["ar/strategy.pine"]
 eval = "$HOME/grader/eval search --file ar/strategy.pine"    # the agent sees these scores
 select = "$HOME/grader/eval select --file ar/strategy.pine"  # held out: only the controller sees these
-direction = "max"
-min_delta = 0.005
+grader = ["~/grader"]
+min_delta = 0.05
 ```
 
-Every episode is a fresh child run that scores candidates with `ar.eval("hypothesis")`. The host checks that nothing outside the editable paths changed, snapshots the editable files and appends to the ledger, and it keeps each lineage's best state. The schedule follows [fork-and-flush](https://arxiv.org/abs/2610.07447): four branches at the start, a third and two thirds of the budget, each branch getting 6% of it, with the selected leader continuing in between. Fork winners and the final result are chosen with `select`. Evaluators run outside the agent sandbox, so keep the grader and its data outside the workspace. See [docs/runtime-v2.md](docs/runtime-v2.md#autoresearch-workflow).
+The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it, and `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, under a sandbox with no credentials or network. Only the editable paths carry between episodes, and the host keeps each lineage's best state. The schedule follows [fork-and-flush](https://arxiv.org/abs/2610.07447): four branches at the start, a third and two thirds of the budget, each branch getting 6% of it, with the selected leader continuing in between. Fork winners and the final result are chosen with `select`. See [docs/runtime-v2.md](docs/runtime-v2.md#autoresearch-workflow).
 
 ```bash
 hx run --rpi --prompt-file task.md --model MODEL

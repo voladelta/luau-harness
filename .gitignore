@@ -5,3 +5,4 @@ __pycache__/
 .harness/
 .agents/
 .openrouter/
+/target-dev

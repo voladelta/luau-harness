@@ -428,7 +428,7 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
     if let Some(dir) = arg(args, "--resume") {
         return ar::orchestrate(workspace, None, Some(PathBuf::from(dir))).await;
     }
-    let mut child = vec!["--workspace".to_string(), workspace.to_string_lossy().to_string()];
+    let mut child = vec![];
     let mut it = args.iter().skip(1);
     while let Some(name) = it.next() {
         let kind = flag_kind("run", name);

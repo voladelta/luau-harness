@@ -186,7 +186,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
-                let (so, se, status, timed_out) = shell(Some(&pol), &cmd, cwd, secs).await?;
+                let (so, se, status, timed_out) = shell(&Jail::agent(&pol), &cmd, cwd, secs).await?;
                 Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, operation_id:None })
             }).await?;
             match ret {
@@ -336,23 +336,34 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
     Ok(Ok((rows, capped)))
 }
 
-/// Run `cmd` with bash under the run's OS policy (None: an owner command, outside the agent sandbox): own process
-/// group, capped output, killed at `secs`.
-pub async fn shell(pol: Option<&crate::policy::Policy>, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool)> {
-    let mut command = if let Some(pol) = pol.filter(|p| p.enabled) {
-        let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
-        c.arg("-p").arg(pol.seatbelt_profile()).arg("/bin/bash").arg("-c").arg(&cmd);
-        c.env_clear().envs(pol.env());
-        c
-    } else if let Some(profile) = pol.and_then(|p| p.yolo_profile()) {
-        let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
-        c.arg("-p").arg(profile).arg("/bin/bash").arg("-c").arg(&cmd);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("bash");
-        c.arg("-c").arg(&cmd);
-        c
+/// How a shell command is confined: a Seatbelt profile (None: unconfined) and its environment (None: inherited).
+pub struct Jail {
+    pub profile: Option<String>,
+    pub env: Option<Vec<(String, String)>>,
+}
+impl Jail {
+    /// The agent's `sh`: the run's sandbox, or with --yolo the protected-paths profile.
+    pub fn agent(pol: &crate::policy::Policy) -> Jail {
+        if pol.enabled { Jail { profile: Some(pol.seatbelt_profile()), env: Some(pol.env()) } }
+        else { Jail { profile: pol.yolo_profile(), env: None } }
+    }
+}
+
+/// Run `cmd` with bash inside `jail`: own process group, capped output, killed at `secs`.
+pub async fn shell(jail: &Jail, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool)> {
+    let mut command = match &jail.profile {
+        Some(profile) => {
+            let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
+            c.arg("-p").arg(profile).arg("/bin/bash").arg("-c").arg(cmd);
+            c
+        }
+        None => {
+            let mut c = tokio::process::Command::new("bash");
+            c.arg("-c").arg(cmd);
+            c
+        }
     };
+    if let Some(env) = &jail.env { command.env_clear().envs(env.iter().cloned()); }
     let nproc_cap = user_process_count() + 300;
     command
         .current_dir(cwd)
