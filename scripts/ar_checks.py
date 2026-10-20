@@ -127,6 +127,9 @@ assert all(f"\n{r['n']} |" not in task for r in rows if r["lineage"] == "r1b0"),
 assert any(f"\n{r['n']} |" in task for r in rows if r["lineage"] == r0_winner), "parent rows missing"
 check("branches inherit the parent ledger and not their siblings'")
 
+assert "## Evaluator report of the best state" in task and '"x":' in task, task[-800:]
+check("episodes see the evaluator report of their lineage's best state")
+
 for r in rows:
     snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{r['snap']}.json").read_text())
     value = int(base64.b64decode(snap["x.txt"]))
@@ -240,8 +243,8 @@ counter[0] = 0
 with harness.provider(explorer, price=PRICE) as (url, _):
     report = report_of(ar(path, url, 0.05, env=SINGLE))
 assert report["schedule"] == "single" and {r["lineage"] for r in ledger(path, report)} == {"s0"}, report
-assert len(report["selections"]) == 1 and report["cost_usd"] <= 0.05 + 1e-9, report
-check("single schedule runs one lineage on the whole budget")
+assert len(report["selections"]) == 1 and 0.045 <= report["cost_usd"] <= 0.05 + 1e-9, report
+check("single schedule runs one lineage and spends its whole budget")
 
 
 # 9. Provider crashes are charged from the child's journal and retried; misconfiguration fails fast and nonzero.

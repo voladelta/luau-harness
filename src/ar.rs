@@ -28,10 +28,11 @@ use std::sync::{Mutex, OnceLock};
 const K: usize = 4;
 const ROUNDS: usize = 3;
 const EXPLORE_SHARE: f64 = 0.06;
-/// Ledger rows shown to an episode.
+/// Ledger rows shown to an episode, and characters of the best state's evaluator report.
 const SHOWN: usize = 40;
+const REPORT_CHARS: usize = 12_000;
 /// Flushed restarts within one episode when the agent stops early (a guard; the allowance normally ends it first).
-const MAX_ATTEMPTS: usize = 20;
+const MAX_ATTEMPTS: usize = 100;
 /// Retries of a child that crashes before any eval (usually provider rate limits).
 const MAX_CRASHES: u32 = 3;
 /// Limits on the editable files of one snapshot: total bytes, file count and directory depth.
@@ -151,6 +152,9 @@ struct Row {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     se: Option<f64>,
     improved: bool,
+    /// The search evaluator's report, shown to later episodes for their lineage's best state.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    report: Value,
 }
 
 fn ledger(dir: &Path) -> Result<Vec<Row>> {
@@ -344,7 +348,7 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
     if improved { *best = score; }
     let n = ledger(&episode.dir)?.len() + 1;
     let row = Row { n, lineage: episode.lineage.clone(), episode: episode.label.clone(), note: note.chars().take(300).collect(),
-        snap, score, valid, se, improved };
+        snap, score, valid, se, improved, report: report.clone() };
     append_line(&episode.dir.join("ledger.jsonl"), &row)?;
     Ok(json!({"n": n, "score": score, "valid": valid, "se": se, "improved": improved, "best": *best, "report": report}))
 }
@@ -555,7 +559,7 @@ impl Orchestrator {
     fn task(&self, id: &str, label: &str, allowance: f64, rows: &[Row]) -> String {
         let spec = self.spec();
         let history = self.history(id, rows);
-        let (_, best) = self.best(id, rows);
+        let (best_snap, best) = self.best(id, rows);
         let better = if spec.direction == "max" { "higher" } else { "lower" };
         let mut t = format!("{}\n\n## Autoresearch episode {label}\n\n", self.launch.program.trim_end());
         t += &format!("You are one episode of an autoresearch loop. Improve the score by changing the editable paths: {}. \
@@ -590,6 +594,13 @@ to the reported numbers.\n";
             Some(b) => format!("\nThe workspace holds the best state so far (score {b:.6}).\n"),
             None => "\nThe workspace holds the starting state; it has not been scored yet. Start with ar.eval on it as a baseline.\n".into(),
         };
+        // The full report of that state, so an episode starts from the evaluator's detail rather than one number.
+        if let Some(r) = history.iter().rev().find(|r| r.snap == best_snap && r.valid && !r.report.is_null()) {
+            let text = serde_json::to_string_pretty(&r.report).unwrap_or_default();
+            let cut: String = text.chars().take(REPORT_CHARS).collect();
+            t += &format!("\n## Evaluator report of the best state (eval {})\n\n```json\n{cut}{}\n```\n", r.n,
+                if cut.len() < text.len() { "\n... (truncated)" } else { "" });
+        }
         t
     }
 
@@ -619,7 +630,9 @@ to the reported numbers.\n";
         let mut crashes = 0;
         for attempt in first..=MAX_ATTEMPTS {
             let remaining = (allowance - used).min(self.launch.budget - self.spent);
-            if remaining < allowance * 0.15 || remaining <= 0.0 { break; }
+            // Continue while a meaningful slice is left: 15% of a branch allowance, whatever the schedule, so every
+            // schedule spends its budget equally fully.
+            if remaining < allowance.min(self.launch.budget * EXPLORE_SHARE) * 0.15 || remaining <= 0.0 { break; }
             let rows = ledger(&self.dir)?;
             let (snap, best) = self.best(id, &rows);
             let tag = format!("{label}.{attempt}");
