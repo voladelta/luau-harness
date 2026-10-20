@@ -101,11 +101,11 @@ def main():
     groups += [[("redesign", ["python3", "scripts/redesign_checks.py"])],
                [("custom_tools", ["python3", "scripts/custom_tool_checks.py"])] ,
                [("rpi", ["python3", "scripts/rpi_checks.py"])],
-               [("ar", ["python3", "scripts/ar_checks.py"])],
+               [("ar", ["python3", "scripts/ar_checks.py"], 150)],
                [("history", ["python3", "scripts/history_checks.py"])]]
 
     def group(checks):
-        return [run(name, command) for name, command in checks]
+        return [run(*check) for check in checks]
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for future in as_completed([pool.submit(group, checks) for checks in groups]):

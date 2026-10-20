@@ -188,7 +188,25 @@ assert report["schedule"] == "single" and {r["lineage"] for r in ledger(path, re
 assert len(report["selections"]) == 1 and report["cost_usd"] <= 0.05 + 1e-9, report
 check("single schedule runs one lineage on the whole budget")
 
-# 6. Launch validation.
+# 6. A child that crashes on provider errors before any eval is charged from its journal and retried.
+def limited(body, index):
+    if index < 3:
+        return {"status": 429, "error": "rate limited"}
+    return explorer(body, index)
+
+
+path = workspace("crash")
+counter[0] = 0
+with harness.provider(limited, price=PRICE) as (url, _):
+    result = ar(path, url, 0.05, env={"HX_AR_SCHEDULE": "single", "HX_AR_RETRY_SECS": "0"})
+report = json.loads(result.stdout.strip().splitlines()[-1])
+assert "retrying" in result.stderr and report["evals"] > 0, (result.stderr[-1500:], report)
+journal = [json.loads(line) for line in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
+crashed = next(r for r in journal if r["kind"] == "finished" and r["evals"] == 0)
+assert crashed["cost"] < 0.01, crashed  # charged from its journal, not its whole $0.05 allowance
+check("provider crashes are charged from the child journal and retried")
+
+# 7. Launch validation.
 path = workspace("flags", select=False)
 result = subprocess.run([str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"),
                          "--model", "mock"], env=harness.ENV, capture_output=True, text=True)

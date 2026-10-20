@@ -416,6 +416,7 @@ to the reported numbers.\n";
     /// Fresh child runs on lineage `id` until `allowance` is spent or an attempt makes no eval. `used` and `first`
     /// carry what earlier (possibly interrupted) attempts of this step already consumed.
     async fn episode(&mut self, step: usize, id: &str, label: &str, allowance: f64, mut used: f64, first: usize) -> Result<()> {
+        let mut crashes = 0;
         for attempt in first..=MAX_ATTEMPTS {
             let remaining = (allowance - used).min(self.launch.budget - self.spent);
             if remaining < allowance * 0.15 || remaining <= 0.0 { break; }
@@ -431,6 +432,7 @@ to the reported numbers.\n";
             let task_path = ep_dir.join(format!("{tag}.md"));
             std::fs::write(&task_path, self.task(id, &tag, remaining, &rows))?;
             self.journal(&Record::Started { step, attempt, allowance: remaining })?;
+            let logs_before = child_logs(&self.workspace);
             eprintln!("hx ar: episode {tag} (lineage {id}, ${remaining:.2}, best {})", show(best));
             let out = tokio::process::Command::new(std::env::current_exe()?)
                 .arg("run").args(&self.launch.child_args)
@@ -443,15 +445,30 @@ to the reported numbers.\n";
             let report = String::from_utf8_lossy(&out.stdout).lines().rev()
                 .find_map(|l| serde_json::from_str::<Value>(l).ok()).unwrap_or(Value::Null);
             std::fs::write(ep_dir.join(format!("{tag}.report.json")), serde_json::to_vec_pretty(&report)?)?;
-            // An unreported cost is charged as the whole allowance, so a broken child cannot overspend the run.
-            let cost = report["cost_usd"].as_f64().unwrap_or(remaining);
+            // A child that died without a report is charged what its journal recorded, unsettled requests at their
+            // reservation; without a journal, its whole allowance. Either way a broken child cannot overspend the run.
+            let cost = match report["cost_usd"].as_f64() {
+                Some(cost) => cost,
+                None => child_logs(&self.workspace).difference(&logs_before).map(|log| journal_cost(log)).sum::<Option<f64>>().unwrap_or(remaining),
+            };
             let evals = ledger(&self.dir)?.iter().filter(|r| r.episode == tag).count();
             self.journal(&Record::Finished { step, attempt, cost, evals })?;
             used += cost;
             self.spent += cost;
             let end = if report["finished"] == true { "finished" } else { report["stopped"].as_str().unwrap_or("stopped") };
             eprintln!("hx ar: episode {tag}: {evals} evals, ${cost:.3}, {end}");
-            if evals == 0 { break; }
+            if evals == 0 {
+                // A crash before any eval is usually the provider (rate limits); retry after a pause, a few times.
+                if report.is_null() && crashes < 3 {
+                    crashes += 1;
+                    let base = std::env::var("HX_AR_RETRY_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(60);
+                    let pause = base << crashes;
+                    eprintln!("hx ar: episode {tag} crashed before any eval; retrying in {pause}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+                    continue;
+                }
+                break;
+            }
         }
         self.journal(&Record::EpisodeDone { step })
     }
@@ -545,6 +562,21 @@ to the reported numbers.\n";
         std::fs::write(self.dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
         Ok(report)
     }
+}
+
+/// Run journals in the workspace's log directory.
+fn child_logs(workspace: &Path) -> std::collections::BTreeSet<PathBuf> {
+    std::fs::read_dir(workspace.join(".harness/log")).into_iter().flatten().flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl")).collect()
+}
+
+/// Settled model cost of a run journal plus its unsettled reservations.
+fn journal_cost(log: &Path) -> Option<f64> {
+    let books = crate::eventlog::Books::of(&crate::eventlog::load(log).ok()?).ok()?;
+    let pending: f64 = books.reservations.values().map(|r| match r.cost {
+        crate::eventlog::ReservationCost::UpperBound(c) | crate::eventlog::ReservationCost::Allowance(c) => c,
+    }).sum();
+    Some(books.usage.cost + pending)
 }
 
 fn show(v: Option<f64>) -> String {
