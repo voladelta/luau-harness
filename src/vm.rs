@@ -317,6 +317,23 @@ impl Vm {
             stage.set_readonly(true);
             g.set("stage",stage)?;
         }
+        if crate::ar::EPISODE.get().is_some() && host.as_ref().is_some_and(|h| h.depth == 0) {
+            // ar.eval(note): the only way an autoresearch episode scores a candidate (see ar.rs).
+            let ar = lua.create_table()?;
+            let afx = fx.clone();
+            ar.set("eval", lua.create_async_function(move |lua, note: Option<String>| {
+                let fx = afx.clone();
+                async move {
+                    let note = note.unwrap_or_default();
+                    let result = fx.run(&lua, crate::supervisor::Tool::Sh, Class::LocalWrite, json!({"ar_eval": &note}), || async {
+                        crate::ar::eval(&fx.pol, note.clone()).await.map(Ret::Json).map_err(|e| crate::effects::rt(format!("ar.eval: {e}")))
+                    }).await?;
+                    prims::json_value(&lua, result)
+                }
+            })?)?;
+            ar.set_readonly(true);
+            g.set("ar", ar)?;
+        }
         let saved = host.as_ref().map(|h| h.durable.clone()).unwrap_or_else(|| supervisor.durable.clone());
         let durable = lua.create_table()?;
         let data = saved.clone();

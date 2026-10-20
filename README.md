@@ -26,6 +26,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Sandbox (macOS) | `sh` runs under Seatbelt: writes confined to the project and a temp dir, no network, no API keys in the environment |
 | Approval gate | `git push`, publish, `ssh` and other external commands need the user's approval; nothing the model writes can approve |
 | RPI workflow | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds durable owner review gates |
+| Autoresearch | `--ar` searches for a better score with fork-and-flush episodes over the editable paths in `.harness/ar.toml` |
 | Recovery | `--resume` restores explicit saved data and controller state into a fresh VM; old effectful chunks are never replayed |
 | Budgets | Shared admission thresholds reserve each request's priced upper bound (the whole remaining allowance when no price is known); an absolute deadline includes downtime |
 | Compaction | On by default (`std/compact`): from 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; recent messages and Luau globals stay; one compact-and-retry on a context-overflow error |
@@ -132,6 +133,7 @@ hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1
 | `--prompt-file F` | | Task text (not needed with `--resume` if the log recorded it) |
 | `--rpi` | off | Activate the bundled RPI workflow in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
+| `--ar` | off | Autoresearch over `.harness/ar.toml`; needs `--prompt-file` (the program) and `--max-cost` (the whole search budget) |
 | `--model M` | `HX_MODEL` | Model id |
 | `--api A` | `responses` (`HX_API`) | `responses` or `completions` (Chat Completions) |
 | `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
@@ -150,6 +152,18 @@ Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open networ
 ## Research, design and implementation
 
 Use `--rpi` to carry a task through separate research-questions, research, system-design, program-design, implementation and verification stages. Each stage starts with a fresh agent session and receives the relevant immutable documents. Verification failures trigger repair and fresh verification, with at most three repair cycles across the run. This is a bundled Luau workflow adapted from [HumanLayer RPI](stdlib/std/rpi/PROVENANCE.md); activate it with `--rpi`, not `--pack std/rpi`.
+
+Use `--ar` when the task has a score to optimize. `.harness/ar.toml` names the editable paths and the evaluator commands; each prints a JSON line with `score` (and optionally `valid`, `se`, `report`):
+
+```toml
+editable = ["ar/strategy.pine"]
+eval = "$HOME/grader/eval search --file ar/strategy.pine"    # the agent sees these scores
+select = "$HOME/grader/eval select --file ar/strategy.pine"  # held out: only the controller sees these
+direction = "max"
+min_delta = 0.005
+```
+
+Every episode is a fresh child run that scores candidates with `ar.eval("hypothesis")`. The host checks that nothing outside the editable paths changed, snapshots the editable files and appends to the ledger, and it keeps each lineage's best state. The schedule follows [fork-and-flush](https://arxiv.org/abs/2610.07447): four branches at the start, a third and two thirds of the budget, each branch getting 6% of it, with the selected leader continuing in between. Fork winners and the final result are chosen with `select`. Evaluators run outside the agent sandbox, so keep the grader and its data outside the workspace. See [docs/runtime-v2.md](docs/runtime-v2.md#autoresearch-workflow).
 
 ```bash
 hx run --rpi --prompt-file task.md --model MODEL

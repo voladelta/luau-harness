@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// Config files whose content trust covers (paths relative to the workspace), plus whole trees: module overrides and
 /// the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
 /// asks, and the agent stages there itself.)
-const FILES: [&str; 4] = [".harness/policy.toml", ".harness/mcp.toml", ".harness/init.luau", "hx.lock"];
+const FILES: [&str; 5] = [".harness/policy.toml", ".harness/mcp.toml", ".harness/init.luau", ".harness/ar.toml", "hx.lock"];
 const TREES: [&str; 3] = [".harness/override", ".harness/versions", ".harness/tools"];
 
 /// `$XDG_CONFIG_HOME/hx` or `~/.config/hx`.

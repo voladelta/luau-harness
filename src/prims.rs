@@ -186,59 +186,8 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
-                let mut command = if pol.enabled {
-                    let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
-                    c.arg("-p").arg(pol.seatbelt_profile()).arg("/bin/bash").arg("-c").arg(&cmd);
-                    c.env_clear().envs(pol.env());
-                    c
-                } else if let Some(profile) = pol.yolo_profile() {
-                    let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
-                    c.arg("-p").arg(profile).arg("/bin/bash").arg("-c").arg(&cmd);
-                    c
-                } else {
-                    let mut c = tokio::process::Command::new("bash");
-                    c.arg("-c").arg(&cmd);
-                    c
-                };
-                let nproc_cap = user_process_count() + 300;
-                command
-                    .current_dir(cwd)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .kill_on_drop(true);
-                // Own process group (killed as a whole), and a cap on how many processes this user may have, so a fork
-                // bomb inside `sh` hits EAGAIN instead of taking the machine down.
-                unsafe {
-                    command.pre_exec(move || {
-                        libc::setsid();
-                        let lim = libc::rlimit { rlim_cur: nproc_cap, rlim_max: nproc_cap };
-                        libc::setrlimit(libc::RLIMIT_NPROC, &lim);
-                        Ok(())
-                    });
-                }
-                let mut child = command.spawn().map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
-                let group = child.id().map(|p| GroupKill(p as i32)); // killpg on drop: also covers cancellation
-                let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-                async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R) -> Vec<u8> {
-                    let mut buf = Vec::new();
-                    let _ = (&mut s).take(MAX_CAPTURE as u64).read_to_end(&mut buf).await;
-                    // keep reading (and discarding) so the child never blocks on a full pipe
-                    let _ = tokio::io::copy(&mut s, &mut tokio::io::sink()).await;
-                    buf
-                }
-                let (out_h, err_h) = (tokio::spawn(drain(out)), tokio::spawn(drain(err)));
-                let (status, timed_out) = match tokio::time::timeout(Duration::from_secs_f64(secs), child.wait()).await {
-                    Ok(st) => (st.ok().and_then(|s| s.code()), false),
-                    Err(_) => (None, true),
-                };
-                // The command is over: kill stragglers and background jobs now. That also closes the pipes they held,
-                // so the readers finish; whatever was printed before a timeout is kept.
-                drop(group);
-                let grace = Duration::from_secs(2);
-                let so = tokio::time::timeout(grace, out_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-                let se = tokio::time::timeout(grace, err_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-                Ok(Ret::Sh { stdout: so, stderr: se, code: status.map(|c| c as i64), timed_out, operation_id:None })
+                let (so, se, status, timed_out) = shell(Some(&pol), &cmd, cwd, secs).await?;
+                Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, operation_id:None })
             }).await?;
             match ret {
                 Ret::Sh { stdout, stderr, code, timed_out, operation_id } => {
@@ -385,6 +334,64 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
         }
     }
     Ok(Ok((rows, capped)))
+}
+
+/// Run `cmd` with bash under the run's OS policy (None: an owner command, outside the agent sandbox): own process
+/// group, capped output, killed at `secs`.
+pub async fn shell(pol: Option<&crate::policy::Policy>, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool)> {
+    let mut command = if let Some(pol) = pol.filter(|p| p.enabled) {
+        let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
+        c.arg("-p").arg(pol.seatbelt_profile()).arg("/bin/bash").arg("-c").arg(&cmd);
+        c.env_clear().envs(pol.env());
+        c
+    } else if let Some(profile) = pol.and_then(|p| p.yolo_profile()) {
+        let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
+        c.arg("-p").arg(profile).arg("/bin/bash").arg("-c").arg(&cmd);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("bash");
+        c.arg("-c").arg(&cmd);
+        c
+    };
+    let nproc_cap = user_process_count() + 300;
+    command
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    // Own process group (killed as a whole), and a cap on how many processes this user may have, so a fork
+    // bomb inside `sh` hits EAGAIN instead of taking the machine down.
+    unsafe {
+        command.pre_exec(move || {
+            libc::setsid();
+            let lim = libc::rlimit { rlim_cur: nproc_cap, rlim_max: nproc_cap };
+            libc::setrlimit(libc::RLIMIT_NPROC, &lim);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
+    let group = child.id().map(|p| GroupKill(p as i32)); // killpg on drop: also covers cancellation
+    let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = (&mut s).take(MAX_CAPTURE as u64).read_to_end(&mut buf).await;
+        // keep reading (and discarding) so the child never blocks on a full pipe
+        let _ = tokio::io::copy(&mut s, &mut tokio::io::sink()).await;
+        buf
+    }
+    let (out_h, err_h) = (tokio::spawn(drain(out)), tokio::spawn(drain(err)));
+    let (status, timed_out) = match tokio::time::timeout(Duration::from_secs_f64(secs), child.wait()).await {
+        Ok(st) => (st.ok().and_then(|s| s.code()), false),
+        Err(_) => (None, true),
+    };
+    // The command is over: kill stragglers and background jobs now. That also closes the pipes they held,
+    // so the readers finish; whatever was printed before a timeout is kept.
+    drop(group);
+    let grace = Duration::from_secs(2);
+    let so = tokio::time::timeout(grace, out_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+    let se = tokio::time::timeout(grace, err_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+    Ok((so, se, status.map(i64::from), timed_out))
 }
 
 /// Processes currently owned by this user (the baseline for the fork-bomb cap).
