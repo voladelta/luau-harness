@@ -112,7 +112,8 @@ assert -(x - 5) ** 2 == report["select"], (x, report["select"])
 check("the final state is the held-out best among the seed and every improvement, restored into the workspace")
 
 task = (path / ".harness/ar" / report["run"] / "episodes/e3.md").read_text()
-assert "## Evaluator report of the best state" in task and '"x":' in task, task[-800:]
+assert "## Evaluator report of that state" in task and '"x":' in task, task[-800:]
+assert "## Direction" not in task and report["lineages"][0]["idea"] is None, report["lineages"]
 assert "built-in global table" in task and "vars()" in task, task
 check("episodes see the best state's report and are told ar is built in")
 
@@ -179,7 +180,7 @@ assert base64.b64decode(snap["x.txt"]) == b"0\n" and first["score"] == -49, (fir
 check("snapshot and score always agree")
 
 # 6. Binary files and symlinks in an editable directory are carried or skipped, never fatal.
-files = {"pkg/a.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'}
+files = {"pkg/a.txt": "0\n", "search.py": 'import json, os; print(json.dumps({"score": int(os.path.exists("pkg/blob.bin"))}))'}
 path = workspace("binary", files, 'editable = ["pkg"]\neval = "python3 search.py"\ntimeout = 30\n')
 junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn ar.eval("junk")'
 with harness.provider(once(junk), price=PRICE) as (url, _):
@@ -236,9 +237,15 @@ assert result.returncode != 0 and "made no evaluations" in result.stderr and len
 check("idle episodes end the search; a run without evals fails")
 
 # 9. Provider crashes are charged from the child's journal and retried; misconfiguration fails fast and nonzero.
+agent_calls = [0]
+
+
 def limited(body, index):
     # Unavailable twice in a row exhausts the one retry, so the first child crashes (rate limits are waited out instead).
-    return {"status": 503, "error": "unavailable"} if index < 3 else explorer(body, index)
+    if "random_string" in json.dumps(body):
+        return "no direction"
+    agent_calls[0] += 1
+    return {"status": 503, "error": "unavailable"} if agent_calls[0] < 3 else explorer(body, index)
 
 
 path = workspace("crash")
@@ -314,7 +321,8 @@ daemon = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()
           'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn ar.eval("daemon")')
 with harness.provider(once(daemon), price=PRICE) as (url, requests):
     report = report_of(ar(path, url, 0.01))
-pids = [int((path / "pid.txt").read_text())]
+snap = ledger(path, report)[0]["snap"]
+pids = [int(base64.b64decode(json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{snap}.json").read_text())["pid.txt"]))]
 pids += [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_daemon=(\d+)", o)]
 assert len(pids) >= 2, (pids, outputs(requests))
 time.sleep(0.5)
@@ -370,6 +378,55 @@ with harness.provider(once(code), price=PRICE) as (url, requests):
 out = [o for o in outputs(requests) if "RESET " in o][0]
 assert "RESET false" in out and (outside / "x.txt").read_text() == "keep\n", (out, list(outside.iterdir()))
 check("ar.reset refuses a symlinked parent and leaves the link target untouched")
+
+# 17b. Lineages: sampled directions start side by side from the seed, each improves on its own hill, a stalled lineage
+# retires, a new direction starts from the best state, and the held-out pick spans every lineage.
+import threading
+sampled, sample_lock = [], threading.Lock()
+
+
+def directed(body, index):
+    text = json.dumps(body)
+    if "random_string" in text:
+        with sample_lock:
+            sampled.append(text)
+            k = len(sampled)
+        return f"<thinking>dimensions</thinking><answer>go to {[3, 6, 20][k - 1] if k <= 3 else 3 + k}</answer>"
+    if answered(body):
+        return "done"
+    v = re.search(r"## Direction.*?go to (\d+)", text, re.S).group(1)
+    probe = 100 + index  # a fresh state that never improves: every episode scores something new
+    return {"code": f'write("x.txt", "{v}\\n")\nprint(ar.eval("go {v}"))\nwrite("x.txt", "{probe}\\n")\nprint(ar.eval("probe"))\n'
+                    f'ar.reset()\nreturn "RESET {v} " .. read("x.txt")'}
+
+
+path = workspace("lineages")
+with harness.provider(directed, price=PRICE) as (url, requests):
+    result = ar(path, url, 0.06)
+report = report_of(result)
+rows = ledger(path, report)
+lineages = {l["id"]: l for l in report["lineages"]}
+assert {lineages[i]["idea"] for i in (1, 2, 3)} == {"go to 3", "go to 6", "go to 20"} and lineages[4]["idea"] == "go to 7", lineages
+assert all(lineages[i]["retired"] for i in (1, 2, 3)), lineages
+snap6 = next(r["snap"] for r in rows if r["note"] == "go 6")
+assert lineages[4]["start"] == snap6, (lineages[4], snap6)
+check("three directions start from the seed; a new direction starts from the best state once all retire")
+
+assert "Directions already tried" in sampled[3] and all(f"go to {v}" in sampled[3] for v in (3, 6, 20)), sampled[3][-1500:]
+assert "Directions already tried" not in sampled[0]
+lines = result.stderr.splitlines()
+first_end = next(i for i, l in enumerate(lines) if " evals, $" in l)
+assert sum(" on lineage " in l for l in lines[:first_end]) == 3, result.stderr[:2000]
+check("the first directions run side by side, and a new one is sampled knowing every direction tried")
+
+assert [r["n"] for r in rows] == list(range(1, len(rows) + 1)), [r["n"] for r in rows]
+assert next(r for r in rows if r["note"] == "go 20")["improved"], "a direction's first state must improve its own lineage"
+resets = [o for o in outputs(requests) if "RESET " in o]
+assert resets and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
+check("ledger rows stay numbered under concurrency; improvements and ar.reset are per lineage")
+
+assert report["select"] == -1 and (path / "x.txt").read_text() == "6\n", (report["select"], report["checkpoints"])
+check("the held-out pick spans every lineage")
 
 # 17. Launch validation.
 path = workspace("flags")

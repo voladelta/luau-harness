@@ -5,6 +5,7 @@ mod eventlog;
 mod host;
 mod history;
 mod llm;
+mod ssot;
 mod mcp;
 mod modules;
 mod policy;
