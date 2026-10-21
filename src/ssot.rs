@@ -52,9 +52,10 @@ pub async fn sample(http: &reqwest::Client, cfg: &LlmCfg, key: &str, prompt: &st
             Ok(reply) => return (answer(&reply.text), reply.cost),
             Err(error) => match error.downcast_ref::<llm::Answered>() {
                 Some(a) if a.retryable() && attempt + 1 < ATTEMPTS => {
-                    // Back off with jitter so concurrent samples do not retry in lockstep; honour Retry-After.
+                    // Honour Retry-After (up to five minutes); otherwise back off exponentially. Jitter keeps concurrent
+                    // samples from retrying in lockstep.
                     let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_millis()) as f64 / 1000.0;
-                    let wait = a.retry_after.unwrap_or(2f64.powi(attempt + 1)).clamp(1.0, 30.0) + jitter;
+                    let wait = a.retry_after.map_or(2f64.powi(attempt + 1).min(30.0), |s| s.clamp(1.0, 300.0)) + jitter;
                     tokio::time::sleep(Duration::from_secs_f64(wait)).await;
                 }
                 _ => return (None, 0.0),

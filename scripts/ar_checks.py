@@ -396,7 +396,7 @@ def directed(body, index):
         return "done"
     v = re.search(r"## Direction.*?go to (\d+)", text, re.S).group(1)
     probe = 100 + index  # a fresh state that never improves: every episode scores something new
-    return {"code": f'write("x.txt", "{v}\\n")\nprint(ar.eval("go {v}"))\nwrite("x.txt", "{probe}\\n")\nprint(ar.eval("probe"))\n'
+    return {"code": f'print(ar.eval("start"))\nwrite("x.txt", "{v}\\n")\nprint(ar.eval("go {v}"))\nwrite("x.txt", "{probe}\\n")\nprint(ar.eval("probe"))\n'
                     f'ar.reset()\nreturn "RESET {v} " .. read("x.txt")'}
 
 
@@ -421,6 +421,8 @@ check("the first directions run side by side, and a new one is sampled knowing e
 
 assert [r["n"] for r in rows] == list(range(1, len(rows) + 1)), [r["n"] for r in rows]
 assert next(r for r in rows if r["note"] == "go 20")["improved"], "a direction's first state must improve its own lineage"
+assert not any(r["improved"] for r in rows if r["note"] == "start"), "a lineage's start must never improve it"
+assert {r["lineage"] for r in rows if r["note"] == "start"} >= {1, 2, 3, 4}, "a state another lineage scored is recorded for this one"
 resets = [o for o in outputs(requests) if "RESET " in o]
 assert resets and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
 check("ledger rows stay numbered under concurrency; improvements and ar.reset are per lineage")

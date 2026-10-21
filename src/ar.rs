@@ -357,18 +357,24 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
     let spec = &episode.spec;
     let files = capture(&pol.workspace, spec)?;
     let snap = save_snap(&episode.dir, &files)?;
-    // An evaluator that reports no `se` is deterministic: a state it already scored validly gets the stored result,
-    // and no new ledger row.
+    // An evaluator that reports no `se` is deterministic: a state it already scored validly keeps its stored result.
+    // When this lineage scored it, that result is the whole answer and adds no ledger row; a state only another lineage
+    // scored is recorded for this one, judged against this lineage's best, without running the evaluator again.
     let rows = ledger(&episode.dir)?;
-    if let Some(r) = rows.iter().find(|r| r.snap == snap && r.valid && r.se.is_none()) {
+    let stored = rows.iter().find(|r| r.snap == snap && r.valid && r.se.is_none());
+    if let Some(r) = stored.filter(|_| rows.iter().any(|o| o.snap == snap && o.lineage == episode.lineage)) {
         let best = *best.lock().unwrap();
         return Ok(json!({"n": r.n, "score": r.score, "valid": true, "se": null, "improved": false, "best": best,
             "report": r.report, "cached": true}));
     }
-    let (score, valid, se, report) = evaluate(spec, &episode.dir, &files, &spec.eval, false).await?;
+    let (score, valid, se, report) = match stored {
+        Some(r) => (r.score, true, None, r.report.clone()),
+        None => evaluate(spec, &episode.dir, &files, &spec.eval, false).await?,
+    };
     let mut best = best.lock().unwrap();
     let margin = spec.min_delta.max(se.unwrap_or(0.0));
-    let improved = valid && spec.better(score.unwrap(), *best, if best.is_some() { margin } else { 0.0 });
+    // A lineage's starting state never improves it, so a direction's bar is set by the first state it builds.
+    let improved = valid && snap != episode.start && spec.better(score.unwrap(), *best, if best.is_some() { margin } else { 0.0 });
     if improved { *best = score; }
     let row = locked(&episode.dir, || {
         let row = Row { n: ledger(&episode.dir)?.len() + 1, episode: episode.label.clone(), lineage: episode.lineage,
@@ -376,7 +382,9 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
         append_line(&episode.dir.join("ledger.jsonl"), &row)?;
         Ok(row)
     })?;
-    Ok(json!({"n": row.n, "score": score, "valid": valid, "se": se, "improved": improved, "best": *best, "report": report}))
+    let mut out = json!({"n": row.n, "score": score, "valid": valid, "se": se, "improved": improved, "best": *best, "report": report});
+    if stored.is_some() { out["cached"] = json!(true); }
+    Ok(out)
 }
 
 /// Run `f` holding the run's ledger lock, so episodes running side by side number their rows without gaps or repeats.
@@ -613,7 +621,10 @@ impl Orchestrator {
     async fn baseline(&self) -> Result<()> {
         let (score, valid, _, report) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &self.seed()?)?, &self.spec().eval, false).await?;
         eprintln!("hx ar: seed scores {}", if valid { show(score) } else { "invalid".into() });
-        std::fs::write(self.dir.join("seed.json"), serde_json::to_vec(&json!({"score": score.filter(|_| valid), "report": report}))?)?;
+        // Written whole or not at all: resume scores the seed again when the file is missing.
+        let tmp = self.dir.join("seed.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&json!({"score": score.filter(|_| valid), "report": report}))?)?;
+        std::fs::rename(&tmp, self.dir.join("seed.json"))?;
         Ok(())
     }
 
@@ -956,6 +967,8 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f
             ensure!(dir.parent() == Some(&workspace.join(".harness/ar").canonicalize()?), "--resume for --ar takes a run directory under .harness/ar");
             let launch: Launch = serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?)?;
             ensure!(!dir.join("report.json").exists(), "autoresearch run {} already finished", dir.display());
+            ensure!(dir.join("seed.json").exists() || !dir.join("ledger.jsonl").exists(),
+                "autoresearch run {} predates lineages and cannot be resumed; start a new run", dir.display());
             let records = read_lines(&dir.join("journal.jsonl"))?;
             (dir, launch, records)
         }
