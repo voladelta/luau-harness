@@ -142,11 +142,18 @@ pub fn record(ws: &Path) -> Result<Option<String>> {
     }
     let Some(h) = config_hash(ws) else { return Ok(None) };
     let path = store_file()?;
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    // Concurrent `hx trust` runs would otherwise lose each other's entries: read-modify-write under an exclusive lock,
+    // replacing the file atomically.
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
+        .custom_flags(libc::O_NOFOLLOW).open(path.with_extension("lock"))?;
+    anyhow::ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "cannot lock the trust store");
     let mut all = read_store();
     all.insert(key(ws), h.clone());
-    std::fs::create_dir_all(path.parent().unwrap())?;
     let body = toml::to_string(&BTreeMap::from([("workspaces", all)]))?;
-    std::fs::write(&path, format!("# Workspaces whose .harness config and hx.lock you trusted (`hx trust`). Delete a line to revoke.\n{body}"))?;
+    crate::atomic_file::replace_trusted(&path,
+        format!("# Workspaces whose .harness config and hx.lock you trusted (`hx trust`). Delete a line to revoke.\n{body}").as_bytes())?;
     Ok(Some(h))
 }
 
