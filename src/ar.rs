@@ -1,24 +1,28 @@
-//! Autoresearch (`hx run --ar`): an agent loop that improves a score by changing a task's editable files.
+//! Autoresearch (`hx run --ar`): a manager loop that improves a score by changing a task's editable files, and returns
+//! a portfolio of distinct good candidates rather than one best state.
 //!
 //! The task supplies `.harness/ar.toml` (editable paths, evaluator commands, grader and holdout roots) and the program
 //! text (`--prompt-file`). At launch the committed tree is frozen into the run's `base`. Agents never touch the owner's
 //! workspace or its Git repository:
 //!
-//! - Every episode is a fresh child `hx run` in a throwaway copy of `base` holding the best editable files of its
-//!   lineage so far. When an agent stops, a later episode starts fresh from that state and the ledger. Only the
-//!   editable paths ever leave an episode.
+//! - Every episode is a fresh child `hx run` in a throwaway copy of `base` holding the state it starts from. Only
+//!   snapshots of the editable paths ever leave an episode.
 //! - `ar.eval` snapshots the editable files and scores the snapshot in a second throwaway copy of `base`, so the
 //!   evaluator sees exactly the recorded bytes and nothing else the agent did.
 //! - Evaluators run under their own sandbox: a scrubbed environment, no network, reads limited to the system,
 //!   toolchains, the evaluation copy and the declared grader (and, for `select`, holdout) roots.
-//! - The run directory (`.harness/ar/RUN`, with `base`, snapshots, ledger, journal and held-out scores) is sealed from
-//!   agents in every mode.
+//! - The run directory (`.harness/ar/RUN`, with `base`, snapshots, ledger, claims, journal and held-out scores) is
+//!   sealed from agents in every mode.
 //!
-//! The host owns what to try as well as the best states. A lineage is one research direction, sampled with String Seed
-//! of Thought so that directions differ, pursued from a starting state with its own best state. A few lineages start
-//! from the seed together; afterwards the leading lineage gets the next episode, a lineage that stops improving is
-//! retired, and when none is left a new direction starts from the best state found. At the end, the held-out `select`
-//! evaluator, which agents never trigger, picks among the seed and every improvement of every lineage.
+//! A run is research, then rounds. A research episode studies the task and writes the brief every worker gets. Round 1
+//! runs explore workers side by side; each derives its own idea from a host seed and claims it with `ar.claim`. Claims
+//! are served one at a time in arrival order: an idea that two judge calls both find to share the core approach of an
+//! earlier claim is rejected, and the worker tries another. Each accepted idea is a candidate with its own best state. A
+//! gate keeps the candidates that beat the seed on search and are not worse on the held-out `select`, audits the
+//! strongest, and hands up to three to the exploit rounds, whose workers claim distinct refinements of their candidate.
+//! With no good candidate after round 1 the run stops. The result is the audited candidates of the last gate, best
+//! held-out score first: several distinct good answers, since the single best score is the one most likely to be an
+//! overfit or an evaluator hole.
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -27,22 +31,20 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// The search stops when less than this share of the budget is left.
+/// Workers side by side in a round: as many as the provider's rate limit comfortably allows.
+const WORKERS: usize = 6;
+/// Rounds after research: one explore round, then exploit rounds.
+const ROUNDS: usize = 3;
+/// Candidates a gate hands to the next round, and the size of the final portfolio.
+const TOP: usize = 3;
+/// Planning stops when less than this share of the budget is left.
 const MIN_SLICE: f64 = 0.01;
-/// Consecutive rounds of episodes that all finish without an eval before the search stops.
-const MAX_IDLE: u32 = 2;
-/// Lineages that start from the seed, each with its own direction.
-const DRAFTS: usize = 3;
-/// Consecutive episodes of a lineage that do not improve it before it is retired.
-const PATIENCE: u32 = 2;
-/// Characters of the starting state's editable files shown when sampling directions.
-const STATE_CHARS: usize = 16_000;
-/// Ledger rows shown to an episode, and characters of the best state's evaluator report.
+/// Ledger rows shown to a worker, characters of an evaluator report, of a brief and of one finding.
 const SHOWN: usize = 40;
 const REPORT_CHARS: usize = 12_000;
-/// Episodes per run (a guard; the budget normally ends the search first).
-const MAX_ATTEMPTS: usize = 100;
-/// Retries of a child that crashes before any eval (usually provider rate limits).
+const BRIEF_CHARS: usize = 8_000;
+const FINDING_CHARS: usize = 1_500;
+/// Attempts of a planned episode that crashes before any eval (usually provider rate limits).
 const MAX_CRASHES: u32 = 3;
 /// Limits on the editable files of one snapshot: total bytes, file count and directory depth.
 const MAX_SNAPSHOT: usize = 16 << 20;
@@ -118,26 +120,41 @@ impl Spec {
     }
 }
 
-/// What a child run needs to serve `ar.eval`; written by the orchestrator, named by `HX_AR_EPISODE`.
+/// What an episode is for. Research writes the brief; explore workers claim and test a new idea; exploit workers claim
+/// and test a refinement of one candidate; auditors judge whether a candidate's score is real. Research and audit
+/// evaluations are probes: recorded, never a candidate's state.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Role { Research, Explore, Exploit, Audit }
+
+/// What a child run needs to serve `ar`; written by the orchestrator, named by `HX_AR_EPISODE`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Episode {
     /// The run directory; sealed from the child's agent.
     pub dir: PathBuf,
     pub label: String,
     pub spec: Spec,
-    /// The lineage this episode works on, the snapshot it started from, and the lineage's best score so far.
-    pub lineage: u32,
+    pub role: Role,
+    /// The candidate an exploit worker improves (0 for every other role).
+    pub idea: u32,
+    /// The snapshot the workspace starts from, and the score an improvement must beat (none: any valid score).
     pub start: String,
     pub best: Option<f64>,
 }
-pub static EPISODE: OnceLock<(Episode, Mutex<Option<f64>>)> = OnceLock::new();
 
-/// Called once at startup: a child run of an autoresearch episode gets `ar.eval`, and its policy seals the run.
+/// A worker's progress inside its child run: its claim and its best score so far.
+pub struct Progress {
+    claim: Option<u32>,
+    best: Option<f64>,
+}
+pub static EPISODE: OnceLock<(Episode, Mutex<Progress>)> = OnceLock::new();
+
+/// Called once at startup: a child run of an autoresearch episode gets `ar`, and its policy seals the run.
 pub fn load_episode() -> Result<()> {
     if let Some(path) = std::env::var_os("HX_AR_EPISODE") {
         let episode: Episode = serde_json::from_slice(&std::fs::read(&path)?).context("HX_AR_EPISODE")?;
         let best = episode.best;
-        let _ = EPISODE.set((episode, Mutex::new(best)));
+        let _ = EPISODE.set((episode, Mutex::new(Progress { claim: None, best })));
     }
     Ok(())
 }
@@ -155,8 +172,9 @@ pub fn sealed() -> Vec<PathBuf> {
 struct Row {
     n: usize,
     episode: String,
+    /// The candidate this state belongs to; 0 for research and audit probes.
     #[serde(default)]
-    lineage: u32,
+    idea: u32,
     note: String,
     snap: String,
     score: Option<f64>,
@@ -164,9 +182,19 @@ struct Row {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     se: Option<f64>,
     improved: bool,
-    /// The search evaluator's report, shown to later episodes for the best state.
+    /// The search evaluator's report, shown to later episodes for a candidate's best state.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     report: Value,
+}
+
+/// One accepted claim. Explore claims share the scope `explore` and their number is the candidate's id; an exploit
+/// worker's refinement claims are scoped to its candidate (`c3`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Claim {
+    scope: String,
+    n: u32,
+    idea: String,
+    worker: String,
 }
 
 fn ledger(dir: &Path) -> Result<Vec<Row>> {
@@ -351,19 +379,27 @@ fn evaluator_env(tmp: &Path) -> Vec<(String, String)> {
     env
 }
 
-/// `ar.eval(note)` inside an episode: snapshot the editable files, score the snapshot, append to the ledger.
+/// `ar.eval(note)` inside an episode: snapshot the editable files, score the snapshot, append to the ledger. Explore and
+/// exploit workers score only after their claim is accepted, and their states belong to their candidate.
 pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
-    let (episode, best) = EPISODE.get().context("ar.eval is only available inside an autoresearch episode")?;
+    let (episode, progress) = EPISODE.get().context("ar.eval is only available inside an autoresearch episode")?;
     let spec = &episode.spec;
+    let claim = progress.lock().unwrap().claim;
+    let idea = match (episode.role, claim) {
+        (Role::Explore | Role::Exploit, None) => bail!("claim your idea with ar.claim(\"...\") before scoring it"),
+        (Role::Explore, Some(n)) => n,
+        (Role::Exploit, Some(_)) => episode.idea,
+        (Role::Research | Role::Audit, _) => 0,
+    };
     let files = capture(&pol.workspace, spec)?;
     let snap = save_snap(&episode.dir, &files)?;
-    // An evaluator that reports no `se` is deterministic: a state it already scored validly keeps its stored result.
-    // When this lineage scored it, that result is the whole answer and adds no ledger row; a state only another lineage
-    // scored is recorded for this one, judged against this lineage's best, without running the evaluator again.
+    // An evaluator that reports no `se` is deterministic: a state it already scored validly keeps its stored result. A
+    // probe, or a state its candidate already has, gets that result and no new ledger row; a state only another
+    // candidate scored is recorded for this one, judged against its best, without running the evaluator again.
     let rows = ledger(&episode.dir)?;
     let stored = rows.iter().find(|r| r.snap == snap && r.valid && r.se.is_none());
-    if let Some(r) = stored.filter(|_| rows.iter().any(|o| o.snap == snap && o.lineage == episode.lineage)) {
-        let best = *best.lock().unwrap();
+    if let Some(r) = stored.filter(|_| idea == 0 || rows.iter().any(|o| o.snap == snap && o.idea == idea && o.valid && o.se.is_none())) {
+        let best = progress.lock().unwrap().best;
         return Ok(json!({"n": r.n, "score": r.score, "valid": true, "se": null, "improved": false, "best": best,
             "report": r.report, "cached": true}));
     }
@@ -371,38 +407,116 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
         Some(r) => (r.score, true, None, r.report.clone()),
         None => evaluate(spec, &episode.dir, &files, &spec.eval, false).await?,
     };
-    let mut best = best.lock().unwrap();
     let margin = spec.min_delta.max(se.unwrap_or(0.0));
-    // A lineage's starting state never improves it, so a direction's bar is set by the first state it builds.
-    let improved = valid && snap != episode.start && spec.better(score.unwrap(), *best, if best.is_some() { margin } else { 0.0 });
-    if improved { *best = score; }
-    let row = locked(&episode.dir, || {
-        let row = Row { n: ledger(&episode.dir)?.len() + 1, episode: episode.label.clone(), lineage: episode.lineage,
-            note: note.chars().take(300).collect(), snap, score, valid, se, improved, report: report.clone() };
-        append_line(&episode.dir.join("ledger.jsonl"), &row)?;
-        Ok(row)
-    })?;
-    let mut out = json!({"n": row.n, "score": score, "valid": valid, "se": se, "improved": improved, "best": *best, "report": report});
+    let (improved, best) = {
+        let mut p = progress.lock().unwrap();
+        // The state a worker starts from never improves it, so an explore worker's bar is set by the first state it builds.
+        let improved = idea != 0 && valid && snap != episode.start
+            && spec.better(score.unwrap(), p.best, if p.best.is_some() { margin } else { 0.0 });
+        if improved { p.best = score; }
+        (improved, p.best)
+    };
+    let n = {
+        let _lock = lock_file(&episode.dir.join("ledger.lock"))?;
+        let n = ledger(&episode.dir)?.len() + 1;
+        append_line(&episode.dir.join("ledger.jsonl"), &Row { n, episode: episode.label.clone(), idea,
+            note: note.chars().take(300).collect(), snap, score, valid, se, improved, report: report.clone() })?;
+        n
+    };
+    let mut out = json!({"n": n, "score": score, "valid": valid, "se": se, "improved": improved, "best": best, "report": report});
     if stored.is_some() { out["cached"] = json!(true); }
     Ok(out)
 }
 
-/// Run `f` holding the run's ledger lock, so episodes running side by side number their rows without gaps or repeats.
-fn locked<T>(dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    use std::os::fd::AsRawFd;
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("ledger.lock"))?;
-    ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "could not lock the ledger");
-    let out = f();
+/// `ar.claim(idea)`: claim the idea an explore worker will test, or the refinement an exploit worker will try. Claims
+/// are served one at a time in arrival order under the run's claim lock. A claim is rejected only when two independent
+/// judge calls both find that it shares the core approach of the same earlier claim in its scope, so a borderline idea
+/// gets the benefit of the doubt; a judge that cannot answer accepts. One accepted claim per worker.
+pub async fn claim(host: &crate::host::Host, idea: String) -> Result<Value> {
+    let (episode, progress) = EPISODE.get().context("ar.claim is only available inside an autoresearch episode")?;
+    let scope = match episode.role {
+        Role::Explore => "explore".to_string(),
+        Role::Exploit => format!("c{}", episode.idea),
+        Role::Research | Role::Audit => bail!("ar.claim is for explore and exploit workers"),
+    };
+    let idea: String = idea.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(1_000).collect();
+    ensure!(!idea.is_empty(), "ar.claim needs the idea's text");
+    let path = episode.dir.join("claims.lock");
+    let lock = tokio::task::spawn_blocking(move || lock_file(&path)).await??;
+    if let Some(n) = progress.lock().unwrap().claim { bail!("this worker already claimed #{n}: one idea per worker") }
+    let earlier: Vec<Claim> = read_lines::<Claim>(&episode.dir.join("claims.jsonl"))?.into_iter().filter(|c| c.scope == scope).collect();
+    // A retried episode (label `r1-w3.2`) continues the claim an earlier attempt of the same plan made.
+    let plan = |label: &str| label.split('.').next().unwrap_or(label).to_string();
+    if let Some(mine) = earlier.iter().find(|c| plan(&c.worker) == plan(&episode.label)) {
+        progress.lock().unwrap().claim = Some(mine.n);
+        return Ok(json!({"ok": true, "n": mine.n, "idea": mine.idea,
+            "note": "an earlier attempt of this worker claimed this idea before it was interrupted: continue with it"}));
+    }
+    if let Some(i) = judge(host, &earlier, &idea, episode.role == Role::Exploit).await {
+        return Ok(json!({"ok": false, "same_as": {"n": earlier[i].n, "idea": earlier[i].idea},
+            "claimed": earlier.iter().map(|c| json!({"n": c.n, "idea": c.idea})).collect::<Vec<_>>()}));
+    }
+    let n = earlier.len() as u32 + 1;
+    append_line(&episode.dir.join("claims.jsonl"), &Claim { scope, n, idea, worker: episode.label.clone() })?;
+    // Recorded before the lock is released, so a second claim of this worker waiting on the lock sees it.
+    progress.lock().unwrap().claim = Some(n);
     drop(lock);
-    out
+    Ok(json!({"ok": true, "n": n}))
 }
 
-/// `ar.reset()`: make the episode's editable paths hold its lineage's best scored state again (when nothing has
-/// improved it yet, the state the lineage started from).
+/// The index of the earlier claim a new claim duplicates, when two independent judge calls agree: the same core
+/// approach for explore ideas, the same change for refinements of one candidate.
+async fn judge(host: &crate::host::Host, earlier: &[Claim], idea: &str, refinement: bool) -> Option<usize> {
+    if earlier.is_empty() { return None; }
+    let listed: String = earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
+    let prompt = if refinement {
+        format!("Several researchers each claim one refinement of the same solution. Claimed so far:\n{listed}\n\
+New claim:\n{idea}\n\nIs the new claim the same refinement as one already claimed? Same means the same change to the \
+same part of the solution (the same rule, component or parameter, changed the same way); a change to a different part, \
+or a different kind of change, is a different refinement even when both touch similar things. In one sentence, name \
+what the new claim changes and the closest claimed one. Then end with a line 'Answer: N', where N is the matching \
+claim's number, or 0 if it is a different refinement.")
+    } else {
+        format!("Several researchers each claim one core approach to the same task. Claimed so far:\n{listed}\n\
+New claim:\n{idea}\n\nDoes the new claim use the same core approach as one already claimed? Same core means the same main \
+mechanism that decides what the solution does (the same kind of model, algorithm or signal); differing only in \
+parameters, filters, exits, sizing or added gates still counts as the same, while a different main mechanism is a \
+different core even when it shares ingredients. In one sentence, name the new claim's main mechanism and the closest \
+claimed one. Then end with a line 'Answer: N', where N is the matching claim's number, or 0 if it is a genuinely \
+different core approach.")
+    };
+    let request = json!({"system": "You compare research ideas and answer exactly in the format asked.", "prompt": prompt,
+        "effort": "none", "max_tokens": 2000});
+    let replies = host.complete(json!([request, request])).await.ok()?;
+    let picks: Vec<Option<usize>> = replies.as_array()?.iter().map(|r| r["value"].as_str().and_then(answer_number)).collect();
+    match picks.as_slice() {
+        [Some(a), Some(b)] if a == b && (1..=earlier.len()).contains(a) => Some(a - 1),
+        _ => None,
+    }
+}
+
+/// N from the last `Answer: N` in a judge's reply, tolerating markdown such as `**Answer:** #2`.
+fn answer_number(text: &str) -> Option<usize> {
+    let at = text.to_ascii_lowercase().rfind("answer")?;
+    let rest = text[at + "answer".len()..].trim_start_matches(['*', ':', ' ', '#', '\t']);
+    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+}
+
+/// An exclusive lock on `path`, held until the returned file is dropped: episodes running side by side number ledger
+/// rows without gaps or repeats, and claims are judged one at a time in arrival order.
+fn lock_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+    ensure!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0, "could not lock {}", path.display());
+    Ok(file)
+}
+
+/// `ar.reset()`: put this worker's best scored state back into the editable paths (the state it started from when it
+/// has not improved on it).
 pub fn reset(pol: &crate::policy::Policy) -> Result<Value> {
-    let (episode, best) = EPISODE.get().context("ar.reset is only available inside an autoresearch episode")?;
+    let (episode, progress) = EPISODE.get().context("ar.reset is only available inside an autoresearch episode")?;
     let rows = ledger(&episode.dir)?;
-    let snap = rows.iter().rev().find(|r| r.improved && r.lineage == episode.lineage)
+    let snap = rows.iter().rev().find(|r| r.improved && r.episode == episode.label)
         .map_or_else(|| episode.start.clone(), |r| r.snap.clone());
     let files = load_snap(&episode.dir, &snap)?;
     // The agent controls this workspace, so every change goes the way its own `write` would: a policy-resolved path,
@@ -416,7 +530,7 @@ pub fn reset(pol: &crate::policy::Policy) -> Result<Value> {
     for (rel, bytes) in &files {
         target(rel, true)?.replace(bytes)?;
     }
-    Ok(json!({"best": *best.lock().unwrap()}))
+    Ok(json!({"best": progress.lock().unwrap().best}))
 }
 
 /// Git, configured so a repository's own config cannot run commands (owner context, launch only).
@@ -512,50 +626,52 @@ struct Launch {
     commit: String,
 }
 
-/// Journal records. A lineage is recorded, with what sampling its direction cost, before any episode works on it. An
-/// attempt is `started` before its child runs and `finished` after. Resume closes an attempt that never finished with
-/// a durable `finished` record, charging what the child's journals in its leftover scratch directory recorded, or its
-/// whole allowance when that directory is gone.
+/// One planned episode. A batch (the research, a round's workers, a gate's audits) is planned whole before any of it
+/// starts, so a resumed run finishes exactly the batch it was in.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Plan {
+    label: String,
+    role: Role,
+    idea: u32,
+    start: String,
+    best: Option<f64>,
+    /// An explore worker's seed for generating its idea.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed: Option<String>,
+}
+
+/// A candidate at a gate: an accepted explore claim with its best state and verdicts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Candidate {
+    idea: u32,
+    claim: String,
+    snap: String,
+    search: Option<f64>,
+    select: Option<f64>,
+    good: bool,
+    audit: Option<bool>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    reason: String,
+}
+
+/// Journal records. An episode is `started` before its child runs and `finished` after; resume closes one that never
+/// finished with a durable charge from the killed child's journals (its whole allowance when its scratch directory is
+/// gone), runs what was planned but never started, and continues. Held-out scores, audit verdicts and gates are
+/// journaled once and reused.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Record {
-    Lineage { id: u32, idea: Option<String>, start: String, cost: f64 },
-    Started { attempt: usize, label: String, allowance: f64, #[serde(default)] scratch: Option<PathBuf>, #[serde(default)] lineage: u32 },
-    Finished { attempt: usize, cost: f64, evals: usize, #[serde(default)] interrupted: bool, #[serde(default)] crashed: bool },
-}
-
-/// One line of search, as the journal and ledger tell it: a direction (none when sampling gave nothing) pursued from a
-/// starting state. Ids start at 1; rows of ledgers older than lineages carry 0.
-struct Lineage {
-    id: u32,
-    idea: Option<String>,
-    start: String,
-    /// The bar an eval must beat to improve the lineage, and the state its episodes start from: the last improvement,
-    /// else the start. A direction gets its own hill, so its first valid score improves it even when that is worse than
-    /// the state it started from; without a direction, the start's score is the bar.
-    best: Option<f64>,
-    best_snap: String,
-    evals: usize,
-    /// Episodes that scored something, and consecutive finished episodes that did not improve the lineage.
-    tried: usize,
-    idle: u32,
-}
-
-impl Lineage {
-    fn active(&self) -> bool { self.idle < PATIENCE }
-}
-
-/// Everything the journal and ledger say about the search so far.
-struct State {
-    records: Vec<Record>,
-    rows: Vec<Row>,
-    lineages: Vec<Lineage>,
+    Planned { batch: String, episodes: Vec<Plan> },
+    Started { label: String, plan: String, allowance: f64, #[serde(default)] scratch: Option<PathBuf> },
+    Finished { label: String, cost: f64, evals: usize, #[serde(default)] interrupted: bool, #[serde(default)] crashed: bool },
+    Selected { snap: String, score: Option<f64> },
+    Audited { idea: u32, snap: String, pass: bool, reason: String },
+    Gate { round: usize, candidates: Vec<Candidate>, chosen: Vec<u32> },
 }
 
 /// What one episode spent and did.
 struct Outcome {
     cost: f64,
-    evals: usize,
     crashed: bool,
     stderr: String,
 }
@@ -574,54 +690,24 @@ impl Orchestrator {
         append_line(&self.dir.join("journal.jsonl"), record)
     }
 
+    fn records(&self) -> Result<Vec<Record>> {
+        read_lines(&self.dir.join("journal.jsonl"))
+    }
+
     fn seed(&self) -> Result<String> {
         Ok(std::fs::read_to_string(self.dir.join("seed"))?.trim().to_string())
     }
 
-    fn state(&self) -> Result<State> {
-        let records: Vec<Record> = read_lines(&self.dir.join("journal.jsonl"))?;
-        let rows = ledger(&self.dir)?;
-        let mut lineages: Vec<Lineage> = records.iter().filter_map(|r| {
-            let Record::Lineage { id, idea, start, .. } = r else { return None };
-            let own: Vec<&Row> = rows.iter().filter(|r| r.lineage == *id).collect();
-            let last = own.iter().rev().find(|r| r.improved);
-            Some(Lineage {
-                id: *id, idea: idea.clone(), start: start.clone(),
-                best: last.map_or_else(|| idea.is_none().then(|| self.known(&rows, start).0).flatten(), |r| r.score),
-                best_snap: last.map_or_else(|| start.clone(), |r| r.snap.clone()),
-                evals: own.len(), tried: 0, idle: 0,
-            })
-        }).collect();
-        // Episode outcomes in journal order: an improvement resets a lineage's patience; a crash does not count.
-        for r in &records {
-            let Record::Finished { attempt, evals, crashed: false, .. } = r else { continue };
-            let started = records.iter().find_map(|s| match s {
-                Record::Started { attempt: a, label, lineage, .. } if a == attempt => Some((label, *lineage)),
-                _ => None,
-            });
-            let Some((label, id)) = started else { continue };
-            let Some(l) = lineages.iter_mut().find(|l| l.id == id) else { continue };
-            if *evals > 0 { l.tried += 1; }
-            if rows.iter().any(|r| r.episode == *label && r.improved) { l.idle = 0 } else { l.idle += 1 }
-        }
-        Ok(State { records, rows, lineages })
+    /// Every episode gets at most an equal share of the budget: the research, each round's workers and each gate's audits.
+    fn share(&self) -> f64 {
+        self.launch.budget / (1 + ROUNDS * (WORKERS + TOP)) as f64
     }
 
-    /// The lineage with the best score; ties and unscored lineages go to the earliest.
-    fn leader<'a>(&self, lineages: impl Iterator<Item = &'a Lineage>) -> Option<&'a Lineage> {
-        lineages.fold(None, |lead: Option<&Lineage>, l| match (lead, l.best) {
-            (None, _) => Some(l),
-            (Some(a), Some(b)) if self.spec().better(b, a.best, 0.0) => Some(l),
-            (lead, _) => lead,
-        })
-    }
-
-    /// Score the seed with the search evaluator before any episode, so directions are sampled with its report and
-    /// episodes know where they start. Kept in `seed.json`, outside the ledger, which holds the agents' evaluations.
+    /// Score the seed with the search evaluator before any episode, so every episode knows where it starts. Kept in
+    /// `seed.json` (written whole or not at all), outside the ledger, which holds the agents' evaluations.
     async fn baseline(&self) -> Result<()> {
         let (score, valid, _, report) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &self.seed()?)?, &self.spec().eval, false).await?;
         eprintln!("hx ar: seed scores {}", if valid { show(score) } else { "invalid".into() });
-        // Written whole or not at all: resume scores the seed again when the file is missing.
         let tmp = self.dir.join("seed.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&json!({"score": score.filter(|_| valid), "report": report}))?)?;
         std::fs::rename(&tmp, self.dir.join("seed.json"))?;
@@ -636,194 +722,100 @@ impl Orchestrator {
         (baseline["score"].as_f64(), baseline["report"].clone())
     }
 
-    /// Up to `n` deliberately different directions for a lineage starting from `start`, and what sampling them cost.
-    /// Sampling never fails the search: without a provider answer there are just no directions.
-    async fn ideate(&self, n: usize, start: &str, state: &State) -> (Vec<String>, f64) {
-        let session = self.dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let (Ok(mut cfg), Ok(prompt)) = (crate::llm_cfg(&self.launch.child_args, session), self.ideation_prompt(start, state)) else { return (vec![], 0.0) };
-        let (Ok(key), Ok(http)) = (cfg.key(), reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build()) else { return (vec![], 0.0) };
-        cfg.price = crate::llm::fetch_price(&cfg).await;
-        let samples = futures::future::join_all((0..n).map(|_| crate::ssot::sample(&http, &cfg, &key, &prompt))).await;
-        let cost = samples.iter().map(|s| s.1).sum();
-        (samples.into_iter().filter_map(|s| s.0).collect(), cost)
+    /// The held-out score of `snap` (none without a select evaluator, or when it is invalid), journaled once.
+    async fn select(&self, snap: &str) -> Result<Option<f64>> {
+        let Some(cmd) = self.spec().select.clone() else { return Ok(None) };
+        if let Some(score) = self.records()?.into_iter().find_map(|r| match r { Record::Selected { snap: s, score } if s == snap => Some(score), _ => None }) {
+            return Ok(score);
+        }
+        let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, snap)?, &cmd, true).await?;
+        let score = score.filter(|_| valid);
+        self.journal(&Record::Selected { snap: snap.into(), score })?;
+        Ok(score)
     }
 
-    fn ideation_prompt(&self, start: &str, state: &State) -> Result<String> {
-        let mut t = format!("{}\n\n## Starting state\n", self.launch.program.trim_end());
-        let mut left = STATE_CHARS;
-        for (rel, bytes) in load_snap(&self.dir, start)? {
-            let Ok(text) = String::from_utf8(bytes) else { continue };
-            if left == 0 { break; }
-            let shown = clip(&text, left);
-            left = left.saturating_sub(text.chars().count());
-            t += &format!("\n### {rel}\n\n```\n{shown}\n```\n");
-        }
-        let (score, report) = self.known(&state.rows, start);
-        if score.is_some() {
-            let report = serde_json::to_string(&report).unwrap_or_default();
-            t += &format!("\nEvaluator report of this state (score {}):\n\n```json\n{}\n```\n", show(score), clip(&report, REPORT_CHARS / 2));
-        }
-        if !state.lineages.is_empty() {
-            t += "\n## Directions already tried\n\n";
-            for l in &state.lineages {
-                t += &format!("- {} (best score {})\n", l.idea.as_deref().unwrap_or("(none: refine the current approach)").replace('\n', " "), show(l.best));
-            }
-        }
-        t += &format!("\nPropose one research direction for this task: the core approach a solution should be built around, not a \
-tweak, filter or parameter change on top of the starting state{}. Say what to build, why it could score well under this \
-evaluator, and the first experiment. At most 120 words.", if state.lineages.is_empty() { "" } else { ", and different from every direction already tried" });
-        Ok(t)
+    /// The final answer of the last finished attempt of a planned episode: a worker's finding, the brief, a verdict.
+    fn answer(&self, records: &[Record], plan: &str) -> Option<String> {
+        let label = records.iter().rev().find_map(|r| match r {
+            Record::Started { label, plan: p, .. } if p == plan => Some(label.clone()),
+            _ => None,
+        })?;
+        let report: Value = serde_json::from_slice(&std::fs::read(self.dir.join("episodes").join(format!("{label}.report.json"))).ok()?).ok()?;
+        report["final_answer"].as_str().map(str::trim).filter(|a| !a.is_empty()).map(String::from)
     }
 
-    /// Start up to `n` lineages from `start`, each with its own sampled direction; one without a direction when
-    /// sampling gives nothing.
-    async fn spawn(&mut self, n: usize, start: &str, state: &State) -> Result<()> {
-        let (ideas, cost) = self.ideate(n, start, state).await;
-        let first = state.lineages.iter().map(|l| l.id).max().unwrap_or(0) + 1;
-        let ideas: Vec<Option<String>> = if ideas.is_empty() { vec![None] } else { ideas.into_iter().map(Some).collect() };
-        eprintln!("hx ar: {} new lineage(s) from state {start} (${cost:.4} to sample directions)", ideas.len());
-        for (i, idea) in ideas.into_iter().enumerate() {
-            self.journal(&Record::Lineage { id: first + i as u32, idea, start: start.into(), cost: if i == 0 { cost } else { 0.0 } })?;
+    /// Journal a batch once.
+    fn plan(&self, batch: &str, episodes: Vec<Plan>) -> Result<()> {
+        if !self.records()?.iter().any(|r| matches!(r, Record::Planned { batch: b, .. } if b == batch)) {
+            self.journal(&Record::Planned { batch: batch.into(), episodes })?;
         }
-        self.spent += cost;
         Ok(())
     }
 
-    fn task(&self, label: &str, allowance: f64, lineage: &Lineage, state: &State) -> Result<String> {
-        let spec = self.spec();
-        let better = if spec.direction == "max" { "higher" } else { "lower" };
-        let mut t = format!("{}\n\n## Autoresearch episode {label}\n\n", self.launch.program.trim_end());
-        t += &format!("You are one episode of an autoresearch loop. Improve the score by changing the editable paths: {}. \
-Your workspace is a fresh copy of the project without Git history. You may create scratch files anywhere, but only the \
-editable paths are scored and carried to later episodes.\n\n", spec.editable.join(", "));
-        if let Some(idea) = &lineage.idea {
-            let quoted: String = idea.lines().map(|l| format!("> {l}\n")).collect();
-            t += &format!("## Direction\n\nThe search pursues several directions, each as its own lineage. This episode works on \
-lineage {}, whose direction is:\n\n{quoted}\nBuild the solution around this direction: make it the core of the approach, not a filter \
-or tweak on top of the current state, and give it a fair test before judging it. Its states are compared within this lineage, so \
-early scores below other lineages are fine. If it clearly cannot work, say why in your ar.eval notes and finish.\n\n", lineage.id);
-        }
-        t += &format!("- `ar.eval(\"one-line hypothesis\")` scores the current editable files with the owner's frozen evaluator and returns \
-{{n, score, valid, se, improved, best, report}}; {better} scores are better, and `improved` means better than this lineage's best. \
-Only states scored by ar.eval count: anything you measure another way is discarded.\n\
-- `ar` is a built-in global table like `sh` and `read`. `vars()` lists only your own globals, so it never shows `ar`: call `ar.eval` directly.\n\
-- Every scored state is kept, and later episodes of this lineage start from its best one. `ar.reset()` puts this lineage's best \
-state back into the editable paths: use it instead of reverting by hand. Bold changes are safe.\n\
-- When the evaluator reports no `se`, it is deterministic: scoring a state it already scored validly returns the stored \
-result with `cached: true`, so there is no need to re-check one.\n");
-        if spec.min_delta > 0.0 {
-            t += &format!("- A score counts as an improvement only when it beats the lineage's best by more than {}: smaller differences are noise.\n", spec.min_delta);
-        }
-        t += &format!("- Work in experiments: form a hypothesis, edit, ar.eval, read the report, decide the next step. One idea per eval, so the ledger stays readable.\n\
-- This episode has about ${allowance:.2} of model budget. Use it on experiments. Finishing ends the episode; a later episode of this \
-lineage continues from its best state with its ledger.\n");
-        if spec.select.is_some() {
-            t += "- The final result is chosen on held-out data you cannot see. Prefer changes with a reason to generalize over tuning \
-to the reported numbers.\n";
-        }
-        t += "\n## Ledger of this lineage (oldest first)\n\n";
-        let rows: Vec<&Row> = state.rows.iter().filter(|r| r.lineage == lineage.id).collect();
-        t += if rows.is_empty() { "(empty: no evaluations yet)\n" } else { "n | score | improved | note\n" };
-        let skip = rows.len().saturating_sub(SHOWN);
-        if skip > 0 { t += &format!("({skip} older rows omitted)\n"); }
-        for r in &rows[skip..] {
-            let score = match (r.valid, r.score) { (true, Some(s)) => format!("{s:.6}"), _ => "invalid".into() };
-            t += &format!("{} | {score} | {} | {}\n", r.n, if r.improved { "yes" } else { "" }, r.note.replace('\n', " "));
-        }
-        let others: Vec<&Lineage> = state.lineages.iter().filter(|l| l.id != lineage.id).collect();
-        if !others.is_empty() {
-            t += "\n## Other lineages\n\n";
-            for l in others {
-                let idea = clip(&l.idea.as_deref().unwrap_or("(no direction)").replace('\n', " "), 300);
-                t += &format!("- lineage {}: {idea} | best {} over {} evals{}\n", l.id, show(l.best), l.evals, if l.active() { "" } else { ", retired" });
-            }
-        }
-        let (score, report) = self.known(&state.rows, &lineage.best_snap);
-        t += &match (lineage.best_snap == lineage.start, score) {
-            (false, score) => format!("\nThe workspace holds this lineage's best state (score {}).\n", show(score)),
-            (true, Some(score)) => format!("\nThe workspace holds this lineage's starting state (score {score:.6}), which it has not improved yet.\n"),
-            (true, None) => "\nThe workspace holds this lineage's starting state; it has not been scored yet. Start with ar.eval on it as a baseline.\n".into(),
-        };
-        // The full report of that state, so an episode starts from the evaluator's detail rather than one number.
-        if !report.is_null() {
-            let text = serde_json::to_string_pretty(&report).unwrap_or_default();
-            t += &format!("\n## Evaluator report of that state\n\n```json\n{}\n```\n", clip(&text, REPORT_CHARS));
-        }
-        Ok(t)
-    }
-
-    /// The search: lineages that have scored nothing yet run side by side, splitting what is left; then the leading
-    /// active lineage gets the next episode; when every lineage is retired, a new direction starts from the best state.
-    async fn search(&mut self) -> Result<()> {
-        let (mut crashes, mut idle) = (0, 0);
+    /// Run a planned batch side by side until every episode has finished, or crashed `MAX_CRASHES` times. Each runs with
+    /// at most its equal share, or an equal split of what is left.
+    async fn run_batch(&mut self, batch: &str) -> Result<()> {
+        let mut crashes = 0;
         loop {
-            let remaining = self.launch.budget - self.spent;
-            if remaining < self.launch.budget * MIN_SLICE { break; }
-            let state = self.state()?;
-            let attempt = state.records.iter().filter_map(|r| match r { Record::Started { attempt, .. } => Some(*attempt), _ => None })
-                .max().unwrap_or(0) + 1;
-            if attempt > MAX_ATTEMPTS { break; }
-            let fresh: Vec<&Lineage> = state.lineages.iter().filter(|l| l.tried == 0 && l.active()).collect();
-            let batch = match self.leader(state.lineages.iter().filter(|l| l.active())) {
-                _ if !fresh.is_empty() => fresh,
-                Some(lead) => vec![lead],
-                None => {
-                    // The best state found: the leading lineage's, unless no lineage has beaten the seed.
-                    let seed = self.seed()?;
-                    let seed_score = self.known(&state.rows, &seed).0;
-                    let start = match self.leader(state.lineages.iter()) {
-                        Some(l) if l.best.is_some() && seed_score.is_none_or(|s| !self.spec().better(s, l.best, 0.0)) => l.best_snap.clone(),
-                        _ => seed,
-                    };
-                    let n = if state.lineages.is_empty() { DRAFTS } else { 1 };
-                    self.spawn(n, &start, &state).await?;
-                    continue;
-                }
+            let records = self.records()?;
+            let plans: Vec<Plan> = records.iter().find_map(|r| match r {
+                Record::Planned { batch: b, episodes } if b == batch => Some(episodes.clone()),
+                _ => None,
+            }).unwrap_or_default();
+            let attempts = |plan: &str| -> Vec<(&String, bool)> {
+                records.iter().filter_map(|r| match r { Record::Started { label, plan: p, .. } if p == plan => Some(label), _ => None })
+                    .map(|label| (label, records.iter().any(|f| matches!(f, Record::Finished { label: l, crashed: true, .. } if l == label))))
+                    .collect()
             };
-            eprintln!("hx ar: ${remaining:.2} left");
-            let share = remaining / batch.len() as f64;
-            let runs = batch.iter().enumerate().map(|(i, l)| self.episode(attempt + i, l, share, &state));
+            let pending: Vec<(Plan, String)> = plans.into_iter().filter_map(|plan| {
+                let tries = attempts(&plan.label);
+                let done = tries.iter().any(|(_, crashed)| !crashed) || tries.len() >= MAX_CRASHES as usize;
+                let label = if tries.is_empty() { plan.label.clone() } else { format!("{}.{}", plan.label, tries.len() + 1) };
+                (!done).then_some((plan, label))
+            }).collect();
+            let retries_left = pending.iter().any(|(plan, _)| attempts(&plan.label).len() + 1 < MAX_CRASHES as usize);
+            if pending.is_empty() { return Ok(()); }
+            let remaining = self.launch.budget - self.spent;
+            if remaining < self.launch.budget * MIN_SLICE { return Ok(()); }
+            let allowance = self.share().min(remaining / pending.len() as f64);
+            let state = self.state()?;
+            let mut runs = vec![];
+            for (plan, label) in &pending {
+                runs.push(self.episode(plan, label, allowance, self.task(plan, label, allowance, &state)?));
+            }
             let outcomes = futures::future::join_all(runs).await.into_iter().collect::<Result<Vec<_>>>()?;
             self.spent += outcomes.iter().map(|o| o.cost).sum::<f64>();
-            if outcomes.iter().any(|o| o.evals > 0) { (crashes, idle) = (0, 0); continue; }
-            if outcomes.iter().all(|o| o.crashed) {
-                crashes += 1;
-                // Before the first agent eval of the whole run, repeated crashes mean misconfiguration: stop, don't wait hours.
-                if state.rows.is_empty() && crashes >= MAX_CRASHES {
-                    let last: Vec<&str> = outcomes[0].stderr.trim().lines().rev().take(15).collect();
-                    bail!("episode children keep failing before any eval; last error:\n{}", last.into_iter().rev().collect::<Vec<_>>().join("\n"));
-                }
-                if crashes > MAX_CRASHES { break; }
-                let base = std::env::var("HX_AR_RETRY_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(60);
-                let pause = base << crashes;
-                eprintln!("hx ar: episodes crashed before any eval; retrying in {pause}s");
-                tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
-            } else {
-                // Agents that finish without scoring anything: one more round, then the search is over.
-                idle += 1;
-                if idle >= MAX_IDLE { break; }
+            if !outcomes.iter().all(|o| o.crashed) { crashes = 0; continue; }
+            crashes += 1;
+            // Before the first eval of the whole run, repeated crashes mean misconfiguration: stop, don't wait hours.
+            if ledger(&self.dir)?.is_empty() && crashes >= MAX_CRASHES {
+                let last: Vec<&str> = outcomes[0].stderr.trim().lines().rev().take(15).collect();
+                bail!("episode children keep failing before any eval; last error:\n{}", last.into_iter().rev().collect::<Vec<_>>().join("\n"));
             }
+            if !retries_left { return Ok(()); }
+            let base = std::env::var("HX_AR_RETRY_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(60);
+            let pause = base << crashes;
+            eprintln!("hx ar: every episode of {batch} crashed before any eval; retrying in {pause}s");
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         }
-        Ok(())
     }
 
-    /// One fresh child run on `lineage`, in its own copy of the base holding the lineage's best state.
-    async fn episode(&self, attempt: usize, lineage: &Lineage, allowance: f64, state: &State) -> Result<Outcome> {
-        let tag = format!("e{attempt}");
+    /// One fresh child run in its own copy of the base holding its starting state.
+    async fn episode(&self, plan: &Plan, label: &str, allowance: f64, task: String) -> Result<Outcome> {
         let ep_dir = self.dir.join("episodes");
         std::fs::create_dir_all(&ep_dir)?;
-        let ep_path = ep_dir.join(format!("{tag}.json"));
-        let episode = Episode { dir: self.dir.clone(), label: tag.clone(), spec: self.spec().clone(), lineage: lineage.id,
-            start: lineage.start.clone(), best: lineage.best };
+        let ep_path = ep_dir.join(format!("{label}.json"));
+        let episode = Episode { dir: self.dir.clone(), label: label.into(), spec: self.spec().clone(), role: plan.role,
+            idea: plan.idea, start: plan.start.clone(), best: plan.best };
         std::fs::write(&ep_path, serde_json::to_vec_pretty(&episode)?)?;
-        let task_path = ep_dir.join(format!("{tag}.md"));
-        std::fs::write(&task_path, self.task(&tag, allowance, lineage, state)?)?;
+        let task_path = ep_dir.join(format!("{label}.md"));
+        std::fs::write(&task_path, task)?;
         let scratch = Scratch::new("ws")?;
         let ws = scratch.0.join("ws");
         copy_tree(&self.dir.join("base"), &ws)?;
-        place(&ws, self.spec(), &load_snap(&self.dir, &lineage.best_snap)?)?;
-        self.journal(&Record::Started { attempt, label: tag.clone(), allowance, scratch: Some(scratch.0.clone()), lineage: lineage.id })?;
-        eprintln!("hx ar: episode {tag} on lineage {} (${allowance:.2}, best {})", lineage.id, show(lineage.best));
+        place(&ws, self.spec(), &load_snap(&self.dir, &plan.start)?)?;
+        self.journal(&Record::Started { label: label.into(), plan: plan.label.clone(), allowance, scratch: Some(scratch.0.clone()) })?;
+        eprintln!("hx ar: {label} ({:?}{}, ${allowance:.2})", plan.role, if plan.idea > 0 { format!(" #{}", plan.idea) } else { String::new() });
         let out = tokio::process::Command::new(std::env::current_exe()?)
             .arg("run").arg("--workspace").arg(&ws).args(&self.launch.child_args)
             .arg("--prompt-file").arg(&task_path)
@@ -831,61 +823,218 @@ to the reported numbers.\n";
             .env("HX_AR_EPISODE", &ep_path)
             .stdin(std::process::Stdio::null())
             .output().await?;
-        std::fs::write(ep_dir.join(format!("{tag}.stderr")), &out.stderr)?;
+        std::fs::write(ep_dir.join(format!("{label}.stderr")), &out.stderr)?;
         let report = String::from_utf8_lossy(&out.stdout).lines().rev()
             .find_map(|l| serde_json::from_str::<Value>(l).ok()).unwrap_or(Value::Null);
-        std::fs::write(ep_dir.join(format!("{tag}.report.json")), serde_json::to_vec_pretty(&report)?)?;
-        let logs = keep_logs(&ws, &ep_dir, &tag)?;
+        std::fs::write(ep_dir.join(format!("{label}.report.json")), serde_json::to_vec_pretty(&report)?)?;
+        let logs = keep_logs(&ws, &ep_dir, label)?;
         drop(scratch);
         let cost = report["cost_usd"].as_f64().unwrap_or_else(|| logged_cost(&logs, allowance));
-        let evals = ledger(&self.dir)?.iter().filter(|r| r.episode == tag).count();
+        let evals = ledger(&self.dir)?.iter().filter(|r| r.episode == label).count();
         let crashed = evals == 0 && report.is_null();
-        self.journal(&Record::Finished { attempt, cost, evals, interrupted: false, crashed })?;
+        self.journal(&Record::Finished { label: label.into(), cost, evals, interrupted: false, crashed })?;
         let end = if report["finished"] == true { "finished" } else { report["stopped"].as_str().unwrap_or("stopped") };
-        eprintln!("hx ar: episode {tag}: {evals} evals, ${cost:.3}, {end}");
-        Ok(Outcome { cost, evals, crashed, stderr: String::from_utf8_lossy(&out.stderr).into_owned() })
+        eprintln!("hx ar: {label}: {evals} evals, ${cost:.3}, {end}");
+        Ok(Outcome { cost, crashed, stderr: String::from_utf8_lossy(&out.stderr).into_owned() })
     }
 
-    /// The final pick: among the seed and every improvement of every lineage, the state that scores best on the select
-    /// evaluator (held-out early stopping). Without select, or if select is unusable for all of them, the search best.
-    async fn choose(&self, state: &State) -> Result<(String, Option<f64>, Option<f64>, bool, Vec<Value>)> {
-        let seed = self.seed()?;
-        let mut checkpoints: Vec<(String, Option<f64>)> = vec![(seed.clone(), self.known(&state.rows, &seed).0)];
-        for r in state.rows.iter().filter(|r| r.improved) {
-            if !checkpoints.iter().any(|c| c.0 == r.snap) { checkpoints.push((r.snap.clone(), r.score)); }
+    fn state(&self) -> Result<State> {
+        let records = self.records()?;
+        let rows = ledger(&self.dir)?;
+        let claims: Vec<Claim> = read_lines(&self.dir.join("claims.jsonl"))?;
+        let brief = self.answer(&records, "r0-research").unwrap_or_else(|| "(none: the research episode wrote no brief)".into());
+        // A finding per finished worker attempt: its claim, best score and final answer.
+        let mut findings = String::new();
+        for r in &records {
+            let Record::Finished { label, crashed: false, .. } = r else { continue };
+            if !label.starts_with('r') || label.starts_with("r0") { continue; }
+            let claim = claims.iter().rev().find(|c| c.worker == *label).map_or("(no accepted claim)".to_string(), |c| match c.scope.as_str() {
+                "explore" => format!("idea #{}: {}", c.n, c.idea),
+                scope => format!("refinement of #{}: {}", &scope[1..], c.idea),
+            });
+            let best = rows.iter().filter(|x| x.episode == *label && x.improved).filter_map(|x| x.score)
+                .fold(None, |b: Option<f64>, s| if self.spec().better(s, b, 0.0) { Some(s) } else { b });
+            let text = std::fs::read(self.dir.join("episodes").join(format!("{label}.report.json"))).ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| v["final_answer"].as_str().map(String::from)).unwrap_or_default();
+            findings += &format!("### {label}: {} (best {})\n\n{}\n\n", claim.replace('\n', " "), show(best),
+                clip(text.trim(), FINDING_CHARS));
         }
-        let search_best = checkpoints.iter().fold(checkpoints[0].clone(), |best, c| match c.1 {
-            Some(s) if self.spec().better(s, best.1, 0.0) => c.clone(),
-            _ => best,
-        });
-        let Some(cmd) = self.spec().select.clone() else { return Ok((search_best.0, search_best.1, None, false, vec![])) };
-        let mut scored = vec![];
-        let mut winner: Option<(String, Option<f64>, f64)> = None;
-        for (snap, search) in checkpoints {
-            let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &snap)?, &cmd, true).await?;
-            let held = score.filter(|_| valid);
-            scored.push(json!({"snap": snap, "search": search, "select": held}));
-            if let Some(h) = held && self.spec().better(h, winner.as_ref().map(|w| w.2), 0.0) { winner = Some((snap, search, h)); }
+        Ok(State { rows, claims, brief, findings })
+    }
+
+    fn protocol(&self, role: Role, allowance: f64) -> String {
+        let spec = self.spec();
+        let better = if spec.direction == "max" { "higher" } else { "lower" };
+        let mut t = format!("- `ar.eval(\"one-line note\")` scores the current editable files ({}) with the owner's frozen evaluator and \
+returns {{n, score, valid, se, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count.\n\
+- `ar` is a built-in global table like `sh` and `read`. `vars()` lists only your own globals, so it never shows `ar`: call it directly.\n\
+- When the evaluator reports no `se`, it is deterministic: re-scoring a state returns its stored result with `cached: true`.\n",
+            spec.editable.join(", "));
+        if matches!(role, Role::Explore | Role::Exploit) {
+            t += "- `improved` means better than your best so far";
+            if spec.min_delta > 0.0 { t += &format!(" by more than {} (smaller differences are noise)", spec.min_delta); }
+            t += ". `ar.reset()` puts your best scored state back into the editable paths: use it instead of reverting by hand.\n\
+- Work in experiments: form a hypothesis, edit, ar.eval, read the report, decide the next step. One change per eval, so the ledger stays readable.\n";
+        } else {
+            t += "- Your evaluations are probes: recorded, never a candidate. Change the editable files freely to test a question.\n";
         }
-        Ok(match winner {
-            Some((snap, search, held)) => (snap, search, Some(held), false, scored),
-            None => {
-                eprintln!("hx ar: no checkpoint has a valid held-out score; keeping the search best");
-                (search_best.0, search_best.1, None, true, scored)
+        if spec.select.is_some() {
+            t += "- Candidates are judged on held-out data no agent sees. Prefer changes with a reason to generalize over tuning to the reported numbers.\n";
+        }
+        t + &format!("- This episode has about ${allowance:.2} of model budget.\n")
+    }
+
+    fn task(&self, plan: &Plan, label: &str, allowance: f64, state: &State) -> Result<String> {
+        let spec = self.spec();
+        let (score, report) = self.known(&state.rows, &plan.start);
+        let report = clip(&serde_json::to_string_pretty(&report).unwrap_or_default(), REPORT_CHARS);
+        let program = self.launch.program.trim_end();
+        let brief = format!("## Brief from the research lead\n\n{}\n\n", clip(&state.brief, BRIEF_CHARS));
+        let findings = if state.findings.is_empty() { String::new() } else { format!("## Findings so far\n\n{}", state.findings) };
+        let claim = |idea: u32| state.claims.iter().find(|c| c.scope == "explore" && c.n == idea).map_or(String::new(), |c| c.idea.clone());
+        let starting = format!("## Starting state\n\nYour workspace holds it (search score {}). Its evaluator report:\n\n```json\n{report}\n```\n", show(score));
+        Ok(match plan.role {
+            Role::Research => format!("{program}\n\n## Autoresearch research lead ({label})\n\n\
+You lead an autoresearch run. Next, {WORKERS} workers will each pursue a different idea to improve the score by changing the \
+editable paths ({}). Study the task first, so their work is grounded, and write the brief every worker gets:\n\
+- the objective, and exactly how the evaluator computes the score (read the code and data you can see);\n\
+- rules and constraints: what is banned, what makes a result invalid;\n\
+- what the starting state does and where it is weak;\n\
+- traps: ways a score could rise without real improvement (evaluator quirks, overfitting, degenerate solutions) that workers must avoid;\n\
+- open questions worth testing.\n\
+Do not solve the task: the workers do that. Finish with the brief as your final answer, at most 800 words, facts first, \
+without prescribing one solution.\n\n{}\n{starting}", spec.editable.join(", "), self.protocol(plan.role, allowance)),
+            Role::Explore => format!("{program}\n\n{brief}## Autoresearch explore worker {label}\n\n\
+You are one of {WORKERS} workers exploring side by side. Each tests a different core approach to improving the score.\n\n\
+1. Generate your idea from your seed: <seed>{}</seed>. List 5 to 7 root-level dimensions along which approaches to this \
+task differ fundamentally (not parameters or filters), each with at least 6 options from conventional to radical. Pick one \
+option per dimension using a different part of the seed (for example the sum of the character codes of a segment, mod the \
+number of options). Commit to the picks even if unusual, and compose one coherent idea: the core approach to build, not a \
+tweak on top of the starting state.\n\
+2. Claim it before building: `ar.claim(\"the idea in two or three sentences\")`. Claims are served first come, first served. \
+If it returns `ok = false`, another worker already claimed the same core approach (`same_as`; `claimed` lists every claim): \
+pick again from a different part of your seed and claim a different core. ar.eval works only after an accepted claim.\n\
+3. Build the idea, score it with ar.eval, read the report, fix and improve. Your first valid state sets your bar, even below \
+the starting state's score: build the idea properly before judging it.\n\
+4. Finish with your finding as the final answer: the idea, what you built, your best score, what worked and what did not, \
+and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwrap_or(label), self.protocol(plan.role, allowance)),
+            Role::Exploit => {
+                let rows: Vec<&Row> = state.rows.iter().filter(|r| r.idea == plan.idea).collect();
+                let skip = rows.len().saturating_sub(SHOWN);
+                let mut ledger = format!("n | score | improved | worker | note\n{}", if skip > 0 { format!("({skip} older rows omitted)\n") } else { String::new() });
+                for r in &rows[skip..] {
+                    let score = match (r.valid, r.score) { (true, Some(s)) => format!("{s:.6}"), _ => "invalid".into() };
+                    ledger += &format!("{} | {score} | {} | {} | {}\n", r.n, if r.improved { "yes" } else { "" }, r.episode, r.note.replace('\n', " "));
+                }
+                format!("{program}\n\n{brief}{findings}## Autoresearch exploit worker {label}: candidate #{}\n\n\
+Candidate #{}'s idea: {}\n\nIt is among the strongest candidates{}. Several workers refine it side by side; improve it:\n\n\
+1. Choose one refinement, a change with a reason to generalize rather than tuning to the reported numbers, and claim it: \
+`ar.claim(\"the refinement in one or two sentences\")`. If it returns `ok = false`, another worker claimed the same \
+refinement first: choose a different one. ar.eval works only after an accepted claim.\n\
+2. Implement it, ar.eval, read the report, fix and improve. An improvement must beat the candidate's best.\n\
+3. Finish with your finding as the final answer: what you changed, your best score, what worked and what did not.\n\n{}\n\
+## Ledger of candidate #{}\n\n{ledger}\n{starting}", plan.idea, plan.idea, claim(plan.idea),
+                    if spec.select.is_some() { " on both the search and the held-out evaluation" } else { "" },
+                    self.protocol(plan.role, allowance), plan.idea)
             }
+            Role::Audit => format!("{program}\n\n{brief}{findings}## Autoresearch auditor {label}: candidate #{}\n\n\
+Candidate #{} ({}) is about to be kept as a result. Your workspace holds its best state. Decide whether its score is earned:\n\
+- Read the state and explain where its score comes from.\n\
+- Look for an evaluator hole: fills, prices or outcomes the real system would not give, lookahead or leaked information, \
+data the solution should not see, rule violations, or degenerate behaviour the score rewards by mistake.\n\
+- To test a suspicion, write probe states (for example the same trick in isolation) and ar.eval them.\n\
+Overfitting alone is not a failure: held-out data handles that. Finish with your reasoning and a last line \
+`VERDICT: PASS` (the score is earned) or `VERDICT: FAIL: reason` (it comes from a hole or a rule violation).\n\n{}\n{starting}",
+                plan.idea, plan.idea, claim(plan.idea), self.protocol(plan.role, allowance)),
         })
     }
 
+    /// Candidates after `round`: every accepted explore claim with a valid improved state, at its best search state.
+    /// Good: beats the seed on search by more than `min_delta`, and is not worse than the seed on select. The best good
+    /// ones (by select, else search; one per distinct state) are audited until `TOP` pass or none is left; those go on.
+    async fn gate(&mut self, round: usize) -> Result<Vec<u32>> {
+        let seed = self.seed()?;
+        let seed_search = self.known(&ledger(&self.dir)?, &seed).0;
+        let seed_select = self.select(&seed).await?;
+        let prefix = format!("audit{round}.");
+        loop {
+            // A resumed run first finishes the audit batch it was in: verdicts come from that batch's own plans.
+            let records = self.records()?;
+            let unjudged = records.iter().find_map(|r| match r {
+                Record::Planned { batch, episodes } if batch.starts_with(&prefix) && episodes.iter().any(|p| !audited(&records, p)) =>
+                    Some((batch.clone(), episodes.clone())),
+                _ => None,
+            });
+            if let Some((batch, plans)) = unjudged {
+                self.run_batch(&batch).await?;
+                self.judge_audits(&plans)?;
+                continue;
+            }
+            let state = self.state()?;
+            let mut candidates = vec![];
+            for c in state.claims.iter().filter(|c| c.scope == "explore") {
+                let best = state.rows.iter().filter(|r| r.idea == c.n && r.improved && r.valid)
+                    .fold(None::<&Row>, |b, r| if self.spec().better(r.score.unwrap(), b.and_then(|b| b.score), 0.0) { Some(r) } else { b });
+                let Some(best) = best else { continue };
+                let beats = seed_search.is_none_or(|s| self.spec().better(best.score.unwrap(), Some(s), self.spec().min_delta));
+                let select = if beats { self.select(&best.snap).await? } else { None };
+                let held = self.spec().select.is_none()
+                    || select.is_some_and(|s| seed_select.is_none_or(|b| !self.spec().better(b, Some(s), 0.0)));
+                let audit = records.iter().rev().find_map(|r| match r {
+                    Record::Audited { idea, snap, pass, reason } if *idea == c.n && *snap == best.snap => Some((*pass, reason.clone())),
+                    _ => None,
+                });
+                candidates.push(Candidate { idea: c.n, claim: c.idea.clone(), snap: best.snap.clone(), search: best.score, select,
+                    good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
+            }
+            let key = |c: &Candidate| if self.spec().select.is_some() { c.select } else { c.search };
+            let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.good && c.audit != Some(false)).collect();
+            ranked.sort_by(|a, b| {
+                let (a, b) = (key(a).unwrap_or(f64::NAN), key(b).unwrap_or(f64::NAN));
+                if self.spec().better(a, Some(b), 0.0) { std::cmp::Ordering::Less } else if self.spec().better(b, Some(a), 0.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
+            });
+            // Two candidates that reached the same state are one result: the better ranked keeps it.
+            let mut seen = std::collections::HashSet::new();
+            ranked.retain(|c| seen.insert(c.snap.clone()));
+            let unaudited: Vec<&Candidate> = ranked.iter().take(TOP).filter(|c| c.audit.is_none()).copied().collect();
+            if unaudited.is_empty() {
+                let chosen: Vec<u32> = ranked.iter().take(TOP).map(|c| c.idea).collect();
+                eprintln!("hx ar: gate {round}: {} candidates, {} good, going on with {:?}", candidates.len(),
+                    candidates.iter().filter(|c| c.good).count(), chosen);
+                self.journal(&Record::Gate { round, candidates, chosen: chosen.clone() })?;
+                return Ok(chosen);
+            }
+            let k = records.iter().filter(|r| matches!(r, Record::Planned { batch, .. } if batch.starts_with(&prefix))).count() + 1;
+            let plans: Vec<Plan> = unaudited.iter().map(|c| Plan { label: format!("a{round}.{k}-c{}", c.idea), role: Role::Audit,
+                idea: c.idea, start: c.snap.clone(), best: None, seed: None }).collect();
+            self.plan(&format!("{prefix}{k}"), plans.clone())?;
+            self.run_batch(&format!("{prefix}{k}")).await?;
+            self.judge_audits(&plans)?;
+        }
+    }
+
+    /// Journal the verdict of each audit plan that has none yet, from its last attempt's final answer.
+    fn judge_audits(&self, plans: &[Plan]) -> Result<()> {
+        let records = self.records()?;
+        for plan in plans.iter().filter(|p| !audited(&records, p)) {
+            let (pass, reason) = verdict(self.answer(&records, &plan.label).as_deref());
+            eprintln!("hx ar: audit of #{}: {}{}", plan.idea, if pass { "pass" } else { "FAIL" }, if reason.is_empty() { String::new() } else { format!(" ({reason})") });
+            self.journal(&Record::Audited { idea: plan.idea, snap: plan.start.clone(), pass, reason })?;
+        }
+        Ok(())
+    }
+
     async fn run(&mut self, mut records: Vec<Record>) -> Result<Value> {
-        // Close attempts that never finished: charged their whole allowance, durably.
+        // Close episodes that never finished, durably.
         let rows = ledger(&self.dir)?;
-        let open: Vec<(usize, String, f64, Option<PathBuf>)> = records.iter().filter_map(|r| match r {
-            Record::Started { attempt, label, allowance, scratch, .. }
-                if !records.iter().any(|f| matches!(f, Record::Finished { attempt: a, .. } if a == attempt)) =>
-                Some((*attempt, label.clone(), *allowance, scratch.clone())),
+        let open: Vec<(String, f64, Option<PathBuf>)> = records.iter().filter_map(|r| match r {
+            Record::Started { label, allowance, scratch, .. }
+                if !records.iter().any(|f| matches!(f, Record::Finished { label: l, .. } if l == label)) =>
+                Some((label.clone(), *allowance, scratch.clone())),
             _ => None,
         }).collect();
-        for (attempt, label, allowance, scratch) in open {
+        for (label, allowance, scratch) in open {
             let evals = rows.iter().filter(|r| r.episode == label).count();
             // The killed child's scratch copy survives a killed orchestrator: keep its journals, charge from them. Without
             // its scratch copy nothing is known, so the whole allowance is charged.
@@ -897,26 +1046,109 @@ to the reported numbers.\n";
                 }
                 None => allowance,
             };
-            let record = Record::Finished { attempt, cost, evals, interrupted: true, crashed: evals == 0 };
+            // Research and audits are judged by their final answer, which a killed child never gave: they are retried
+            // like a worker that scored nothing.
+            let answer_only = label.starts_with("r0-") || label.starts_with('a');
+            let record = Record::Finished { label, cost, evals, interrupted: true, crashed: evals == 0 || answer_only };
             self.journal(&record)?;
             records.push(record);
         }
-        self.spent += records.iter().map(|r| match r { Record::Finished { cost, .. } | Record::Lineage { cost, .. } => *cost, _ => 0.0 }).sum::<f64>();
+        self.spent += records.iter().map(|r| match r { Record::Finished { cost, .. } => *cost, _ => 0.0 }).sum::<f64>();
         if !self.dir.join("seed.json").exists() { self.baseline().await?; }
-        self.search().await?;
+        let seed = self.seed()?;
+        // A select evaluator that cannot score the seed would reject every candidate at the first gate: stop before spending.
+        if self.spec().select.is_some() {
+            ensure!(self.select(&seed).await?.is_some(), "the select evaluator gives no valid score for the seed; fix it before searching");
+        }
+        self.plan("research", vec![Plan { label: "r0-research".into(), role: Role::Research, idea: 0, start: seed.clone(), best: None, seed: None }])?;
+        self.run_batch("research").await?;
+        let mut chosen: Option<Vec<u32>> = None;
+        for round in 1..=ROUNDS {
+            let gate = self.records()?.into_iter().find_map(|r| match r { Record::Gate { round: g, chosen, .. } if g == round => Some(chosen), _ => None });
+            if let Some(c) = gate {
+                let stop = c.is_empty();
+                chosen = Some(c);
+                if stop { break; }
+                continue;
+            }
+            if self.launch.budget - self.spent < self.launch.budget * MIN_SLICE { break; }
+            let plans = match &chosen {
+                None => (1..=WORKERS).map(|w| -> Result<Plan> {
+                    Ok(Plan { label: format!("r{round}-w{w}"), role: Role::Explore, idea: 0, start: seed.clone(), best: None,
+                        seed: Some(crate::ssot::seed()?) })
+                }).collect::<Result<Vec<_>>>()?,
+                Some(c) => {
+                    let last = self.last_gate()?.map(|g| g.0).unwrap_or_default();
+                    (0..WORKERS).map(|w| {
+                        let idea = c[w % c.len()];
+                        let cand = last.iter().find(|x| x.idea == idea);
+                        Plan { label: format!("r{round}-w{}", w + 1), role: Role::Exploit, idea,
+                            start: cand.map_or(seed.clone(), |x| x.snap.clone()), best: cand.and_then(|x| x.search), seed: None }
+                    }).collect()
+                }
+            };
+            self.plan(&format!("round{round}"), plans)?;
+            self.run_batch(&format!("round{round}")).await?;
+            let c = self.gate(round).await?;
+            let stop = c.is_empty();
+            chosen = Some(c);
+            if stop { break; }
+        }
         let state = self.state()?;
         ensure!(!state.rows.is_empty(), "autoresearch made no evaluations; see {}", self.dir.join("episodes").display());
-        let (snap, search, select, fallback, checkpoints) = self.choose(&state).await?;
+        let (candidates, chosen) = self.last_gate()?.unwrap_or_default();
+        let portfolio: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).collect();
+        // The portfolio's states, best held-out score first; the first goes into the workspace (the seed when none).
+        for c in &portfolio {
+            let dir = self.dir.join("portfolio").join(format!("c{}", c.idea));
+            if !dir.exists() { place(&dir, self.spec(), &load_snap(&self.dir, &c.snap)?)?; }
+        }
+        let (snap, search, select) = match portfolio.first() {
+            Some(c) => (c.snap.clone(), c.search, c.select),
+            None => (seed.clone(), self.known(&state.rows, &seed).0, self.select(&seed).await?),
+        };
         place(&self.workspace, self.spec(), &load_snap(&self.dir, &snap)?)?;
-        let lineages: Vec<Value> = state.lineages.iter().map(|l| json!({"id": l.id, "idea": l.idea, "start": l.start,
-            "best": l.best, "evals": l.evals, "episodes": l.tried, "retired": !l.active()})).collect();
+        if portfolio.is_empty() { eprintln!("hx ar: no candidate beat the seed; the workspace keeps the seed"); }
         let report = json!({
             "run": self.dir.file_name().unwrap().to_string_lossy(), "dir": self.dir, "commit": self.launch.commit,
-            "snap": snap, "search": search, "select": select, "fallback": fallback, "checkpoints": checkpoints,
-            "lineages": lineages, "evals": state.rows.len(), "cost_usd": self.spent, "budget_usd": self.launch.budget,
+            "snap": snap, "search": search, "select": select, "portfolio": portfolio, "candidates": candidates,
+            "rounds": self.records()?.iter().filter(|r| matches!(r, Record::Gate { .. })).count(),
+            "evals": state.rows.len(), "cost_usd": self.spent, "budget_usd": self.launch.budget,
         });
         std::fs::write(self.dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
         Ok(report)
+    }
+
+    /// The last gate's candidates and the ideas it chose.
+    fn last_gate(&self) -> Result<Option<(Vec<Candidate>, Vec<u32>)>> {
+        Ok(self.records()?.into_iter().rev().find_map(|r| match r { Record::Gate { candidates, chosen, .. } => Some((candidates, chosen)), _ => None }))
+    }
+}
+
+/// Has this audit plan's verdict been journaled?
+fn audited(records: &[Record], plan: &Plan) -> bool {
+    records.iter().any(|r| matches!(r, Record::Audited { idea, snap, .. } if *idea == plan.idea && *snap == plan.start))
+}
+
+/// What the journal, ledger and claims say, as workers are shown it.
+struct State {
+    rows: Vec<Row>,
+    claims: Vec<Claim>,
+    brief: String,
+    findings: String,
+}
+
+/// An auditor's verdict from its last `VERDICT:` line. An auditor that stopped before giving one does not block the
+/// candidate; the report says so.
+fn verdict(answer: Option<&str>) -> (bool, String) {
+    let Some(answer) = answer else { return (true, "no verdict: the auditor stopped before giving one".into()) };
+    let upper = answer.to_ascii_uppercase();
+    let Some(at) = upper.rfind("VERDICT:") else { return (true, "no verdict: the auditor stopped before giving one".into()) };
+    let rest = answer[at + "VERDICT:".len()..].trim();
+    if rest.to_ascii_uppercase().starts_with("FAIL") {
+        (false, rest[4..].trim_start_matches([':', ' ', '-']).lines().next().unwrap_or("").chars().take(300).collect())
+    } else {
+        (true, String::new())
     }
 }
 
@@ -968,7 +1200,7 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f
             let launch: Launch = serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?)?;
             ensure!(!dir.join("report.json").exists(), "autoresearch run {} already finished", dir.display());
             ensure!(dir.join("seed.json").exists() || !dir.join("ledger.jsonl").exists(),
-                "autoresearch run {} predates lineages and cannot be resumed; start a new run", dir.display());
+                "autoresearch run {} predates this design and cannot be resumed; start a new run", dir.display());
             let records = read_lines(&dir.join("journal.jsonl"))?;
             (dir, launch, records)
         }
@@ -1000,4 +1232,24 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f
 fn chrono_stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{answer_number, verdict};
+
+    #[test]
+    fn judge_answers() {
+        assert_eq!(answer_number("Mechanism: breakout.\nAnswer: 2"), Some(2));
+        assert_eq!(answer_number("**Answer:** #3"), Some(3));
+        assert_eq!(answer_number("answer: 0"), Some(0));
+        assert_eq!(answer_number("I think 2 is closest."), None);
+    }
+
+    #[test]
+    fn audit_verdicts() {
+        assert_eq!(verdict(Some("ok\nVERDICT: PASS")), (true, String::new()));
+        assert_eq!(verdict(Some("verdict: fail: fills below the market")), (false, "fills below the market".into()));
+        assert!(verdict(None).0 && verdict(Some("ran out")).1.starts_with("no verdict"));
+    }
 }

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Offline autoresearch (`hx run --ar`) checks with the real CLI, a scripted provider and a toy evaluator.
 
-The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and the held-out one -(x-5)^2, so the
-final pick must prefer held-out quality over the agent-visible score. The isolation checks replay attacks an
-independent review found against the first design: each must now leave the recorded scores honest.
+The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and the held-out one -(x-5)^2, so the gates
+and the final pick must prefer held-out quality over the agent-visible score. Scripted runs exercise the manager loop:
+research, first-come claims judged by the model, gates with audits, exploit rounds and the portfolio. The isolation
+checks replay attacks an independent review found against the first design: each must leave the recorded scores honest.
 """
 import base64
 import json
@@ -74,10 +75,44 @@ def answered(body):
     return "function_call_output" in json.dumps(body) or '"role": "tool"' in json.dumps(body)
 
 
-def once(code):
-    """A provider whose agent runs `code` once per child and then finishes."""
+def text_of(body):
+    """Every string in a request, newlines intact: the system prompt, the task and any tool outputs."""
+    out = []
+    def walk(v):
+        if isinstance(v, str): out.append(v)
+        elif isinstance(v, dict): [walk(x) for x in v.values()]
+        elif isinstance(v, list): [walk(x) for x in v]
+    walk(body)
+    return "\n".join(out)
+
+
+def role_of(body):
+    t = text_of(body)
+    if "You compare research ideas" in t: return "judge", None
+    for role, marker in (("research", "## Autoresearch research lead ("), ("explore", "## Autoresearch explore worker "),
+                         ("exploit", "## Autoresearch exploit worker "), ("audit", "## Autoresearch auditor ")):
+        if marker in t:
+            return role, t.split(marker, 1)[1].split(None, 1)[0].rstrip(":)")
+    return "other", None
+
+
+def judge_same(body):
+    """A judge that finds two claims the same core when their text is identical."""
+    t = text_of(body)
+    listed = re.findall(r"^(\d+)\. (.*)$", t.split("New claim:")[0].split("Claimed so far:")[1], re.M)
+    new = t.split("New claim:\n", 1)[1].split("\n", 1)[0].strip()
+    same = next((n for n, idea in listed if idea.strip() == new), "0")
+    return f"The new claim's mechanism is {new}.\nAnswer: {same}"
+
+
+def once(code, where=("research",)):
+    """A provider whose agent runs `code` once in the named roles or episode labels and finishes; every other episode
+    finishes at once. Code that runs in a worker first claims an idea."""
     def reply(body, index):
-        return "done" if answered(body) else {"code": code}
+        role, label = role_of(body)
+        if role == "judge": return "Answer: 0"
+        if answered(body) or (role not in where and label not in where): return "done"
+        return {"code": (f'pcall(ar.claim, "probe idea from {label}")\n' if role in ("explore", "exploit") else "") + code}
     return reply
 
 
@@ -85,43 +120,112 @@ def outputs(requests):
     return [item.get("output", "") for body in requests for item in body.get("input", []) if item.get("type") == "function_call_output"]
 
 
-# 1. The loop: fresh episodes until the budget is spent, host-owned best state, held-out final pick among checkpoints.
-counter = [0]
+# 1. The manager loop: research, explore workers claiming first come first served, a gate with an audit, exploit
+# rounds with distinct refinements, and a portfolio of distinct audited candidates ranked by held-out score.
+TARGETS = {1: 3, 2: 6, 3: 20, 4: 6, 5: 9, 6: 1}  # workers 2 and 4 want the same idea: one of them must be turned away
 
 
-def explorer(body, index):
+def scripted(body, index):
+    role, label = role_of(body)
+    if role == "judge":
+        return judge_same(body)
     if answered(body):
-        return "done"
-    counter[0] += 1
-    value = (counter[0] * 7) % 101  # deterministic and distinct: repeated states are cached, not new evals
-    return {"code": f'write("x.txt", "{value}\\n")\nreturn ar.eval("try {value}")'}
+        return f"FINDING from {label}: done"
+    if role == "research":
+        return "BRIEF: the score rewards x close to the hidden target; avoid huge x."
+    if role == "audit":
+        return "Checked the state.\nVERDICT: FAIL: probe trick" if "(go to 3)" in text_of(body) else "Checked.\nVERDICT: PASS"
+    if role == "explore":
+        w = int(label.split("-w")[1].split(".")[0])
+        t, alt = TARGETS[w], 40 + w
+        return {"code": f'local r = ar.claim("go to {t}")\nlocal x = {t}\nif not r.ok then r = ar.claim("go to {alt}"); x = {alt} end\n'
+                        f'print("CLAIM", r.ok, r.n)\nwrite("x.txt", tostring(x) .. "\\n")\nprint(ar.eval("go " .. x))\n'
+                        f'write("x.txt", "{100 + index}\\n")\nprint(ar.eval("probe"))\nar.reset()\nreturn "RESET " .. x .. " " .. read("x.txt")'}
+    if role == "exploit":
+        return {"code": 'local x = tonumber(read("x.txt"))\nlocal r = ar.claim("step up")\nlocal d = 1\n'
+                        'if not r.ok then r = ar.claim("step down"); d = -1 end\n'
+                        'if r.ok then write("x.txt", tostring(x + d) .. "\\n"); print(ar.eval("step " .. d)) end\nreturn "STEP " .. d'}
+    return "done"
 
 
-path = workspace("loop")
-with harness.provider(explorer, price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.05))
+path = workspace("rounds")
+with harness.provider(scripted, price=PRICE) as (url, requests):
+    result = ar(path, url, 0.6)
+report = report_of(result)
+run = path / ".harness/ar" / report["run"]
 rows = ledger(path, report)
-assert 0.045 <= report["cost_usd"] <= 0.05 + 1e-9, report
-assert report["evals"] == len(rows) >= 10 and all(r["valid"] for r in rows), (report["evals"], rows[:3])
-check("the loop spends its whole budget on fresh episodes")
+claims = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines()]
+records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
+explore = [c for c in claims if c["scope"] == "explore"]
+assert [c["n"] for c in explore] == [1, 2, 3, 4, 5, 6], explore
+ideas = [c["idea"] for c in explore]
+assert ideas.count("go to 6") == 1 and len(set(ideas)) == 6, ideas
+loser = 2 if next(c for c in explore if c["idea"] == "go to 6")["worker"] == "r1-w4" else 4
+assert f"go to {40 + loser}" in ideas, (loser, ideas)
+check("claims are served first come, first served: a duplicate idea is turned away and its worker claims another")
 
-checkpoints = [c for c in report["checkpoints"] if c["select"] is not None]
-assert len(checkpoints) >= 2 and report["select"] == max(c["select"] for c in checkpoints), report["checkpoints"]
+assert (run / "episodes/r0-research.report.json").exists() and "BRIEF:" in (run / "episodes/r1-w1.md").read_text()
+gates = [r for r in records if r["kind"] == "gate"]
+assert [g["round"] for g in gates] == [1, 2, 3], gates
+three = next(c["n"] for c in explore if c["idea"] == "go to 3")
+six = next(c["n"] for c in explore if c["idea"] == "go to 6")
+assert gates[0]["chosen"][0] == six and three not in gates[0]["chosen"] and len(gates[0]["chosen"]) == 3, gates[0]
+assert any(r["kind"] == "audited" and r["idea"] == three and not r["pass"] for r in records)
+assert not any(c["idea"] == three for g in gates for c in g["candidates"] if c["idea"] in g["chosen"])
+bad = {c["n"] for c in explore if c["idea"] in ("go to 20", f"go to {40 + loser}")}
+assert all(not c["good"] for c in gates[0]["candidates"] if c["idea"] in bad), gates[0]["candidates"]
+check("research briefs every worker; the gate keeps good candidates, audits them and drops the one that fails")
+
+for g in gates[:2]:
+    for idea in g["chosen"]:
+        refinements = [c["idea"] for c in claims if c["scope"] == f"c{idea}"]
+        assert len(refinements) == len(set(refinements)) and set(refinements) <= {"step up", "step down"}, (idea, refinements)
+assert any(c["scope"] != "explore" for c in claims) and not any(l.name.startswith("r4") for l in (run / "episodes").iterdir())
+judged = [text_of(b) for b in requests if role_of(b)[0] == "judge"]
+assert any("same refinement" in j for j in judged) and any("same core approach" in j for j in judged), len(judged)
+check("exploit rounds split workers across the chosen candidates, each claiming a distinct refinement")
+
+portfolio = report["portfolio"]
+assert 1 <= len(portfolio) <= 3 and len({p["snap"] for p in portfolio}) == len(portfolio), portfolio
+assert all(p["audit"] is True and p["idea"] != three for p in portfolio), portfolio
+assert [p["select"] for p in portfolio] == sorted((p["select"] for p in portfolio), reverse=True), portfolio
 x = int((path / "x.txt").read_text())
-assert -(x - 5) ** 2 == report["select"], (x, report["select"])
-check("the final state is the held-out best among the seed and every improvement, restored into the workspace")
+assert report["select"] == portfolio[0]["select"] == -(x - 5) ** 2, (x, report["select"], portfolio)
+assert all((run / "portfolio" / f"c{p['idea']}" / "x.txt").exists() for p in portfolio)
+check("the result is a portfolio of distinct audited candidates, best held-out first, the best in the workspace")
 
-task = (path / ".harness/ar" / report["run"] / "episodes/e3.md").read_text()
-assert "## Evaluator report of that state" in task and '"x":' in task, task[-800:]
-assert "## Direction" not in task and report["lineages"][0]["idea"] is None, report["lineages"]
-assert "built-in global table" in task and "vars()" in task, task
-check("episodes see the best state's report and are told ar is built in")
-
+assert [r["n"] for r in rows] == list(range(1, len(rows) + 1)), [r["n"] for r in rows]
 for r in rows:
-    snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{r['snap']}.json").read_text())
-    value = int(base64.b64decode(snap["x.txt"]))
-    assert r["score"] == -(value - 7) ** 2, (r, value)
-check("every ledger score is the score of its recorded snapshot")
+    snap = json.loads((run / "snaps" / f"{r['snap']}.json").read_text())
+    assert r["score"] == -(int(base64.b64decode(snap["x.txt"])) - 7) ** 2, r
+resets = [o for o in outputs(requests) if o.startswith("RESET ") or "RESET " in o]
+assert len(resets) == 6 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
+check("ledger rows stay numbered under concurrency, every score matches its snapshot, and ar.reset is per worker")
+
+# 2. When no explore idea beats the seed, the run stops after round 1 and keeps the seed.
+def hopeless(body, index):
+    role, label = role_of(body)
+    if role == "judge": return judge_same(body)
+    if answered(body) or role != "explore": return "done"
+    w = int(label.split("-w")[1].split(".")[0])
+    return {"code": f'ar.claim("go to {30 + w}")\nwrite("x.txt", "{30 + w}\\n")\nreturn ar.eval("far")'}
+
+
+path = workspace("hopeless")
+with harness.provider(hopeless, price=PRICE) as (url, _):
+    result = ar(path, url, 0.3)
+report = report_of(result)
+run = path / ".harness/ar" / report["run"]
+assert report["rounds"] == 1 and report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n", report
+assert not any(p.name.startswith(("r2", "a1")) for p in (run / "episodes").iterdir()) and "no candidate beat the seed" in result.stderr
+check("with no good candidate after round 1 the run stops and the workspace keeps the seed")
+
+# 3. A select evaluator that cannot score the seed stops the run before any episode.
+path = workspace("badselect", spec='editable = ["x.txt"]\neval = "python3 search.py"\nselect = "exit 3"\ntimeout = 30\n')
+with harness.provider(scripted, price=PRICE) as (url, requests):
+    result = ar(path, url, 0.3, ok=False)
+assert result.returncode != 0 and "select evaluator gives no valid score" in result.stderr and not requests, result.stderr[-800:]
+check("a broken select evaluator fails fast, before spending")
 
 # 2. Tampering outside the editable paths never reaches the evaluator: no Git hooks, no ignore rules, no evaluator edits.
 tamper = (f'sh("git init -q; git config core.fsmonitor $PWD/hook.sh; printf \'#!/bin/sh\\\\ntouch {BASE}/pwned\\\\n\' > hook.sh; chmod +x hook.sh; echo json.py >> .git/info/exclude")\n'
@@ -131,7 +235,7 @@ tamper = (f'sh("git init -q; git config core.fsmonitor $PWD/hook.sh; printf \'#!
 for mode in ("sandbox", "yolo"):
     path = workspace(f"tamper-{mode}")
     with harness.provider(once(tamper), price=PRICE) as (url, _):
-        report = report_of(ar(path, url, 0.01, extra=["--yolo"] if mode == "yolo" else []))
+        report = report_of(ar(path, url, 0.1, extra=["--yolo"] if mode == "yolo" else []))
     rows = ledger(path, report)
     assert rows and all(r["score"] == -49 for r in rows), rows
     assert (path / "search.py").read_text() == SCORE % 7
@@ -148,7 +252,7 @@ snoop = (f'write("cand.py", "import os, glob\\nvalue = [os.environ.get(\'HX_TEST
          f'glob.glob(\'{path}/.harness/ar/*/*\'), glob.glob(\'{path}/*\')]\\n")\n'
          'return ar.eval("snoop")')
 with harness.provider(once(snoop), price=PRICE) as (url, requests):
-    ar(path, url, 0.01)
+    ar(path, url, 0.1)
 leak = [o for o in outputs(requests) if "leak" in o]
 assert leak and "[None, None, [], []]" in leak[0], leak
 check("evaluators run with a scrubbed environment and cannot read the run or workspace")
@@ -160,8 +264,8 @@ for mode in ("sandbox", "yolo"):
             f'local ok, e = pcall(read, "{path}/.harness/ar")\n'
             'print(ar.eval("baseline"))\n'
             'return "OUT " .. r.stdout .. " READ " .. tostring(e)')
-    with harness.provider(once(look), price=PRICE) as (url, requests):
-        ar(path, url, 0.03, extra=["--yolo"] if mode == "yolo" else [])
+    with harness.provider(once(look, ("research", "r1-w1")), price=PRICE) as (url, requests):
+        ar(path, url, 0.1, extra=["--yolo"] if mode == "yolo" else [])
     outs = [o for o in outputs(requests) if "OUT " in o]
     assert len(outs) >= 2, outs
     assert all("snaps" not in o and "journal" not in o and "ledger" not in o for o in outs), outs
@@ -173,7 +277,7 @@ race = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\
         'sh("python3 d.py >/dev/null 2>&1 </dev/null")\nreturn ar.eval("honest x=0")')
 path = workspace("race", spec='editable = ["x.txt"]\neval = "sleep 1; python3 search.py"\ntimeout = 30\n')
 with harness.provider(once(race), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.01))
+    report = report_of(ar(path, url, 0.1))
 first = ledger(path, report)[0]
 snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{first['snap']}.json").read_text())
 assert base64.b64decode(snap["x.txt"]) == b"0\n" and first["score"] == -49, (first, snap)
@@ -184,29 +288,37 @@ files = {"pkg/a.txt": "0\n", "search.py": 'import json, os; print(json.dumps({"s
 path = workspace("binary", files, 'editable = ["pkg"]\neval = "python3 search.py"\ntimeout = 30\n')
 junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn ar.eval("junk")'
 with harness.provider(once(junk), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.02))
-assert report["evals"] >= 1 and (path / "pkg/blob.bin").read_bytes() == b"\xff\xfe" and not (path / "pkg/link").exists()
+    report = report_of(ar(path, url, 0.1))
+snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{ledger(path, report)[0]['snap']}.json").read_text())
+assert base64.b64decode(snap["pkg/blob.bin"]) == b"\xff\xfe" and "pkg/link" not in snap, list(snap)
 check("binary editable files survive and symlinks are skipped")
 
-# 7. A killed search resumes from its journal; the charge for the interrupted attempt is journaled durably.
+# 7. A killed run resumes from its journal: the interrupted worker is charged from its own journal and retried, the rest
+# of the plan continues.
+def slow(body, index):
+    role, label = role_of(body)
+    if role == "explore" and label == "r1-w6" and not answered(body):
+        return {"code": 'print(ar.claim("go to 1"))\nsh("sleep 20")\nreturn "late"'}
+    return scripted(body, index)
+
+
 path = workspace("resume")
-counter[0] = 0
-with harness.provider(explorer, price=PRICE) as (url, _):
-    process = subprocess.Popen(command(path, url, 0.1), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+with harness.provider(slow, price=PRICE) as (url, _):
+    process = subprocess.Popen(command(path, url, 0.6), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True)
-    deadline, journal = time.time() + 120, None
+    deadline, journal = time.time() + 180, None
     while time.time() < deadline:
         journals = list((path / ".harness/ar").glob("*/journal.jsonl"))
         if journals:
-            lines = journals[0].read_text().splitlines()
-            if sum('"finished"' in l for l in lines) >= 3 and '"started"' in lines[-1]:
+            lines = [json.loads(l) for l in journals[0].read_text().splitlines() if l.endswith("}")]
+            done = {r["label"] for r in lines if r["kind"] == "finished"}
+            if sum(r["kind"] == "finished" and r["label"].startswith("r1-") for r in lines) >= 5 and "r1-w6" not in done:
                 journal = journals[0]
                 break
-        time.sleep(0.01)
-    assert journal, "never caught an attempt in flight"
+        time.sleep(0.05)
+    assert journal, "never caught round 1 with a worker in flight"
     os.killpg(process.pid, signal.SIGKILL)
     process.wait()
-    # Simulate writers killed mid-append, and an owner who edited ar.toml (trust lapses) after launch.
     for torn in (journal, journal.parent / "ledger.jsonl"):
         with open(torn, "a") as f:
             f.write('{"kind": "fini')
@@ -218,59 +330,90 @@ with harness.provider(explorer, price=PRICE) as (url, _):
     assert result.returncode == 0, result.stderr[-3000:]
 report = report_of(result)
 records = [json.loads(l) for l in journal.read_text().splitlines()]
-rows = ledger(path, report)
 interrupted = [r for r in records if r["kind"] == "finished" and r.get("interrupted")]
-assert interrupted and interrupted[0]["cost"] < 0.01, interrupted  # charged from the killed child's own journal
-assert sum(r["kind"] == "finished" and not r.get("interrupted") for r in records) > 3, "resume did not continue"
-killed = next(r for r in records if r["kind"] == "started" and r["attempt"] == interrupted[0]["attempt"])
+assert [r["label"] for r in interrupted] == ["r1-w6"] and interrupted[0]["cost"] < 0.05, interrupted
+killed = next(r for r in records if r["kind"] == "started" and r["label"] == "r1-w6")
 assert not Path(killed["scratch"]).exists(), "killed episode's scratch copy left behind"
-assert report["evals"] == len(rows) and report["cost_usd"] <= 0.1 + 1e-9
-assert "resumed" in result.stderr
-check("killed search resumes past torn lines with its frozen spec, charging the killed child from its own journal")
+assert any(r["kind"] == "started" and r["label"] == "r1-w6.2" for r in records), "the interrupted worker was not retried"
+run = journal.parent
+mine = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines() if json.loads(l)["worker"].startswith("r1-w6")]
+assert [c["worker"] for c in mine] == ["r1-w6"], mine
+assert any(r["episode"] == "r1-w6.2" and r["idea"] == mine[0]["n"] for r in ledger(path, report)), "the retry did not keep its claim"
+assert sum(r["kind"] == "planned" and r["batch"] == "round1" for r in records) == 1 and report["rounds"] == 3
+assert "resumed" in result.stderr and report["cost_usd"] <= 0.6 + 1e-9
+check("a killed run resumes past torn lines with its frozen spec, charging and retrying the interrupted worker")
 
-# 8. Agents that finish without scoring end the search after two idle episodes, and a run with no evals fails.
+# 7b. A run killed during an audit re-runs that audit on resume; no candidate passes unaudited.
+def slow_audit(body, index):
+    role, label = role_of(body)
+    if role == "audit" and label.startswith("a1.1-") and not answered(body) and (path / "audit-gate").exists() is False:
+        (path / "audit-gate").write_text("")
+        return {"code": 'sh("sleep 20")\nreturn "late"'}
+    return scripted(body, index)
+
+
+path = workspace("resume-audit")
+with harness.provider(slow_audit, price=PRICE) as (url, _):
+    process = subprocess.Popen(command(path, url, 0.6), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    deadline, journal = time.time() + 180, None
+    while time.time() < deadline:
+        journals = list((path / ".harness/ar").glob("*/journal.jsonl"))
+        if journals and (path / "audit-gate").exists():
+            lines = [json.loads(l) for l in journals[0].read_text().splitlines() if l.endswith("}")]
+            if any(r["kind"] == "started" and r["label"].startswith("a1.1-") for r in lines):
+                journal = journals[0]
+                break
+        time.sleep(0.05)
+    assert journal, "never caught an audit in flight"
+    time.sleep(1)
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    result = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(journal.parent), "--workspace", str(path)],
+                            env=harness.ENV, capture_output=True, text=True, timeout=600)
+    assert result.returncode == 0, result.stderr[-3000:]
+records = [json.loads(l) for l in journal.read_text().splitlines()]
+audited = [r for r in records if r["kind"] == "audited"]
+assert audited and not any("no verdict" in r["reason"] for r in audited), audited
+assert sum(r["kind"] == "planned" and r["batch"] == "audit1.1" for r in records) == 1
+rerun = [r["label"] for r in records if r["kind"] == "started" and r["label"].startswith("a1.1-") and "." in r["label"][4:]]
+assert rerun, [r["label"] for r in records if r["kind"] == "started"]
+check("a run killed during an audit re-runs it on resume; no candidate passes unaudited")
+
+# 8. Agents that never score anything end the run after round 1, and a run with no evals fails.
 path = workspace("idle")
-with harness.provider(lambda body, index: "nothing to do", price=PRICE) as (url, _):
-    result = ar(path, url, 0.05, ok=False)
-episodes = list((path / ".harness/ar").glob("*/episodes/e*.md"))
-assert result.returncode != 0 and "made no evaluations" in result.stderr and len(episodes) == 2, (len(episodes), result.stderr[-800:])
-check("idle episodes end the search; a run without evals fails")
+with harness.provider(lambda body, index: "Answer: 0" if role_of(body)[0] == "judge" else "nothing to do", price=PRICE) as (url, _):
+    result = ar(path, url, 0.3, ok=False)
+episodes = list((path / ".harness/ar").glob("*/episodes/*.md"))
+assert result.returncode != 0 and "made no evaluations" in result.stderr and len(episodes) == 7, (len(episodes), result.stderr[-800:])
+check("idle agents end the run after round 1; a run without evals fails")
 
 # 9. Provider crashes are charged from the child's journal and retried; misconfiguration fails fast and nonzero.
 agent_calls = [0]
 
 
 def limited(body, index):
-    # Unavailable twice in a row exhausts the one retry, so the first child crashes (rate limits are waited out instead).
-    if "random_string" in json.dumps(body):
-        return "no direction"
-    agent_calls[0] += 1
-    return {"status": 503, "error": "unavailable"} if agent_calls[0] < 3 else explorer(body, index)
+    # Unavailable twice in a row exhausts the one retry, so the research child crashes (rate limits are waited out instead).
+    if role_of(body)[0] == "research" and not answered(body):
+        agent_calls[0] += 1
+        if agent_calls[0] < 3: return {"status": 503, "error": "unavailable"}
+    return once('return ar.eval("b")')(body, index)
 
 
 path = workspace("crash")
 with harness.provider(limited, price=PRICE) as (url, _):
-    result = ar(path, url, 0.05, env={"HX_AR_RETRY_SECS": "0"})
+    result = ar(path, url, 0.3, env={"HX_AR_RETRY_SECS": "0"})
 report = report_of(result)
 assert "retrying" in result.stderr and report["evals"] > 0, result.stderr[-1500:]
 records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
-crashed = next(r for r in records if r["kind"] == "finished" and r["evals"] == 0)
-assert crashed["cost"] < 0.01, crashed
+crashed = next(r for r in records if r["kind"] == "finished" and r.get("crashed"))
+assert crashed["cost"] < 0.01 and any(r["kind"] == "started" and r["label"] == "r0-research.2" for r in records), records
 path = workspace("misconfigured")
 start = time.time()
-with harness.provider(explorer, price=PRICE) as (url, _):
-    result = ar(path, url, 0.05, ok=False, env={"HX_AR_RETRY_SECS": "0"}, key="HX_AR_NO_SUCH_KEY")
+with harness.provider(scripted, price=PRICE) as (url, _):
+    result = ar(path, url, 0.3, ok=False, env={"HX_AR_RETRY_SECS": "0"}, key="HX_AR_NO_SUCH_KEY")
 assert result.returncode != 0 and "keep failing" in result.stderr and time.time() - start < 120, result.stderr[-1500:]
 check("crashes are charged from child journals and retried; misconfiguration fails fast")
-
-# 10. A broken select evaluator falls back to the search score, visibly.
-path = workspace("fallback", spec='editable = ["x.txt"]\neval = "python3 search.py"\nselect = "exit 3"\ntimeout = 30\n')
-counter[0] = 0
-with harness.provider(explorer, price=PRICE) as (url, _):
-    result = ar(path, url, 0.03)
-report = report_of(result)
-assert report["fallback"] is True and "held-out" in result.stderr, report
-check("an unusable select evaluator falls back to search, recorded")
 
 # 11. No sandboxed process can write a shared xcrun cache path (a channel between episodes); shims still run.
 T = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True).stdout.strip()
@@ -279,7 +422,7 @@ files = {"x.txt": "0\n", "search.py": f'import json, os\nok = True\ntry:\n    os
 path = workspace("xcrun", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
 code = f'local r = sh("mkdir -p {probe}a 2>&1; echo leak > {probe}a/f 2>&1; /usr/bin/git --version")\nprint(r.stdout)\nreturn ar.eval("probe")'
 with harness.provider(once(code), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.01))
+    report = report_of(ar(path, url, 0.1))
 assert not os.path.exists(probe + "a") and not os.path.exists(probe + "e"), "xcrun prefix is writable"
 assert any("git version" in o for o in outputs(requests)), outputs(requests)
 assert ledger(path, report)[0]["score"] == 1
@@ -295,7 +438,7 @@ spec = (f'editable = ["x.txt"]\neval = "sh {grader}/score.sh {holdout}"\nselect 
         f'grader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n')
 path = workspace("holdout", spec=spec)
 with harness.provider(once('return ar.eval("baseline")'), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.01))
+    report = report_of(ar(path, url, 0.1))
 assert all(r["score"] == 0 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
 check("held-out roots are readable by select only")
 
@@ -307,7 +450,7 @@ path = workspace("yolo-seal", spec=spec)
 look = (f'local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'; cat {path}/.harness/ar/old-run/ledger.jsonl 2>&1; '
         f'cat {holdout}/secret.txt 2>&1; echo x >> {grader}/score.sh 2>&1")\nprint(ar.eval("b"))\nreturn "OUT " .. r.stdout')
 with harness.provider(once(look), price=PRICE) as (url, requests):
-    ar(path, url, 0.01, extra=["--yolo"])
+    ar(path, url, 0.1, extra=["--yolo"])
 outs = [o for o in outputs(requests) if "OUT " in o]
 assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and "secret ledger" not in o and "held-out" not in o for o in outs), outs
 assert (grader / "score.sh").read_text().count("\n") == 1, "grader root was modified"
@@ -320,7 +463,7 @@ path = workspace("reap", files, spec)
 daemon = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    open(\'pid.txt\', \'w\').write(str(os.getpid()))\\n    time.sleep(300)\\nos._exit(0)\\n")\n'
           'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn ar.eval("daemon")')
 with harness.provider(once(daemon), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.01))
+    report = report_of(ar(path, url, 0.1))
 snap = ledger(path, report)[0]["snap"]
 pids = [int(base64.b64decode(json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{snap}.json").read_text())["pid.txt"]))]
 pids += [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_daemon=(\d+)", o)]
@@ -337,7 +480,7 @@ code = ('sh("mkdir -p pkg/many && cd pkg/many && seq 1 10001 | xargs touch")\nlo
         'sh("rm -rf pkg/many; mkdir -p pkg/$(printf \'d/%.0s\' $(seq 1 40))")\nlocal ok2, e2 = pcall(ar.eval, "deep")\n'
         'sh("rm -rf pkg/d")\nprint(ar.eval("fine"))\nreturn "E1 " .. tostring(e1) .. " E2 " .. tostring(e2)')
 with harness.provider(once(code), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.01))
+    report = report_of(ar(path, url, 0.1))
 outs = " ".join(outputs(requests))
 assert "more than 10000 files" in outs and "deeper than 32" in outs and report["evals"] >= 1, outs[-2000:]
 check("snapshot file-count and depth limits refuse one eval, not the run")
@@ -348,7 +491,7 @@ files = {"x.txt": "0\n", ".gitattributes": "hidden.txt export-ignore\nsubst.txt 
          "search.py": 'import json\nok = open("hidden.txt").read() == "here\\n" and open("subst.txt").read() == "$Format:%H$\\n"\nprint(json.dumps({"score": 1 if ok else 0}))'}
 path = workspace("attributes", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
 with harness.provider(once('return ar.eval("b")'), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.01))
+    report = report_of(ar(path, url, 0.1))
 assert ledger(path, report)[0]["score"] == 1, ledger(path, report)
 check("the frozen base ignores export attributes")
 
@@ -357,8 +500,8 @@ code = ('print("A", ar.eval("baseline").cached)\nwrite("x.txt", "6\\n")\nprint("
         'write("x.txt", "1\\n")\nprint("C", ar.eval("one").improved)\nprint("R", ar.reset().best)\n'
         'print("X", read("x.txt"))\nlocal r = ar.eval("six again")\nreturn "D " .. tostring(r.cached) .. " " .. r.n')
 path = workspace("reset")
-with harness.provider(once(code), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.01))
+with harness.provider(once(code, ("r1-w1",)), price=PRICE) as (url, requests):
+    report = report_of(ar(path, url, 0.1))
 out = " ".join([o for o in outputs(requests) if "D " in o][0].split())
 assert "A nil" in out and "B true" in out and "C false" in out and "R -1" in out and "X 6" in out and "D true 2" in out, out
 rows = ledger(path, report)
@@ -373,62 +516,11 @@ code = (f'print(ar.eval("baseline"))\nsh("rm -rf pkg && ln -s {outside} pkg")\n'
         'local ok, e = pcall(ar.reset)\nreturn "RESET " .. tostring(ok) .. " " .. tostring(e)')
 path = workspace("reset-link", {"pkg/x.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'},
                  'editable = ["pkg/x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
-with harness.provider(once(code), price=PRICE) as (url, requests):
-    ar(path, url, 0.01)
+with harness.provider(once(code, ("r1-w1",)), price=PRICE) as (url, requests):
+    ar(path, url, 0.1)
 out = [o for o in outputs(requests) if "RESET " in o][0]
 assert "RESET false" in out and (outside / "x.txt").read_text() == "keep\n", (out, list(outside.iterdir()))
 check("ar.reset refuses a symlinked parent and leaves the link target untouched")
-
-# 17b. Lineages: sampled directions start side by side from the seed, each improves on its own hill, a stalled lineage
-# retires, a new direction starts from the best state, and the held-out pick spans every lineage.
-import threading
-sampled, sample_lock = [], threading.Lock()
-
-
-def directed(body, index):
-    text = json.dumps(body)
-    if "random_string" in text:
-        with sample_lock:
-            sampled.append(text)
-            k = len(sampled)
-        return f"<thinking>dimensions</thinking><answer>go to {[3, 6, 20][k - 1] if k <= 3 else 3 + k}</answer>"
-    if answered(body):
-        return "done"
-    v = re.search(r"## Direction.*?go to (\d+)", text, re.S).group(1)
-    probe = 100 + index  # a fresh state that never improves: every episode scores something new
-    return {"code": f'print(ar.eval("start"))\nwrite("x.txt", "{v}\\n")\nprint(ar.eval("go {v}"))\nwrite("x.txt", "{probe}\\n")\nprint(ar.eval("probe"))\n'
-                    f'ar.reset()\nreturn "RESET {v} " .. read("x.txt")'}
-
-
-path = workspace("lineages")
-with harness.provider(directed, price=PRICE) as (url, requests):
-    result = ar(path, url, 0.06)
-report = report_of(result)
-rows = ledger(path, report)
-lineages = {l["id"]: l for l in report["lineages"]}
-assert {lineages[i]["idea"] for i in (1, 2, 3)} == {"go to 3", "go to 6", "go to 20"} and lineages[4]["idea"] == "go to 7", lineages
-assert all(lineages[i]["retired"] for i in (1, 2, 3)), lineages
-snap6 = next(r["snap"] for r in rows if r["note"] == "go 6")
-assert lineages[4]["start"] == snap6, (lineages[4], snap6)
-check("three directions start from the seed; a new direction starts from the best state once all retire")
-
-assert "Directions already tried" in sampled[3] and all(f"go to {v}" in sampled[3] for v in (3, 6, 20)), sampled[3][-1500:]
-assert "Directions already tried" not in sampled[0]
-lines = result.stderr.splitlines()
-first_end = next(i for i, l in enumerate(lines) if " evals, $" in l)
-assert sum(" on lineage " in l for l in lines[:first_end]) == 3, result.stderr[:2000]
-check("the first directions run side by side, and a new one is sampled knowing every direction tried")
-
-assert [r["n"] for r in rows] == list(range(1, len(rows) + 1)), [r["n"] for r in rows]
-assert next(r for r in rows if r["note"] == "go 20")["improved"], "a direction's first state must improve its own lineage"
-assert not any(r["improved"] for r in rows if r["note"] == "start"), "a lineage's start must never improve it"
-assert {r["lineage"] for r in rows if r["note"] == "start"} >= {1, 2, 3, 4}, "a state another lineage scored is recorded for this one"
-resets = [o for o in outputs(requests) if "RESET " in o]
-assert resets and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
-check("ledger rows stay numbered under concurrency; improvements and ar.reset are per lineage")
-
-assert report["select"] == -1 and (path / "x.txt").read_text() == "6\n", (report["select"], report["checkpoints"])
-check("the held-out pick spans every lineage")
 
 # 17. Launch validation.
 path = workspace("flags")

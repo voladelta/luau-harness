@@ -318,7 +318,8 @@ impl Vm {
             g.set("stage",stage)?;
         }
         if crate::ar::EPISODE.get().is_some() && host.as_ref().is_some_and(|h| h.depth == 0) {
-            // ar.eval(note) is the only way an autoresearch episode scores a candidate; ar.reset() restores the best state (see ar.rs).
+            // ar.eval(note) is the only way an autoresearch episode scores a state, ar.claim(idea) claims what a worker tests,
+            // and ar.reset() restores the worker's best state (see ar.rs).
             let ar = lua.create_table()?;
             let afx = fx.clone();
             ar.set("eval", lua.create_async_function(move |lua, note: Option<String>| {
@@ -327,6 +328,17 @@ impl Vm {
                     let note = note.unwrap_or_default();
                     let result = fx.run(&lua, crate::supervisor::Tool::Sh, Class::LocalWrite, json!({"ar_eval": &note}), || async {
                         crate::ar::eval(&fx.pol, note.clone()).await.map(Ret::Json).map_err(|e| crate::effects::rt(format!("ar.eval: {e}")))
+                    }).await?;
+                    prims::json_value(&lua, result)
+                }
+            })?)?;
+            let afx = fx.clone();
+            let ahost = host.clone().expect("autoresearch episodes run at depth 0 with a host");
+            ar.set("claim", lua.create_async_function(move |lua, idea: String| {
+                let (fx, host) = (afx.clone(), ahost.clone());
+                async move {
+                    let result = fx.run(&lua, crate::supervisor::Tool::Sh, Class::LocalWrite, json!({"ar_claim": &idea}), || async {
+                        crate::ar::claim(&host, idea.clone()).await.map(Ret::Json).map_err(|e| crate::effects::rt(format!("ar.claim: {e}")))
                     }).await?;
                     prims::json_value(&lua, result)
                 }

@@ -4,8 +4,8 @@
 -- Each candidate gets a fresh host seed. The model lists the root-level dimensions along which answers differ, picks one
 -- option per dimension from a different part of the seed, then answers. In blind tests on DeepSeek V4.1 Flash this, not
 -- the paper's self-generated string, is what moved answers off the model's default: the model's own "random" strings
--- repeat across calls, and a seed alone only reshuffles surface details. `hx run --ar` samples its research directions
--- with the same instructions (src/ssot.rs).
+-- repeat across calls, and a seed alone only reshuffles surface details. `hx run --ar` explore workers derive their
+-- ideas the same way, from a host seed (src/ssot.rs).
 
 local function instructions(seed)
 	return "You must produce exactly one unique and diverse answer. Your random string is "
