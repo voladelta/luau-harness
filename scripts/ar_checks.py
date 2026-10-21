@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Offline autoresearch (`hx run --ar`) checks with the real CLI, a scripted provider and a toy evaluator.
 
-The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and the held-out one -(x-5)^2, so
-selection must prefer held-out quality over the agent-visible score. The isolation checks replay attacks an
+The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and the held-out one -(x-5)^2, so the
+final pick must prefer held-out quality over the agent-visible score. The isolation checks replay attacks an
 independent review found against the first design: each must now leave the recorded scores honest.
 """
 import base64
@@ -13,12 +13,12 @@ import signal
 import subprocess
 import time
 import redesign_checks as harness
+from pathlib import Path
 
 BASE = harness.BASE / "ar"
 BASE.mkdir(exist_ok=True)
 PRICE = {"prompt": "0.00001", "completion": "0.00001"}
 SCORE = 'import json; x = int(open("x.txt").read()); print(json.dumps({"score": -(x - %d) ** 2, "report": {"x": x}}))'
-SINGLE = {"HX_AR_SCHEDULE": "single"}
 passed = 0
 
 
@@ -85,7 +85,7 @@ def outputs(requests):
     return [item.get("output", "") for body in requests for item in body.get("input", []) if item.get("type") == "function_call_output"]
 
 
-# 1. The full schedule: 3 rounds x 4 branches plus leader segments, host-owned best states, held-out selection.
+# 1. The loop: fresh episodes until the budget is spent, host-owned best state, held-out final pick among checkpoints.
 counter = [0]
 
 
@@ -97,38 +97,24 @@ def explorer(body, index):
     return {"code": f'write("x.txt", "{value}\\n")\nreturn ar.eval("try {value}")'}
 
 
-path = workspace("schedule")
+path = workspace("loop")
 with harness.provider(explorer, price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.1))
+    report = report_of(ar(path, url, 0.05))
 rows = ledger(path, report)
-assert report["cost_usd"] <= 0.1 + 1e-9, report
-assert report["evals"] == len(rows) and len(rows) >= 15, (report["evals"], len(rows))
-assert all(r["valid"] for r in rows), rows
-assert {f"r{r}b{k}" for r in range(3) for k in range(4)} <= {r["lineage"] for r in rows}
-check("schedule runs every fork branch within budget")
+assert 0.045 <= report["cost_usd"] <= 0.05 + 1e-9, report
+assert report["evals"] == len(rows) >= 10 and all(r["valid"] for r in rows), (report["evals"], rows[:3])
+check("the loop spends its whole budget on fresh episodes")
 
-assert len(report["selections"]) == 4, report["selections"]
-final = report["selections"][-1]
-best_select = max(c["select"] for c in final["candidates"] if c["select"] is not None)
-assert report["select"] == best_select, (report["select"], best_select)
+checkpoints = [c for c in report["checkpoints"] if c["select"] is not None]
+assert len(checkpoints) >= 2 and report["select"] == max(c["select"] for c in checkpoints), report["checkpoints"]
 x = int((path / "x.txt").read_text())
-assert -(x - 5) ** 2 == best_select, (x, best_select)
-check("final state is the held-out winner and is restored into the workspace")
+assert -(x - 5) ** 2 == report["select"], (x, report["select"])
+check("the final state is the held-out best among the seed and every improvement, restored into the workspace")
 
-for selection in report["selections"][:3]:
-    scored = [c for c in selection["candidates"] if c["select"] is not None]
-    winner = next(c for c in scored if c["lineage"] == selection["winner"])
-    assert winner["select"] == max(c["select"] for c in scored), selection
-check("each round's winner maximizes the held-out score")
-
-task = (path / ".harness/ar" / report["run"] / "episodes/r1b1.1.md").read_text()
-r0_winner = report["selections"][0]["winner"]
-assert all(f"\n{r['n']} |" not in task for r in rows if r["lineage"] == "r1b0"), "sibling rows leaked into another branch"
-assert any(f"\n{r['n']} |" in task for r in rows if r["lineage"] == r0_winner), "parent rows missing"
-check("branches inherit the parent ledger and not their siblings'")
-
+task = (path / ".harness/ar" / report["run"] / "episodes/e3.md").read_text()
 assert "## Evaluator report of the best state" in task and '"x":' in task, task[-800:]
-check("episodes see the evaluator report of their lineage's best state")
+assert "built-in global table" in task and "vars()" in task, task
+check("episodes see the best state's report and are told ar is built in")
 
 for r in rows:
     snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{r['snap']}.json").read_text())
@@ -144,7 +130,7 @@ tamper = (f'sh("git init -q; git config core.fsmonitor $PWD/hook.sh; printf \'#!
 for mode in ("sandbox", "yolo"):
     path = workspace(f"tamper-{mode}")
     with harness.provider(once(tamper), price=PRICE) as (url, _):
-        report = report_of(ar(path, url, 0.01, env=SINGLE, extra=["--yolo"] if mode == "yolo" else []))
+        report = report_of(ar(path, url, 0.01, extra=["--yolo"] if mode == "yolo" else []))
     rows = ledger(path, report)
     assert rows and all(r["score"] == -49 for r in rows), rows
     assert (path / "search.py").read_text() == SCORE % 7
@@ -161,7 +147,7 @@ snoop = (f'write("cand.py", "import os, glob\\nvalue = [os.environ.get(\'HX_TEST
          f'glob.glob(\'{path}/.harness/ar/*/*\'), glob.glob(\'{path}/*\')]\\n")\n'
          'return ar.eval("snoop")')
 with harness.provider(once(snoop), price=PRICE) as (url, requests):
-    ar(path, url, 0.01, env=SINGLE)
+    ar(path, url, 0.01)
 leak = [o for o in outputs(requests) if "leak" in o]
 assert leak and "[None, None, [], []]" in leak[0], leak
 check("evaluators run with a scrubbed environment and cannot read the run or workspace")
@@ -174,7 +160,7 @@ for mode in ("sandbox", "yolo"):
             'print(ar.eval("baseline"))\n'
             'return "OUT " .. r.stdout .. " READ " .. tostring(e)')
     with harness.provider(once(look), price=PRICE) as (url, requests):
-        ar(path, url, 0.03, env=SINGLE, extra=["--yolo"] if mode == "yolo" else [])
+        ar(path, url, 0.03, extra=["--yolo"] if mode == "yolo" else [])
     outs = [o for o in outputs(requests) if "OUT " in o]
     assert len(outs) >= 2, outs
     assert all("snaps" not in o and "journal" not in o and "ledger" not in o for o in outs), outs
@@ -186,7 +172,7 @@ race = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\
         'sh("python3 d.py >/dev/null 2>&1 </dev/null")\nreturn ar.eval("honest x=0")')
 path = workspace("race", spec='editable = ["x.txt"]\neval = "sleep 1; python3 search.py"\ntimeout = 30\n')
 with harness.provider(once(race), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.01, env=SINGLE))
+    report = report_of(ar(path, url, 0.01))
 first = ledger(path, report)[0]
 snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{first['snap']}.json").read_text())
 assert base64.b64decode(snap["x.txt"]) == b"0\n" and first["score"] == -49, (first, snap)
@@ -197,7 +183,7 @@ files = {"pkg/a.txt": "0\n", "search.py": 'import json; print(json.dumps({"score
 path = workspace("binary", files, 'editable = ["pkg"]\neval = "python3 search.py"\ntimeout = 30\n')
 junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn ar.eval("junk")'
 with harness.provider(once(junk), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.02, env=SINGLE))
+    report = report_of(ar(path, url, 0.02))
 assert report["evals"] >= 1 and (path / "pkg/blob.bin").read_bytes() == b"\xff\xfe" and not (path / "pkg/link").exists()
 check("binary editable files survive and symlinks are skipped")
 
@@ -212,11 +198,11 @@ with harness.provider(explorer, price=PRICE) as (url, _):
         journals = list((path / ".harness/ar").glob("*/journal.jsonl"))
         if journals:
             lines = journals[0].read_text().splitlines()
-            if any('"chosen"' in l for l in lines) and '"started"' in lines[-1]:
+            if sum('"finished"' in l for l in lines) >= 3 and '"started"' in lines[-1]:
                 journal = journals[0]
                 break
         time.sleep(0.01)
-    assert journal, "never caught an attempt in flight after the first selection"
+    assert journal, "never caught an attempt in flight"
     os.killpg(process.pid, signal.SIGKILL)
     process.wait()
     # Simulate writers killed mid-append, and an owner who edited ar.toml (trust lapses) after launch.
@@ -232,20 +218,22 @@ with harness.provider(explorer, price=PRICE) as (url, _):
 report = report_of(result)
 records = [json.loads(l) for l in journal.read_text().splitlines()]
 rows = ledger(path, report)
-assert any(r["kind"] == "finished" and r.get("interrupted") for r in records), "interrupted charge not journaled"
-assert [s["round"] for s in report["selections"]] == [0, 1, 2, 3] and report["cost_usd"] <= 0.1 + 1e-9
+interrupted = [r for r in records if r["kind"] == "finished" and r.get("interrupted")]
+assert interrupted and interrupted[0]["cost"] < 0.01, interrupted  # charged from the killed child's own journal
+assert sum(r["kind"] == "finished" and not r.get("interrupted") for r in records) > 3, "resume did not continue"
+killed = next(r for r in records if r["kind"] == "started" and r["attempt"] == interrupted[0]["attempt"])
+assert not Path(killed["scratch"]).exists(), "killed episode's scratch copy left behind"
+assert report["evals"] == len(rows) and report["cost_usd"] <= 0.1 + 1e-9
 assert "resumed" in result.stderr
-check("killed search resumes past torn journal and ledger lines, with its frozen spec, and journals the interrupted charge")
+check("killed search resumes past torn lines with its frozen spec, charging the killed child from its own journal")
 
-# 8. The single-run baseline: one lineage with the whole budget.
-path = workspace("single")
-counter[0] = 0
-with harness.provider(explorer, price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.05, env=SINGLE))
-assert report["schedule"] == "single" and {r["lineage"] for r in ledger(path, report)} == {"s0"}, report
-assert len(report["selections"]) == 1 and 0.045 <= report["cost_usd"] <= 0.05 + 1e-9, report
-check("single schedule runs one lineage and spends its whole budget")
-
+# 8. Agents that finish without scoring end the search after two idle episodes, and a run with no evals fails.
+path = workspace("idle")
+with harness.provider(lambda body, index: "nothing to do", price=PRICE) as (url, _):
+    result = ar(path, url, 0.05, ok=False)
+episodes = list((path / ".harness/ar").glob("*/episodes/e*.md"))
+assert result.returncode != 0 and "made no evaluations" in result.stderr and len(episodes) == 2, (len(episodes), result.stderr[-800:])
+check("idle episodes end the search; a run without evals fails")
 
 # 9. Provider crashes are charged from the child's journal and retried; misconfiguration fails fast and nonzero.
 def limited(body, index):
@@ -254,7 +242,7 @@ def limited(body, index):
 
 path = workspace("crash")
 with harness.provider(limited, price=PRICE) as (url, _):
-    result = ar(path, url, 0.05, env={**SINGLE, "HX_AR_RETRY_SECS": "0"})
+    result = ar(path, url, 0.05, env={"HX_AR_RETRY_SECS": "0"})
 report = report_of(result)
 assert "retrying" in result.stderr and report["evals"] > 0, result.stderr[-1500:]
 records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
@@ -263,7 +251,7 @@ assert crashed["cost"] < 0.01, crashed
 path = workspace("misconfigured")
 start = time.time()
 with harness.provider(explorer, price=PRICE) as (url, _):
-    result = ar(path, url, 0.05, ok=False, env={**SINGLE, "HX_AR_RETRY_SECS": "0"}, key="HX_AR_NO_SUCH_KEY")
+    result = ar(path, url, 0.05, ok=False, env={"HX_AR_RETRY_SECS": "0"}, key="HX_AR_NO_SUCH_KEY")
 assert result.returncode != 0 and "keep failing" in result.stderr and time.time() - start < 120, result.stderr[-1500:]
 check("crashes are charged from child journals and retried; misconfiguration fails fast")
 
@@ -271,9 +259,9 @@ check("crashes are charged from child journals and retried; misconfiguration fai
 path = workspace("fallback", spec='editable = ["x.txt"]\neval = "python3 search.py"\nselect = "exit 3"\ntimeout = 30\n')
 counter[0] = 0
 with harness.provider(explorer, price=PRICE) as (url, _):
-    result = ar(path, url, 0.03, env=SINGLE)
+    result = ar(path, url, 0.03)
 report = report_of(result)
-assert report["selections"][0]["fallback"] is True and "held-out" in result.stderr, report
+assert report["fallback"] is True and "held-out" in result.stderr, report
 check("an unusable select evaluator falls back to search, recorded")
 
 # 11. No sandboxed process can write a shared xcrun cache path (a channel between episodes); shims still run.
@@ -283,7 +271,7 @@ files = {"x.txt": "0\n", "search.py": f'import json, os\nok = True\ntry:\n    os
 path = workspace("xcrun", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
 code = f'local r = sh("mkdir -p {probe}a 2>&1; echo leak > {probe}a/f 2>&1; /usr/bin/git --version")\nprint(r.stdout)\nreturn ar.eval("probe")'
 with harness.provider(once(code), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.01, env=SINGLE))
+    report = report_of(ar(path, url, 0.01))
 assert not os.path.exists(probe + "a") and not os.path.exists(probe + "e"), "xcrun prefix is writable"
 assert any("git version" in o for o in outputs(requests)), outputs(requests)
 assert ledger(path, report)[0]["score"] == 1
@@ -299,7 +287,7 @@ spec = (f'editable = ["x.txt"]\neval = "sh {grader}/score.sh {holdout}"\nselect 
         f'grader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n')
 path = workspace("holdout", spec=spec)
 with harness.provider(once('return ar.eval("baseline")'), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.01, env=SINGLE))
+    report = report_of(ar(path, url, 0.01))
 assert all(r["score"] == 0 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
 check("held-out roots are readable by select only")
 
@@ -311,7 +299,7 @@ path = workspace("yolo-seal", spec=spec)
 look = (f'local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'; cat {path}/.harness/ar/old-run/ledger.jsonl 2>&1; '
         f'cat {holdout}/secret.txt 2>&1; echo x >> {grader}/score.sh 2>&1")\nprint(ar.eval("b"))\nreturn "OUT " .. r.stdout')
 with harness.provider(once(look), price=PRICE) as (url, requests):
-    ar(path, url, 0.01, env=SINGLE, extra=["--yolo"])
+    ar(path, url, 0.01, extra=["--yolo"])
 outs = [o for o in outputs(requests) if "OUT " in o]
 assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and "secret ledger" not in o and "held-out" not in o for o in outs), outs
 assert (grader / "score.sh").read_text().count("\n") == 1, "grader root was modified"
@@ -324,7 +312,7 @@ path = workspace("reap", files, spec)
 daemon = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    open(\'pid.txt\', \'w\').write(str(os.getpid()))\\n    time.sleep(300)\\nos._exit(0)\\n")\n'
           'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn ar.eval("daemon")')
 with harness.provider(once(daemon), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.01, env=SINGLE))
+    report = report_of(ar(path, url, 0.01))
 pids = [int((path / "pid.txt").read_text())]
 pids += [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_daemon=(\d+)", o)]
 assert len(pids) >= 2, (pids, outputs(requests))
@@ -340,7 +328,7 @@ code = ('sh("mkdir -p pkg/many && cd pkg/many && seq 1 10001 | xargs touch")\nlo
         'sh("rm -rf pkg/many; mkdir -p pkg/$(printf \'d/%.0s\' $(seq 1 40))")\nlocal ok2, e2 = pcall(ar.eval, "deep")\n'
         'sh("rm -rf pkg/d")\nprint(ar.eval("fine"))\nreturn "E1 " .. tostring(e1) .. " E2 " .. tostring(e2)')
 with harness.provider(once(code), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.01, env=SINGLE))
+    report = report_of(ar(path, url, 0.01))
 outs = " ".join(outputs(requests))
 assert "more than 10000 files" in outs and "deeper than 32" in outs and report["evals"] >= 1, outs[-2000:]
 check("snapshot file-count and depth limits refuse one eval, not the run")
@@ -351,7 +339,7 @@ files = {"x.txt": "0\n", ".gitattributes": "hidden.txt export-ignore\nsubst.txt 
          "search.py": 'import json\nok = open("hidden.txt").read() == "here\\n" and open("subst.txt").read() == "$Format:%H$\\n"\nprint(json.dumps({"score": 1 if ok else 0}))'}
 path = workspace("attributes", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
 with harness.provider(once('return ar.eval("b")'), price=PRICE) as (url, _):
-    report = report_of(ar(path, url, 0.01, env=SINGLE))
+    report = report_of(ar(path, url, 0.01))
 assert ledger(path, report)[0]["score"] == 1, ledger(path, report)
 check("the frozen base ignores export attributes")
 

@@ -26,7 +26,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Sandbox (macOS) | `sh` runs under Seatbelt: writes confined to the project and a temp dir, no network, no API keys in the environment |
 | Approval gate | `git push`, publish, `ssh` and other external commands need the user's approval; nothing the model writes can approve |
 | RPI workflow | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds durable owner review gates |
-| Autoresearch | `--ar` searches for a better score with fork-and-flush episodes over the editable paths in `.harness/ar.toml` |
+| Autoresearch | `--ar` improves a score with fresh agent episodes over the editable paths in `.harness/ar.toml`, keeping the held-out best |
 | Recovery | `--resume` restores explicit saved data and controller state into a fresh VM; old effectful chunks are never replayed |
 | Budgets | Shared admission thresholds reserve each request's priced upper bound (the whole remaining allowance when no price is known); an absolute deadline includes downtime |
 | Compaction | On by default (`std/compact`): from 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; recent messages and Luau globals stay; one compact-and-retry on a context-overflow error |
@@ -164,7 +164,7 @@ holdout = ["~/grader/select"]                                # read-only for sel
 min_delta = 0.05
 ```
 
-The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it, and `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, under a sandbox with no credentials or network. Only the editable paths carry between episodes, and the host keeps each lineage's best state. The schedule follows [fork-and-flush](https://arxiv.org/abs/2610.07447): four branches at the start, a third and two thirds of the budget, each branch getting 6% of it, with the selected leader continuing in between. Fork winners and the final result are chosen with `select`. See [docs/runtime-v2.md](docs/runtime-v2.md#autoresearch-workflow).
+The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it, and `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, under a sandbox with no credentials or network. Only the editable paths carry between episodes; the host keeps the best state, and when an agent stops a fresh one continues from it with the ledger until the budget is spent. At the end, `select` picks among the seed and every improvement. See [docs/runtime-v2.md](docs/runtime-v2.md#autoresearch-workflow).
 
 ```bash
 hx run --rpi --prompt-file task.md --model MODEL
