@@ -212,6 +212,10 @@ fn capture(root: &Path, spec: &Spec) -> Result<Files> {
     let (mut out, mut total) = (BTreeMap::new(), 0);
     for e in &spec.editable {
         let e = e.trim_end_matches('/');
+        // A symlinked parent directory is skipped like any symlink: nothing is read through it.
+        let linked = Path::new(e).ancestors().skip(1).filter(|a| !a.as_os_str().is_empty())
+            .any(|a| std::fs::symlink_metadata(root.join(a)).is_ok_and(|m| m.file_type().is_symlink()));
+        if linked { continue; }
         walk(&root.join(e), e, 0, &mut out, &mut total)?;
     }
     Ok(out)
@@ -339,6 +343,14 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
     let spec = &episode.spec;
     let files = capture(&pol.workspace, spec)?;
     let snap = save_snap(&episode.dir, &files)?;
+    // An evaluator that reports no `se` is deterministic: a state it already scored validly gets the stored result,
+    // and no new ledger row.
+    let rows = ledger(&episode.dir)?;
+    if let Some(r) = rows.iter().find(|r| r.snap == snap && r.valid && r.se.is_none()) {
+        let best = *best.lock().unwrap();
+        return Ok(json!({"n": r.n, "score": r.score, "valid": true, "se": null, "improved": false, "best": best,
+            "report": r.report, "cached": true}));
+    }
     let (score, valid, se, report) = evaluate(spec, &episode.dir, &files, &spec.eval, false).await?;
     let mut best = best.lock().unwrap();
     let margin = spec.min_delta.max(se.unwrap_or(0.0));
@@ -349,6 +361,30 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
         snap, score, valid, se, improved, report: report.clone() };
     append_line(&episode.dir.join("ledger.jsonl"), &row)?;
     Ok(json!({"n": n, "score": score, "valid": valid, "se": se, "improved": improved, "best": *best, "report": report}))
+}
+
+/// `ar.reset()`: make the episode's editable paths hold the best scored state again (when
+/// nothing has improved yet, the seed).
+pub fn reset(pol: &crate::policy::Policy) -> Result<Value> {
+    let (episode, best) = EPISODE.get().context("ar.reset is only available inside an autoresearch episode")?;
+    let rows = ledger(&episode.dir)?;
+    let snap = match rows.iter().rev().find(|r| r.improved) {
+        Some(r) => r.snap.clone(),
+        None => std::fs::read_to_string(episode.dir.join("seed"))?.trim().to_string(),
+    };
+    let files = load_snap(&episode.dir, &snap)?;
+    // The agent controls this workspace, so every change goes the way its own `write` would: a policy-resolved path,
+    // and directories opened without following links.
+    let target = |rel: &str, create| -> Result<crate::atomic_file::Target> {
+        Ok(crate::atomic_file::Target::open(&pol.check_write(rel)?, create)?)
+    };
+    for rel in capture(&pol.workspace, &episode.spec)?.keys().filter(|rel| !files.contains_key(*rel)) {
+        target(rel, false)?.remove()?;
+    }
+    for (rel, bytes) in &files {
+        target(rel, true)?.replace(bytes)?;
+    }
+    Ok(json!({"best": *best.lock().unwrap()}))
 }
 
 /// Git, configured so a repository's own config cannot run commands (owner context, launch only).
@@ -486,10 +522,13 @@ impl Orchestrator {
 Your workspace is a fresh copy of the project without Git history. You may create scratch files anywhere, but only the \
 editable paths are scored and carried to later episodes.\n\n", spec.editable.join(", "));
         t += &format!("- `ar.eval(\"one-line hypothesis\")` scores the current editable files with the owner's frozen evaluator and returns \
-{{n, score, valid, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count: anything you measure \
+{{n, score, valid, se, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count: anything you measure \
 another way is discarded.\n\
 - `ar` is a built-in global table like `sh` and `read`. `vars()` lists only your own globals, so it never shows `ar`: call `ar.eval` directly.\n\
-- The host keeps the best scored state automatically. Bold changes are safe: you never need to revert by hand.\n");
+- Every scored state is kept, and the next episode starts from the best one. `ar.reset()` puts the best state back into \
+the editable paths: use it instead of reverting by hand. Bold changes are safe.\n\
+- When the evaluator reports no `se`, it is deterministic: scoring a state it already scored validly returns the stored \
+result with `cached: true`, so there is no need to re-check one.\n");
         if spec.min_delta > 0.0 {
             t += &format!("- A score counts as an improvement only when it beats the best by more than {}: smaller differences are noise.\n", spec.min_delta);
         }

@@ -93,7 +93,7 @@ def explorer(body, index):
     if answered(body):
         return "done"
     counter[0] += 1
-    value = (counter[0] * 7) % 11  # deterministic spread over 0..10
+    value = (counter[0] * 7) % 101  # deterministic and distinct: repeated states are cached, not new evals
     return {"code": f'write("x.txt", "{value}\\n")\nreturn ar.eval("try {value}")'}
 
 
@@ -342,6 +342,33 @@ with harness.provider(once('return ar.eval("b")'), price=PRICE) as (url, _):
     report = report_of(ar(path, url, 0.01))
 assert ledger(path, report)[0]["score"] == 1, ledger(path, report)
 check("the frozen base ignores export attributes")
+
+# 16b. A deterministic evaluator scores each state once; ar.reset() restores the best state.
+code = ('print("A", ar.eval("baseline").cached)\nwrite("x.txt", "6\\n")\nprint("B", ar.eval("six").improved)\n'
+        'write("x.txt", "1\\n")\nprint("C", ar.eval("one").improved)\nprint("R", ar.reset().best)\n'
+        'print("X", read("x.txt"))\nlocal r = ar.eval("six again")\nreturn "D " .. tostring(r.cached) .. " " .. r.n')
+path = workspace("reset")
+with harness.provider(once(code), price=PRICE) as (url, requests):
+    report = report_of(ar(path, url, 0.01))
+out = " ".join([o for o in outputs(requests) if "D " in o][0].split())
+assert "A nil" in out and "B true" in out and "C false" in out and "R -1" in out and "X 6" in out and "D true 2" in out, out
+rows = ledger(path, report)
+assert [r["note"] for r in rows[:3]] == ["baseline", "six", "one"] and not any(r["note"] == "six again" for r in rows), rows
+check("re-scoring a scored state returns the stored result without a ledger row, and ar.reset restores the best")
+
+# 16c. ar.reset never writes or deletes through a symlink the agent planted in an editable path's parent.
+outside = BASE / "outside"
+outside.mkdir()
+(outside / "x.txt").write_text("keep\n")
+code = (f'print(ar.eval("baseline"))\nsh("rm -rf pkg && ln -s {outside} pkg")\n'
+        'local ok, e = pcall(ar.reset)\nreturn "RESET " .. tostring(ok) .. " " .. tostring(e)')
+path = workspace("reset-link", {"pkg/x.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'},
+                 'editable = ["pkg/x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
+with harness.provider(once(code), price=PRICE) as (url, requests):
+    ar(path, url, 0.01)
+out = [o for o in outputs(requests) if "RESET " in o][0]
+assert "RESET false" in out and (outside / "x.txt").read_text() == "keep\n", (out, list(outside.iterdir()))
+check("ar.reset refuses a symlinked parent and leaves the link target untouched")
 
 # 17. Launch validation.
 path = workspace("flags")
