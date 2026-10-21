@@ -391,13 +391,13 @@ def local_write_reconciliation():
 
 
 def model_status_codes():
-    # A rate limit is retried once and releases its reservation: nothing was generated.
+    # A rate limit is waited out (backing off 2 s, then 4 s) and releases each reservation: nothing was generated.
     path = workspace("status-429")
-    with provider(lambda body, i: {"status": 429, "error": "slow down"} if i == 0 else "done") as (url, calls):
+    with provider(lambda body, i: {"status": 429, "error": "slow down"} if i < 2 else "done") as (url, calls):
         report = json.loads(start(path, url, "--max-cost", "0.01").stdout)
-        assert report["finished"] and calls[0] == calls[1] and report["budget"]["reserved_cost"] == 0, report
+        assert report["finished"] and calls[0] == calls[2] and report["budget"]["reserved_cost"] == 0, report
         failed = [r for r in records(journal(path)) if r["kind"] == "llm" and "error" in r]
-        assert [r["billing_uncertain"] for r in failed] == [False], failed
+        assert [r["billing_uncertain"] for r in failed] == [False, False], failed
     # A definite rejection releases the reservation, so the run is not left blocked behind it.
     path = workspace("status-400")
     with provider(lambda body, i: {"status": 400, "error": "bad request"} if i == 0 else "done") as (url, calls):
@@ -974,7 +974,7 @@ if __name__ == "__main__":
     check("explicit branches inherit only committed data and select a new manifest", branch_saved_state)
     check("owner abandon unblocks a resumed run; retry is no longer a decision", unknown_abandon)
     check("crash-interrupted write/edit settle from the files without the owner", local_write_reconciliation)
-    check("rate limits retry once; definite rejections release reservations", model_status_codes)
+    check("rate limits are waited out; definite rejections release reservations", model_status_codes)
     check("concurrent children queue under a cost cap instead of failing", concurrent_children_under_cost_cap)
     check("lost model response is not retried; reservation survives resume", no_transport_retry)
     check("bounded lost responses are charged at their bound and the run continues", bounded_lost_response)

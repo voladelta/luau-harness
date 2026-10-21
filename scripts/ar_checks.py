@@ -237,7 +237,8 @@ check("idle episodes end the search; a run without evals fails")
 
 # 9. Provider crashes are charged from the child's journal and retried; misconfiguration fails fast and nonzero.
 def limited(body, index):
-    return {"status": 429, "error": "rate limited"} if index < 3 else explorer(body, index)
+    # Unavailable twice in a row exhausts the one retry, so the first child crashes (rate limits are waited out instead).
+    return {"status": 503, "error": "unavailable"} if index < 3 else explorer(body, index)
 
 
 path = workspace("crash")

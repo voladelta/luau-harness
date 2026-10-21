@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
 
+/// New requests after a 429 that generated nothing; other retryable failures get one.
+const RATE_LIMIT_RETRIES: u32 = 8;
+
 pub struct StartOptions {
     pub task: String,
     pub max_turns: usize,
@@ -158,7 +161,7 @@ impl Host {
     /// One budgeted, journaled request to `cfg`: the run's provider, key and model, possibly with another reasoning effort.
     pub async fn chat_as(&self, cfg: &LlmCfg, req: &Value) -> Result<Reply> {
         crate::controller::validate_request(req)?;
-        let mut retried = false;
+        let mut retries = 0;
         let key = if self.key.is_empty() {cfg.key()?} else {self.key.clone()};
         loop {
             let op = self.supervisor.reserve_model(cfg, req, self.depth).await?;
@@ -177,13 +180,16 @@ impl Host {
             let answered = error.downcast_ref::<llm::Answered>();
             let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.is_some_and(|a| a.unbilled()), self.depth)?;
             let retry = match answered { Some(a) => a.retryable().then_some(a.retry_after), None => closed.then_some(None) };
-            match retry.filter(|_| !retried) {
+            // A rate limit generated nothing, so waiting it out is free: up to RATE_LIMIT_RETRIES new requests, backing
+            // off when the provider names no delay. Anything else gets one.
+            let limit = if answered.is_some_and(|a| a.status == 429 && a.unbilled()) { RATE_LIMIT_RETRIES } else { 1 };
+            match retry.filter(|_| retries < limit) {
                 Some(after) => {
-                    let wait = after.unwrap_or(2.0).clamp(1.0, 30.0);
+                    let wait = after.unwrap_or(2f64.powi(retries as i32 + 1)).clamp(1.0, 30.0);
                     if self.supervisor.remaining().is_some_and(|r| r.as_secs_f64() <= wait) { return Err(error); }
                     self.log(&format!("### MODEL RETRY\n{error}"));
                     tokio::time::sleep(Duration::from_secs_f64(wait)).await;
-                    retried = true;
+                    retries += 1;
                 },
                 None => return Err(error),
             }
