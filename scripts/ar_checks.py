@@ -112,7 +112,7 @@ def once(code, where=("research",)):
         role, label = role_of(body)
         if role == "judge": return "Answer: 0"
         if answered(body) or (role not in where and label not in where): return "done"
-        return {"code": (f'pcall(ar.claim, "probe idea from {label}")\n' if role in ("explore", "exploit") else "") + code}
+        return {"code": (f'pcall(ar.claim, "a probe idea from worker {label} used only by the isolation checks")\n' if role in ("explore", "exploit") else "") + code}
     return reply
 
 
@@ -123,6 +123,12 @@ def outputs(requests):
 # 1. The manager loop: research, explore workers claiming first come first served, a gate with an audit, exploit
 # rounds with distinct refinements, and a portfolio of distinct audited candidates ranked by held-out score.
 TARGETS = {1: 3, 2: 6, 3: 20, 4: 6, 5: 9, 6: 1}  # workers 2 and 4 want the same idea: one of them must be turned away
+UP, DOWN = "step up by adding one to the current value of x", "step down by subtracting one from the current value of x"
+
+
+def go(x):
+    """A claim's text: at least eight words, as ar.claim requires."""
+    return f"go to {x} by writing that one value into x.txt"
 
 
 def scripted(body, index):
@@ -134,16 +140,16 @@ def scripted(body, index):
     if role == "research":
         return "BRIEF: the score rewards x close to the hidden target; avoid huge x."
     if role == "audit":
-        return "Checked the state.\nVERDICT: FAIL: probe trick" if "(go to 3)" in text_of(body) else "Checked.\nVERDICT: PASS"
+        return "Checked the state.\nVERDICT: FAIL: probe trick" if f"({go(3)})" in text_of(body) else "Checked.\nVERDICT: PASS"
     if role == "explore":
         w = int(label.split("-w")[1].split(".")[0])
         t, alt = TARGETS[w], 40 + w
-        return {"code": f'local r = ar.claim("go to {t}")\nlocal x = {t}\nif not r.ok then r = ar.claim("go to {alt}"); x = {alt} end\n'
+        return {"code": f'print("PROBE", pcall(ar.claim, "x"))\nlocal r = ar.claim("{go(t)}")\nlocal x = {t}\nif not r.ok then r = ar.claim("{go(alt)}"); x = {alt} end\n'
                         f'print("CLAIM", r.ok, r.n)\nwrite("x.txt", tostring(x) .. "\\n")\nprint(ar.eval("go " .. x))\n'
                         f'write("x.txt", "{100 + index}\\n")\nprint(ar.eval("probe"))\nar.reset()\nreturn "RESET " .. x .. " " .. read("x.txt")'}
     if role == "exploit":
-        return {"code": 'local x = tonumber(read("x.txt"))\nlocal r = ar.claim("step up")\nlocal d = 1\n'
-                        'if not r.ok then r = ar.claim("step down"); d = -1 end\n'
+        return {"code": f'local x = tonumber(read("x.txt"))\nlocal r = ar.claim("{UP}")\nlocal d = 1\n'
+                        f'if not r.ok then r = ar.claim("{DOWN}"); d = -1 end\n'
                         'if r.ok then write("x.txt", tostring(x + d) .. "\\n"); print(ar.eval("step " .. d)) end\nreturn "STEP " .. d'}
     return "done"
 
@@ -159,27 +165,29 @@ records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines
 explore = [c for c in claims if c["scope"] == "explore"]
 assert [c["n"] for c in explore] == [1, 2, 3, 4, 5, 6], explore
 ideas = [c["idea"] for c in explore]
-assert ideas.count("go to 6") == 1 and len(set(ideas)) == 6, ideas
-loser = 2 if next(c for c in explore if c["idea"] == "go to 6")["worker"] == "r1-w4" else 4
-assert f"go to {40 + loser}" in ideas, (loser, ideas)
-check("claims are served first come, first served: a duplicate idea is turned away and its worker claims another")
+assert ideas.count(go(6)) == 1 and len(set(ideas)) == 6, ideas
+loser = 2 if next(c for c in explore if c["idea"] == go(6))["worker"] == "r1-w4" else 4
+assert go(40 + loser) in ideas, (loser, ideas)
+probes = [o for o in outputs(requests) if "PROBE" in o]
+assert len(probes) == 6 and all("false" in p and "at least 8 words" in p for p in probes), probes[:2]
+check("claims are served first come, first served: a duplicate idea is turned away and its worker claims another; a placeholder claim is refused")
 
 assert (run / "episodes/r0-research.report.json").exists() and "BRIEF:" in (run / "episodes/r1-w1.md").read_text()
 gates = [r for r in records if r["kind"] == "gate"]
 assert [g["round"] for g in gates] == [1, 2, 3], gates
-three = next(c["n"] for c in explore if c["idea"] == "go to 3")
-six = next(c["n"] for c in explore if c["idea"] == "go to 6")
+three = next(c["n"] for c in explore if c["idea"] == go(3))
+six = next(c["n"] for c in explore if c["idea"] == go(6))
 assert gates[0]["chosen"][0] == six and three not in gates[0]["chosen"] and len(gates[0]["chosen"]) == 3, gates[0]
 assert any(r["kind"] == "audited" and r["idea"] == three and not r["pass"] for r in records)
 assert not any(c["idea"] == three for g in gates for c in g["candidates"] if c["idea"] in g["chosen"])
-bad = {c["n"] for c in explore if c["idea"] in ("go to 20", f"go to {40 + loser}")}
+bad = {c["n"] for c in explore if c["idea"] in (go(20), go(40 + loser))}
 assert all(not c["good"] for c in gates[0]["candidates"] if c["idea"] in bad), gates[0]["candidates"]
 check("research briefs every worker; the gate keeps good candidates, audits them and drops the one that fails")
 
 for g in gates[:2]:
     for idea in g["chosen"]:
         refinements = [c["idea"] for c in claims if c["scope"] == f"c{idea}"]
-        assert len(refinements) == len(set(refinements)) and set(refinements) <= {"step up", "step down"}, (idea, refinements)
+        assert len(refinements) == len(set(refinements)) and set(refinements) <= {UP, DOWN}, (idea, refinements)
 assert any(c["scope"] != "explore" for c in claims) and not any(l.name.startswith("r4") for l in (run / "episodes").iterdir())
 judged = [text_of(b) for b in requests if role_of(b)[0] == "judge"]
 assert any("same refinement" in j for j in judged) and any("same core approach" in j for j in judged), len(judged)
@@ -208,7 +216,7 @@ def hopeless(body, index):
     if role == "judge": return judge_same(body)
     if answered(body) or role != "explore": return "done"
     w = int(label.split("-w")[1].split(".")[0])
-    return {"code": f'ar.claim("go to {30 + w}")\nwrite("x.txt", "{30 + w}\\n")\nreturn ar.eval("far")'}
+    return {"code": f'ar.claim("{go(30 + w)}")\nwrite("x.txt", "{30 + w}\\n")\nreturn ar.eval("far")'}
 
 
 path = workspace("hopeless")
@@ -321,7 +329,7 @@ check("binary editable files survive and symlinks are skipped")
 def slow(body, index):
     role, label = role_of(body)
     if role == "explore" and label == "r1-w6" and not answered(body):
-        return {"code": 'print(ar.claim("go to 1"))\nsh("sleep 20")\nreturn "late"'}
+        return {"code": f'print(ar.claim("{go(1)}"))\nsh("sleep 20")\nreturn "late"'}
     return scripted(body, index)
 
 

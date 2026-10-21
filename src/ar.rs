@@ -440,7 +440,10 @@ pub async fn claim(host: &crate::host::Host, idea: String) -> Result<Value> {
         Role::Research | Role::Audit => bail!("ar.claim is for explore and exploit workers"),
     };
     let idea: String = idea.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(1_000).collect();
-    ensure!(!idea.is_empty(), "ar.claim needs the idea's text");
+    // Agents probe a function with a dummy argument ("x"); an accepted claim is final, so a non-description is refused
+    // without using up the claim.
+    ensure!(idea.split(' ').count() >= 8, "describe the idea in two or three sentences (at least 8 words): an accepted \
+claim is final and is how other workers, auditors and the report know what you built");
     let path = episode.dir.join("claims.lock");
     let lock = tokio::task::spawn_blocking(move || lock_file(&path)).await??;
     if let Some(n) = progress.lock().unwrap().claim { bail!("this worker already claimed #{n}: one idea per worker") }
