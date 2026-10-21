@@ -122,10 +122,15 @@ fn price_of(pricing: &Value) -> Option<Price> {
             other => Some(other.or_else(|| { let b = &pricing[k]; b.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| b.as_f64()) })),
         }
     };
+    // OpenRouter lists dollars per token as strings. Some routers list bare numbers in dollars per million tokens; no
+    // model costs over $0.01 a token ($10,000 per million), so a larger bare number is per million.
+    let numeric = pricing["prompt"].is_number();
+    let per_token = |p: f64| if numeric && p > 0.01 { p / 1_000_000.0 } else { p };
     let tier = |t: &Value| -> Option<Tier> {
         let input = [num(t, "prompt")?, num(t, "input_cache_write")?, num(t, "input_cache_write_1h")?];
         Some(Tier { min_prompt_tokens: t["min_prompt_tokens"].as_u64().unwrap_or(0),
-            input: input[0]?.max(input[1].unwrap_or(0.0)).max(input[2].unwrap_or(0.0)), output: num(t, "completion")?? })
+            input: per_token(input[0]?.max(input[1].unwrap_or(0.0)).max(input[2].unwrap_or(0.0))),
+            output: per_token(num(t, "completion")??) })
     };
     let tiers = std::iter::once(pricing).chain(pricing["overrides"].as_array().into_iter().flatten()).map(tier).collect::<Option<Vec<_>>>()?;
     Some(Price { tiers, request: num(pricing, "request")?.unwrap_or(0.0) })
@@ -133,6 +138,16 @@ fn price_of(pricing: &Value) -> Option<Price> {
 
 #[cfg(test)]
 mod price_tests {
+    #[test]
+    fn per_million_prices_are_read_per_token() {
+        let p = super::price_of(&serde_json::json!({"prompt": 0.15, "completion": 0.5})).unwrap();
+        assert!((p.tiers[0].input - 0.15e-6).abs() < 1e-15 && (p.tiers[0].output - 0.5e-6).abs() < 1e-15);
+        let q = super::price_of(&serde_json::json!({"prompt": "0.00000015", "completion": "0.0000005"})).unwrap();
+        assert_eq!((q.tiers[0].input, q.tiers[0].output), (p.tiers[0].input, p.tiers[0].output));
+        let r = super::price_of(&serde_json::json!({"prompt": "0.05", "completion": "0.05"})).unwrap();
+        assert_eq!(r.tiers[0].input, 0.05); // a string is always per token
+    }
+
     use super::*;
 
     #[test]
