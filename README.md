@@ -153,7 +153,7 @@ Global flags: `--workspace DIR` (default `.`), `--yolo` (no sandbox, open networ
 
 Use `--rpi` to carry a task through separate research-questions, research, system-design, program-design, implementation and verification stages. Each stage starts with a fresh agent session and receives the relevant immutable documents. Verification failures trigger repair and fresh verification, with at most three repair cycles across the run. This is a bundled Luau workflow adapted from [HumanLayer RPI](stdlib/std/rpi/PROVENANCE.md); activate it with `--rpi`, not `--pack std/rpi`.
 
-Use `--ar` when the task has a score to optimize. `.harness/ar.toml` names the editable paths, the evaluator commands and the read-only roots they need; each evaluator prints a JSON line with `score` (and optionally `valid`, `se`, `report`):
+Use `--ar` when the score must stay out of the agent's hands: a private evaluator, held-out data, or a metric an agent could game. When the agent can check its work from files in the workspace, a plain run with the same budget did as well in our tests. `.harness/ar.toml` names the editable paths, the evaluator commands and the read-only roots they need; each evaluator prints a JSON line with `score` (and optionally `valid`, `se`, `report`):
 
 ```toml
 editable = ["ar/strategy.pine"]
@@ -164,7 +164,7 @@ holdout = ["~/grader/select"]                                # read-only for sel
 min_delta = 0.05
 ```
 
-The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it, and `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, under a sandbox with no credentials or network. Only the editable paths carry between episodes; the host keeps the best state, and when an agent stops a fresh one continues from it with the ledger until the budget is spent. At the end, `select` picks among the seed and every improvement. See [docs/runtime-v2.md](docs/runtime-v2.md#autoresearch-workflow).
+The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it, and `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, under a sandbox with no credentials or network. Only the editable paths carry between episodes; the host keeps the best state, and when an agent stops a fresh one continues from it with the ledger until the budget is spent. At the end, `select` picks among the seed and every improvement, so it must reach the shift the result has to survive (other years, symbols or input ranges) and have enough cases to tell checkpoints apart. See [docs/runtime-v2.md](docs/runtime-v2.md#autoresearch-workflow).
 
 ```bash
 hx run --rpi --prompt-file task.md --model MODEL
