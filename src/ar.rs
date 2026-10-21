@@ -453,15 +453,18 @@ pub async fn claim(host: &crate::host::Host, idea: String) -> Result<Value> {
             "note": "an earlier attempt of this worker claimed this idea before it was interrupted: continue with it"}));
     }
     if let Some(i) = judge(host, &earlier, &idea, episode.role == Role::Exploit).await {
-        return Ok(json!({"ok": false, "same_as": {"n": earlier[i].n, "idea": earlier[i].idea},
-            "claimed": earlier.iter().map(|c| json!({"n": c.n, "idea": c.idea})).collect::<Vec<_>>()}));
+        // Plain text, so a printed result shows every claim (printers abbreviate nested tables).
+        let listed: String = earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
+        let what = if episode.role == Role::Exploit { "refinement" } else { "core approach" };
+        return Ok(json!({"ok": false, "same_as": earlier[i].n, "message": format!("Rejected: the same {what} as #{} was \
+claimed first. Claimed so far:\n{listed}Choose a different {what} and claim it.", earlier[i].n)}));
     }
     let n = earlier.len() as u32 + 1;
     append_line(&episode.dir.join("claims.jsonl"), &Claim { scope, n, idea, worker: episode.label.clone() })?;
     // Recorded before the lock is released, so a second claim of this worker waiting on the lock sees it.
     progress.lock().unwrap().claim = Some(n);
     drop(lock);
-    Ok(json!({"ok": true, "n": n}))
+    Ok(json!({"ok": true, "n": n, "message": format!("Accepted as #{n}. Build it now; ar.eval works from here on.")}))
 }
 
 /// The index of the earlier claim a new claim duplicates, when two independent judge calls agree: the same core
@@ -777,7 +780,9 @@ impl Orchestrator {
             if pending.is_empty() { return Ok(()); }
             let remaining = self.launch.budget - self.spent;
             if remaining < self.launch.budget * MIN_SLICE { return Ok(()); }
-            let allowance = self.share().min(remaining / pending.len() as f64);
+            // The research brief serves every later episode, so it gets three shares.
+            let share = if batch == "research" { 3.0 * self.share() } else { self.share() };
+            let allowance = share.min(remaining / pending.len() as f64);
             let state = self.state()?;
             let mut runs = vec![];
             for (plan, label) in &pending {
@@ -903,8 +908,9 @@ editable paths ({}). Study the task first, so their work is grounded, and write 
 - what the starting state does and where it is weak;\n\
 - traps: ways a score could rise without real improvement (evaluator quirks, overfitting, degenerate solutions) that workers must avoid;\n\
 - open questions worth testing.\n\
-Do not solve the task: the workers do that. Finish with the brief as your final answer, at most 800 words, facts first, \
-without prescribing one solution.\n\n{}\n{starting}", spec.editable.join(", "), self.protocol(plan.role, allowance)),
+Do not solve the task: the workers do that. Keep the study short, about 15 steps: an unfinished study leaves every \
+worker without a brief. Finish with the brief as your final answer, at most 800 words, facts first, without prescribing \
+one solution.\n\n{}\n{starting}", spec.editable.join(", "), self.protocol(plan.role, allowance)),
             Role::Explore => format!("{program}\n\n{brief}## Autoresearch explore worker {label}\n\n\
 You are one of {WORKERS} workers exploring side by side. Each tests a different core approach to improving the score.\n\n\
 1. Generate your idea from your seed: <seed>{}</seed>. List 5 to 7 root-level dimensions along which approaches to this \
@@ -912,9 +918,11 @@ task differ fundamentally (not parameters or filters), each with at least 6 opti
 option per dimension using a different part of the seed (for example the sum of the character codes of a segment, mod the \
 number of options). Commit to the picks even if unusual, and compose one coherent idea: the core approach to build, not a \
 tweak on top of the starting state.\n\
-2. Claim it before building: `ar.claim(\"the idea in two or three sentences\")`. Claims are served first come, first served. \
-If it returns `ok = false`, another worker already claimed the same core approach (`same_as`; `claimed` lists every claim): \
-pick again from a different part of your seed and claim a different core. ar.eval works only after an accepted claim.\n\
+2. Claim it early, within your first few steps and before building: `ar.claim(\"the idea in two or three sentences\")`. \
+Claims are served first come, first served. If it returns `ok = false`, another worker already claimed the same core \
+approach (`message` lists every claim): pick again from a different part of your seed and claim a different core. An \
+accepted claim is final, so claim only your real idea, never a placeholder or a test. ar.eval works only after an \
+accepted claim.\n\
 3. Build the idea, score it with ar.eval, read the report, fix and improve. Your first valid state sets your bar, even below \
 the starting state's score: build the idea properly before judging it.\n\
 4. Finish with your finding as the final answer: the idea, what you built, your best score, what worked and what did not, \
@@ -930,8 +938,9 @@ and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwr
                 format!("{program}\n\n{brief}{findings}## Autoresearch exploit worker {label}: candidate #{}\n\n\
 Candidate #{}'s idea: {}\n\nIt is among the strongest candidates{}. Several workers refine it side by side; improve it:\n\n\
 1. Choose one refinement, a change with a reason to generalize rather than tuning to the reported numbers, and claim it: \
-`ar.claim(\"the refinement in one or two sentences\")`. If it returns `ok = false`, another worker claimed the same \
-refinement first: choose a different one. ar.eval works only after an accepted claim.\n\
+`ar.claim(\"the refinement in one or two sentences\")`, early. If it returns `ok = false`, another worker claimed the \
+same refinement first (`message` lists every claim): choose a different one. An accepted claim is final, so claim only \
+your real refinement, never a placeholder or a test. ar.eval works only after an accepted claim.\n\
 2. Implement it, ar.eval, read the report, fix and improve. An improvement must beat the candidate's best.\n\
 3. Finish with your finding as the final answer: what you changed, your best score, what worked and what did not.\n\n{}\n\
 ## Ledger of candidate #{}\n\n{ledger}\n{starting}", plan.idea, plan.idea, claim(plan.idea),
@@ -958,6 +967,9 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
         let seed_search = self.known(&ledger(&self.dir)?, &seed).0;
         let seed_select = self.select(&seed).await?;
         let prefix = format!("audit{round}.");
+        // Set when an audit batch could not start (the budget is spent): the gate then goes on with its candidates
+        // unaudited, and says so, rather than inventing a verdict.
+        let mut spent = false;
         loop {
             // A resumed run first finishes the audit batch it was in: verdicts come from that batch's own plans.
             let records = self.records()?;
@@ -966,9 +978,9 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                     Some((batch.clone(), episodes.clone())),
                 _ => None,
             });
-            if let Some((batch, plans)) = unjudged {
+            if let Some((batch, plans)) = unjudged.filter(|_| !spent) {
                 self.run_batch(&batch).await?;
-                self.judge_audits(&plans)?;
+                spent = self.judge_audits(&plans)? == 0;
                 continue;
             }
             let state = self.state()?;
@@ -998,8 +1010,13 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
             let mut seen = std::collections::HashSet::new();
             ranked.retain(|c| seen.insert(c.snap.clone()));
             let unaudited: Vec<&Candidate> = ranked.iter().take(TOP).filter(|c| c.audit.is_none()).copied().collect();
-            if unaudited.is_empty() {
-                let chosen: Vec<u32> = ranked.iter().take(TOP).map(|c| c.idea).collect();
+            if unaudited.is_empty() || spent {
+                let unaudited: Vec<u32> = unaudited.iter().map(|c| c.idea).collect();
+                // An unaudited candidate never ranks above an audited one, so it reaches the workspace only when nothing
+                // audited did.
+                let mut chosen: Vec<u32> = ranked.iter().take(TOP).map(|c| c.idea).collect();
+                chosen.sort_by_key(|id| unaudited.contains(id));
+                for c in candidates.iter_mut().filter(|c| unaudited.contains(&c.idea)) { c.reason = "not audited: budget spent".into(); }
                 eprintln!("hx ar: gate {round}: {} candidates, {} good, going on with {:?}", candidates.len(),
                     candidates.iter().filter(|c| c.good).count(), chosen);
                 self.journal(&Record::Gate { round, candidates, chosen: chosen.clone() })?;
@@ -1010,19 +1027,25 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                 idea: c.idea, start: c.snap.clone(), best: None, seed: None }).collect();
             self.plan(&format!("{prefix}{k}"), plans.clone())?;
             self.run_batch(&format!("{prefix}{k}")).await?;
-            self.judge_audits(&plans)?;
+            spent = self.judge_audits(&plans)? == 0;
         }
     }
 
-    /// Journal the verdict of each audit plan that has none yet, from its last attempt's final answer.
-    fn judge_audits(&self, plans: &[Plan]) -> Result<()> {
+    /// Journal the verdict of each audit plan that has none yet and ran, from its last attempt's final answer; returns
+    /// how many were judged (none when the budget left no room to start them).
+    fn judge_audits(&self, plans: &[Plan]) -> Result<usize> {
         let records = self.records()?;
-        for plan in plans.iter().filter(|p| !audited(&records, p)) {
+        // An attempt of the plan finished without crashing: a crashed auditor audited nothing.
+        let ran = |p: &Plan| records.iter().any(|r| matches!(r, Record::Started { label, plan, .. } if *plan == p.label
+            && records.iter().any(|f| matches!(f, Record::Finished { label: l, crashed: false, .. } if l == label))));
+        let mut judged = 0;
+        for plan in plans.iter().filter(|p| !audited(&records, p) && ran(p)) {
+            judged += 1;
             let (pass, reason) = verdict(self.answer(&records, &plan.label).as_deref());
             eprintln!("hx ar: audit of #{}: {}{}", plan.idea, if pass { "pass" } else { "FAIL" }, if reason.is_empty() { String::new() } else { format!(" ({reason})") });
             self.journal(&Record::Audited { idea: plan.idea, snap: plan.start.clone(), pass, reason })?;
         }
-        Ok(())
+        Ok(judged)
     }
 
     async fn run(&mut self, mut records: Vec<Record>) -> Result<Value> {

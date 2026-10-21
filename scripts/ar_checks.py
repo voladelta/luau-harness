@@ -220,6 +220,29 @@ assert report["rounds"] == 1 and report["portfolio"] == [] and (path / "x.txt").
 assert not any(p.name.startswith(("r2", "a1")) for p in (run / "episodes").iterdir()) and "no candidate beat the seed" in result.stderr
 check("with no good candidate after round 1 the run stops and the workspace keeps the seed")
 
+# 2b. When the budget is spent before a gate's audits can start, candidates go on marked unaudited; no verdict is invented.
+def costly(body, index):
+    """Explore workers' replies are billed $0.05 each, so round 1 spends the whole budget before any audit can start."""
+    answer = scripted(body, index)
+    if role_of(body)[0] == "explore" and isinstance(answer, dict):
+        answer = {**answer, "usage": {"cost": 0.05}}
+    return answer
+
+
+path = workspace("noaudit")
+with harness.provider(costly, price=PRICE) as (url, _):
+    report = report_of(ar(path, url, 0.3))
+records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
+finished = {r["label"] for r in records if r["kind"] == "finished" and not r.get("crashed")}
+ran = {(p["idea"], p["start"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("audit")
+       for p in r["episodes"] if any(s["label"] in finished for s in records if s["kind"] == "started" and s["plan"] == p["label"])}
+assert all((r["idea"], r["snap"]) in ran for r in records if r["kind"] == "audited"), "a verdict without a finished audit"
+unaudited = [p for p in report["portfolio"] if p["audit"] is None]
+assert unaudited and all(p["reason"] == "not audited: budget spent" for p in unaudited), report["portfolio"]
+first_unaudited = next(i for i, p in enumerate(report["portfolio"]) if p["audit"] is None)
+assert all(p["audit"] is None for p in report["portfolio"][first_unaudited:]), "an unaudited candidate ranks above an audited one"
+check("candidates the budget left no room to audit go on marked unaudited, never as a pass")
+
 # 3. A select evaluator that cannot score the seed stops the run before any episode.
 path = workspace("badselect", spec='editable = ["x.txt"]\neval = "python3 search.py"\nselect = "exit 3"\ntimeout = 30\n')
 with harness.provider(scripted, price=PRICE) as (url, requests):
