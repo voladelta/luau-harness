@@ -294,7 +294,7 @@ return {
 
 The model can call `greeting.hello("Ada")`. All methods need a signature, description and `run` function. Successful registrations contribute their signatures to the model prompt. Invalid definitions, missing credentials, reserved names and namespace collisions reject the whole file with a warning; other tools still load. Both `.lua` and `.luau` use Luau syntax. Defining the same namespace in both files rejects both.
 
-Registration is pure and limited to one second and 16 MiB. Each method call runs the frozen source in a fresh isolated VM with copied arguments and results; mutable locals do not persist between calls. For filesystem, shell or agent access, declare `capabilities = { fs = {"read", "write"}, proc = {"sh"}, llm = {"agent"} }`, requesting only what you need. Workspace trust grants those declarations; the existing path, sandbox, budget and approval checks still apply. Local tools cannot import privileged harness modules.
+Registration is pure and limited to one second and 16 MiB. Each method call runs the frozen source in a fresh isolated VM with copied arguments and results; mutable locals do not persist between calls. For filesystem, shell or model access, declare `capabilities = { fs = {"read", "write"}, proc = {"sh"}, llm = {"agent", "chat"} }`, requesting only what you need. `llm.agent` grants `agent(task)`; `llm.chat` grants `llm{{system=..., prompt=..., effort=..., max_tokens=...}, ...}`, which sends up to 32 single-shot requests concurrently to the run's provider and model (budgeted and journaled like any model call; `effort` defaults to the run's, `"none"` sends no reasoning setting) and returns `{ok, value}` or `{ok, error}` per request in input order. `llm` needs `hx run`. Every tool also gets `nonce()`, 32 URL-safe characters of fresh OS entropy. Workspace trust grants those declarations; the existing path, sandbox, budget and approval checks still apply. Local tools cannot import privileged harness modules.
 
 HTTP tools declare named, fixed endpoints in `http`, then call `http("endpoint", args)` inside a method. Each endpoint accepts `url`, `method` (default `GET`), `secret` (optional credential name), `header` (default `Authorization`, value sent verbatim), `bearer` (default `false`; sends `Bearer <secret>`, so store the bare token), `raw` (default `false`), and `read_only` (default `false`). A `{name}` placeholder fills one whole path segment (`/videos/{job_id}`, not `/v{id}`) from the argument of that name, percent-encoded; the origin is fixed. Remaining GET arguments become encoded query parameters; other methods send JSON. The return value is decoded JSON, or for `raw` endpoints `{text, media_type}` (UTF-8 bodies) or `{base64, media_type}` (audio, image, video and other bytes). Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose bytes can go straight to `write`. HTTP errors raise with their status and a bounded response excerpt. Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects.
 
@@ -348,6 +348,18 @@ hx exec 'print(openrouter.text{model="deepseek/deepseek-chat-v3.1", prompt="Hell
   - `openrouter.image{model, prompt, ...}`: Text-to-image generation; `save_to` writes every image (`name.png`, `name-2.png`, ...), returns the paths as a list and drops the base64 from the result. A failed write raises.
   - `openrouter.sound{model, input, ...}`: Text-to-speech audio synthesis; `save_to` writes the audio and omits base64 from the result. A failed write raises.
   - `openrouter.video{model, prompt, ...}` and `openrouter.poll_video{job_id}`: Video generation submission and job polling.
+
+### SSoT: diverse candidates from the run's model
+
+Install the included [SSoT tool](examples/tools/ssot.lua), based on [String Seed of Thought](https://pub.sakana.ai/ssot/):
+
+```sh
+mkdir -p .harness/tools
+cp examples/tools/ssot.lua .harness/tools/ssot.lua
+hx trust
+```
+
+`ssot.sample{prompt, n=5}` asks the run's model for `n` deliberately different answers in parallel and returns `{answers = {{answer, seed}, ...}, errors}`. Each request gets its own `nonce()` seed and is told to list the root-level dimensions along which answers can differ, pick one option per dimension from a different part of the seed, then answer. Reasoning is off unless `effort` says otherwise. Use it for open-ended work (ideas, designs, angles, drafts), then judge the candidates: some are deliberately unusual and some are weak. In blind tests on DeepSeek V4.1 Flash (10 samples per arm, UI layouts, blog posts and trading research ideas), the paper's plain prompt barely moved answers off the model's default, while this seeded-dimensions prompt gave 10 of 10 distinct blog posts against 0 of 10 and raised the novelty of trading ideas from 2.3 to 3.25 out of 5, at some cost in soundness (3.5 to 3.15).
 
 ## Security model
 

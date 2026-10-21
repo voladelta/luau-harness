@@ -23,6 +23,18 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     let g = lua.globals();
     g.set("__emit", lua.create_function(|_, _: String| Ok(()))?)?;
     g.set("__format", lua.create_function(|_, value: Value| value.to_string())?)?;
+    let (lfx, lhost) = (fx.clone(), host.clone());
+    g.set("llm", lua.create_async_function(move |lua, requests: Value| {
+        let (host, fx) = (lhost.clone(), lfx.clone());
+        async move {
+            let input = values::copy_out(requests)?;
+            let ret = fx.run(&lua, crate::supervisor::Tool::Llm, crate::policy::Class::Read, input.clone(), || async {
+                let host = host.ok_or_else(|| mlua::Error::runtime("llm requires hx run"))?;
+                Ok(crate::effects::Ret::Json(host.complete(input).await.map_err(mlua::Error::external)?))
+            }).await?;
+            prims::json_value(&lua, ret)
+        }
+    })?)?;
     if let Some(host) = host {
         let afx = fx.clone();
         g.set("agent", lua.create_async_function(move |lua, (task, opts): (String, Option<Table>)| {

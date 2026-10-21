@@ -15,6 +15,24 @@ HX = ROOT / "target/release/hx"
 CALLS = []
 
 
+def text(content):
+    return "\n".join(part.get("text", "") for part in content) if isinstance(content, list) else content or ""
+
+
+def model_reply(body):
+    """SSoT requests answer from their seed; a run's agent runs MODEL_CODE once (if set), then says done."""
+    system = text(body["messages"][0]["content"])
+    if "<random_string>" in system:
+        seed = system.split("<random_string>")[1].split("</random_string>")[0]
+        return {"role": "assistant", "content": "" if "cut off" in text(body["messages"][1]["content"]) else f"<thinking>axes</thinking><answer> idea {seed} </answer>"}
+    if MODEL_CODE and not any(m["role"] == "assistant" for m in body["messages"]):
+        return {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "luau", "arguments": json.dumps({"code": MODEL_CODE[0]})}}]}
+    return {"role": "assistant", "content": "done"}
+
+
+MODEL_CODE = []
+
+
 class API(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -34,7 +52,7 @@ class API(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}).encode())
+            self.wfile.write(json.dumps({"choices": [{"message": model_reply(body), "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}).encode())
             return
         status = 401 if url.path == "/unauthorized" else 302 if url.path == "/redirect" else 200
         self.send_response(status)
@@ -238,6 +256,44 @@ class Tools(unittest.TestCase):
         self.assertIn("probe.get(args: table): table", system)
         self.assertNotIn("missing.get", system)
         self.assertNotIn("model-test-key", system)
+
+    def run_model(self, code, *flags):
+        MODEL_CODE[:] = [code]
+        self.addCleanup(MODEL_CODE.clear)
+        task = self.root / "task.txt"
+        task.write_text("Use the tool.")
+        self.command("run", "--prompt-file", str(task), "--model", "mock", "--api", "completions", "--base-url", self.base,
+                     "--key-env", "HX_TEST_MODEL_KEY", "--max-turns", "3", *flags, env=dict(self.env, HX_TEST_MODEL_KEY="model-test-key"))
+        ssot = [c[3] for c in CALLS if "<random_string>" in text(c[3]["messages"][0]["content"])]
+        result = [text(m["content"]) for c in CALLS for m in c[3]["messages"] if m["role"] == "tool"]
+        return ssot, result[-1] if result else ""
+
+    def test_ssot_samples_from_the_runs_model_with_fresh_seeds(self):
+        (self.dir / "ssot.lua").write_text((ROOT / "examples/tools/ssot.lua").read_text())
+        ssot, out = self.run_model('local r = ssot.sample{prompt="p", n=3}; print(#r.answers, #r.errors); for _, a in r.answers do print(a.answer == "idea " .. a.seed) end', "--reasoning", "high")
+        self.assertEqual(len(ssot), 3)
+        self.assertTrue(all(b["model"] == "mock" and "reasoning" not in b and text(b["messages"][1]["content"]) == "p" for b in ssot))
+        seeds = {text(b["messages"][0]["content"]).split("<random_string>")[1].split("<")[0] for b in ssot}
+        self.assertEqual(len(seeds), 3)
+        self.assertTrue(all(len(seed) == 32 for seed in seeds))
+        self.assertIn("3\t0", out)
+        self.assertEqual(out.count("true"), 3)
+        CALLS.clear()
+        ssot, out = self.run_model('local r = ssot.sample{prompt="cut off", n=2, effort="low", max_tokens=100}; print(#r.answers, r.errors[1]); print(pcall(ssot.sample, {prompt="p", effort="huge"}))')
+        self.assertEqual([(b["reasoning"], b["max_tokens"]) for b in ssot], [({"effort": "low"}, 100)] * 2)
+        self.assertIn("effort must be none, low, medium, high, xhigh or max", out)
+        self.assertIn("0\tno answer in reply", out)
+
+    def test_llm_needs_capability_and_a_run(self):
+        source = 'return {CAPS tools={go={signature="go(): table",description="chat",run=function() return llm({{system="s",prompt="p"}}) end}}}'
+        (self.dir / "plain.lua").write_text(source.replace("CAPS", ""))
+        (self.dir / "chatty.lua").write_text(source.replace("CAPS", 'capabilities={llm={"chat"}},'))
+        out = self.run_code('print(pcall(plain.go)); print(pcall(chatty.go))')
+        self.assertIn("capability_denied: tool:plain lacks llm.chat", out)
+        self.assertIn("llm requires hx run", out)
+        _, out = self.run_model('print(pcall(chatty.go)); print(pcall(llm, {}))')
+        self.assertIn("true\t<table: 1 rows {ok,value}>", out)
+        self.assertIn("false\tattempt to call a nil value", out)  # the model itself gets no llm
 
     def test_json_escaped_credential_is_redacted(self):
         self.tool(secret="TINYFISH_API_KEY")

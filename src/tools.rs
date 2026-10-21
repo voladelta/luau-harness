@@ -139,7 +139,14 @@ pub fn install_codecs(lua: &Lua) -> mlua::Result<()> {
         lua.create_string(bytes)
     })?)?;
     b64.set_readonly(true);
-    lua.globals().set("base64", b64)
+    lua.globals().set("base64", b64)?;
+    // Fresh OS entropy, for a seed that no earlier call or fixed PRNG state can predict.
+    lua.globals().set("nonce", lua.create_function(|_, ()| {
+        use base64::Engine;
+        let mut bytes = [0u8; 24];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut bytes)?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    })?)
 }
 
 pub fn definition(table: &Table) -> Result<Definition> {
@@ -148,7 +155,7 @@ pub fn definition(table: &Table) -> Result<Definition> {
     let mut capabilities: BTreeMap<String, Vec<String>> = data(table, "capabilities")?;
     for (cap, scopes) in &capabilities {
         for scope in scopes {
-            ensure!(matches!((cap.as_str(), scope.as_str()), ("fs", "read" | "write") | ("proc", "sh") | ("llm", "agent")), "unsupported tool capability {cap}.{scope}");
+            ensure!(matches!((cap.as_str(), scope.as_str()), ("fs", "read" | "write") | ("proc", "sh") | ("llm", "agent" | "chat")), "unsupported tool capability {cap}.{scope}");
         }
     }
     for (name, endpoint) in &http {

@@ -134,7 +134,7 @@ fn binary_sha() -> Result<String> { Ok(eventlog::sha_bytes(&std::fs::read(std::e
 
 /// Every effect a principal can ask for, and the capability it needs.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Tool { Read, Search, History, View, Write, Edit, Sh, Agent, McpList, McpCall, Promote, ProposeModule, Http }
+pub enum Tool { Read, Search, History, View, Write, Edit, Sh, Agent, McpList, McpCall, Promote, ProposeModule, Http, Llm }
 
 impl Tool {
     /// The name journal records carry.
@@ -143,7 +143,7 @@ impl Tool {
             Self::Read => "read", Self::Search => "search", Self::History => "history", Self::View => "view", Self::Write => "write", Self::Edit => "edit",
             Self::Sh => "sh", Self::Agent => "agent", Self::McpList => "mcp_list", Self::McpCall => "mcp_call",
             Self::Promote => "promote", Self::ProposeModule => "propose_module",
-            Self::Http => "http",
+            Self::Http => "http", Self::Llm => "llm",
         }
     }
 
@@ -155,6 +155,7 @@ impl Tool {
             Self::Agent => ("llm", "agent"),
             Self::McpList | Self::McpCall => ("mcp", "call"),
             Self::Http => ("http", "request"),
+            Self::Llm => ("llm", "chat"),
         }
     }
 }
@@ -169,7 +170,7 @@ impl Principal {
     pub fn name(&self) -> &str { match self { Self::Agent { read_only: false } => "agent", Self::Agent { read_only: true } => "read-only agent", Self::Package { name, .. } => name } }
     pub(crate) fn allows(&self, cap: &str, scope: &str) -> bool {
         match self {
-            Self::Agent { read_only } => !read_only || matches!((cap, scope), ("fs", "read") | ("llm", "agent")),
+            Self::Agent { read_only } => !read_only || matches!((cap, scope), ("fs", "read") | ("llm", "agent" | "chat")),
             Self::Package { caps, active, .. } => active.load(Ordering::Acquire) && caps.get(cap).is_some_and(|s| s.iter().any(|s| s == scope || s == "*")),
         }
     }
@@ -180,7 +181,8 @@ impl Principal {
             Self::Package { name, active, .. } => {
                 let mut restricted = BTreeMap::new();
                 if self.allows("fs", "read") { restricted.insert("fs".into(), vec!["read".into()]); }
-                if self.allows("llm", "agent") { restricted.insert("llm".into(), vec!["agent".into()]); }
+                let llm: Vec<String> = ["agent", "chat"].into_iter().filter(|scope| self.allows("llm", scope)).map(String::from).collect();
+                if !llm.is_empty() { restricted.insert("llm".into(), llm); }
                 Self::Package { name: name.clone(), caps: restricted, active: active.clone() }
             },
         }

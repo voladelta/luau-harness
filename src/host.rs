@@ -41,6 +41,17 @@ pub struct AgentOptions {
 
 fn default_agent_turns() -> usize { 12 }
 
+/// One single-shot completion for `llm{...}`: no tools, no history, the run's provider and model.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Completion {
+    system: String,
+    prompt: String,
+    /// absent: the run's effort; "none": send no reasoning setting; otherwise low..max
+    effort: Option<String>,
+    max_tokens: Option<u64>,
+}
+
 impl AgentOptions {
     pub fn parse(value: Value) -> Result<Self> {
         let options: Self = serde_json::from_value(if value.is_null() { json!({}) } else { value })
@@ -142,26 +153,29 @@ impl Host {
         report
     }
 
-    pub async fn chat(&self, req: &Value) -> Result<Reply> {
+    pub async fn chat(&self, req: &Value) -> Result<Reply> { self.chat_as(&self.llm, req).await }
+
+    /// One budgeted, journaled request to `cfg`: the run's provider, key and model, possibly with another reasoning effort.
+    pub async fn chat_as(&self, cfg: &LlmCfg, req: &Value) -> Result<Reply> {
         crate::controller::validate_request(req)?;
         let mut retried = false;
-        let key = if self.key.is_empty() {self.llm.key()?} else {self.key.clone()};
+        let key = if self.key.is_empty() {cfg.key()?} else {self.key.clone()};
         loop {
-            let op = self.supervisor.reserve_model(&self.llm, req, self.depth).await?;
-            let call = llm::chat(&self.http, &self.llm, &key, req);
+            let op = self.supervisor.reserve_model(cfg, req, self.depth).await?;
+            let call = llm::chat(&self.http, cfg, &key, req);
             let result = match self.supervisor.remaining() {
                 Some(remaining) => tokio::time::timeout(remaining, call).await.map_err(|_| anyhow::anyhow!("budget_exceeded: absolute run deadline reached during model request")).and_then(|r| r),
                 None => call.await,
             };
             let error = match result {
-                Ok(reply) => { self.supervisor.settle_model(op, &self.llm, &reply, self.depth)?; return Ok(reply); },
+                Ok(reply) => { self.supervisor.settle_model(op, cfg, &reply, self.depth)?; return Ok(reply); },
                 Err(error) => error,
             };
             // An answer without a generation is classified. A lost response may have been billed: when its reservation
             // was a real bound it is charged at that bound and a new request may follow; otherwise it stays reserved for
             // the owner. The lost operation itself is never dispatched again.
             let answered = error.downcast_ref::<llm::Answered>();
-            let closed = self.supervisor.fail_model(op, &self.llm, &error.to_string(), answered.is_some_and(|a| a.unbilled()), self.depth)?;
+            let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.is_some_and(|a| a.unbilled()), self.depth)?;
             let retry = match answered { Some(a) => a.retryable().then_some(a.retry_after), None => closed.then_some(None) };
             match retry.filter(|_| !retried) {
                 Some(after) => {
@@ -174,6 +188,30 @@ impl Host {
                 None => return Err(error),
             }
         }
+    }
+
+    /// Validate every completion, then run them concurrently. Results keep input order as `{ok, value}` or `{ok, error}`.
+    pub async fn complete(&self, input: Value) -> Result<Value> {
+        let requests: Vec<Completion> = serde_json::from_value(input).context("llm takes a list of {system, prompt, effort?, max_tokens?}")?;
+        anyhow::ensure!((1..=32).contains(&requests.len()), "llm takes 1 to 32 requests");
+        let jobs = requests.into_iter().map(|c| -> Result<_> {
+            let mut cfg = self.llm.clone();
+            match c.effort.as_deref() {
+                None => {},
+                Some("none") => cfg.reasoning = None,
+                Some(effort @ ("low" | "medium" | "high" | "xhigh" | "max")) => cfg.reasoning = Some(effort.into()),
+                Some(other) => anyhow::bail!("llm: effort must be none, low, medium, high, xhigh or max (got {other:?})"),
+            }
+            let mut req = json!({"system": c.system, "messages": [{"role": "user", "content": c.prompt}]});
+            if let Some(max) = c.max_tokens { req["max_tokens"] = json!(max); }
+            crate::controller::validate_request(&req)?;
+            Ok(async move { self.chat_as(&cfg, &req).await })
+        }).collect::<Result<Vec<_>>>()?;
+        let results = futures::future::join_all(jobs).await.into_iter().map(|reply| match reply {
+            Ok(reply) => json!({"ok": true, "value": reply.text}),
+            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        }).collect();
+        Ok(Value::Array(results))
     }
 
     pub fn run_task(self: Arc<Self>, task: String, max_turns: usize) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> {
