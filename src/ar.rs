@@ -32,8 +32,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// Workers side by side in a round: as many as the provider's rate limit comfortably allows.
-const WORKERS: usize = 6;
+/// Workers side by side in a round, and fewer once the provider has rate-limited an episode of the run.
+const WORKERS: usize = 8;
+const NARROW: usize = 6;
 /// Rounds an episode's share is sized for: each gets at most budget / (1 + PACE * (WORKERS + TOP)). Rounds go on
 /// while the budget lasts, so episodes that spend less than their share buy more rounds.
 const PACE: usize = 3;
@@ -756,6 +757,25 @@ impl Orchestrator {
         report["final_answer"].as_str().map(str::trim).filter(|a| !a.is_empty()).map(String::from)
     }
 
+    /// Workers per round: `WORKERS`, or `NARROW` once any episode's journal records a rate limit (HTTP 429).
+    fn width(&self) -> usize {
+        let limited = |dir: PathBuf| -> bool {
+            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|f| {
+                f.path().extension().is_some_and(|e| e == "jsonl")
+                    && std::fs::read_to_string(f.path()).is_ok_and(|t| t.contains("\"API 429 "))
+            })
+        };
+        let logs = std::fs::read_dir(self.dir.join("episodes")).into_iter().flatten().flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".log"));
+        for log in logs {
+            if limited(log.path()) {
+                eprintln!("hx ar: the provider rate-limited {}; rounds run {NARROW} workers", log.file_name().to_string_lossy());
+                return NARROW;
+            }
+        }
+        WORKERS
+    }
+
     /// The episodes of a journaled batch.
     fn planned(&self, batch: &str) -> Result<Option<Vec<Plan>>> {
         Ok(self.records()?.into_iter().find_map(|r| match r { Record::Planned { batch: b, episodes } if b == batch => Some(episodes), _ => None }))
@@ -893,7 +913,7 @@ returns {{n, score, valid, se, improved, best, report}}; {better} scores are bet
             t += "- `improved` means better than your best so far";
             if spec.min_delta > 0.0 { t += &format!(" by more than {} (smaller differences are noise)", spec.min_delta); }
             t += ". `ar.reset()` puts your best scored state back into the editable paths: use it instead of reverting by hand.\n\
-- Work in experiments: form a hypothesis, edit, ar.eval, read the report, decide the next step. One change per eval, so the ledger stays readable.\n";
+- Score with ar.eval after each change and read the report: it shows what broke. One change per eval, so the ledger stays readable.\n";
         } else {
             t += "- Your evaluations are probes: recorded, never a candidate. Change the editable files freely to test a question.\n";
         }
@@ -944,8 +964,10 @@ Claims are served first come, first served. If it returns `ok = false`, another 
 approach (`message` lists every claim): pick again from a different part of your seed and claim a different core. An \
 accepted claim is final, so claim only your real idea, never a placeholder or a test. ar.eval works only after an \
 accepted claim.\n\
-3. Build the idea, score it with ar.eval, read the report, fix and improve. Your first valid state sets your bar, even below \
-the starting state's score: build the idea properly before judging it.\n\
+3. Build the idea faithfully, score it with ar.eval and read the report. Fix what is broken (errors, invalid results, a bug \
+that keeps the idea from working as designed) until it works. Do not optimize: no parameter sweeps, no tuning for score, \
+no switching ideas. Later rounds refine the strongest candidates, so return as soon as the idea works. Your first valid \
+state sets your bar, even below the starting state's score.\n\
 4. Finish with your finding as the final answer: the idea, what you built, your best score, what worked and what did not, \
 and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwrap_or(label), self.protocol(plan.role, allowance))
             }
@@ -963,7 +985,9 @@ Candidate #{}'s idea: {}\n\nIt is among the strongest candidates{}. Several work
 `ar.claim(\"the refinement in one or two sentences\")`, early. If it returns `ok = false`, another worker claimed the \
 same refinement first (`message` lists every claim): choose a different one. An accepted claim is final, so claim only \
 your real refinement, never a placeholder or a test. ar.eval works only after an accepted claim.\n\
-2. Implement it, ar.eval, read the report, fix and improve. An improvement must beat the candidate's best.\n\
+2. Implement it, ar.eval, read the report, and fix it if it is broken. Do not optimize beyond your one refinement: no \
+parameter sweeps, no further changes. Return once it is built and scored; the next round builds on the best result. An \
+improvement must beat the candidate's best.\n\
 3. Finish with your finding as the final answer: what you changed, your best score, what worked and what did not.\n\n{}\n\
 ## Ledger of candidate #{}\n\n{ledger}\n{starting}", plan.idea, plan.idea, claim(plan.idea),
                     if spec.select.is_some() { " on both the search and the held-out evaluation" } else { "" },
@@ -1119,7 +1143,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                 None => {
                     // Each worker gets a full share and one share stays for the gate's audits; the last round runs fewer workers.
                     let s = self.share();
-                    let workers = (((self.launch.budget - self.spent - s) / s).round().max(0.0) as usize).min(WORKERS);
+                    let workers = (((self.launch.budget - self.spent - s) / s).round().max(0.0) as usize).min(self.width());
                     if workers == 0 { break; }
                     let plans = if explore {
                         (1..=workers).map(|w| -> Result<Plan> {

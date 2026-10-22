@@ -122,7 +122,7 @@ def outputs(requests):
 
 # 1. The manager loop: research, explore workers claiming first come first served, a gate with an audit, exploit
 # rounds with distinct refinements, and a portfolio of distinct audited candidates ranked by held-out score.
-TARGETS = {1: 3, 2: 6, 3: 20, 4: 6, 5: 9, 6: 1}  # workers 2 and 4 want the same idea: one of them must be turned away
+TARGETS = {1: 3, 2: 6, 3: 20, 4: 6, 5: 9, 6: 1, 7: 12, 8: 13}  # workers 2 and 4 want the same idea: one of them must be turned away
 UP, DOWN = "step up by adding one to the current value of x", "step down by subtracting one from the current value of x"
 
 
@@ -163,13 +163,13 @@ rows = ledger(path, report)
 claims = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines()]
 records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
 explore = [c for c in claims if c["scope"] == "explore" and c["worker"].startswith("r1-")]
-assert [c["n"] for c in explore] == [1, 2, 3, 4, 5, 6], explore
+assert [c["n"] for c in explore] == list(range(1, 9)), explore
 ideas = [c["idea"] for c in explore]
-assert ideas.count(go(6)) == 1 and len(set(ideas)) == 6, ideas
+assert ideas.count(go(6)) == 1 and len(set(ideas)) == 8, ideas
 loser = 2 if next(c for c in explore if c["idea"] == go(6))["worker"] == "r1-w4" else 4
 assert go(40 + loser) in ideas, (loser, ideas)
 probes = [o for o in outputs(requests) if "PROBE" in o]
-assert len(probes) >= 6 and all("false" in p and "at least 8 words" in p for p in probes), probes[:2]
+assert len(probes) >= 8 and all("false" in p and "at least 8 words" in p for p in probes), probes[:2]
 check("claims are served first come, first served: a duplicate idea is turned away and its worker claims another; a placeholder claim is refused")
 
 assert (run / "episodes/r0-research.report.json").exists() and "BRIEF:" in (run / "episodes/r1-w1.md").read_text()
@@ -198,7 +198,7 @@ check("exploit rounds split workers across the chosen candidates, each claiming 
 roles = {r["batch"]: r["episodes"][0]["role"] for r in records if r["kind"] == "planned" and r["batch"].startswith("round")}
 assert roles == {"round1": "explore", "round2": "exploit", "round3": "exploit", "round4": "explore", "round5": "exploit"}, roles
 everything = [c["idea"] for c in claims if c["scope"] == "explore"]
-assert len(everything) > 6 and len(set(everything)) == len(everything), everything
+assert len(everything) > 8 and len(set(everything)) == len(everything), everything
 r4 = (run / "episodes/r4-w1.md").read_text().split("Earlier rounds already claimed these ideas")[1].split("\n2. ")[0]
 assert all(f"#{c['n']}:" in r4 for c in explore) and not any(f"#{c['n']}:" in r4 for c in claims if c["worker"].startswith("r4-")), r4
 assert "Earlier rounds" not in (run / "episodes/r1-w1.md").read_text()
@@ -231,16 +231,22 @@ for r in rows:
     snap = json.loads((run / "snaps" / f"{r['snap']}.json").read_text())
     assert r["score"] == -(int(base64.b64decode(snap["x.txt"])) - 7) ** 2, r
 resets = [o for o in outputs(requests) if o.startswith("RESET ") or "RESET " in o]
-assert len(resets) >= 6 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
+assert len(resets) >= 8 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
 check("ledger rows stay numbered under concurrency, every score matches its snapshot, and ar.reset is per worker")
 
 # 1b. While every round moves a chosen candidate, rounds go on until the budget is spent.
 CLIMB = 'import json; x = int(open("x.txt").read()); print(json.dumps({"score": x}))'
 
 
+limited_once = [True]
+
+
 def climbing(body, index):
     role, label = role_of(body)
     if role == "judge": return judge_same(body)
+    if label == "r1-w1" and limited_once[0]:
+        limited_once[0] = False
+        return {"status": 429, "error": "slow down"}
     if answered(body): return f"FINDING from {label}: done"
     if role == "audit": return "Checked.\nVERDICT: PASS"
     if role == "explore":
@@ -256,11 +262,17 @@ path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIM
 with harness.provider(climbing, price=PRICE) as (url, _):
     result = ar(path, url, 0.3)
 report = report_of(result)
-share = 0.3 / (1 + 3 * (6 + 3))
+share = 0.3 / (1 + 3 * (8 + 3))
 assert report["rounds"] > 3 and "moved no chosen candidate" not in result.stderr, (report["rounds"], result.stderr[-1500:])
 assert 0.3 - 1.5 * share - 0.02 <= report["cost_usd"] <= 0.3 + 0.02, report["cost_usd"]
 assert report["search"] > 6 + 1, report["search"]
 check("while every round moves a chosen candidate, rounds go on until the budget is spent")
+
+records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
+widths = [len(r["episodes"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("round")]
+assert widths[0] == 8 and widths[1] == 6 and max(widths[1:]) == 6, widths
+assert "rate-limited r1-w1" in result.stderr, result.stderr[-1500:]
+check("eight workers per round, six once the provider rate-limits an episode")
 
 # 2. When no explore idea beats the seed, the run stops after round 1 and keeps the seed.
 def hopeless(body, index):
@@ -395,7 +407,7 @@ with harness.provider(slow, price=PRICE) as (url, _):
         if journals:
             lines = [json.loads(l) for l in journals[0].read_text().splitlines() if l.endswith("}")]
             done = {r["label"] for r in lines if r["kind"] == "finished"}
-            if sum(r["kind"] == "finished" and r["label"].startswith("r1-") for r in lines) >= 5 and "r1-w6" not in done:
+            if sum(r["kind"] == "finished" and r["label"].startswith("r1-") for r in lines) >= 7 and "r1-w6" not in done:
                 journal = journals[0]
                 break
         time.sleep(0.05)
@@ -468,7 +480,7 @@ path = workspace("idle")
 with harness.provider(lambda body, index: "Answer: 0" if role_of(body)[0] == "judge" else "nothing to do", price=PRICE) as (url, _):
     result = ar(path, url, 0.3, ok=False)
 episodes = list((path / ".harness/ar").glob("*/episodes/*.md"))
-assert result.returncode != 0 and "made no evaluations" in result.stderr and len(episodes) == 7, (len(episodes), result.stderr[-800:])
+assert result.returncode != 0 and "made no evaluations" in result.stderr and len(episodes) == 9, (len(episodes), result.stderr[-800:])
 check("idle agents end the run after round 1; a run without evals fails")
 
 # 9. Provider crashes are charged from the child's journal and retried; misconfiguration fails fast and nonzero.
