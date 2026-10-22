@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Offline autoresearch (`hx run --ar`) checks with the real CLI, a scripted provider and a toy evaluator.
 
-The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and the held-out one -(x-5)^2, so the gates
-and the final pick must prefer held-out quality over the agent-visible score. Scripted runs exercise the manager loop:
+The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and the held-out one -(x-5)^2. Candidates
+rank by search; the held-out score only vetoes those worse than the seed on it (x of 10 and beyond). Scripted runs exercise the manager loop:
 research, first-come claims judged by the model, gates with audits, exploit rounds and the portfolio. The isolation
 checks replay attacks an independent review found against the first design: each must leave the recorded scores honest.
 """
@@ -181,13 +181,15 @@ check("claims are served first come, first served: a duplicate idea is turned aw
 
 assert (run / "episodes/r0-research.report.json").exists() and "BRIEF:" in (run / "episodes/r1-w1.md").read_text()
 gates = [r for r in records if r["kind"] == "gate"]
-assert [g["round"] for g in gates] == [1, 2, 3, 4, 5], gates
+assert [g["round"] for g in gates] == [1, 2, 3, 4], gates
 three = next(c["n"] for c in explore if c["idea"] == go(3))
 six = next(c["n"] for c in explore if c["idea"] == go(6))
 assert gates[0]["chosen"][0] == six and three not in gates[0]["chosen"] and len(gates[0]["chosen"]) == 3, gates[0]
 assert any(r["kind"] == "audited" and r["idea"] == three and not r["pass"] for r in records)
 assert not any(c["idea"] == three for g in gates for c in g["candidates"] if c["idea"] in g["chosen"])
-bad = {c["n"] for c in explore if c["idea"] in (go(20), go(40 + loser))}
+bad = {c["n"] for c in explore if c["idea"] in (go(20), go(40 + loser), go(12), go(13))}
+vetoed = [c for c in gates[0]["candidates"] if c["idea"] in bad and c["search"] > -49]
+assert vetoed and all(c["select"] < -25 for c in vetoed), vetoed  # beat the seed on search, lose on held-out
 assert all(not c["good"] for c in gates[0]["candidates"] if c["idea"] in bad), gates[0]["candidates"]
 check("research briefs every worker; the gate keeps good candidates, audits them and drops the one that fails")
 
@@ -201,16 +203,16 @@ assert any("same refinement" in j for j in judged) and any("same core approach" 
 check("exploit rounds split workers across the chosen candidates, each claiming a distinct refinement")
 
 # Round 3 finds no refinement left, so round 4 explores again; its workers see every earlier idea and claim new ones.
-# Rounds 3 to 5 move no chosen candidate, so the run stops with budget left.
+# Round 4's new ideas don't move the chosen candidates either, so the run stops with budget left.
 roles = {r["batch"]: r["episodes"][0]["role"] for r in records if r["kind"] == "planned" and r["batch"].startswith("round")}
-assert roles == {"round1": "explore", "round2": "exploit", "round3": "exploit", "round4": "explore", "round5": "exploit"}, roles
+assert roles == {"round1": "explore", "round2": "exploit", "round3": "exploit", "round4": "explore"}, roles
 everything = [c["idea"] for c in claims if c["scope"] == "explore"]
 assert len(everything) > 8 and len(set(everything)) == len(everything), everything
 r4 = (run / "episodes/r4-w1.md").read_text().split("Earlier rounds already claimed these ideas")[1].split("\n2. ")[0]
 assert all(f"#{c['n']}:" in r4 for c in explore) and not any(f"#{c['n']}:" in r4 for c in claims if c["worker"].startswith("r4-")), r4
 assert "Earlier rounds" not in (run / "episodes/r1-w1.md").read_text()
-assert "3 rounds moved no chosen candidate" in result.stderr and report["cost_usd"] < 0.6 / 2, report["cost_usd"]
-check("an exploit round that moves no chosen candidate is followed by an explore round; three such rounds stop the run")
+assert "neither refining nor exploring moved" in result.stderr and report["cost_usd"] < 0.6 / 2, report["cost_usd"]
+check("an exploit round that moves no chosen candidate is followed by an explore round; when that moves none, the run stops")
 
 # Replaying the finished run from its journal reaches the same stop without starting anything.
 (run / "report.json").unlink()
@@ -227,11 +229,12 @@ check("a resumed run replays its rounds from the journal: same decisions, nothin
 portfolio = report["portfolio"]
 assert 1 <= len(portfolio) <= 3 and len({p["snap"] for p in portfolio}) == len(portfolio), portfolio
 assert all(p["audit"] is True and p["idea"] != three for p in portfolio), portfolio
-assert [p["select"] for p in portfolio] == sorted((p["select"] for p in portfolio), reverse=True), portfolio
+assert [p["search"] for p in portfolio] == sorted((p["search"] for p in portfolio), reverse=True), portfolio
+assert all(p["good"] and p["select"] >= -25 for p in portfolio), portfolio  # nothing the held-out veto rejects
 x = int((path / "x.txt").read_text())
 assert report["select"] == portfolio[0]["select"] == -(x - 5) ** 2, (x, report["select"], portfolio)
 assert all((run / "portfolio" / f"c{p['idea']}" / "x.txt").exists() for p in portfolio)
-check("the result is a portfolio of distinct audited candidates, best held-out first, the best in the workspace")
+check("the result is a portfolio of distinct audited candidates the held-out score did not veto, best search first")
 
 assert [r["n"] for r in rows] == list(range(1, len(rows) + 1)), [r["n"] for r in rows]
 for r in rows:
@@ -303,8 +306,8 @@ records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines
 gates = [r for r in records if r["kind"] == "gate"]
 assert len(gates[0]["chosen"]) == 3 and not any(c["good"] for c in gates[0]["candidates"]), gates[0]
 copy = next(c for c in gates[0]["candidates"] if c["search"] == -49)
-first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["select"]) if c is not copy][:3]
-assert copy["select"] == -25 and copy["idea"] not in gates[0]["chosen"], gates[0]
+first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["search"]) if c is not copy][:3]
+assert copy["idea"] not in gates[0]["chosen"], gates[0]
 assert gates[0]["chosen"] == first, (gates[0]["chosen"], first)
 round2 = next(r for r in records if r["kind"] == "planned" and r["batch"] == "round2")
 assert {p["role"] for p in round2["episodes"]} == {"exploit"} and {p["idea"] for p in round2["episodes"]} == set(first), round2

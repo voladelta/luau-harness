@@ -18,13 +18,16 @@
 //! runs explore workers side by side; each derives its own idea from a host seed and claims it with `ar.claim`. Claims
 //! are served one at a time in arrival order: an idea that two judge calls both find to share the core approach of an
 //! earlier claim is rejected, and the worker tries another. Each accepted idea is a candidate with its own best state. A
-//! gate keeps the candidates that beat the seed on search and are not worse on the held-out `select`, audits the
-//! strongest, and hands the three most promising (good ones first, but an unpolished idea below the seed too) to the
-//! exploit rounds, whose workers claim distinct refinements of their candidate.
-//! Rounds go on until the budget is spent: after an exploit round that moves no chosen candidate, the next round
-//! explores new ideas again. With no valid candidate after round 1 the run stops. The result is the audited good
-//! candidates of the last gate, best held-out score first: several distinct good answers, since the single best score is the one
-//! most likely to be an overfit or an evaluator hole.
+//! gate hands the three strongest by search (good ones first, but an unpolished idea below the seed too) to the
+//! exploit rounds, whose workers claim distinct refinements of their candidate. Good means beating the seed on search
+//! and not being worse on the held-out `select`; good candidates are audited, and only they can become results. The
+//! held-out score is only ever a veto: ranking on it as well would select on it every round until it is as optimistic
+//! as the search score.
+//!
+//! Rounds go on while the budget lasts: after an exploit round that moves no chosen candidate, the next round explores
+//! new ideas again, and when that moves none either the run stops. With no valid candidate after round 1 the run stops.
+//! The result is the audited good candidates of the last gate, best search score first: several distinct good answers,
+//! since the single best score is the one most likely to be an overfit or an evaluator hole.
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -39,12 +42,8 @@ const NARROW: usize = 6;
 /// Rounds an episode's share is sized for: each gets at most budget / (1 + PACE * (WORKERS + TOP)). Rounds go on
 /// while the budget lasts, so episodes that spend less than their share buy more rounds.
 const PACE: usize = 3;
-/// Rounds in a row that move no chosen candidate before the run stops with budget left.
-const STALL: usize = 3;
 /// Candidates a gate hands to the next round, and the size of the final portfolio.
 const TOP: usize = 3;
-/// Planning stops when less than this share of the budget is left.
-const MIN_SLICE: f64 = 0.01;
 /// Ledger rows shown to a worker, characters of an evaluator report, of a brief and of one finding.
 const SHOWN: usize = 40;
 /// Findings shown to a worker: the most recent ones.
@@ -67,7 +66,8 @@ pub struct Spec {
     /// Search evaluator: agent-visible. Prints a JSON object with `score` (and optionally `valid`, `se`, `report`)
     /// as its last stdout line.
     pub eval: String,
-    /// Selection evaluator (held-out): used only by the orchestrator to pick the final result among checkpoints.
+    /// Selection evaluator (held-out), never shown to agents: a veto, so a candidate worse than the seed on it never
+    /// becomes a result.
     pub select: Option<String>,
     /// Directories both evaluators may read (the grader and its search data), outside the workspace. `~/` and
     /// `$HOME/` expand.
@@ -844,7 +844,8 @@ impl Orchestrator {
             let retries_left = pending.iter().any(|(plan, _)| attempts(&plan.label).len() + 1 < MAX_CRASHES as usize);
             if pending.is_empty() { return Ok(()); }
             let remaining = self.launch.budget - self.spent;
-            if remaining < self.launch.budget * MIN_SLICE { return Ok(()); }
+            // Less than half a share cannot fund a useful episode.
+            if remaining < self.share() / 2.0 { return Ok(()); }
             // The research brief serves every later episode, so it gets three shares.
             let share = if batch == "research" { 3.0 * self.share() } else { self.share() };
             let allowance = share.min(remaining / pending.len() as f64);
@@ -1015,7 +1016,7 @@ and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwr
                     ledger += &format!("{} | {score} | {} | {} | {}\n", r.n, if r.improved { "yes" } else { "" }, r.episode, r.note.replace('\n', " "));
                 }
                 format!("{program}\n\n{brief}{findings}## Autoresearch exploit worker {label}: candidate #{}\n\n\
-Candidate #{}'s idea: {}\n\nIt is among the most promising candidates{}. Several workers refine it side by side; improve it:\n\n\
+Candidate #{}'s idea: {}\n\nIt is among the most promising candidates. Several workers refine it side by side; improve it:\n\n\
 1. Choose one refinement, a change with a reason to generalize rather than tuning to the reported numbers, and claim it: \
 `ar.claim(\"the refinement in one or two sentences\")`, early. If it returns `ok = false`, another worker claimed the \
 same refinement first (`message` lists every claim): choose a different one. An accepted claim is final, so claim only \
@@ -1025,7 +1026,6 @@ parameter sweeps, no further changes. Return once it is built and scored; the ne
 improvement must beat the candidate's best.\n\
 3. Finish with your finding as the final answer: what you changed, your best score, what worked and what did not.\n\n{}\n\
 ## Ledger of candidate #{}\n\n{ledger}\n{starting}", plan.idea, plan.idea, claim(plan.idea),
-                    if spec.select.is_some() { " on both the search and the held-out evaluation" } else { "" },
                     self.protocol(plan.role, allowance), plan.idea)
             }
             Role::Audit => format!("{program}\n\n{brief}{findings}## Autoresearch auditor {label}: candidate #{}\n\n\
@@ -1041,10 +1041,10 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
     }
 
     /// Candidates after `round`: every accepted explore claim with a valid improved state, at its best search state.
-    /// Good: beats the seed on search by more than `min_delta`, and is not worse than the seed on select. The `TOP`
-    /// strongest go on (good ones first, then by select, else search; one per distinct state): workers return their
-    /// ideas unpolished, so one below the seed still earns refinement. Good ones among them are audited until `TOP`
-    /// pass or none is left; only good ones can become results.
+    /// Good: beats the seed on search by more than `min_delta`, and is not worse than the seed on select (a veto, never
+    /// a ranking). The `TOP` strongest go on (good ones first, then by search; one per distinct state): workers return
+    /// their ideas unpolished, so one below the seed still earns refinement. Good ones among them are audited until
+    /// `TOP` pass or none is left; only good ones can become results.
     async fn gate(&mut self, round: usize) -> Result<Vec<u32>> {
         let seed = self.seed()?;
         let seed_search = self.known(&ledger(&self.dir)?, &seed).0;
@@ -1073,7 +1073,8 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                     .fold(None::<&Row>, |b, r| if self.spec().better(r.score.unwrap(), b.and_then(|b| b.score), 0.0) { Some(r) } else { b });
                 let Some(best) = best else { continue };
                 let beats = seed_search.is_none_or(|s| self.spec().better(best.score.unwrap(), Some(s), self.spec().min_delta));
-                let select = self.select(&best.snap).await?;
+                // The veto is computed only where it can decide something, so held-out data is looked at as little as possible.
+                let select = if beats { self.select(&best.snap).await? } else { None };
                 let held = self.spec().select.is_none()
                     || select.is_some_and(|s| seed_select.is_none_or(|b| !self.spec().better(b, Some(s), 0.0)));
                 let audit = records.iter().rev().find_map(|r| match r {
@@ -1083,12 +1084,11 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                 candidates.push(Candidate { idea: c.n, claim: c.idea.clone(), snap: best.snap.clone(), search: best.score, select,
                     good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
             }
-            let key = |c: &Candidate| if self.spec().select.is_some() { c.select } else { c.search };
-            // A candidate that scores exactly as the seed on every tier is the seed in other bytes: it never goes on.
-            let seedlike = |c: &Candidate| c.search == seed_search && c.select == seed_select;
+            // A candidate that scores exactly as the seed is the seed in other bytes: it never goes on.
+            let seedlike = |c: &Candidate| c.search == seed_search;
             let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.audit != Some(false) && !seedlike(c)).collect();
             ranked.sort_by(|a, b| b.good.cmp(&a.good).then_with(|| {
-                let (a, b) = (key(a).unwrap_or(f64::NAN), key(b).unwrap_or(f64::NAN));
+                let (a, b) = (a.search.unwrap_or(f64::NAN), b.search.unwrap_or(f64::NAN));
                 if self.spec().better(a, Some(b), 0.0) { std::cmp::Ordering::Less } else if self.spec().better(b, Some(a), 0.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
             }));
             // Two candidates that reached the same state are one result: the better ranked keeps it.
@@ -1173,7 +1173,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
         self.run_batch("research").await?;
         // Rounds go on while the budget lasts. Round 1 explores; later rounds exploit the last gate's chosen candidates
         // while that moves them, and explore new ideas after an exploit round that moved none.
-        let (mut last, mut stalled, mut explore) = (Vec::<(u32, String)>::new(), 0, true);
+        let (mut last, mut explore) = (Vec::<(u32, String)>::new(), true);
         for round in 1.. {
             let batch = format!("round{round}");
             let mut gate = self.records()?.into_iter().find_map(|r| match r { Record::Gate { round: g, candidates, chosen } if g == round => Some((candidates, chosen)), _ => None });
@@ -1212,16 +1212,20 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
             if chosen.is_empty() { break; }
             let now: Vec<(u32, String)> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).map(|c| (c.idea, c.snap.clone())).collect();
             let moved = now.iter().any(|c| !last.contains(c));
-            stalled = if moved { 0 } else { stalled + 1 };
-            if stalled >= STALL { eprintln!("hx ar: {STALL} rounds moved no chosen candidate; stopping"); break; }
-            explore = !moved && plans.first().is_some_and(|p| p.role == Role::Exploit);
+            // Exploring follows only an exploit round that moved nothing: when exploring moves nothing either, both ways
+            // forward are spent.
+            if !moved && plans.first().is_some_and(|p| p.role == Role::Explore) {
+                eprintln!("hx ar: neither refining nor exploring moved a chosen candidate; stopping");
+                break;
+            }
+            explore = !moved;
             last = now;
         }
         let state = self.state()?;
         ensure!(!state.rows.is_empty(), "autoresearch made no evaluations; see {}", self.dir.join("episodes").display());
         let (candidates, chosen) = self.last_gate()?.unwrap_or_default();
         let portfolio: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).filter(|c| c.good).collect();
-        // The portfolio's states, best held-out score first; the first goes into the workspace (the seed when none).
+        // The portfolio's states, best search score first; the first goes into the workspace (the seed when none).
         for c in &portfolio {
             let dir = self.dir.join("portfolio").join(format!("c{}", c.idea));
             if !dir.exists() { place(&dir, self.spec(), &load_snap(&self.dir, &c.snap)?)?; }
