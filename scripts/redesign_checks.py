@@ -498,13 +498,13 @@ def sandboxed_sh_settles():
 
 
 def compaction_and_recovery():
-    pad = " -- " + "p" * 200
+    pad = " -- " + "p" * 2000
     sequence = [
         {"code": 'x=42; durable.set("x",42)' + pad},
-        {"code": 'y=1' + pad, "tokens": 30000},
+        {"code": 'y=1' + pad, "tokens": 23000},
         "SUMMARY-ONE",
         {"code": 'assert(x==42); print("AFTER_ONE")' + pad},
-        {"code": 'z=2' + pad, "tokens": 30000},
+        {"code": 'z=2' + pad, "tokens": 23000},
         "SUMMARY-TWO",
         {"code": 'assert(x==42); print("AFTER_TWO")' + pad},
         "done",
@@ -514,7 +514,7 @@ def compaction_and_recovery():
     with provider(lambda body, i: sequence[i]) as (url, calls):
         report = json.loads(start(path, url, "--context-window", "40000", "--max-output", "1000").stdout)
         assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 8, report
-        assert "<previous-summary>\\nSUMMARY-ONE" in body_text(calls[5])
+        assert "SUMMARY-ONE" in body_text(calls[5]) and "Write a context checkpoint" in body_text(calls[5])
         assert "SUMMARY-TWO" in body_text(calls[-1]) and "SUMMARY-ONE" not in body_text(calls[-1])
         log = journal(path)
         summary_seq = next(r["seq"] for r in records(log) if r["kind"] == "llm" and json.loads((log.parent / "blobs" / r["reply"]).read_text())["text"] == "SUMMARY-ONE")

@@ -11,59 +11,59 @@ test.case("threshold", function()
 	test.ok(compact.threshold(10000, 16384, 16384) <= 0, "a window smaller than the reply budget disables compaction")
 end)
 
-test.case("find_cut moves to an assistant message and never returns a tool message", function()
+test.case("find_cut walks back to an assistant message and never cuts the task or a tool exchange", function()
 	local pad = string.rep("x", 400) -- 100 tokens
 	local m = { user("task"), asst(pad, "a"), tool("a", "ok"), asst(pad, "b"), tool("b", "ok"), asst(pad, "c"), tool("c", "ok") }
-	for keep = 1, 400 do
-		local cut = compact.find_cut(m, 2, keep)
+	for keep = 0, 400 do
+		local cut = compact.find_cut(m, keep, 1, 1000, 1000)
 		if cut then
 			test.eq(m[cut].role, "assistant")
-			test.ok(cut > 2)
+			test.ok(cut >= 3)
 		end
 	end
-	test.eq(compact.find_cut(m, 2, 150), 4) -- "c" and its result are ~101 tokens, "b" brings it past 150
-	test.eq(compact.find_cut(m, 2, 50), 6) -- "c" alone is enough
-	test.eq(compact.find_cut(m, 2, 102), 6) -- reached at the tool result of "b": move forward to "c"...
-	test.eq(compact.find_cut({ user("task"), asst("a", "a"), tool("a", string.rep("r", 400)), asst("b", "b"), tool("b", "ok") }, 2, 60), 4) -- ...or inside a result: move forward to the next assistant
+	test.eq(compact.find_cut(m, 0, 1, 1000, 1000), 6) -- keep 0: the newest complete exchange
+	test.eq(compact.find_cut(m, 101, 1, 1000, 1000), 6) -- "c" and its result are 101 tokens
+	test.eq(compact.find_cut(m, 102, 1, 1000, 1000), 4) -- one more token: back to "b"
+	test.eq(compact.find_cut(m, 1000, 1, 1000, 1000), nil) -- everything fits in the kept budget: nothing to summarize
+	test.eq(compact.find_cut({ user("task"), asst("x", "a"), tool("a", "ok") }, 0, 1, 1000, 1000), nil) -- only one exchange
+	test.eq(compact.find_cut({ user("task"), user("u"), user("tail") }, 0, 1, 1000, 1000), nil) -- no assistant message
 end)
 
-test.case("find_cut is nil when the whole history fits or nothing would be summarized", function()
-	local m = { user("task"), asst("x = 1", "a"), tool("a", "ok"), asst("y = 2", "b"), tool("b", "ok") }
-	test.eq(compact.find_cut(m, 2, 100000), nil)
-	test.eq(compact.find_cut({ user("task") }, 2, 1), nil)
-	-- the only assistant message after `start` is the first one: nothing before it to summarize
-	local n = { user("task"), asst(string.rep("x", 400), "a"), tool("a", "ok") }
-	test.eq(compact.find_cut(n, 2, 10), nil)
-	-- no assistant message to cut at
-	test.eq(compact.find_cut({ user("task"), user(string.rep("u", 400)), user("tail") }, 2, 10), nil)
+test.case("find_cut keeps more until the summarizer prefix fits, and returns its size", function()
+	local pad = string.rep("x", 400)
+	local m = { user("task"), asst(pad, "a"), tool("a", "ok"), asst(pad, "b"), tool("b", "ok"), asst(pad, "c"), tool("c", "ok") }
+	local cut, size = compact.find_cut(m, 0, 1, 1000, 1000)
+	test.eq(cut, 6); test.eq(size, 1000 - 101)
+	cut, size = compact.find_cut(m, 0, 1, 1000, 850) -- 899 does not fit: keep "b" too
+	test.eq(cut, 4); test.eq(size, 1000 - 202)
+	test.eq(compact.find_cut(m, 0, 1, 1000, 100), nil) -- no cut leaves a prefix that small
+	test.eq(compact.find_cut(m, 150, 2, 1000, 1000), 6) -- the scale applies: "c" weighs 202
 end)
 
-test.case("serialize numbers calls and results and labels roles", function()
-	local m = { user("task"), asst("print(1)", "a"), tool("a", "1"), { role = "assistant", content = "thinking out loud" }, user("go on") }
-	local out = compact.serialize(m, 2, 5)
-	test.ok(out:find("[Assistant tool calls]: #1 luau(code=print(1))", 1, true), out)
-	test.ok(out:find("[Tool result #1]: 1", 1, true), out)
-	test.ok(out:find("[Assistant]: thinking out loud", 1, true), out)
-	test.ok(out:find("[User]: go on", 1, true), out)
-	test.ok(not out:find("task", 1, true), "from/to bound the range")
+test.case("request replays the agent prefix and appends one instruction", function()
+	local m = { user("TASK"), asst("x = 1", "a"), tool("a", "1"), asst("y = 2", "b"), tool("b", "2") }
+	local tools = { { name = "luau" } }
+	local r = compact.request("SYS", tools, m, 4)
+	test.eq(r.system, "SYS"); test.eq(r.tools, tools)
+	test.eq(#r.messages, 4)
+	for i = 1, 3 do test.eq(r.messages[i], m[i]) end -- the same message tables, unchanged
+	test.eq(r.messages[4].role, "user")
+	test.ok(r.messages[4].content:find("context checkpoint", 1, true))
+	test.ok(r.messages[4].content:find("[compaction-summary]", 1, true), "asks to merge an earlier checkpoint")
+	test.eq(r.replay, true)
+	test.eq(#m, 5)
 end)
 
-test.case("serialize truncates long text keeping the head and the 500-char tail", function()
-	local long = string.rep("a", 1500) .. string.rep("m", 3000) .. string.rep("z", 500)
-	local out = compact.serialize({ tool("a", long) }, 1, 1)
-	test.ok(out:find(string.rep("a", 1500) .. "\n…[truncated]…\n" .. string.rep("z", 500), 1, true), "head 1500 + marker + tail 500")
-	test.ok(not out:find("m", 1, true), "the middle is gone")
-	test.eq(compact.serialize({ tool("a", string.rep("q", 2000)) }, 1, 1), "[Tool result]: " .. string.rep("q", 2000))
-end)
-
-test.case("serialize keeps UTF-8 intact when truncating", function()
-	local out = compact.serialize({ user(string.rep("é", 2000)) }, 1, 1)
-	test.ok(utf8.len(out) ~= nil, "valid UTF-8")
-end)
-
-test.case("serialize shows images as [image]", function()
-	local m = { { role = "user", content = "look", images = { { mime = "image/png", data = "AAAA" } } } }
-	test.eq(compact.serialize(m, 1, 1), "[User]: look\n[image]")
+test.case("accept takes only a complete, text-only, smaller summary", function()
+	local m = { user("TASK"), asst(string.rep("x", 4000), "a"), tool("a", "ok"), asst("y", "b") }
+	local first = compact.accept({ text = "SUM", finish = "stop" }, "TASK", m, 4, false)
+	test.ok(first:find("^TASK\n\n%[compaction%-summary%]"), first)
+	test.ok(first:find("SUM", 1, true))
+	test.ok(compact.accept({ text = "SUM" }, "TASK", m, 4, true):find("history({", 1, true), "the archive notice when history is on")
+	test.eq(select(2, compact.accept({ text = "SUM", finish = "length" }, "TASK", m, 4, false)), "truncated")
+	test.eq(select(2, compact.accept({ text = "SUM", calls = { {} } }, "TASK", m, 4, false)), "tool call")
+	test.eq(select(2, compact.accept({ text = "  \n" }, "TASK", m, 4, false)), "empty")
+	test.eq(select(2, compact.accept({ text = string.rep("s", 5000) }, "TASK", m, 4, false)), "not smaller")
 end)
 
 test.case("estimate counts the raw provider message (with its reasoning) instead of the text", function()
@@ -74,19 +74,19 @@ test.case("estimate counts the raw provider message (with its reasoning) instead
 	test.eq(compact.estimate({ role = "user", content = "abcd", images = { {}, {} } }), 1 + 2 * 1200)
 end)
 
-test.case("scale turns estimates into the provider's real count, clamped", function()
+test.case("anchor calibrates on the provider count; measure adds later messages at that scale", function()
 	local m = { user(string.rep("u", 400)), tool("a", string.rep("t", 400)) } -- 200 estimated tokens
-	test.eq(compact.scale(0, "", m), 1) -- no usage yet
-	test.eq(compact.scale(400, string.rep("s", 400), m), 400 / 300) -- the system prompt counts too
-	test.eq(compact.scale(100000, "", m), 4)
-	test.eq(compact.scale(10, "", m), 0.5)
-end)
-
-test.case("find_cut applies the scale", function()
-	local pad = string.rep("x", 400) -- 100 tokens
-	local m = { user("task"), asst(pad, "a"), tool("a", "ok"), asst(pad, "b"), tool("b", "ok"), asst(pad, "c"), tool("c", "ok") }
-	test.eq(compact.find_cut(m, 2, 150), 4)
-	test.eq(compact.find_cut(m, 2, 150, 2), 6) -- each message weighs twice as much: "c" alone reaches 150
+	local a = compact.anchor(string.rep("s", 400), m, 600, 50) -- 300 estimated with the system prompt: scale 2
+	test.eq(a.scale, 2); test.eq(a.count, 3); test.eq(a.tokens, 650)
+	test.eq(compact.measure(a, m), 650) -- nothing after the reply yet
+	table.insert(m, { role = "assistant", content = "", raw = string.rep("r", 40) })
+	table.insert(m, tool("b", string.rep("t", 400)))
+	test.eq(compact.measure(a, m), 650 + 200) -- the reply is counted; the new result is 100 estimated, times 2
+	test.eq(compact.anchor("", m, 0, 0).scale, 1) -- no usage
+	test.eq(compact.anchor("", m, 10 ^ 6, 0).scale, 4)
+	test.eq(compact.anchor("", m, 1, 0).scale, 0.5)
+	local r = compact.reanchor(a, string.rep("s", 400), { user(string.rep("u", 400)) })
+	test.eq(r.tokens, 400); test.eq(r.count, 1); test.eq(r.scale, 2)
 end)
 
 test.case("trigger caps the threshold at max_trigger_tokens", function()

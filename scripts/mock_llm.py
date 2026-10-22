@@ -6,7 +6,7 @@ A reply is a string or an object. A string that starts with a ```luau fence beco
 {"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments.
 An object may also carry "prompt_tokens": N (reported as the usage input tokens, default 10) and, instead of a reply,
 "status": 400, "error": "<body>" (answer with that HTTP status and body).
-"reasoning": str adds a reasoning summary item that is echoed back on later turns."""
+"reasoning": str adds a reasoning summary item that is echoed back on later turns; "finish": "length" marks the reply cut at max_output_tokens."""
 import json, os, re, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 R = json.loads(os.environ["MOCK_REPLIES"]); n = [0]
@@ -50,6 +50,8 @@ class H(BaseHTTPRequestHandler):
             out.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
         out += [{"type": "function_call", "call_id": i, "name": nm, "arguments": a} for i, (nm, a) in zip(ids, calls)]
         doc = {"error": None, "output": out, "usage": {"input_tokens": ptok, "output_tokens": 5}}
+        if isinstance(reply, dict) and reply.get("finish") == "length":
+            doc["incomplete_details"] = {"reason": "max_output_tokens"}
         out = json.dumps(doc).encode()
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(out)))
         self.end_headers(); self.wfile.write(out)

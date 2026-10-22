@@ -2,7 +2,7 @@
 -- `s.phase` is a tagged table; each kind carries only the data that is valid in it:
 --   { kind = "ready", compact = "auto" | "skip" | "force", overflow = error? }  overflow only with "force"
 --   { kind = "model" }                       waiting for the agent's reply
---   { kind = "compact", cut = n, overflow = error? }  waiting for a summary of messages before `cut`
+--   { kind = "compact", cut = n, size = tokens, overflow = error? }  waiting for a summary of messages before `cut` (`size`: its prefix)
 --   { kind = "run", calls = {...}, index = n }  working through one reply's tool calls
 --   { kind = "finished" }
 local hooks = require("std/hooks")
@@ -38,7 +38,7 @@ function M.init(cfg)
 	return {
 		phase = { kind = "ready", compact = "auto" }, max_turns = cfg.max_turns, task_text = cfg.task_message, messages = { { role = "user", content = cfg.task_message } },
 		report = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" },
-		bad = 0, no_call = 0, recheck_asked = false, last_tokens = 0, compact_failures = 0,
+		bad = 0, no_call = 0, recheck_asked = false, anchor = { tokens = 0, count = 0, scale = 1 }, passes = 0, compact_failures = 0,
 		retried = false, hook_state = {},
 	}
 end
@@ -85,8 +85,8 @@ local function step(s, event, options)
 		end
 		if phase.kind == "finished" then return finish(s) end
 		s.retried = false
-		s.last_tokens = 0
 		table.insert(s.messages, { role = "user", content = event.message })
+		s.anchor = compact.reanchor(s.anchor, prompt.system(options), s.messages)
 		return ready(s, "skip")
 	elseif event.kind == "run_result" then
 		assert(s.phase.kind == "run", "unexpected chunk result")
@@ -116,6 +116,8 @@ local function step(s, event, options)
 			return finish(s)
 		end
 		if s.phase.kind == "compact" then
+			-- a summarizer request that does not fit bounds the window too
+			if event.safe_context_rejection and compact.overflow(event.error) then s.window_bound = math.min(s.window_bound or math.huge, s.phase.size) end
 			if s.phase.overflow then error("compaction failed after context overflow: " .. s.phase.overflow, 0) end
 			s.compact_failures += 1
 			return ready(s, "skip")
@@ -127,32 +129,37 @@ local function step(s, event, options)
 		end
 		if event.safe_context_rejection and compact.enabled and not s.retried and compact.overflow(event.error) then
 			s.retried = true
+			-- the rejected request bounds the window from above (in our measure); the forced compaction fits under it
+			s.window_bound = math.min(s.window_bound or math.huge, compact.measure(s.anchor, s.messages))
 			return ready(s, "force", event.error)
 		end
 		error(if s.retried then "the model call failed again after one compact-and-retry: " .. event.error else event.error, 0)
 	elseif event.kind == "model_reply" then
 		if s.phase.kind == "compact" then
-			local text = event.reply.text or ""
-			local archive_cut = s.phase.cut
+			local cut = s.phase.cut
 			local archive_enabled = hx.model_info().history == true
-			if text:match("^%s*$") then
-				if s.phase.overflow then error("compaction returned no summary after: " .. s.phase.overflow, 0) end
+			local first, reason = compact.accept(event.reply, s.task_text, s.messages, cut, archive_enabled)
+			if not first then
+				if s.phase.overflow then error("compaction rejected (" .. reason .. ") after: " .. s.phase.overflow, 0) end
 				s.compact_failures += 1
-			else
-				local kept = table.move(s.messages, s.phase.cut, #s.messages, 1, {})
-				s.previous_summary = text
-				s.messages = { { role = "user", content = compact.wrap(s.task_text, text, archive_enabled) } }
-				table.move(kept, 1, #kept, 2, s.messages)
-				s.last_tokens = 0
+				return ready(s, "skip")
 			end
-			local next_state, command = ready(s, "skip")
-			if archive_enabled and not text:match("^%s*$") then command.archive = {kind="compaction", cut=archive_cut} end
+			local kept = table.move(s.messages, cut, #s.messages, 2, { { role = "user", content = first } })
+			s.previous_summary = event.reply.text
+			s.messages = kept
+			s.anchor = compact.reanchor(s.anchor, prompt.system(options), s.messages)
+			s.passes += 1
+			s.compact_failures = 0
+			-- "auto": a history still above the trigger compacts again, up to compact.max_passes per agent reply
+			local next_state, command = ready(s)
+			if archive_enabled then command.archive = {kind="compaction", cut=cut} end
 			return next_state, command
 		end
 		assert(s.phase.kind == "model", "unexpected model reply")
 		local resp = event.reply
 		s.report.turns += 1
-		s.last_tokens = (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0) + (resp.output or 0)
+		s.anchor = compact.anchor(prompt.system(options), s.messages, (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0), resp.output or 0)
+		s.passes = 0
 		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish, usage = {
 			input = resp.input, output = resp.output, cache_read = resp.cache_read, cache_write = resp.cache_write } })
 		local text, calls = reply.text, resp.calls or {}
@@ -216,17 +223,22 @@ local function step(s, event, options)
 	end
 	local req = hooks.emit("before_model", { system = prompt.system(options), messages = s.messages, tools = prompt.tools })
 	local info = hx.model_info()
-	local window = if type(info.context_window) == "number" then info.context_window else compact.context_window
+	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, s.window_bound or math.huge)
 	local max_output = info.max_output or 16384
-	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" and (phase.compact == "force" or s.last_tokens >= compact.trigger(window, max_output)) then
-		local limit = compact.trigger(window, max_output)
-		local cut = compact.find_cut(s.messages, 2, math.min(compact.keep_recent_tokens, math.floor((if limit > 0 then limit else window) / 4)), compact.scale(s.last_tokens, req.system, s.messages))
-		if cut then
-			s.phase = { kind = "compact", cut = cut, overflow = phase.overflow }
-			return s, { kind = "model", request = compact.request(s.messages, cut, s.previous_summary), purpose = "compact" }
+	local force = phase.compact == "force"
+	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" and (force or s.passes < compact.max_passes) then
+		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)
+		if force or (limit > 0 and total >= limit) then
+			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under the learned bound
+			local keep = if force then 0 else math.min(compact.keep_recent_tokens, math.floor(limit / 4))
+			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - compact.reserve_tokens)
+			if cut then
+				s.phase = { kind = "compact", cut = cut, size = size, overflow = phase.overflow }
+				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut), purpose = "compact" }
+			end
 		end
-		if phase.overflow then error(phase.overflow, 0) end
 	end
+	if phase.overflow then error(phase.overflow, 0) end
 	s.phase = { kind = "model" }
 	return s, { kind = "model", request = req, purpose = "agent" }
 end

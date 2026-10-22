@@ -277,6 +277,9 @@ impl Host {
         let mut event=owner_event.or(pending).or_else(||recovery.take()).unwrap_or_else(||json!({"kind":"next"}));
         let mut vm:Option<Vm>=None;
         let mut compacting=false;
+        // The system prompt of the last agent request as sent (VM hooks and local tools applied). A summarizer request
+        // reuses it so it is a byte prefix of that request and the provider's cached prefix applies.
+        let mut agent_system:Option<Value>=None;
         loop {
             let admin=workflow && matches!(event["kind"].as_str(),Some("owner_decision"|"boundary_ready"));
             if admin {self.policy.log.check()?;} else {self.supervisor.check()?;}
@@ -291,7 +294,7 @@ impl Host {
             if workflow && event["kind"]=="run_result" && command["kind"]!="boundary" {self.supervisor.finish_stage_chunk(false);}
             if workflow && admin {self.supervisor.workflow.lock().unwrap().as_mut().unwrap().pending_event=None;}
             if std::mem::take(&mut compacting) {
-                let failed=event["kind"]=="model_error" || event["reply"]["text"].as_str().unwrap_or("").trim().is_empty();
+                let failed=state["messages"].get(0)==previous_messages.first();
                 let kept=state["messages"].as_array().map_or(0,Vec::len).saturating_sub(1);
                 self.log(&if failed {"### COMPACT FAILED".into()} else {format!("### COMPACT\nsummarized {} messages, kept {kept}, summary committed",previous_messages.len().saturating_sub(kept+1))});
             }
@@ -315,7 +318,11 @@ impl Host {
                 let request=vm.as_ref().unwrap().prepare_request(&command["request"])?;
                 state["messages"]=request["messages"].clone();
                 if workflow {state["worker"]["messages"]=request["messages"].clone();}
+                agent_system=Some(request["system"].clone());
                 command["request"]=request;
+            }
+            if command["kind"]=="model" && command["purpose"]=="compact" && command["request"]["replay"]==true {
+                if let Some(system)=&agent_system {command["request"]["system"]=system.clone();}
             }
             compacting=command["kind"]=="model" && command["purpose"]=="compact";
             let command=crate::controller::command(&command)?;

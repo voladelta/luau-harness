@@ -59,7 +59,7 @@ MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `all
 
 ## `init.luau`: compaction and recheck
 
-**Compaction** (`std/compact`) is on by default. From 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; recent messages and Luau globals stay. On a context-overflow error hx compacts once and retries. Disable it for new runs:
+**Compaction** (`std/compact`) is on by default. From 256k tokens at the latest (earlier for a smaller `--context-window`), older history becomes a structured summary; the task message, recent messages and Luau globals stay. The summarizer call replays the agent's own request prefix, so it sees exact messages and can hit the provider's prompt cache. A summary that is truncated, calls a tool or is not smaller than what it replaces is rejected and the history is kept. On a context-overflow error hx treats the rejected size as an upper bound on the window, compacts once keeping as little recent history as fits under it, and retries. Disable it for new runs:
 
 ```luau
 require("std/compact").enabled = false

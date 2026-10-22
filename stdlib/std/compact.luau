@@ -1,41 +1,35 @@
 -- Default pack (installed by std/loop; off with `require("std/compact").enabled = false` in .harness/init.luau): keeps a
 -- long run inside the model's context window.
--- When the last reply's context reaches the threshold (see M.trigger), the next model call is preceded by one summarizer
--- command dispatched by the Rust supervisor. Older messages are replaced by a structured summary; the task message
--- and the most recent messages stay verbatim; the Luau session (globals) is untouched. A context-overflow error from the model
--- triggers one compaction and a retry of the same turn (the loop's model_error event).
--- Below the threshold the pack adds nothing to the requests. It never writes files.
+-- When the context reaches the trigger (see M.trigger, measured by M.measure), the next model call is preceded by one
+-- summarizer call dispatched by the Rust supervisor. That call replays the agent's own request prefix (system prompt, tools,
+-- the task message and the history to summarize) and appends one instruction, so the summarizer sees exact messages and
+-- the provider can reuse its cached prefix. A validated summary (M.accept) replaces the older messages; the task message
+-- and the most recent messages stay verbatim; the Luau session (globals) is untouched. A context-overflow error from the
+-- model teaches an upper bound on the window and triggers one compaction that keeps as little as fits under it (at least
+-- the newest exchange), then a retry.
+-- Below the trigger the pack adds nothing to the requests. It never writes files.
 -- Config (set in .harness/init.luau, which runs before packs install):
 --   require("std/compact").keep_recent_tokens = 8000
 -- The window comes from --context-window, else M.context_window. Compaction starts at M.trigger (never above
--- M.max_trigger_tokens, so a 1M window does not mean resending ~1M tokens a turn); a model whose real window is smaller
--- than the assumed one hits an overflow error first, which compacts and retries once.
+-- M.max_trigger_tokens, so a 1M window does not mean resending ~1M tokens a turn).
 local M = {}
 
 M.enabled = true
 M.context_window = 1000000 -- used only when --context-window is not given
 M.max_trigger_tokens = 256000 -- compaction starts at this context size at the latest
-M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer (prime-agent/pi default)
+M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer's output (prime-agent/pi default)
 M.keep_recent_tokens = 64000 -- recent history kept verbatim (clamped to a quarter of the trigger)
+M.max_passes = 2 -- compactions allowed between two agent replies
 
-local MAX_FAILURES = 2
-local TRUNCATE_ABOVE, TRUNCATE_HEAD, TRUNCATE_TAIL = 2000, 1500, 500
 local IMAGE_TOKENS = 1200
 
-local SUMMARIZER_SYSTEM = [==[You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
-
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.]==]
-
-local SUMMARY_PROMPT = [==[The conversation above is a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
-
-Use this EXACT format:
+local INSTRUCTION = [==[Stop working on the task for this one reply. Write a context checkpoint of the conversation above: another model will continue the work from it, the task message and the most recent messages, which stay verbatim. Do not call any tool. Output only the checkpoint, in this EXACT format:
 
 ## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+[What the user is trying to accomplish; can be multiple items if the task expanded.]
 
 ## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or "(none)" if none were mentioned]
+- [Constraints, preferences or requirements the user stated, or "(none)"]
 
 ## Progress
 ### Done
@@ -57,54 +51,13 @@ Use this EXACT format:
 1. [Ordered list of what should happen next]
 
 ## Critical Context
-- [Any data, examples, or references needed to continue]
-- [Or "(none)" if not applicable]
+- [Data, examples or references needed to continue, or "(none)"]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.]==]
-
-local UPDATE_PROMPT = [==[The conversation above contains NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
-
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
-
-Use this EXACT format:
-
-## Goal
-[Preserve existing goals, add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
-
-## Progress
-### Done
-- [x] [Include previously done items AND newly completed items]
-
-### In Progress
-- [ ] [Current work - update based on progress]
-
-### Blocked
-- [Current blockers - remove if resolved]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
-
-## Dead Ends
-- [Approaches tried and abandoned, with the reason] (preserve all previous, add new)
-
-## Next Steps
-1. [Update based on current state]
-
-## Critical Context
-- [Preserve important context, add new if needed]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.]==]
-
-local VM_NOTE = "Luau scope for Critical Context: compaction keeps the running VM. Distinguish user globals assigned without local from chunk-local variables and local functions; do not list locals or builtins as live user state. Record useful globals and what they hold based on the supplied code, noting any uncertainty. For a needed past local, record how to retrieve or recompute its value instead of implying the name is available. The continuing agent can inspect vars(), a name-to-value map of live user globals; the summarizer cannot inspect the VM."
+Rules:
+- Keep each section concise. Preserve exact file paths, function names, commands, error messages and numbers.
+- Capture user instructions and corrections faithfully. This checkpoint request is not one of them: do not mention it.
+- If the conversation contains a [compaction-summary] block, it is an earlier checkpoint: carry forward what is still true, drop what is stale, and merge everything into this one checkpoint.
+- Luau scope for Critical Context: compaction keeps the running VM. Distinguish user globals assigned without local from chunk-local variables and local functions; do not list locals or builtins as live user state. Record useful globals and what they hold based on the code above, noting any uncertainty. For a needed past local, record how to retrieve or recompute its value instead of implying the name is available. The continuing agent can inspect vars(), a name-to-value map of live user globals.]==]
 
 local SUMMARY_PREFIX = "[compaction-summary]\n\nThe conversation history before this point was compacted into the following summary.\nThe retained messages below are authoritative; this summary may lag behind them.\nFiles on disk are current; the file listing in the task above may be out of date.\n\n<summary>\n"
 local SUMMARY_SUFFIX = "\n</summary>\nLuau scope is unchanged: only globals remain accessible across calls. Check vars() before reusing uncertain names; retrieve or recompute past locals."
@@ -150,114 +103,82 @@ function M.estimate(msg): number
 	return math.ceil(chars / 4) + #(msg.images or {}) * IMAGE_TOKENS
 end
 
--- Factor that turns estimates into real tokens: the provider's count for the last request over the estimate of the whole
--- request (system prompt + messages). Clamped to [0.5, 4]; 1 when there is no usage yet.
-function M.scale(last_tokens: number, system: string, messages): number
-	local est = math.ceil(#(system or "") / 4)
-	for _, m in messages do
-		est += M.estimate(m)
+local function estimate_all(system: string, messages, from: number): number
+	local n = math.ceil(#system / 4)
+	for i = from, #messages do
+		n += M.estimate(messages[i])
 	end
-	if last_tokens <= 0 or est <= 0 then
-		return 1
-	end
-	return math.clamp(last_tokens / est, 0.5, 4)
+	return n
 end
 
--- Index of the first message to keep, or nil when there is nothing to summarize. Walks back from the end until the kept
--- messages add up to `keep_tokens` (estimates times `scale`, see M.scale), then moves forward to an assistant message: a
--- tool result is never cut away from the call it answers (results follow their assistant message). messages[1 .. start-1]
--- are never summarized.
-function M.find_cut(messages, start: number, keep_tokens: number, scale: number?): number?
-	local k = scale or 1
-	local sum, i = 0, #messages
-	while i >= start do
-		sum += M.estimate(messages[i]) * k
-		if sum >= keep_tokens then
-			break
-		end
-		i -= 1
-	end
-	if i < start then
-		return nil -- everything after `start` fits in the kept budget
-	end
-	while i <= #messages and messages[i].role ~= "assistant" do
-		i += 1
-	end
-	if i > #messages or i <= start then
-		return nil
-	end
-	return i
+-- One measurement for the whole pack. An anchor says the provider counted `tokens` for the system prompt, tools and
+-- messages[1 .. count]; later messages (tool results, notes) are estimates times `scale`, which turns chars/4 into the
+-- provider's tokens.
+-- M.anchor: taken at an agent reply from its usage; `messages` is the request it answered, `count` covers the reply too.
+-- The scale is the prompt count over the estimate of the same request, clamped to [0.5, 4]; 1 without usage.
+function M.anchor(system: string, messages, prompt_tokens: number, output_tokens: number)
+	local est = estimate_all(system, messages, 1)
+	local scale = if prompt_tokens > 0 and est > 0 then math.clamp(prompt_tokens / est, 0.5, 4) else 1
+	return { tokens = prompt_tokens + output_tokens, count = #messages + 1, scale = scale }
 end
 
-local function is_continuation(s: string, i: number): boolean
-	local b = string.byte(s, i)
-	return b ~= nil and b >= 0x80 and b < 0xC0
+-- An estimated anchor for a history without a provider count (after a compaction or a recovery), keeping the scale.
+function M.reanchor(a, system: string, messages)
+	return { tokens = math.ceil(estimate_all(system, messages, 1) * a.scale), count = #messages, scale = a.scale }
 end
 
-local function truncate(s: string): string
-	if #s <= TRUNCATE_ABOVE then
-		return s
+-- Context size of the next request in provider tokens.
+function M.measure(a, messages): number
+	local n = a.tokens
+	for i = a.count + 1, #messages do
+		n += M.estimate(messages[i]) * a.scale
 	end
-	local head_end, tail_start = TRUNCATE_HEAD, #s - TRUNCATE_TAIL + 1
-	while head_end > 0 and is_continuation(s, head_end + 1) do
-		head_end -= 1 -- never split a UTF-8 character
-	end
-	while is_continuation(s, tail_start) do
-		tail_start += 1
-	end
-	return s:sub(1, head_end) .. "\n…[truncated]…\n" .. s:sub(tail_start)
+	return n
 end
 
--- messages[from .. to] as plain text for the summarizer. Tool results are numbered like the calls they answer.
-function M.serialize(messages, from: number, to: number): string
-	local numbers, n = {}, 0
-	for i = from, to do
-		for _, c in messages[i].calls or {} do
-			n += 1
-			numbers[c.id] = n
+-- Index of the first message to keep and the summarizer's prefix size, or nil when no cut works. Walks back from the end and returns the first assistant
+-- message (a tool result is never cut away from its call) at which the kept messages reach `keep_tokens` and the
+-- summarizer's prefix (`total` minus the kept messages) is at most `max_prefix`. keep_tokens = 0 keeps as little as fits.
+-- messages[1] (the task) is never summarized, so the cut is at least 3.
+function M.find_cut(messages, keep_tokens: number, scale: number, total: number, max_prefix: number): (number?, number?)
+	local kept = 0
+	for i = #messages, 3, -1 do
+		kept += M.estimate(messages[i]) * scale
+		if messages[i].role == "assistant" and kept >= keep_tokens and total - kept <= max_prefix then
+			return i, total - kept
 		end
 	end
-	local parts = {}
-	for i = from, to do
-		local m = messages[i]
-		if m.role == "user" then
-			local text = truncate(m.content or "")
-			for _ = 1, #(m.images or {}) do
-				text ..= "\n[image]"
-			end
-			table.insert(parts, "[User]: " .. text)
-		elseif m.role == "assistant" then
-			if (m.content or "") ~= "" then
-				table.insert(parts, "[Assistant]: " .. truncate(m.content))
-			end
-			if m.calls and #m.calls > 0 then
-				local lines = {}
-				for _, c in m.calls do
-					local code = if type(c.input) == "table" and type(c.input.code) == "string" then c.input.code else "(invalid arguments) " .. tostring(c.error or "")
-					table.insert(lines, "#" .. tostring(numbers[c.id]) .. " " .. tostring(c.name) .. "(code=" .. truncate(code) .. ")")
-				end
-				table.insert(parts, "[Assistant tool calls]: " .. table.concat(lines, "\n"))
-			end
-		elseif m.role == "tool" then
-			local num = numbers[m.id]
-			table.insert(parts, "[Tool result" .. (if num then " #" .. num else "") .. "]: " .. truncate(m.content or ""))
-		end
-	end
-	return table.concat(parts, "\n\n")
+	return nil
 end
 
--- Pure request construction. The supervisor performs the model call and checkpoints its result.
-function M.request(messages, cut, previous)
-	local body = "<conversation>\n" .. M.serialize(messages, 2, cut - 1) .. "\n</conversation>\n\n"
-	if previous then body ..= "<previous-summary>\n" .. previous .. "\n</previous-summary>\n\n" .. UPDATE_PROMPT
-	else body ..= SUMMARY_PROMPT end
-	return { system = SUMMARIZER_SYSTEM, messages = { { role = "user", content = body .. "\n" .. VM_NOTE } },
-		max_tokens = math.floor(M.reserve_tokens * 4 / 5) }
+-- The summarizer request: the agent's own request prefix (same system prompt and tools, messages[1 .. cut-1] unchanged)
+-- plus the instruction. Pure; the supervisor performs the call and checkpoints its result.
+function M.request(system: string, tools, messages, cut: number)
+	local prefix = table.move(messages, 1, cut - 1, 1, {})
+	table.insert(prefix, { role = "user", content = INSTRUCTION })
+	-- replay: the supervisor sends it under the system prompt of the last agent request as sent (VM hooks applied)
+	return { system = system, tools = tools, messages = prefix, max_tokens = math.floor(M.reserve_tokens * 4 / 5), replay = true }
 end
 
 function M.wrap(task, summary, history)
 	local notice = if history then '\nMessages removed by recorded compactions are available in this root lane: history({q="literal text"}), then history({id="entry-id"}). Print entry.text; follow next (resend q) or next_offset for more. Un-compacted retired RPI stages and other lanes are outside this archive.\n' else ""
 	return task .. "\n\n" .. SUMMARY_PREFIX .. summary .. SUMMARY_SUFFIX .. notice
+end
+
+-- A summarizer reply is a candidate: it replaces messages[1 .. cut-1] only if it is complete, text only, and smaller
+-- than what it replaces. Returns the new first message, or nil and the reason.
+function M.accept(reply, task: string, messages, cut: number, history: boolean): (string?, string?)
+	local text = reply.text or ""
+	if reply.finish == "length" then return nil, "truncated" end
+	if #(reply.calls or {}) > 0 then return nil, "tool call" end
+	if text:match("^%s*$") then return nil, "empty" end
+	local first = M.wrap(task, text, history)
+	local replaced = 0
+	for i = 1, cut - 1 do
+		replaced += M.estimate(messages[i])
+	end
+	if M.estimate({ content = first }) >= replaced then return nil, "not smaller" end
+	return first, nil
 end
 
 function M.overflow(message)

@@ -22,7 +22,7 @@ assert(found); print("ARCHIVE_OK")'''
 
 
 def is_summary(body):
-    return "context summarization assistant" in h.body_text(body)
+    return "Write a context checkpoint" in h.body_text(body)
 
 
 def script(repeat=False, empty=False):
@@ -35,10 +35,10 @@ def script(repeat=False, empty=False):
         if n == 1:
             return h.tool(FIRST)
         if n == 2:
-            return {"code": 'print("tail")', "tokens": 30000}
+            return {"code": 'print("tail")', "tokens": 23000}
         if n == 3:
             return {"code": 'assert(history().status=="unavailable");print("NO_ARCHIVE")' if empty else GET,
-                    "tokens": 30000 if repeat else 10}
+                    "tokens": 23000 if repeat else 10}
         if n == 4 and repeat:
             return h.tool('local p=history({id=durable.get("old_entry")});assert(p.text:find("HISTORY_NEEDLE=8bd7e395",1,true));print("OLD_ENTRY_SURVIVES")')
         return "done"
@@ -62,7 +62,7 @@ def roundtrip():
         records = h.records(log)
         assert len(archives(log)) == 2, archives(log)
         summaries = [b for b in calls if is_summary(b)]
-        assert MARKER not in h.body_text(summaries[0])
+        assert MARKER in h.body_text(summaries[0])  # the summarizer replays exact messages, nothing truncated
         assert "OLD_ENTRY_SURVIVES" in h.body_text(calls[-1])
         assert any(r.get("tool") == "history" for r in records)
         count = len(calls)
@@ -168,7 +168,7 @@ def rpi_compaction():
             if research_calls == 1:
                 return h.tool(FIRST)
             if research_calls == 2:
-                return {"code": 'print("tail")', "tokens": 30000}
+                return {"code": 'print("tail")', "tokens": 23000}
             if research_calls == 3:
                 return h.tool(GET)
         if name == "research" and not carried:
