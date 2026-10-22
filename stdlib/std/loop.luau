@@ -232,7 +232,7 @@ local function step(s, event, options)
 		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)
 		if force or (limit > 0 and total >= limit) then
 			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under its bound
-			local keep = if force then 0 else math.min(compact.keep_recent_tokens, math.floor(limit / 4))
+			local keep = if force then 0 else compact.keep(window, max_output)
 			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - compact.reserve_tokens)
 			-- under pressure, summarize at least a quarter of the trigger beyond the system prompt and task, so a compaction
 			-- frees real room and cannot recur every turn when they alone sit near the trigger (an overflow takes any cut)

@@ -509,7 +509,7 @@ def compaction_and_recovery():
         {"code": 'assert(x==42); print("AFTER_TWO")' + pad},
         "done",
     ]
-    init = 'require("std/recheck").enabled=false\nrequire("std/compact").keep_recent_tokens=40\n'
+    init = 'require("std/recheck").enabled=false\nrequire("std/compact").keep_ratio=0.001\n'
     path = workspace("compaction", init)
     with provider(lambda body, i: sequence[i]) as (url, calls):
         report = json.loads(start(path, url, "--context-window", "40000", "--max-output", "1000").stdout)

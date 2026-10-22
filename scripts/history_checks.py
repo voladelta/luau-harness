@@ -3,7 +3,7 @@
 import json
 import redesign_checks as h
 
-INIT = 'require("std/recheck").enabled=false\nrequire("std/compact").keep_recent_tokens=40\n'
+INIT = 'require("std/recheck").enabled=false\nrequire("std/compact").keep_ratio=0.001\n'
 MARKER = "HISTORY_NEEDLE=8bd7e395"
 FIRST = 'print(string.rep("x",2200).."HISTORY_".."NEEDLE=8bd7e395"..string.rep("y",2200))'
 GET = '''local p=history({q="HISTORY_NEEDLE",limit=20}); local found=false

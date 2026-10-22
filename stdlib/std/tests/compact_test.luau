@@ -4,11 +4,12 @@ local function user(text) return { role = "user", content = text } end
 local function asst(code, id) return { role = "assistant", content = "", calls = { { id = id, name = "luau", input = { code = code } } } } end
 local function tool(id, text) return { role = "tool", id = id, content = text } end
 
-test.case("threshold", function()
-	test.eq(compact.threshold(128000, 16384, 16384), 95232)
-	test.eq(compact.threshold(40000, 1000, 16384), 22616)
-	test.eq(compact.threshold(200000, 1000, 100), 190000) -- 95% of the window wins; the reserve is at least 4096
-	test.ok(compact.threshold(10000, 16384, 16384) <= 0, "a window smaller than the reply budget disables compaction")
+test.case("trigger and keep are shares of the window", function()
+	test.eq(compact.trigger(1000000, 16384), 800000) -- 80% of DeepSeek's 1M
+	test.eq(compact.trigger(128000, 16384), 95232) -- a small window: room for the reply and the reserve wins
+	test.eq(compact.trigger(40000, 1000), 22616)
+	test.ok(compact.trigger(10000, 16384) <= 0, "a window smaller than the reply budget disables compaction")
+	test.eq(compact.keep(1000000, 16384), 157378) -- 16% of the window less the reply
 end)
 
 test.case("find_cut cuts only at an assistant message, never the task or a tool exchange", function()
@@ -100,8 +101,3 @@ test.case("anchor calibrates on the provider count; measure adds later messages 
 	test.eq(r.tokens, 400); test.eq(r.count, 1); test.eq(r.scale, 2)
 end)
 
-test.case("trigger caps the threshold at max_trigger_tokens", function()
-	test.eq(compact.trigger(1000000, 16384), 128000) -- an unknown window is assumed to be 1M: start at 128k
-	test.eq(compact.trigger(128000, 16384), 95232) -- a known smaller window: the threshold wins
-	test.ok(compact.trigger(10000, 16384) <= 0, "too small a window stays off")
-end)

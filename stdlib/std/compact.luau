@@ -8,16 +8,16 @@
 -- model bounds the window for one compaction that keeps as little as fits under that bound, then a retry.
 -- Below the trigger the pack adds nothing to the requests. It never writes files.
 -- Config (set in .harness/init.luau, which runs before packs install):
---   require("std/compact").keep_recent_tokens = 8000
--- The window comes from --context-window, else M.context_window. Compaction starts at M.trigger (never above
--- M.max_trigger_tokens, so a 1M window does not mean resending ~1M tokens a turn).
+--   require("std/compact").trigger_ratio = 0.5
+-- The window comes from --context-window, else M.context_window; give a smaller model's window, or it overflows first.
+-- The ratios are the DeepSeek harness defaults (compaction-basic), chosen by the DeepSeek team.
 local M = {}
 
 M.enabled = true
 M.context_window = 1000000 -- used only when --context-window is not given
-M.max_trigger_tokens = 128000 -- compaction starts at this context size at the latest (measured: ~1/3 cheaper than 256k on DeepSeek, room to work)
+M.trigger_ratio = 0.8 -- compaction starts at this share of the window
+M.keep_ratio = 0.16 -- recent history kept verbatim: at most this share of the window less the reply; the newest exchange always
 M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer's output (prime-agent/pi default)
-M.keep_recent_tokens = 32000 -- recent history kept verbatim, at most (clamped to a quarter of the trigger); the newest exchange is always kept
 
 local IMAGE_TOKENS = 1200
 
@@ -74,17 +74,17 @@ local OVERFLOW = {
 	"reduce the length",
 }
 
--- Context size at which to compact: 95% of the window, but always leaving room for the reply plus the reserve.
--- <= 0 means the window is too small for compaction (the pack stays off).
-function M.threshold(window: number, max_output: number, reserve: number): number
-	return math.min(math.floor(window * 0.95), window - max_output - math.max(reserve, 4096))
+-- Context size at which to compact: M.trigger_ratio of the window, but always leaving room for the reply plus the
+-- reserve. <= 0 means the window is too small for compaction (the pack stays off).
+function M.trigger(window: number, max_output: number): number
+	return math.min(math.floor(window * M.trigger_ratio), window - max_output - math.max(M.reserve_tokens, 4096))
 end
 
--- The context size that starts a compaction: M.threshold, capped at M.max_trigger_tokens. <= 0 means off.
-function M.trigger(window: number, max_output: number): number
-	local t = M.threshold(window, max_output, M.reserve_tokens)
-	return if t > 0 then math.min(t, M.max_trigger_tokens) else t
+-- Recent history kept verbatim at most (see M.find_cut).
+function M.keep(window: number, max_output: number): number
+	return math.floor((window - max_output) * M.keep_ratio)
 end
+
 
 -- Rough size of one message in tokens (chars/4). An assistant message's `raw` (the provider-native message the loop echoes
 -- back) is counted instead of its text and calls when present, because it also carries the reasoning blocks.

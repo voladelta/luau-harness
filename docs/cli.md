@@ -37,7 +37,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--reasoning R` | | Reasoning effort |
 | `--max-turns N` | 200 | Turn limit; the report says `stopped: "max_turns: N"` when it is hit |
 | `--max-output N` | 16384 | Max output tokens per turn |
-| `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at min(~95% of it, 128k); give a smaller model's window so it compacts before an overflow |
+| `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at 80% of it; give a smaller model's window so it compacts before an overflow |
 | `--max-tokens N` `--max-wall SECS` | none | Admission thresholds and absolute deadline; flags override `policy.toml` for a new run |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
 | `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
