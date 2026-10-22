@@ -10,3 +10,9 @@ test.case("runtime access is a named section independent of custom prose", funct
 	test.ok(offline:find("not available to `sh`", 1, true) ~= nil)
 	test.ok(offline:find("MCP tools listed below work", 1, true) ~= nil)
 end)
+
+test.case("limits in the system prompt come from the values in force", function()
+	local text = prompt.fill("cap {{DEFAULT_HITS}}; cut at {{STR_TOP}}; {{file: string}} stays", { DEFAULT_HITS = 7 })
+	test.eq(text, "cap 7; cut at " .. require("std/printer").STR_TOP .. "; {{file: string}} stays")
+	test.ok(not pcall(prompt.fill, "{{NO_SUCH_LIMIT}}", {}))
+end)

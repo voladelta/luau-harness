@@ -119,15 +119,22 @@ pub struct OwnerInputRef {
     #[serde(default)]
     pub artifacts: Vec<String>,
 }
+/// The stage whose effects are admitted, and its prepared submission. A submission cannot exist without its stage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActiveStage {
+    pub spec: StageSpec,
+    #[serde(default)]
+    pub submission: Option<Submission>,
+}
+/// No stage is active before the first boundary or while an owner gate is open: the open gate lives only in
+/// `RunState::AwaitingReview`, so a paused run admits no stage effects by construction.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExecutionFrame {
-    pub active_stage: Option<StageSpec>,
-    pub pending_submission: Option<Submission>,
+    pub stage: Option<ActiveStage>,
     pub artifacts: Vec<ArtifactRef>,
     pub owner_inputs: Vec<OwnerInputRef>,
     pub pending_event: Option<Value>,
-    pub gate: Option<ReviewRequest>,
     pub consumed_decisions: Vec<String>,
     pub stage_epoch: u64,
     pub check_plan: Vec<PlannedCheck>,

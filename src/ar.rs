@@ -39,8 +39,7 @@ use std::path::{Path, PathBuf};
 
 mod episode;
 mod files;
-pub use episode::{EPISODE, claim, claims, eval, load_episode, reset};
-use episode::Episode;
+pub use episode::{Episode, Progress, claim, claims, eval, load_episode, reset};
 use files::*;
 
 /// Workers side by side in a round, and fewer once the provider has rate-limited an episode of the run.
@@ -138,8 +137,7 @@ pub enum Role { Research, Explore, Exploit, Audit }
 
 /// Paths a child's policy must seal, so that even with --yolo its agent cannot read or change them: every
 /// autoresearch run of the owner's workspace (this run included) and the evaluators' roots.
-pub fn sealed() -> Vec<PathBuf> {
-    let Some((e, _)) = EPISODE.get() else { return vec![] };
+pub fn sealed(e: &Episode) -> Vec<PathBuf> {
     let mut out = vec![e.dir.parent().unwrap_or(&e.dir).to_path_buf()];
     out.extend(e.spec.roots(true).unwrap_or_default());
     out

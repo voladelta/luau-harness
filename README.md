@@ -168,7 +168,7 @@ hx test stdlib/std               # Luau unit tests
 cargo test --release
 ```
 
-Independent suites run concurrently; suites sharing mock ports run sequentially, and the process-cap sandbox suite runs alone. Stalled suites fail with a diagnostic, and reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
+Suites run concurrently (mock servers bind free ports); the process-cap sandbox suite and the autoresearch suite run alone. Stalled suites fail with a diagnostic, and reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
 
 | Path | Contents |
 |---|---|

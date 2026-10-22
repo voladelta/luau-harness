@@ -40,15 +40,12 @@ impl Supervisor {
             epoch == Some(frame.stage_epoch),
             "stage effect belongs to a stale epoch"
         );
-        ensure!(frame.gate.is_none(), "stage is awaiting owner review");
+        let active = frame.stage.as_ref().context("no active workflow stage")?;
         ensure!(
-            frame.pending_submission.is_none(),
+            active.submission.is_none(),
             "stage.submit is terminal: effects after submission are refused"
         );
-        let stage = frame
-            .active_stage
-            .as_ref()
-            .context("no active workflow stage")?;
+        let stage = &active.spec;
         if stage.access == StageAccess::Inspect {
             ensure!(
                 matches!(
@@ -67,7 +64,7 @@ impl Supervisor {
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|f| f.active_stage.clone());
+            .and_then(|f| f.stage.as_ref().map(|a| a.spec.clone()));
         if let Some(stage) = stage {
             fields["workflow_stage"] = json!(stage.id);
             if matches!(tool, Tool::Sh) && stage.verify {
@@ -108,18 +105,15 @@ impl Supervisor {
             epoch == Some(frame.stage_epoch),
             "stage.submit belongs to a stale stage"
         );
-        ensure!(
-            frame.pending_submission.is_none(),
-            "stage.submit may only be called once"
-        );
-        ensure!(
-            frame.gate.is_none(),
-            "stage.submit cannot answer an owner gate"
-        );
-        let stage = frame
-            .active_stage
+        let active = frame
+            .stage
             .as_ref()
             .context("stage.submit requires active stage")?;
+        ensure!(
+            active.submission.is_none(),
+            "stage.submit may only be called once"
+        );
+        let stage = &active.spec;
         if stage.verify {
             let observation = observe_checks(
                 &self.policy.workspace,
@@ -179,23 +173,20 @@ impl Supervisor {
             payload,
             document_blob,
         };
-        self.workflow
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .pending_submission = Some(submission);
+        if let Some(active) = self.workflow.lock().unwrap().as_mut().unwrap().stage.as_mut() {
+            active.submission = Some(submission);
+        }
         Ok(id)
     }
     pub fn finish_stage_chunk(&self, success: bool) -> Option<Value> {
         let mut frame = self.workflow.lock().unwrap();
-        let frame = frame.as_mut()?;
+        let active = frame.as_mut()?.stage.as_mut()?;
         if !success {
-            frame.pending_submission = None;
+            active.submission = None;
             return None;
         }
-        frame
-            .pending_submission
+        active
+            .submission
             .as_ref()
             .map(|s| json!({"id":s.id,"payload":s.payload}))
     }
@@ -276,7 +267,7 @@ impl Host {
         self.report(report, 0.0)
     }
 
-    pub(crate) fn resume_owner_decision(&self) -> Result<Option<Value>> {
+    pub(crate) fn resume_owner_decision(&self, request: &ReviewRequest) -> Result<Option<Value>> {
         let frame = self
             .supervisor
             .workflow
@@ -284,9 +275,6 @@ impl Host {
             .unwrap()
             .clone()
             .context("missing workflow frame")?;
-        let Some(request) = frame.gate.clone() else {
-            return Ok(None);
-        };
         let records = eventlog::load(&self.policy.log.path)?;
         let decision = records.iter().rev().find(|r| {
             r["kind"] == "owner_decision"
@@ -332,7 +320,6 @@ impl Host {
             artifacts: request.artifacts.clone(),
         });
         next.consumed_decisions.push(id);
-        next.gate = None;
         let mut event = document_event(&next, &self.policy.log)?;
         event["kind"] = json!("owner_decision");
         event["decision"] = decision["decision"].clone();
@@ -383,18 +370,16 @@ impl Host {
             });
         }
         if let Some(id) = &boundary.submission {
-            let submission = frame
-                .pending_submission
+            let active = frame.stage.as_mut().context("boundary missing active stage")?;
+            let submission = active
+                .submission
                 .take()
                 .context("boundary has no native submission")?;
             ensure!(
                 &submission.id == id,
                 "boundary submission ID does not match native result"
             );
-            let stage = frame
-                .active_stage
-                .as_ref()
-                .context("boundary missing active stage")?;
+            let stage = &active.spec;
             ensure!(
                 stage.id == submission.stage_id,
                 "submission belongs to another stage"
@@ -423,7 +408,9 @@ impl Host {
         } else {
             // A reducer may reject malformed phase-specific data and keep working,
             // or stop without accepting it. It cannot carry a sealed VM into a new stage.
-            frame.pending_submission = None;
+            if let Some(active) = frame.stage.as_mut() {
+                active.submission = None;
+            }
         }
         frame.boundaries.insert(boundary.id, hash);
         let saved = match boundary.next {
@@ -435,8 +422,7 @@ impl Host {
                     );
                 }
                 frame.stage_epoch += 1;
-                frame.active_stage = Some(stage.clone());
-                frame.gate = None;
+                frame.stage = Some(ActiveStage { spec: stage.clone(), submission: None });
                 frame.evidence.clear();
                 frame.observation = if stage.verify {
                     Some(observe_checks(&self.workspace, &frame.check_plan)?)
@@ -465,12 +451,13 @@ impl Host {
                 if request.kind == "acceptance" {
                     request.project = frame.observation.clone();
                 }
-                let report = json!({"finished":false,"final_answer":if request.kind=="input" {"Owner input required."} else {"Artifact ready for review."},"workflow":"rpi","status":if request.kind=="input" {"needs_input"} else {"awaiting_review"},"stage":frame.active_stage.as_ref().map(|s|&s.name),"gate":request,"artifact_directory":self.workspace.join(".agents/artifacts").join(format!("rpi-{}",self.policy.log.session)),"next_command":format!("hx review {} --gate {} --decision {}",self.policy.log.path.display(),request.gate_id,if request.kind=="input" {"answer --input-file answers.md"} else {"approve"})});
-                frame.gate = Some(request);
+                let report = json!({"finished":false,"final_answer":if request.kind=="input" {"Owner input required."} else {"Artifact ready for review."},"workflow":"rpi","status":if request.kind=="input" {"needs_input"} else {"awaiting_review"},"stage":frame.stage.as_ref().map(|a|&a.spec.name),"gate":request,"artifact_directory":self.workspace.join(".agents/artifacts").join(format!("rpi-{}",self.policy.log.session)),"next_command":format!("hx review {} --gate {} --decision {}",self.policy.log.path.display(),request.gate_id,if request.kind=="input" {"answer --input-file answers.md"} else {"approve"})});
+                frame.stage = None;
                 frame.pending_event = None;
                 RunState::AwaitingReview {
                     controller: controller.clone(),
                     report: report.as_object().unwrap().clone(),
+                    gate: request,
                 }
             }
             BoundaryNext::Finish { mut report } => {
@@ -505,7 +492,7 @@ impl Host {
                 );
                 report.insert("artifact_refs".into(), json!(frame.artifacts));
                 report.insert("owner_inputs".into(), json!(frame.owner_inputs));
-                frame.gate = None;
+                frame.stage = None;
                 frame.pending_event = None;
                 RunState::Finished { report }
             }
@@ -530,12 +517,9 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
         log.dir(),
         latest["blob"].as_str().context("checkpoint blob missing")?,
     )?)?;
-    ensure!(
-        matches!(checkpoint.run, RunState::AwaitingReview { .. }),
-        "run is not awaiting review"
-    );
-    let frame = checkpoint.workflow.context("missing workflow frame")?;
-    let request = frame.gate.context("missing active review gate")?;
+    let RunState::AwaitingReview { gate: request, .. } = checkpoint.run else {
+        anyhow::bail!("run is not awaiting review");
+    };
     ensure!(request.gate_id == gate_id, "stale or unknown review gate");
     let text = input_file
         .map(|p| -> Result<String> {

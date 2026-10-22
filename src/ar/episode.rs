@@ -1,7 +1,9 @@
-//! Inside an episode: `ar.eval`, `ar.claim` (with its judge), `ar.claims` and `ar.reset`, which every episode child
-//! reaches through the run directory named by `HX_AR_EPISODE`.
+//! Inside an episode: `ar.eval`, `ar.claim` (with its judge), `ar.claims` and `ar.reset`. A child run reads its episode
+//! once at launch from the file named by `HX_AR_EPISODE` and records it in its frozen policy; everything here reads it
+//! from that policy.
 use super::*;
-use std::sync::{Mutex, OnceLock};
+use crate::policy::Policy;
+use std::sync::Mutex;
 use super::files::*;
 
 /// What a child run needs to serve `ar`; written by the orchestrator, named by `HX_AR_EPISODE`.
@@ -19,32 +21,40 @@ pub struct Episode {
     pub best: Option<f64>,
 }
 
-/// A worker's progress inside its child run: its claim and its best score so far.
+/// A worker's progress inside its child run: its claim and its best score so far. Held by the run's `Policy`.
+#[derive(Default)]
 pub struct Progress {
     claim: Option<u32>,
     best: Option<f64>,
 }
-pub static EPISODE: OnceLock<(Episode, Mutex<Progress>)> = OnceLock::new();
-
-/// Called once at startup: a child run of an autoresearch episode gets `ar`, and its policy seals the run.
-pub fn load_episode() -> Result<()> {
-    if let Some(path) = std::env::var_os("HX_AR_EPISODE") {
-        let episode: Episode = serde_json::from_slice(&std::fs::read(&path)?).context("HX_AR_EPISODE")?;
-        let best = episode.best;
-        let _ = EPISODE.set((episode, Mutex::new(Progress { claim: None, best })));
-        // The orchestrator holds this child's stdin open while it lives: end of input means it is gone, so stop too.
-        std::thread::spawn(|| {
-            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
-            crate::prims::stop(1);
-        });
+impl Progress {
+    pub fn start(episode: Option<&Episode>) -> Progress {
+        Progress { claim: None, best: episode.and_then(|e| e.best) }
     }
-    Ok(())
+}
+
+/// The episode this child `hx run` serves, if the orchestrator started it. Called once at launch; the episode goes into
+/// the run's policy, which seals the run directory and installs `ar`.
+pub fn load_episode() -> Result<Option<Episode>> {
+    let Some(path) = std::env::var_os("HX_AR_EPISODE") else { return Ok(None) };
+    let episode: Episode = serde_json::from_slice(&std::fs::read(&path)?).context("HX_AR_EPISODE")?;
+    // The orchestrator holds this child's stdin open while it lives: end of input means it is gone, so stop too.
+    std::thread::spawn(|| {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        crate::prims::stop(1);
+    });
+    Ok(Some(episode))
+}
+
+fn served<'a>(pol: &'a Policy, what: &str) -> Result<(&'a Episode, &'a Mutex<Progress>)> {
+    let episode = pol.episode.as_ref().with_context(|| format!("{what} is only available inside an autoresearch episode"))?;
+    Ok((episode, &pol.ar_progress))
 }
 
 /// `ar.eval(note)` inside an episode: snapshot the editable files, score the snapshot, append to the ledger. Explore and
 /// exploit workers score only after their claim is accepted, and their states belong to their candidate.
-pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
-    let (episode, progress) = EPISODE.get().context("ar.eval is only available inside an autoresearch episode")?;
+pub async fn eval(pol: &Policy, note: String) -> Result<Value> {
+    let (episode, progress) = served(pol, "ar.eval")?;
     let spec = &episode.spec;
     let claim = progress.lock().unwrap().claim;
     let idea = match (episode.role, claim) {
@@ -97,7 +107,7 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
 /// judge calls both find that it shares the core approach of the same earlier claim in its scope, so a borderline idea
 /// gets the benefit of the doubt; a judge that cannot answer accepts. One accepted claim per worker.
 pub async fn claim(host: &crate::host::Host, idea: String) -> Result<Value> {
-    let (episode, progress) = EPISODE.get().context("ar.claim is only available inside an autoresearch episode")?;
+    let (episode, progress) = served(&host.policy, "ar.claim")?;
     let scope = match episode.role {
         Role::Explore => "explore".to_string(),
         Role::Exploit => format!("c{}", episode.idea),
@@ -191,8 +201,8 @@ pub(super) fn answer_number(text: &str) -> Option<usize> {
 }
 
 /// `ar.claims()`: the claims made so far in this worker's scope, as plain text.
-pub fn claims() -> Result<Value> {
-    let (episode, _) = EPISODE.get().context("ar.claims is only available inside an autoresearch episode")?;
+pub fn claims(pol: &Policy) -> Result<Value> {
+    let (episode, _) = served(pol, "ar.claims")?;
     let scope = match episode.role {
         Role::Explore => "explore".to_string(),
         Role::Exploit => format!("c{}", episode.idea),
@@ -214,8 +224,8 @@ pub(super) fn lock_file(path: &Path) -> Result<std::fs::File> {
 
 /// `ar.reset()`: put this worker's best scored state back into the editable paths (the state it started from when it
 /// has not improved on it).
-pub fn reset(pol: &crate::policy::Policy) -> Result<Value> {
-    let (episode, progress) = EPISODE.get().context("ar.reset is only available inside an autoresearch episode")?;
+pub fn reset(pol: &Policy) -> Result<Value> {
+    let (episode, progress) = served(pol, "ar.reset")?;
     let rows = ledger(&episode.dir)?;
     let snap = rows.iter().rev().find(|r| r.improved && r.episode == episode.label)
         .map_or_else(|| episode.start.clone(), |r| r.snap.clone());

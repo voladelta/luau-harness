@@ -1,8 +1,8 @@
-//! Module resolution, package manifests, the lockfile (approvals and grants) and staging.
+//! Module resolution, package manifests, the lockfile (approvals) and staging.
 //!
 //! `require("pkg")` loads `init.luau`; `require("pkg/mod")` loads `mod.luau`. Lookup order:
 //!   1. `<ws>/.harness/override/<pkg>/<mod>.luau`   user override of any module (e.g. the printer), no rebuild needed
-//!   2. `<ws>/.harness/pkgs/<pkg>/<mod>.luau`       project package (needs a lockfile entry + granted capabilities)
+//!   2. `<ws>/.harness/pkgs/<pkg>/<mod>.luau`       project package (needs a lockfile entry for its exact content)
 //!   3. the built-in `std` package embedded in the binary
 //!
 //! Agent skills (the `.agents/skills` convention): `<ws>/.agents/skills/<name>/SKILL.md`, then `~/.agents/skills/<name>/SKILL.md`.
@@ -89,7 +89,8 @@ pub struct PkgInfo {
 /// `hx test DIR` mounts the package under test here so it can be required without being installed.
 pub static TEST_PKG: std::sync::OnceLock<(String, PathBuf)> = std::sync::OnceLock::new();
 
-/// `hx.lock`: one record per approved package: the exact content approved and the capabilities granted to it.
+/// `hx.lock`: one record per approved package: the exact content approved. The hash covers `hx.toml`, so approving it
+/// grants exactly the capabilities that manifest requests; there is no separate grant list to keep in step.
 #[derive(Debug, Deserialize, serde::Serialize, Default)]
 struct Lockfile {
     #[serde(default)]
@@ -101,17 +102,6 @@ struct LockEntry {
     name: String,
     version: String,
     hash: String,
-    /// capability -> granted scopes (`"*"` grants every scope)
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    grants: BTreeMap<String, Vec<String>>,
-}
-
-impl LockEntry {
-    /// The first requested capability scope this entry does not grant.
-    fn ungranted<'a>(&self, requested: &'a BTreeMap<String, Vec<String>>) -> Option<(&'a str, &'a str)> {
-        requested.iter().flat_map(|(cap, scopes)| scopes.iter().map(move |s| (cap.as_str(), s.as_str())))
-            .find(|(cap, s)| !self.grants.get(*cap).is_some_and(|g| g.iter().any(|x| x == s || x == "*")))
-    }
 }
 
 pub struct Resolver {
@@ -219,9 +209,8 @@ impl Registry {
                     hash.update(bytes); hash.update([0]);
                 }
                 let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-                let entry = lock.package.iter().find(|p| p.name == info.name && p.hash == digest && p.version == man.package.version)
+                lock.package.iter().find(|p| p.name == info.name && p.hash == digest && p.version == man.package.version)
                     .with_context(|| format!("package {} changed while its approved snapshot was captured", info.name))?;
-                if let Some((cap, scope)) = entry.ungranted(&man.capabilities) { bail!("package {} requests ungranted {cap}.{scope}", info.name); }
                 registry.capabilities.insert(info.name.clone(), man.capabilities.clone());
                 let mut info = info;
                 info.version = man.package.version.clone(); info.kind = man.package.kind.clone().unwrap_or_default();
@@ -485,13 +474,10 @@ impl Resolver {
                 &hash[..8]
             );
         }
-        if let Some((cap, s)) = entry.ungranted(&man.capabilities) {
-            bail!("package {pkg} requests capability {cap}={s} which has not been granted in hx.lock; run `hx approve {pkg}`");
-        }
         Ok(())
     }
 
-    /// Every installed package that is locked, unchanged and fully granted: what the model may use. Others are skipped.
+    /// Every installed package that is locked and unchanged: what the model may use. Others are skipped.
     pub fn list_packages(&self) -> Vec<PkgInfo> {
         let mut out = Vec::new();
         if !crate::trust::is_trusted(&self.root) {
@@ -779,14 +765,14 @@ impl Resolver {
         Ok(format!("rolled back {module} to {}", if files.is_empty() { "the built-in module" } else { "the previous version" }))
     }
 
-    /// `hx approve <pkg>`: record the lock entry and grant exactly the capabilities the manifest requests.
+    /// `hx approve <pkg>`: lock the package's exact content, which grants exactly the capabilities its manifest requests.
     pub fn approve(&self, pkg: &str) -> Result<String> {
         let (dir, man) = self.locate(pkg)?;
         let hash = hash_dir(&dir)?;
         let lock_path = self.root.join("hx.lock");
         let mut entries = read_toml::<Lockfile>(&lock_path)?.package;
         entries.retain(|e| e.name != pkg);
-        entries.push(LockEntry { name: pkg.into(), version: man.package.version.clone(), hash: hash.clone(), grants: man.capabilities.clone() });
+        entries.push(LockEntry { name: pkg.into(), version: man.package.version.clone(), hash: hash.clone() });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         std::fs::write(&lock_path, toml::to_string(&Lockfile { package: entries })?)?;
         Ok(format!("approved {pkg} {} ({}…) from {} with capabilities {:?}", man.package.version, &hash[..8], dir.display(), man.capabilities))
@@ -836,17 +822,17 @@ mod tests {
     }
 
     #[test]
-    fn package_must_be_locked_unchanged_and_granted() {
+    fn package_must_be_locked_and_unchanged() {
         let root = ws("lock");
         let dir = install_pkg(&root, "foo");
         let r = Resolver::new(root.clone());
         assert!(err(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap())).contains("not locked"));
-        // Approval records the exact content and capabilities.
+        // Approval records the exact content, manifest (and so capabilities) included.
         let msg = r.approve("foo").unwrap();
         assert!(msg.starts_with("approved foo 1.0"), "{msg}");
         let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
         assert!(lock.contains("name = \"foo\"") && lock.contains("version = \"1.0\""), "{lock}");
-        assert!(lock.contains("[package.grants]\nfs = [\"read\"]"), "{lock}");
+        assert!(!lock.contains("grants"), "{lock}");
         assert!(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap()).is_ok());
         // any content change invalidates the lock
         std::fs::write(dir.join("init.luau"), "return { x = 2 }\n").unwrap();
@@ -861,20 +847,18 @@ mod tests {
     }
 
     #[test]
-    fn ungranted_capability_is_refused_and_wildcard_allowed() {
+    fn capabilities_come_from_the_locked_manifest() {
         let root = ws("grants");
         let dir = install_pkg(&root, "foo");
         let r = Resolver::new(root.clone());
         r.approve("foo").unwrap();
-        let man = Resolver::read_manifest("foo", &dir).unwrap();
+        // A lock written before grants were dropped still parses; its extra table is ignored.
         let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
-        let with = |grants: &str| std::fs::write(root.join("hx.lock"), lock.replace("[package.grants]\nfs = [\"read\"]\n", grants)).unwrap();
-        with("[package.grants]\nfs = [\"write\"]\n");
-        assert!(err(r.verify("foo", &dir, &man)).contains("capability fs=read which has not been granted"));
-        with("");
-        assert!(err(r.verify("foo", &dir, &man)).contains("not been granted"));
-        with("[package.grants]\nfs = [\"*\"]\n");
-        assert!(r.verify("foo", &dir, &man).is_ok());
+        std::fs::write(root.join("hx.lock"), format!("{lock}\n[package.grants]\nfs = [\"read\"]\n")).unwrap();
+        assert!(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap()).is_ok());
+        // Requesting more is a manifest edit, so it changes the hash and needs a new approval.
+        std::fs::write(dir.join("hx.toml"), "[package]\nversion = \"1.0\"\n\n[capabilities]\nfs = [\"read\", \"write\"]\n").unwrap();
+        assert!(err(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap())).contains("changed since it was approved"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

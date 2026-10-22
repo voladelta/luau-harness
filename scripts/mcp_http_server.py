@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The demo MCP tools over Streamable HTTP, for testing hx's HTTP transport.
-usage: mcp_http_server.py PORT [json|sse] ; env: NEED_HEADER=name:value (401 without it), HDR_LOG=file (one JSON line of
+usage: mcp_http_server.py PORT [json|sse] (0 picks a free port, written to $PORT_FILE) ; env: NEED_HEADER=name:value (401 without it), HDR_LOG=file (one JSON line of
 request headers per POST), SESSION=1 (issue Mcp-Session-Id, 404 on a wrong one), ECHO_KEY=1 (401 body echoes the
 rejected header value), EXPIRE=file (if it exists: delete it, rotate the session, 404 once). Mode sse-split sends the
 stream in 3-byte chunks, ends without the final blank line, and precedes the response with a server request using id 1. POST /redir answers 302 to /elsewhere."""
@@ -55,4 +55,9 @@ class H(BaseHTTPRequestHandler):
             self.reply(200, f"event: message\r\ndata: {note}\r\n\r\nevent: message\r\ndata: {out}\r\n\r\n".encode(), "text/event-stream", extra)
         else: self.reply(200, out.encode(), extra=extra)
 
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+# Port 0 binds a free port. With PORT_FILE set, write the port there once listening (atomically: its existence means ready).
+if os.environ.get("PORT_FILE"):
+    with open(os.environ["PORT_FILE"] + ".tmp", "w") as f: f.write(str(server.server_address[1]))
+    os.replace(os.environ["PORT_FILE"] + ".tmp", os.environ["PORT_FILE"])
+server.serve_forever()

@@ -57,9 +57,9 @@ echo 'return { run = function(s) return (s:lower():gsub("[^%w]+", "-")) end }' >
 check "restoring the approved content brings it back" "$(x 'print(tools.slug.run("A B"))' | head -1)" "a-b"
 
 # --- the prompt shows installed extensions (and nothing when there are none)
-MOCK_REPLIES='["done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl python3 scripts/mock_llm.py 8796 & MOCK=$!
-wait_for_port 8796 || exit 1; echo go > $T/p.txt
-run() { OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:8796 --key-env OPENROUTER_API_KEY >/dev/null 2>&1; }
+MOCK_REPLIES='["done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
+echo go > $T/p.txt
+run() { OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null 2>&1; }
 system_of_last() { python3 -c "
 import json
 l=[json.loads(x) for x in open('$T/req.jsonl')][-1]

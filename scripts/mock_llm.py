@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Scripted model server (chat completions and /responses) for deterministic harness tests.
-usage: mock_llm.py PORT  (replies are read from the MOCK_REPLIES env var, a JSON list, served in order)
+usage: mock_llm.py PORT  (0 picks a free port, written to $PORT_FILE; replies are read from the MOCK_REPLIES env var, a JSON list, served in order)
 A reply is a string or an object. A string that starts with a ```luau fence becomes one native `luau` tool call with that code
 (any text after the fence is the reply text); any other string is a plain-text reply. An object is
 {"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments.
@@ -63,4 +63,9 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(out)))
         self.end_headers(); self.wfile.write(out)
     def log_message(self, *a): pass
-HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+server = HTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+# Port 0 binds a free port. With PORT_FILE set, write the port there once listening (atomically: its existence means ready).
+if os.environ.get("PORT_FILE"):
+    with open(os.environ["PORT_FILE"] + ".tmp", "w") as f: f.write(str(server.server_address[1]))
+    os.replace(os.environ["PORT_FILE"] + ".tmp", os.environ["PORT_FILE"])
+server.serve_forever()

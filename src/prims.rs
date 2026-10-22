@@ -19,6 +19,17 @@ use tokio::io::AsyncReadExt;
 const MAX_READ: u64 = 10 * 1024 * 1024;
 const MAX_CAPTURE: usize = 1024 * 1024;
 const DEFAULT_HITS: usize = 200;
+const SH_TIMEOUT: f64 = 60.0;
+const SH_TIMEOUT_MAX: f64 = 600.0;
+
+/// The limits the system prompt states, by placeholder name (`{{MAX_READ_MB}}` in prompts/system.md). std/prompt fills
+/// them in, so the prose the model reads comes from the constants that enforce it.
+pub fn prompt_limits() -> serde_json::Value {
+    serde_json::json!({
+        "MAX_READ_MB": MAX_READ >> 20, "DEFAULT_HITS": DEFAULT_HITS, "SH_TIMEOUT": SH_TIMEOUT, "SH_TIMEOUT_MAX": SH_TIMEOUT_MAX,
+        "CHUNK_SECS": crate::vm::CHUNK_SECS, "HISTORY_ENTRIES": crate::history::DEFAULT_LIMIT, "HISTORY_BYTES": crate::history::MAX_TEXT,
+    })
+}
 
 
 fn resolve(root: &Path, p: &str) -> PathBuf {
@@ -181,7 +192,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                 if let Err(why) = pol.approve(&cmd, class).await {
                     return Err(rt(format!("approval_required: {why}")));
                 }
-                let secs = opt_num(&opts, "timeout").unwrap_or(60.0).clamp(1.0, 600.0);
+                let secs = opt_num(&opts, "timeout").unwrap_or(SH_TIMEOUT).clamp(1.0, SH_TIMEOUT_MAX);
                 let cwd = match opt_str(&opts, "cwd") {
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
@@ -345,7 +356,7 @@ impl Jail {
     /// The agent's `sh`: the run's sandbox, or with --yolo the protected-paths profile.
     pub fn agent(pol: &crate::policy::Policy) -> Jail {
         if pol.enabled { Jail { profile: Some(pol.seatbelt_profile()), env: Some(pol.env()) } }
-        else if crate::ar::EPISODE.get().is_some() {
+        else if pol.episode.is_some() {
             // An autoresearch episode never hands credentials or its run's location to the agent, even with --yolo.
             let env = std::env::vars().filter(|(k, _)| {
                 let k = k.to_ascii_uppercase();
@@ -530,6 +541,24 @@ pub fn load_view_image(pol: &crate::policy::Policy, path: &str, max: u32) -> std
 }
 
 #[cfg(test)]
+mod prompt_limit_tests {
+    #[test]
+    fn every_limit_the_shipped_prompt_names_has_a_value() {
+        let text = crate::modules::Resolver::embedded("std", "system.md").unwrap();
+        let limits = super::prompt_limits();
+        let mut named = 0;
+        for part in text.split("{{").skip(1) {
+            let name = part.split("}}").next().unwrap();
+            if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) { continue; } // `{{file: string}}` is prose
+            named += 1;
+            // STR_TOP belongs to the printer, an overridable Luau module, so std/prompt adds it.
+            assert!(limits.get(name).is_some() || name == "STR_TOP", "system.md names {{{{{name}}}}}, which has no value");
+        }
+        assert!(named >= 7, "placeholders went missing: {named}");
+    }
+}
+
+#[cfg(test)]
 mod receipt_tests {
     use super::*;
 
@@ -537,7 +566,7 @@ mod receipt_tests {
     async fn shell_receipt_identity_includes_the_command_after_character_2000() {
         let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None, None).unwrap());
         let path = pol.log.path.clone();
         let prefix = format!(": #{}\n", "x".repeat(2100));
         let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));

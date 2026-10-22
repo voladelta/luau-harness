@@ -1,16 +1,11 @@
 # Readiness deadlines for integration checks, replacing fixed startup sleeps.
-wait_for_port() {
-  python3 - "$1" <<'PY'
-import socket, sys, time
-deadline = time.monotonic() + 5
-while time.monotonic() < deadline:
-    try:
-        with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.1):
-            sys.exit(0)
-    except OSError:
-        time.sleep(0.01)
-sys.exit("mock server did not become ready within 5s")
-PY
+# serve VAR CMD...: run a mock server in the background on a free port (CMD passes port 0; the server writes the
+# bound port to $PORT_FILE once listening). Sets VAR to the port and SERVED to the server's pid.
+serve() {
+  local var=$1 file; shift; file=$(mktemp -u)
+  PORT_FILE=$file "$@" & SERVED=$!
+  wait_for_file "$file" || return 1
+  printf -v "$var" %s "$(cat "$file")"; rm -f "$file"
 }
 
 wait_for_file() {

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-pub const FORMAT: u64 = 5;
+pub const FORMAT: u64 = 6;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,7 +35,8 @@ pub struct Branch { pub parent: std::path::PathBuf, pub durable: Value }
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunState {
     Running { controller: Value },
-    AwaitingReview { controller: Value, report: serde_json::Map<String, Value> },
+    /// The open owner gate is stored here and nowhere else.
+    AwaitingReview { controller: Value, report: serde_json::Map<String, Value>, gate: crate::workflow::ReviewRequest },
     Finished { report: serde_json::Map<String, Value> },
 }
 
@@ -79,8 +80,7 @@ impl Manifest {
             .context("this journal has no manifest record; start a new run")?;
         let bytes = eventlog::read_blob(path.parent().context("log has no parent")?, record["blob"].as_str().context("manifest blob missing")?)?;
         let manifest: Self = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(manifest.format == FORMAT || manifest.format == 4, "unsupported run format {}", manifest.format);
-        anyhow::ensure!(manifest.format != 4 || manifest.workflow.is_none(), "legacy format cannot contain a workflow");
+        anyhow::ensure!(manifest.format == FORMAT, "unsupported run format {} (this binary resumes format {FORMAT}); start a new run", manifest.format);
         if let Some(config)=&manifest.workflow {config.validate()?;}
         Ok(manifest)
     }
@@ -439,7 +439,7 @@ mod checkpoint_tests {
         for (tag, limit) in [("capped", Some(102)), ("uncapped", None)] {
             let dir = std::env::temp_dir().join(format!("hx-billing-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+            let policy = Arc::new(Policy::new(&dir, true, None, None, None, None).unwrap());
             let cfg = model();
             let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
                 Budget { max_tokens: limit, ..Budget::default() }, None).unwrap();
@@ -460,7 +460,7 @@ mod checkpoint_tests {
     async fn queued_model_admission_expires_without_a_settlement() {
         let dir = std::env::temp_dir().join(format!("hx-admission-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dir, true, None, None, None, None).unwrap());
         let cfg = model();
         let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
             Budget { max_tokens: Some(102), max_wall_secs: Some(0.5), ..Budget::default() }, None).unwrap();

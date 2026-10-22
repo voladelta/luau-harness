@@ -106,6 +106,8 @@ impl std::str::FromStr for ApprovalMode {
 pub struct Policy {
     cfg: Snapshot,
     pub log: Arc<EventLog>,
+    /// An autoresearch worker's claim and best score, when `episode` is set.
+    pub ar_progress: std::sync::Mutex<crate::ar::Progress>,
 }
 
 impl std::ops::Deref for Policy {
@@ -124,6 +126,9 @@ pub struct Snapshot {
     /// Owner state the model may neither read nor write (autoresearch held-out results and snapshots), in any mode.
     #[serde(default)]
     pub sealed: Vec<PathBuf>,
+    /// The autoresearch episode this run serves (`ar.*`), recorded with the rest of the frozen policy.
+    #[serde(default)]
+    pub episode: Option<crate::ar::Episode>,
     pub net: bool,
     pub gpu: bool,
     pub ask: Vec<String>,
@@ -194,7 +199,7 @@ fn normalize(p: &Path) -> PathBuf {
 impl Policy {
     /// `enabled = false` is `--yolo`: no Seatbelt confinement, path roots or approval gate. Protected paths (`.harness/`,
     /// `hx.lock`, the trust store) stay read-only to the model, so a yolo run cannot rewrite config later runs apply.
-    pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, net: Option<bool>) -> Result<Policy> {
+    pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, net: Option<bool>, episode: Option<crate::ar::Episode>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
         if let Some(path) = resume {
             // Lock before reading any recovery state or repairing the log. Mutable workspace configuration is never
@@ -212,19 +217,22 @@ impl Policy {
             // Newly introduced aliases must not turn frozen protected paths into writable paths.
             let aliases: Vec<_> = p.protected.iter().filter_map(canon).collect();
             p.protected.extend(aliases);
+            // The orchestrator retries an episode as a new child and never resumes one; a stale episode must not get `ar`.
+            anyhow::ensure!(p.episode.is_none(), "this run was an autoresearch episode; continue the search with `hx run --ar --resume .harness/ar/RUN`");
             log.check()?;
-            return Ok(Policy { cfg: p, log });
+            return Ok(Policy { cfg: p, log, ar_progress: Default::default() });
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
-        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], net: false, gpu: false, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
+        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], episode: None, net: false, gpu: false, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
         p.sealed.push(workspace.join(".harness/ar"));
-        p.sealed.extend(crate::ar::sealed());
+        if let Some(e) = &episode { p.sealed.extend(crate::ar::sealed(e)); }
+        p.episode = episode;
         for r in SYSTEM_READ {
             if let Some(c) = canon(r) {
                 p.read_roots.push(c);
@@ -276,7 +284,8 @@ impl Policy {
             "net": p.net, "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
-        Ok(Policy { cfg: p, log })
+        let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
+        Ok(Policy { cfg: p, log, ar_progress })
     }
 
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
@@ -554,7 +563,7 @@ mod tests {
         std::fs::write(victim.join("sentinel"), "KEEP").unwrap();
         let log = EventLog::open(&dir.join("log")).unwrap();
         log.write("session", json!({"workspace": dir, "tmp": victim}), true).unwrap();
-        let result = Policy::new(&dir, true, None, Some(&log.path), None);
+        let result = Policy::new(&dir, true, None, Some(&log.path), None, None);
         let accepted = result.is_ok();
         drop(result);
         assert!(victim.join("sentinel").exists(), "Policy::drop deleted unrelated data");
@@ -587,7 +596,7 @@ mod tests {
     fn classify_sh_orders_irreversible_before_external() {
         let dir = std::env::temp_dir().join(format!("hx-policy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = Policy::new(&dir, true, None, None, None).unwrap();
+        let p = Policy::new(&dir, true, None, None, None, None).unwrap();
         assert_eq!(p.classify_sh("git push --force origin main"), Class::Irreversible);
         assert_eq!(p.classify_sh("git push origin main"), Class::External);
         assert_eq!(p.classify_sh("ls -la"), Class::LocalWrite);
@@ -609,8 +618,8 @@ mod tests {
         std::fs::write(on.join(".harness/policy.toml"), "[gpu]\nallow = true\n").unwrap();
         // the launcher's consent to use workspace config (modules tests set the same value; no test needs it unset)
         unsafe { std::env::set_var("HX_TRUST", "1") };
-        assert!(!Policy::new(&off, true, None, None, None).unwrap().seatbelt_profile().contains("iokit-open"));
-        let prof = Policy::new(&on, true, None, None, None).unwrap().seatbelt_profile();
+        assert!(!Policy::new(&off, true, None, None, None, None).unwrap().seatbelt_profile().contains("iokit-open"));
+        let prof = Policy::new(&on, true, None, None, None, None).unwrap().seatbelt_profile();
         assert!(prof.contains("(allow iokit-open)") && prof.contains("MTLCompilerService"));
         let _ = std::fs::remove_dir_all(&base);
     }

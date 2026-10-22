@@ -102,6 +102,7 @@ impl Controller {
         let p = profile.clone();
         hx.set("model_info", lua.create_function(move |lua, ()| values::copy_in(lua, &p))?)?;
         hx.set("net", profile["net"].as_bool().unwrap_or(false))?;
+        hx.set("limits", values::copy_in(&lua, &crate::prims::prompt_limits())?)?;
         let names = registry.mcp.keys().cloned().collect::<Vec<_>>();
         hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(names.clone()))?)?;
         hx.set("prompt_contributions", contributions)?;

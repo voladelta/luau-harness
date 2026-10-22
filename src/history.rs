@@ -12,8 +12,11 @@ use std::{
 const MAX_SOURCE: usize = 64 << 20;
 const CACHE_BYTES: usize = 8 << 20;
 const MAX_RESPONSE: usize = 12 << 10;
-const MAX_TEXT: usize = 4096;
+pub const MAX_TEXT: usize = 4096;
 const MAX_SCAN: usize = 128;
+/// Entries per page when `limit` is omitted, and the most a page may ask for.
+pub const DEFAULT_LIMIT: usize = 5;
+const MAX_LIMIT: usize = 20;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +89,7 @@ impl Query {
                 "history: offset/bytes require id"
             );
             ensure!(
-                (1..=20).contains(&q.limit.unwrap_or(5)),
+                (1..=MAX_LIMIT).contains(&q.limit.unwrap_or(DEFAULT_LIMIT)),
                 "history: limit must be 1..20"
             );
             if let Some(text) = &q.q {
@@ -277,7 +280,7 @@ impl History {
         let mut entries = Vec::new();
         let mut examined = 0;
         let mut budget = MAX_SOURCE;
-        while seq != 0 && entries.len() < query.limit.unwrap_or(5) && examined < MAX_SCAN {
+        while seq != 0 && entries.len() < query.limit.unwrap_or(DEFAULT_LIMIT) && examined < MAX_SCAN {
             check_deadline(deadline)?;
             let pos = index
                 .records

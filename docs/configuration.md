@@ -10,7 +10,7 @@ All configuration lives in `.harness/` in the workspace. The model can read it b
 | `.harness/ar.toml` | Autoresearch setup (see [workflows](workflows.md#harnessartoml)) |
 | `.harness/override/`, `.harness/tools/`, `.harness/pkgs/` | Extensions (see [Extending](extending.md)) |
 | `.harness/secrets.toml` | Credentials for tools (see [credentials](extending.md#credentials)) |
-| `hx.lock` | Approved packages, their hashes and grants |
+| `hx.lock` | Approved packages and their content hashes |
 
 ## `policy.toml`
 
@@ -82,6 +82,6 @@ require("std/recheck").enabled = true
 
 ## Approvals and `hx.lock`
 
-`hx.lock` is the single approval record: per package, the approved version, its content hash and the capabilities granted to it (`[package.grants]`, where `"*"` grants every scope).
+`hx.lock` is the single approval record: per package, the approved version and its content hash. The hash covers the package's `hx.toml`, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval.
 
-Workspaces from before this format kept grants in `.harness/grants.toml`, which hx no longer reads. Run `hx approve NAME` again for each package that requests capabilities.
+Older lock files may still carry `[package.grants]` tables or a `.harness/grants.toml`; hx ignores both.

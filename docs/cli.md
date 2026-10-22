@@ -42,6 +42,15 @@ Every command takes `--help`.
 | `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
 | `--trace FILE` | | Write a readable trace |
 
+## Owner command flags
+
+| Flag | Commands | Meaning |
+|---|---|---|
+| `--gate ID` | `review` | The gate to decide |
+| `--decision D` | `review`, `recover` | `approve`, `revise`, `answer` or `waive` for a review; `complete` or `abandon` for a recovery |
+| `--input-file F` | `review` | Feedback, answers or the waiver reason |
+| `--yes` | `recover`, `trust`, `accept` | Confirm without a terminal prompt (required when stdin is not a terminal) |
+
 ## Global flags
 
 | Flag | Meaning |

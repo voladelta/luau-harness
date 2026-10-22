@@ -34,7 +34,7 @@ PY
 R() { PYTHONPATH=$T python3 -c "from r import *; $1"; }   # R 'dump(C("x=1"), S("done"))' -> JSON list
 Q() { PYTHONPATH=$T python3 -c "from q import *; $1"; }
 
-mock() { MOCK_REPLIES="$1" MOCK_LOG="$2" python3 scripts/mock_llm.py $3 & MP=$!; wait_for_port "$3" || exit 1; }  # replies-json log port
+mock() { MOCK_REPLIES="$1" MOCK_LOG="$2" serve PORT python3 scripts/mock_llm.py 0 || exit 1; MP=$SERVED; }  # replies-json log; sets PORT
 unmock() { kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=""; }
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf 'require("std/compact").keep_recent_tokens = 40\nrequire("std/recheck").enabled = false\n' > $W/.harness/init.luau; }
 off() { echo 'require("std/compact").enabled = false' >> $W/.harness/init.luau; }  # the pack is on by default
@@ -47,8 +47,8 @@ lastlog() { ls -t $1/.harness/log/*.jsonl | head -1; }
 
 # ---- 1. A1: with the pack off, and with it on below the threshold, requests are identical ----
 THREE=$(R 'dump(C("a=1"), C("b=2"), S("done"))')
-newws a1; off; mock "$THREE" $T/a1.plain 8810; run $W 8810 $T/a1.tr1; unmock
-newws a1b; mock "$THREE" $T/a1.pack 8810; run $W 8810 $T/a1.tr2 --pack std/compact; unmock
+newws a1; off; mock "$THREE" $T/a1.plain; run $W $PORT $T/a1.tr1; unmock
+newws a1b; mock "$THREE" $T/a1.pack; run $W $PORT $T/a1.tr2 --pack std/compact; unmock
 check "A1 pack below the threshold: request bodies identical to a run with the pack off" "$(python3 - <<PY
 import json
 def norm(f):
@@ -63,7 +63,7 @@ PY
 
 # ---- 2. A2 + 3. A4: one summarizer request, then summary + kept tail; globals survive ----
 S2=$(R 'dump(C("x = 42 -- TURN-ONE-MARKER"), C("y = 1", 30000), S("SUMMARY-ONE"), {"text": "", "calls": [{"code": "print(x)"}]}, S("done"))')
-newws a2; mock "$S2" $T/a2.req 8811; run $W 8811 $T/a2.tr --pack std/compact; rc=$?; unmock
+newws a2; mock "$S2" $T/a2.req; run $W $PORT $T/a2.tr --pack std/compact; rc=$?; unmock
 A2W=$W
 check "A2 run with a compaction finishes" "$rc $(field finished)" "0 True"
 check "A2 exactly one summarizer request, 5 requests in all" "$(Q 'r = load("'$T'/a2.req"); print(len(r), len(sums("'$T'/a2.req")))')" "5 1"
@@ -81,7 +81,7 @@ check "A4 a global set before the compaction is readable after it" "$(awk '/^pri
 
 # ---- 4. A3: the second compaction updates the first summary and serializes only newer messages ----
 S4=$(R 'dump(C("x = 42 -- TURN-ONE-MARKER"), C("y = 1", 30000), S("SUMMARY-ONE"), C("print(x) -- TURN-THREE-MARKER"), C("z = 2 -- TURN-FOUR-MARKER", 30000), S("SUMMARY-TWO"), S("done"))')
-newws a3; mock "$S4" $T/a3.req 8812; run $W 8812 $T/a3.tr --pack std/compact; rc=$?; unmock
+newws a3; mock "$S4" $T/a3.req; run $W $PORT $T/a3.tr --pack std/compact; rc=$?; unmock
 check "A3 run with two compactions finishes" "$rc $(field finished) $(Q 'print(len(sums("'$T'/a3.req")))')" "0 True 2"
 check "A3 second summarizer request carries <previous-summary>, the UPDATE prompt and only newer messages" "$(Q '
 c = conv(sums("'$T'/a3.req")[1])
@@ -91,44 +91,44 @@ t = text(msgs(load("'$T'/a3.req")[-1])[0]["content"]); print("SUMMARY-TWO" in t,
 
 # ---- 5. A5: a failed summarizer leaves messages alone; two failures switch the pack off ----
 S5=$(R 'dump(C("a=1"), C("b=2"), C("c=3", 30000), S(""), C("d=4", 30000), S(""), C("e=5", 30000), S("done"))')
-newws a5; mock "$S5" $T/a5.req 8813; run $W 8813 $T/a5.tr --pack std/compact; rc=$?; unmock
+newws a5; mock "$S5" $T/a5.req; run $W $PORT $T/a5.tr --pack std/compact; rc=$?; unmock
 check "A5 failing summarizer: run finishes, history never replaced" "$rc $(field finished) $(grep -c 'compaction-summary' $T/a5.req)" "0 True 0"
 check "A5 two failures logged, then no third summarizer request" "$(grep -c '^### COMPACT FAILED$' $T/a5.tr) $(Q 'print(len(sums("'$T'/a5.req")))')" "2 2"
 check "A5 a summarizer API error counts as a failure too" "$(
-S5b=$(R 'dump(C("a=1"), C("b=2"), C("c=3", 30000), E("boom"), C("d=4", 30000), S("done"))'); newws a5b; mock "$S5b" $T/a5b.req 8813; run $W 8813 $T/a5b.tr --pack std/compact; rc=$?; unmock
+S5b=$(R 'dump(C("a=1"), C("b=2"), C("c=3", 30000), E("boom"), C("d=4", 30000), S("done"))'); newws a5b; mock "$S5b" $T/a5b.req; run $W $PORT $T/a5b.tr --pack std/compact; rc=$?; unmock
 echo "$rc $(field finished) $(grep -c '^### COMPACT FAILED$' $T/a5b.tr)")" "0 True 1"
 
 # ---- 6. A6: a context-overflow error compacts once and retries the same turn ----
 S6=$(R 'dump(C("a=1"), C("b=2"), E("maximum context length exceeded"), S("SUMMARY-OV"), C("print(a) -- AFTER"), S("done"))')
-newws a6; mock "$S6" $T/a6.req 8814; run $W 8814 $T/a6.tr --pack std/compact; rc=$?; unmock
+newws a6; mock "$S6" $T/a6.req; run $W $PORT $T/a6.tr --pack std/compact; rc=$?; unmock
 A6W=$W; A6REQ=$T/a6.req
 check "A6 overflow then compaction then retry: run finishes" "$rc $(field finished) $(field turns)" "0 True 4"
 check "A6 the retry carries the summary; the failed request did not" "$(Q 'r = load("'$T'/a6.req"); print(len(r), "compaction-summary" in json.dumps(r[2]), "SUMMARY-OV" in json.dumps(r[4]))')" "6 False True"
 S6b=$(R 'dump(C("a=1"), C("b=2"), E("maximum context length exceeded"), S("SUMMARY-OV"), E("context_length_exceeded again"), S("never used"))')
-newws a6b; mock "$S6b" $T/a6b.req 8814; run $W 8814 $T/a6b.tr --pack std/compact; rc=$?; unmock
+newws a6b; mock "$S6b" $T/a6b.req; run $W $PORT $T/a6b.tr --pack std/compact; rc=$?; unmock
 check "A6 a second overflow on the same turn fails the run and says so" "$([ $rc -ne 0 ] && echo fail) $(grep -c 'failed again after one compact-and-retry' $T/err) $(Q 'print(len(load("'$T'/a6b.req")))')" "fail 1 5"
 S6c=$(R 'dump(C("a=1"), C("b=2"), E("maximum context length exceeded"), S(""), S("never used"))')
-newws a6c; mock "$S6c" $T/a6c.req 8814; run $W 8814 $T/a6c.tr --pack std/compact; rc=$?; unmock
+newws a6c; mock "$S6c" $T/a6c.req; run $W $PORT $T/a6c.tr --pack std/compact; rc=$?; unmock
 check "A6 overflow with a failed compaction ends the run with the API error" "$([ $rc -ne 0 ] && echo fail) $(grep -c 'maximum context length exceeded' $T/err)" "fail 1"
-newws a6d; off; mock "$S6c" $T/a6d.req 8814; run $W 8814 $T/a6d.tr; rc=$?; unmock
+newws a6d; off; mock "$S6c" $T/a6d.req; run $W $PORT $T/a6d.tr; rc=$?; unmock
 check "A6 with the pack off an overflow fails as before (no summarizer call)" "$([ $rc -ne 0 ] && echo fail) $(Q 'print(len(load("'$T'/a6d.req")))')" "fail 3"
 
 # ---- 6c. on by default: no --pack needed; enabled = false turns it off ----
-newws a6e; mock "$S2" $T/a6e.req 8814; run $W 8814 $T/a6e.tr; rc=$?; unmock
+newws a6e; mock "$S2" $T/a6e.req; run $W $PORT $T/a6e.tr; rc=$?; unmock
 check "6c default: compacts without --pack (one summarizer request)" "$rc $(field finished) $(Q 'print(len(sums("'$T'/a6e.req")))')" "0 True 1"
-newws a6f; off; mock "$S2" $T/a6f.req 8814; run $W 8814 $T/a6f.tr; rc=$?; unmock
+newws a6f; off; mock "$S2" $T/a6f.req; run $W $PORT $T/a6f.tr; rc=$?; unmock
 check "6c enabled = false: no summarizer request, no summary in any request" "$(Q 'print(len(sums("'$T'/a6f.req")))') $(grep -c 'compaction-summary' $T/a6f.req)" "0 0"
 
 # ---- 6b. real-model shape: reasoning (echoed back in raw) dominates the context, and keep_recent is the default ----
 S6r=$(R 'R1 = "r" * 6000; dump(*[dict(C("t%d = %d" % (i, i), 30000 if i == 8 else 3000 * i), reasoning=R1) for i in range(1, 9)], S("SUMMARY-R"), C("print(t1)", 2000), S("done"))')
 W=$T/a6r; mkdir -p $W/.harness; echo 'require("std/compact").keep_recent_tokens = 5000' > $W/.harness/init.luau
 echo 'require("std/recheck").enabled = false' >> $W/.harness/init.luau
-mock "$S6r" $T/a6r.req 8814; run $W 8814 $T/a6r.tr --pack std/compact; rc=$?; unmock
+mock "$S6r" $T/a6r.req; run $W $PORT $T/a6r.tr --pack std/compact; rc=$?; unmock
 check "6b reasoning-heavy turns: the compaction summarizes most of the history, keeping a short tail" "$rc $(field finished) $(grep -A1 '^### COMPACT$' $T/a6r.tr | tail -1 | sed -E 's/summarized ([0-9]+) messages, kept ([0-9]+),.*/\1 \2/')" "0 True 12 4"
 
 # ---- 8. A8: a subagent compacts its own history ----
 S8=$(R 'dump({"text": "", "calls": [{"code": "local r = agent(\"sub\")\nprint(r.answer)"}]}, C("a=1 -- CHILD-MARK"), C("b=2 -- CHILD-MARK"), C("c=3 -- CHILD-MARK", 30000), S("CHILD-SUMMARY"), S("child done"), S("parent done"))')
-newws a8; mock "$S8" $T/a8.req 8816; run $W 8816 $T/a8.tr --pack std/compact; rc=$?; unmock
+newws a8; mock "$S8" $T/a8.req; run $W $PORT $T/a8.tr --pack std/compact; rc=$?; unmock
 check "A8 subagent crossing the threshold sends a summarizer request with the child's history" "$rc $(field finished) $(Q 's = sums("'$T'/a8.req"); print(len(s), "CHILD-MARK" in conv(s[0]), "agent(" in conv(s[0]))')" "0 True 1 True False"
 
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

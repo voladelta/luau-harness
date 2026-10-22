@@ -68,7 +68,7 @@ def gate(result):
     records = harness.records(log)
     checkpoint = next(r for r in reversed(records) if r["kind"] == "checkpoint" and r.get("lane") == "root")
     state = json.loads((log.parent / "blobs" / checkpoint["blob"]).read_text())
-    return state["workflow"]["gate"]
+    return state["gate"]
 
 
 def stage(body):

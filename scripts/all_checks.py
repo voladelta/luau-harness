@@ -87,28 +87,17 @@ def main():
         return 1
     # Process-cap tests deliberately spawn hundreds of children: keep them isolated.
     results = [run("sandbox_checks", ["bash", "scripts/sandbox_checks.sh"], cap=60)]
-    # Serialize suites sharing mock ports; everything else uses separate workspaces.
-    groups = [
-        [("Rust tests", ["cargo", "test", "--release", "--quiet"])],
-        [("std unit tests", ["target/release/hx", "test", "stdlib/std"]),
-         ("extension_checks", ["bash", "scripts/extension_checks.sh"]),
-         ("llm_checks", ["bash", "scripts/llm_checks.sh"])],
-        [("mcp_checks", ["bash", "scripts/mcp_checks.sh"]),
-         ("vision_checks", ["bash", "scripts/vision_checks.sh"])],
-    ]
-    for name in ("compact", "harness", "journal", "budget", "caps", "upgrade", "trust"):
-        groups.append([(name + "_checks", ["bash", f"scripts/{name}_checks.sh"])])
-    groups += [[("redesign", ["python3", "scripts/redesign_checks.py"])],
-               [("custom_tools", ["python3", "scripts/custom_tool_checks.py"])] ,
-               [("rpi", ["python3", "scripts/rpi_checks.py"])],
-               [("history", ["python3", "scripts/history_checks.py"])]]
-
-    def group(checks):
-        return [run(*check) for check in checks]
+    # Mock servers bind free ports and every suite uses its own workspaces, so the rest run independently.
+    suites = [("Rust tests", ["cargo", "test", "--release", "--quiet"]),
+              ("std unit tests", ["target/release/hx", "test", "stdlib/std"])]
+    for name in ("extension", "llm", "mcp", "vision", "compact", "harness", "journal", "budget", "caps", "upgrade", "trust"):
+        suites.append((name + "_checks", ["bash", f"scripts/{name}_checks.sh"]))
+    for name in ("redesign", "custom_tool", "rpi", "history"):
+        suites.append((name + "_checks", ["python3", f"scripts/{name}_checks.py"]))
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        for future in as_completed([pool.submit(group, checks) for checks in groups]):
-            results.extend(future.result())
+        for future in as_completed([pool.submit(run, *suite) for suite in suites]):
+            results.append(future.result())
     # ar runs four scenarios at a time on its own; beside other suites it starves them past their caps.
     results.append(run("ar", ["python3", "scripts/ar_checks.py"], cap=280))
     elapsed = time.monotonic() - started

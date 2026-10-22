@@ -51,15 +51,10 @@ COMMANDS:
     reject       discard something staged
     rollback     undo the last accepted replacement of a harness module
     log verify   check an event log's hash chain and list unknown-outcome effects
+";
 
-GLOBAL FLAGS:
-    --workspace DIR   workspace root (default: .)
-    --yolo            no sandbox, network, path limits or approval gate; .harness/ stays read-only (prints a warning)
-    --net | --no-net  allow or deny network access
-    --approval MODE   deny (default) or prompt: what happens to a command that needs approval
-    --resume LOG      resume from an event log
-    -h, --help        show help (also `hx <command> --help`)
-    -V, --version     show version
+const TOP_HELP_TAIL: &str = "    -h, --help            show help (also `hx <command> --help`)
+    -V, --version         show version
 
 EXAMPLES:
     hx exec --workspace . 'print(1+1)'
@@ -71,10 +66,94 @@ ENVIRONMENT:
     HX_DEBUG=1                      print the full error chain on failure
 ";
 
+const DEFAULT_MAX_TURNS: u64 = 200;
+const DEFAULT_MAX_OUTPUT: u64 = 16384;
+
+#[derive(Clone, Copy, PartialEq)]
+enum FlagKind { Switch, Text, Unsigned, Positive, Amount }
+
+/// One command-line flag. This table is the only place flags are declared: validation, `hx exec`'s separation of flags
+/// from code, and every help screen read it.
+struct Flag {
+    /// Commands that accept it; empty means every command (a global flag).
+    commands: &'static [&'static str],
+    name: &'static str,
+    kind: FlagKind,
+    value: &'static str,
+    help: &'static str,
+    default: Option<u64>,
+}
+
+const fn flag(commands: &'static [&'static str], name: &'static str, kind: FlagKind, value: &'static str, help: &'static str) -> Flag {
+    Flag { commands, name, kind, value, help, default: None }
+}
+
+const FLAGS: &[Flag] = {
+    use FlagKind::*;
+    const RUN: &[&str] = &["run"];
+    &[
+        flag(&[], "--workspace", Text, "DIR", "workspace root (default: .)"),
+        flag(&[], "--yolo", Switch, "", "no sandbox, network, path limits or approval gate; .harness/ stays read-only (prints a warning)"),
+        flag(&[], "--net", Switch, "", "allow network access"),
+        flag(&[], "--no-net", Switch, "", "deny network access"),
+        flag(&[], "--approval", Text, "MODE", "deny (default) or prompt: what happens to a command that needs approval"),
+        flag(&["run", "exec"], "--pack", Text, "A,B", "extra packs: std/authoring (agent-written tools), std/vision (view() shows images)"),
+        flag(RUN, "--resume", Text, "LOG", "restore frozen settings and checkpoint into a fresh VM; do not repeat flags"),
+        flag(RUN, "--branch", Text, "LOG", "start a new run with current approved configuration and inherited durable data"),
+        flag(RUN, "--prompt-file", Text, "F", "task text"),
+        flag(RUN, "--model", Text, "M", "model id (default: HX_MODEL)"),
+        flag(RUN, "--api", Text, "A", "responses (default, or HX_API) or completions"),
+        flag(RUN, "--base-url", Text, "U", "API base URL (default: HX_BASE_URL, else OpenRouter)"),
+        flag(RUN, "--key-env", Text, "E", "environment variable holding the API key (default: OPENROUTER_API_KEY)"),
+        flag(RUN, "--reasoning", Text, "R", "reasoning effort"),
+        Flag { default: Some(DEFAULT_MAX_OUTPUT), ..flag(RUN, "--max-output", Positive, "N", "max output tokens per turn") },
+        flag(RUN, "--context-window", Positive, "N", "the model's context window; compaction starts before it"),
+        flag(RUN, "--provider-only", Text, "A,B", "OpenRouter only: route to these providers, no fallbacks"),
+        Flag { default: Some(DEFAULT_MAX_TURNS), ..flag(RUN, "--max-turns", Unsigned, "N", "turn limit") },
+        flag(RUN, "--max-tokens", Unsigned, "N", "token admission threshold"),
+        flag(RUN, "--max-wall", Amount, "SECS", "absolute deadline, in seconds"),
+        flag(RUN, "--trace", Text, "FILE", "write a readable trace"),
+        flag(RUN, "--rpi", Switch, "", "research, design, implement, verify and repair automatically"),
+        flag(RUN, "--manual", Switch, "", "require RPI artifact review (requires --rpi)"),
+        flag(RUN, "--ar", Switch, "", "autoresearch over .harness/ar.toml until progress stops (--ar --resume .harness/ar/RUN continues one)"),
+        flag(&["review"], "--gate", Text, "ID", "the gate to decide"),
+        flag(&["review"], "--decision", Text, "D", "approve, revise, answer or waive"),
+        flag(&["review"], "--input-file", Text, "F", "feedback, answers or the waiver reason"),
+        flag(&["recover"], "--decision", Text, "D", "complete or abandon"),
+        flag(&["recover", "trust", "accept"], "--yes", Switch, "", "confirm without a terminal prompt"),
+    ]
+};
+
+fn flag_kind(command: &str, name: &str) -> Option<FlagKind> {
+    FLAGS.iter().find(|f| f.name == name && (f.commands.is_empty() || f.commands.contains(&command))).map(|f| f.kind)
+}
+
+/// Help lines for flags: global ones (`command` None) or those of one command.
+fn flag_lines(command: Option<&str>) -> String {
+    let mut out = String::new();
+    for f in FLAGS.iter().filter(|f| match command { None => f.commands.is_empty(), Some(c) => f.commands.contains(&c) }) {
+        let left = if f.value.is_empty() { f.name.to_string() } else { format!("{} {}", f.name, f.value) };
+        let default = f.default.map(|d| format!(" (default: {d})")).unwrap_or_default();
+        out.push_str(&format!("    {left:<22}{}{default}\n", f.help));
+    }
+    out
+}
+
+fn top_help() -> String {
+    format!("{TOP_HELP}\nGLOBAL FLAGS:\n{}{TOP_HELP_TAIL}", flag_lines(None))
+}
+
+/// `hx <command> --help`: the command's usage text with its flags from FLAGS.
+fn command_help(cmd: &str) -> Option<String> {
+    let text = help_for(cmd)?;
+    let flags = flag_lines(Some(cmd));
+    Some(if flags.is_empty() { text.to_string() } else { format!("{text}\nFLAGS:\n{flags}") })
+}
+
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
-        "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n    --rpi              research, design, implement, verify and repair automatically\n    --manual           require RPI artifact review (requires --rpi)\n    --ar               autoresearch: agent episodes improve .harness/ar.toml editable paths until progress stops\n                       (--ar --resume .harness/ar/RUN continues an interrupted search)\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
+        "exec" => "hx exec [flags] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
         "review" => "hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]\n\nRecords a decision only; continue with hx run --resume LOG.\n",
         "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, sandboxed offline sh is settled as unknown_local, and model requests whose response was lost are charged their reserved tokens; none needs a decision.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
@@ -144,19 +223,10 @@ fn list_arg(args: &[String], name: &str) -> Vec<String> {
     arg(args, name).map(|v| v.split(',').map(String::from).collect()).unwrap_or_default()
 }
 
-/// A numeric flag: None when absent, a usage error when present but not a number (a mistyped `--max-tokens` must not
-/// silently run without a budget). A flag present without a following value (last argument, or next token is a flag)
-/// is also a usage error.
+/// A numeric flag's value, None when absent. `validate_args` has already refused a missing or malformed value (a mistyped
+/// `--max-tokens` must not silently run without a budget), so this only converts.
 fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>> {
-    let pos = args.iter().position(|a| a == name);
-    match pos {
-        None => Ok(None),
-        Some(i) => match args.get(i + 1) {
-            None => Err(usage(&format!("{name} requires a value"))),
-            Some(v) if v.starts_with("--") => Err(usage(&format!("{name} requires a value"))),
-            Some(v) => v.parse().map(Some).map_err(|_| usage(&format!("{name}: expected a number, got {v:?}"))),
-        },
-    }
+    arg(args, name).map(|v| v.parse().map_err(|_| usage(&format!("{name}: expected a number, got {v:?}")))).transpose()
 }
 
 /// `--net` / `--no-net`, or None to let the policy decide.
@@ -168,27 +238,6 @@ fn net_flag(args: &[String]) -> Option<bool> {
     } else {
         None
     }
-}
-
-#[derive(Clone, Copy)]
-enum FlagKind { Switch, Text, Unsigned, Positive, Amount }
-
-/// One flag schema for preflight validation and exec's separation of flags from code.
-fn flag_kind(command: &str, name: &str) -> Option<FlagKind> {
-    use FlagKind::*;
-    Some(match (command, name) {
-        (_, "--workspace" | "--approval") => Text,
-        (_, "--yolo" | "--net" | "--no-net") => Switch,
-        ("run" | "exec", "--pack") => Text,
-        ("run", "--resume" | "--branch" | "--prompt-file" | "--model" | "--api" | "--base-url" | "--key-env" | "--reasoning" | "--provider-only" | "--trace") => Text,
-        ("run", "--max-turns" | "--max-tokens") => Unsigned,
-        ("run", "--max-output" | "--context-window") => Positive,
-        ("run", "--max-wall") => Amount,
-        ("recover", "--decision") | ("review", "--decision" | "--gate" | "--input-file") => Text,
-        ("run", "--rpi" | "--manual" | "--ar") => Switch,
-        ("recover" | "trust" | "accept", "--yes") => Switch,
-        _ => return None,
-    })
 }
 
 /// Reject malformed options before opening a journal, starting an MCP server, or contacting a provider.
@@ -246,9 +295,9 @@ fn validate_args(args: &[String]) -> Result<()> {
 /// Top-level help, version, or `<command> --help`: printed, and the caller is done.
 fn print_info(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        None | Some("-h" | "--help" | "help") => print!("{TOP_HELP}"),
+        None | Some("-h" | "--help" | "help") => print!("{}", top_help()),
         Some("-V" | "-v" | "--version" | "version") => println!("hx {}", env!("CARGO_PKG_VERSION")),
-        Some(c) if args.iter().skip(1).any(|a| a == "-h" || a == "--help") => match help_for(c) {
+        Some(c) if args.iter().skip(1).any(|a| a == "-h" || a == "--help") => match command_help(c) {
             Some(h) => print!("{h}"),
             None => return false,
         },
@@ -274,11 +323,11 @@ async fn real_main() -> Result<()> {
         eprintln!("warning: --yolo: no sandbox, network open, no path limits, no approval gate (.harness/ and hx.lock stay read-only)");
     }
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
-    let mk_policy = || -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), net_flag(&args))?)) };
+    let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), net_flag(&args), episode)?)) };
     match args[0].as_str() {
         "exec" => {
             trust::warn_if_untrusted(&workspace);
-            cmd_exec(&args, mk_policy()?).await
+            cmd_exec(&args, mk_policy(None)?).await
         }
         "run" if has(&args, "--ar") => {
             trust::warn_if_untrusted(&workspace);
@@ -286,8 +335,8 @@ async fn real_main() -> Result<()> {
         }
         "run" => {
             trust::warn_if_untrusted(&workspace);
-            ar::load_episode()?;
-            cmd_run(&args, workspace.clone(), mk_policy()?).await
+            // A child run of an autoresearch episode: the episode becomes part of its frozen policy.
+            cmd_run(&args, workspace.clone(), mk_policy(ar::load_episode()?)?).await
         }
         "recover" => cmd_recover(&args),
         "review" => workflow_runtime::review(Path::new(&args[1]), &arg(&args,"--gate").unwrap(), &arg(&args,"--decision").unwrap(), arg(&args,"--input-file").as_deref().map(Path::new)),
@@ -298,7 +347,7 @@ async fn real_main() -> Result<()> {
             println!("revoked {}", path.display());
             Ok(())
         },
-        "test" => cmd_test(&args, &workspace, mk_policy()?).await,
+        "test" => cmd_test(&args, &workspace, mk_policy(None)?).await,
         "approve" => cmd_approve(&args, &workspace),
         "trust" => cmd_trust(&args, &workspace),
         // hx skills : agent skills on disk and their approval state
@@ -359,7 +408,7 @@ fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
         base_url: arg(args, "--base-url").or_else(|| std::env::var("HX_BASE_URL").ok()),
         key_env: arg(args, "--key-env"),
         reasoning: arg(args, "--reasoning"),
-        max_output: parsed(args, "--max-output")?.unwrap_or(16384),
+        max_output: parsed(args, "--max-output")?.unwrap_or(DEFAULT_MAX_OUTPUT),
         context_window: parsed(args, "--context-window")?,
         cache_key: Some(session),
         provider_only: list_arg(args, "--provider-only"),
@@ -390,7 +439,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             None => inherited.as_ref().map(|(_, m, _)| m.task.clone()).ok_or_else(|| usage("--prompt-file required for a new run"))?,
         };
         let cfg = llm_cfg(args, policy.log.session.clone())?;
-        let max_turns = parsed(args, "--max-turns")?.unwrap_or(200);
+        let max_turns = parsed(args, "--max-turns")?.unwrap_or(DEFAULT_MAX_TURNS as usize);
         let budget = policy::Budget { max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
         let branch = inherited.as_ref().map(|(parent, manifest, state)| supervisor::Branch {
             parent: parent.path.clone(),
@@ -577,15 +626,11 @@ mod tests {
         assert!(list_arg(&a, "--provider-only").is_empty());
         assert_eq!(parsed::<u32>(&a, "--max-turns").unwrap(), Some(7));
         assert_eq!(parsed::<u32>(&a, "--max-tokens").unwrap(), None);
-        let e = parsed::<f64>(&a, "--max-wall").unwrap_err();
-        assert!(e.is::<Usage>() && e.to_string().contains("--max-wall"), "a mistyped budget is a usage error, not unlimited: {e}");
-        // A flag present without a following value (last arg or next token is a flag) is also a usage error.
-        let a2 = argv("run --model m --max-wall");
-        let e2 = parsed::<f64>(&a2, "--max-wall").unwrap_err();
-        assert!(e2.is::<Usage>() && e2.to_string().contains("requires a value"), "missing value (last arg): {e2}");
-        let a3 = argv("run --max-wall --net");
-        let e3 = parsed::<f64>(&a3, "--max-wall").unwrap_err();
-        assert!(e3.is::<Usage>() && e3.to_string().contains("requires a value"), "missing value (next is flag): {e3}");
+        // Validation, not parsing, refuses a bad or missing value: a mistyped budget is a usage error, not unlimited.
+        for bad in ["run --max-wall x", "run --model m --max-wall", "run --max-wall --net"] {
+            let e = validate_args(&argv(bad)).unwrap_err();
+            assert!(e.is::<Usage>() && e.to_string().contains("--max-wall"), "{bad}: {e}");
+        }
         assert_eq!(net_flag(&a), Some(true));
         assert_eq!(net_flag(&argv("run --no-net")), Some(false));
         assert_eq!(net_flag(&argv("run")), None);
@@ -600,6 +645,17 @@ mod tests {
         let a_def = argv("run --model m");
         let c_def = llm_cfg(&a_def, "s".into()).unwrap();
         assert_eq!(c_def.api, "responses");
+    }
+
+    #[test]
+    fn every_flag_is_documented_and_shown_in_help() {
+        let docs = include_str!("../docs/cli.md");
+        for f in FLAGS {
+            assert!(docs.contains(&format!("`{}", f.name)), "docs/cli.md does not mention {}", f.name);
+            let help = if f.commands.is_empty() { top_help() } else { command_help(f.commands[0]).unwrap() };
+            assert!(help.contains(f.name), "help for {:?} does not list {}", f.commands, f.name);
+        }
+        assert!(command_help("run").unwrap().contains("turn limit (default: 200)"));
     }
 
     #[test]

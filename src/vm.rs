@@ -17,6 +17,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// Luau CPU allowance of one agent chunk (time waiting on effects does not count).
+pub const CHUNK_SECS: u64 = 120;
+
 pub(crate) const PRELUDE: &str = r##"
 function print(...)
 	local n = select("#", ...)
@@ -58,7 +61,7 @@ mod session_budget_tests {
     async fn awaiting_an_effect_does_not_spend_the_luau_cpu_allowance() {
         let dir = std::env::temp_dir().join(format!("hx-chunk-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dir, true, None, None, None, None).unwrap());
         let vm = Vm::new(policy, Duration::from_millis(30), 32 << 20, None).unwrap();
         let waited = vm.session.run("local r=sh('sleep 0.1; echo waited'); assert(r.code==0); print(r.stdout)").await;
         assert!(waited.error.is_none(), "{:?}", waited.error);
@@ -72,7 +75,7 @@ mod session_budget_tests {
     async fn isolated_package_wait_preserves_the_callers_cpu_allowance() {
         let dir = std::env::temp_dir().join(format!("hx-package-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dir, true, None, None, None, None).unwrap());
         let vm = Vm::new(policy.clone(), Duration::from_millis(30), 32 << 20, None).unwrap();
         let mut registry = crate::modules::Registry::capture(&dir).unwrap();
         let caps = BTreeMap::from([("proc".into(), vec!["sh".into()])]);
@@ -303,7 +306,7 @@ impl Vm {
         if host.as_ref().is_some_and(|h|h.is_workflow_root()) {
             let stage = lua.create_table()?;
             let frame = supervisor.workflow.lock().unwrap().clone().unwrap();
-            if let Some(active) = &frame.active_stage {
+            if let Some(active) = frame.stage.as_ref().map(|a| &a.spec) {
                 stage.set("id",active.id.clone())?;
                 stage.set("name",active.name.clone())?;
                 stage.set("checks",crate::values::copy_in(&lua,&serde_json::to_value(&frame.check_plan).map_err(mlua::Error::external)?)?)?;
@@ -317,7 +320,7 @@ impl Vm {
             stage.set_readonly(true);
             g.set("stage",stage)?;
         }
-        if crate::ar::EPISODE.get().is_some() && host.as_ref().is_some_and(|h| h.depth == 0) {
+        if policy.episode.is_some() && host.as_ref().is_some_and(|h| h.depth == 0) {
             // ar.eval(note) is the only way an autoresearch episode scores a state, ar.claim(idea) claims what a worker tests,
             // and ar.reset() restores the worker's best state (see ar.rs).
             let ar = lua.create_table()?;
@@ -344,8 +347,9 @@ impl Vm {
                 }
             })?)?;
             let afx = fx.clone();
-            ar.set("claims", lua.create_function(|lua, ()| {
-                let listed = crate::ar::claims().map_err(|e| crate::effects::rt(format!("ar.claims: {e}")))?;
+            let cpol = policy.clone();
+            ar.set("claims", lua.create_function(move |lua, ()| {
+                let listed = crate::ar::claims(&cpol).map_err(|e| crate::effects::rt(format!("ar.claims: {e}")))?;
                 prims::json_value(lua, Ret::Json(listed))
             })?)?;
             ar.set("reset", lua.create_async_function(move |lua, ()| {
@@ -581,6 +585,7 @@ impl Vm {
         let pres = registry.clone();
         // whether `sh` can reach the network (sandbox off, or --net / policy allow): std/prompt words the sandbox section by it
         hx.set("net", !policy.enabled || policy.net)?;
+        hx.set("limits", crate::values::copy_in(&lua, &prims::prompt_limits())?)?;
         hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_names.clone()))?)?;
         hx.set("packages", lua.create_function(move |lua, ()| crate::values::copy_in(lua, &serde_json::to_value(&pres.packages).map_err(mlua::Error::external)?))?)?;
         let assets = registry.clone();

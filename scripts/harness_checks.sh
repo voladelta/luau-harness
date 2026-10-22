@@ -49,7 +49,7 @@ check "sealed read batch" "$($H exec --workspace $W 'print(batch({{op="read",arg
 # 4. vars() lists session variables
 check "vars" "$($H exec --workspace $W $'x = 41\nvars()' | head -1)" "=> <table: 1 keys> {x=41}"
 
-# 5. package lock + grants gate
+# 5. package lock gate
 P=$W/.harness/pkgs/mypkg; mkdir -p $P/tests
 printf '[package]\nname = "mypkg"\nversion = "0.1.0"\n[capabilities]\nnet = ["example.com"]\n' > $P/hx.toml
 echo 'return { hello = function() return "hi" end }' > $P/init.luau
@@ -77,9 +77,9 @@ require("std/hooks").on("before_run", function(p)
 	if p.code:find("rm -rf", 1, true) then return { deny = "no rm -rf here" } end
 end)
 LUA
-MOCK_REPLIES='["```luau\nsh(\"rm -rf /tmp/zzz-hx\")\n```","```luau\nlocal r = agent(\"sub\")\nprint(\"sub said: \" .. r.answer)\n```","```luau\nprint(1)\n```","SUB-ANSWER","All done."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-wait_for_port 8768 || exit 1; echo go > $T/p.txt
-OPENROUTER_API_KEY=x $H run --workspace $W2 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace.txt > $T/rep.json
+MOCK_REPLIES='["```luau\nsh(\"rm -rf /tmp/zzz-hx\")\n```","```luau\nlocal r = agent(\"sub\")\nprint(\"sub said: \" .. r.answer)\n```","```luau\nprint(1)\n```","SUB-ANSWER","All done."]' serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
+echo go > $T/p.txt
+OPENROUTER_API_KEY=x $H run --workspace $W2 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY --trace $T/trace.txt > $T/rep.json
 check "hook denied rm -rf" "$(grep -c 'no rm -rf here' $T/trace.txt)" "1"
 check "subagent answer reached parent" "$(grep -c "sub said: SUB-ANSWER" $T/trace.txt)" "1"
 check "usage aggregated across subagent (5 llm calls)" "$(python3 -c "import json;print(json.load(open('$T/rep.json'))['llm_calls'])")" "5"
@@ -96,25 +96,22 @@ hooks.on("before_finish", function(p)
 end)
 LUA
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
-MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-wait_for_port 8768 || exit 1
-OPENROUTER_API_KEY=x $H run --workspace $W4 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace4.txt > $T/rep4.json
+MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
+OPENROUTER_API_KEY=x $H run --workspace $W4 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY --trace $T/trace4.txt > $T/rep4.json
 check "before_finish continues once" "$(python3 -c "import json;r=json.load(open('$T/rep4.json'));print(r['llm_calls'], r['final_answer'])")" "3 Checked: final answer."
 
 # 6d. opt-in recheck sends the model back exactly once
 W6=$T/ws6; mkdir -p $W6/.harness
 echo 'require("std/recheck").enabled = true' > $W6/.harness/init.luau
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
-MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-wait_for_port 8768 || exit 1
-OPENROUTER_API_KEY=x $H run --workspace $W6 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace6.txt > $T/rep6.json
+MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
+OPENROUTER_API_KEY=x $H run --workspace $W6 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY --trace $T/trace6.txt > $T/rep6.json
 check "opt-in recheck continues once" "$(python3 -c "import json;r=json.load(open('$T/rep6.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace6.txt)" "3 Checked: final answer. 1"
 
 W7=$T/ws7; mkdir -p $W7
 kill $MOCK 2>/dev/null; wait $MOCK 2>/dev/null
-MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' python3 scripts/mock_llm.py 8768 & MOCK=$!
-wait_for_port 8768 || exit 1
-OPENROUTER_API_KEY=x $H run --workspace $W7 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:8768 --key-env OPENROUTER_API_KEY --trace $T/trace7.txt > $T/rep7.json
+MOCK_REPLIES='["```luau\nprint(1)\n```","First answer.","Checked: final answer."]' serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
+OPENROUTER_API_KEY=x $H run --workspace $W7 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY --trace $T/trace7.txt > $T/rep7.json
 check "default accepts the first final answer" "$(python3 -c "import json;r=json.load(open('$T/rep7.json'));print(r['llm_calls'], r['final_answer'])") $(grep -c 'state the root cause you fixed' $T/trace7.txt)" "2 First answer. 0"
 
 # 6c. Lost or malformed generations are not automatically retried (and retain reservations).

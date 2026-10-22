@@ -12,8 +12,20 @@ function M.sandbox(text: string, net: boolean, has_mcp: boolean): string
 	return text .. "\n\n# Runtime access\n" .. line
 end
 
+-- `{{NAME}}` (upper case) in the system prompt is a limit the host enforces (`hx.limits`) or the printer applies, filled
+-- from the value in force so prose and code cannot disagree. An unknown name is an error, never text the model reads.
+function M.fill(text: string, limits): string
+	local values = table.clone(limits or {})
+	values.STR_TOP = require("std/printer").STR_TOP
+	return (text:gsub("{{(%u[%u%d_]*)}}", function(name)
+		local value = values[name]
+		if value == nil then error("system prompt names unknown limit {{" .. name .. "}}") end
+		return tostring(value)
+	end))
+end
+
 function M.system(options): string
-	local sections = { M.sandbox(hx.asset("std/system.md"), hx.net, #hx.mcp_servers() > 0) }
+	local sections = { M.sandbox(M.fill(hx.asset("std/system.md"), hx.limits), hx.net, #hx.mcp_servers() > 0) }
 	local recheck = require("std/recheck")
 	if recheck.enabled and (not options or options.recheck ~= false) then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
 	if hx.prompt_contributions and hx.prompt_contributions ~= "" then table.insert(sections, hx.prompt_contributions) end

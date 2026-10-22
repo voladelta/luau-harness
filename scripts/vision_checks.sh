@@ -12,9 +12,9 @@ check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "
 W=$T/ws; mkdir -p $W
 ffmpeg -v error -f lavfi -i testsrc=size=1600x900 -frames:v 1 $W/frame.png
 REPLIES='["```luau\nlocal r = view(\"frame.png\")\nprint(r[1].width, r[1].height)\n```","done"]'
-MOCK_REPLIES="$REPLIES" MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl python3 scripts/mock_llm.py 8797 & M=$!
-wait_for_port 8797 || exit 1; echo go > $T/p.txt
-run() { OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api $2 --base-url http://127.0.0.1:8797 --key-env OPENROUTER_API_KEY "${@:3}" 2>/dev/null; }
+MOCK_REPLIES="$REPLIES" MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl serve MP python3 scripts/mock_llm.py 0 || exit 1; M=$SERVED
+echo go > $T/p.txt
+run() { OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api $2 --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY "${@:3}" 2>/dev/null; }
 img_parts() { python3 -c "
 import json
 b=[json.loads(x) for x in open('$T/req.jsonl')][-1]

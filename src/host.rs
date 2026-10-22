@@ -151,7 +151,7 @@ impl Host {
             report["workflow"]=json!("rpi");
             if report.get("status").is_none() {report["status"]=json!(if report["finished"]==true {"completed"} else {"stopped"});}
             if let Some(frame)=self.supervisor.workflow.lock().unwrap().as_ref() {
-                if report.get("stage").is_none() {report["stage"]=json!(frame.active_stage.as_ref().map(|s|&s.name));}
+                if report.get("stage").is_none() {report["stage"]=json!(frame.stage.as_ref().map(|a|&a.spec.name));}
                 report["root_model_admissions"]=json!(frame.root_turns);
                 report["artifact_directory"]=json!(self.workspace.join(".agents/artifacts").join(format!("rpi-{}",self.policy.log.session)));
             }
@@ -252,8 +252,8 @@ impl Host {
         if self.depth == 0 && let Some(RunState::Finished { report }) = &self.supervisor.restored {
             return Ok(self.report(Value::Object(report.clone()), 0.0));
         }
-        let owner_event = if workflow && let Some(RunState::AwaitingReview{report,..})=&self.supervisor.restored {
-            match self.resume_owner_decision() {
+        let owner_event = if workflow && let Some(RunState::AwaitingReview{report,gate,..})=&self.supervisor.restored {
+            match self.resume_owner_decision(gate) {
                 Ok(Some(event))=>Some(event),
                 Ok(None)=>return Ok(self.workflow_pause_report(report)),
                 Err(error) if error.to_string().starts_with("budget_exceeded")=>return Ok(self.workflow_pause_report(report)),
@@ -282,7 +282,7 @@ impl Host {
             if admin {self.policy.log.check()?;} else {self.supervisor.check()?;}
             let previous_messages=state["messages"].as_array().cloned().unwrap_or_default();
             let was_compacting = compacting;
-            let source_stage = self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f| f.active_stage.as_ref().map(|s| s.id.clone()));
+            let source_stage = self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f| f.stage.as_ref().map(|a| a.spec.id.clone()));
             let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
             let (next_state,mut command)=controller.step(&state,&event)?;
             ensure_object(&next_state)?;
@@ -305,7 +305,7 @@ impl Host {
             if command["kind"]=="model" || command["kind"]=="run" {
                 self.supervisor.check()?;
                 if vm.is_none() {
-                    let fresh=Vm::new(self.policy.clone(),Duration::from_secs(120),512<<20,Some(self.clone()))?;
+                    let fresh=Vm::new(self.policy.clone(),Duration::from_secs(crate::vm::CHUNK_SECS),512<<20,Some(self.clone()))?;
                     let mut packs=vec!["std/packages".into(),"std/mcp".into()];
                     for name in &self.packs {if matches!(name.as_str(),"std/vision"|"std/authoring") && !packs.contains(name) {packs.push(name.clone());}}
                     fresh.install_packs(&packs).await?;vm=Some(fresh);
