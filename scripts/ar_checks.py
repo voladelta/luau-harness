@@ -283,7 +283,8 @@ check("while every round moves a chosen candidate, rounds go on until the budget
 records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
 widths = [len(r["episodes"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("round")]
 assert widths[0] == 8 and widths[1] == 6 and max(widths[1:]) == 6, widths
-assert "rate-limited r1-w1" in result.stderr, result.stderr[-1500:]
+limited = [r for r in records if r["kind"] == "finished" and r.get("rate_limits")]
+assert [r["label"] for r in limited] == ["r1-w1"] and "1 rate-limited" in result.stderr, limited
 check("eight workers per round, six once the provider rate-limits an episode")
 
 # 2. Ideas below the seed still go on to refinement, but never become results: the workspace keeps the seed. With no
@@ -322,7 +323,8 @@ report = report_of(result)
 assert report["rounds"] == 1 and report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n", report
 check("with no valid idea after round 1 the run stops and the workspace keeps the seed")
 
-# 2b. When the budget is spent before a gate's audits can start, candidates go on marked unaudited; no verdict is invented.
+# 2b. When the budget is spent before a gate's audits can start, no verdict is invented and nothing unaudited becomes a
+# result: the workspace keeps the seed.
 def costly(body, index):
     """Explore workers' final replies are billed $0.05 each, so round 1 spends the whole budget before any audit can
     start; their claims and evaluations run first, within their allowance."""
@@ -340,11 +342,20 @@ finished = {r["label"] for r in records if r["kind"] == "finished" and not r.get
 ran = {(p["idea"], p["start"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("audit")
        for p in r["episodes"] if any(s["label"] in finished for s in records if s["kind"] == "started" and s["plan"] == p["label"])}
 assert all((r["idea"], r["snap"]) in ran for r in records if r["kind"] == "audited"), "a verdict without a finished audit"
-unaudited = [p for p in report["portfolio"] if p["audit"] is None]
-assert unaudited and all(p["reason"] == "not audited: budget spent" for p in unaudited), report["portfolio"]
-first_unaudited = next(i for i, p in enumerate(report["portfolio"]) if p["audit"] is None)
-assert all(p["audit"] is None for p in report["portfolio"][first_unaudited:]), "an unaudited candidate ranks above an audited one"
-check("candidates the budget left no room to audit go on marked unaudited, never as a pass")
+good = [c for c in report["candidates"] if c["good"]]
+assert good and all(c["audit"] is None for c in good), report["candidates"]
+assert report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n", report["portfolio"]
+check("good candidates the budget left no room to audit never become results, and no verdict is invented")
+
+# 2c. An auditor that gives no verdict leaves its candidate unaudited: nothing becomes a result without a passing audit.
+path = workspace("noverdict")
+with harness.provider(lambda body, index: "Checked the state." if role_of(body)[0] == "audit" else scripted(body, index), price=PRICE) as (url, _):
+    report = report_of(ar(path, url, 0.3))
+records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
+assert any(r["kind"] == "planned" and r["batch"].startswith("audit") for r in records), "no audit ran"
+assert not any(r["kind"] == "audited" for r in records) and report["portfolio"] == [], report["portfolio"]
+assert (path / "x.txt").read_text() == "0\n" and "no verdict; it stays unaudited" in (BASE / "noverdict.stderr").read_text()
+check("an auditor that gives no verdict leaves its candidate unaudited, never a result")
 
 # 3. A select evaluator that cannot score the seed stops the run before any episode.
 path = workspace("badselect", spec='editable = ["x.txt"]\neval = "python3 search.py"\nselect = "exit 3"\ntimeout = 30\n')
@@ -472,7 +483,7 @@ check("a killed run resumes past torn lines with its frozen spec, charging and r
 # 7b. A run killed during an audit re-runs that audit on resume; no candidate passes unaudited.
 def slow_audit(body, index):
     role, label = role_of(body)
-    if role == "audit" and label.startswith("a1.1-") and not answered(body) and (path / "audit-gate").exists() is False:
+    if role == "audit" and label.startswith("a1-") and not answered(body) and (path / "audit-gate").exists() is False:
         (path / "audit-gate").write_text("")
         return {"code": 'sh("sleep 20")\nreturn "late"'}
     return scripted(body, index)
@@ -487,7 +498,7 @@ with harness.provider(slow_audit, price=PRICE) as (url, _):
         journals = list((path / ".harness/ar").glob("*/journal.jsonl"))
         if journals and (path / "audit-gate").exists():
             lines = [json.loads(l) for l in journals[0].read_text().splitlines() if l.endswith("}")]
-            if any(r["kind"] == "started" and r["label"].startswith("a1.1-") for r in lines):
+            if any(r["kind"] == "started" and r["label"].startswith("a1-") for r in lines):
                 journal = journals[0]
                 break
         time.sleep(0.05)
@@ -501,8 +512,8 @@ with harness.provider(slow_audit, price=PRICE) as (url, _):
 records = [json.loads(l) for l in journal.read_text().splitlines()]
 audited = [r for r in records if r["kind"] == "audited"]
 assert audited and not any("no verdict" in r["reason"] for r in audited), audited
-assert sum(r["kind"] == "planned" and r["batch"] == "audit1.1" for r in records) == 1
-rerun = [r["label"] for r in records if r["kind"] == "started" and r["label"].startswith("a1.1-") and "." in r["label"][4:]]
+assert sum(r["kind"] == "planned" and r["batch"] == "audit1" for r in records) == 1
+rerun = [r["label"] for r in records if r["kind"] == "started" and r["label"].startswith("a1-") and "." in r["label"]]
 assert rerun, [r["label"] for r in records if r["kind"] == "started"]
 check("a run killed during an audit re-runs it on resume; no candidate passes unaudited")
 

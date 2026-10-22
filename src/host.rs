@@ -134,6 +134,7 @@ impl Host {
         report["output_tokens"] = json!(usage.output);
         report["cost_usd"] = json!(usage.cost);
         report["llm_calls"] = json!(usage.calls);
+        report["rate_limits"] = json!(usage.rate_limits);
         report["wall_secs"] = json!(wall_secs);
         report["budget"] = self.budget_status();
         report["log"] = json!(self.policy.log.path);
@@ -178,7 +179,7 @@ impl Host {
             // was a real bound it is charged at that bound and a new request may follow; otherwise it stays reserved for
             // the owner. The lost operation itself is never dispatched again.
             let answered = error.downcast_ref::<llm::Answered>();
-            let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.is_some_and(|a| a.unbilled()), self.depth)?;
+            let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.map(|a| a.status), answered.is_some_and(|a| a.unbilled()), self.depth)?;
             let retry = match answered { Some(a) => a.retryable().then_some(a.retry_after), None => closed.then_some(None) };
             // A rate limit generated nothing, so waiting it out is free: up to RATE_LIMIT_RETRIES new requests, backing
             // off when the provider names no delay. Anything else gets one.

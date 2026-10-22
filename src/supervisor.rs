@@ -192,6 +192,9 @@ impl Principal {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input: u64, pub cache_write: u64, pub cache_read: u64, pub output: u64, pub cost: f64, pub calls: u64,
+    /// Requests the provider refused with HTTP 429.
+    #[serde(default)]
+    pub rate_limits: u64,
 }
 
 impl Usage {
@@ -398,11 +401,11 @@ impl Supervisor {
 
     /// A failed request: a definite rejection releases its reservation; a possibly billed one with a bounded reservation
     /// is charged at that bound; otherwise it stays reserved as uncertain billing. Returns whether the reservation closed.
-    pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, unbilled: bool, depth: usize) -> Result<bool> {
+    pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, status: Option<u16>, unbilled: bool, depth: usize) -> Result<bool> {
         let mut books = self.books.lock().unwrap();
         let bound = books.reservations.get(&op).filter(|_| !unbilled)
             .and_then(|r| r.cost.upper_bound().map(|cost| (r.tokens, cost)));
-        let result = self.record_in(&mut books, "llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "billing_uncertain": !unbilled}), true)
+        let result = self.record_in(&mut books, "llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "status": status, "billing_uncertain": !unbilled}), true)
             .and_then(|_| bound.map(|(tokens, cost)| self.record_in(&mut books, "billing", bound_billing(op, tokens, cost), true)).transpose());
         Self::stop_running(&mut books, op);
         drop(books);
@@ -462,7 +465,7 @@ mod checkpoint_tests {
             let op = supervisor.reserve_model(&cfg, &json!({}), 0).await.unwrap();
             let bound = cfg.price.as_ref().map(|p| p.bound(2, 100));
             assert_eq!(supervisor.books.lock().unwrap().reservations[&op].cost.upper_bound(), bound);
-            assert_eq!(supervisor.fail_model(op, &cfg, "lost response", false, 0).unwrap(), priced);
+            assert_eq!(supervisor.fail_model(op, &cfg, "lost response", None, false, 0).unwrap(), priced);
             let replay = Books::of(&eventlog::load(&supervisor.policy.log.path).unwrap()).unwrap();
             if let Some(bound) = bound {
                 assert!(bound > 0.001);

@@ -710,7 +710,9 @@ struct Candidate {
 enum Record {
     Planned { batch: String, episodes: Vec<Plan> },
     Started { label: String, plan: String, allowance: f64, #[serde(default)] scratch: Option<PathBuf> },
-    Finished { label: String, cost: f64, evals: usize, #[serde(default)] interrupted: bool, #[serde(default)] crashed: bool },
+    Finished { label: String, cost: f64, evals: usize, #[serde(default)] interrupted: bool, #[serde(default)] crashed: bool,
+        /// Requests the provider refused with HTTP 429, from the child's report.
+        #[serde(default)] rate_limits: u64 },
     Selected { snap: String, score: Option<f64> },
     Audited { idea: u32, snap: String, pass: bool, reason: String },
     Gate { round: usize, candidates: Vec<Candidate>, chosen: Vec<u32> },
@@ -791,23 +793,10 @@ impl Orchestrator {
         report["final_answer"].as_str().map(str::trim).filter(|a| !a.is_empty()).map(String::from)
     }
 
-    /// Workers per round: `WORKERS`, or `NARROW` once any episode's journal records a rate limit (HTTP 429).
-    fn width(&self) -> usize {
-        let limited = |dir: PathBuf| -> bool {
-            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|f| {
-                f.path().extension().is_some_and(|e| e == "jsonl")
-                    && std::fs::read_to_string(f.path()).is_ok_and(|t| t.contains("\"API 429 "))
-            })
-        };
-        let logs = std::fs::read_dir(self.dir.join("episodes")).into_iter().flatten().flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".log"));
-        for log in logs {
-            if limited(log.path()) {
-                eprintln!("hx ar: the provider rate-limited {}; rounds run {NARROW} workers", log.file_name().to_string_lossy());
-                return NARROW;
-            }
-        }
-        WORKERS
+    /// Workers per round: `WORKERS`, or `NARROW` once the provider has refused a request of any episode with HTTP 429.
+    fn width(&self) -> Result<usize> {
+        let limited = self.records()?.iter().any(|r| matches!(r, Record::Finished { rate_limits, .. } if *rate_limits > 0));
+        Ok(if limited { NARROW } else { WORKERS })
     }
 
     /// The episodes of a journaled batch.
@@ -900,12 +889,16 @@ impl Orchestrator {
         std::fs::write(ep_dir.join(format!("{label}.report.json")), serde_json::to_vec_pretty(&report)?)?;
         let logs = keep_logs(&ws, &ep_dir, label)?;
         drop(scratch);
-        let cost = report["cost_usd"].as_f64().unwrap_or_else(|| logged_cost(&logs, allowance));
+        // Without a report the child's journals say what it spent and how often it was rate-limited.
+        let (cost, rate_limits) = match (report["cost_usd"].as_f64(), report["rate_limits"].as_u64()) {
+            (Some(cost), Some(limits)) => (cost, limits),
+            _ => logged(&logs, allowance),
+        };
         let evals = ledger(&self.dir)?.iter().filter(|r| r.episode == label).count();
         let crashed = evals == 0 && report.is_null();
-        self.journal(&Record::Finished { label: label.into(), cost, evals, interrupted: false, crashed })?;
+        self.journal(&Record::Finished { label: label.into(), cost, evals, interrupted: false, crashed, rate_limits })?;
         let end = if report["finished"] == true { "finished" } else { report["stopped"].as_str().unwrap_or("stopped") };
-        eprintln!("hx ar: {label}: {evals} evals, ${cost:.3}, {end}");
+        eprintln!("hx ar: {label}: {evals} evals, ${cost:.3}, {end}{}", if rate_limits > 0 { format!(", {rate_limits} rate-limited") } else { String::new() });
         Ok(Outcome { cost, crashed, stderr: String::from_utf8_lossy(&out.stderr).into_owned() })
     }
 
@@ -1040,98 +1033,91 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
         })
     }
 
-    /// Candidates after `round`: every accepted explore claim with a valid improved state, at its best search state.
-    /// Good: beats the seed on search by more than `min_delta`, and is not worse than the seed on select (a veto, never
-    /// a ranking). The `TOP` strongest go on (good ones first, then by search; one per distinct state): workers return
-    /// their ideas unpolished, so one below the seed still earns refinement. Good ones among them are audited until
-    /// `TOP` pass or none is left; only good ones can become results.
-    async fn gate(&mut self, round: usize) -> Result<Vec<u32>> {
+    /// Every candidate (an accepted explore claim with a valid improved state, at its best search state), and the ones
+    /// that may go on, strongest first. Good: beats the seed on search by more than `min_delta`, and is not worse than the
+    /// seed on select (a veto, never a ranking). Ranked good ones first, then by search: workers return their ideas
+    /// unpolished, so one below the seed still earns refinement. A failed audit, a copy of the seed, or a state another
+    /// candidate ranked higher already holds never goes on.
+    async fn candidates(&self) -> Result<(Vec<Candidate>, Vec<u32>)> {
         let seed = self.seed()?;
-        let seed_search = self.known(&ledger(&self.dir)?, &seed).0;
+        let state = self.state()?;
+        let records = self.records()?;
+        let seed_search = self.known(&state.rows, &seed).0;
         let seed_select = self.select(&seed).await?;
-        let prefix = format!("audit{round}.");
-        // Set when an audit batch could not start (the budget is spent): the gate then goes on with its candidates
-        // unaudited, and says so, rather than inventing a verdict.
-        let mut spent = false;
-        loop {
-            // A resumed run first finishes the audit batch it was in: verdicts come from that batch's own plans.
-            let records = self.records()?;
-            let unjudged = records.iter().find_map(|r| match r {
-                Record::Planned { batch, episodes } if batch.starts_with(&prefix) && episodes.iter().any(|p| !audited(&records, p)) =>
-                    Some((batch.clone(), episodes.clone())),
+        let mut candidates = vec![];
+        for c in state.claims.iter().filter(|c| c.scope == "explore") {
+            let best = state.rows.iter().filter(|r| r.idea == c.n && r.improved && r.valid)
+                .fold(None::<&Row>, |b, r| if self.spec().better(r.score.unwrap(), b.and_then(|b| b.score), 0.0) { Some(r) } else { b });
+            let Some(best) = best else { continue };
+            let beats = seed_search.is_none_or(|s| self.spec().better(best.score.unwrap(), Some(s), self.spec().min_delta));
+            // The veto is computed only where it can decide something, so held-out data is looked at as little as possible.
+            let select = if beats { self.select(&best.snap).await? } else { None };
+            let held = self.spec().select.is_none()
+                || select.is_some_and(|s| seed_select.is_none_or(|b| !self.spec().better(b, Some(s), 0.0)));
+            let audit = records.iter().rev().find_map(|r| match r {
+                Record::Audited { idea, snap, pass, reason } if *idea == c.n && *snap == best.snap => Some((*pass, reason.clone())),
                 _ => None,
             });
-            if let Some((batch, plans)) = unjudged.filter(|_| !spent) {
-                self.run_batch(&batch).await?;
-                spent = self.judge_audits(&plans)? == 0;
-                continue;
-            }
-            let state = self.state()?;
-            let mut candidates = vec![];
-            for c in state.claims.iter().filter(|c| c.scope == "explore") {
-                let best = state.rows.iter().filter(|r| r.idea == c.n && r.improved && r.valid)
-                    .fold(None::<&Row>, |b, r| if self.spec().better(r.score.unwrap(), b.and_then(|b| b.score), 0.0) { Some(r) } else { b });
-                let Some(best) = best else { continue };
-                let beats = seed_search.is_none_or(|s| self.spec().better(best.score.unwrap(), Some(s), self.spec().min_delta));
-                // The veto is computed only where it can decide something, so held-out data is looked at as little as possible.
-                let select = if beats { self.select(&best.snap).await? } else { None };
-                let held = self.spec().select.is_none()
-                    || select.is_some_and(|s| seed_select.is_none_or(|b| !self.spec().better(b, Some(s), 0.0)));
-                let audit = records.iter().rev().find_map(|r| match r {
-                    Record::Audited { idea, snap, pass, reason } if *idea == c.n && *snap == best.snap => Some((*pass, reason.clone())),
-                    _ => None,
-                });
-                candidates.push(Candidate { idea: c.n, claim: c.idea.clone(), snap: best.snap.clone(), search: best.score, select,
-                    good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
-            }
-            // A candidate that scores exactly as the seed is the seed in other bytes: it never goes on.
-            let seedlike = |c: &Candidate| c.search == seed_search;
-            let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.audit != Some(false) && !seedlike(c)).collect();
-            ranked.sort_by(|a, b| b.good.cmp(&a.good).then_with(|| {
-                let (a, b) = (a.search.unwrap_or(f64::NAN), b.search.unwrap_or(f64::NAN));
-                if self.spec().better(a, Some(b), 0.0) { std::cmp::Ordering::Less } else if self.spec().better(b, Some(a), 0.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
-            }));
-            // Two candidates that reached the same state are one result: the better ranked keeps it.
-            let mut seen = std::collections::HashSet::new();
-            ranked.retain(|c| seen.insert(c.snap.clone()));
-            let unaudited: Vec<&Candidate> = ranked.iter().take(TOP).filter(|c| c.good && c.audit.is_none()).copied().collect();
-            if unaudited.is_empty() || spent {
-                let unaudited: Vec<u32> = unaudited.iter().map(|c| c.idea).collect();
-                // An unaudited good candidate never ranks above an audited one, so it reaches the workspace only when
-                // nothing audited did; candidates below the seed come last.
-                let mut chosen: Vec<&Candidate> = ranked.iter().take(TOP).copied().collect();
-                chosen.sort_by_key(|c| (!c.good, unaudited.contains(&c.idea)));
-                let chosen: Vec<u32> = chosen.iter().map(|c| c.idea).collect();
-                for c in candidates.iter_mut().filter(|c| unaudited.contains(&c.idea)) { c.reason = "not audited: budget spent".into(); }
-                eprintln!("hx ar: gate {round}: {} candidates, {} good, going on with {:?}", candidates.len(),
-                    candidates.iter().filter(|c| c.good).count(), chosen);
-                self.journal(&Record::Gate { round, candidates, chosen: chosen.clone() })?;
-                return Ok(chosen);
-            }
-            let k = records.iter().filter(|r| matches!(r, Record::Planned { batch, .. } if batch.starts_with(&prefix))).count() + 1;
-            let plans: Vec<Plan> = unaudited.iter().map(|c| Plan { label: format!("a{round}.{k}-c{}", c.idea), role: Role::Audit,
-                idea: c.idea, start: c.snap.clone(), best: None, seed: None }).collect();
-            self.plan(&format!("{prefix}{k}"), plans.clone())?;
-            self.run_batch(&format!("{prefix}{k}")).await?;
-            spent = self.judge_audits(&plans)? == 0;
+            candidates.push(Candidate { idea: c.n, claim: c.idea.clone(), snap: best.snap.clone(), search: best.score, select,
+                good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
         }
+        let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.audit != Some(false) && c.search != seed_search).collect();
+        ranked.sort_by(|a, b| b.good.cmp(&a.good).then_with(|| {
+            let (a, b) = (a.search.unwrap_or(f64::NAN), b.search.unwrap_or(f64::NAN));
+            if self.spec().better(a, Some(b), 0.0) { std::cmp::Ordering::Less } else if self.spec().better(b, Some(a), 0.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
+        }));
+        let mut seen = std::collections::HashSet::new();
+        ranked.retain(|c| seen.insert(c.snap.clone()));
+        let ranked = ranked.iter().map(|c| c.idea).collect();
+        Ok((candidates, ranked))
     }
 
-    /// Journal the verdict of each audit plan that has none yet and ran, from its last attempt's final answer; returns
-    /// how many were judged (none when the budget left no room to start them).
-    fn judge_audits(&self, plans: &[Plan]) -> Result<usize> {
+    /// The gate after `round`: audit the good candidates among the `TOP` strongest that have no verdict yet, in one
+    /// batch, then hand the `TOP` strongest to the next round. A failed candidate never goes on and the next strongest
+    /// takes its place, unaudited until a later gate; only audited good candidates become results.
+    async fn gate(&mut self, round: usize) -> Result<Vec<u32>> {
+        let batch = format!("audit{round}");
+        // A resumed run finishes the batch it planned, so verdicts come from that batch's own plans.
+        let plans = match self.planned(&batch)? {
+            Some(plans) => plans,
+            None => {
+                let (candidates, ranked) = self.candidates().await?;
+                let plans: Vec<Plan> = ranked.iter().take(TOP).filter_map(|id| candidates.iter().find(|c| c.idea == *id))
+                    .filter(|c| c.good && c.audit.is_none())
+                    .map(|c| Plan { label: format!("a{round}-c{}", c.idea), role: Role::Audit, idea: c.idea, start: c.snap.clone(),
+                        best: None, seed: None }).collect();
+                if !plans.is_empty() { self.plan(&batch, plans.clone())?; }
+                plans
+            }
+        };
+        if !plans.is_empty() {
+            self.run_batch(&batch).await?;
+            self.judge_audits(&plans)?;
+        }
+        let (candidates, ranked) = self.candidates().await?;
+        let chosen: Vec<u32> = ranked.into_iter().take(TOP).collect();
+        eprintln!("hx ar: gate {round}: {} candidates, {} good, going on with {:?}", candidates.len(),
+            candidates.iter().filter(|c| c.good).count(), chosen);
+        self.journal(&Record::Gate { round, candidates, chosen: chosen.clone() })?;
+        Ok(chosen)
+    }
+
+    /// Journal the verdict of each audit plan that ran and has none yet, from its last attempt's final answer. An
+    /// auditor the budget left no room to start, that crashed, or that stopped before a `VERDICT:` line gives none: its
+    /// candidate stays unaudited, so it cannot become a result until a later gate audits it.
+    fn judge_audits(&self, plans: &[Plan]) -> Result<()> {
         let records = self.records()?;
-        // An attempt of the plan finished without crashing: a crashed auditor audited nothing.
         let ran = |p: &Plan| records.iter().any(|r| matches!(r, Record::Started { label, plan, .. } if *plan == p.label
             && records.iter().any(|f| matches!(f, Record::Finished { label: l, crashed: false, .. } if l == label))));
-        let mut judged = 0;
         for plan in plans.iter().filter(|p| !audited(&records, p) && ran(p)) {
-            judged += 1;
-            let (pass, reason) = verdict(self.answer(&records, &plan.label).as_deref());
+            let Some((pass, reason)) = verdict(self.answer(&records, &plan.label).as_deref()) else {
+                eprintln!("hx ar: audit of #{}: no verdict; it stays unaudited", plan.idea);
+                continue;
+            };
             eprintln!("hx ar: audit of #{}: {}{}", plan.idea, if pass { "pass" } else { "FAIL" }, if reason.is_empty() { String::new() } else { format!(" ({reason})") });
             self.journal(&Record::Audited { idea: plan.idea, snap: plan.start.clone(), pass, reason })?;
         }
-        Ok(judged)
+        Ok(())
     }
 
     async fn run(&mut self, mut records: Vec<Record>) -> Result<Value> {
@@ -1147,18 +1133,18 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
             let evals = rows.iter().filter(|r| r.episode == label).count();
             // The killed child's scratch copy survives a killed orchestrator: keep its journals, charge from them. Without
             // its scratch copy nothing is known, so the whole allowance is charged.
-            let cost = match scratch.filter(|s| s.is_dir()) {
+            let (cost, rate_limits) = match scratch.filter(|s| s.is_dir()) {
                 Some(dir) => {
                     let logs = keep_logs(&dir.join("ws"), &self.dir.join("episodes"), &label)?;
                     drop(Scratch(dir));
-                    logged_cost(&logs, allowance)
+                    logged(&logs, allowance)
                 }
-                None => allowance,
+                None => (allowance, 0),
             };
             // Research and audits are judged by their final answer, which a killed child never gave: they are retried
             // like a worker that scored nothing.
             let answer_only = label.starts_with("r0-") || label.starts_with('a');
-            let record = Record::Finished { label, cost, evals, interrupted: true, crashed: evals == 0 || answer_only };
+            let record = Record::Finished { label, cost, evals, interrupted: true, crashed: evals == 0 || answer_only, rate_limits };
             self.journal(&record)?;
             records.push(record);
         }
@@ -1183,7 +1169,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                 None => {
                     // Each worker gets a full share and one share stays for the gate's audits; the last round runs fewer workers.
                     let s = self.share();
-                    let workers = (((self.launch.budget - self.spent - s) / s).round().max(0.0) as usize).min(self.width());
+                    let workers = (((self.launch.budget - self.spent - s) / s).round().max(0.0) as usize).min(self.width()?);
                     if workers == 0 { break; }
                     let plans = if explore {
                         (1..=workers).map(|w| -> Result<Plan> {
@@ -1224,7 +1210,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
         let state = self.state()?;
         ensure!(!state.rows.is_empty(), "autoresearch made no evaluations; see {}", self.dir.join("episodes").display());
         let (candidates, chosen) = self.last_gate()?.unwrap_or_default();
-        let portfolio: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).filter(|c| c.good).collect();
+        let portfolio: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).filter(|c| c.good && c.audit == Some(true)).collect();
         // The portfolio's states, best search score first; the first goes into the workspace (the seed when none).
         for c in &portfolio {
             let dir = self.dir.join("portfolio").join(format!("c{}", c.idea));
@@ -1265,18 +1251,16 @@ struct State {
     findings: String,
 }
 
-/// An auditor's verdict from its last `VERDICT:` line. An auditor that stopped before giving one does not block the
-/// candidate; the report says so.
-fn verdict(answer: Option<&str>) -> (bool, String) {
-    let Some(answer) = answer else { return (true, "no verdict: the auditor stopped before giving one".into()) };
-    let upper = answer.to_ascii_uppercase();
-    let Some(at) = upper.rfind("VERDICT:") else { return (true, "no verdict: the auditor stopped before giving one".into()) };
+/// An auditor's verdict from its last `VERDICT:` line: pass, or fail with its reason. None when it gave none.
+fn verdict(answer: Option<&str>) -> Option<(bool, String)> {
+    let answer = answer?;
+    let at = answer.to_ascii_uppercase().rfind("VERDICT:")?;
     let rest = answer[at + "VERDICT:".len()..].trim();
-    if rest.to_ascii_uppercase().starts_with("FAIL") {
+    Some(if rest.to_ascii_uppercase().starts_with("FAIL") {
         (false, rest[4..].trim_start_matches([':', ' ', '-']).lines().next().unwrap_or("").chars().take(300).collect())
     } else {
         (true, String::new())
-    }
+    })
 }
 
 /// At most `max` characters of `text`, marked when cut.
@@ -1295,22 +1279,23 @@ fn keep_logs(ws: &Path, episodes: &Path, label: &str) -> Result<PathBuf> {
     Ok(logs)
 }
 
-/// What a child without a report spent: its journals' settled cost plus unsettled reservations. A child opens its
-/// journal before it can admit any model request, so no journal means nothing spent; an unreadable journal is
-/// charged `allowance`.
-fn logged_cost(logs: &Path, allowance: f64) -> f64 {
+/// What a child without a report spent, and how often it was rate-limited: its journals' settled cost plus unsettled
+/// reservations, and their HTTP 429s. A child opens its journal before it can admit any model request, so no journal
+/// means nothing spent; an unreadable journal is charged `allowance`.
+fn logged(logs: &Path, allowance: f64) -> (f64, u64) {
     std::fs::read_dir(logs).into_iter().flatten().flatten().map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .map(|j| journal_cost(&j).unwrap_or(allowance)).sum()
+        .map(|j| journal_books(&j).unwrap_or((allowance, 0)))
+        .fold((0.0, 0), |(c, r), (dc, dr)| (c + dc, r + dr))
 }
 
-/// Settled model cost of a run journal plus its unsettled reservations.
-fn journal_cost(log: &Path) -> Option<f64> {
+/// Settled model cost of a run journal plus its unsettled reservations, and the requests refused with HTTP 429.
+fn journal_books(log: &Path) -> Option<(f64, u64)> {
     let books = crate::eventlog::Books::of(&crate::eventlog::load(log).ok()?).ok()?;
     let pending: f64 = books.reservations.values().map(|r| match r.cost {
         crate::eventlog::ReservationCost::UpperBound(c) | crate::eventlog::ReservationCost::Allowance(c) => c,
     }).sum();
-    Some(books.usage.cost + pending)
+    Some((books.usage.cost + pending, books.usage.rate_limits))
 }
 
 fn show(v: Option<f64>) -> String {
@@ -1376,8 +1361,9 @@ mod tests {
 
     #[test]
     fn audit_verdicts() {
-        assert_eq!(verdict(Some("ok\nVERDICT: PASS")), (true, String::new()));
-        assert_eq!(verdict(Some("verdict: fail: fills below the market")), (false, "fills below the market".into()));
-        assert!(verdict(None).0 && verdict(Some("ran out")).1.starts_with("no verdict"));
+        assert_eq!(verdict(Some("ok\nVERDICT: PASS")), Some((true, String::new())));
+        assert_eq!(verdict(Some("verdict: fail: fills below the market")), Some((false, "fills below the market".into())));
+        assert_eq!(verdict(None), None);
+        assert_eq!(verdict(Some("ran out")), None);
     }
 }

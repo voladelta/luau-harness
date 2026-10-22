@@ -279,6 +279,7 @@ impl Books {
     pub fn apply(&mut self, seq: u64, kind: &str, r: &Value) -> Result<()> {
         Self::validate(kind, r)?;
         let of = || r["of"].as_u64().with_context(|| format!("{kind} record missing operation ID"));
+        if kind == "llm" && r["status"] == 429 { self.usage.rate_limits += 1; }
         match kind {
             "intent" if r["class"] != "read" => { self.open.insert(seq, r.clone()); },
             "outcome" | "resolution" => { let id = of()?; self.open.remove(&id); self.uncertain.remove(&id); },
