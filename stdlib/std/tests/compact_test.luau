@@ -101,7 +101,7 @@ test.case("anchor calibrates on the provider count; measure adds later messages 
 end)
 
 test.case("trigger caps the threshold at max_trigger_tokens", function()
-	test.eq(compact.trigger(1000000, 16384), 256000) -- an unknown window is assumed to be 1M: start at 256k
-	test.eq(compact.trigger(200000, 16384), 167232) -- a known smaller window: the threshold wins
+	test.eq(compact.trigger(1000000, 16384), 128000) -- an unknown window is assumed to be 1M: start at 128k
+	test.eq(compact.trigger(128000, 16384), 95232) -- a known smaller window: the threshold wins
 	test.ok(compact.trigger(10000, 16384) <= 0, "too small a window stays off")
 end)

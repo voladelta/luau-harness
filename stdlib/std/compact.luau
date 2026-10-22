@@ -15,9 +15,9 @@ local M = {}
 
 M.enabled = true
 M.context_window = 1000000 -- used only when --context-window is not given
-M.max_trigger_tokens = 256000 -- compaction starts at this context size at the latest
+M.max_trigger_tokens = 128000 -- compaction starts at this context size at the latest (measured: ~1/3 cheaper than 256k on DeepSeek, room to work)
 M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer's output (prime-agent/pi default)
-M.keep_recent_tokens = 64000 -- recent history kept verbatim, at most (clamped to a quarter of the trigger); the newest exchange is always kept
+M.keep_recent_tokens = 32000 -- recent history kept verbatim, at most (clamped to a quarter of the trigger); the newest exchange is always kept
 
 local IMAGE_TOKENS = 1200
 
@@ -53,6 +53,7 @@ local INSTRUCTION = [==[Stop working on the task for this one reply. Write a con
 
 Rules:
 - Keep each section concise. Preserve exact file paths, function names, commands, error messages and numbers.
+- Carry recorded data (values, scores, IDs, results) forward exactly, item by item. Never replace it with a total, count or other figure you compute here: arithmetic in a checkpoint goes unchecked, and the data it replaces is lost.
 - Capture user instructions and corrections faithfully. This checkpoint request is not one of them: do not mention it.
 - If the conversation contains a [compaction-summary] block, it is an earlier checkpoint: carry forward what is still true, drop what is stale, and merge everything into this one checkpoint.
 - Luau scope for Critical Context: compaction keeps the running VM. Distinguish user globals assigned without local from chunk-local variables and local functions; do not list locals or builtins as live user state. Record useful globals and what they hold based on the code above, noting any uncertainty. For a needed past local, record how to retrieve or recompute its value instead of implying the name is available. The continuing agent can inspect vars(), a name-to-value map of live user globals.]==]
