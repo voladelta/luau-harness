@@ -162,19 +162,19 @@ run = path / ".harness/ar" / report["run"]
 rows = ledger(path, report)
 claims = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines()]
 records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
-explore = [c for c in claims if c["scope"] == "explore"]
+explore = [c for c in claims if c["scope"] == "explore" and c["worker"].startswith("r1-")]
 assert [c["n"] for c in explore] == [1, 2, 3, 4, 5, 6], explore
 ideas = [c["idea"] for c in explore]
 assert ideas.count(go(6)) == 1 and len(set(ideas)) == 6, ideas
 loser = 2 if next(c for c in explore if c["idea"] == go(6))["worker"] == "r1-w4" else 4
 assert go(40 + loser) in ideas, (loser, ideas)
 probes = [o for o in outputs(requests) if "PROBE" in o]
-assert len(probes) == 6 and all("false" in p and "at least 8 words" in p for p in probes), probes[:2]
+assert len(probes) >= 6 and all("false" in p and "at least 8 words" in p for p in probes), probes[:2]
 check("claims are served first come, first served: a duplicate idea is turned away and its worker claims another; a placeholder claim is refused")
 
 assert (run / "episodes/r0-research.report.json").exists() and "BRIEF:" in (run / "episodes/r1-w1.md").read_text()
 gates = [r for r in records if r["kind"] == "gate"]
-assert [g["round"] for g in gates] == [1, 2, 3], gates
+assert [g["round"] for g in gates] == [1, 2, 3, 4, 5], gates
 three = next(c["n"] for c in explore if c["idea"] == go(3))
 six = next(c["n"] for c in explore if c["idea"] == go(6))
 assert gates[0]["chosen"][0] == six and three not in gates[0]["chosen"] and len(gates[0]["chosen"]) == 3, gates[0]
@@ -188,10 +188,34 @@ for g in gates[:2]:
     for idea in g["chosen"]:
         refinements = [c["idea"] for c in claims if c["scope"] == f"c{idea}"]
         assert len(refinements) == len(set(refinements)) and set(refinements) <= {UP, DOWN}, (idea, refinements)
-assert any(c["scope"] != "explore" for c in claims) and not any(l.name.startswith("r4") for l in (run / "episodes").iterdir())
+assert any(c["scope"] != "explore" for c in claims)
 judged = [text_of(b) for b in requests if role_of(b)[0] == "judge"]
 assert any("same refinement" in j for j in judged) and any("same core approach" in j for j in judged), len(judged)
 check("exploit rounds split workers across the chosen candidates, each claiming a distinct refinement")
+
+# Round 3 finds no refinement left, so round 4 explores again; its workers see every earlier idea and claim new ones.
+# Rounds 3 to 5 move no chosen candidate, so the run stops with budget left.
+roles = {r["batch"]: r["episodes"][0]["role"] for r in records if r["kind"] == "planned" and r["batch"].startswith("round")}
+assert roles == {"round1": "explore", "round2": "exploit", "round3": "exploit", "round4": "explore", "round5": "exploit"}, roles
+everything = [c["idea"] for c in claims if c["scope"] == "explore"]
+assert len(everything) > 6 and len(set(everything)) == len(everything), everything
+r4 = (run / "episodes/r4-w1.md").read_text().split("Earlier rounds already claimed these ideas")[1].split("\n2. ")[0]
+assert all(f"#{c['n']}:" in r4 for c in explore) and not any(f"#{c['n']}:" in r4 for c in claims if c["worker"].startswith("r4-")), r4
+assert "Earlier rounds" not in (run / "episodes/r1-w1.md").read_text()
+assert "3 rounds moved no chosen candidate" in result.stderr and report["cost_usd"] < 0.6 / 2, report["cost_usd"]
+check("an exploit round that moves no chosen candidate is followed by an explore round; three such rounds stop the run")
+
+# Replaying the finished run from its journal reaches the same stop without starting anything.
+(run / "report.json").unlink()
+before = (run / "journal.jsonl").read_text()
+with harness.provider(scripted, price=PRICE) as (url, replayed):
+    replay = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)],
+                            env=harness.ENV, capture_output=True, text=True, timeout=600)
+assert replay.returncode == 0 and not replayed, replay.stderr[-2000:]
+assert (run / "journal.jsonl").read_text() == before, "the replay journaled something"
+again = report_of(replay)
+assert (again["rounds"], again["snap"], again["portfolio"]) == (report["rounds"], report["snap"], report["portfolio"]), again
+check("a resumed run replays its rounds from the journal: same decisions, nothing re-planned or re-run")
 
 portfolio = report["portfolio"]
 assert 1 <= len(portfolio) <= 3 and len({p["snap"] for p in portfolio}) == len(portfolio), portfolio
@@ -207,8 +231,36 @@ for r in rows:
     snap = json.loads((run / "snaps" / f"{r['snap']}.json").read_text())
     assert r["score"] == -(int(base64.b64decode(snap["x.txt"])) - 7) ** 2, r
 resets = [o for o in outputs(requests) if o.startswith("RESET ") or "RESET " in o]
-assert len(resets) == 6 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
+assert len(resets) >= 6 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
 check("ledger rows stay numbered under concurrency, every score matches its snapshot, and ar.reset is per worker")
+
+# 1b. While every round moves a chosen candidate, rounds go on until the budget is spent.
+CLIMB = 'import json; x = int(open("x.txt").read()); print(json.dumps({"score": x}))'
+
+
+def climbing(body, index):
+    role, label = role_of(body)
+    if role == "judge": return judge_same(body)
+    if answered(body): return f"FINDING from {label}: done"
+    if role == "audit": return "Checked.\nVERDICT: PASS"
+    if role == "explore":
+        w = int(label.split("-w")[1].split(".")[0])
+        return {"code": f'ar.claim("{go(w)}")\nwrite("x.txt", "{w}\\n")\nreturn ar.eval("go {w}")'}
+    if role == "exploit":
+        return {"code": f'ar.claim("raise x by one more step, the refinement tried by worker {label}")\n'
+                        'write("x.txt", tostring(tonumber(read("x.txt")) + 1) .. "\\n")\nreturn ar.eval("up")'}
+    return "done"
+
+
+path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIMB})
+with harness.provider(climbing, price=PRICE) as (url, _):
+    result = ar(path, url, 0.3)
+report = report_of(result)
+share = 0.3 / (1 + 3 * (6 + 3))
+assert report["rounds"] > 3 and "moved no chosen candidate" not in result.stderr, (report["rounds"], result.stderr[-1500:])
+assert 0.3 - 1.5 * share - 0.02 <= report["cost_usd"] <= 0.3 + 0.02, report["cost_usd"]
+assert report["search"] > 6 + 1, report["search"]
+check("while every round moves a chosen candidate, rounds go on until the budget is spent")
 
 # 2. When no explore idea beats the seed, the run stops after round 1 and keeps the seed.
 def hopeless(body, index):
@@ -370,7 +422,7 @@ run = journal.parent
 mine = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines() if json.loads(l)["worker"].startswith("r1-w6")]
 assert [c["worker"] for c in mine] == ["r1-w6"], mine
 assert any(r["episode"] == "r1-w6.2" and r["idea"] == mine[0]["n"] for r in ledger(path, report)), "the retry did not keep its claim"
-assert sum(r["kind"] == "planned" and r["batch"] == "round1" for r in records) == 1 and report["rounds"] == 3
+assert sum(r["kind"] == "planned" and r["batch"] == "round1" for r in records) == 1 and report["rounds"] >= 3
 assert "resumed" in result.stderr and report["cost_usd"] <= 0.6 + 1e-9
 check("a killed run resumes past torn lines with its frozen spec, charging and retrying the interrupted worker")
 

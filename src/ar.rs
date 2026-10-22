@@ -20,9 +20,10 @@
 //! earlier claim is rejected, and the worker tries another. Each accepted idea is a candidate with its own best state. A
 //! gate keeps the candidates that beat the seed on search and are not worse on the held-out `select`, audits the
 //! strongest, and hands up to three to the exploit rounds, whose workers claim distinct refinements of their candidate.
-//! With no good candidate after round 1 the run stops. The result is the audited candidates of the last gate, best
-//! held-out score first: several distinct good answers, since the single best score is the one most likely to be an
-//! overfit or an evaluator hole.
+//! Rounds go on until the budget is spent: after an exploit round that moves no chosen candidate, the next round
+//! explores new ideas again. With no good candidate after round 1 the run stops. The result is the audited candidates
+//! of the last gate, best held-out score first: several distinct good answers, since the single best score is the one
+//! most likely to be an overfit or an evaluator hole.
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -33,14 +34,19 @@ use std::sync::{Mutex, OnceLock};
 
 /// Workers side by side in a round: as many as the provider's rate limit comfortably allows.
 const WORKERS: usize = 6;
-/// Rounds after research: one explore round, then exploit rounds.
-const ROUNDS: usize = 3;
+/// Rounds an episode's share is sized for: each gets at most budget / (1 + PACE * (WORKERS + TOP)). Rounds go on
+/// while the budget lasts, so episodes that spend less than their share buy more rounds.
+const PACE: usize = 3;
+/// Rounds in a row that move no chosen candidate before the run stops with budget left.
+const STALL: usize = 3;
 /// Candidates a gate hands to the next round, and the size of the final portfolio.
 const TOP: usize = 3;
 /// Planning stops when less than this share of the budget is left.
 const MIN_SLICE: f64 = 0.01;
 /// Ledger rows shown to a worker, characters of an evaluator report, of a brief and of one finding.
 const SHOWN: usize = 40;
+/// Findings shown to a worker: the most recent ones.
+const FINDINGS: usize = 2 * WORKERS;
 const REPORT_CHARS: usize = 12_000;
 const BRIEF_CHARS: usize = 8_000;
 const FINDING_CHARS: usize = 1_500;
@@ -706,7 +712,7 @@ impl Orchestrator {
 
     /// Every episode gets at most an equal share of the budget: the research, each round's workers and each gate's audits.
     fn share(&self) -> f64 {
-        self.launch.budget / (1 + ROUNDS * (WORKERS + TOP)) as f64
+        self.launch.budget / (1 + PACE * (WORKERS + TOP)) as f64
     }
 
     /// Score the seed with the search evaluator before any episode, so every episode knows where it starts. Kept in
@@ -750,6 +756,11 @@ impl Orchestrator {
         report["final_answer"].as_str().map(str::trim).filter(|a| !a.is_empty()).map(String::from)
     }
 
+    /// The episodes of a journaled batch.
+    fn planned(&self, batch: &str) -> Result<Option<Vec<Plan>>> {
+        Ok(self.records()?.into_iter().find_map(|r| match r { Record::Planned { batch: b, episodes } if b == batch => Some(episodes), _ => None }))
+    }
+
     /// Journal a batch once.
     fn plan(&self, batch: &str, episodes: Vec<Plan>) -> Result<()> {
         if !self.records()?.iter().any(|r| matches!(r, Record::Planned { batch: b, .. } if b == batch)) {
@@ -764,10 +775,7 @@ impl Orchestrator {
         let mut crashes = 0;
         loop {
             let records = self.records()?;
-            let plans: Vec<Plan> = records.iter().find_map(|r| match r {
-                Record::Planned { batch: b, episodes } if b == batch => Some(episodes.clone()),
-                _ => None,
-            }).unwrap_or_default();
+            let plans = self.planned(batch)?.unwrap_or_default();
             let attempts = |plan: &str| -> Vec<(&String, bool)> {
                 records.iter().filter_map(|r| match r { Record::Started { label, plan: p, .. } if p == plan => Some(label), _ => None })
                     .map(|label| (label, records.iter().any(|f| matches!(f, Record::Finished { label: l, crashed: true, .. } if l == label))))
@@ -851,8 +859,8 @@ impl Orchestrator {
         let rows = ledger(&self.dir)?;
         let claims: Vec<Claim> = read_lines(&self.dir.join("claims.jsonl"))?;
         let brief = self.answer(&records, "r0-research").unwrap_or_else(|| "(none: the research episode wrote no brief)".into());
-        // A finding per finished worker attempt: its claim, best score and final answer.
-        let mut findings = String::new();
+        // A finding per finished worker attempt: its claim, best score and final answer; the most recent are shown.
+        let mut findings = vec![];
         for r in &records {
             let Record::Finished { label, crashed: false, .. } = r else { continue };
             if !label.starts_with('r') || label.starts_with("r0") { continue; }
@@ -865,9 +873,11 @@ impl Orchestrator {
             let text = std::fs::read(self.dir.join("episodes").join(format!("{label}.report.json"))).ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                 .and_then(|v| v["final_answer"].as_str().map(String::from)).unwrap_or_default();
-            findings += &format!("### {label}: {} (best {})\n\n{}\n\n", claim.replace('\n', " "), show(best),
-                clip(text.trim(), FINDING_CHARS));
+            findings.push(format!("### {label}: {} (best {})\n\n{}\n\n", claim.replace('\n', " "), show(best),
+                clip(text.trim(), FINDING_CHARS)));
         }
+        let skip = findings.len().saturating_sub(FINDINGS);
+        let findings = if skip > 0 { format!("({skip} earlier findings omitted)\n\n") } else { String::new() } + &findings[skip..].concat();
         Ok(State { rows, claims, brief, findings })
     }
 
@@ -914,13 +924,21 @@ editable paths ({}). Study the task first, so their work is grounded, and write 
 Do not solve the task: the workers do that. Keep the study short, about 15 steps: an unfinished study leaves every \
 worker without a brief. Finish with the brief as your final answer, at most 800 words, facts first, without prescribing \
 one solution.\n\n{}\n{starting}", spec.editable.join(", "), self.protocol(plan.role, allowance)),
-            Role::Explore => format!("{program}\n\n{brief}## Autoresearch explore worker {label}\n\n\
+            Role::Explore => {
+                // Only earlier rounds' claims: a retried worker gets its own claim back from ar.claim and must keep building it.
+                let round = label.split('-').next();
+                let taken: String = state.claims.iter().filter(|c| c.scope == "explore" && c.worker.split('-').next() != round)
+                    .map(|c| format!("- #{}: {}\n", c.n, c.idea)).collect();
+                let taken = if taken.is_empty() { String::new() } else {
+                    format!("\n\nEarlier rounds already claimed these ideas; yours must use a different core approach:\n{}", clip(&taken, BRIEF_CHARS))
+                };
+                format!("{program}\n\n{brief}{findings}## Autoresearch explore worker {label}\n\n\
 You are one of {WORKERS} workers exploring side by side. Each tests a different core approach to improving the score.\n\n\
 1. Generate your idea from your seed: <seed>{}</seed>. List 5 to 7 root-level dimensions along which approaches to this \
 task differ fundamentally (not parameters or filters), each with at least 6 options from conventional to radical. Pick one \
 option per dimension using a different part of the seed (for example the sum of the character codes of a segment, mod the \
 number of options). Commit to the picks even if unusual, and compose one coherent idea: the core approach to build, not a \
-tweak on top of the starting state.\n\
+tweak on top of the starting state.{taken}\n\
 2. Claim it early, within your first few steps and before building: `ar.claim(\"the idea in two or three sentences\")`. \
 Claims are served first come, first served. If it returns `ok = false`, another worker already claimed the same core \
 approach (`message` lists every claim): pick again from a different part of your seed and claim a different core. An \
@@ -929,7 +947,8 @@ accepted claim.\n\
 3. Build the idea, score it with ar.eval, read the report, fix and improve. Your first valid state sets your bar, even below \
 the starting state's score: build the idea properly before judging it.\n\
 4. Finish with your finding as the final answer: the idea, what you built, your best score, what worked and what did not, \
-and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwrap_or(label), self.protocol(plan.role, allowance)),
+and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwrap_or(label), self.protocol(plan.role, allowance))
+            }
             Role::Exploit => {
                 let rows: Vec<&Row> = state.rows.iter().filter(|r| r.idea == plan.idea).collect();
                 let skip = rows.len().saturating_sub(SHOWN);
@@ -1088,37 +1107,51 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
         }
         self.plan("research", vec![Plan { label: "r0-research".into(), role: Role::Research, idea: 0, start: seed.clone(), best: None, seed: None }])?;
         self.run_batch("research").await?;
-        let mut chosen: Option<Vec<u32>> = None;
-        for round in 1..=ROUNDS {
-            let gate = self.records()?.into_iter().find_map(|r| match r { Record::Gate { round: g, chosen, .. } if g == round => Some(chosen), _ => None });
-            if let Some(c) = gate {
-                let stop = c.is_empty();
-                chosen = Some(c);
-                if stop { break; }
-                continue;
-            }
-            if self.launch.budget - self.spent < self.launch.budget * MIN_SLICE { break; }
-            let plans = match &chosen {
-                None => (1..=WORKERS).map(|w| -> Result<Plan> {
-                    Ok(Plan { label: format!("r{round}-w{w}"), role: Role::Explore, idea: 0, start: seed.clone(), best: None,
-                        seed: Some(crate::ssot::seed()?) })
-                }).collect::<Result<Vec<_>>>()?,
-                Some(c) => {
-                    let last = self.last_gate()?.map(|g| g.0).unwrap_or_default();
-                    (0..WORKERS).map(|w| {
-                        let idea = c[w % c.len()];
-                        let cand = last.iter().find(|x| x.idea == idea);
-                        Plan { label: format!("r{round}-w{}", w + 1), role: Role::Exploit, idea,
-                            start: cand.map_or(seed.clone(), |x| x.snap.clone()), best: cand.and_then(|x| x.search), seed: None }
-                    }).collect()
+        // Rounds go on while the budget lasts. Round 1 explores; later rounds exploit the last gate's chosen candidates
+        // while that moves them, and explore new ideas after an exploit round that moved none.
+        let (mut last, mut stalled, mut explore) = (Vec::<(u32, String)>::new(), 0, true);
+        for round in 1.. {
+            let batch = format!("round{round}");
+            let mut gate = self.records()?.into_iter().find_map(|r| match r { Record::Gate { round: g, candidates, chosen } if g == round => Some((candidates, chosen)), _ => None });
+            let plans = match self.planned(&batch)? {
+                Some(plans) => plans,
+                None if gate.is_some() => vec![],
+                None => {
+                    // Each worker gets a full share and one share stays for the gate's audits; the last round runs fewer workers.
+                    let s = self.share();
+                    let workers = (((self.launch.budget - self.spent - s) / s).round().max(0.0) as usize).min(WORKERS);
+                    if workers == 0 { break; }
+                    let plans = if explore {
+                        (1..=workers).map(|w| -> Result<Plan> {
+                            Ok(Plan { label: format!("r{round}-w{w}"), role: Role::Explore, idea: 0, start: seed.clone(), best: None,
+                                seed: Some(crate::ssot::seed()?) })
+                        }).collect::<Result<Vec<_>>>()?
+                    } else {
+                        let candidates = self.last_gate()?.map(|g| g.0).unwrap_or_default();
+                        (0..workers).map(|w| {
+                            let (idea, start) = &last[w % last.len()];
+                            let best = candidates.iter().find(|c| c.idea == *idea).and_then(|c| c.search);
+                            Plan { label: format!("r{round}-w{}", w + 1), role: Role::Exploit, idea: *idea, start: start.clone(), best, seed: None }
+                        }).collect()
+                    };
+                    self.plan(&batch, plans.clone())?;
+                    plans
                 }
             };
-            self.plan(&format!("round{round}"), plans)?;
-            self.run_batch(&format!("round{round}")).await?;
-            let c = self.gate(round).await?;
-            let stop = c.is_empty();
-            chosen = Some(c);
-            if stop { break; }
+            if gate.is_none() {
+                self.run_batch(&batch).await?;
+                self.gate(round).await?;
+                gate = self.last_gate()?;
+            }
+            let (candidates, chosen) = gate.unwrap_or_default();
+            // With nothing good after a gate the run stops (in practice after round 1: later gates keep earlier candidates).
+            if chosen.is_empty() { break; }
+            let now: Vec<(u32, String)> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).map(|c| (c.idea, c.snap.clone())).collect();
+            let moved = now.iter().any(|c| !last.contains(c));
+            stalled = if moved { 0 } else { stalled + 1 };
+            if stalled >= STALL { eprintln!("hx ar: {STALL} rounds moved no chosen candidate; stopping"); break; }
+            explore = !moved && plans.first().is_some_and(|p| p.role == Role::Exploit);
+            last = now;
         }
         let state = self.state()?;
         ensure!(!state.rows.is_empty(), "autoresearch made no evaluations; see {}", self.dir.join("episodes").display());
