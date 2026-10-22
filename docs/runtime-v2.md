@@ -103,7 +103,7 @@ To choose current approved extensions, new policy, a new binary or other setting
 
 ```bash
 hx run --workspace PROJECT --branch PROJECT/.harness/log/RUN.jsonl \
-  --model MODEL --api completions --key-env OPENROUTER_API_KEY
+  --model MODEL --key-env OPENROUTER_API_KEY
 ```
 
 A branch inherits committed durable data and the task unless `--prompt-file` supplies a new task. It starts a new conversation and budget under a new manifest. Reconcile uncertain effects first. Previous receipts remain in the parent journal; branching does not undo the parent's workspace changes.

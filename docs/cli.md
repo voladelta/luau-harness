@@ -23,6 +23,8 @@ Every command takes `--help`.
 
 ## `hx run` flags
 
+hx always uses the Responses API. Requests go to `/responses` under the configured base URL.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--prompt-file F` | | Task text (not needed with `--resume` if the log recorded it) |
@@ -30,8 +32,7 @@ Every command takes `--help`.
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
 | `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs `--prompt-file` (the program); runs until progress stops |
 | `--model M` | `HX_MODEL` | Model id |
-| `--api A` | `responses` (`HX_API`) | `responses` or `completions` (Chat Completions) |
-| `--base-url U` | `HX_BASE_URL` | API base URL; defaults to OpenRouter |
+| `--base-url U` | `HX_BASE_URL` | Responses API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
 | `--reasoning R` | | Reasoning effort |
 | `--max-turns N` | 200 | Turn limit; the report says `stopped: "max_turns: N"` when it is hit |
@@ -60,7 +61,7 @@ Every command takes `--help`.
 | `--net` / `--no-net` | Allow or deny network access for `sh` |
 | `--approval prompt` | Ask on the terminal instead of refusing commands that need approval (default `deny`) |
 
-Environment: `HX_MODEL`, `HX_API` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=1` trusts the workspace for one launch (see [workspace trust](configuration.md#workspace-trust)).
+Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=1` trusts the workspace for one launch (see [workspace trust](configuration.md#workspace-trust)).
 
 ## Report and logs
 

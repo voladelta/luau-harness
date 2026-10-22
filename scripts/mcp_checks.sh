@@ -54,17 +54,17 @@ check "the model cannot rewrite mcp.toml" "$(x 'print(pcall(write, ".harness/mcp
 # --- the model sees generated signatures
 MOCK_REPLIES='["done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
 echo go > $T/p.txt
-OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null 2>&1
+OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null 2>&1
 sysmsg=$(python3 -c "
 import json
-l=[json.loads(x) for x in open('$T/req.jsonl')][-1]; m=l['messages'][0]['content']; print(m[0]['text'] if isinstance(m,list) else m)")
+l=[json.loads(x) for x in open('$T/req.jsonl')][-1]; print(l['instructions'])")
 check "prompt lists MCP tools with schema-derived signatures" "$(echo "$sysmsg" | grep -c 'mcp.demo.add{a: number, b: number}  -- Add two numbers')" "1"
 check "optional/none: a tool with no arguments is mcp.demo.boom{}" "$(echo "$sysmsg" | grep -c 'mcp.demo.boom{}')" "1"
 rm $W/.harness/mcp.toml
-OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null 2>&1
+OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null 2>&1
 sysmsg=$(python3 -c "
 import json
-l=[json.loads(x) for x in open('$T/req.jsonl')][-1]; m=l['messages'][0]['content']; print(m[0]['text'] if isinstance(m,list) else m)")
+l=[json.loads(x) for x in open('$T/req.jsonl')][-1]; print(l['instructions'])")
 check "no MCP config: nothing added to the prompt" "$(echo "$sysmsg" | grep -c 'MCP tools')" "0"
 
 # --- Streamable HTTP transport (remote server: url + header auth from env)

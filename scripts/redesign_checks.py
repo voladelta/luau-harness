@@ -26,7 +26,7 @@ else:
     BASE = Path(tempfile.mkdtemp(prefix="hx-redesign-"))
 BASE.mkdir(parents=True, exist_ok=True)
 ENV = {**os.environ, "HX_TRUST": "1", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1"}  # backoff: host.rs unit test
-for key in ("HX_MODEL", "HX_API", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
+for key in ("HX_MODEL", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
     ENV.pop(key, None)
 passed = 0
 
@@ -96,21 +96,12 @@ def provider(reply):
                 calls = answer.get("calls", [tool(answer["code"])]) if "code" in answer else answer.get("calls", [])
                 text = answer.get("text", "")
                 usage = {"input_tokens": answer.get("tokens", 10), "output_tokens": 5}
-                if self.path.endswith("responses"):
-                    usage.update(answer.get("usage", {}))
-                    output = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
-                    output += [{"type": "function_call", "call_id": f"c{index}_{i}", "name": c.get("name", "luau"),
-                                "arguments": c.get("arguments", json.dumps({"code": c.get("code", "")}))} for i, c in enumerate(calls)]
-                    data = json.dumps({"output": output, "usage": usage}).encode()
-                else:
-                    message = {"role": "assistant", "content": text or None}
-                    if calls:
-                        message["tool_calls"] = [{"id": f"c{index}_{i}", "type": "function", "function": {
-                            "name": c.get("name", "luau"), "arguments": c.get("arguments", json.dumps({"code": c.get("code", "")}))}}
-                            for i, c in enumerate(calls)]
-                    usage = {"prompt_tokens": usage["input_tokens"], "completion_tokens": 5}
-                    usage.update(answer.get("usage", {}))
-                    data = json.dumps({"choices": [{"message": message, "finish_reason": "tool_calls" if calls else "stop"}], "usage": usage}).encode()
+                assert self.path.endswith("/responses"), self.path
+                usage.update(answer.get("usage", {}))
+                output = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
+                output += [{"type": "function_call", "call_id": f"c{index}_{i}", "name": c.get("name", "luau"),
+                            "arguments": c.get("arguments", json.dumps({"code": c.get("code", "")}))} for i, c in enumerate(calls)]
+                data = json.dumps({"output": output, "usage": usage}).encode()
                 self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -143,8 +134,8 @@ def check(name, fn):
     print(f"PASS {name}", flush=True)
 
 
-def protocol(api):
-    path = workspace("protocol-" + api)
+def protocol():
+    path = workspace("protocol-responses")
     code = 'x=7; local t={n=3}; durable.set("saved",t); t.n=99; assert(durable.get("saved").n==3); assert(os.time()>0 and os.clock()>=0 and type(os.date())=="string"); assert(math.random(1,1)==1 and __nd_value==nil); print("live",x)'
     def answer(body, index):
         if index == 0:
@@ -153,7 +144,7 @@ def protocol(api):
             return tool('assert(x==7); assert(durable.get("saved").n==3); assert(_G==nil and coroutine==nil); print("checked")')
         return "done"
     with provider(answer) as (url, calls):
-        report = json.loads(start(path, url, "--api", api).stdout)
+        report = json.loads(start(path, url).stdout)
         assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 3, report
         log = journal(path)
         assert not any(r.get("tool") == "nd" or "tid" in r for r in records(log))
@@ -449,15 +440,12 @@ def lost_response():
 
 
 def cached_token_budget():
-    for api in ("completions", "responses"):
-        path = workspace(f"cached-budget-{api}")
-        prefix = "prompt" if api == "completions" else "input"
-        usage = {f"{prefix}_tokens": 100, f"{prefix}_tokens_details": {"cached_tokens":90,"cache_write_tokens":9},
-                 "completion_tokens" if api == "completions" else "output_tokens": 1}
-        with provider(lambda body, i: {"code":"print(1)","usage":usage}) as (url, calls):
-            report = json.loads(start(path, url, "--api", api, "--max-tokens", "100").stdout)
-            assert len(calls) == 1 and report["budget"]["tokens"] == 101, report
-            assert not report["finished"] and "token admission threshold" in report["stopped"], report
+    path = workspace("cached-budget")
+    usage = {"input_tokens": 100, "input_tokens_details": {"cached_tokens":90,"cache_write_tokens":9}, "output_tokens": 1}
+    with provider(lambda body, i: {"code":"print(1)","usage":usage}) as (url, calls):
+        report = json.loads(start(path, url, "--max-tokens", "100").stdout)
+        assert len(calls) == 1 and report["budget"]["tokens"] == 101, report
+        assert not report["finished"] and "token admission threshold" in report["stopped"], report
 
 
 def children_run_concurrently():
@@ -836,7 +824,7 @@ def cli_preflight():
         ["--max-wall", "NaN"], ["--max-wall", "-1"], ["--max-output", "0"], ["--max-cost", "1"],
         ["--max-toknes", "10"], ["--net", "--no-net"],
         ["--max-wall", "1", "--max-wall", "2"], ["--resume", "absent.jsonl", "--model", "mock"],
-        ["--api", "typo"],
+        ["--api", "responses"],
     ]):
         path = workspace(f"cli-preflight-{index}")
         # Keep the invalid flag last when appropriate: run() appends --workspace and would mask that regression.
@@ -907,8 +895,7 @@ def corrupt_artifacts():
 
 
 if __name__ == "__main__":
-    check("chat protocol, live globals, copied durable state, completed resume", lambda: protocol("completions"))
-    check("responses protocol and frozen launch settings", lambda: protocol("responses"))
+    check("responses protocol and frozen launch settings", protocol)
     check("crash recovery never reruns old chunks", crash_boundaries)
     check("workspace edits do not alter a frozen manifest", immutable_manifest)
     check("isolated stateless packages and transitive capability boundaries", package_isolation)

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Scripted model server (chat completions and /responses) for deterministic harness tests.
+"""Scripted model server (/responses) for deterministic harness tests.
 usage: mock_llm.py PORT  (0 picks a free port, written to $PORT_FILE; replies are read from the MOCK_REPLIES env var, a JSON list, served in order)
 A reply is a string or an object. A string that starts with a ```luau fence becomes one native `luau` tool call with that code
 (any text after the fence is the reply text); any other string is a plain-text reply. An object is
 {"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments.
-An object may also carry "prompt_tokens": N (reported as the usage prompt/input tokens, default 10) and, instead of a reply,
-"status": 400, "error": "<body>" (answer with that HTTP status and body), and "reasoning": str (Chat Completions: a
-reasoning field on the assistant message, as reasoning models return)."""
+An object may also carry "prompt_tokens": N (reported as the usage input tokens, default 10) and, instead of a reply,
+"status": 400, "error": "<body>" (answer with that HTTP status and body).
+"reasoning": str adds a reasoning summary item that is echoed back on later turns."""
 import json, os, re, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 R = json.loads(os.environ["MOCK_REPLIES"]); n = [0]
@@ -24,12 +24,11 @@ def parse(t):
 
 def turns(body):
     """number of assistant turns already in the request"""
-    if "input" in body:  # responses: a turn is a message item, or the first function_call of a turn
-        return sum(1 for m in body["input"] if m.get("role") == "assistant" or (m.get("type") == "function_call" and m["call_id"].endswith("_0")))
-    return sum(1 for m in body.get("messages", []) if m["role"] == "assistant")
+    return sum(1 for m in body["input"] if m.get("role") == "assistant" or (m.get("type") == "function_call" and m["call_id"].endswith("_0")))
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
+        assert self.path.endswith("/responses"), self.path
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         if os.environ.get("MOCK_LOG"):
             open(os.environ["MOCK_LOG"], "a").write(json.dumps(body) + "\n")
@@ -45,20 +44,12 @@ class H(BaseHTTPRequestHandler):
         ptok = reply.get("prompt_tokens", 10) if isinstance(reply, dict) else 10
         text, calls = parse(reply)
         ids = [f"call_{idx}_{k}" for k in range(len(calls))]
-        if self.path.endswith("/responses"):  # Responses API shape
-            out = [{"type": "reasoning", "summary": []}]
-            if text or not calls:
-                out.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
-            out += [{"type": "function_call", "call_id": i, "name": nm, "arguments": a} for i, (nm, a) in zip(ids, calls)]
-            doc = {"error": None, "output": out, "usage": {"input_tokens": ptok, "output_tokens": 5}}
-        else:
-            msg = {"role": "assistant", "content": text or None}
-            if isinstance(reply, dict) and reply.get("reasoning"):
-                msg["reasoning"] = reply["reasoning"]  # echoed back by hx inside the raw assistant message
-            if calls:
-                msg["tool_calls"] = [{"id": i, "type": "function", "function": {"name": nm, "arguments": a}} for i, (nm, a) in zip(ids, calls)]
-            doc = {"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else "stop"}],
-                   "usage": {"prompt_tokens": ptok, "completion_tokens": 5}}
+        reasoning = reply.get("reasoning") if isinstance(reply, dict) else None
+        out = [{"type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning}] if reasoning else []}]
+        if text or not calls:
+            out.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
+        out += [{"type": "function_call", "call_id": i, "name": nm, "arguments": a} for i, (nm, a) in zip(ids, calls)]
+        doc = {"error": None, "output": out, "usage": {"input_tokens": ptok, "output_tokens": 5}}
         out = json.dumps(doc).encode()
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(out)))
         self.end_headers(); self.wfile.write(out)

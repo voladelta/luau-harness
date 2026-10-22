@@ -77,7 +77,7 @@ def prepare(run_dir):
     subprocess.run(['git', 'config', 'user.name', 'test'], cwd=ws, check=True)
     (run_dir / 'prompt.md').write_text(BRIEF)
     write_json(run_dir / 'case.json', {'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        'model':'deepseek-flash','api':'responses','base_url':'https://api.deepseek.com',
+        'model':'deepseek-flash','base_url':'https://api.deepseek.com',
         'docs':['https://api-docs.deepseek.com/api/create-response/'],
         'independent_verifier':str(Path(__file__).resolve())})
     print(run_dir)
@@ -87,7 +87,7 @@ def run_agent(run_dir, args):
     if not os.environ.get('DEEPSEEK_API_KEY'):
         raise SystemExit('DEEPSEEK_API_KEY is missing')
     argv = [str(Path(args.hx).resolve()), 'run', '--rpi', '--workspace', str(run_dir/'workspace'),
-            '--prompt-file', str(run_dir/'prompt.md'), '--model','deepseek-flash','--api','responses',
+            '--prompt-file', str(run_dir/'prompt.md'), '--model','deepseek-flash',
             '--base-url','https://api.deepseek.com','--key-env','DEEPSEEK_API_KEY', '--reasoning',args.reasoning,
             '--max-wall',str(args.max_wall),'--max-turns','200','--max-output','16384',
             '--context-window','1048576','--trace',str(run_dir/'trace.md')]

@@ -26,10 +26,10 @@ cat > $T/q.py <<'PY'
 import json
 def text(c): return c if isinstance(c, str) else "".join(p.get("text", "") for p in (c or []) if isinstance(p, dict))
 def load(f): return [json.loads(l) for l in open(f)]
-def is_sum(b): return "context summarization assistant" in text(b["messages"][0]["content"])
-def msgs(b): return b["messages"][1:]  # without the system message
+def is_sum(b): return "context summarization assistant" in b["instructions"]
+def msgs(b): return b["input"]
 def sums(f): return [b for b in load(f) if is_sum(b)]
-def conv(b): return text(b["messages"][1]["content"])
+def conv(b): return text(b["input"][0]["content"])
 PY
 R() { PYTHONPATH=$T python3 -c "from r import *; $1"; }   # R 'dump(C("x=1"), S("done"))' -> JSON list
 Q() { PYTHONPATH=$T python3 -c "from q import *; $1"; }
@@ -39,7 +39,7 @@ unmock() { kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=""; }
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf 'require("std/compact").keep_recent_tokens = 40\nrequire("std/recheck").enabled = false\n' > $W/.harness/init.luau; }
 off() { echo 'require("std/compact").enabled = false' >> $W/.harness/init.luau; }  # the pack is on by default
 run() { # workspace port trace extra-flags...   (stdout/stderr in $T/out, $T/err; status is hx's)
-  OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$2 --key-env OPENROUTER_API_KEY \
+  OPENROUTER_API_KEY=x $H run --workspace $1 --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$2 --key-env OPENROUTER_API_KEY \
     --context-window 40000 --max-output 1000 --trace $3 "${@:4}" > $T/out 2> $T/err
 }
 field() { python3 -c "import sys,json;r=json.loads(open('$T/out').read().strip().splitlines()[-1]);print(r.get('$1'))" 2>/dev/null; }
@@ -69,12 +69,12 @@ check "A2 run with a compaction finishes" "$rc $(field finished)" "0 True"
 check "A2 exactly one summarizer request, 5 requests in all" "$(Q 'r = load("'$T'/a2.req"); print(len(r), len(sums("'$T'/a2.req")))')" "5 1"
 check "A2 summarizer request: system prompt, one user message, no tools" "$(Q 'b = load("'$T'/a2.req")[2]; print(is_sum(b), len(msgs(b)), msgs(b)[0]["role"], "tools" not in b)')" "True 1 user True"
 check "A2 summarizer sees the serialized history, not the task message" "$(Q 'c = conv(load("'$T'/a2.req")[2]); print("<conversation>" in c, "TURN-ONE-MARKER" in c, "TASKTEXT-SCRIPTED" in c, "Dead Ends" in c, "<previous-summary>" in c)')" "True True False True False"
-check "A2 next request: task + summary block, then an assistant message, tool results answer calls in the tail" "$(Q '
+check "A2 next request: task + summary block, then assistant output, tool results answer calls in the tail" "$(Q '
 b = load("'$T'/a2.req")[3]; m = msgs(b)
-ids = {c["id"] for x in m if x["role"] == "assistant" for c in x.get("tool_calls", [])}
-tools = [x for x in m if x["role"] == "tool"]
+ids = {x["call_id"] for x in m if x.get("type") == "function_call"}
+tools = [x for x in m if x.get("type") == "function_call_output"]
 first = text(m[0]["content"])
-print(m[0]["role"], "TASKTEXT-SCRIPTED" in first, "[compaction-summary]" in first, "SUMMARY-ONE" in first, "</summary>" in first, m[1]["role"], len(tools) > 0 and all(t["tool_call_id"] in ids for t in tools))')" "user True True True True assistant True"
+print(m[0]["role"], "TASKTEXT-SCRIPTED" in first, "[compaction-summary]" in first, "SUMMARY-ONE" in first, "</summary>" in first, bool(ids), len(tools) > 0 and all(t["call_id"] in ids for t in tools))')" "user True True True True True True"
 check "A2 the dropped history is gone from the next request" "$(Q 'print("TURN-ONE-MARKER" in json.dumps(load("'$T'/a2.req")[3]))')" "False"
 check "A2 trace records the compaction" "$(grep -c '^### COMPACT$' $T/a2.tr)" "1"
 check "A4 a global set before the compaction is readable after it" "$(awk '/^print\(x\)$/{s=1} s&&/^### RESULT/{getline; print; exit}' $T/a2.tr)" "42"

@@ -140,7 +140,7 @@ Registration requires `OPENROUTER_API_KEY` in the environment or a secrets file;
 | `openrouter.credits()` | Queries `/api/v1/credits`; returns `{ total_credits, total_usage, remaining_credits }` |
 | `openrouter.models{...}` | Discovers, filters and searches the 400+ models from `/api/v1/models`; caches the catalog for 24 hours (`force=true` bypasses) |
 | `openrouter.help{model="..."}` | Fetches the model guide (`https://openrouter.ai/{provider}/{model-id}/llms.txt`) and root docs (`https://openrouter.ai/docs/llms.txt`); 24-hour cache (`force=true` bypasses) |
-| `openrouter.text{model, prompt\|messages}` | Chat completions text generation |
+| `openrouter.text{model, prompt\|messages, ...}` | Text generation via `/api/v1/responses`; optional `max_output_tokens` and `text` configure the output. Returns `{id, text, usage, model, raw}` |
 | `openrouter.image{model, prompt, ...}` | Text-to-image; `save_to` writes every image (`name.png`, `name-2.png`, ...), returns the paths as a list and drops the base64. A failed write raises |
 | `openrouter.sound{model, input, ...}` | Text-to-speech; `save_to` writes the audio and omits the base64. A failed write raises |
 | `openrouter.video{model, prompt, ...}`, `openrouter.poll_video{job_id}` | Video generation submission and job polling |

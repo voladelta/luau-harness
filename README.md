@@ -31,7 +31,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | [Budgets](docs/configuration.md#policytoml) | Token and wall-clock admission thresholds; each request reserves its upper bound in tokens |
 | [Compaction](docs/configuration.md#initluau-compaction-and-recheck) | On by default: from 256k tokens at the latest, older history becomes a structured summary; Luau globals stay |
 | [Extensions](docs/extending.md) | Override any `std` module; add single-file tools, approved packages, skills and MCP servers |
-| Any provider | Responses API or Chat Completions; any compatible base URL (OpenRouter by default) |
+| Any provider | Responses API; any compatible base URL (OpenRouter by default) |
 
 ## Quick example
 
@@ -98,7 +98,7 @@ cargo install --path .
 
 hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens) and writes the event log to `.harness/log/`.
 
-Any OpenRouter model works the same way. For another OpenAI-compatible provider, pass its URL and key variable:
+hx uses the Responses API for every model. For another provider with a compatible `/responses` endpoint, pass its base URL and key variable:
 
 ```bash
 hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1 --key-env EXAMPLE_API_KEY
@@ -183,7 +183,7 @@ Suites run concurrently (mock servers bind free ports); the process-cap sandbox 
 - **macOS only for sandboxing.** The sandbox uses `sandbox-exec`, which Apple has deprecated. There is no Linux sandbox; on other systems you would need `--yolo`, which also removes the path limits and the approval gate, and there `sh` can write `.harness/` (on macOS `--yolo` still blocks that with Seatbelt). hx has not been tested on Linux.
 - **Network is all-or-nothing.** Seatbelt cannot filter by host.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
-- **Only Chat Completions was verified live** (OpenRouter and Enclave); the Responses API is tested against a mock.
+- The Responses API is tested against a mock.
 - **Compaction and finish review are heuristics.** Summary and review quality depend on the model. Context size is configured, not detected; resume restores it. Disabling compaction is in [configuration](docs/configuration.md#initluau-compaction-and-recheck).
 - **No benchmark.** hx ships without an eval suite; its checks cover behavior, not task success or token efficiency.
 - **Recovery is explicit.** Arbitrary globals, closures and scratch files are not durable. A killed command's unrecorded output is lost; its external effect may already have happened. There is no exactly-once remote execution or rollback guarantee.

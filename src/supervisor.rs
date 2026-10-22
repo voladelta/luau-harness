@@ -430,7 +430,7 @@ mod checkpoint_tests {
     use super::*;
 
     fn model() -> LlmCfg {
-        serde_json::from_value(json!({"model":"mock","api":"responses","max_output":100,
+        serde_json::from_value(json!({"model":"mock","max_output":100,
             "base_url":null,"key_env":null,"reasoning":null,"context_window":null,"cache_key":null,"provider_only":[]})).unwrap()
     }
 

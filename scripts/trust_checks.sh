@@ -100,7 +100,7 @@ mkdir -p $T/home/.agents/skills/g; printf -- '---\ndescription: global g\n---\ng
 HOME=$T/home XDG_CONFIG_HOME=$T/cfg2 $H approve g --workspace $W >/dev/null 2>&1
 check "untrusted: a global skill approved only by the repo's hx.lock is invisible" "$(HOME=$T/home $H exec --workspace $W 'print(pcall(skill, "g"))' 2>/dev/null | head -1 | grep -c 'no installed skill')" "1"
 MOCK_REPLIES='["done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.jsonl serve MP python3 scripts/mock_llm.py 0 || exit 1; MK=$SERVED; echo go > $T/p.txt
-mrun() { OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY --trace $T/tr.txt >/dev/null 2>&1; }
+mrun() { OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY --trace $T/tr.txt >/dev/null 2>&1; }
 mrun
 check "untrusted: system.md override not in the request" "$(tail -1 $T/req.jsonl | grep -c PLANTED)" "0"
 check "untrusted: init.luau did not run" "$(tail -1 $T/req.jsonl | grep -c 'INIT RAN')" "0"

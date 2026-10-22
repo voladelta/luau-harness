@@ -43,14 +43,13 @@ def prepare(run, args=None):
         'Add meaningful regressions that compile and fail against the original implementation, '
         'then pass after repair. Avoid keeping all obsolete history.\n')
     model = getattr(args, 'model', 'deepseek-flash') if args else 'deepseek-flash'
-    api = getattr(args, 'api', None) or ('responses' if 'deepseek' in model else 'completions')
     base_url = getattr(args, 'base_url', None) or ('https://api.deepseek.com' if 'deepseek' in model else 'https://openrouter.ai/api/v1')
     save(run/'case.json',{'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'baseline':str(TASK/'environment/app'),'task_commit':subprocess.check_output(
             ['git','rev-parse','HEAD'],cwd=TASK,text=True).strip(),
         'baseline_source':'original task, not a previous generated solution',
         'verifier_image':VERIFIER_IMAGE,'verifier_source':str(TASK/'tests'),
-        'model':model,'api':api,'base_url':base_url})
+        'model':model,'base_url':base_url})
     print('Prepared: '+str(run),flush=True)
 
 
@@ -78,13 +77,12 @@ def verify(run):
 
 def run_agent(run,args):
     model = args.model
-    api = args.api or ('responses' if 'deepseek' in model else 'completions')
     base_url = args.base_url or ('https://api.deepseek.com' if 'deepseek' in model else 'https://openrouter.ai/api/v1')
     key_env = args.key_env or ('DEEPSEEK_API_KEY' if 'deepseek' in model else 'OPENROUTER_API_KEY')
     if not os.environ.get(key_env):raise SystemExit(f'{key_env} is missing')
     context_window = str(args.context_window or (1048576 if 'deepseek' in model else 1000000))
     argv=[str(Path(args.hx).resolve()),'run','--rpi','--workspace',str(run/'ws'),
-        '--prompt-file',str(run/'prompt.md'),'--model',model,'--api',api,
+        '--prompt-file',str(run/'prompt.md'),'--model',model,
         '--base-url',base_url,'--key-env',key_env,'--reasoning',args.reasoning,
         '--max-wall',str(args.max_wall),
         '--max-turns','200','--max-output','16384','--context-window',context_window,'--trace',str(run/'trace.md')]
@@ -119,7 +117,6 @@ def main():
     p.add_argument('--verifier-image',default=VERIFIER_IMAGE)
     p.add_argument('--hx',default=str(ROOT/'target/release/hx'))
     p.add_argument('--model',default='deepseek-flash')
-    p.add_argument('--api',default=None)
     p.add_argument('--base-url',default=None)
     p.add_argument('--key-env',default=None)
     p.add_argument('--context-window',type=int,default=None)

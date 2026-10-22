@@ -8,7 +8,7 @@
 -- - Help index: https://openrouter.ai/docs/llms.txt
 -- - Model help: https://openrouter.ai/{provider}/{model-id}/llms.txt
 -- - Credits: https://openrouter.ai/api/v1/credits
--- - Chat: https://openrouter.ai/api/v1/chat/completions
+-- - Responses: https://openrouter.ai/api/v1/responses
 -- - Images: https://openrouter.ai/api/v1/images
 -- - Audio: https://openrouter.ai/api/v1/audio/speech
 -- - Videos: https://openrouter.ai/api/v1/videos
@@ -61,7 +61,7 @@ return {
 		models = endpoint("/api/v1/models", "GET", { read_only = true }),
 		model_help = endpoint("/{provider}/{model_id}/llms.txt", "GET", { raw = true, read_only = true }),
 		docs_index = endpoint("/docs/llms.txt", "GET", { raw = true, read_only = true }),
-		chat = endpoint("/api/v1/chat/completions", "POST"),
+		responses = endpoint("/api/v1/responses", "POST"),
 		images = endpoint("/api/v1/images", "POST"),
 		speech = endpoint("/api/v1/audio/speech", "POST", { raw = true }),
 		videos = endpoint("/api/v1/videos", "POST"),
@@ -275,8 +275,8 @@ return {
 			end,
 		},
 		text = {
-			signature = "text(args: {model: string, prompt: string?, messages: table?, temperature: number?, max_tokens: number?, top_p: number?, response_format: table?, provider: table?}): table",
-			description = "Generate text via OpenRouter Chat Completions API. Pass either prompt (string) or messages (array of {role, content}). Returns {id, text, usage, raw}.",
+			signature = "text(args: {model: string, prompt: string?, messages: table?, temperature: number?, max_output_tokens: number?, top_p: number?, text: table?, provider: table?}): table",
+			description = "Generate text via OpenRouter Responses API. Pass either prompt (string) or messages (array of {role, content}). Returns {id, text, usage, raw}.",
 			run = function(args)
 				assert(type(args) == "table" and type(args.model) == "string" and args.model:match("%S"), "openrouter.text requires a model")
 				local messages = args.messages
@@ -288,16 +288,23 @@ return {
 				end
 				local payload = {
 					model = args.model,
-					messages = messages,
+					input = messages,
 					temperature = args.temperature,
-					max_tokens = args.max_tokens,
+					max_output_tokens = args.max_output_tokens,
 					top_p = args.top_p,
-					response_format = args.response_format,
+					text = args.text,
 					provider = args.provider,
 				}
-				local res = http("chat", payload)
-				local choice = res.choices and res.choices[1]
-				local content = choice and choice.message and choice.message.content or ""
+				local res = http("responses", payload)
+				local parts = {}
+				for _, item in ipairs(res.output or {}) do
+					if item.type == "message" then
+						for _, part in ipairs(item.content or {}) do
+							if part.type == "output_text" then table.insert(parts, part.text) end
+						end
+					end
+				end
+				local content = table.concat(parts, "\n")
 				return {
 					id = res.id,
 					text = content,

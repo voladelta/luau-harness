@@ -13,7 +13,7 @@ import unittest
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-HX = ROOT / "target/debug/hx"
+HX = ROOT / "target/release/hx"
 CALLS = []
 
 
@@ -101,15 +101,15 @@ class OpenRouterMockAPI(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"# Documentation Index\nDiscover all available pages.")
             return
 
-        if url.path == "/api/v1/chat/completions":
+        if url.path == "/api/v1/responses":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "id": "gen-chat-123",
+                "id": "gen-response-123",
                 "model": body.get("model") if body else "mock-model",
-                "choices": [{"message": {"role": "assistant", "content": "Mock text response"}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Mock text response"}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
             }).encode())
             return
 
@@ -312,6 +312,21 @@ class OpenRouterToolTests(unittest.TestCase):
         (self.ws / ".openrouter/models.json").write_text("9999999999\n" + json.dumps(catalog))
         self.assertEqual(fresh, self.run_code(code, env=env))
         self.assertEqual(len(CALLS), 2)
+
+    def test_text_uses_responses_input_and_output(self):
+        env = dict(self.env, OPENROUTER_API_KEY="sk-or-test-key")
+        out = self.run_code(
+            'local r = openrouter.text{model="mock", prompt="hello", max_output_tokens=64, '
+            'text={format={type="text"}}}; print(r.id, r.text, r.usage.output_tokens)', env=env, yolo=True)
+        self.assertIn("gen-response-123\tMock text response\t5", out)
+        method, path, query, body, auth = CALLS[-1]
+        self.assertEqual((method, path, auth), ("POST", "/api/v1/responses", "Bearer sk-or-test-key"))
+        self.assertEqual(body["input"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(body["max_output_tokens"], 64)
+        self.assertEqual(body["text"], {"format": {"type": "text"}})
+        self.assertNotIn("messages", body)
+        self.run_code('print(openrouter.text{model="mock", messages={{role="user",content="again"}}}.text)', env=env, yolo=True)
+        self.assertEqual(CALLS[-1][3]["input"], [{"role": "user", "content": "again"}])
 
     def test_help_on_demand_and_24h_caching(self):
         """Model-specific help and docs index are fetched on demand and cached 24h."""

@@ -15,7 +15,7 @@ MOCK_REPLIES="$SUB" serve P2 python3 scripts/mock_llm.py 0 || exit 1; M2=$SERVED
 echo go > $T/p.txt
 run() { # port, workspace, extra flags...
   local port=$1 ws=$2; shift 2
-  OPENROUTER_API_KEY=x $H run --workspace $ws --prompt-file $T/p.txt --model m --api completions --base-url http://127.0.0.1:$port --key-env OPENROUTER_API_KEY "$@" 2>/dev/null | tail -1
+  OPENROUTER_API_KEY=x $H run --workspace $ws --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$port --key-env OPENROUTER_API_KEY "$@" 2>/dev/null | tail -1
 }
 field() { python3 -c "import sys,json;r=json.loads(sys.stdin.read());print(r.get('$1'))"; }
 ws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; }
