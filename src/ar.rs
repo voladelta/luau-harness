@@ -487,7 +487,8 @@ your best scored state back into the editable paths.\n";
         let worker_rules = "- ar.eval refuses to score before your claim is accepted: claim first.\n\
 - An accepted claim is final: claim only what you will build, never a placeholder, a probe or a test.\n\
 - Build and fix; do not optimize: no parameter sweeps, no tuning for score, no switching ideas. Later rounds refine the \
-strongest candidates.\n- Follow the program's rules: a result that breaks them is worthless.\n";
+strongest candidates.\n- Every state you score must keep the program's rules and limits (size, time, determinism): check them before each \
+ar.eval. An audit discards a state that breaks one.\n";
         let checklist = "Before your final answer, check: [ ] my claim was accepted [ ] my last state was scored by ar.eval and \
 is valid [ ] my final answer says what I built, my best score, what worked and what did not.\n";
         Ok(match plan.role {
@@ -571,8 +572,16 @@ comes from a hole or a rule violation). Without that line the audit counts for n
         let seed_search = self.known(&state.rows, &seed).0;
         let seed_select = self.select(&seed).await?;
         let mut candidates = vec![];
+        let verdict = |idea: u32, at: &str| records.iter().rev().find_map(|r| match r {
+            Record::Audited { idea: i, snap, pass, reason } if *i == idea && snap == at => Some((*pass, reason.clone())),
+            _ => None,
+        });
         for c in state.claims.iter().filter(|c| c.scope == "explore") {
-            let best = state.rows.iter().filter(|r| r.idea == c.n && r.improved && r.valid)
+            // Its best state; once an audit has failed one of its states, its best state that passed one, so a
+            // refinement that breaks a rule costs only itself (with none that passed, the candidate is out).
+            let rows: Vec<&Row> = state.rows.iter().filter(|r| r.idea == c.n && r.improved && r.valid).collect();
+            let failed = rows.iter().any(|r| verdict(c.n, &r.snap).is_some_and(|v| !v.0));
+            let best = rows.into_iter().filter(|r| !failed || verdict(c.n, &r.snap).is_some_and(|v| v.0))
                 .fold(None::<&Row>, |b, r| if self.spec().better(r.score.unwrap(), b.and_then(|b| b.score), 0.0) { Some(r) } else { b });
             let Some(best) = best else { continue };
             let beats = seed_search.is_none_or(|s| self.spec().better(best.score.unwrap(), Some(s), self.spec().min_delta));
@@ -580,14 +589,11 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             let select = if beats { self.select(&best.snap).await? } else { None };
             let held = self.spec().select.is_none()
                 || select.is_some_and(|s| seed_select.is_none_or(|b| !self.spec().better(b, Some(s), 0.0)));
-            let audit = records.iter().rev().find_map(|r| match r {
-                Record::Audited { idea, snap, pass, reason } if *idea == c.n && *snap == best.snap => Some((*pass, reason.clone())),
-                _ => None,
-            });
+            let audit = verdict(c.n, &best.snap);
             candidates.push(Candidate { idea: c.n, claim: c.idea.clone(), snap: best.snap.clone(), search: best.score, select,
                 good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
         }
-        let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.audit != Some(false) && c.search != seed_search).collect();
+        let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.search != seed_search).collect();
         ranked.sort_by(|a, b| b.good.cmp(&a.good).then_with(|| {
             let (a, b) = (a.search.unwrap_or(f64::NAN), b.search.unwrap_or(f64::NAN));
             if self.spec().better(a, Some(b), 0.0) { std::cmp::Ordering::Less } else if self.spec().better(b, Some(a), 0.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
@@ -599,8 +605,9 @@ comes from a hole or a rule violation). Without that line the audit counts for n
     }
 
     /// The gate after `round`: audit the good candidates among the `TOP` strongest that have no verdict yet, in one
-    /// batch, then hand the `TOP` strongest to the next round. A failed candidate never goes on and the next strongest
-    /// takes its place, unaudited until a later gate; only audited good candidates become results.
+    /// batch, then hand the `TOP` strongest to the next round. A candidate whose state fails falls back to its best
+    /// state that passed, or drops out; a candidate that takes another's place is audited at a later gate. Only audited
+    /// good candidates become results.
     async fn gate(&mut self, round: usize) -> Result<Vec<u32>> {
         let batch = format!("audit{round}");
         // A resumed run finishes the batch it planned, so verdicts come from that batch's own plans.
