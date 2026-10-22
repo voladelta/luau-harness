@@ -101,7 +101,7 @@ def judge_same(body):
     t = text_of(body)
     listed = re.findall(r"^(\d+)\. (.*)$", t.split("New claim:")[0].split("Claimed so far:")[1], re.M)
     new = t.split("New claim:\n", 1)[1].split("\n", 1)[0].strip()
-    same = next((n for n, idea in listed if idea.strip() == new), "0")
+    same = "none" if "probe sentence" in new else next((n for n, idea in listed if idea.strip() == new), "0")
     return f"The new claim's mechanism is {new}.\nAnswer: {same}"
 
 
@@ -144,7 +144,10 @@ def scripted(body, index):
     if role == "explore":
         w = int(label.split("-w")[1].split(".")[0])
         t, alt = TARGETS[w], 40 + w
-        return {"code": f'print("PROBE", pcall(ar.claim, "x"))\nlocal r = ar.claim("{go(t)}")\nlocal x = {t}\nif not r.ok then r = ar.claim("{go(alt)}"); x = {alt} end\n'
+        # A retry gets its earlier attempt's claim back from its first ar.claim call, so only first attempts probe.
+        placeholder = 'print("PLACEHOLDER", ar.claim("a short probe sentence that is long enough to be accepted here").message)\n' if "." not in label else ""
+        return {"code": f'print("PROBE", pcall(ar.claim, "x"))\nprint("CLAIMS", ar.claims().message)\n{placeholder}'
+                        f'local r = ar.claim("{go(t)}")\nlocal x = {t}\nif not r.ok then r = ar.claim("{go(alt)}"); x = {alt} end\n'
                         f'print("CLAIM", r.ok, r.n)\nwrite("x.txt", tostring(x) .. "\\n")\nprint(ar.eval("go " .. x))\n'
                         f'write("x.txt", "{100 + index}\\n")\nprint(ar.eval("probe"))\nar.reset()\nreturn "RESET " .. x .. " " .. read("x.txt")'}
     if role == "exploit":
@@ -170,6 +173,10 @@ loser = 2 if next(c for c in explore if c["idea"] == go(6))["worker"] == "r1-w4"
 assert go(40 + loser) in ideas, (loser, ideas)
 probes = [o for o in outputs(requests) if "PROBE" in o]
 assert len(probes) >= 8 and all("false" in p and "at least 8 words" in p for p in probes), probes[:2]
+placeholders = [o for o in outputs(requests) if "PLACEHOLDER" in o]
+assert len(placeholders) >= 8 and all("names no concrete" in o.split("PLACEHOLDER")[1] for o in placeholders), placeholders[:1]
+assert not any("probe sentence" in c["idea"] for c in claims)
+assert all("CLAIMS\tNo claims yet." in o or "CLAIMS\tClaimed so far:" in o for o in outputs(requests) if "CLAIMS" in o)
 check("claims are served first come, first served: a duplicate idea is turned away and its worker claims another; a placeholder claim is refused")
 
 assert (run / "episodes/r0-research.report.json").exists() and "BRIEF:" in (run / "episodes/r1-w1.md").read_text()
@@ -258,7 +265,9 @@ def climbing(body, index):
     return "done"
 
 
-path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIMB})
+# min_delta = 2 is the bar against the seed; refinement steps of +1 still count, so every round moves.
+path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIMB},
+                 'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "python3 select.py"\ntimeout = 30\nmin_delta = 2\n')
 with harness.provider(climbing, price=PRICE) as (url, _):
     result = ar(path, url, 0.3)
 report = report_of(result)
@@ -266,7 +275,7 @@ share = 0.3 / (1 + 3 * (8 + 3))
 assert report["rounds"] > 3 and "moved no chosen candidate" not in result.stderr, (report["rounds"], result.stderr[-1500:])
 assert 0.3 - 1.5 * share - 0.02 <= report["cost_usd"] <= 0.3 + 0.02, report["cost_usd"]
 assert report["search"] > 6 + 1, report["search"]
-check("while every round moves a chosen candidate, rounds go on until the budget is spent")
+check("while every round moves a chosen candidate, rounds go on until the budget is spent; steps below min_delta count")
 
 records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
 widths = [len(r["episodes"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("round")]
@@ -281,7 +290,7 @@ def hopeless(body, index, x=None):
     if role == "judge": return judge_same(body)
     if answered(body) or role != "explore": return "done"
     w = int(label.split("-w")[1].split(".")[0])
-    value = x or 30 + w
+    value = x or ("00" if w == 1 else 30 + w)  # worker 1 rebuilds the seed in other bytes
     return {"code": f'ar.claim("{go(30 + w)}")\nwrite("x.txt", "{value}\\n")\nreturn ar.eval("far")'}
 
 
@@ -293,13 +302,15 @@ run = path / ".harness/ar" / report["run"]
 records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
 gates = [r for r in records if r["kind"] == "gate"]
 assert len(gates[0]["chosen"]) == 3 and not any(c["good"] for c in gates[0]["candidates"]), gates[0]
-first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["select"])[:3]]
+copy = next(c for c in gates[0]["candidates"] if c["search"] == -49)
+first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["select"]) if c is not copy][:3]
+assert copy["select"] == -25 and copy["idea"] not in gates[0]["chosen"], gates[0]
 assert gates[0]["chosen"] == first, (gates[0]["chosen"], first)
 round2 = next(r for r in records if r["kind"] == "planned" and r["batch"] == "round2")
 assert {p["role"] for p in round2["episodes"]} == {"exploit"} and {p["idea"] for p in round2["episodes"]} == set(first), round2
 assert report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n" and "no candidate beat the seed" in result.stderr, report
 assert not any(p.name.startswith("a") for p in (run / "episodes").iterdir()), "a candidate below the seed was audited"
-check("ideas below the seed go on to refinement unaudited, never into the result; the workspace keeps the seed")
+check("ideas below the seed go on to refinement unaudited, a copy of the seed never; the workspace keeps the seed")
 
 path = workspace("invalid")
 with harness.provider(lambda body, index: hopeless(body, index, "nope"), price=PRICE) as (url, _):
@@ -310,10 +321,11 @@ check("with no valid idea after round 1 the run stops and the workspace keeps th
 
 # 2b. When the budget is spent before a gate's audits can start, candidates go on marked unaudited; no verdict is invented.
 def costly(body, index):
-    """Explore workers' replies are billed $0.05 each, so round 1 spends the whole budget before any audit can start."""
+    """Explore workers' final replies are billed $0.05 each, so round 1 spends the whole budget before any audit can
+    start; their claims and evaluations run first, within their allowance."""
     answer = scripted(body, index)
-    if role_of(body)[0] == "explore" and isinstance(answer, dict):
-        answer = {**answer, "usage": {"cost": 0.05}}
+    if role_of(body)[0] == "explore" and answered(body):
+        answer = {"text": answer, "usage": {"cost": 0.05}}
     return answer
 
 
@@ -376,7 +388,7 @@ for mode in ("sandbox", "yolo"):
             'print(ar.eval("baseline"))\n'
             'return "OUT " .. r.stdout .. " READ " .. tostring(e)')
     with harness.provider(once(look, ("research", "r1-w1")), price=PRICE) as (url, requests):
-        ar(path, url, 0.1, extra=["--yolo"] if mode == "yolo" else [])
+        ar(path, url, 0.3, extra=["--yolo"] if mode == "yolo" else [])  # room for r1-w1's claim judgements and its reply
     outs = [o for o in outputs(requests) if "OUT " in o]
     assert len(outs) >= 2, outs
     assert all("snaps" not in o and "journal" not in o and "ledger" not in o for o in outs), outs
@@ -612,7 +624,7 @@ code = ('print("A", ar.eval("baseline").cached)\nwrite("x.txt", "6\\n")\nprint("
         'print("X", read("x.txt"))\nlocal r = ar.eval("six again")\nreturn "D " .. tostring(r.cached) .. " " .. r.n')
 path = workspace("reset")
 with harness.provider(once(code, ("r1-w1",)), price=PRICE) as (url, requests):
-    report = report_of(ar(path, url, 0.1))
+    report = report_of(ar(path, url, 0.3))  # room for r1-w1's claim judgements and its reply
 out = " ".join([o for o in outputs(requests) if "D " in o][0].split())
 assert "A nil" in out and "B true" in out and "C false" in out and "R -1" in out and "X 6" in out and "D true 2" in out, out
 rows = ledger(path, report)
@@ -628,7 +640,7 @@ code = (f'print(ar.eval("baseline"))\nsh("rm -rf pkg && ln -s {outside} pkg")\n'
 path = workspace("reset-link", {"pkg/x.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'},
                  'editable = ["pkg/x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
 with harness.provider(once(code, ("r1-w1",)), price=PRICE) as (url, requests):
-    ar(path, url, 0.1)
+    ar(path, url, 0.3)
 out = [o for o in outputs(requests) if "RESET " in o][0]
 assert "RESET false" in out and (outside / "x.txt").read_text() == "keep\n", (out, list(outside.iterdir()))
 check("ar.reset refuses a symlinked parent and leaves the link target untouched")

@@ -415,7 +415,9 @@ pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
         Some(r) => (r.score, true, None, r.report.clone()),
         None => evaluate(spec, &episode.dir, &files, &spec.eval, false).await?,
     };
-    let margin = spec.min_delta.max(se.unwrap_or(0.0));
+    // A worker's step counts when it beats its best by more than the evaluator's noise, so small steps add up across
+    // rounds; `min_delta` is the bar against the seed, applied at the gate.
+    let margin = se.unwrap_or(0.0);
     let (improved, best) = {
         let mut p = progress.lock().unwrap();
         // The state a worker starts from never improves it, so an explore worker's bar is set by the first state it builds.
@@ -460,15 +462,19 @@ claim is final and is how other workers, auditors and the report know what you b
     let plan = |label: &str| label.split('.').next().unwrap_or(label).to_string();
     if let Some(mine) = earlier.iter().find(|c| plan(&c.worker) == plan(&episode.label)) {
         progress.lock().unwrap().claim = Some(mine.n);
-        return Ok(json!({"ok": true, "n": mine.n, "idea": mine.idea,
-            "note": "an earlier attempt of this worker claimed this idea before it was interrupted: continue with it"}));
+        return Ok(json!({"ok": true, "n": mine.n, "idea": mine.idea, "message": format!("Accepted as #{}: an earlier attempt \
+of this worker claimed this idea before it was interrupted. Continue with it: {}", mine.n, mine.idea)}));
     }
-    if let Some(i) = judge(host, &earlier, &idea, episode.role == Role::Exploit).await {
-        // Plain text, so a printed result shows every claim (printers abbreviate nested tables).
-        let listed: String = earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
-        let what = if episode.role == Role::Exploit { "refinement" } else { "core approach" };
-        return Ok(json!({"ok": false, "same_as": earlier[i].n, "message": format!("Rejected: the same {what} as #{} was \
-claimed first. Claimed so far:\n{listed}Choose a different {what} and claim it.", earlier[i].n)}));
+    // Plain text, so a printed result shows every claim (printers abbreviate nested tables).
+    let listed: String = earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
+    let what = if episode.role == Role::Exploit { "refinement" } else { "core approach" };
+    match judge(host, &earlier, &idea, episode.role == Role::Exploit).await {
+        Judged::New => {},
+        Judged::Same(i) => return Ok(json!({"ok": false, "same_as": earlier[i].n, "message": format!("Rejected: the same \
+{what} as #{} was claimed first. Claimed so far:\n{listed}Choose a different {what} and claim it.", earlier[i].n)})),
+        Judged::Placeholder => return Ok(json!({"ok": false, "message": format!("Rejected: this names no concrete \
+{what}. A claim is final and is how everyone knows what you built: claim the {what} you will build. `ar.claims()` lists \
+what is taken. Claimed so far:\n{listed}")})),
     }
     let n = earlier.len() as u32 + 1;
     append_line(&episode.dir.join("claims.jsonl"), &Claim { scope, n, idea, worker: episode.label.clone() })?;
@@ -478,18 +484,27 @@ claimed first. Claimed so far:\n{listed}Choose a different {what} and claim it."
     Ok(json!({"ok": true, "n": n, "message": format!("Accepted as #{n}. Build it now; ar.eval works from here on.")}))
 }
 
-/// The index of the earlier claim a new claim duplicates, when two independent judge calls agree: the same core
-/// approach for explore ideas, the same change for refinements of one candidate.
-async fn judge(host: &crate::host::Host, earlier: &[Claim], idea: &str, refinement: bool) -> Option<usize> {
-    if earlier.is_empty() { return None; }
-    let listed: String = earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
+/// What two independent judge calls agree a new claim is.
+enum Judged {
+    New,
+    /// The index of the earlier claim it duplicates: the same core approach for explore ideas, the same change for
+    /// refinements of one candidate.
+    Same(usize),
+    /// No concrete approach at all: a placeholder, a probe or a test of the tool.
+    Placeholder,
+}
+
+/// Judge a new claim against the earlier ones. Only an answer both calls agree on rejects it; anything else accepts.
+async fn judge(host: &crate::host::Host, earlier: &[Claim], idea: &str, refinement: bool) -> Judged {
+    let listed: String = if earlier.is_empty() { "(none)\n".into() } else { earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect() };
     let prompt = if refinement {
         format!("Several researchers each claim one refinement of the same solution. Claimed so far:\n{listed}\n\
 New claim:\n{idea}\n\nIs the new claim the same refinement as one already claimed? Same means the same change to the \
 same part of the solution (the same rule, component or parameter, changed the same way); a change to a different part, \
 or a different kind of change, is a different refinement even when both touch similar things. In one sentence, name \
 what the new claim changes and the closest claimed one. Then end with a line 'Answer: N', where N is the matching \
-claim's number, or 0 if it is a different refinement.")
+claim's number, or 0 if it is a different refinement. If the new claim names no concrete change at all (a placeholder, \
+a probe or a test of the tool), end with 'Answer: none' instead.")
     } else {
         format!("Several researchers each claim one core approach to the same task. Claimed so far:\n{listed}\n\
 New claim:\n{idea}\n\nDoes the new claim use the same core approach as one already claimed? Same core means the same main \
@@ -497,23 +512,41 @@ mechanism that decides what the solution does (the same kind of model, algorithm
 parameters, filters, exits, sizing or added gates still counts as the same, while a different main mechanism is a \
 different core even when it shares ingredients. In one sentence, name the new claim's main mechanism and the closest \
 claimed one. Then end with a line 'Answer: N', where N is the matching claim's number, or 0 if it is a genuinely \
-different core approach.")
+different core approach. If the new claim names no concrete approach at all (a placeholder, a probe or a test of the \
+tool), end with 'Answer: none' instead.")
     };
     let request = json!({"system": "You compare research ideas and answer exactly in the format asked.", "prompt": prompt,
         "effort": "none", "max_tokens": 2000});
-    let replies = host.complete(json!([request, request])).await.ok()?;
-    let picks: Vec<Option<usize>> = replies.as_array()?.iter().map(|r| r["value"].as_str().and_then(answer_number)).collect();
+    let Ok(replies) = host.complete(json!([request, request])).await else { return Judged::New };
+    let picks: Vec<Option<usize>> = replies.as_array().into_iter().flatten().map(|r| r["value"].as_str().and_then(answer_number)).collect();
     match picks.as_slice() {
-        [Some(a), Some(b)] if a == b && (1..=earlier.len()).contains(a) => Some(a - 1),
-        _ => None,
+        [Some(0), Some(0)] => Judged::New,
+        [Some(a), Some(b)] if a == b && *a == usize::MAX => Judged::Placeholder,
+        [Some(a), Some(b)] if a == b && (1..=earlier.len()).contains(a) => Judged::Same(a - 1),
+        _ => Judged::New,
     }
 }
 
-/// N from the last `Answer: N` in a judge's reply, tolerating markdown such as `**Answer:** #2`.
+/// N from the last `Answer: N` in a judge's reply, tolerating markdown such as `**Answer:** #2`; `Answer: none` is
+/// `usize::MAX`.
 fn answer_number(text: &str) -> Option<usize> {
     let at = text.to_ascii_lowercase().rfind("answer")?;
     let rest = text[at + "answer".len()..].trim_start_matches(['*', ':', ' ', '#', '\t']);
+    if rest.to_ascii_lowercase().starts_with("none") { return Some(usize::MAX); }
     rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+}
+
+/// `ar.claims()`: the claims made so far in this worker's scope, as plain text.
+pub fn claims() -> Result<Value> {
+    let (episode, _) = EPISODE.get().context("ar.claims is only available inside an autoresearch episode")?;
+    let scope = match episode.role {
+        Role::Explore => "explore".to_string(),
+        Role::Exploit => format!("c{}", episode.idea),
+        Role::Research | Role::Audit => bail!("ar.claims is for explore and exploit workers"),
+    };
+    let listed: String = read_lines::<Claim>(&episode.dir.join("claims.jsonl"))?.into_iter().filter(|c| c.scope == scope)
+        .map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
+    Ok(json!({"message": if listed.is_empty() { "No claims yet.".to_string() } else { format!("Claimed so far:\n{listed}") }}))
 }
 
 /// An exclusive lock on `path`, held until the returned file is dropped: episodes running side by side number ledger
@@ -911,9 +944,10 @@ returns {{n, score, valid, se, improved, best, report}}; {better} scores are bet
 - When the evaluator reports no `se`, it is deterministic: re-scoring a state returns its stored result with `cached: true`.\n",
             spec.editable.join(", "));
         if matches!(role, Role::Explore | Role::Exploit) {
-            t += "- `improved` means better than your best so far";
-            if spec.min_delta > 0.0 { t += &format!(" by more than {} (smaller differences are noise)", spec.min_delta); }
+            t += "- `improved` means better than your best so far (by more than `se` when the evaluator reports one)";
+            if spec.min_delta > 0.0 { t += &format!(". To become a result, a candidate must beat the starting seed by more than {}", spec.min_delta); }
             t += ". `ar.reset()` puts your best scored state back into the editable paths: use it instead of reverting by hand.\n\
+- `ar.claims()` lists the claims made so far that yours must differ from: read it before you claim.
 - Score with ar.eval after each change and read the report: it shows what broke. One change per eval, so the ledger stays readable.\n";
         } else {
             t += "- Your evaluations are probes: recorded, never a candidate. Change the editable files freely to test a question.\n";
@@ -1050,7 +1084,9 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                     good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
             }
             let key = |c: &Candidate| if self.spec().select.is_some() { c.select } else { c.search };
-            let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.audit != Some(false)).collect();
+            // A candidate that scores exactly as the seed on every tier is the seed in other bytes: it never goes on.
+            let seedlike = |c: &Candidate| c.search == seed_search && c.select == seed_select;
+            let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.audit != Some(false) && !seedlike(c)).collect();
             ranked.sort_by(|a, b| b.good.cmp(&a.good).then_with(|| {
                 let (a, b) = (key(a).unwrap_or(f64::NAN), key(b).unwrap_or(f64::NAN));
                 if self.spec().better(a, Some(b), 0.0) { std::cmp::Ordering::Less } else if self.spec().better(b, Some(a), 0.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
@@ -1330,6 +1366,7 @@ mod tests {
         assert_eq!(answer_number("Mechanism: breakout.\nAnswer: 2"), Some(2));
         assert_eq!(answer_number("**Answer:** #3"), Some(3));
         assert_eq!(answer_number("answer: 0"), Some(0));
+        assert_eq!(answer_number("It names no approach.\n**Answer:** none"), Some(usize::MAX));
         assert_eq!(answer_number("I think 2 is closest."), None);
     }
 

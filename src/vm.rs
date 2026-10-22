@@ -344,6 +344,10 @@ impl Vm {
                 }
             })?)?;
             let afx = fx.clone();
+            ar.set("claims", lua.create_function(|lua, ()| {
+                let listed = crate::ar::claims().map_err(|e| crate::effects::rt(format!("ar.claims: {e}")))?;
+                prims::json_value(lua, Ret::Json(listed))
+            })?)?;
             ar.set("reset", lua.create_async_function(move |lua, ()| {
                 let fx = afx.clone();
                 async move {
