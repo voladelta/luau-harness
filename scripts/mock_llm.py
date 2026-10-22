@@ -6,7 +6,9 @@ A reply is a string or an object. A string that starts with a ```luau fence beco
 {"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments.
 An object may also carry "prompt_tokens": N (reported as the usage input tokens, default 10) and, instead of a reply,
 "status": 400, "error": "<body>" (answer with that HTTP status and body).
-"reasoning": str adds a reasoning summary item that is echoed back on later turns; "finish": "length" marks the reply cut at max_output_tokens."""
+"reasoning": str adds a reasoning summary item that is echoed back on later turns; "finish": "length" marks the reply cut at max_output_tokens.
+A request with "stream": true is answered with server-sent events (the final response split across writes); "drop": true ends
+that stream before the response completes, like a lost connection."""
 import json, os, re, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 R = json.loads(os.environ["MOCK_REPLIES"]); n = [0]
@@ -52,6 +54,17 @@ class H(BaseHTTPRequestHandler):
         doc = {"error": None, "output": out, "usage": {"input_tokens": ptok, "output_tokens": 5}}
         if isinstance(reply, dict) and reply.get("finish") == "length":
             doc["incomplete_details"] = {"reason": "max_output_tokens"}
+        if body.get("stream"):
+            final = "response.incomplete" if "incomplete_details" in doc else "response.completed"
+            events = [{"type": "response.created", "response": {"output": []}}, {"type": "response.output_text.delta", "delta": text}]
+            if not (isinstance(reply, dict) and reply.get("drop")):
+                events.append({"type": final, "response": doc})
+            out = "".join(f"event: {e['type']}\r\ndata: {json.dumps(e)}\r\n\r\n" for e in events).encode()
+            self.send_response(200); self.send_header("content-type", "text/event-stream"); self.send_header("content-length", str(len(out)))
+            self.end_headers()
+            for i in range(0, len(out), 97):  # small writes: events arrive split across reads
+                self.wfile.write(out[i:i + 97]); self.wfile.flush()
+            return
         out = json.dumps(doc).encode()
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(out)))
         self.end_headers(); self.wfile.write(out)

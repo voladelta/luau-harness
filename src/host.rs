@@ -102,7 +102,7 @@ impl Host {
         Ok(Arc::new(Self { llm: m.model.clone(), workspace: m.policy.workspace.clone(), policy: supervisor.policy.clone(),
             principal: Principal::Agent { read_only: false }, durable: supervisor.durable.clone(), lane: "root".into(),
             max_turns: m.max_turns, depth: 0, max_depth: 2,
-            http: reqwest::Client::builder().timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?,
+            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).read_timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?,
             trace: Arc::new(Mutex::new(file)), key, packs: m.packs.clone(), supervisor }))
     }
 

@@ -29,7 +29,7 @@ runq any/model;           check "responses: prompt_cache_key sent" "$(has prompt
 runq any/model --provider-only anthropic,google; check "--provider-only pins providers" "$(has allow_fallbacks)" "yes"
 # --- native tool calling: the loop answers every call id; bad calls get an error result, not a crash
 mockrun() { # replies-json -> "finished|final_answer|turns|code_turns|truncated_turns"
-  MOCK_REPLIES="$1" MOCK_BY_LEN=1 MOCK_LOG=$T/tool.log serve TP python3 scripts/mock_llm.py 0 || return 1; local m=$SERVED; : > $T/tool.log
+  MOCK_REPLIES="$1" MOCK_BY_LEN=${BYLEN:-1} MOCK_LOG=$T/tool.log serve TP python3 scripts/mock_llm.py 0 || return 1; local m=$SERVED; : > $T/tool.log
   W=$T/m-$RANDOM; mkdir -p $W/.harness
   echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
   local o; o=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --base-url http://127.0.0.1:$TP --key-env K 2>&1 | tail -1)
@@ -47,4 +47,8 @@ check "tool-call markup leaked into the text is nudged, not taken as the answer"
 check "the markup nudge reaches the model" "$(grep -c 'arrived as plain text' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
 check "prose before any code is nudged to start" "$(mockrun '["I will look.","```luau\nprint(7)\n```","done"]')" "True|done|3|1|1"
 check "the luau tool is declared in the request" "$(grep -c '"luau"' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
+# --- streaming: every request asks for a stream; a stream that ends before the response completes is a lost response
+check "requests ask for a streamed response" "$(grep -c '"stream": true' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
+check "a dropped stream is a lost response: one new request, run finishes" "$(BYLEN=0 mockrun '[{"text":"","calls":[{"code":"print(1)"}],"drop":true},"```luau\nprint(2)\n```","all done"]')" "True|all done|2|1|0"
+check "an empty reply is resent unchanged, not nudged" "$(BYLEN=0 mockrun '["```luau\nprint(7)\n```","","all done"]')|$(grep -c 'cut off or empty' $T/tool.log | tr -d ' ')" "True|all done|3|1|1|0"
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

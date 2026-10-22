@@ -66,7 +66,7 @@ test.case("an overflow bounds the window for its one compaction only", function(
 	test.eq(command.kind, "next")
 	s, command = loop.step(s, { kind = "next" })
 	test.eq(command.purpose, "compact")
-	test.ok(s.phase.size <= measured - compact.reserve_tokens, "the summarizer prefix fits under the bound minus the reserve")
+	test.ok(s.phase.size <= measured - compact.reserve(measured), "the summarizer prefix fits under the bound minus the reserve")
 	s, command = summary(s, "SUMMARY")
 	s, command = loop.step(s, { kind = "next" })
 	test.eq(command.purpose, "agent") -- the retry: under the 1M window there is no further compaction
@@ -92,6 +92,32 @@ test.case("a tool call that reached the text as markup is nudged, not accepted a
 	test.eq(s.report.truncated_turns, 1)
 	test.eq(s.messages[#s.messages].content, require("std/prompt").nudge_markup)
 	test.eq(command.kind, "next")
+end)
+
+test.case("an empty reply resends the same request; the fourth in a row stops the run", function()
+	local s, command = start()
+	s, command = turn(s, 1000, 1)
+	local before = #s.messages
+	for n = 1, 3 do
+		s, command = loop.step(s, { kind = "model_reply", system_chars = SYSTEM, reply = { text = " ", finish = "stop", input = 1100, output = 10, calls = {} } })
+		test.eq(command.kind, "next")
+		test.eq(#s.messages, before) -- nothing appended: the retry is the same request
+		test.eq(s.anchor.tokens, 1100); test.eq(s.anchor.count, before)
+		s, command = loop.step(s, { kind = "next" })
+		test.eq(command.purpose, "agent")
+	end
+	test.eq(s.report.truncated_turns, 3)
+	s, command = loop.step(s, { kind = "model_reply", system_chars = SYSTEM, reply = { text = "", finish = "stop", input = 1100, output = 10, calls = {} } })
+	test.eq(command.kind, "finish")
+	test.ok(s.report.stopped:find("repeated empty", 1, true))
+end)
+
+test.case("a call after an empty reply resets the retry count", function()
+	local s, command = start()
+	s, command = loop.step(s, { kind = "model_reply", system_chars = SYSTEM, reply = { text = "", finish = "stop", input = 1000, output = 0, calls = {} } })
+	s, command = loop.step(s, { kind = "next" })
+	s, command = turn(s, 1000, 1)
+	test.eq(s.bad, 0)
 end)
 
 test.case("a large fixed part (system prompt + task) does not make compaction recur every turn", function()

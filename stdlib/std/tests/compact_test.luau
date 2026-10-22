@@ -12,6 +12,13 @@ test.case("trigger and keep are shares of the window", function()
 	test.eq(compact.keep(1000000, 16384), 157378) -- 16% of the window less the reply
 end)
 
+test.case("the summarizer reserve is an eighth of the window, from 16384 up to reserve_tokens", function()
+	test.eq(compact.reserve(40000), 16384)
+	test.eq(compact.reserve(200000), 25000)
+	test.eq(compact.reserve(1000000), 65536)
+	test.eq(compact.trigger(1000000, 65536), 800000) -- the defaults at DeepSeek's 1M still compact at 80%
+end)
+
 test.case("find_cut cuts only at an assistant message, never the task or a tool exchange", function()
 	local pad = string.rep("x", 400) -- 100 tokens
 	local m = { user("task"), asst(pad, "a"), tool("a", "ok"), asst(pad, "b"), tool("b", "ok"), asst(pad, "c"), tool("c", "ok") }
@@ -54,8 +61,9 @@ end)
 test.case("request replays the agent prefix and appends one instruction", function()
 	local m = { user("TASK"), asst("x = 1", "a"), tool("a", "1"), asst("y = 2", "b"), tool("b", "2") }
 	local tools = { { name = "luau" } }
-	local r = compact.request("SYS", tools, m, 4)
+	local r = compact.request("SYS", tools, m, 4, compact.reserve(1000000))
 	test.eq(r.system, "SYS"); test.eq(r.tools, tools)
+	test.eq(r.max_tokens, 52428) -- four fifths of the 64k reserve at a 1M window: room for a reasoning summarizer
 	test.eq(#r.messages, 4)
 	for i = 1, 3 do test.eq(r.messages[i], m[i]) end -- the same message tables, unchanged
 	test.eq(r.messages[4].role, "user")

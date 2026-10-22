@@ -144,18 +144,86 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         body["provider"] = json!({"only": cfg.provider_only, "allow_fallbacks": false});
     }
     add_cache_key(&mut body, cfg);
+    // Streamed, so a long reasoning reply keeps the connection busy: the client's read timeout bounds silence, not
+    // the whole generation. Only the final response object is used.
+    body["stream"] = json!(true);
     let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
     let url = format!("{base}/responses");
     // Generation can be billable even when its response is lost. The supervisor owns admission and recovery;
     // neither this adapter nor reqwest may silently dispatch a second attempt.
-    let response = http.post(&url).bearer_auth(key).json(&body).send().await?;
+    let mut response = http.post(&url).bearer_auth(key).json(&body).send().await?;
     let status = response.status();
     let retry_after = response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()?.trim().parse::<f64>().ok());
-    let text = response.text().await?;
     let answered = |message: String| Answered { status: status.as_u16(), message, retry_after };
-    if !status.is_success() { return Err(answered(format!("API {status}: {text}")).into()); }
-    let resp: Value = serde_json::from_str(&text).map_err(|e| answered(format!("API returned a malformed body: {e}")))?;
-    if resp.get("error").is_some_and(|error| !error.is_null()) { return Err(answered(format!("API error: {}", resp["error"])).into()); }
+    let sse = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+    if !status.is_success() || !sse {
+        let text = response.text().await?;
+        if !status.is_success() { return Err(answered(format!("API {status}: {text}")).into()); }
+        // a provider that ignores `stream` answers with the plain response object
+        let resp: Value = serde_json::from_str(&text).map_err(|e| answered(format!("API returned a malformed body: {e}")))?;
+        return reply(resp).map_err(|m| answered(m).into());
+    }
+    let mut events = Sse::default();
+    while let Some(chunk) = response.chunk().await? {
+        for data in events.push(&chunk) {
+            let Ok(event) = serde_json::from_str::<Value>(&data) else { continue }; // e.g. a `[DONE]` sentinel
+            match event["type"].as_str().unwrap_or("") {
+                "response.completed" | "response.incomplete" => return reply(event["response"].clone()).map_err(|m| answered(m).into()),
+                "response.failed" => return Err(answered(format!("API error: {}", event["response"]["error"])).into()),
+                "error" => return Err(answered(format!("API error: {}", event.get("error").unwrap_or(&event))).into()),
+                _ => {},
+            }
+        }
+    }
+    // The stream ended without a final response: like a lost connection, the generation may have been billed.
+    anyhow::bail!("the response stream ended before the response completed")
+}
+
+/// Server-sent events: bytes in, the `data` of each complete event out.
+#[derive(Default)]
+struct Sse {
+    buf: Vec<u8>,
+    /// bytes of `buf` already searched for an event end
+    scanned: usize,
+}
+
+impl Sse {
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        // A line ends with \n or \r\n; JSON data never holds a raw \r, so dropping every \r leaves \n endings only.
+        self.buf.extend(bytes.iter().filter(|&&b| b != b'\r'));
+        let mut out = Vec::new();
+        // An event ends at a blank line. The final response is one large event, so resume the search where it stopped.
+        while let Some(end) = self.buf.get(self.scanned.saturating_sub(1)..).and_then(|b| b.windows(2).position(|w| w == b"\n\n")) {
+            let end = self.scanned.saturating_sub(1) + end;
+            let event = String::from_utf8_lossy(&self.buf[..end]).into_owned();
+            self.buf.drain(..end + 2);
+            self.scanned = 0;
+            let data: Vec<&str> = event.lines().filter_map(|l| l.strip_prefix("data:")).map(|d| d.strip_prefix(' ').unwrap_or(d)).collect();
+            if !data.is_empty() { out.push(data.join("\n")); }
+        }
+        self.scanned = self.buf.len();
+        out
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::Sse;
+
+    #[test]
+    fn events_split_across_chunks_and_line_endings() {
+        let mut sse = Sse::default();
+        assert!(sse.push(b"event: response.created\ndata: {\"a\"").is_empty());
+        assert_eq!(sse.push(b":1}\n\n: comment\n\ndata: x\r\n\r\ndata: one\ndata: two\n"), vec!["{\"a\":1}", "x"]);
+        assert_eq!(sse.push(b"\n"), vec!["one\ntwo"]);
+        assert!(sse.push(b"data: partial\r\n\r").is_empty());
+        assert_eq!(sse.push(b"\n"), vec!["partial"]);
+    }
+}
+
+/// A finished Responses API response object -> Reply; Err is the message of a provider error.
+fn reply(resp: Value) -> std::result::Result<Reply, String> {
+    if resp.get("error").is_some_and(|error| !error.is_null()) { return Err(format!("API error: {}", resp["error"])); }
 
     let u = &resp["usage"];
     let mut out = Reply::default();
@@ -167,7 +235,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     let items: Vec<Value> = resp["output"].as_array().cloned().unwrap_or_default();
     out.text = items.iter().filter(|o| o["type"] == "message").flat_map(|o| o["content"].as_array().into_iter().flatten()).filter(|c| c["type"] == "output_text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n");
     out.calls = items.iter().filter(|o| o["type"] == "function_call").map(|o| call(o["call_id"].as_str().unwrap_or(""), o["name"].as_str().unwrap_or(""), o["arguments"].as_str().unwrap_or(""))).collect();
-    out.raw = serde_json::to_string(&items)?;
+    out.raw = serde_json::to_string(&items).map_err(|e| e.to_string())?;
     let cut = resp["incomplete_details"]["reason"].as_str() == Some("max_output_tokens");
     let markup = out.calls.is_empty() && TOOL_MARKUP.iter().any(|m| out.text.contains(m));
     out.finish = Some(if cut { "length" } else if markup { "tool_markup" } else { "stop" }.into());

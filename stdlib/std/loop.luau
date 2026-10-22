@@ -160,12 +160,21 @@ local function step(s, event, options)
 		local resp = event.reply
 		s.report.turns += 1
 		s.system_chars = event.system_chars or s.system_chars
-		s.anchor = compact.anchor(system_chars(s, options), s.messages, (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0), resp.output or 0)
+		local prompt_tokens = (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0)
+		s.anchor = compact.anchor(system_chars(s, options), s.messages, prompt_tokens, resp.output or 0)
 		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish, usage = {
 			input = resp.input, output = resp.output, cache_read = resp.cache_read, cache_write = resp.cache_write } })
 		local text, calls = reply.text, resp.calls or {}
 		if #calls == 0 then
 			local markup = resp.finish == "tool_markup" -- a tool call that reached the text unparsed: nothing ran
+			if text:match("^%s*$") and resp.finish ~= "length" and not markup and s.bad < 3 then
+				-- An empty reply that ended normally is a provider glitch, not an answer: send the same request again. The
+				-- history stays unchanged, so the retry reuses its cached prefix; the anchor covers only that history.
+				s.bad += 1
+				s.report.truncated_turns += 1
+				s.anchor = { tokens = prompt_tokens, count = #s.messages, scale = s.anchor.scale }
+				return ready(s)
+			end
 			if text:match("^%s*$") or resp.finish == "length" or markup then
 				if options.submissions then
 					s.report.truncated_turns += 1
@@ -233,13 +242,14 @@ local function step(s, event, options)
 		if force or (limit > 0 and total >= limit) then
 			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under its bound
 			local keep = if force then 0 else compact.keep(window, max_output)
-			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - compact.reserve_tokens)
+			local reserve = compact.reserve(window)
+			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - reserve)
 			-- under pressure, summarize at least a quarter of the trigger beyond the system prompt and task, so a compaction
 			-- frees real room and cannot recur every turn when they alone sit near the trigger (an overflow takes any cut)
 			if cut and not force and size - compact.fixed(s.anchor, system_chars(s, options), s.messages[1]) < limit / 4 then cut = nil end
 			if cut then
 				s.phase = { kind = "compact", cut = cut, size = size, overflow = phase.overflow }
-				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut), purpose = "compact" }
+				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut, reserve), purpose = "compact" }
 			end
 		end
 	end

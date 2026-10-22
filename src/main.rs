@@ -67,7 +67,9 @@ ENVIRONMENT:
 ";
 
 const DEFAULT_MAX_TURNS: u64 = 200;
-const DEFAULT_MAX_OUTPUT: u64 = 16384;
+/// Room for a reasoning model's thinking plus a large edit in one reply (DeepSeek counts reasoning as output); with
+/// `--context-window`, at most a quarter of that window.
+const DEFAULT_MAX_OUTPUT: u64 = 65536;
 
 #[derive(Clone, Copy, PartialEq)]
 enum FlagKind { Switch, Text, Unsigned, Positive, Amount }
@@ -105,7 +107,7 @@ const FLAGS: &[Flag] = {
         flag(RUN, "--base-url", Text, "U", "API base URL (default: HX_BASE_URL, else OpenRouter)"),
         flag(RUN, "--key-env", Text, "E", "environment variable holding the API key (default: OPENROUTER_API_KEY)"),
         flag(RUN, "--reasoning", Text, "R", "reasoning effort"),
-        Flag { default: Some(DEFAULT_MAX_OUTPUT), ..flag(RUN, "--max-output", Positive, "N", "max output tokens per turn") },
+        Flag { default: Some(DEFAULT_MAX_OUTPUT), ..flag(RUN, "--max-output", Positive, "N", "max output tokens per turn; with --context-window, at most a quarter of it") },
         flag(RUN, "--context-window", Positive, "N", "the model's context window; compaction starts before it"),
         flag(RUN, "--provider-only", Text, "A,B", "OpenRouter only: route to these providers, no fallbacks"),
         Flag { default: Some(DEFAULT_MAX_TURNS), ..flag(RUN, "--max-turns", Unsigned, "N", "turn limit") },
@@ -398,13 +400,14 @@ async fn cmd_exec(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
 
 /// `hx run` model settings: flags, then HX_* environment defaults.
 fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
+    let context_window = parsed(args, "--context-window")?;
     Ok(llm::LlmCfg {
         model: arg(args, "--model").or_else(|| std::env::var("HX_MODEL").ok()).ok_or_else(|| anyhow::anyhow!("--model or HX_MODEL required"))?,
         base_url: arg(args, "--base-url").or_else(|| std::env::var("HX_BASE_URL").ok()),
         key_env: arg(args, "--key-env"),
         reasoning: arg(args, "--reasoning"),
-        max_output: parsed(args, "--max-output")?.unwrap_or(DEFAULT_MAX_OUTPUT),
-        context_window: parsed(args, "--context-window")?,
+        max_output: parsed(args, "--max-output")?.unwrap_or_else(|| context_window.map_or(DEFAULT_MAX_OUTPUT, |w| DEFAULT_MAX_OUTPUT.min(w / 4).max(1))),
+        context_window,
         cache_key: Some(session),
         provider_only: list_arg(args, "--provider-only"),
     })
@@ -637,6 +640,10 @@ mod tests {
         let c = llm_cfg(&a, "s".into()).unwrap();
         assert_eq!((c.model.as_str(), c.max_output, c.context_window), ("m", 99, Some(1000)));
         assert_eq!((c.provider_only, c.cache_key), (vec!["x".to_string(), "y".to_string()], Some("s".to_string())));
+        let cap = |a: &str| llm_cfg(&argv(a), "s".into()).unwrap().max_output;
+        assert_eq!(cap("run --model m"), DEFAULT_MAX_OUTPUT);
+        assert_eq!(cap("run --model m --context-window 128000"), 32000); // a small window caps the default
+        assert_eq!(cap("run --model m --context-window 1000000"), DEFAULT_MAX_OUTPUT);
     }
 
     #[test]

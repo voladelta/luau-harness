@@ -17,7 +17,7 @@ M.enabled = true
 M.context_window = 1000000 -- used only when --context-window is not given
 M.trigger_ratio = 0.8 -- compaction starts at this share of the window
 M.keep_ratio = 0.16 -- recent history kept verbatim: at most this share of the window less the reply; the newest exchange always
-M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer's output (prime-agent/pi default)
+M.reserve_tokens = 65536 -- most headroom kept free for the summarizer's output, reasoning included (DeepSeek harness default)
 
 local IMAGE_TOKENS = 1200
 
@@ -74,10 +74,16 @@ local OVERFLOW = {
 	"reduce the length",
 }
 
+-- Headroom for the summarizer's output: an eighth of the window, from 16384 tokens up to M.reserve_tokens, so a
+-- reasoning summarizer is not cut off on a large window and a small window keeps room for history.
+function M.reserve(window: number): number
+	return math.min(M.reserve_tokens, math.max(16384, math.floor(window / 8)))
+end
+
 -- Context size at which to compact: M.trigger_ratio of the window, but always leaving room for the reply plus the
 -- reserve. <= 0 means the window is too small for compaction (the pack stays off).
 function M.trigger(window: number, max_output: number): number
-	return math.min(math.floor(window * M.trigger_ratio), window - max_output - math.max(M.reserve_tokens, 4096))
+	return math.min(math.floor(window * M.trigger_ratio), window - max_output - math.max(M.reserve(window), 4096))
 end
 
 -- Recent history kept verbatim at most (see M.find_cut).
@@ -164,11 +170,13 @@ end
 
 -- The summarizer request: the agent's own request prefix (same system prompt and tools, messages[1 .. cut-1] unchanged)
 -- plus the instruction. Pure; the supervisor performs the call and checkpoints its result.
-function M.request(system: string, tools, messages, cut: number)
+-- `reserve`: M.reserve of the window the prefix was cut to fit; the summary may use four fifths of it, the rest absorbs
+-- estimation error.
+function M.request(system: string, tools, messages, cut: number, reserve: number)
 	local prefix = table.move(messages, 1, cut - 1, 1, {})
 	table.insert(prefix, { role = "user", content = INSTRUCTION })
 	-- replay: the supervisor sends it under the system prompt of the last agent request as sent (VM hooks applied)
-	return { system = system, tools = tools, messages = prefix, max_tokens = math.floor(M.reserve_tokens * 4 / 5), replay = true }
+	return { system = system, tools = tools, messages = prefix, max_tokens = math.floor(reserve * 4 / 5), replay = true }
 end
 
 function M.wrap(task, summary, history)
