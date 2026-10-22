@@ -19,10 +19,11 @@
 //! are served one at a time in arrival order: an idea that two judge calls both find to share the core approach of an
 //! earlier claim is rejected, and the worker tries another. Each accepted idea is a candidate with its own best state. A
 //! gate keeps the candidates that beat the seed on search and are not worse on the held-out `select`, audits the
-//! strongest, and hands up to three to the exploit rounds, whose workers claim distinct refinements of their candidate.
+//! strongest, and hands the three most promising (good ones first, but an unpolished idea below the seed too) to the
+//! exploit rounds, whose workers claim distinct refinements of their candidate.
 //! Rounds go on until the budget is spent: after an exploit round that moves no chosen candidate, the next round
-//! explores new ideas again. With no good candidate after round 1 the run stops. The result is the audited candidates
-//! of the last gate, best held-out score first: several distinct good answers, since the single best score is the one
+//! explores new ideas again. With no valid candidate after round 1 the run stops. The result is the audited good
+//! candidates of the last gate, best held-out score first: several distinct good answers, since the single best score is the one
 //! most likely to be an overfit or an evaluator hole.
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
@@ -980,7 +981,7 @@ and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwr
                     ledger += &format!("{} | {score} | {} | {} | {}\n", r.n, if r.improved { "yes" } else { "" }, r.episode, r.note.replace('\n', " "));
                 }
                 format!("{program}\n\n{brief}{findings}## Autoresearch exploit worker {label}: candidate #{}\n\n\
-Candidate #{}'s idea: {}\n\nIt is among the strongest candidates{}. Several workers refine it side by side; improve it:\n\n\
+Candidate #{}'s idea: {}\n\nIt is among the most promising candidates{}. Several workers refine it side by side; improve it:\n\n\
 1. Choose one refinement, a change with a reason to generalize rather than tuning to the reported numbers, and claim it: \
 `ar.claim(\"the refinement in one or two sentences\")`, early. If it returns `ok = false`, another worker claimed the \
 same refinement first (`message` lists every claim): choose a different one. An accepted claim is final, so claim only \
@@ -1006,8 +1007,10 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
     }
 
     /// Candidates after `round`: every accepted explore claim with a valid improved state, at its best search state.
-    /// Good: beats the seed on search by more than `min_delta`, and is not worse than the seed on select. The best good
-    /// ones (by select, else search; one per distinct state) are audited until `TOP` pass or none is left; those go on.
+    /// Good: beats the seed on search by more than `min_delta`, and is not worse than the seed on select. The `TOP`
+    /// strongest go on (good ones first, then by select, else search; one per distinct state): workers return their
+    /// ideas unpolished, so one below the seed still earns refinement. Good ones among them are audited until `TOP`
+    /// pass or none is left; only good ones can become results.
     async fn gate(&mut self, round: usize) -> Result<Vec<u32>> {
         let seed = self.seed()?;
         let seed_search = self.known(&ledger(&self.dir)?, &seed).0;
@@ -1036,7 +1039,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                     .fold(None::<&Row>, |b, r| if self.spec().better(r.score.unwrap(), b.and_then(|b| b.score), 0.0) { Some(r) } else { b });
                 let Some(best) = best else { continue };
                 let beats = seed_search.is_none_or(|s| self.spec().better(best.score.unwrap(), Some(s), self.spec().min_delta));
-                let select = if beats { self.select(&best.snap).await? } else { None };
+                let select = self.select(&best.snap).await?;
                 let held = self.spec().select.is_none()
                     || select.is_some_and(|s| seed_select.is_none_or(|b| !self.spec().better(b, Some(s), 0.0)));
                 let audit = records.iter().rev().find_map(|r| match r {
@@ -1047,21 +1050,22 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                     good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
             }
             let key = |c: &Candidate| if self.spec().select.is_some() { c.select } else { c.search };
-            let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.good && c.audit != Some(false)).collect();
-            ranked.sort_by(|a, b| {
+            let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.audit != Some(false)).collect();
+            ranked.sort_by(|a, b| b.good.cmp(&a.good).then_with(|| {
                 let (a, b) = (key(a).unwrap_or(f64::NAN), key(b).unwrap_or(f64::NAN));
                 if self.spec().better(a, Some(b), 0.0) { std::cmp::Ordering::Less } else if self.spec().better(b, Some(a), 0.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
-            });
+            }));
             // Two candidates that reached the same state are one result: the better ranked keeps it.
             let mut seen = std::collections::HashSet::new();
             ranked.retain(|c| seen.insert(c.snap.clone()));
-            let unaudited: Vec<&Candidate> = ranked.iter().take(TOP).filter(|c| c.audit.is_none()).copied().collect();
+            let unaudited: Vec<&Candidate> = ranked.iter().take(TOP).filter(|c| c.good && c.audit.is_none()).copied().collect();
             if unaudited.is_empty() || spent {
                 let unaudited: Vec<u32> = unaudited.iter().map(|c| c.idea).collect();
-                // An unaudited candidate never ranks above an audited one, so it reaches the workspace only when nothing
-                // audited did.
-                let mut chosen: Vec<u32> = ranked.iter().take(TOP).map(|c| c.idea).collect();
-                chosen.sort_by_key(|id| unaudited.contains(id));
+                // An unaudited good candidate never ranks above an audited one, so it reaches the workspace only when
+                // nothing audited did; candidates below the seed come last.
+                let mut chosen: Vec<&Candidate> = ranked.iter().take(TOP).copied().collect();
+                chosen.sort_by_key(|c| (!c.good, unaudited.contains(&c.idea)));
+                let chosen: Vec<u32> = chosen.iter().map(|c| c.idea).collect();
                 for c in candidates.iter_mut().filter(|c| unaudited.contains(&c.idea)) { c.reason = "not audited: budget spent".into(); }
                 eprintln!("hx ar: gate {round}: {} candidates, {} good, going on with {:?}", candidates.len(),
                     candidates.iter().filter(|c| c.good).count(), chosen);
@@ -1168,7 +1172,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
                 gate = self.last_gate()?;
             }
             let (candidates, chosen) = gate.unwrap_or_default();
-            // With nothing good after a gate the run stops (in practice after round 1: later gates keep earlier candidates).
+            // With no candidate after a gate the run stops (in practice after round 1: later gates keep earlier candidates).
             if chosen.is_empty() { break; }
             let now: Vec<(u32, String)> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).map(|c| (c.idea, c.snap.clone())).collect();
             let moved = now.iter().any(|c| !last.contains(c));
@@ -1180,7 +1184,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
         let state = self.state()?;
         ensure!(!state.rows.is_empty(), "autoresearch made no evaluations; see {}", self.dir.join("episodes").display());
         let (candidates, chosen) = self.last_gate()?.unwrap_or_default();
-        let portfolio: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).collect();
+        let portfolio: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).filter(|c| c.good).collect();
         // The portfolio's states, best held-out score first; the first goes into the workspace (the seed when none).
         for c in &portfolio {
             let dir = self.dir.join("portfolio").join(format!("c{}", c.idea));

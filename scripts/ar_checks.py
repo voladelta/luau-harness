@@ -274,13 +274,15 @@ assert widths[0] == 8 and widths[1] == 6 and max(widths[1:]) == 6, widths
 assert "rate-limited r1-w1" in result.stderr, result.stderr[-1500:]
 check("eight workers per round, six once the provider rate-limits an episode")
 
-# 2. When no explore idea beats the seed, the run stops after round 1 and keeps the seed.
-def hopeless(body, index):
+# 2. Ideas below the seed still go on to refinement, but never become results: the workspace keeps the seed. With no
+# valid idea at all the run stops after round 1.
+def hopeless(body, index, x=None):
     role, label = role_of(body)
     if role == "judge": return judge_same(body)
     if answered(body) or role != "explore": return "done"
     w = int(label.split("-w")[1].split(".")[0])
-    return {"code": f'ar.claim("{go(30 + w)}")\nwrite("x.txt", "{30 + w}\\n")\nreturn ar.eval("far")'}
+    value = x or 30 + w
+    return {"code": f'ar.claim("{go(30 + w)}")\nwrite("x.txt", "{value}\\n")\nreturn ar.eval("far")'}
 
 
 path = workspace("hopeless")
@@ -288,9 +290,23 @@ with harness.provider(hopeless, price=PRICE) as (url, _):
     result = ar(path, url, 0.3)
 report = report_of(result)
 run = path / ".harness/ar" / report["run"]
+records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
+gates = [r for r in records if r["kind"] == "gate"]
+assert len(gates[0]["chosen"]) == 3 and not any(c["good"] for c in gates[0]["candidates"]), gates[0]
+first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["select"])[:3]]
+assert gates[0]["chosen"] == first, (gates[0]["chosen"], first)
+round2 = next(r for r in records if r["kind"] == "planned" and r["batch"] == "round2")
+assert {p["role"] for p in round2["episodes"]} == {"exploit"} and {p["idea"] for p in round2["episodes"]} == set(first), round2
+assert report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n" and "no candidate beat the seed" in result.stderr, report
+assert not any(p.name.startswith("a") for p in (run / "episodes").iterdir()), "a candidate below the seed was audited"
+check("ideas below the seed go on to refinement unaudited, never into the result; the workspace keeps the seed")
+
+path = workspace("invalid")
+with harness.provider(lambda body, index: hopeless(body, index, "nope"), price=PRICE) as (url, _):
+    result = ar(path, url, 0.3)
+report = report_of(result)
 assert report["rounds"] == 1 and report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n", report
-assert not any(p.name.startswith(("r2", "a1")) for p in (run / "episodes").iterdir()) and "no candidate beat the seed" in result.stderr
-check("with no good candidate after round 1 the run stops and the workspace keeps the seed")
+check("with no valid idea after round 1 the run stops and the workspace keeps the seed")
 
 # 2b. When the budget is spent before a gate's audits can start, candidates go on marked unaudited; no verdict is invented.
 def costly(body, index):
