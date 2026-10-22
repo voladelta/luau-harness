@@ -1,5 +1,5 @@
 //! One owner for admission, immutable run configuration, receipts, and recovery.
-use crate::{eventlog::{self, Books, EventLog, ReservationCost}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
+use crate::{eventlog::{self, Books, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -91,7 +91,7 @@ impl Manifest {
 ///   never touched; otherwise the file's hash says whether it landed. An unreadable file is left for the owner.
 /// - `sh` that ran under Seatbelt with the network off and no approval-gated command could only write inside the
 ///   workspace and the run's temp dir, which the recovery turn can inspect: `unknown_local`.
-/// - A model request with a price bound is charged at that bound.
+/// - A model request whose response was lost is charged its reserved tokens.
 ///
 /// Returns how many records were written.
 pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Result<usize> {
@@ -117,17 +117,15 @@ pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Resu
         settled += 1;
     }
     for (&id, reservation) in &books.reservations {
-        if let Some(bound) = reservation.cost.upper_bound() {
-            log.write("billing", bound_billing(id, reservation.tokens, bound), true)?;
-            settled += 1;
-        }
+        log.write("billing", bound_billing(id, reservation.tokens), true)?;
+        settled += 1;
     }
     Ok(settled)
 }
 
 /// A lost response's usage, charged at its reservation's bound.
-fn bound_billing(of: u64, tokens: u64, cost: f64) -> Value {
-    json!({"of": of, "tokens": tokens, "cost": cost, "source": "hx", "evidence": "response lost; charged at the request's reserved upper bound"})
+fn bound_billing(of: u64, tokens: u64) -> Value {
+    json!({"of": of, "tokens": tokens, "source": "hx", "evidence": "response lost; charged at the request's reserved upper bound"})
 }
 
 fn binary_sha() -> Result<String> { Ok(eventlog::sha_bytes(&std::fs::read(std::env::current_exe()?)?)) }
@@ -191,7 +189,7 @@ impl Principal {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
-    pub input: u64, pub cache_write: u64, pub cache_read: u64, pub output: u64, pub cost: f64, pub calls: u64,
+    pub input: u64, pub cache_write: u64, pub cache_read: u64, pub output: u64, pub calls: u64,
     /// Requests the provider refused with HTTP 429.
     #[serde(default)]
     pub rate_limits: u64,
@@ -369,44 +367,29 @@ impl Supervisor {
         }
         let budget = self.manifest.as_ref().map(|m| &m.budget).unwrap_or(&self.policy.budget);
         let used = books.usage.total_tokens();
-        let (pending_tokens, pending_cost) = books.reserved();
+        let pending_tokens = books.reserved();
         // This is a conservative admission allowance, not a tokenizer or provider billing guarantee.
         let bytes = serde_json::to_vec(req)?.len() as u64;
         let max_output = req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output);
         let tokens = bytes.saturating_add(max_output);
         let over_tokens = budget.max_tokens.is_some_and(|m| used.saturating_add(pending_tokens) >= m);
-        let over_cost = budget.max_cost.is_some_and(|m| books.usage.cost + pending_cost >= m);
-        if (over_tokens || over_cost) && books.reservations.values().any(|r| r.running) { return Ok(None); }
+        if over_tokens && books.reservations.values().any(|r| r.running) { return Ok(None); }
         if over_tokens {
             self.policy.log.write("budget", json!({"reason":"budget_exceeded: token admission threshold reached","depth":depth}), true)?;
             bail!("budget_exceeded: token admission threshold reached");
         }
-        if over_cost {
-            self.policy.log.write("budget", json!({"reason":"budget_exceeded: cost admission threshold reached (including uncertain requests)","depth":depth}), true)?;
-            bail!("budget_exceeded: cost admission threshold reached (including uncertain requests)");
-        }
-        // A priced model reserves its request's upper bound, so concurrent requests run side by side. Without a price
-        // there is no defensible per-request dollar bound: one outstanding request reserves the remaining allowance and
-        // concurrent requests queue behind it above. Admission allowance is not billing evidence: only an explicit,
-        // unclipped price bound can settle a lost response, even when there is no dollar threshold.
-        let remaining = budget.max_cost.map(|m| (m - books.usage.cost - pending_cost).max(0.0));
-        let cost = match &cfg.price {
-            Some(price) => ReservationCost::UpperBound(price.bound(bytes, max_output)),
-            None => ReservationCost::Allowance(remaining.unwrap_or(0.0)),
-        };
         let seq = self.record_in(&mut books, "model_intent", json!({"model": cfg.model, "depth": depth,
-            "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens, "reserved_cost": cost}), true)?;
+            "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens}), true)?;
         Ok(Some(seq))
     }
 
-    /// A failed request: a definite rejection releases its reservation; a possibly billed one with a bounded reservation
-    /// is charged at that bound; otherwise it stays reserved as uncertain billing. Returns whether the reservation closed.
+    /// A failed request: a definite rejection releases its reservation; a possibly billed one is charged its reserved
+    /// tokens. Returns whether the reservation closed.
     pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, status: Option<u16>, unbilled: bool, depth: usize) -> Result<bool> {
         let mut books = self.books.lock().unwrap();
-        let bound = books.reservations.get(&op).filter(|_| !unbilled)
-            .and_then(|r| r.cost.upper_bound().map(|cost| (r.tokens, cost)));
+        let bound = books.reservations.get(&op).filter(|_| !unbilled).map(|r| r.tokens);
         let result = self.record_in(&mut books, "llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "status": status, "billing_uncertain": !unbilled}), true)
-            .and_then(|_| bound.map(|(tokens, cost)| self.record_in(&mut books, "billing", bound_billing(op, tokens, cost), true)).transpose());
+            .and_then(|_| bound.map(|tokens| self.record_in(&mut books, "billing", bound_billing(op, tokens), true)).transpose());
         Self::stop_running(&mut books, op);
         drop(books);
         self.settled.notify_waiters();
@@ -417,7 +400,7 @@ impl Supervisor {
         let mut books = self.books.lock().unwrap();
         let written = self.policy.log.blob(&serde_json::to_vec(reply)?).and_then(|blob| self.record_in(&mut books, "llm", json!({"of": op, "model": cfg.model,
             "depth": depth, "reply": blob, "input": reply.input, "cache_read": reply.cache_read, "cache_write": reply.cache_write,
-            "output": reply.output, "cost": reply.cost, "finish": reply.finish}), true));
+            "output": reply.output, "finish": reply.finish}), true));
         Self::stop_running(&mut books, op);
         drop(books);
         self.settled.notify_waiters();
@@ -434,11 +417,10 @@ impl Supervisor {
 
     pub fn budget_status(&self) -> Value {
         let books = self.books.lock().unwrap();
-        let (reserved_tokens, reserved_cost) = books.reserved();
+        let reserved_tokens = books.reserved();
         let b = self.manifest.as_ref().map(|m| &m.budget).unwrap_or(&self.policy.budget);
-        json!({"cost": books.usage.cost, "max_cost": b.max_cost, "tokens": books.usage.total_tokens(),
-            "max_tokens": b.max_tokens, "reserved_tokens": reserved_tokens,
-            "reserved_cost": reserved_cost, "max_wall": b.max_wall_secs,
+        json!({"tokens": books.usage.total_tokens(), "max_tokens": b.max_tokens, "reserved_tokens": reserved_tokens,
+            "max_wall": b.max_wall_secs,
             "deadline": self.manifest.as_ref().and_then(|m| m.deadline), "mode": "admission_threshold"})
     }
 }
@@ -453,37 +435,25 @@ mod checkpoint_tests {
     }
 
     #[tokio::test]
-    async fn lost_responses_require_real_billing_bounds_independent_of_budget() {
-        for (tag, limit, priced) in [("clipped", Some(0.001), true), ("uncapped", None, true), ("unknown", None, false)] {
+    async fn lost_responses_are_charged_their_reserved_tokens() {
+        for (tag, limit) in [("capped", Some(102)), ("uncapped", None)] {
             let dir = std::env::temp_dir().join(format!("hx-billing-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
-            let mut cfg = model();
-            if priced { cfg.price = Some(llm_price()); }
+            let cfg = model();
             let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
-                Budget { max_cost: limit, ..Budget::default() }, None).unwrap();
+                Budget { max_tokens: limit, ..Budget::default() }, None).unwrap();
             let op = supervisor.reserve_model(&cfg, &json!({}), 0).await.unwrap();
-            let bound = cfg.price.as_ref().map(|p| p.bound(2, 100));
-            assert_eq!(supervisor.books.lock().unwrap().reservations[&op].cost.upper_bound(), bound);
-            assert_eq!(supervisor.fail_model(op, &cfg, "lost response", None, false, 0).unwrap(), priced);
+            assert_eq!(supervisor.books.lock().unwrap().reservations[&op].tokens, 102);
+            assert!(supervisor.fail_model(op, &cfg, "lost response", None, false, 0).unwrap());
             let replay = Books::of(&eventlog::load(&supervisor.policy.log.path).unwrap()).unwrap();
-            if let Some(bound) = bound {
-                assert!(bound > 0.001);
-                assert_eq!(supervisor.usage().cost, bound);
-                assert!((replay.usage.cost - bound).abs() < 1e-12);
-                assert!(replay.reservations.is_empty());
-                if limit.is_some() { assert!(supervisor.reserve_model(&cfg, &json!({}), 0).await.is_err()); }
-            } else {
-                assert_eq!(supervisor.usage().calls, 0);
-                assert!(replay.reservations.contains_key(&op));
-            }
+            assert_eq!(supervisor.usage().total_tokens(), 102);
+            assert_eq!(replay.usage.total_tokens(), 102);
+            assert!(replay.reservations.is_empty());
+            if limit.is_some() { assert!(supervisor.reserve_model(&cfg, &json!({}), 0).await.is_err()); }
             drop(supervisor);
             let _ = std::fs::remove_dir_all(dir);
         }
-    }
-
-    fn llm_price() -> crate::llm::Price {
-        crate::llm::Price { tiers: vec![crate::llm::Tier { min_prompt_tokens: 0, input: 0.001, output: 0.001 }], request: 0.0 }
     }
 
     #[tokio::test]
@@ -493,7 +463,7 @@ mod checkpoint_tests {
         let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
         let cfg = model();
         let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
-            Budget { max_cost: Some(1.0), max_wall_secs: Some(0.1), ..Budget::default() }, None).unwrap();
+            Budget { max_tokens: Some(102), max_wall_secs: Some(0.5), ..Budget::default() }, None).unwrap();
         let first = supervisor.reserve_model(&cfg, &json!({}), 0).await.unwrap();
         let queued = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor.reserve_model(&cfg, &json!({}), 1)).await
             .expect("queued admission must not wait for an unsettled request after its deadline");

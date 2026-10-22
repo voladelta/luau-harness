@@ -78,9 +78,7 @@ def prepare(run_dir):
     (run_dir / 'prompt.md').write_text(BRIEF)
     write_json(run_dir / 'case.json', {'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'model':'deepseek-flash','api':'responses','base_url':'https://api.deepseek.com',
-        'pricing_note':'Harness estimates peak pricing; actual off-peak billing may be lower.',
-        'docs':['https://api-docs.deepseek.com/quick_start/pricing/',
-                'https://api-docs.deepseek.com/api/create-response/'],
+        'docs':['https://api-docs.deepseek.com/api/create-response/'],
         'independent_verifier':str(Path(__file__).resolve())})
     print(run_dir)
 
@@ -91,7 +89,6 @@ def run_agent(run_dir, args):
     argv = [str(Path(args.hx).resolve()), 'run', '--rpi', '--workspace', str(run_dir/'workspace'),
             '--prompt-file', str(run_dir/'prompt.md'), '--model','deepseek-flash','--api','responses',
             '--base-url','https://api.deepseek.com','--key-env','DEEPSEEK_API_KEY', '--reasoning',args.reasoning,
-            '--max-cost',str(args.max_cost),
             '--max-wall',str(args.max_wall),'--max-turns','200','--max-output','16384',
             '--context-window','1048576','--trace',str(run_dir/'trace.md')]
     if args.max_tokens is not None:
@@ -114,7 +111,7 @@ def run_agent(run_dir, args):
     if code:
         raise SystemExit('Agent failed; inspect '+str(run_dir/'stderr.log'))
     report=json.loads((run_dir/'result.json').read_text())
-    print(json.dumps({k:report.get(k) for k in ['finished','status','stopped','cost_usd','wall_secs','llm_calls']}))
+    print(json.dumps({k:report.get(k) for k in ['finished','status','stopped','wall_secs','llm_calls']}))
     verify(run_dir)
     if not report.get('finished'):
         raise SystemExit('External checks ran, but workflow did not finish; inspect result.json')
@@ -248,7 +245,6 @@ def main():
     parser.add_argument('action',choices=['prepare','run','verify'])
     parser.add_argument('--run-dir',type=Path)
     parser.add_argument('--hx',default=str(ROOT/'target/release/hx'))
-    parser.add_argument('--max-cost',type=float,default=2.0)
     parser.add_argument('--max-tokens',type=int,default=None)
     parser.add_argument('--max-wall',type=int,default=900)
     parser.add_argument('--reasoning',default='medium')

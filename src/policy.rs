@@ -26,7 +26,7 @@ struct PolicyFile {
     #[serde(default)]
     approval: ApprovalSection,
     #[serde(default)]
-    budget: Budget,
+    budget: BudgetSection,
     #[serde(default)]
     packs: PacksSection,
     #[serde(default)]
@@ -44,11 +44,17 @@ struct PacksSection {
     enable: Vec<String>,
 }
 
-/// Limits for one run, shared with every subagent. None = unlimited. Cost needs a provider that reports it
-/// (OpenRouter, Enclave); tokens (input + cache reads + cache writes + output) work everywhere.
+/// `[budget]`: unknown keys are an error, so a removed or misspelled limit cannot silently run unlimited.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct BudgetSection {
+    max_tokens: Option<u64>,
+    max_wall_secs: Option<f64>,
+}
+
+/// Limits for one run, shared with every subagent. None = unlimited. Tokens are input + cache reads + cache writes + output.
 #[derive(Deserialize, serde::Serialize, Default, Clone, Debug, PartialEq)]
 pub struct Budget {
-    pub max_cost: Option<f64>,
     pub max_tokens: Option<u64>,
     pub max_wall_secs: Option<f64>,
 }
@@ -244,7 +250,7 @@ impl Policy {
             p.write_roots.extend(w);
             p.net = f.net.allow;
             p.gpu = f.gpu.allow;
-            p.budget = f.budget;
+            p.budget = Budget { max_tokens: f.budget.max_tokens, max_wall_secs: f.budget.max_wall_secs };
             p.packs = f.packs.enable;
             p.ask = f.approval.ask;
             p.allow = f.approval.allow;

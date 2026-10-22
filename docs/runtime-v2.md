@@ -71,7 +71,7 @@ Checkpoint blobs remain the only authoritative bodies. A disposable descriptor i
 
 Every mutating effect records a synced intent before its executor runs. Outcomes include full argument hashes and result receipts. A global mutation permit serializes mutations; sealed read batches may run concurrently. Subagents and packages retain or reduce their caller's authority.
 
-There is at most one application-level dispatch attempt for an operation ID. A provider that answers without a generation is classified: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 5xx or malformed 200 body gets one new request under a new operation ID, and a 429 that generated nothing up to eight, backing off 2, 4, 8 … s when the provider names no delay (honouring `Retry-After`, capped at 30 s). A failed attempt that may have been billed (a lost response, a 500, 502 or 504) is charged at its reservation when that reservation has a price bound (`"reserved_cost": {"kind": "upper_bound", "usd": amount}`), recorded as a `billing` record with `"source": "hx"`; a lost response then gets one new request under a new operation ID. An unpriced reservation stays open as uncertain billing until the owner reconciles it, even without a dollar threshold; zero reserved dollars do not mean a request was free. Underlying services may have their own internal behavior; hx does not establish exactly-once remote execution.
+There is at most one application-level dispatch attempt for an operation ID. A provider that answers without a generation is classified: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 5xx or malformed 200 body gets one new request under a new operation ID, and a 429 that generated nothing up to eight, backing off 2, 4, 8 … s when the provider names no delay (honouring `Retry-After`, capped at 30 s). A failed attempt that may have been billed (a lost response, a 500, 502 or 504) is charged its reserved tokens, recorded as a `billing` record with `"source": "hx"`; a lost response then gets one new request under a new operation ID. A reservation left open by a crash is charged the same way on resume or branch. Underlying services may have their own internal behavior; hx does not establish exactly-once remote execution.
 
 An intent without an outcome is uncertain. Local `write` and `edit` settle themselves on resume or branch: each journals the hash of the content it is about to produce (`expect`) and replaces the file atomically (temp file, fsync, rename), so the file holds either its old content or exactly that. hx records a `resolution` with `"by": "hx"` and its evidence: `complete` when the file's hash matches, `abandon` when no `expect` was journaled or the file holds its previous content. An unreadable file is left for the owner.
 
@@ -86,14 +86,6 @@ hx recover .harness/log/RUN.jsonl OP --decision abandon --yes
 ```
 
 Record a decision based on the actual external state; it dispatches nothing and is final. After `abandon`, the resumed agent sees the receipts and can issue the operation again if it is still needed.
-
-Uncertain model calls with an admission allowance (`"reserved_cost": {"kind": "allowance", "usd": amount}`) retain their reservations. The amount controls admission and is not evidence of a charge. After checking provider usage, the owner can settle one explicitly:
-
-```bash
-hx recover .harness/log/RUN.jsonl OP --decision billing --tokens 1234 --cost 0.02 --yes
-```
-
-That command records asserted usage and releases the reservation; it never sends a provider request.
 
 Journal or blob failure is fatal to effect admission, including when Luau catches the returned error. A separate OS lock allows only one writer/resumer. Hash chains and blob hashes detect corruption; they are not authentication against an owner who can rewrite the entire run store.
 
@@ -114,9 +106,9 @@ hx run --workspace PROJECT --branch PROJECT/.harness/log/RUN.jsonl \
   --model MODEL --api completions --key-env OPENROUTER_API_KEY
 ```
 
-A branch inherits committed durable data and the task unless `--prompt-file` supplies a new task. It starts a new conversation and budget under a new manifest. Reconcile uncertain effects and model billing first. Previous receipts remain in the parent journal; branching does not undo the parent's workspace changes.
+A branch inherits committed durable data and the task unless `--prompt-file` supplies a new task. It starts a new conversation and budget under a new manifest. Reconcile uncertain effects first. Previous receipts remain in the parent journal; branching does not undo the parent's workspace changes.
 
-The branch's parent identity and inherited data are committed in its manifest, so recovery before the first controller checkpoint retains the seed data. Revocation blocks execution while still permitting the owner to reconcile effect receipts and billing, then branch.
+The branch's parent identity and inherited data are committed in its manifest, so recovery before the first controller checkpoint retains the seed data. Revocation blocks execution while still permitting the owner to reconcile effect receipts, then branch.
 
 ## Extensions and capabilities
 
@@ -214,7 +206,7 @@ Adapted phase instructions and the upstream MIT notice are embedded with the bin
 
 ## Autoresearch workflow
 
-`hx run --ar --prompt-file PROGRAM` searches for a better score under `.harness/ar.toml` (covered by `hx trust`). It requires Git and a committed workspace apart from the editable paths. `--rpi`, `--branch`, `--trace`, `--max-tokens`, `--max-wall`, `--max-turns` and `--max-cost` are refused: episodes are limited in model turns, and the run ends by its own progress rule. All other run flags pass through to the episodes. `hx run --ar --resume .harness/ar/RUN` continues an interrupted search with its frozen launch settings.
+`hx run --ar --prompt-file PROGRAM` searches for a better score under `.harness/ar.toml` (covered by `hx trust`). It requires Git and a committed workspace apart from the editable paths. `--rpi`, `--branch`, `--trace`, `--max-tokens`, `--max-wall` and `--max-turns` are refused: episodes are limited in model turns, and the run ends by its own progress rule. All other run flags pass through to the episodes. `hx run --ar --resume .harness/ar/RUN` continues an interrupted search with its frozen launch settings.
 
 ```toml
 editable = ["ar/strategy.pine"]                  # files or directories; the only thing that leaves an episode
@@ -248,15 +240,15 @@ min_delta = 0.05
 
 **Final result.** The good candidates the last gate chose, best search score first, are written to `portfolio/c<id>/`, and the first goes into the workspace's editable paths. Choosing on `select` makes its numbers optimistic, so compare finished runs on a third tier no run ever touches (a lockbox). The result is only as safe as the select tier's veto: it must reach the shift the result has to survive (other years, symbols or input ranges), and it needs enough cases that candidates differ by more than its noise.
 
-**Limits.** Every episode is limited to 40 model turns, so a run means the same on any model; there is no dollar budget. Stopping the orchestrator (SIGINT, SIGTERM or SIGHUP) stops its episode children, which kill the commands and evaluators they started; a child whose orchestrator dies outright sees its stdin close and stops the same way. An episode that dies before any eval is retried up to twice; when every episode of a batch crashed, the next try waits 2, then 4 minutes, and if the run has no eval yet and episodes keep crashing, it stops with the child's error. A run that ends with no evals exits nonzero.
+**Limits.** Every episode is limited to 40 model turns, so a run means the same on any model. Stopping the orchestrator (SIGINT, SIGTERM or SIGHUP) stops its episode children, which kill the commands and evaluators they started; a child whose orchestrator dies outright sees its stdin close and stops the same way. An episode that dies before any eval is retried up to twice; when every episode of a batch crashed, the next try waits 2, then 4 minutes, and if the run has no eval yet and episodes keep crashing, it stops with the child's error. A run that ends with no evals exits nonzero.
 
 **State and recovery.** `.harness/ar/RUN/` holds `launch.json` (spec, program, child flags, budget, frozen commit), `base/`, `seed`, `seed.json`, `journal.jsonl` (planned batches, episodes, held-out scores, audits and gates), `ledger.jsonl` (each row names its candidate), `claims.jsonl`, `snaps/`, `portfolio/`, `episodes/` (task, stderr, report and journals per child) and `report.json`. Each batch is journaled whole before any of it starts, and each episode as started (with its scratch directory) before its child runs and finished after. Resume uses the spec frozen in `launch.json` (approved at launch), so later edits to `ar.toml` neither change nor block it. It first closes an episode that never finished with a journaled charge: from the killed child's journals in its leftover scratch directory, which is then removed, or the whole allowance when that directory is gone. Then it runs what was planned but not finished, retrying interrupted workers that had not scored anything and interrupted research and audits (judged by a final answer a killed child never gave), and continues; a retried worker keeps the claim its earlier attempt made, and held-out scores, audit verdicts and gates already journaled are reused. A torn final line in the ledger or journal (a writer killed mid-append) is ignored when read and dropped before the next append. Kill the orchestrator's process group, not only the orchestrator, so no child keeps running.
 
 ## Budgets and validation
 
-One journal-backed ledger accounts for the root and all descendants. Admission atomically reserves an allowance; successful receipts settle it. Under a dollar threshold, launch looks up the model's price in the endpoint's `/models` list (OpenRouter publishes it) and freezes it in the manifest. Each request then reserves its full upper bound, even when it exceeds the remaining allowance: every request byte as an input token at the highest of the prompt and cache-write prices, plus the full output cap, plus any per-request fee, at the highest pricing tier the request could reach. OpenRouter's `overrides` tiers count: time-of-day tiers always, long-context tiers only once the request's bytes reach their `min_prompt_tokens`, since a request has no more tokens than bytes. A model with variable pricing (a negative price, as `openrouter/auto` lists) is unpriced. The lookup needs no key. Concurrent subagents are admitted side by side while bounds fit. A subagent on a different model, or a run whose endpoint has no price, falls back to reserving the whole remaining allowance per request; other requests wait for it to settle instead of failing. Only settled usage and unbounded uncertain reservations stop admission. Token allowances use request bytes plus the configured output cap. Settled token usage includes ordinary input, cache reads, cache writes and output; reasoning is already included in output. Both limits are documented admission thresholds, not exact tokenizer or billing ceilings. Reservations from uncertain requests survive restarts.
+One journal-backed ledger accounts for the root and all descendants. Admission atomically reserves request bytes plus the configured output cap in tokens; successful receipts settle it. Concurrent subagents are admitted side by side while reservations fit under `max_tokens`; otherwise a request waits for running ones to settle instead of failing. Settled token usage includes ordinary input, cache reads, cache writes and output; reasoning is already included in output. The limit is an admission threshold, not an exact tokenizer or billing ceiling. hx tracks no dollar cost.
 
-A 4xx answer, including a context rejection, releases its reservation, so a definite context rejection can trigger one compaction and a new request under any threshold. Transport loss and failed 5xx attempts are charged at bounded reservations and otherwise retain them.
+A 4xx answer, including a context rejection, releases its reservation, so a definite context rejection can trigger one compaction and a new request under any threshold. Transport loss and failed 5xx attempts are charged their reserved tokens.
 
 The absolute run deadline includes downtime. It is checked before admission and around every controller transition, including controller-only loops. Controller execution and queued model admission also observe it. It interrupts local VM/process/model work where possible. Cancellation cannot revoke a request already accepted by a remote service.
 

@@ -50,7 +50,7 @@ class H(BaseHTTPRequestHandler):
             if text or not calls:
                 out.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
             out += [{"type": "function_call", "call_id": i, "name": nm, "arguments": a} for i, (nm, a) in zip(ids, calls)]
-            doc = {"error": None, "output": out, "usage": {"input_tokens": ptok, "output_tokens": 5, "cost": 0.001}}
+            doc = {"error": None, "output": out, "usage": {"input_tokens": ptok, "output_tokens": 5}}
         else:
             msg = {"role": "assistant", "content": text or None}
             if isinstance(reply, dict) and reply.get("reasoning"):
@@ -58,7 +58,7 @@ class H(BaseHTTPRequestHandler):
             if calls:
                 msg["tool_calls"] = [{"id": i, "type": "function", "function": {"name": nm, "arguments": a}} for i, (nm, a) in zip(ids, calls)]
             doc = {"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else "stop"}],
-                   "usage": {"prompt_tokens": ptok, "completion_tokens": 5, "cost": 0.001}}
+                   "usage": {"prompt_tokens": ptok, "completion_tokens": 5}}
         out = json.dumps(doc).encode()
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(out)))
         self.end_headers(); self.wfile.write(out)

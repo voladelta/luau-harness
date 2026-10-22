@@ -76,8 +76,8 @@ impl Host {
     pub fn start(llm: LlmCfg, policy: Arc<Policy>, options: StartOptions) -> Result<Arc<Self>> {
         let StartOptions { task, max_turns, trace, budget: flags, mut packs, branch, workflow } = options;
         let pb = &policy.budget;
-        let budget = Budget { max_cost: flags.max_cost.or(pb.max_cost), max_tokens: flags.max_tokens.or(pb.max_tokens), max_wall_secs: flags.max_wall_secs.or(pb.max_wall_secs) };
-        for limit in [budget.max_cost, budget.max_wall_secs].into_iter().flatten() {
+        let budget = Budget { max_tokens: flags.max_tokens.or(pb.max_tokens), max_wall_secs: flags.max_wall_secs.or(pb.max_wall_secs) };
+        if let Some(limit) = budget.max_wall_secs {
             anyhow::ensure!(limit.is_finite() && limit >= 0.0, "budgets must be finite and nonnegative");
         }
         for pack in &policy.packs { if !packs.contains(pack) { packs.push(pack.clone()); } }
@@ -105,8 +105,7 @@ impl Host {
         anyhow::ensure!(self.depth < self.max_depth, "agent depth limit ({}) reached", self.max_depth);
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let mut llm = self.llm.clone();
-        // The launch-time price is for the run's model; another model's requests fall back to the unpriced reservation.
-        if let Some(model) = options.model.as_ref().filter(|m| **m != llm.model) { llm.model = model.clone(); llm.price = None; }
+        if let Some(model) = &options.model { llm.model = model.clone(); }
         if options.effort.is_some() { llm.reasoning = options.effort.clone(); }
         Ok(Arc::new(Self { llm, workspace: self.workspace.clone(), policy: self.policy.clone(), supervisor: self.supervisor.clone(),
             principal, durable: Arc::new(Mutex::new(json!({}))), lane: format!("{}/{}", self.lane, NEXT.fetch_add(1, Ordering::Relaxed)),
@@ -132,7 +131,6 @@ impl Host {
         report["cache_creation_tokens"] = json!(usage.cache_write);
         report["cache_read_tokens"] = json!(usage.cache_read);
         report["output_tokens"] = json!(usage.output);
-        report["cost_usd"] = json!(usage.cost);
         report["llm_calls"] = json!(usage.calls);
         report["rate_limits"] = json!(usage.rate_limits);
         report["wall_secs"] = json!(wall_secs);
@@ -175,9 +173,8 @@ impl Host {
                 Ok(reply) => { self.supervisor.settle_model(op, cfg, &reply, self.depth)?; return Ok(reply); },
                 Err(error) => error,
             };
-            // An answer without a generation is classified. A lost response may have been billed: when its reservation
-            // was a real bound it is charged at that bound and a new request may follow; otherwise it stays reserved for
-            // the owner. The lost operation itself is never dispatched again.
+            // An answer without a generation is classified. A lost response may have been billed: it is charged its
+            // reserved tokens and a new request may follow. The lost operation itself is never dispatched again.
             let answered = error.downcast_ref::<llm::Answered>();
             let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.map(|a| a.status), answered.is_some_and(|a| a.unbilled()), self.depth)?;
             let retry = match answered { Some(a) => a.retryable().then_some(a.retry_after), None => closed.then_some(None) };

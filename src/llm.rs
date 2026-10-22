@@ -21,162 +21,6 @@ pub struct LlmCfg {
     pub cache_key: Option<String>,
     /// OpenRouter only: restrict routing to these upstream providers, no fallbacks (keeps a prompt cache on one provider)
     pub provider_only: Vec<String>,
-    /// this model's price, looked up at launch when a dollar threshold is set; bounds each request's reservation
-    #[serde(default)]
-    pub price: Option<Price>,
-}
-
-/// USD per token (and per request), from the endpoint's model list.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct Price {
-    /// the base price and each listed override (long-context and time-of-day tiers)
-    pub tiers: Vec<Tier>,
-    pub request: f64,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct Tier {
-    /// the tier applies from this many prompt tokens (0: always possible, e.g. a time-of-day tier)
-    pub min_prompt_tokens: u64,
-    /// the highest of the prompt and cache-write prices
-    pub input: f64,
-    pub output: f64,
-}
-
-impl Price {
-    /// An upper bound on one request's cost: every request byte billed as an input token, plus the full output cap, at
-    /// the highest tier the request could fall in. A request has no more prompt tokens than bytes, so a tier whose
-    /// threshold exceeds the byte count cannot apply.
-    pub fn bound(&self, request_bytes: u64, max_output: u64) -> f64 {
-        let (input, output) = self.tiers.iter().filter(|t| t.min_prompt_tokens <= request_bytes)
-            .fold((0.0_f64, 0.0_f64), |(i, o), t| (i.max(t.input), o.max(t.output)));
-        request_bytes as f64 * input + max_output as f64 * output + self.request
-    }
-}
-
-pub fn fallback_price(model: &str) -> Option<Price> {
-    if model.contains("deepseek-flash") {
-        Some(Price {
-            tiers: vec![Tier { min_prompt_tokens: 0, input: 0.30 / 1_000_000.0, output: 1.20 / 1_000_000.0 }],
-            request: 0.0,
-        })
-    } else if model.contains("deepseek") {
-        Some(Price {
-            tiers: vec![Tier { min_prompt_tokens: 0, input: 0.55 / 1_000_000.0, output: 2.19 / 1_000_000.0 }],
-            request: 0.0,
-        })
-    } else {
-        None
-    }
-}
-
-pub fn calculate_token_cost(model: &str, price: Option<&Price>, input: u64, cache_read: u64, cache_write: u64, output: u64) -> f64 {
-    if model.contains("deepseek-flash") {
-        (cache_read as f64 * (0.006 / 1_000_000.0))
-            + ((input + cache_write) as f64 * (0.30 / 1_000_000.0))
-            + (output as f64 * (1.20 / 1_000_000.0))
-    } else if model.contains("deepseek") {
-        (cache_read as f64 * (0.14 / 1_000_000.0))
-            + ((input + cache_write) as f64 * (0.55 / 1_000_000.0))
-            + (output as f64 * (2.19 / 1_000_000.0))
-    } else if let Some(p) = price {
-        if let Some(tier) = p.tiers.first() {
-            let prompt_tokens = (input + cache_write) as f64;
-            let cache_tokens = cache_read as f64;
-            let cache_rate = tier.input * 0.1;
-            prompt_tokens * tier.input + cache_tokens * cache_rate + output as f64 * tier.output
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    }
-}
-
-/// The model's price from `{base}/models` (OpenRouter publishes `pricing` there). None when the endpoint has no
-/// usable price for it, e.g. a router with variable pricing.
-pub async fn fetch_price(cfg: &LlmCfg) -> Option<Price> {
-    let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
-    if let Some(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok() {
-        let mut get = http.get(format!("{base}/models"));
-        if let Ok(key) = cfg.key() { get = get.bearer_auth(key); }
-        if let Some(resp) = get.send().await.ok().and_then(|r| r.error_for_status().ok()) {
-            if let Some(list) = resp.json::<Value>().await.ok() {
-                if let Some(model) = list["data"].as_array().and_then(|a| a.iter().find(|m| m["id"] == cfg.model.as_str())) {
-                    if let Some(price) = price_of(&model["pricing"]) {
-                        return Some(price);
-                    }
-                }
-            }
-        }
-    }
-    fallback_price(&cfg.model)
-}
-
-/// Each tier's prices, an override inheriting what it does not list from the base. A negative price means variable: None.
-fn price_of(pricing: &Value) -> Option<Price> {
-    let num = |t: &Value, k: &str| -> Option<Option<f64>> {
-        let v = &t[k];
-        match v.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| v.as_f64()).filter(|p| p.is_finite()) {
-            Some(p) if p < 0.0 => None,
-            other => Some(other.or_else(|| { let b = &pricing[k]; b.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| b.as_f64()) })),
-        }
-    };
-    // OpenRouter lists dollars per token as strings. Some routers list bare numbers in dollars per million tokens; no
-    // model costs over $0.01 a token ($10,000 per million), so a larger bare number is per million.
-    let numeric = pricing["prompt"].is_number();
-    let per_token = |p: f64| if numeric && p > 0.01 { p / 1_000_000.0 } else { p };
-    let tier = |t: &Value| -> Option<Tier> {
-        let input = [num(t, "prompt")?, num(t, "input_cache_write")?, num(t, "input_cache_write_1h")?];
-        Some(Tier { min_prompt_tokens: t["min_prompt_tokens"].as_u64().unwrap_or(0),
-            input: per_token(input[0]?.max(input[1].unwrap_or(0.0)).max(input[2].unwrap_or(0.0))),
-            output: per_token(num(t, "completion")??) })
-    };
-    let tiers = std::iter::once(pricing).chain(pricing["overrides"].as_array().into_iter().flatten()).map(tier).collect::<Option<Vec<_>>>()?;
-    Some(Price { tiers, request: num(pricing, "request")?.unwrap_or(0.0) })
-}
-
-#[cfg(test)]
-mod price_tests {
-    #[test]
-    fn per_million_prices_are_read_per_token() {
-        let p = super::price_of(&serde_json::json!({"prompt": 0.15, "completion": 0.5})).unwrap();
-        assert!((p.tiers[0].input - 0.15e-6).abs() < 1e-15 && (p.tiers[0].output - 0.5e-6).abs() < 1e-15);
-        let q = super::price_of(&serde_json::json!({"prompt": "0.00000015", "completion": "0.0000005"})).unwrap();
-        assert_eq!((q.tiers[0].input, q.tiers[0].output), (p.tiers[0].input, p.tiers[0].output));
-        let r = super::price_of(&serde_json::json!({"prompt": "0.05", "completion": "0.05"})).unwrap();
-        assert_eq!(r.tiers[0].input, 0.05); // a string is always per token
-    }
-
-    use super::*;
-
-    #[test]
-    fn price_tiers_inherit_the_base_and_bound_by_reachable_tiers() {
-        let haiku = json!({"prompt": "0.0000001", "completion": "0.0000005", "input_cache_write": "0.000000125", "input_cache_write_1h": "0.0000002",
-            "overrides": [{"min_prompt_tokens": 100000, "prompt": "0.0000005", "completion": "0.0000025", "input_cache_write_1h": "0.000001"}]});
-        let p = price_of(&haiku).unwrap();
-        assert_eq!(p.tiers, vec![Tier { min_prompt_tokens: 0, input: 0.0000002, output: 0.0000005 },
-            Tier { min_prompt_tokens: 100000, input: 0.000001, output: 0.0000025 }]);
-        // a short request cannot reach the long-context tier; a long one can
-        assert!((p.bound(1000, 1000) - (1000.0 * 0.0000002 + 1000.0 * 0.0000005)).abs() < 1e-12);
-        assert!((p.bound(200000, 1000) - (200000.0 * 0.000001 + 1000.0 * 0.0000025)).abs() < 1e-12);
-        // a time-of-day tier has no threshold, so it always counts
-        let peak = price_of(&json!({"prompt": "0.000001", "completion": "0.000002", "request": "0.01",
-            "overrides": [{"utc_days": ["monday"], "prompt": "0.000002", "completion": "0.000004"}]})).unwrap();
-        assert!((peak.bound(10, 10) - (10.0 * 0.000002 + 10.0 * 0.000004 + 0.01)).abs() < 1e-12);
-        assert_eq!(price_of(&json!({"prompt": "-1", "completion": "-1"})), None);
-        assert_eq!(price_of(&json!({"prompt": "0.000001"})), None);
-    }
-
-    #[test]
-    fn deepseek_flash_cost_calculation_tracks_usage_accurately() {
-        let p = fallback_price("deepseek-flash").unwrap();
-        assert_eq!(p.request, 0.0);
-        // 100k cache read ($0.006/1M), 10k input ($0.30/1M), 5k output ($1.20/1M)
-        let cost = calculate_token_cost("deepseek-flash", Some(&p), 10_000, 100_000, 0, 5_000);
-        let expected = (100_000.0 * 0.006 + 10_000.0 * 0.30 + 5_000.0 * 1.20) / 1_000_000.0;
-        assert!((cost - expected).abs() < 1e-9);
-    }
 }
 
 /// The provider answered but returned no usable generation. A transport loss is a plain error instead: only then is
@@ -216,7 +60,6 @@ pub struct Reply {
     pub cache_read: u64,
     pub cache_write: u64,
     pub output: u64,
-    pub cost: f64,
 }
 
 impl LlmCfg {
@@ -393,11 +236,6 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         out.cache_write = d["cache_write_tokens"].as_u64().unwrap_or(0);
         out.input = u["input_tokens"].as_u64().unwrap_or(0).saturating_sub(out.cache_read + out.cache_write);
         out.output = u["output_tokens"].as_u64().unwrap_or(0);
-        let mut cost = u["cost"].as_f64().unwrap_or(0.0);
-        if cost == 0.0 {
-            cost = calculate_token_cost(&cfg.model, cfg.price.as_ref(), out.input, out.cache_read, out.cache_write, out.output);
-        }
-        out.cost = cost;
         let items: Vec<Value> = resp["output"].as_array().cloned().unwrap_or_default();
         out.text = items.iter().filter(|o| o["type"] == "message").flat_map(|o| o["content"].as_array().into_iter().flatten()).filter(|c| c["type"] == "output_text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n");
         out.calls = items.iter().filter(|o| o["type"] == "function_call").map(|o| call(o["call_id"].as_str().unwrap_or(""), o["name"].as_str().unwrap_or(""), o["arguments"].as_str().unwrap_or(""))).collect();
@@ -410,11 +248,6 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         out.cache_write = d["cache_write_tokens"].as_u64().unwrap_or(0);
         out.input = u["prompt_tokens"].as_u64().unwrap_or(0).saturating_sub(out.cache_read + out.cache_write);
         out.output = u["completion_tokens"].as_u64().unwrap_or(0);
-        let mut cost = u["cost"].as_f64().unwrap_or(0.0);
-        if cost == 0.0 {
-            cost = calculate_token_cost(&cfg.model, cfg.price.as_ref(), out.input, out.cache_read, out.cache_write, out.output);
-        }
-        out.cost = cost;
         let msg = &resp["choices"][0]["message"];
         out.text = msg["content"].as_str().unwrap_or_default().to_string();
         out.calls = msg["tool_calls"].as_array().into_iter().flatten().map(|c| call(c["id"].as_str().unwrap_or(""), c["function"]["name"].as_str().unwrap_or(""), c["function"]["arguments"].as_str().unwrap_or(""))).collect();

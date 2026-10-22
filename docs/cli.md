@@ -11,7 +11,6 @@ Every command takes `--help`.
 | `hx run --branch LOG --model M` | Start a new run using current approved configuration and inherited saved data |
 | `hx review LOG --gate ID --decision approve` | Record an RPI review decision; resume separately to continue |
 | `hx recover LOG OP --decision complete\|abandon --yes` | Record an owner's decision about an uncertain mutation; never executes it |
-| `hx recover LOG OP --decision billing --tokens N --cost USD --yes` | Settle an uncertain model request's reservation using asserted usage |
 | `hx revoke LOG` | Stop admitting further operations for a run |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
 | `hx test PKG_DIR` | Run a package's `tests/*.luau`; exits 1 on failure |
@@ -38,7 +37,7 @@ Every command takes `--help`.
 | `--max-turns N` | 200 | Turn limit; the report says `stopped: "max_turns: N"` when it is hit |
 | `--max-output N` | 16384 | Max output tokens per turn |
 | `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at min(~95% of it, 256k); give a smaller model's window so it compacts before an overflow |
-| `--max-cost USD` `--max-tokens N` `--max-wall SECS` | none | Admission thresholds and absolute deadline; flags override `policy.toml` for a new run |
+| `--max-tokens N` `--max-wall SECS` | none | Admission thresholds and absolute deadline; flags override `policy.toml` for a new run |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
 | `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
 | `--trace FILE` | | Write a readable trace |
@@ -56,13 +55,13 @@ Environment: `HX_MODEL`, `HX_API` and `HX_BASE_URL` set defaults for the matchin
 
 ## Report and logs
 
-`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer`, tokens and cost. The event log is written to `.harness/log/`. The log stores file contents and command output as blobs in `.harness/log/blobs/`, so treat it as sensitive.
+`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer` and tokens. The event log is written to `.harness/log/`. The log stores file contents and command output as blobs in `.harness/log/blobs/`, so treat it as sensitive.
 
 ## Checkpoints and resume
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Interrupted local `write`/`edit` and sandboxed offline `sh` settle themselves from the evidence. Other uncertain effects and unbounded model reservations wait for `hx recover`.
+Interrupted local `write`/`edit` and sandboxed offline `sh` settle themselves from the evidence. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
 
 `--branch LOG` starts a new run with new settings and the inherited saved data.
 

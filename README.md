@@ -28,7 +28,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | [RPI workflow](docs/workflows.md#rpi-research-design-implement-verify) | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds owner review gates |
 | [Autoresearch](docs/workflows.md#autoresearch) | `--ar` improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
 | [Recovery](docs/cli.md#checkpoints-and-resume) | `--resume` restores saved data and controller state into a fresh VM; old effectful chunks are never replayed |
-| [Budgets](docs/configuration.md#policytoml) | Cost, token and wall-clock admission thresholds; each request reserves its priced upper bound |
+| [Budgets](docs/configuration.md#policytoml) | Token and wall-clock admission thresholds; each request reserves its upper bound in tokens |
 | [Compaction](docs/configuration.md#initluau-compaction-and-recheck) | On by default: from 256k tokens at the latest, older history becomes a structured summary; Luau globals stay |
 | [Extensions](docs/extending.md) | Override any `std` module; add single-file tools, approved packages, skills and MCP servers |
 | Any provider | Responses API or Chat Completions; any compatible base URL (OpenRouter by default) |
@@ -93,10 +93,10 @@ cargo install --path .
 3. Run it in the project directory:
 
    ```bash
-   hx run --workspace . --prompt-file task.md --model anthropic/claude-sonnet-5.5 --max-cost 0.50
+   hx run --workspace . --prompt-file task.md --model anthropic/claude-sonnet-5.5 --max-tokens 2000000
    ```
 
-hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens, cost) and writes the event log to `.harness/log/`.
+hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens) and writes the event log to `.harness/log/`.
 
 Any OpenRouter model works the same way. For another OpenAI-compatible provider, pass its URL and key variable:
 
@@ -187,7 +187,7 @@ Independent suites run concurrently; suites sharing mock ports run sequentially,
 - **Compaction and finish review are heuristics.** Summary and review quality depend on the model. Context size is configured, not detected; resume restores it. Disabling compaction is in [configuration](docs/configuration.md#initluau-compaction-and-recheck).
 - **No benchmark.** hx ships without an eval suite; its checks cover behavior, not task success or token efficiency.
 - **Recovery is explicit.** Arbitrary globals, closures and scratch files are not durable. A killed command's unrecorded output is lost; its external effect may already have happened. There is no exactly-once remote execution or rollback guarantee.
-- **Budgets are admission thresholds.** Request-byte allowances are not exact token counts, provider costs may be unavailable, and cancellation cannot stop remote billing already accepted. Runtime v2 has scripted validation, not new live-provider or performance measurements.
+- **Budgets are admission thresholds.** Request-byte allowances are not exact token counts, hx tracks no dollar cost, and cancellation cannot stop remote billing already accepted. Runtime v2 has scripted validation, not new live-provider or performance measurements.
 
 ## License
 

@@ -86,7 +86,7 @@ def run_agent(run,args):
     argv=[str(Path(args.hx).resolve()),'run','--rpi','--workspace',str(run/'ws'),
         '--prompt-file',str(run/'prompt.md'),'--model',model,'--api',api,
         '--base-url',base_url,'--key-env',key_env,'--reasoning',args.reasoning,
-        '--max-cost',str(args.max_cost),'--max-wall',str(args.max_wall),
+        '--max-wall',str(args.max_wall),
         '--max-turns','200','--max-output','16384','--context-window',context_window,'--trace',str(run/'trace.md')]
     if args.max_tokens is not None:
         argv.extend(['--max-tokens',str(args.max_tokens)])
@@ -105,7 +105,7 @@ def run_agent(run,args):
     save(run/'process.json',{'exit_code':code,'elapsed_secs':time.monotonic()-started})
     if code:raise SystemExit('Agent failed; inspect '+str(run/'stderr.log'))
     report=json.loads((run/'result.json').read_text())
-    print(json.dumps({k:report.get(k) for k in ['finished','status','stopped','cost_usd','wall_secs','llm_calls']}),flush=True)
+    print(json.dumps({k:report.get(k) for k in ['finished','status','stopped','wall_secs','llm_calls']}),flush=True)
     verify(run)
     if not report.get('finished'):raise SystemExit('Verifier passed but workflow did not finish')
 
@@ -123,7 +123,6 @@ def main():
     p.add_argument('--base-url',default=None)
     p.add_argument('--key-env',default=None)
     p.add_argument('--context-window',type=int,default=None)
-    p.add_argument('--max-cost',type=float,default=2.0)
     p.add_argument('--max-tokens',type=int,default=None)
     p.add_argument('--max-wall',type=int,default=900)
     p.add_argument('--reasoning',default='medium')

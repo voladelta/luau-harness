@@ -31,7 +31,6 @@ ask = ["terraform apply"]       # extra command substrings that need approval
 allow = ["git push origin"]     # pre-approved (substring; irreversible commands need an exact match)
 
 [budget]
-max_cost = 0.50
 max_tokens = 600000
 max_wall_secs = 900
 
@@ -39,7 +38,7 @@ max_wall_secs = 900
 enable = []
 ```
 
-Budgets are admission thresholds: each request reserves its priced upper bound (the whole remaining allowance when no price is known), and the deadline is absolute, so downtime counts. `hx run` flags override these values for a new run.
+Budgets are admission thresholds: each request reserves its upper bound in tokens (request bytes plus the output cap), and the deadline is absolute, so downtime counts. There is no dollar budget; an unknown key such as `max_cost` is an error. `hx run` flags override these values for a new run.
 
 ## `mcp.toml`
 

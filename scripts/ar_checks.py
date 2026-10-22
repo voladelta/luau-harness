@@ -20,7 +20,6 @@ from pathlib import Path
 
 BASE = harness.BASE / "ar"
 BASE.mkdir(exist_ok=True)
-PRICE = {"prompt": "0.00001", "completion": "0.00001"}
 SCORE = 'import json; x = int(open("x.txt").read()); print(json.dumps({"score": -(x - %d) ** 2, "report": {"x": x}}))'
 passed = 0
 lock = threading.Lock()
@@ -274,7 +273,7 @@ def scenario_00():
     # 1. The manager loop: research, explore workers claiming first come first served, a gate with an audit, exploit
     # rounds with distinct refinements, and a portfolio of distinct audited candidates ranked by held-out score.
     path = workspace("rounds")
-    with harness.provider(scripted, price=PRICE) as (url, requests):
+    with harness.provider(scripted) as (url, requests):
         result = ar(path, url)
     report = report_of(result)
     run = path / ".harness/ar" / report["run"]
@@ -333,7 +332,7 @@ def scenario_00():
     # Replaying the finished run from its journal reaches the same stop without starting anything.
     (run / "report.json").unlink()
     before = (run / "journal.jsonl").read_text()
-    with harness.provider(scripted, price=PRICE) as (url, replayed):
+    with harness.provider(scripted) as (url, replayed):
         replay = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)],
                                 env=harness.ENV, capture_output=True, text=True, timeout=600)
     assert replay.returncode == 0 and not replayed, replay.stderr[-2000:]
@@ -367,7 +366,7 @@ def scenario_01():
     # each round alone would stop after round 3.
     path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIMB},
                      'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "python3 select.py"\ntimeout = 30\nmin_delta = 1.5\n')
-    with harness.provider(climbing, price=PRICE) as (url, _):
+    with harness.provider(climbing) as (url, _):
         result = ar(path, url)
     report = report_of(result)
     assert report["rounds"] > 4 and "two rounds in a row made no progress" in result.stderr, (report["rounds"], result.stderr[-1500:])
@@ -386,7 +385,7 @@ def scenario_02():
     # 2. Ideas below the seed still go on to refinement, but never become results: the workspace keeps the seed. With no
     # valid idea at all the run stops after round 1.
     path = workspace("hopeless")
-    with harness.provider(hopeless, price=PRICE) as (url, _):
+    with harness.provider(hopeless) as (url, _):
         result = ar(path, url)
     report = report_of(result)
     run = path / ".harness/ar" / report["run"]
@@ -404,7 +403,7 @@ def scenario_02():
     check("ideas below the seed go on to refinement unaudited, a copy of the seed never; the workspace keeps the seed")
 
     path = workspace("invalid")
-    with harness.provider(lambda body, index: hopeless(body, index, "nope"), price=PRICE) as (url, _):
+    with harness.provider(lambda body, index: hopeless(body, index, "nope")) as (url, _):
         result = ar(path, url)
     report = report_of(result)
     assert report["rounds"] == 1 and report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n", report
@@ -414,7 +413,7 @@ def scenario_02():
 def scenario_03():
     # 2c. An auditor that gives no verdict leaves its candidate unaudited: nothing becomes a result without a passing audit.
     path = workspace("noverdict")
-    with harness.provider(lambda body, index: "Checked the state." if role_of(body)[0] == "audit" else scripted(body, index), price=PRICE) as (url, _):
+    with harness.provider(lambda body, index: "Checked the state." if role_of(body)[0] == "audit" else scripted(body, index)) as (url, _):
         report = report_of(ar(path, url))
     records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
     assert any(r["kind"] == "planned" and r["batch"].startswith("audit") for r in records), "no audit ran"
@@ -426,7 +425,7 @@ def scenario_03():
 def scenario_04():
     # 3. A select evaluator that cannot score the seed stops the run before any episode.
     path = workspace("badselect", spec='editable = ["x.txt"]\neval = "python3 search.py"\nselect = "exit 3"\ntimeout = 30\n')
-    with harness.provider(scripted, price=PRICE) as (url, requests):
+    with harness.provider(scripted) as (url, requests):
         result = ar(path, url, ok=False)
     assert result.returncode != 0 and "select evaluator gives no valid score" in result.stderr and not requests, result.stderr[-800:]
     check("a broken select evaluator fails fast, before spending")
@@ -440,7 +439,7 @@ def scenario_05():
               'return ar.eval("tamper")')
     for mode in ("sandbox", "yolo"):
         path = workspace(f"tamper-{mode}")
-        with harness.provider(once(tamper), price=PRICE) as (url, _):
+        with harness.provider(once(tamper)) as (url, _):
             report = report_of(ar(path, url, extra=["--yolo"] if mode == "yolo" else []))
         rows = ledger(path, report)
         assert rows and all(r["score"] == -49 for r in rows), rows
@@ -459,7 +458,7 @@ def scenario_06():
     snoop = (f'write("cand.py", "import os, glob\\nvalue = [os.environ.get(\'HX_TEST_KEY\'), os.environ.get(\'HX_AR_EPISODE\'), '
              f'glob.glob(\'{path}/.harness/ar/*/*\'), glob.glob(\'{path}/*\')]\\n")\n'
              'return ar.eval("snoop")')
-    with harness.provider(once(snoop), price=PRICE) as (url, requests):
+    with harness.provider(once(snoop)) as (url, requests):
         ar(path, url)
     leak = [o for o in outputs(requests) if "leak" in o]
     assert leak and "[None, None, [], []]" in leak[0], leak
@@ -474,7 +473,7 @@ def scenario_07():
                 f'local ok, e = pcall(read, "{path}/.harness/ar")\n'
                 'print(ar.eval("baseline"))\n'
                 'return "OUT " .. r.stdout .. " READ " .. tostring(e)')
-        with harness.provider(once(look, ("research", "r1-w1")), price=PRICE) as (url, requests):
+        with harness.provider(once(look, ("research", "r1-w1"))) as (url, requests):
             ar(path, url, extra=["--yolo"] if mode == "yolo" else [])
         outs = [o for o in outputs(requests) if "OUT " in o]
         assert len(outs) >= 2, outs
@@ -488,7 +487,7 @@ def scenario_08():
     race = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    time.sleep(0.3)\\n    open(\'x.txt\',\'w\').write(\'7\\\\n\')\\n    os._exit(0)\\n")\n'
             'sh("python3 d.py >/dev/null 2>&1 </dev/null")\nreturn ar.eval("honest x=0")')
     path = workspace("race", spec='editable = ["x.txt"]\neval = "sleep 1; python3 search.py"\ntimeout = 30\n')
-    with harness.provider(once(race), price=PRICE) as (url, _):
+    with harness.provider(once(race)) as (url, _):
         report = report_of(ar(path, url))
     first = ledger(path, report)[0]
     snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{first['snap']}.json").read_text())
@@ -501,7 +500,7 @@ def scenario_09():
     files = {"pkg/a.txt": "0\n", "search.py": 'import json, os; print(json.dumps({"score": int(os.path.exists("pkg/blob.bin"))}))'}
     path = workspace("binary", files, 'editable = ["pkg"]\neval = "python3 search.py"\ntimeout = 30\n')
     junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn ar.eval("junk")'
-    with harness.provider(once(junk), price=PRICE) as (url, _):
+    with harness.provider(once(junk)) as (url, _):
         report = report_of(ar(path, url))
     snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{ledger(path, report)[0]['snap']}.json").read_text())
     assert base64.b64decode(snap["pkg/blob.bin"]) == b"\xff\xfe" and "pkg/link" not in snap, list(snap)
@@ -512,7 +511,7 @@ def scenario_10():
     # 7. A killed run resumes from its journal: the interrupted worker is charged from its own journal and retried, the rest
     # of the plan continues.
     path = workspace("resume")
-    with harness.provider(slow, price=PRICE) as (url, _):
+    with harness.provider(slow) as (url, _):
         process = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
         deadline, journal = time.time() + 180, None
@@ -556,7 +555,7 @@ def scenario_10():
 def scenario_11():
     # 7b. A run killed during an audit re-runs that audit on resume; no candidate passes unaudited.
     path = workspace("resume-audit")
-    with harness.provider(slow_audit, price=PRICE) as (url, _):
+    with harness.provider(slow_audit) as (url, _):
         process = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
         deadline, journal = time.time() + 180, None
@@ -588,7 +587,7 @@ def scenario_12():
     # 7c. Stopping the orchestrator stops everything it started: episode children and the commands they run.
     path = workspace("stop")
     marker = f"sleep 47{os.getpid() % 100}"
-    with harness.provider(once(f'sh("{marker}")\nreturn "late"'), price=PRICE) as (url, _):
+    with harness.provider(once(f'sh("{marker}")\nreturn "late"')) as (url, _):
         process = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.time() + 60
         while time.time() < deadline and marker not in subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True).stdout:
@@ -606,7 +605,7 @@ def scenario_12():
 def scenario_13():
     # 8. Agents that never score anything end the run after round 1, and a run with no evals fails.
     path = workspace("idle")
-    with harness.provider(lambda body, index: "Answer: 0" if role_of(body)[0] == "judge" else "nothing to do", price=PRICE) as (url, _):
+    with harness.provider(lambda body, index: "Answer: 0" if role_of(body)[0] == "judge" else "nothing to do") as (url, _):
         result = ar(path, url, ok=False)
     episodes = list((path / ".harness/ar").glob("*/episodes/*.md"))
     assert result.returncode != 0 and "made no evaluations" in result.stderr and len(episodes) == 9, (len(episodes), result.stderr[-800:])
@@ -616,7 +615,7 @@ def scenario_13():
 def scenario_14():
     # 9. Provider crashes are charged from the child's journal and retried; misconfiguration fails fast and nonzero.
     path = workspace("crash")
-    with harness.provider(limited, price=PRICE) as (url, _):
+    with harness.provider(limited) as (url, _):
         result = ar(path, url, env={"HX_AR_RETRY_SECS": "0"})
     report = report_of(result)
     assert "retrying" in result.stderr and report["evals"] > 0, result.stderr[-1500:]
@@ -625,7 +624,7 @@ def scenario_14():
     assert any(r["kind"] == "started" and r["label"] == "r0-research.2" for r in records), records
     path = workspace("misconfigured")
     start = time.time()
-    with harness.provider(scripted, price=PRICE) as (url, _):
+    with harness.provider(scripted) as (url, _):
         result = ar(path, url, ok=False, env={"HX_AR_RETRY_SECS": "0"}, key="HX_AR_NO_SUCH_KEY")
     assert result.returncode != 0 and "keep failing" in result.stderr and time.time() - start < 120, result.stderr[-1500:]
     check("crashes are charged from child journals and retried; misconfiguration fails fast")
@@ -638,7 +637,7 @@ def scenario_15():
     files = {"x.txt": "0\n", "search.py": f'import json, os\nok = True\ntry:\n    os.makedirs("{probe}e", exist_ok=True)\nexcept OSError:\n    ok = False\nprint(json.dumps({{"score": 1 if not ok else 0}}))'}
     path = workspace("xcrun", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
     code = f'local r = sh("mkdir -p {probe}a 2>&1; echo leak > {probe}a/f 2>&1; /usr/bin/git --version")\nprint(r.stdout)\nreturn ar.eval("probe")'
-    with harness.provider(once(code), price=PRICE) as (url, requests):
+    with harness.provider(once(code)) as (url, requests):
         report = report_of(ar(path, url))
     assert not os.path.exists(probe + "a") and not os.path.exists(probe + "e"), "xcrun prefix is writable"
     assert any("git version" in o for o in outputs(requests)), outputs(requests)
@@ -652,7 +651,7 @@ def scenario_16():
     spec = (f'editable = ["x.txt"]\neval = "sh {grader}/score.sh {holdout}"\nselect = "sh {grader}/score.sh {holdout}"\n'
             f'grader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n')
     path = workspace("holdout", spec=spec)
-    with harness.provider(once('return ar.eval("baseline")'), price=PRICE) as (url, _):
+    with harness.provider(once('return ar.eval("baseline")')) as (url, _):
         report = report_of(ar(path, url))
     assert all(r["score"] == 0 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
     check("held-out roots are readable by select only")
@@ -667,7 +666,7 @@ def scenario_17():
     (path / ".harness/ar/old-run/ledger.jsonl").write_text("secret ledger")
     look = (f'local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'; cat {path}/.harness/ar/old-run/ledger.jsonl 2>&1; '
             f'cat {holdout}/secret.txt 2>&1; echo x >> {grader}/score.sh 2>&1")\nprint(ar.eval("b"))\nreturn "OUT " .. r.stdout')
-    with harness.provider(once(look), price=PRICE) as (url, requests):
+    with harness.provider(once(look)) as (url, requests):
         ar(path, url, extra=["--yolo"])
     outs = [o for o in outputs(requests) if "OUT " in o]
     assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and "secret ledger" not in o and "held-out" not in o for o in outs), outs
@@ -682,7 +681,7 @@ def scenario_18():
     path = workspace("reap", files, spec)
     daemon = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    open(\'pid.txt\', \'w\').write(str(os.getpid()))\\n    time.sleep(300)\\nos._exit(0)\\n")\n'
               'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn ar.eval("daemon")')
-    with harness.provider(once(daemon), price=PRICE) as (url, requests):
+    with harness.provider(once(daemon)) as (url, requests):
         report = report_of(ar(path, url))
     snap = ledger(path, report)[0]["snap"]
     pids = [int(base64.b64decode(json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{snap}.json").read_text())["pid.txt"]))]
@@ -701,7 +700,7 @@ def scenario_19():
     code = ('sh("mkdir -p pkg/many && cd pkg/many && seq 1 10001 | xargs touch")\nlocal ok1, e1 = pcall(ar.eval, "many")\n'
             'sh("rm -rf pkg/many; mkdir -p pkg/$(printf \'d/%.0s\' $(seq 1 40))")\nlocal ok2, e2 = pcall(ar.eval, "deep")\n'
             'sh("rm -rf pkg/d")\nprint(ar.eval("fine"))\nreturn "E1 " .. tostring(e1) .. " E2 " .. tostring(e2)')
-    with harness.provider(once(code), price=PRICE) as (url, requests):
+    with harness.provider(once(code)) as (url, requests):
         report = report_of(ar(path, url))
     outs = " ".join(outputs(requests))
     assert "more than 10000 files" in outs and "deeper than 32" in outs and report["evals"] >= 1, outs[-2000:]
@@ -714,7 +713,7 @@ def scenario_20():
              "subst.txt": "$Format:%H$\n",
              "search.py": 'import json\nok = open("hidden.txt").read() == "here\\n" and open("subst.txt").read() == "$Format:%H$\\n"\nprint(json.dumps({"score": 1 if ok else 0}))'}
     path = workspace("attributes", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
-    with harness.provider(once('return ar.eval("b")'), price=PRICE) as (url, _):
+    with harness.provider(once('return ar.eval("b")')) as (url, _):
         report = report_of(ar(path, url))
     assert ledger(path, report)[0]["score"] == 1, ledger(path, report)
     check("the frozen base ignores export attributes")
@@ -726,7 +725,7 @@ def scenario_21():
             'write("x.txt", "1\\n")\nprint("C", ar.eval("one").improved)\nprint("R", ar.reset().best)\n'
             'print("X", read("x.txt"))\nlocal r = ar.eval("six again")\nreturn "D " .. tostring(r.cached) .. " " .. r.n')
     path = workspace("reset")
-    with harness.provider(once(code, ("r1-w1",)), price=PRICE) as (url, requests):
+    with harness.provider(once(code, ("r1-w1",))) as (url, requests):
         report = report_of(ar(path, url))
     out = " ".join([o for o in outputs(requests) if "D " in o][0].split())
     assert "A nil" in out and "B true" in out and "C false" in out and "R -1" in out and "X 6" in out and "D true 2" in out, out
@@ -744,7 +743,7 @@ def scenario_22():
             'local ok, e = pcall(ar.reset)\nreturn "RESET " .. tostring(ok) .. " " .. tostring(e)')
     path = workspace("reset-link", {"pkg/x.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'},
                      'editable = ["pkg/x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
-    with harness.provider(once(code, ("r1-w1",)), price=PRICE) as (url, requests):
+    with harness.provider(once(code, ("r1-w1",))) as (url, requests):
         ar(path, url)
     out = [o for o in outputs(requests) if "RESET " in o][0]
     assert "RESET false" in out and (outside / "x.txt").read_text() == "keep\n", (out, list(outside.iterdir()))
@@ -778,7 +777,7 @@ def scenario_fallback():
         return scripted(body, index)
 
     path = workspace("fallback")
-    with harness.provider(strict, price=PRICE) as (url, _):
+    with harness.provider(strict) as (url, _):
         report = report_of(ar(path, url))
     run = path / ".harness/ar" / report["run"]
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]

@@ -74,9 +74,9 @@ ENVIRONMENT:
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n    --rpi              research, design, implement, verify and repair automatically\n    --manual           require RPI artifact review (requires --rpi)\n    --ar               autoresearch: agent episodes improve .harness/ar.toml editable paths until progress stops\n                       (--ar --resume .harness/ar/RUN continues an interrupted search)\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n    --rpi              research, design, implement, verify and repair automatically\n    --manual           require RPI artifact review (requires --rpi)\n    --ar               autoresearch: agent episodes improve .harness/ar.toml editable paths until progress stops\n                       (--ar --resume .harness/ar/RUN continues an interrupted search)\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
         "review" => "hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]\n\nRecords a decision only; continue with hx run --resume LOG.\n",
-        "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, sandboxed offline sh is settled as unknown_local, and bounded model reservations are charged at their bound; none needs a decision.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
+        "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, sandboxed offline sh is settled as unknown_local, and model requests whose response was lost are charged their reserved tokens; none needs a decision.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
@@ -144,7 +144,7 @@ fn list_arg(args: &[String], name: &str) -> Vec<String> {
     arg(args, name).map(|v| v.split(',').map(String::from).collect()).unwrap_or_default()
 }
 
-/// A numeric flag: None when absent, a usage error when present but not a number (a mistyped `--max-cost` must not
+/// A numeric flag: None when absent, a usage error when present but not a number (a mistyped `--max-tokens` must not
 /// silently run without a budget). A flag present without a following value (last argument, or next token is a flag)
 /// is also a usage error.
 fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>> {
@@ -181,9 +181,9 @@ fn flag_kind(command: &str, name: &str) -> Option<FlagKind> {
         (_, "--yolo" | "--net" | "--no-net") => Switch,
         ("run" | "exec", "--pack") => Text,
         ("run", "--resume" | "--branch" | "--prompt-file" | "--model" | "--api" | "--base-url" | "--key-env" | "--reasoning" | "--provider-only" | "--trace") => Text,
-        ("run", "--max-turns" | "--max-tokens") | ("recover", "--tokens") => Unsigned,
+        ("run", "--max-turns" | "--max-tokens") => Unsigned,
         ("run", "--max-output" | "--context-window") => Positive,
-        ("run", "--max-cost" | "--max-wall") | ("recover", "--cost") => Amount,
+        ("run", "--max-wall") => Amount,
         ("recover", "--decision") | ("review", "--decision" | "--gate" | "--input-file") => Text,
         ("run", "--rpi" | "--manual" | "--ar") => Switch,
         ("recover" | "trust" | "accept", "--yes") => Switch,
@@ -222,7 +222,7 @@ fn validate_args(args: &[String]) -> Result<()> {
         return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
     }
     if seen.contains("--manual") && !seen.contains("--rpi") { return Err(usage("--manual requires --rpi")); }
-    if seen.contains("--ar") && let Some(flag) = seen.iter().find(|f| matches!(**f, "--rpi" | "--branch" | "--trace" | "--max-tokens" | "--max-wall" | "--max-turns" | "--max-cost")) {
+    if seen.contains("--ar") && let Some(flag) = seen.iter().find(|f| matches!(**f, "--rpi" | "--branch" | "--trace" | "--max-tokens" | "--max-wall" | "--max-turns")) {
         return Err(usage(&format!("{flag} cannot be combined with --ar")));
     }
     if seen.contains("--ar") && !seen.contains("--resume") && !seen.contains("--prompt-file") {
@@ -363,7 +363,6 @@ fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
         context_window: parsed(args, "--context-window")?,
         cache_key: Some(session),
         provider_only: list_arg(args, "--provider-only"),
-        price: None,
     })
 }
 
@@ -390,13 +389,9 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             Some(path) => std::fs::read_to_string(path)?,
             None => inherited.as_ref().map(|(_, m, _)| m.task.clone()).ok_or_else(|| usage("--prompt-file required for a new run"))?,
         };
-        let mut cfg = llm_cfg(args, policy.log.session.clone())?;
+        let cfg = llm_cfg(args, policy.log.session.clone())?;
         let max_turns = parsed(args, "--max-turns")?.unwrap_or(200);
-        let budget = policy::Budget { max_cost: parsed(args, "--max-cost")?, max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
-        if budget.max_cost.or(policy.budget.max_cost).is_some() {
-            cfg.price = llm::fetch_price(&cfg).await;
-            if cfg.price.is_none() { eprintln!("hx: note: no price found for {}; each request reserves the whole remaining dollar allowance", cfg.model); }
-        }
+        let budget = policy::Budget { max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
         let branch = inherited.as_ref().map(|(parent, manifest, state)| supervisor::Branch {
             parent: parent.path.clone(),
             durable: state.as_ref().map(|s| s.durable.clone())
@@ -447,20 +442,9 @@ fn cmd_recover(args: &[String]) -> Result<()> {
     let path = Path::new(args.get(1).ok_or_else(|| usage("usage: hx recover LOG OP --decision complete|abandon"))?);
     let id: u64 = args.get(2).ok_or_else(|| usage("missing operation ID"))?.parse()?;
     let decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?;
-    anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon" | "billing"), "decision must be complete, abandon or billing");
+    anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon"), "decision must be complete or abandon");
     let log = eventlog::EventLog::reconcile(path)?;
     let records = eventlog::load(path)?;
-    if decision == "billing" {
-        anyhow::ensure!(records.iter().any(|r| r["seq"] == id && r["kind"] == "model_intent"), "not a model operation ID");
-        anyhow::ensure!(eventlog::Books::of(&records)?.reservations.contains_key(&id), "model operation already settled");
-        let tokens: u64 = parsed(args, "--tokens")?.ok_or_else(|| usage("billing requires --tokens"))?;
-        let cost: f64 = parsed(args, "--cost")?.ok_or_else(|| usage("billing requires --cost"))?;
-        anyhow::ensure!(cost.is_finite() && cost >= 0.0, "billing cost must be finite and nonnegative");
-        if !has(args, "--yes") { confirm(&format!("Assert {tokens} tokens and ${cost} of usage for uncertain generation {id}?"))?; }
-        log.write("billing", serde_json::json!({"of":id,"tokens":tokens,"cost":cost,"source":"owner"}), true)?;
-        println!("recorded billing for {id}; no request was dispatched");
-        return Ok(());
-    }
     let intent = records.iter().find(|r| r["seq"] == id && r["kind"] == "intent").ok_or_else(|| usage("not a mutating operation ID"))?;
     anyhow::ensure!(!records.iter().any(|r| r["kind"] == "outcome" && r["of"] == id), "operation already has an outcome");
     anyhow::ensure!(!records.iter().any(|r| r["kind"] == "resolution" && r["of"] == id), "operation already resolved");
@@ -560,7 +544,7 @@ fn cmd_log_verify(args: &[String]) -> Result<()> {
     for (seq, tool, summary) in &r.unknown {
         println!("UNKNOWN OUTCOME: #{seq} {tool}: {summary}");
     }
-    for seq in &r.unknown_models { println!("UNKNOWN BILLING: #{seq} model request"); }
+    for seq in &r.unknown_models { println!("UNKNOWN BILLING: #{seq} model request (charged its reserved tokens on resume)"); }
     if let Some(error) = &r.recovery_error { println!("INVALID RECOVERY ACCOUNTING: {error}"); }
     if !r.chain_ok || r.recovery_error.is_some() {
         std::process::exit(1);
@@ -588,19 +572,19 @@ mod tests {
 
     #[test]
     fn flag_helpers() {
-        let a = argv("run --pack a,b --max-turns 7 --max-cost x --net");
+        let a = argv("run --pack a,b --max-turns 7 --max-wall x --net");
         assert_eq!(list_arg(&a, "--pack"), vec!["a", "b"]);
         assert!(list_arg(&a, "--provider-only").is_empty());
         assert_eq!(parsed::<u32>(&a, "--max-turns").unwrap(), Some(7));
         assert_eq!(parsed::<u32>(&a, "--max-tokens").unwrap(), None);
-        let e = parsed::<f64>(&a, "--max-cost").unwrap_err();
-        assert!(e.is::<Usage>() && e.to_string().contains("--max-cost"), "a mistyped budget is a usage error, not unlimited: {e}");
+        let e = parsed::<f64>(&a, "--max-wall").unwrap_err();
+        assert!(e.is::<Usage>() && e.to_string().contains("--max-wall"), "a mistyped budget is a usage error, not unlimited: {e}");
         // A flag present without a following value (last arg or next token is a flag) is also a usage error.
-        let a2 = argv("run --model m --max-cost");
-        let e2 = parsed::<f64>(&a2, "--max-cost").unwrap_err();
+        let a2 = argv("run --model m --max-wall");
+        let e2 = parsed::<f64>(&a2, "--max-wall").unwrap_err();
         assert!(e2.is::<Usage>() && e2.to_string().contains("requires a value"), "missing value (last arg): {e2}");
-        let a3 = argv("run --max-cost --net");
-        let e3 = parsed::<f64>(&a3, "--max-cost").unwrap_err();
+        let a3 = argv("run --max-wall --net");
+        let e3 = parsed::<f64>(&a3, "--max-wall").unwrap_err();
         assert!(e3.is::<Usage>() && e3.to_string().contains("requires a value"), "missing value (next is flag): {e3}");
         assert_eq!(net_flag(&a), Some(true));
         assert_eq!(net_flag(&argv("run --no-net")), Some(false));
