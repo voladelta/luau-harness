@@ -211,8 +211,8 @@ assert len(everything) > 8 and len(set(everything)) == len(everything), everythi
 r4 = (run / "episodes/r4-w1.md").read_text().split("Earlier rounds already claimed these ideas")[1].split("\n2. ")[0]
 assert all(f"#{c['n']}:" in r4 for c in explore) and not any(f"#{c['n']}:" in r4 for c in claims if c["worker"].startswith("r4-")), r4
 assert "Earlier rounds" not in (run / "episodes/r1-w1.md").read_text()
-assert "neither refining nor exploring moved" in result.stderr and report["cost_usd"] < 0.6 / 2, report["cost_usd"]
-check("an exploit round that moves no chosen candidate is followed by an explore round; when that moves none, the run stops")
+assert "two rounds in a row made no progress" in result.stderr and report["max_cost_usd"] == 0.6, report
+check("a refining round that moves no chosen candidate is followed by an explore round; two rounds without progress stop the run")
 
 # Replaying the finished run from its journal reaches the same stop without starting anything.
 (run / "report.json").unlink()
@@ -244,7 +244,7 @@ resets = [o for o in outputs(requests) if o.startswith("RESET ") or "RESET " in 
 assert len(resets) >= 8 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
 check("ledger rows stay numbered under concurrency, every score matches its snapshot, and ar.reset is per worker")
 
-# 1b. While every round moves a chosen candidate, rounds go on until the budget is spent.
+# 1b. While refining keeps making progress, rounds go on; here only the optional cost ceiling stops them.
 CLIMB = 'import json; x = int(open("x.txt").read()); print(json.dumps({"score": x}))'
 
 
@@ -268,17 +268,17 @@ def climbing(body, index):
     return "done"
 
 
-# min_delta = 2 is the bar against the seed; refinement steps of +1 still count, so every round moves.
+# Each refining round adds 1, below min_delta = 1.5: progress only counts once two steps add up, so a run that judged
+# each round alone would stop after round 3.
 path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIMB},
-                 'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "python3 select.py"\ntimeout = 30\nmin_delta = 2\n')
+                 'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "python3 select.py"\ntimeout = 30\nmin_delta = 1.5\n')
 with harness.provider(climbing, price=PRICE) as (url, _):
     result = ar(path, url, 0.3)
 report = report_of(result)
-share = 0.3 / (1 + 3 * (8 + 3))
-assert report["rounds"] > 3 and "moved no chosen candidate" not in result.stderr, (report["rounds"], result.stderr[-1500:])
-assert 0.3 - 1.5 * share - 0.02 <= report["cost_usd"] <= 0.3 + 0.02, report["cost_usd"]
-assert report["search"] > 6 + 1, report["search"]
-check("while every round moves a chosen candidate, rounds go on until the budget is spent; steps below min_delta count")
+assert report["rounds"] > 4 and "made no progress" not in result.stderr, (report["rounds"], result.stderr[-1500:])
+assert 0.3 <= report["cost_usd"] <= 0.3 + 0.1 and report["max_cost_usd"] == 0.3, report["cost_usd"]
+assert report["search"] > 8 + 2, report["search"]
+check("small refinement steps add up to progress; only the optional cost ceiling stops a run that keeps progressing")
 
 records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
 widths = [len(r["episodes"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("round")]
@@ -323,11 +323,11 @@ report = report_of(result)
 assert report["rounds"] == 1 and report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n", report
 check("with no valid idea after round 1 the run stops and the workspace keeps the seed")
 
-# 2b. When the budget is spent before a gate's audits can start, no verdict is invented and nothing unaudited becomes a
-# result: the workspace keeps the seed.
+# 2b. When the cost ceiling is reached before a gate's audits can start, no verdict is invented and nothing unaudited
+# becomes a result: the workspace keeps the seed.
 def costly(body, index):
-    """Explore workers' final replies are billed $0.05 each, so round 1 spends the whole budget before any audit can
-    start; their claims and evaluations run first, within their allowance."""
+    """Explore workers' final replies are billed $0.05 each, so round 1 passes the $0.30 ceiling before any audit can
+    start; their claims and evaluations run first."""
     answer = scripted(body, index)
     if role_of(body)[0] == "explore" and answered(body):
         answer = {"text": answer, "usage": {"cost": 0.05}}
@@ -345,7 +345,7 @@ assert all((r["idea"], r["snap"]) in ran for r in records if r["kind"] == "audit
 good = [c for c in report["candidates"] if c["good"]]
 assert good and all(c["audit"] is None for c in good), report["candidates"]
 assert report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n", report["portfolio"]
-check("good candidates the budget left no room to audit never become results, and no verdict is invented")
+check("good candidates the cost ceiling left no room to audit never become results, and no verdict is invented")
 
 # 2c. An auditor that gives no verdict leaves its candidate unaudited: nothing becomes a result without a passing audit.
 path = workspace("noverdict")
@@ -662,15 +662,17 @@ check("ar.reset refuses a symlinked parent and leaves the link target untouched"
 # 17. Launch validation.
 path = workspace("flags")
 base_cmd = [str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"), "--model", "mock"]
-result = subprocess.run(base_cmd, env=harness.ENV, capture_output=True, text=True)
-assert result.returncode != 0 and "--max-cost" in result.stderr, result.stderr
+result = subprocess.run(base_cmd[:-4] + ["--model", "mock"], env=harness.ENV, capture_output=True, text=True)
+assert result.returncode != 0 and "--prompt-file" in result.stderr, result.stderr
+result = subprocess.run(base_cmd + ["--max-turns", "5"], env=harness.ENV, capture_output=True, text=True)
+assert result.returncode != 0 and "--max-turns cannot be combined with --ar" in result.stderr, result.stderr
 (path / "notes.txt").write_text("uncommitted")
-result = subprocess.run(base_cmd + ["--max-cost", "1"], env=harness.ENV, capture_output=True, text=True)
+result = subprocess.run(base_cmd, env=harness.ENV, capture_output=True, text=True)
 assert result.returncode != 0 and "notes.txt" in result.stderr, result.stderr
 (path / "notes.txt").unlink()
 (path / ".harness/ar.toml").write_text('editable = ["."]\neval = "true"\n')
-result = subprocess.run(base_cmd + ["--max-cost", "1"], env=harness.ENV, capture_output=True, text=True)
+result = subprocess.run(base_cmd, env=harness.ENV, capture_output=True, text=True)
 assert result.returncode != 0 and "editable path" in result.stderr, result.stderr
-check("launch requires a budget, a clean scope and sane editable paths")
+check("launch requires a program, a clean scope and sane editable paths; episodes are limited in turns, not by flags")
 
 print(f"{passed}/{passed} ar checks passed")

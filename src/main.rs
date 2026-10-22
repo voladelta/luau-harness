@@ -74,7 +74,7 @@ ENVIRONMENT:
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [--workspace DIR] [--pack A,B] [--net|--no-net] [--yolo] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n    --rpi              research, design, implement, verify and repair automatically\n    --manual           require RPI artifact review (requires --rpi)\n    --ar               autoresearch: agent episodes improve .harness/ar.toml editable paths within --max-cost\n                       (--ar --resume .harness/ar/RUN continues an interrupted search)\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
+        "run" => "hx run --prompt-file F --model M [flags]\n\n    --resume LOG       restore frozen settings and checkpoint into a fresh VM; do not repeat flags\n    --branch LOG       start a new run with current approved configuration and inherited durable data\n    --prompt-file F    task text\n    --model M --api A --base-url U --key-env E --reasoning R\n    --max-output N --context-window N --provider-only A,B\n    --max-turns N --max-cost X --max-tokens N --max-wall SECS\n    --pack A,B --trace FILE\n    --rpi              research, design, implement, verify and repair automatically\n    --manual           require RPI artifact review (requires --rpi)\n    --ar               autoresearch: agent episodes improve .harness/ar.toml editable paths until progress stops\n                       (--max-cost is an optional ceiling; episodes are limited in turns)\n                       (--ar --resume .harness/ar/RUN continues an interrupted search)\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
         "review" => "hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]\n\nRecords a decision only; continue with hx run --resume LOG.\n",
         "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\nhx recover LOG OP --decision billing --tokens N --cost USD [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, sandboxed offline sh is settled as unknown_local, and bounded model reservations are charged at their bound; none needs a decision.\nBilling replaces an uncertain model request reservation with the owner's asserted usage.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
@@ -221,11 +221,11 @@ fn validate_args(args: &[String]) -> Result<()> {
         return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
     }
     if seen.contains("--manual") && !seen.contains("--rpi") { return Err(usage("--manual requires --rpi")); }
-    if seen.contains("--ar") && let Some(flag) = seen.iter().find(|f| matches!(**f, "--rpi" | "--branch" | "--trace" | "--max-tokens" | "--max-wall")) {
+    if seen.contains("--ar") && let Some(flag) = seen.iter().find(|f| matches!(**f, "--rpi" | "--branch" | "--trace" | "--max-tokens" | "--max-wall" | "--max-turns")) {
         return Err(usage(&format!("{flag} cannot be combined with --ar")));
     }
-    if seen.contains("--ar") && !seen.contains("--resume") && (!seen.contains("--max-cost") || !seen.contains("--prompt-file")) {
-        return Err(usage("--ar requires --prompt-file (the program) and --max-cost (the whole search budget), or --resume RUN_DIR"));
+    if seen.contains("--ar") && !seen.contains("--resume") && !seen.contains("--prompt-file") {
+        return Err(usage("--ar requires --prompt-file (the program), or --resume RUN_DIR"));
     }
     if list_arg(args, "--pack").iter().any(|p| p == "std/rpi" || p.starts_with("std/rpi/")) {
         return Err(usage("RPI must be activated explicitly with --rpi, not --pack"));
@@ -424,7 +424,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
     Ok(())
 }
 
-/// hx run --ar: every flag except the program and budget passes through to the episodes' child runs.
+/// hx run --ar: every flag except the program and the cost ceiling passes through to the episodes' child runs.
 async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
     if let Some(dir) = arg(args, "--resume") {
         return ar::orchestrate(workspace, None, Some(PathBuf::from(dir))).await;
@@ -439,8 +439,7 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
         child.extend(value.cloned());
     }
     let program = std::fs::read_to_string(arg(args, "--prompt-file").unwrap())?;
-    let budget: f64 = parsed(args, "--max-cost")?.unwrap();
-    ar::orchestrate(workspace, Some((child, program, budget)), None).await
+    ar::orchestrate(workspace, Some((child, program, parsed(args, "--max-cost")?)), None).await
 }
 
 fn cmd_recover(args: &[String]) -> Result<()> {

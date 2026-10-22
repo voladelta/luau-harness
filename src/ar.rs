@@ -39,9 +39,8 @@ use std::sync::{Mutex, OnceLock};
 /// Workers side by side in a round, and fewer once the provider has rate-limited an episode of the run.
 const WORKERS: usize = 8;
 const NARROW: usize = 6;
-/// Rounds an episode's share is sized for: each gets at most budget / (1 + PACE * (WORKERS + TOP)). Rounds go on
-/// while the budget lasts, so episodes that spend less than their share buy more rounds.
-const PACE: usize = 3;
+/// Model turns an episode may take: its whole allowance, in work rather than dollars, so it means the same on any model.
+const TURNS: usize = 40;
 /// Candidates a gate hands to the next round, and the size of the final portfolio.
 const TOP: usize = 3;
 /// Ledger rows shown to a worker, characters of an evaluator report, of a brief and of one finding.
@@ -669,7 +668,9 @@ struct Launch {
     spec: Spec,
     program: String,
     child_args: Vec<String>,
-    budget: f64,
+    /// An optional ceiling on the run's model cost, checked before each batch; the run is never planned by it.
+    #[serde(alias = "budget")]
+    max_cost: Option<f64>,
     commit: String,
 }
 
@@ -702,14 +703,14 @@ struct Candidate {
 }
 
 /// Journal records. An episode is `started` before its child runs and `finished` after; resume closes one that never
-/// finished with a durable charge from the killed child's journals (its whole allowance when its scratch directory is
-/// gone), runs what was planned but never started, and continues. Held-out scores, audit verdicts and gates are
+/// finished with a durable charge from the killed child's journals, runs what was planned but never started, and
+/// continues. Held-out scores, audit verdicts and gates are
 /// journaled once and reused.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Record {
     Planned { batch: String, episodes: Vec<Plan> },
-    Started { label: String, plan: String, allowance: f64, #[serde(default)] scratch: Option<PathBuf> },
+    Started { label: String, plan: String, #[serde(default)] scratch: Option<PathBuf> },
     Finished { label: String, cost: f64, evals: usize, #[serde(default)] interrupted: bool, #[serde(default)] crashed: bool,
         /// Requests the provider refused with HTTP 429, from the child's report.
         #[serde(default)] rate_limits: u64 },
@@ -747,9 +748,9 @@ impl Orchestrator {
         Ok(std::fs::read_to_string(self.dir.join("seed"))?.trim().to_string())
     }
 
-    /// Every episode gets at most an equal share of the budget: the research, each round's workers and each gate's audits.
-    fn share(&self) -> f64 {
-        self.launch.budget / (1 + PACE * (WORKERS + TOP)) as f64
+    /// Has the run reached its optional cost ceiling?
+    fn capped(&self) -> bool {
+        self.launch.max_cost.is_some_and(|m| self.spent >= m)
     }
 
     /// Score the seed with the search evaluator before any episode, so every episode knows where it starts. Kept in
@@ -812,8 +813,7 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Run a planned batch side by side until every episode has finished, or crashed `MAX_CRASHES` times. Each runs with
-    /// at most its equal share, or an equal split of what is left.
+    /// Run a planned batch side by side until every episode has finished, or crashed `MAX_CRASHES` times.
     async fn run_batch(&mut self, batch: &str) -> Result<()> {
         let mut crashes = 0;
         loop {
@@ -832,16 +832,11 @@ impl Orchestrator {
             }).collect();
             let retries_left = pending.iter().any(|(plan, _)| attempts(&plan.label).len() + 1 < MAX_CRASHES as usize);
             if pending.is_empty() { return Ok(()); }
-            let remaining = self.launch.budget - self.spent;
-            // Less than half a share cannot fund a useful episode.
-            if remaining < self.share() / 2.0 { return Ok(()); }
-            // The research brief serves every later episode, so it gets three shares.
-            let share = if batch == "research" { 3.0 * self.share() } else { self.share() };
-            let allowance = share.min(remaining / pending.len() as f64);
+            if self.capped() { return Ok(()); }
             let state = self.state()?;
             let mut runs = vec![];
             for (plan, label) in &pending {
-                runs.push(self.episode(plan, label, allowance, self.task(plan, label, allowance, &state)?));
+                runs.push(self.episode(plan, label, self.task(plan, label, &state)?));
             }
             let outcomes = futures::future::join_all(runs).await.into_iter().collect::<Result<Vec<_>>>()?;
             self.spent += outcomes.iter().map(|o| o.cost).sum::<f64>();
@@ -861,7 +856,7 @@ impl Orchestrator {
     }
 
     /// One fresh child run in its own copy of the base holding its starting state.
-    async fn episode(&self, plan: &Plan, label: &str, allowance: f64, task: String) -> Result<Outcome> {
+    async fn episode(&self, plan: &Plan, label: &str, task: String) -> Result<Outcome> {
         let ep_dir = self.dir.join("episodes");
         std::fs::create_dir_all(&ep_dir)?;
         let ep_path = ep_dir.join(format!("{label}.json"));
@@ -874,12 +869,12 @@ impl Orchestrator {
         let ws = scratch.0.join("ws");
         copy_tree(&self.dir.join("base"), &ws)?;
         place(&ws, self.spec(), &load_snap(&self.dir, &plan.start)?)?;
-        self.journal(&Record::Started { label: label.into(), plan: plan.label.clone(), allowance, scratch: Some(scratch.0.clone()) })?;
-        eprintln!("hx ar: {label} ({:?}{}, ${allowance:.2})", plan.role, if plan.idea > 0 { format!(" #{}", plan.idea) } else { String::new() });
+        self.journal(&Record::Started { label: label.into(), plan: plan.label.clone(), scratch: Some(scratch.0.clone()) })?;
+        eprintln!("hx ar: {label} ({:?}{})", plan.role, if plan.idea > 0 { format!(" #{}", plan.idea) } else { String::new() });
         let out = tokio::process::Command::new(std::env::current_exe()?)
             .arg("run").arg("--workspace").arg(&ws).args(&self.launch.child_args)
             .arg("--prompt-file").arg(&task_path)
-            .arg("--max-cost").arg(format!("{allowance:.6}"))
+            .arg("--max-turns").arg(TURNS.to_string())
             .env("HX_AR_EPISODE", &ep_path)
             .stdin(std::process::Stdio::null())
             .output().await?;
@@ -892,7 +887,7 @@ impl Orchestrator {
         // Without a report the child's journals say what it spent and how often it was rate-limited.
         let (cost, rate_limits) = match (report["cost_usd"].as_f64(), report["rate_limits"].as_u64()) {
             (Some(cost), Some(limits)) => (cost, limits),
-            _ => logged(&logs, allowance),
+            _ => logged(&logs),
         };
         let evals = ledger(&self.dir)?.iter().filter(|r| r.episode == label).count();
         let crashed = evals == 0 && report.is_null();
@@ -929,107 +924,111 @@ impl Orchestrator {
         Ok(State { rows, claims, brief, findings })
     }
 
-    fn protocol(&self, role: Role, allowance: f64) -> String {
+    /// The tools an episode has, in the order the prompt guide asks for: grounding before the task, rules last.
+    fn tools(&self, role: Role) -> String {
         let spec = self.spec();
         let better = if spec.direction == "max" { "higher" } else { "lower" };
-        let mut t = format!("- `ar.eval(\"one-line note\")` scores the current editable files ({}) with the owner's frozen evaluator and \
-returns {{n, score, valid, se, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count.\n\
-- `ar` is a built-in global table like `sh` and `read`. `vars()` lists only your own globals, so it never shows `ar`: call it directly.\n\
-- When the evaluator reports no `se`, it is deterministic: re-scoring a state returns its stored result with `cached: true`.\n",
+        let mut t = format!("<tools>\n- `ar.eval(\"one-line note\")` scores the editable files ({}) with the owner's frozen evaluator and \
+returns {{n, score, valid, se, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count. \
+A deterministic evaluator (no `se`) returns a state it already scored from its cache.\n\
+- `ar` is a built-in global table like `sh` and `read`; `vars()` lists only your own globals, so call it directly.\n",
             spec.editable.join(", "));
         if matches!(role, Role::Explore | Role::Exploit) {
-            t += "- `improved` means better than your best so far (by more than `se` when the evaluator reports one)";
-            if spec.min_delta > 0.0 { t += &format!(". To become a result, a candidate must beat the starting seed by more than {}", spec.min_delta); }
-            t += ". `ar.reset()` puts your best scored state back into the editable paths: use it instead of reverting by hand.\n\
-- `ar.claims()` lists the claims made so far that yours must differ from: read it before you claim.
-- Score with ar.eval after each change and read the report: it shows what broke. One change per eval, so the ledger stays readable.\n";
+            t += "- `ar.claims()` lists the claims yours must differ from. `ar.claim(text)` claims your idea or refinement.\n\
+- `improved` means better than your best so far (by more than `se` when the evaluator reports one). `ar.reset()` puts \
+your best scored state back into the editable paths.\n";
         } else {
             t += "- Your evaluations are probes: recorded, never a candidate. Change the editable files freely to test a question.\n";
         }
         if spec.select.is_some() {
-            t += "- Candidates are judged on held-out data no agent sees. Prefer changes with a reason to generalize over tuning to the reported numbers.\n";
+            t += "- Results are judged on held-out data no agent sees: a change with a reason to generalize beats tuning to the reported numbers.\n";
         }
-        t + &format!("- This episode has about ${allowance:.2} of model budget.\n")
+        t + &format!("- You have {TURNS} steps (model turns). At the limit the run stops you, with or without a final answer.\n</tools>\n\n")
     }
 
-    fn task(&self, plan: &Plan, label: &str, allowance: f64, state: &State) -> Result<String> {
+    fn task(&self, plan: &Plan, label: &str, state: &State) -> Result<String> {
         let spec = self.spec();
         let (score, report) = self.known(&state.rows, &plan.start);
         let report = clip(&serde_json::to_string_pretty(&report).unwrap_or_default(), REPORT_CHARS);
-        let program = self.launch.program.trim_end();
-        let brief = format!("## Brief from the research lead\n\n{}\n\n", clip(&state.brief, BRIEF_CHARS));
-        let findings = if state.findings.is_empty() { String::new() } else { format!("## Findings so far\n\n{}", state.findings) };
+        let mut context = format!("{}\n\n", self.launch.program.trim_end());
+        if plan.role != Role::Research {
+            context += &format!("<brief>\n{}\n</brief>\n\n", clip(&state.brief, BRIEF_CHARS));
+            if !state.findings.is_empty() { context += &format!("<findings>\n{}</findings>\n\n", state.findings); }
+        }
+        context += &format!("<starting_state>\nYour workspace holds it (search score {}). Its evaluator report:\n```json\n{report}\n```\n</starting_state>\n\n", show(score));
         let claim = |idea: u32| state.claims.iter().find(|c| c.scope == "explore" && c.n == idea).map_or(String::new(), |c| c.idea.clone());
-        let starting = format!("## Starting state\n\nYour workspace holds it (search score {}). Its evaluator report:\n\n```json\n{report}\n```\n", show(score));
+        let worker_rules = "- ar.eval refuses to score before your claim is accepted: claim first.\n\
+- An accepted claim is final: claim only what you will build, never a placeholder, a probe or a test.\n\
+- Build and fix; do not optimize: no parameter sweeps, no tuning for score, no switching ideas. Later rounds refine the \
+strongest candidates.\n- Follow the program's rules: a result that breaks them is worthless.\n";
+        let checklist = "Before your final answer, check: [ ] my claim was accepted [ ] my last state was scored by ar.eval and \
+is valid [ ] my final answer says what I built, my best score, what worked and what did not.\n";
         Ok(match plan.role {
-            Role::Research => format!("{program}\n\n## Autoresearch research lead ({label})\n\n\
+            Role::Research => format!("{context}{}## Autoresearch research lead ({label})\n\n\
 You lead an autoresearch run. Next, {WORKERS} workers will each pursue a different idea to improve the score by changing the \
-editable paths ({}). Study the task first, so their work is grounded, and write the brief every worker gets:\n\
-- the objective, and exactly how the evaluator computes the score (read the code and data you can see);\n\
-- rules and constraints: what is banned, what makes a result invalid;\n\
-- what the starting state does and where it is weak;\n\
-- traps: ways a score could rise without real improvement (evaluator quirks, overfitting, degenerate solutions) that workers must avoid;\n\
-- open questions worth testing.\n\
-Do not solve the task: the workers do that. Keep the study short, about 15 steps: an unfinished study leaves every \
-worker without a brief. Finish with the brief as your final answer, at most 800 words, facts first, without prescribing \
-one solution.\n\n{}\n{starting}", spec.editable.join(", "), self.protocol(plan.role, allowance)),
+editable paths ({}). Study the task so their work is grounded, then write the brief every worker gets:\n\
+1. The objective, and exactly how the evaluator computes the score (read the code and data you can see).\n\
+2. Rules and constraints: what is banned, what makes a result invalid.\n\
+3. What the starting state does and where it is weak.\n\
+4. Traps: ways a score could rise without real improvement (evaluator quirks, overfitting, degenerate solutions).\n\
+5. Open questions worth testing.\n\n<rules>\n- Do not solve the task: the workers do that.\n\
+- Keep the study to about 15 steps: an unfinished study leaves every worker without a brief.\n\
+- Your final answer is the brief: at most 800 words, facts first, without prescribing one solution.\n</rules>\n",
+                self.tools(plan.role), spec.editable.join(", ")),
             Role::Explore => {
                 // Only earlier rounds' claims: a retried worker gets its own claim back from ar.claim and must keep building it.
                 let round = label.split('-').next();
                 let taken: String = state.claims.iter().filter(|c| c.scope == "explore" && c.worker.split('-').next() != round)
                     .map(|c| format!("- #{}: {}\n", c.n, c.idea)).collect();
                 let taken = if taken.is_empty() { String::new() } else {
-                    format!("\n\nEarlier rounds already claimed these ideas; yours must use a different core approach:\n{}", clip(&taken, BRIEF_CHARS))
+                    format!(" Earlier rounds already claimed these ideas; yours must use a different core approach:\n{}", clip(&taken, BRIEF_CHARS))
                 };
-                format!("{program}\n\n{brief}{findings}## Autoresearch explore worker {label}\n\n\
-You are one of {WORKERS} workers exploring side by side. Each tests a different core approach to improving the score.\n\n\
+                format!("{context}{}## Autoresearch explore worker {label}\n\n\
+You are one of {WORKERS} workers exploring side by side; each builds a different core approach to improving the score.\n\n\
 1. Generate your idea from your seed: <seed>{}</seed>. List 5 to 7 root-level dimensions along which approaches to this \
 task differ fundamentally (not parameters or filters), each with at least 6 options from conventional to radical. Pick one \
 option per dimension using a different part of the seed (for example the sum of the character codes of a segment, mod the \
-number of options). Commit to the picks even if unusual, and compose one coherent idea: the core approach to build, not a \
-tweak on top of the starting state.{taken}\n\
-2. Claim it early, within your first few steps and before building: `ar.claim(\"the idea in two or three sentences\")`. \
-Claims are served first come, first served. If it returns `ok = false`, another worker already claimed the same core \
-approach (`message` lists every claim): pick again from a different part of your seed and claim a different core. An \
-accepted claim is final, so claim only your real idea, never a placeholder or a test. ar.eval works only after an \
-accepted claim.\n\
-3. Build the idea faithfully, score it with ar.eval and read the report. Fix what is broken (errors, invalid results, a bug \
-that keeps the idea from working as designed) until it works. Do not optimize: no parameter sweeps, no tuning for score, \
-no switching ideas. Later rounds refine the strongest candidates, so return as soon as the idea works. Your first valid \
-state sets your bar, even below the starting state's score.\n\
-4. Finish with your finding as the final answer: the idea, what you built, your best score, what worked and what did not, \
-and whether the idea is promising.\n\n{}\n{starting}", plan.seed.as_deref().unwrap_or(label), self.protocol(plan.role, allowance))
+number of options). Commit to the picks even if unusual, and compose one coherent idea: a core approach, not a tweak on \
+top of the starting state.{taken}\n\
+2. Read `ar.claims()`, then claim your idea within your first few steps: `ar.claim(\"the idea in two or three sentences\")`. \
+If it returns `ok = false`, the same core is taken: pick again from a different part of your seed and claim another.\n\
+3. Build the simplest version of the idea that runs, and score it with ar.eval within about 10 steps of claiming. Then \
+read the report and fix what is broken until the idea works as designed. Your first valid state sets your bar, even \
+below the starting state's score.\n\
+4. Your final answer is your finding: the idea, what you built, your best score, what worked and what did not, and \
+whether the idea is promising.\n\n<rules>\n{worker_rules}</rules>\n\n{checklist}",
+                    self.tools(plan.role), plan.seed.as_deref().unwrap_or(label))
             }
             Role::Exploit => {
                 let rows: Vec<&Row> = state.rows.iter().filter(|r| r.idea == plan.idea).collect();
                 let skip = rows.len().saturating_sub(SHOWN);
-                let mut ledger = format!("n | score | improved | worker | note\n{}", if skip > 0 { format!("({skip} older rows omitted)\n") } else { String::new() });
+                let mut ledger = format!("<ledger>\nn | score | improved | worker | note\n{}", if skip > 0 { format!("({skip} older rows omitted)\n") } else { String::new() });
                 for r in &rows[skip..] {
                     let score = match (r.valid, r.score) { (true, Some(s)) => format!("{s:.6}"), _ => "invalid".into() };
                     ledger += &format!("{} | {score} | {} | {} | {}\n", r.n, if r.improved { "yes" } else { "" }, r.episode, r.note.replace('\n', " "));
                 }
-                format!("{program}\n\n{brief}{findings}## Autoresearch exploit worker {label}: candidate #{}\n\n\
-Candidate #{}'s idea: {}\n\nIt is among the most promising candidates. Several workers refine it side by side; improve it:\n\n\
-1. Choose one refinement, a change with a reason to generalize rather than tuning to the reported numbers, and claim it: \
-`ar.claim(\"the refinement in one or two sentences\")`, early. If it returns `ok = false`, another worker claimed the \
-same refinement first (`message` lists every claim): choose a different one. An accepted claim is final, so claim only \
-your real refinement, never a placeholder or a test. ar.eval works only after an accepted claim.\n\
-2. Implement it, ar.eval, read the report, and fix it if it is broken. Do not optimize beyond your one refinement: no \
-parameter sweeps, no further changes. Return once it is built and scored; the next round builds on the best result. An \
-improvement must beat the candidate's best.\n\
-3. Finish with your finding as the final answer: what you changed, your best score, what worked and what did not.\n\n{}\n\
-## Ledger of candidate #{}\n\n{ledger}\n{starting}", plan.idea, plan.idea, claim(plan.idea),
-                    self.protocol(plan.role, allowance), plan.idea)
+                format!("{context}{ledger}</ledger>\n\n{}## Autoresearch exploit worker {label}: candidate #{}\n\n\
+Candidate #{}'s idea: {}\n\nIt is among the most promising candidates. Several workers refine it side by side, each with \
+a different refinement.\n\n\
+1. Read the ledger and the findings, then choose one refinement: a change with a reason to generalize.\n\
+2. Read `ar.claims()`, then claim it within your first few steps: `ar.claim(\"the refinement in one or two sentences\")`. \
+If it returns `ok = false`, the same refinement is taken: choose another.\n\
+3. Implement it and score it with ar.eval within about 10 steps of claiming; read the report and fix it if it is broken. \
+It improves the candidate when it beats its best ({}).\n\
+4. Your final answer is your finding: what you changed, your best score, what worked and what did not.\n\n\
+<rules>\n{worker_rules}- One refinement: return once it is built and scored; the next round builds on the best result.\n\
+</rules>\n\n{checklist}", self.tools(plan.role), plan.idea, plan.idea, claim(plan.idea), show(plan.best))
             }
-            Role::Audit => format!("{program}\n\n{brief}{findings}## Autoresearch auditor {label}: candidate #{}\n\n\
+            Role::Audit => format!("{context}{}## Autoresearch auditor {label}: candidate #{}\n\n\
 Candidate #{} ({}) is about to be kept as a result. Your workspace holds its best state. Decide whether its score is earned:\n\
-- Read the state and explain where its score comes from.\n\
-- Look for an evaluator hole: fills, prices or outcomes the real system would not give, lookahead or leaked information, \
-data the solution should not see, rule violations, or degenerate behaviour the score rewards by mistake.\n\
-- To test a suspicion, write probe states (for example the same trick in isolation) and ar.eval them.\n\
-Overfitting alone is not a failure: held-out data handles that. Finish with your reasoning and a last line \
-`VERDICT: PASS` (the score is earned) or `VERDICT: FAIL: reason` (it comes from a hole or a rule violation).\n\n{}\n{starting}",
-                plan.idea, plan.idea, claim(plan.idea), self.protocol(plan.role, allowance)),
+1. Read the state and explain where its score comes from.\n\
+2. Look for an evaluator hole: outcomes the real system would not give, lookahead or leaked information, data the \
+solution should not see, hard-coded answers, rule violations, or degenerate behaviour the score rewards by mistake.\n\
+3. To test a suspicion, write probe states (for example the trick in isolation) and ar.eval them.\n\n\
+<rules>\n- Overfitting alone is not a failure: held-out data handles that.\n\
+- Your final answer ends with exactly one line: `VERDICT: PASS` (the score is earned) or `VERDICT: FAIL: reason` (it \
+comes from a hole or a rule violation). Without that line the audit counts for nothing.\n</rules>\n",
+                self.tools(plan.role), plan.idea, plan.idea, claim(plan.idea)),
         })
     }
 
@@ -1123,23 +1122,23 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
     async fn run(&mut self, mut records: Vec<Record>) -> Result<Value> {
         // Close episodes that never finished, durably.
         let rows = ledger(&self.dir)?;
-        let open: Vec<(String, f64, Option<PathBuf>)> = records.iter().filter_map(|r| match r {
-            Record::Started { label, allowance, scratch, .. }
+        let open: Vec<(String, Option<PathBuf>)> = records.iter().filter_map(|r| match r {
+            Record::Started { label, scratch, .. }
                 if !records.iter().any(|f| matches!(f, Record::Finished { label: l, .. } if l == label)) =>
-                Some((label.clone(), *allowance, scratch.clone())),
+                Some((label.clone(), scratch.clone())),
             _ => None,
         }).collect();
-        for (label, allowance, scratch) in open {
+        for (label, scratch) in open {
             let evals = rows.iter().filter(|r| r.episode == label).count();
             // The killed child's scratch copy survives a killed orchestrator: keep its journals, charge from them. Without
-            // its scratch copy nothing is known, so the whole allowance is charged.
+            // its scratch copy nothing is known.
             let (cost, rate_limits) = match scratch.filter(|s| s.is_dir()) {
                 Some(dir) => {
                     let logs = keep_logs(&dir.join("ws"), &self.dir.join("episodes"), &label)?;
                     drop(Scratch(dir));
-                    logged(&logs, allowance)
+                    logged(&logs)
                 }
-                None => (allowance, 0),
+                None => (0.0, 0),
             };
             // Research and audits are judged by their final answer, which a killed child never gave: they are retried
             // like a worker that scored nothing.
@@ -1157,31 +1156,32 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
         }
         self.plan("research", vec![Plan { label: "r0-research".into(), role: Role::Research, idea: 0, start: seed.clone(), best: None, seed: None }])?;
         self.run_batch("research").await?;
-        // Rounds go on while the budget lasts. Round 1 explores; later rounds exploit the last gate's chosen candidates
-        // while that moves them, and explore new ideas after an exploit round that moved none.
-        let (mut last, mut explore) = (Vec::<(u32, String)>::new(), true);
+        // Round 1 explores. A round makes progress when it chooses a new candidate or a chosen one beats its score at the
+        // last progress by more than `min_delta`, so small steps add up across rounds until they count. After exploring
+        // the run refines; it refines again while that moves a chosen candidate at all, and explores again after a
+        // refining round that moved none. Two rounds in a row without progress stop the run: every round that makes
+        // progress raises a score by more than `min_delta` or adds a candidate, so the run ends.
+        let (mut at, mut prev) = (Vec::<(u32, Option<f64>)>::new(), Vec::<(u32, String)>::new());
+        let (mut explore, mut quiet) = (true, false);
         for round in 1.. {
             let batch = format!("round{round}");
             let mut gate = self.records()?.into_iter().find_map(|r| match r { Record::Gate { round: g, candidates, chosen } if g == round => Some((candidates, chosen)), _ => None });
             let plans = match self.planned(&batch)? {
                 Some(plans) => plans,
                 None if gate.is_some() => vec![],
+                None if self.capped() => break,
                 None => {
-                    // Each worker gets a full share and one share stays for the gate's audits; the last round runs fewer workers.
-                    let s = self.share();
-                    let workers = (((self.launch.budget - self.spent - s) / s).round().max(0.0) as usize).min(self.width()?);
-                    if workers == 0 { break; }
+                    let workers = self.width()?;
                     let plans = if explore {
                         (1..=workers).map(|w| -> Result<Plan> {
                             Ok(Plan { label: format!("r{round}-w{w}"), role: Role::Explore, idea: 0, start: seed.clone(), best: None,
                                 seed: Some(crate::ssot::seed()?) })
                         }).collect::<Result<Vec<_>>>()?
                     } else {
-                        let candidates = self.last_gate()?.map(|g| g.0).unwrap_or_default();
+                        let (candidates, chosen) = self.last_gate()?.unwrap_or_default();
                         (0..workers).map(|w| {
-                            let (idea, start) = &last[w % last.len()];
-                            let best = candidates.iter().find(|c| c.idea == *idea).and_then(|c| c.search);
-                            Plan { label: format!("r{round}-w{}", w + 1), role: Role::Exploit, idea: *idea, start: start.clone(), best, seed: None }
+                            let c = candidates.iter().find(|c| c.idea == chosen[w % chosen.len()]).expect("chosen candidates are listed");
+                            Plan { label: format!("r{round}-w{}", w + 1), role: Role::Exploit, idea: c.idea, start: c.snap.clone(), best: c.search, seed: None }
                         }).collect()
                     };
                     self.plan(&batch, plans.clone())?;
@@ -1196,16 +1196,20 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
             let (candidates, chosen) = gate.unwrap_or_default();
             // With no candidate after a gate the run stops (in practice after round 1: later gates keep earlier candidates).
             if chosen.is_empty() { break; }
-            let now: Vec<(u32, String)> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).map(|c| (c.idea, c.snap.clone())).collect();
-            let moved = now.iter().any(|c| !last.contains(c));
-            // Exploring follows only an exploit round that moved nothing: when exploring moves nothing either, both ways
-            // forward are spent.
-            if !moved && plans.first().is_some_and(|p| p.role == Role::Explore) {
-                eprintln!("hx ar: neither refining nor exploring moved a chosen candidate; stopping");
+            let chosen: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).collect();
+            let progress = chosen.iter().any(|c| match at.iter().find(|(i, _)| *i == c.idea) {
+                None => true,
+                Some((_, before)) => c.search.is_some_and(|s| self.spec().better(s, *before, self.spec().min_delta)),
+            });
+            let moved = chosen.iter().any(|c| !prev.contains(&(c.idea, c.snap.clone())));
+            if !progress && quiet {
+                eprintln!("hx ar: two rounds in a row made no progress; stopping");
                 break;
             }
-            explore = !moved;
-            last = now;
+            quiet = !progress;
+            explore = !moved && plans.first().is_some_and(|p| p.role == Role::Exploit);
+            if progress { at = chosen.iter().map(|c| (c.idea, c.search)).collect(); }
+            prev = chosen.iter().map(|c| (c.idea, c.snap.clone())).collect();
         }
         let state = self.state()?;
         ensure!(!state.rows.is_empty(), "autoresearch made no evaluations; see {}", self.dir.join("episodes").display());
@@ -1226,7 +1230,7 @@ Overfitting alone is not a failure: held-out data handles that. Finish with your
             "run": self.dir.file_name().unwrap().to_string_lossy(), "dir": self.dir, "commit": self.launch.commit,
             "snap": snap, "search": search, "select": select, "portfolio": portfolio, "candidates": candidates,
             "rounds": self.records()?.iter().filter(|r| matches!(r, Record::Gate { .. })).count(),
-            "evals": state.rows.len(), "cost_usd": self.spent, "budget_usd": self.launch.budget,
+            "evals": state.rows.len(), "cost_usd": self.spent, "max_cost_usd": self.launch.max_cost,
         });
         std::fs::write(self.dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
         Ok(report)
@@ -1281,11 +1285,11 @@ fn keep_logs(ws: &Path, episodes: &Path, label: &str) -> Result<PathBuf> {
 
 /// What a child without a report spent, and how often it was rate-limited: its journals' settled cost plus unsettled
 /// reservations, and their HTTP 429s. A child opens its journal before it can admit any model request, so no journal
-/// means nothing spent; an unreadable journal is charged `allowance`.
-fn logged(logs: &Path, allowance: f64) -> (f64, u64) {
+/// means nothing spent.
+fn logged(logs: &Path) -> (f64, u64) {
     std::fs::read_dir(logs).into_iter().flatten().flatten().map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .map(|j| journal_books(&j).unwrap_or((allowance, 0)))
+        .map(|j| journal_books(&j).unwrap_or((0.0, 0)))
         .fold((0.0, 0), |(c, r), (dc, dr)| (c + dc, r + dr))
 }
 
@@ -1302,8 +1306,9 @@ fn show(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.6}")).unwrap_or_else(|| "none".into())
 }
 
-/// `hx run --ar`: search over the whole `--max-cost` budget, or continue the run in `resume` (a run directory).
-pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f64)>, resume: Option<PathBuf>) -> Result<()> {
+/// `hx run --ar`: search until neither refining nor exploring makes progress (or an optional cost ceiling), or continue
+/// the run in `resume` (a run directory).
+pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, Option<f64>)>, resume: Option<PathBuf>) -> Result<()> {
     // A resumed run uses the spec frozen in its sealed launch.json, approved when it started; only a launch reads ar.toml.
     let (dir, launch, records) = match (start, resume) {
         (_, Some(dir)) => {
@@ -1316,7 +1321,7 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f
             let records = read_lines(&dir.join("journal.jsonl"))?;
             (dir, launch, records)
         }
-        (Some((child_args, program, budget)), None) => {
+        (Some((child_args, program, max_cost)), None) => {
             ensure!(crate::trust::is_trusted(workspace), "--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first");
             ensure!(crate::workflow::git_inventory(workspace)?.is_some(), "--ar requires a Git repository at the workspace root");
             let spec = Spec::load(workspace)?;
@@ -1327,15 +1332,15 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, f
             std::fs::create_dir_all(&dir)?;
             let commit = freeze(workspace, &dir)?;
             std::fs::write(dir.join("seed"), save_snap(&dir, &capture(workspace, &spec)?)?)?;
-            let launch = Launch { spec, program, child_args, budget, commit };
+            let launch = Launch { spec, program, child_args, max_cost, commit };
             std::fs::write(dir.join("launch.json"), serde_json::to_vec_pretty(&launch)?)?;
             (dir, launch, vec![])
         }
-        (None, None) => bail!("--ar needs a program and budget, or --resume RUN_DIR"),
+        (None, None) => bail!("--ar needs a program, or --resume RUN_DIR"),
     };
-    let budget = launch.budget;
+    let ceiling = launch.max_cost.map_or(String::new(), |m| format!(" (cost ceiling ${m:.2})"));
     let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, launch, spent: 0.0 };
-    eprintln!("hx ar: run {} (${budget:.2}){}", o.dir.display(), if records.is_empty() { "" } else { ", resumed" });
+    eprintln!("hx ar: run {}{ceiling}{}", o.dir.display(), if records.is_empty() { "" } else { ", resumed" });
     let report = o.run(records).await?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
