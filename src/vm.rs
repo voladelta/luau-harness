@@ -12,7 +12,7 @@ use mlua::{Function, Lua, MultiValue, Table, Value, Variadic, VmState};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -105,6 +105,8 @@ pub struct Session {
     ops: Arc<AtomicUsize>,
     deadline: Arc<Mutex<Option<Instant>>>,
     budget: Duration,
+    /// chunks run so far (see `hx.retain`)
+    chunks: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -129,6 +131,7 @@ impl Session {
     pub async fn run(&self, code: &str) -> RunResult {
         self.out.lock().unwrap().clear();
         self.ops.store(0, Ordering::Relaxed);
+        self.chunks.fetch_add(1, Ordering::Relaxed);
         *self.deadline.lock().unwrap() = Some(Instant::now() + self.budget);
         let result = match self.compile(code) {
             Ok(f) => f.call_async::<MultiValue>(()).await,
@@ -538,7 +541,21 @@ impl Vm {
             ex_set.lock().unwrap().insert(name);
             Ok(())
         })?)?;
-        let session = Session { lua: lua.clone(), log: policy.log.clone(), env: session_env, out, ops, deadline, budget };
+        // hx.retain(v) -> n: keep a value the printer cut as `_cut[n]` in the session, so its notice can name it. The list
+        // belongs to the latest chunk that cut something; the next chunk can read it until it cuts something itself.
+        let chunks = Arc::new(AtomicU64::new(0));
+        let (cut_env, cut_chunks, cut_seq) = (session_env.clone(), chunks.clone(), Arc::new(Mutex::new(u64::MAX)));
+        hx.set("retain", lua.create_function(move |lua, v: Value| {
+            let chunk = cut_chunks.load(Ordering::Relaxed);
+            let mut seq = cut_seq.lock().unwrap();
+            let list = match cut_env.raw_get::<Value>("_cut")? {
+                Value::Table(t) if *seq == chunk => t,
+                _ => { let t = lua.create_table()?; cut_env.raw_set("_cut", t.clone())?; *seq = chunk; t },
+            };
+            list.raw_push(v)?;
+            Ok(list.raw_len())
+        })?)?;
+        let session = Session { lua: lua.clone(), log: policy.log.clone(), env: session_env, out, ops, deadline, budget, chunks };
         // hx.view_image(path, max) -> { path, width, height, orig_width, orig_height, mime, data } for the vision pack.
         // Record the live image identity once and return the same loaded bytes.
         let vfx = fx.clone();

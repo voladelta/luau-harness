@@ -23,8 +23,13 @@ function M.context(code: string, msg: string): string
 	return out
 end
 
+-- One budget for the whole result: the error (itself capped) is kept whole, printed output and values share the rest.
 function M.compose(res, code: string): string
-	local text = printer.cap(res.output)
+	local err = ""
+	if res.error then
+		err = printer.cut("error: " .. res.error .. "\n" .. M.context(code, res.error), printer.OUTPUT_CAP // 3, "error")
+	end
+	local text = res.output
 	if #res.values > 0 then
 		local shown = {}
 		for _, v in res.values do
@@ -32,9 +37,7 @@ function M.compose(res, code: string): string
 		end
 		text ..= "=> " .. table.concat(shown, "\t") .. "\n"
 	end
-	if res.error then
-		text ..= "error: " .. res.error .. "\n" .. M.context(code, res.error)
-	end
+	text = printer.cap(text, printer.OUTPUT_CAP - (utf8.len(err) or #err)) .. err
 	if text:match("^%s*$") then
 		text = "(no output)\n"
 	end

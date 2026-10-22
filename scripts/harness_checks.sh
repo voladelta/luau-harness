@@ -49,6 +49,10 @@ check "sealed read batch" "$($H exec --workspace $W 'print(batch({{op="read",arg
 # 4. vars() lists session variables
 check "vars" "$($H exec --workspace $W $'x = 41\nvars()' | head -1)" "=> <table: 1 keys> {x=41}"
 
+# 4b. cut output keeps its start and end; the next chunk reads the middle from _cut; sh keeps the end of a huge stream
+check "a cut temporary is readable next chunk" "$($H exec --workspace $W 'print(sh("seq 1 3000").stdout)' 'print(_cut[1]:find("\n1500\n", 1, true) ~= nil, vars()._cut == nil)' | sed -n '/^true/p')" "true	true"
+check "sh keeps the end of a stream over 1 MiB" "$($H exec --workspace $W 'local r = sh("seq 1 400000; echo FINAL-LINE"); print(r.truncated, r.stdout:sub(-11) == "FINAL-LINE\n", sh("echo hi").truncated)' | head -1)" "true	true	false"
+
 # 5. package lock gate
 P=$W/.harness/pkgs/mypkg; mkdir -p $P/tests
 printf '[package]\nname = "mypkg"\nversion = "0.1.0"\n[capabilities]\nnet = ["example.com"]\n' > $P/hx.toml

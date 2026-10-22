@@ -141,7 +141,7 @@ pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, 
         profile: crate::policy::evaluator_profile(&read, std::slice::from_ref(&scratch.0)),
         env: Some(evaluator_env(&tmp)),
     };
-    let (stdout, stderr, code, timed_out) = crate::prims::shell(&jail, cmd, tree, spec.timeout).await
+    let (stdout, stderr, code, timed_out, _) = crate::prims::shell(&jail, cmd, tree, spec.timeout).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let stdout = String::from_utf8_lossy(&stdout);
     let tail = |s: &str| s.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>();

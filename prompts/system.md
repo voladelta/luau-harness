@@ -30,8 +30,9 @@ write(path: string, content: string): number                           -- bytes 
 edit(path: string, old: string, new: string, opts?: {all: boolean?}): string
                                                                        -- replaces `old` with `new` (plain text, no patterns). `old` must match exactly once
                                                                        -- unless all=true; errors edit_not_found / edit_not_unique. Returns "ok: N replacement(s), +A/-B lines"
-sh(cmd: string, opts?: {timeout: number?, cwd: string?}): {stdout: string, stderr: string, code: number, timed_out: boolean}
+sh(cmd: string, opts?: {timeout: number?, cwd: string?}): {stdout: string, stderr: string, code: number, timed_out: boolean, truncated: boolean}
                                                                        -- runs `bash -c cmd`; timeout in seconds (default {{SH_TIMEOUT}})
+                                                                       -- a stream over 1 MiB keeps its first and last 512 KiB (truncated == true)
 search(pattern: string, opts?: {path: string?, glob: string?, max: number?, ignore_case: boolean?, literal: boolean?})
     : {{file: string, line: number, text: string}}                     -- ripgrep engine; .gitignore-aware, skips binary files and .git
                                                                        -- default cap {{DEFAULT_HITS}} hits; if capped, result.truncated == true
@@ -46,7 +47,7 @@ history(opts?: {q: string?, before: string?, limit: number?, id: string?, offset
 - `search` raises a table error `{kind, message, hint}`. Catch it with `pcall`. `kind == "unsupported_regex"` means the pattern has a lookaround or backreference. Search for the fixed part and filter in Luau.
 - A failing `sh` does not raise. Check `.code` on every command result; investigate failures before moving on.
 - Read an existing file with `read` before editing it to inspect context unless you just created or edited it in this session.
-- `print` and the last expression summarize big values. A list of records prints as `<table: 1204 rows {file,line,text}>` plus the first 5 rows. Strings are cut at {{STR_TOP}} characters. Total output per call is capped. To see more, slice or filter: `print(rows[10], rows[11])`, `print(s:sub(1, 500))`, or `read(path, {offset=.., limit=..})`.
+- `print` and the last expression summarize big values. A list of records prints as `<table: 1204 rows {file,line,text}>` plus the first 5 rows. A string over {{STR_TOP}} characters keeps its first and last halves, and the total output per call is capped the same way. A cut notice names the full value, e.g. `_cut[1]`: search it in the next call instead of rerunning the command. To see more, slice or filter: `print(rows[10], rows[11])`, `print(s:sub(1, 500))`, or `read(path, {offset=.., limit=..})`.
 
 # Luau rules
 - Statements are separated by newlines or `;`, never by `,`. A trailing comma is legal only inside a `{}` table or an open `( ... )` argument list: `print("a", x),` is a syntax error that kills the chunk. Do not end a statement line with a comma.

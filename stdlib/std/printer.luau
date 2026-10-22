@@ -22,6 +22,33 @@ local function clip(s: string, max: number): string
 	return s:sub(1, cut) .. "…(+" .. (n - max) .. " chars)"
 end
 
+-- Keep the start and the end of `s` (`max` characters in all: the end is where errors and summaries usually are),
+-- with a notice between them. A string the printer cuts is retained for the rest of the next chunk (`hx.retain`), so
+-- the notice can name the exact expression for the omitted middle.
+local function retained(v): string?
+	local ok, i = pcall(function() return hx.retain(v) end)
+	return if ok and type(i) == "number" then "_cut[" .. i .. "]" else nil
+end
+
+function M.cut(s: string, max: number, what: string): string
+	local n = utf8.len(s)
+	local unit = if n then "chars" else "bytes"
+	n = n or #s
+	if n <= max then
+		return s
+	end
+	local tail = max // 2
+	local head = max - tail
+	-- byte positions: the end of the head and the start of the tail
+	local hb = if unit == "chars" then utf8.offset(s, head + 1) - 1 else head
+	local tb = if unit == "chars" then utf8.offset(s, n - tail + 1) else #s - tail + 1
+	local name = retained(s)
+	local how = if name then string.format("the full %s is %s in your next call: search it with find/gmatch and print only the matches, instead of printing it or rerunning the command (omitted bytes: %s:sub(%d, %d))", what, name, name, hb + 1, tb - 1)
+		else "slice or filter the value, or use read(path, {offset, limit})"
+	return s:sub(1, hb) .. string.format("\n…[%s truncated: the first %d and last %d of %d %s are shown; %s]…\n", what, head, tail, n, unit, how)
+		.. s:sub(tb)
+end
+
 local function num(n: number): string
 	if n == math.floor(n) and math.abs(n) < 1e15 then
 		return string.format("%d", n)
@@ -137,7 +164,8 @@ local function toptable(t): string
 			table.insert(out, "  [" .. i .. "] " .. clip(fmt(arr[i], 1), M.ROW_CHARS))
 		end
 		if #arr > M.ROWS then
-			table.insert(out, "  …+" .. (#arr - M.ROWS) .. " more rows")
+			local name = retained(t)
+			table.insert(out, "  …+" .. (#arr - M.ROWS) .. " more rows" .. (if name then " (all rows: " .. name .. ")" else ""))
 		end
 		return table.concat(out, "\n")
 	end
@@ -153,29 +181,16 @@ end
 -- Summary of one top-level value (what print() and the last expression show).
 function M.top(v: any): string
 	if type(v) == "string" then
-		local n = utf8.len(v) or #v
-		if n <= M.STR_TOP then
-			return v
-		end
-		return clip(v, M.STR_TOP)
-			.. "\n…[string truncated: "
-			.. M.STR_TOP
-			.. " of "
-			.. n
-			.. " chars shown; slice it or use read(path,{offset,limit})]"
+		return M.cut(v, M.STR_TOP, "string")
 	elseif type(v) == "table" then
 		return toptable(v)
 	end
 	return fmt(v, 0)
 end
 
--- Cap the total printed output of one turn.
-function M.cap(text: string): string
-	local n = utf8.len(text) or #text
-	if n <= M.OUTPUT_CAP then
-		return text
-	end
-	return clip(text, M.OUTPUT_CAP) .. "\n…[output truncated: " .. (n - M.OUTPUT_CAP) .. " chars omitted; print less or summarize]"
+-- Cap the text of one turn's result (`max`, default M.OUTPUT_CAP).
+function M.cap(text: string, max: number?): string
+	return M.cut(text, max or M.OUTPUT_CAP, "output")
 end
 
 return M

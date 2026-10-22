@@ -197,16 +197,17 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
-                let (so, se, status, timed_out) = shell(&Jail::agent(&pol), &cmd, cwd, secs).await?;
-                Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, operation_id:None })
+                let (so, se, status, timed_out, truncated) = shell(&Jail::agent(&pol), &cmd, cwd, secs).await?;
+                Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None })
             }).await?;
             match ret {
-                Ret::Sh { stdout, stderr, code, timed_out, operation_id } => {
+                Ret::Sh { stdout, stderr, code, timed_out, truncated, operation_id } => {
                     let t = lua.create_table()?;
                     t.set("stdout", lua.create_string(&stdout)?)?;
                     t.set("stderr", lua.create_string(&stderr)?)?;
                     t.set("code", code.unwrap_or(-1))?;
                     t.set("timed_out", timed_out)?;
+                    t.set("truncated", truncated)?;
                     t.set("operation_id", operation_id)?;
                     Ok(t)
                 }
@@ -369,7 +370,8 @@ impl Jail {
 }
 
 /// Run `cmd` with bash inside `jail`: own process group, capped output, killed at `secs`.
-pub async fn shell(jail: &Jail, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool)> {
+/// -> (stdout, stderr, exit code, timed out, either stream cut to its first and last MAX_CAPTURE / 2 bytes)
+pub async fn shell(jail: &Jail, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool, bool)> {
     let mut command = match &jail.profile {
         Some(profile) => {
             let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
@@ -403,12 +405,25 @@ pub async fn shell(jail: &Jail, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Res
     let mut child = command.spawn().map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
     let group = child.id().map(|p| GroupKill::new(p as i32)); // killpg on drop: also covers cancellation
     let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-    async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let _ = (&mut s).take(MAX_CAPTURE as u64).read_to_end(&mut buf).await;
-        // keep reading (and discarding) so the child never blocks on a full pipe
-        let _ = tokio::io::copy(&mut s, &mut tokio::io::sink()).await;
-        buf
+    /// The whole stream, or its first and last MAX_CAPTURE / 2 bytes around a marker (the end is where a failing
+    /// test or build says why); reads to EOF so the child never blocks on a full pipe.
+    async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R) -> (Vec<u8>, bool) {
+        let half = MAX_CAPTURE / 2;
+        let (mut head, mut tail, mut total) = (Vec::new(), Vec::new(), 0usize);
+        let mut chunk = vec![0u8; 64 * 1024];
+        while let Ok(n) = s.read(&mut chunk).await {
+            if n == 0 { break }
+            total += n;
+            let take = n.min(half - head.len());
+            head.extend_from_slice(&chunk[..take]);
+            tail.extend_from_slice(&chunk[take..n]);
+            if tail.len() > 2 * half { tail.drain(..tail.len() - half); }
+        }
+        if total <= MAX_CAPTURE { head.append(&mut tail); return (head, false) }
+        let omitted = total - head.len() - half;
+        head.extend_from_slice(format!("\n…[hx: {omitted} bytes omitted from the middle of this output]…\n").as_bytes());
+        head.extend_from_slice(&tail[tail.len() - half..]);
+        (head, true)
     }
     let (out_h, err_h) = (tokio::spawn(drain(out)), tokio::spawn(drain(err)));
     let (status, timed_out) = match tokio::time::timeout(Duration::from_secs_f64(secs), child.wait()).await {
@@ -419,9 +434,9 @@ pub async fn shell(jail: &Jail, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Res
     // so the readers finish; whatever was printed before a timeout is kept.
     drop(group);
     let grace = Duration::from_secs(2);
-    let so = tokio::time::timeout(grace, out_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-    let se = tokio::time::timeout(grace, err_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-    Ok((so, se, status.map(i64::from), timed_out))
+    let (so, cut_out) = tokio::time::timeout(grace, out_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+    let (se, cut_err) = tokio::time::timeout(grace, err_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+    Ok((so, se, status.map(i64::from), timed_out, cut_out || cut_err))
 }
 
 /// Processes currently owned by this user (the baseline for the fork-bomb cap).
