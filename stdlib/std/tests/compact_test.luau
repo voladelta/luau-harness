@@ -76,16 +76,16 @@ end)
 
 test.case("anchor calibrates on the provider count; measure adds later messages at that scale", function()
 	local m = { user(string.rep("u", 400)), tool("a", string.rep("t", 400)) } -- 200 estimated tokens
-	local a = compact.anchor(string.rep("s", 400), m, 600, 50) -- 300 estimated with the system prompt: scale 2
+	local a = compact.anchor(400, m, 600, 50) -- 300 estimated with the system prompt: scale 2
 	test.eq(a.scale, 2); test.eq(a.count, 3); test.eq(a.tokens, 650)
 	test.eq(compact.measure(a, m), 650) -- nothing after the reply yet
 	table.insert(m, { role = "assistant", content = "", raw = string.rep("r", 40) })
 	table.insert(m, tool("b", string.rep("t", 400)))
 	test.eq(compact.measure(a, m), 650 + 200) -- the reply is counted; the new result is 100 estimated, times 2
-	test.eq(compact.anchor("", m, 0, 0).scale, 1) -- no usage
-	test.eq(compact.anchor("", m, 10 ^ 6, 0).scale, 4)
-	test.eq(compact.anchor("", m, 1, 0).scale, 0.5)
-	local r = compact.reanchor(a, string.rep("s", 400), { user(string.rep("u", 400)) })
+	test.eq(compact.anchor(0, m, 0, 0).scale, 1) -- no usage
+	test.eq(compact.anchor(0, m, 10 ^ 6, 0).scale, 4)
+	test.eq(compact.anchor(0, m, 1, 0).scale, 0.5)
+	local r = compact.reanchor(a, 400, { user(string.rep("u", 400)) })
 	test.eq(r.tokens, 400); test.eq(r.count, 1); test.eq(r.scale, 2)
 end)
 

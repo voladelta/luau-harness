@@ -364,7 +364,10 @@ impl Host {
                 crate::controller::Command::NextCall=>event=json!({"kind":"next_call"}),
                 crate::controller::Command::Model{request,..}=>{
                     match self.chat(&request).await {
-                        Ok(reply)=>{self.log(&format!("### MODEL\n{}",reply.text));event=json!({"kind":"model_reply","reply":reply});},
+                        Ok(reply)=>{self.log(&format!("### MODEL\n{}",reply.text));
+                            // the anchor's estimate covers the system prompt as sent, so its scale is not skewed by VM additions
+                            let system_chars=agent_system.as_ref().and_then(Value::as_str).map(str::len);
+                            event=json!({"kind":"model_reply","reply":reply,"system_chars":system_chars});},
                         Err(error)=>{let message=error.to_string();let safe_context_rejection=["API 400 ","API 413 ","API 422 "].iter().any(|p|message.starts_with(p));event=json!({"kind":"model_error","error":message,"safe_context_rejection":safe_context_rejection});},
                     }
                 },

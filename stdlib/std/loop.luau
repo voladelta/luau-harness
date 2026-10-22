@@ -1,6 +1,6 @@
 -- Pure controller: all durable workflow state is passed in and returned. Rust dispatches commands.
 -- `s.phase` is a tagged table; each kind carries only the data that is valid in it:
---   { kind = "ready", compact = "auto" | "skip" | "force", overflow = error? }  overflow only with "force"
+--   { kind = "ready", compact = "auto" | "skip" | "force", overflow = error?, bound = tokens? }  overflow and bound only with "force"
 --   { kind = "model" }                       waiting for the agent's reply
 --   { kind = "compact", cut = n, size = tokens, overflow = error? }  waiting for a summary of messages before `cut` (`size`: its prefix)
 --   { kind = "run", calls = {...}, index = n }  working through one reply's tool calls
@@ -22,10 +22,10 @@ local function code_of(call)
 	return if type(call.input) == "table" and type(call.input.code) == "string" then call.input.code else nil
 end
 
-local function ready(s, compact, overflow)
+local function ready(s, compact, overflow, bound)
 	for _, message in s.notifications or {} do table.insert(s.messages, message) end
 	s.notifications = nil
-	s.phase = { kind = "ready", compact = compact or "auto", overflow = overflow }
+	s.phase = { kind = "ready", compact = compact or "auto", overflow = overflow, bound = bound }
 	return s, { kind = "next" }
 end
 
@@ -41,6 +41,11 @@ function M.init(cfg)
 		bad = 0, no_call = 0, recheck_asked = false, anchor = { tokens = 0, count = 0, scale = 1 }, passes = 0, compact_failures = 0,
 		retried = false, hook_state = {},
 	}
+end
+
+-- Characters of the system prompt as last sent (VM additions included); the prompt's own text before any request.
+local function system_chars(s, options)
+	return s.system_chars or #prompt.system(options)
 end
 
 local function save_hook_state(s)
@@ -86,7 +91,7 @@ local function step(s, event, options)
 		if phase.kind == "finished" then return finish(s) end
 		s.retried = false
 		table.insert(s.messages, { role = "user", content = event.message })
-		s.anchor = compact.reanchor(s.anchor, prompt.system(options), s.messages)
+		s.anchor = compact.reanchor(s.anchor, system_chars(s, options), s.messages)
 		return ready(s, "skip")
 	elseif event.kind == "run_result" then
 		assert(s.phase.kind == "run", "unexpected chunk result")
@@ -116,8 +121,6 @@ local function step(s, event, options)
 			return finish(s)
 		end
 		if s.phase.kind == "compact" then
-			-- a summarizer request that does not fit bounds the window too
-			if event.safe_context_rejection and compact.overflow(event.error) then s.window_bound = math.min(s.window_bound or math.huge, s.phase.size) end
 			if s.phase.overflow then error("compaction failed after context overflow: " .. s.phase.overflow, 0) end
 			s.compact_failures += 1
 			return ready(s, "skip")
@@ -129,9 +132,8 @@ local function step(s, event, options)
 		end
 		if event.safe_context_rejection and compact.enabled and not s.retried and compact.overflow(event.error) then
 			s.retried = true
-			-- the rejected request bounds the window from above (in our measure); the forced compaction fits under it
-			s.window_bound = math.min(s.window_bound or math.huge, compact.measure(s.anchor, s.messages))
-			return ready(s, "force", event.error)
+			-- the rejected request bounds the window (in our measure) for this one compaction, which must fit under it
+			return ready(s, "force", event.error, compact.measure(s.anchor, s.messages))
 		end
 		error(if s.retried then "the model call failed again after one compact-and-retry: " .. event.error else event.error, 0)
 	elseif event.kind == "model_reply" then
@@ -147,7 +149,7 @@ local function step(s, event, options)
 			local kept = table.move(s.messages, cut, #s.messages, 2, { { role = "user", content = first } })
 			s.previous_summary = event.reply.text
 			s.messages = kept
-			s.anchor = compact.reanchor(s.anchor, prompt.system(options), s.messages)
+			s.anchor = compact.reanchor(s.anchor, system_chars(s, options), s.messages)
 			s.passes += 1
 			s.compact_failures = 0
 			-- "auto": a history still above the trigger compacts again, up to compact.max_passes per agent reply
@@ -158,7 +160,8 @@ local function step(s, event, options)
 		assert(s.phase.kind == "model", "unexpected model reply")
 		local resp = event.reply
 		s.report.turns += 1
-		s.anchor = compact.anchor(prompt.system(options), s.messages, (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0), resp.output or 0)
+		s.system_chars = event.system_chars or s.system_chars
+		s.anchor = compact.anchor(system_chars(s, options), s.messages, (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0), resp.output or 0)
 		s.passes = 0
 		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish, usage = {
 			input = resp.input, output = resp.output, cache_read = resp.cache_read, cache_write = resp.cache_write } })
@@ -223,13 +226,13 @@ local function step(s, event, options)
 	end
 	local req = hooks.emit("before_model", { system = prompt.system(options), messages = s.messages, tools = prompt.tools })
 	local info = hx.model_info()
-	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, s.window_bound or math.huge)
+	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, phase.bound or math.huge)
 	local max_output = info.max_output or 16384
 	local force = phase.compact == "force"
 	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" and (force or s.passes < compact.max_passes) then
 		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)
 		if force or (limit > 0 and total >= limit) then
-			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under the learned bound
+			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under its bound
 			local keep = if force then 0 else math.min(compact.keep_recent_tokens, math.floor(limit / 4))
 			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - compact.reserve_tokens)
 			if cut then

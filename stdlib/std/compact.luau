@@ -5,8 +5,7 @@
 -- the task message and the history to summarize) and appends one instruction, so the summarizer sees exact messages and
 -- the provider can reuse its cached prefix. A validated summary (M.accept) replaces the older messages; the task message
 -- and the most recent messages stay verbatim; the Luau session (globals) is untouched. A context-overflow error from the
--- model teaches an upper bound on the window and triggers one compaction that keeps as little as fits under it (at least
--- the newest exchange), then a retry.
+-- model bounds the window for one compaction that keeps as little as fits under that bound, then a retry.
 -- Below the trigger the pack adds nothing to the requests. It never writes files.
 -- Config (set in .harness/init.luau, which runs before packs install):
 --   require("std/compact").keep_recent_tokens = 8000
@@ -103,9 +102,9 @@ function M.estimate(msg): number
 	return math.ceil(chars / 4) + #(msg.images or {}) * IMAGE_TOKENS
 end
 
-local function estimate_all(system: string, messages, from: number): number
-	local n = math.ceil(#system / 4)
-	for i = from, #messages do
+local function estimate_all(system_chars: number, messages): number
+	local n = math.ceil(system_chars / 4)
+	for i = 1, #messages do
 		n += M.estimate(messages[i])
 	end
 	return n
@@ -115,16 +114,17 @@ end
 -- messages[1 .. count]; later messages (tool results, notes) are estimates times `scale`, which turns chars/4 into the
 -- provider's tokens.
 -- M.anchor: taken at an agent reply from its usage; `messages` is the request it answered, `count` covers the reply too.
--- The scale is the prompt count over the estimate of the same request, clamped to [0.5, 4]; 1 without usage.
-function M.anchor(system: string, messages, prompt_tokens: number, output_tokens: number)
-	local est = estimate_all(system, messages, 1)
+-- The scale is the prompt count over the estimate of the same request (`system_chars`: its system prompt as sent),
+-- clamped to [0.5, 4]; 1 without usage.
+function M.anchor(system_chars: number, messages, prompt_tokens: number, output_tokens: number)
+	local est = estimate_all(system_chars, messages)
 	local scale = if prompt_tokens > 0 and est > 0 then math.clamp(prompt_tokens / est, 0.5, 4) else 1
 	return { tokens = prompt_tokens + output_tokens, count = #messages + 1, scale = scale }
 end
 
 -- An estimated anchor for a history without a provider count (after a compaction or a recovery), keeping the scale.
-function M.reanchor(a, system: string, messages)
-	return { tokens = math.ceil(estimate_all(system, messages, 1) * a.scale), count = #messages, scale = a.scale }
+function M.reanchor(a, system_chars: number, messages)
+	return { tokens = math.ceil(estimate_all(system_chars, messages) * a.scale), count = #messages, scale = a.scale }
 end
 
 -- Context size of the next request in provider tokens.
