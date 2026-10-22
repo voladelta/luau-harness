@@ -4,6 +4,7 @@
 No provider credentials are used. Process outputs are kept outside the observed
 workspace, so acceptance checks measure source changes rather than test logging.
 """
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -275,11 +276,14 @@ def saved_state(log):
     return json.loads((log.parent / "blobs" / record["blob"]).read_text())
 
 
-def expire(log):
+def deadline(log):
     log = Path(log)
     manifest = next(r for r in harness.records(log) if r["kind"] == "manifest")
-    deadline = json.loads((log.parent / "blobs" / manifest["blob"]).read_text())["deadline"]
-    time.sleep(max(0, deadline - time.time()) + 0.05)
+    return json.loads((log.parent / "blobs" / manifest["blob"]).read_text())["deadline"]
+
+
+def expire(log):
+    time.sleep(max(0, deadline(log) - time.time()) + 0.05)
 
 
 def post_submit_batch():
@@ -303,12 +307,31 @@ def post_submit_batch():
         assert len([body for body in calls if stage(body) == "research_questions"]) >= 2
 
 
+@contextlib.contextmanager
+def manual_at(name, kind, wall):
+    """A manual run approved up to its first `kind` gate, with the wall budget doubled until one is reached.
+    Parallel suites can spend a short budget before the gate; only behavior after expiry is under test."""
+    for attempt in range(4):
+        path = workspace(f"{name}-{attempt}")
+        with harness.provider(Script()) as (url, calls):
+            value = report(start(path, url, "--manual", "--max-wall", str(wall)))
+            for _ in range(8):
+                request = gate(value)
+                if not request or request["kind"] == kind or time.time() >= deadline(value["log"]):
+                    break
+                run(path, "review", value["log"], "--gate", request["gate_id"], "--decision", "approve")
+                value = report(run(path, "run", "--resume", value["log"]))
+            if request and request["kind"] == kind:
+                yield path, value, request, calls
+                return
+        assert time.time() >= deadline(value["log"]), (kind, request, value)
+        wall *= 2
+    raise AssertionError(f"{name}: no {kind} gate within a {wall / 2:g}s wall budget")
+
+
 def expired_review_and_acceptance():
     # Intermediate expired gates stay inspectable without credentials or model work.
-    path = workspace("expired-review")
-    with harness.provider(Script()) as (url, calls):
-        value = report(start(path, url, "--manual", "--max-wall", "1"))
-        request = gate(value)
+    with manual_at("expired-review", "review", 1) as (path, value, request, calls):
         expire(value["log"])
         count = len(calls)
         before = len([r for r in harness.records(Path(value["log"])) if r["kind"] == "model_intent"])
@@ -318,15 +341,7 @@ def expired_review_and_acceptance():
         assert len(calls) == count
         assert len([r for r in harness.records(Path(value["log"])) if r["kind"] == "model_intent"]) == before
     # Completing final acceptance after expiry is an administrative transition.
-    path = workspace("expired-acceptance")
-    with harness.provider(Script()) as (url, calls):
-        value = report(start(path, url, "--manual", "--max-wall", "5"))
-        for _ in range(4):
-            request = gate(value)
-            run(path, "review", value["log"], "--gate", request["gate_id"], "--decision", "approve")
-            value = report(run(path, "run", "--resume", value["log"]))
-        request = gate(value)
-        assert request["kind"] == "acceptance"
+    with manual_at("expired-acceptance", "acceptance", 5) as (path, value, request, calls):
         expire(value["log"])
         count = len(calls)
         assert not report(run(path, "run", "--resume", value["log"], env={"HX_TEST_KEY": None}))["finished"]
