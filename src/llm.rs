@@ -65,6 +65,12 @@ pub fn fallback_price(model: &str) -> Option<Price> {
             tiers: vec![Tier { min_prompt_tokens: 0, input: 0.55 / 1_000_000.0, output: 2.19 / 1_000_000.0 }],
             request: 0.0,
         })
+    } else if model == "mercury-3" {
+        // Inception lists it at 0 on its /models endpoint; this is its billed (launch) price.
+        Some(Price {
+            tiers: vec![Tier { min_prompt_tokens: 0, input: 0.10 / 1_000_000.0, output: 0.35 / 1_000_000.0 }],
+            request: 0.0,
+        })
     } else {
         None
     }
@@ -104,7 +110,9 @@ pub async fn fetch_price(cfg: &LlmCfg) -> Option<Price> {
             if let Some(list) = resp.json::<Value>().await.ok() {
                 if let Some(model) = list["data"].as_array().and_then(|a| a.iter().find(|m| m["id"] == cfg.model.as_str())) {
                     if let Some(price) = price_of(&model["pricing"]) {
-                        return Some(price);
+                        // A provider can list a paid model as free; a known price wins over a listed zero.
+                        let free = price.request == 0.0 && price.tiers.iter().all(|t| t.input == 0.0 && t.output == 0.0);
+                        return if free { fallback_price(&cfg.model).or(Some(price)) } else { Some(price) };
                     }
                 }
             }
