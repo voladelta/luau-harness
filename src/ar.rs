@@ -207,9 +207,6 @@ struct Launch {
     spec: Spec,
     program: String,
     child_args: Vec<String>,
-    /// An optional ceiling on the run's model cost, checked before each batch; the run is never planned by it.
-    #[serde(alias = "budget")]
-    max_cost: Option<f64>,
     commit: String,
 }
 
@@ -242,7 +239,7 @@ struct Candidate {
 }
 
 /// Journal records. An episode is `started` before its child runs and `finished` after; resume closes one that never
-/// finished with a durable charge from the killed child's journals, runs what was planned but never started, and
+/// finished with a durable record from the killed child's journals, runs what was planned but never started, and
 /// continues. Held-out scores, audit verdicts and gates are
 /// journaled once and reused.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -250,7 +247,7 @@ struct Candidate {
 enum Record {
     Planned { batch: String, episodes: Vec<Plan> },
     Started { label: String, plan: String, #[serde(default)] scratch: Option<PathBuf> },
-    Finished { label: String, cost: f64, evals: usize, #[serde(default)] interrupted: bool, #[serde(default)] crashed: bool,
+    Finished { label: String, evals: usize, #[serde(default)] interrupted: bool, #[serde(default)] crashed: bool,
         /// Requests the provider refused with HTTP 429, from the child's report.
         #[serde(default)] rate_limits: u64 },
     Selected { snap: String, score: Option<f64> },
@@ -258,9 +255,8 @@ enum Record {
     Gate { round: usize, candidates: Vec<Candidate>, chosen: Vec<u32> },
 }
 
-/// What one episode spent and did.
+/// What one episode did.
 struct Outcome {
-    cost: f64,
     crashed: bool,
     stderr: String,
 }
@@ -269,7 +265,6 @@ struct Orchestrator {
     workspace: PathBuf,
     dir: PathBuf,
     launch: Launch,
-    spent: f64,
 }
 
 impl Orchestrator {
@@ -285,11 +280,6 @@ impl Orchestrator {
 
     fn seed(&self) -> Result<String> {
         Ok(std::fs::read_to_string(self.dir.join("seed"))?.trim().to_string())
-    }
-
-    /// Has the run reached its optional cost ceiling?
-    fn capped(&self) -> bool {
-        self.launch.max_cost.is_some_and(|m| self.spent >= m)
     }
 
     /// Score the seed with the search evaluator before any episode, so every episode knows where it starts. Kept in
@@ -371,14 +361,12 @@ impl Orchestrator {
             }).collect();
             let retries_left = pending.iter().any(|(plan, _)| attempts(&plan.label).len() + 1 < MAX_CRASHES as usize);
             if pending.is_empty() { return Ok(()); }
-            if self.capped() { return Ok(()); }
             let state = self.state()?;
             let mut runs = vec![];
             for (plan, label) in &pending {
                 runs.push(self.episode(plan, label, self.task(plan, label, &state)?));
             }
             let outcomes = futures::future::join_all(runs).await.into_iter().collect::<Result<Vec<_>>>()?;
-            self.spent += outcomes.iter().map(|o| o.cost).sum::<f64>();
             if !outcomes.iter().all(|o| o.crashed) { crashes = 0; continue; }
             crashes += 1;
             // Before the first eval of the whole run, repeated crashes mean misconfiguration: stop, don't wait hours.
@@ -410,30 +398,30 @@ impl Orchestrator {
         place(&ws, self.spec(), &load_snap(&self.dir, &plan.start)?)?;
         self.journal(&Record::Started { label: label.into(), plan: plan.label.clone(), scratch: Some(scratch.0.clone()) })?;
         eprintln!("hx ar: {label} ({:?}{})", plan.role, if plan.idea > 0 { format!(" #{}", plan.idea) } else { String::new() });
-        let out = tokio::process::Command::new(std::env::current_exe()?)
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
             .arg("run").arg("--workspace").arg(&ws).args(&self.launch.child_args)
             .arg("--prompt-file").arg(&task_path)
             .arg("--max-turns").arg(TURNS.to_string())
             .env("HX_AR_EPISODE", &ep_path)
-            .stdin(std::process::Stdio::null())
-            .output().await?;
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn()?;
+        // Its stdin stays open while this orchestrator lives; if it stops, the child stops with it.
+        let (_alive, _tracked) = (child.stdin.take(), child.id().map(crate::prims::Child::track));
+        let out = child.wait_with_output().await?;
         std::fs::write(ep_dir.join(format!("{label}.stderr")), &out.stderr)?;
         let report = String::from_utf8_lossy(&out.stdout).lines().rev()
             .find_map(|l| serde_json::from_str::<Value>(l).ok()).unwrap_or(Value::Null);
         std::fs::write(ep_dir.join(format!("{label}.report.json")), serde_json::to_vec_pretty(&report)?)?;
         let logs = keep_logs(&ws, &ep_dir, label)?;
         drop(scratch);
-        // Without a report the child's journals say what it spent and how often it was rate-limited.
-        let (cost, rate_limits) = match (report["cost_usd"].as_f64(), report["rate_limits"].as_u64()) {
-            (Some(cost), Some(limits)) => (cost, limits),
-            _ => logged(&logs),
-        };
+        // Without a report the child's journals say how often it was rate-limited.
+        let rate_limits = report["rate_limits"].as_u64().unwrap_or_else(|| rate_limited(&logs));
         let evals = ledger(&self.dir)?.iter().filter(|r| r.episode == label).count();
         let crashed = evals == 0 && report.is_null();
-        self.journal(&Record::Finished { label: label.into(), cost, evals, interrupted: false, crashed, rate_limits })?;
+        self.journal(&Record::Finished { label: label.into(), evals, interrupted: false, crashed, rate_limits })?;
         let end = if report["finished"] == true { "finished" } else { report["stopped"].as_str().unwrap_or("stopped") };
-        eprintln!("hx ar: {label}: {evals} evals, ${cost:.3}, {end}{}", if rate_limits > 0 { format!(", {rate_limits} rate-limited") } else { String::new() });
-        Ok(Outcome { cost, crashed, stderr: String::from_utf8_lossy(&out.stderr).into_owned() })
+        eprintln!("hx ar: {label}: {evals} evals, {end}{}", if rate_limits > 0 { format!(", {rate_limits} rate-limited") } else { String::new() });
+        Ok(Outcome { crashed, stderr: String::from_utf8_lossy(&out.stderr).into_owned() })
     }
 
     fn state(&self) -> Result<State> {
@@ -669,24 +657,22 @@ comes from a hole or a rule violation). Without that line the audit counts for n
         }).collect();
         for (label, scratch) in open {
             let evals = rows.iter().filter(|r| r.episode == label).count();
-            // The killed child's scratch copy survives a killed orchestrator: keep its journals, charge from them. Without
-            // its scratch copy nothing is known.
-            let (cost, rate_limits) = match scratch.filter(|s| s.is_dir()) {
+            // The killed child's scratch copy survives a killed orchestrator: keep its journals.
+            let rate_limits = match scratch.filter(|s| s.is_dir()) {
                 Some(dir) => {
                     let logs = keep_logs(&dir.join("ws"), &self.dir.join("episodes"), &label)?;
                     drop(Scratch(dir));
-                    logged(&logs)
+                    rate_limited(&logs)
                 }
-                None => (0.0, 0),
+                None => 0,
             };
             // Research and audits are judged by their final answer, which a killed child never gave: they are retried
             // like a worker that scored nothing.
             let answer_only = label.starts_with("r0-") || label.starts_with('a');
-            let record = Record::Finished { label, cost, evals, interrupted: true, crashed: evals == 0 || answer_only, rate_limits };
+            let record = Record::Finished { label, evals, interrupted: true, crashed: evals == 0 || answer_only, rate_limits };
             self.journal(&record)?;
             records.push(record);
         }
-        self.spent += records.iter().map(|r| match r { Record::Finished { cost, .. } => *cost, _ => 0.0 }).sum::<f64>();
         if !self.dir.join("seed.json").exists() { self.baseline().await?; }
         let seed = self.seed()?;
         // A select evaluator that cannot score the seed would reject every candidate at the first gate: stop before spending.
@@ -708,7 +694,6 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             let plans = match self.planned(&batch)? {
                 Some(plans) => plans,
                 None if gate.is_some() => vec![],
-                None if self.capped() => break,
                 None => {
                     let workers = self.width()?;
                     let plans = if explore {
@@ -769,7 +754,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             "run": self.dir.file_name().unwrap().to_string_lossy(), "dir": self.dir, "commit": self.launch.commit,
             "snap": snap, "search": search, "select": select, "portfolio": portfolio, "candidates": candidates,
             "rounds": self.records()?.iter().filter(|r| matches!(r, Record::Gate { .. })).count(),
-            "evals": state.rows.len(), "cost_usd": self.spent, "max_cost_usd": self.launch.max_cost,
+            "evals": state.rows.len(),
         });
         std::fs::write(self.dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
         Ok(report)
@@ -816,9 +801,8 @@ fn show(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.6}")).unwrap_or_else(|| "none".into())
 }
 
-/// `hx run --ar`: search until neither refining nor exploring makes progress (or an optional cost ceiling), or continue
-/// the run in `resume` (a run directory).
-pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, Option<f64>)>, resume: Option<PathBuf>) -> Result<()> {
+/// `hx run --ar`: search until two rounds in a row make no progress, or continue the run in `resume` (a run directory).
+pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>, resume: Option<PathBuf>) -> Result<()> {
     // A resumed run uses the spec frozen in its sealed launch.json, approved when it started; only a launch reads ar.toml.
     let (dir, launch, records) = match (start, resume) {
         (_, Some(dir)) => {
@@ -831,7 +815,7 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, O
             let records = read_lines(&dir.join("journal.jsonl"))?;
             (dir, launch, records)
         }
-        (Some((child_args, program, max_cost)), None) => {
+        (Some((child_args, program)), None) => {
             ensure!(crate::trust::is_trusted(workspace), "--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first");
             ensure!(crate::workflow::git_inventory(workspace)?.is_some(), "--ar requires a Git repository at the workspace root");
             let spec = Spec::load(workspace)?;
@@ -842,15 +826,14 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String, O
             std::fs::create_dir_all(&dir)?;
             let commit = freeze(workspace, &dir)?;
             std::fs::write(dir.join("seed"), save_snap(&dir, &capture(workspace, &spec)?)?)?;
-            let launch = Launch { spec, program, child_args, max_cost, commit };
+            let launch = Launch { spec, program, child_args, commit };
             std::fs::write(dir.join("launch.json"), serde_json::to_vec_pretty(&launch)?)?;
             (dir, launch, vec![])
         }
         (None, None) => bail!("--ar needs a program, or --resume RUN_DIR"),
     };
-    let ceiling = launch.max_cost.map_or(String::new(), |m| format!(" (cost ceiling ${m:.2})"));
-    let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, launch, spent: 0.0 };
-    eprintln!("hx ar: run {}{ceiling}{}", o.dir.display(), if records.is_empty() { "" } else { ", resumed" });
+    let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, launch };
+    eprintln!("hx ar: run {}{}", o.dir.display(), if records.is_empty() { "" } else { ", resumed" });
     let report = o.run(records).await?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())

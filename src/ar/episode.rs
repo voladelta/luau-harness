@@ -32,6 +32,11 @@ pub fn load_episode() -> Result<()> {
         let episode: Episode = serde_json::from_slice(&std::fs::read(&path)?).context("HX_AR_EPISODE")?;
         let best = episode.best;
         let _ = EPISODE.set((episode, Mutex::new(Progress { claim: None, best })));
+        // The orchestrator holds this child's stdin open while it lives: end of input means it is gone, so stop too.
+        std::thread::spawn(|| {
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+            crate::prims::stop(1);
+        });
     }
     Ok(())
 }

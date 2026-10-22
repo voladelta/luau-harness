@@ -390,7 +390,7 @@ pub async fn shell(jail: &Jail, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Res
         });
     }
     let mut child = command.spawn().map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
-    let group = child.id().map(|p| GroupKill(p as i32)); // killpg on drop: also covers cancellation
+    let group = child.id().map(|p| GroupKill::new(p as i32)); // killpg on drop: also covers cancellation
     let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
     async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -423,14 +423,62 @@ fn user_process_count() -> u64 {
         .unwrap_or(500)
 }
 
-/// Kills the whole process group of an `sh` command when dropped.
+/// Kills the whole process group of an `sh` command (or evaluator) when dropped.
 struct GroupKill(i32);
 
+impl GroupKill {
+    fn new(group: i32) -> Self {
+        GROUPS.lock().unwrap().insert(group);
+        GroupKill(group)
+    }
+}
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
+        GROUPS.lock().unwrap().remove(&self.0);
         unsafe { libc::killpg(self.0, libc::SIGKILL) };
     }
+}
+
+/// The process groups of this process's running commands and the child runs it started. A process that is told to stop
+/// runs no destructors, so `stop` takes them down itself; otherwise they would outlive it.
+static GROUPS: std::sync::Mutex<std::collections::BTreeSet<i32>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+static CHILDREN: std::sync::Mutex<std::collections::BTreeSet<i32>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A child run, asked to stop (and so to stop its own commands) when this process stops.
+pub struct Child(i32);
+
+impl Child {
+    pub fn track(pid: u32) -> Self {
+        CHILDREN.lock().unwrap().insert(pid as i32);
+        Child(pid as i32)
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        CHILDREN.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Kill every running command's process group, ask every child run to stop, and exit.
+pub fn stop(code: i32) -> ! {
+    for group in GROUPS.lock().unwrap().iter() { unsafe { libc::killpg(*group, libc::SIGKILL) }; }
+    for child in CHILDREN.lock().unwrap().iter() { unsafe { libc::kill(*child, libc::SIGTERM) }; }
+    std::process::exit(code)
+}
+
+/// Stop on SIGINT, SIGTERM or SIGHUP, taking every process this one started down with it.
+pub fn stop_on_signals() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let watch = |kind: SignalKind, code: i32| {
+        if let Ok(mut s) = signal(kind) {
+            tokio::spawn(async move { if s.recv().await.is_some() { stop(code) } });
+        }
+    };
+    watch(SignalKind::interrupt(), 130);
+    watch(SignalKind::terminate(), 143);
+    watch(SignalKind::hangup(), 129);
 }
 
 /// An image for the model: re-encoded so its long side is at most `max` px.

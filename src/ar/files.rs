@@ -257,21 +257,10 @@ pub(super) fn keep_logs(ws: &Path, episodes: &Path, label: &str) -> Result<PathB
     Ok(logs)
 }
 
-/// What a child without a report spent, and how often it was rate-limited: its journals' settled cost plus unsettled
-/// reservations, and their HTTP 429s. A child opens its journal before it can admit any model request, so no journal
-/// means nothing spent.
-pub(super) fn logged(logs: &Path) -> (f64, u64) {
+/// How often a child without a report was rate-limited: the HTTP 429s its journals recorded.
+pub(super) fn rate_limited(logs: &Path) -> u64 {
     std::fs::read_dir(logs).into_iter().flatten().flatten().map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .map(|j| journal_books(&j).unwrap_or((0.0, 0)))
-        .fold((0.0, 0), |(c, r), (dc, dr)| (c + dc, r + dr))
-}
-
-/// Settled model cost of a run journal plus its unsettled reservations, and the requests refused with HTTP 429.
-pub(super) fn journal_books(log: &Path) -> Option<(f64, u64)> {
-    let books = crate::eventlog::Books::of(&crate::eventlog::load(log).ok()?).ok()?;
-    let pending: f64 = books.reservations.values().map(|r| match r.cost {
-        crate::eventlog::ReservationCost::UpperBound(c) | crate::eventlog::ReservationCost::Allowance(c) => c,
-    }).sum();
-    Some((books.usage.cost + pending, books.usage.rate_limits))
+        .filter_map(|j| crate::eventlog::Books::of(&crate::eventlog::load(&j).ok()?).ok())
+        .map(|books| books.usage.rate_limits).sum()
 }
