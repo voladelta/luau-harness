@@ -821,7 +821,8 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>,
             let spec = Spec::load(workspace)?;
             let bad = uncommitted(workspace, &spec)?;
             ensure!(bad.is_empty(), "--ar freezes the committed tree: commit or remove changes outside the editable paths: {}", bad.join(", "));
-            let id = format!("{}-{}", chrono_stamp(), std::process::id());
+            // `.noindex`: Spotlight skips the run's snapshots, logs and copies.
+            let id = format!("{}-{}.noindex", chrono_stamp(), std::process::id());
             let dir = workspace.join(".harness/ar").join(&id);
             std::fs::create_dir_all(&dir)?;
             let commit = freeze(workspace, &dir)?;
