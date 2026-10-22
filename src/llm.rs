@@ -122,6 +122,10 @@ fn responses_input(msgs: &[Value]) -> Vec<Value> {
     out
 }
 
+/// Tool-call syntax that reached the reply text instead of a structured call (the route failed to parse the model's call).
+/// DeepSeek's own markers only: their fullwidth bars do not occur in ordinary prose.
+const TOOL_MARKUP: [&str; 2] = ["｜DSML｜", "<｜tool▁call"];
+
 /// `req`: { system?: string, messages: [neutral message], tools?: [{name, description, parameters}], max_tokens?: number }
 pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) -> Result<Reply> {
     let system = req["system"].as_str().unwrap_or("");
@@ -165,6 +169,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     out.calls = items.iter().filter(|o| o["type"] == "function_call").map(|o| call(o["call_id"].as_str().unwrap_or(""), o["name"].as_str().unwrap_or(""), o["arguments"].as_str().unwrap_or(""))).collect();
     out.raw = serde_json::to_string(&items)?;
     let cut = resp["incomplete_details"]["reason"].as_str() == Some("max_output_tokens");
-    out.finish = Some(if cut { "length".into() } else { "stop".to_string() });
+    let markup = out.calls.is_empty() && TOOL_MARKUP.iter().any(|m| out.text.contains(m));
+    out.finish = Some(if cut { "length" } else if markup { "tool_markup" } else { "stop" }.into());
     Ok(out)
 }

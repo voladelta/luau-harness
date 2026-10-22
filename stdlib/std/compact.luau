@@ -165,11 +165,11 @@ function M.wrap(task, summary, history)
 	return task .. "\n\n" .. SUMMARY_PREFIX .. summary .. SUMMARY_SUFFIX .. notice
 end
 
--- A summarizer reply is a candidate: it replaces messages[1 .. cut-1] only if it is complete, text only, and smaller
+-- A summarizer reply is a candidate: it replaces messages[1 .. cut-1] only if it finished normally, is text only, and smaller
 -- than what it replaces. Returns the new first message, or nil and the reason.
 function M.accept(reply, task: string, messages, cut: number, history: boolean): (string?, string?)
 	local text = reply.text or ""
-	if reply.finish == "length" then return nil, "truncated" end
+	if reply.finish ~= nil and reply.finish ~= "stop" then return nil, reply.finish end -- "length", "tool_markup"
 	if #(reply.calls or {}) > 0 then return nil, "tool call" end
 	if text:match("^%s*$") then return nil, "empty" end
 	local first = M.wrap(task, text, history)

@@ -49,6 +49,7 @@ M.tools = {
 }
 
 M.nudge_cut = "Your last reply was cut off or empty, so nothing ran. Call the luau tool again with shorter code (split big edits across calls), or reply in plain text if you are done."
+M.nudge_markup = "Your tool call arrived as plain text (the provider could not parse it), so nothing ran. Call the luau tool again."
 M.nudge_no_call = "You have not run any code yet. Call the luau tool to start the work."
 M.cut_call = "error: your tool call was cut off before the code was complete, so nothing ran. Send shorter code (split big edits across calls)."
 

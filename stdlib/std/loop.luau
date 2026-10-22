@@ -167,7 +167,8 @@ local function step(s, event, options)
 			input = resp.input, output = resp.output, cache_read = resp.cache_read, cache_write = resp.cache_write } })
 		local text, calls = reply.text, resp.calls or {}
 		if #calls == 0 then
-			if text:match("^%s*$") or resp.finish == "length" then
+			local markup = resp.finish == "tool_markup" -- a tool call that reached the text unparsed: nothing ran
+			if text:match("^%s*$") or resp.finish == "length" or markup then
 				if options.submissions then
 					s.report.truncated_turns += 1
 					table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
@@ -178,7 +179,7 @@ local function step(s, event, options)
 				s.report.truncated_turns += 1
 				if s.bad > 3 then s.report.stopped = "protocol: repeated empty or truncated replies"; return finish(s) end
 				table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
-				table.insert(s.messages, { role = "user", content = prompt.nudge_cut })
+				table.insert(s.messages, { role = "user", content = if markup then prompt.nudge_markup else prompt.nudge_cut })
 				return ready(s)
 			end
 			if not options.submissions and s.report.code_turns == 0 and s.no_call < 2 then

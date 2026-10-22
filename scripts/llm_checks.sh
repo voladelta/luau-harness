@@ -43,6 +43,8 @@ check "responses: results go back in the native tool-result shape (one per call)
 check "invalid tool arguments: error result, run continues" "$(mockrun '[{"calls":[{"name":"luau","arguments":"{\"code\": \"print(1"}]},"```luau\nprint(2)\n```","all done"]')" "True|all done|3|1|1"
 check "unknown tool name: error result, run continues" "$(mockrun '[{"calls":[{"name":"bash","arguments":"{}"}]},"```luau\nprint(2)\n```","all done"]')" "True|all done|3|1|0"
 check "plain prose after a code turn finishes (no nudge)" "$(mockrun '["```luau\nprint(7)\n```","The fix is in place."]')" "True|The fix is in place.|2|1|0"
+check "tool-call markup leaked into the text is nudged, not taken as the answer" "$(mockrun '["```luau\nprint(7)\n```","part07: SECRET=614</｜DSML｜ parameter>","```luau\nprint(2)\n```","all done"]')" "True|all done|4|2|1"
+check "the markup nudge reaches the model" "$(grep -c 'arrived as plain text' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
 check "prose before any code is nudged to start" "$(mockrun '["I will look.","```luau\nprint(7)\n```","done"]')" "True|done|3|1|1"
 check "the luau tool is declared in the request" "$(grep -c '"luau"' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

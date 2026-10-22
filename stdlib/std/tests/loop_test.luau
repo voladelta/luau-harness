@@ -87,3 +87,14 @@ test.case("the anchor scale uses the system prompt as sent", function()
 	test.eq(s.system_chars, 40000)
 	test.ok(math.abs(s.anchor.scale - 1) < 0.01, "10000 system tokens + the task: scale ~1, not the 4x clamp")
 end)
+
+test.case("a tool call that reached the text as markup is nudged, not accepted as the answer", function()
+	local s, command = start()
+	s, command = turn(s, 1000, 1) -- a code turn first, so plain prose would otherwise be a final answer
+	s, command = loop.step(s, { kind = "model_reply", system_chars = SYSTEM,
+		reply = { text = "part07: SECRET=614</｜DSML｜ parameter>", finish = "tool_markup", input = 1100, output = 10, calls = {} } })
+	test.eq(s.report.finished, false)
+	test.eq(s.report.truncated_turns, 1)
+	test.eq(s.messages[#s.messages].content, require("std/prompt").nudge_markup)
+	test.eq(command.kind, "next")
+end)
