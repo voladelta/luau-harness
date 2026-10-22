@@ -7,6 +7,11 @@ use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex,
 /// New requests after a 429 that generated nothing; other retryable failures get one.
 const RATE_LIMIT_RETRIES: u32 = 8;
 
+/// Seconds before retry number `retries + 1`: the provider's `Retry-After`, else 2, 4, 8 … s; always 1–30 s.
+fn backoff(retries: u32, retry_after: Option<f64>) -> f64 {
+    retry_after.unwrap_or(2f64.powi(retries as i32 + 1)).clamp(1.0, 30.0)
+}
+
 pub struct StartOptions {
     pub task: String,
     pub max_turns: usize,
@@ -183,10 +188,11 @@ impl Host {
             let limit = if answered.is_some_and(|a| a.status == 429 && a.unbilled()) { RATE_LIMIT_RETRIES } else { 1 };
             match retry.filter(|_| retries < limit) {
                 Some(after) => {
-                    let wait = after.unwrap_or(2f64.powi(retries as i32 + 1)).clamp(1.0, 30.0);
+                    let wait = backoff(retries, after);
                     if self.supervisor.remaining().is_some_and(|r| r.as_secs_f64() <= wait) { return Err(error); }
                     self.log(&format!("### MODEL RETRY\n{error}"));
-                    tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                    // test hook: the checks exercise retries, not the clock (HX_TEST_NO_BACKOFF)
+                    if std::env::var_os("HX_TEST_NO_BACKOFF").is_none() { tokio::time::sleep(Duration::from_secs_f64(wait)).await; }
                     retries += 1;
                 },
                 None => return Err(error),
@@ -389,3 +395,15 @@ pub fn file_tree(root: &std::path::Path) -> String {
 }
 
 fn ensure_object(value:&Value)->Result<()> {anyhow::ensure!(value.is_object(),"controller state must be an object");Ok(())}
+
+#[cfg(test)]
+mod backoff_tests {
+    #[test]
+    fn retries_back_off_exponentially_within_bounds_and_honour_retry_after() {
+        let schedule: Vec<f64> = (0..6).map(|n| super::backoff(n, None)).collect();
+        assert_eq!(schedule, [2.0, 4.0, 8.0, 16.0, 30.0, 30.0]);
+        assert_eq!(super::backoff(3, Some(5.0)), 5.0);
+        assert_eq!(super::backoff(0, Some(0.0)), 1.0);
+        assert_eq!(super::backoff(0, Some(120.0)), 30.0);
+    }
+}

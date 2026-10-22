@@ -25,7 +25,7 @@ if os.environ.get("HX_CHECK_ARTIFACTS"):
 else:
     BASE = Path(tempfile.mkdtemp(prefix="hx-redesign-"))
 BASE.mkdir(parents=True, exist_ok=True)
-ENV = {**os.environ, "HX_TRUST": "1", "HX_TEST_KEY": "local-mock-only"}
+ENV = {**os.environ, "HX_TRUST": "1", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1"}  # backoff: host.rs unit test
 for key in ("HX_MODEL", "HX_API", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
     ENV.pop(key, None)
 passed = 0
@@ -378,7 +378,7 @@ def local_write_reconciliation():
 
 
 def model_status_codes():
-    # A rate limit is waited out (backing off 2 s, then 4 s) and releases each reservation: nothing was generated.
+    # A rate limit is waited out and releases each reservation: nothing was generated.
     path = workspace("status-429")
     with provider(lambda body, i: {"status": 429, "error": "slow down"} if i < 2 else "done") as (url, calls):
         report = json.loads(start(path, url, "--max-tokens", "1000000").stdout)

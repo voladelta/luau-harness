@@ -101,7 +101,6 @@ def main():
     groups += [[("redesign", ["python3", "scripts/redesign_checks.py"])],
                [("custom_tools", ["python3", "scripts/custom_tool_checks.py"])] ,
                [("rpi", ["python3", "scripts/rpi_checks.py"])],
-               [("ar", ["python3", "scripts/ar_checks.py"], 280)],
                [("history", ["python3", "scripts/history_checks.py"])]]
 
     def group(checks):
@@ -110,6 +109,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for future in as_completed([pool.submit(group, checks) for checks in groups]):
             results.extend(future.result())
+    # ar runs four scenarios at a time on its own; beside other suites it starves them past their caps.
+    results.append(run("ar", ["python3", "scripts/ar_checks.py"], cap=280))
     elapsed = time.monotonic() - started
     print(f"\n{sum(results)}/{len(results)} suites passed in {elapsed:.1f}s (limit: 5 minutes)", flush=True)
     return 0 if all(results) and elapsed < 300 else 1
