@@ -24,17 +24,24 @@
 //! held-out score is only ever a veto: ranking on it as well would select on it every round until it is as optimistic
 //! as the search score.
 //!
-//! Rounds go on while the budget lasts: after an exploit round that moves no chosen candidate, the next round explores
-//! new ideas again, and when that moves none either the run stops. With no valid candidate after round 1 the run stops.
-//! The result is the audited good candidates of the last gate, best search score first: several distinct good answers,
-//! since the single best score is the one most likely to be an overfit or an evaluator hole.
+//! Episodes are limited in model turns, not dollars. Rounds refine while refining moves a chosen candidate and explore
+//! again when it moves none; a round makes progress when it chooses a new candidate or lifts one by more than
+//! `min_delta`, and two rounds in a row without progress end the run. With no valid candidate after round 1 the run
+//! stops. The result is the audited good candidates of the last gate, best search score first: several distinct good
+//! answers, since the single best score is the one most likely to be an overfit or an evaluator hole.
+//!
+//! `episode` holds what runs inside an episode (`ar.eval`, `ar.claim`, `ar.claims`, `ar.reset`); `files` holds what
+//! crosses its boundary (snapshots, throwaway copies, the sandboxed evaluator, the frozen base).
 use anyhow::{Context, Result, bail, ensure};
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+
+mod episode;
+mod files;
+pub use episode::{EPISODE, claim, claims, eval, load_episode, reset};
+use episode::Episode;
+use files::*;
 
 /// Workers side by side in a round, and fewer once the provider has rate-limited an episode of the run.
 const WORKERS: usize = 8;
@@ -52,11 +59,6 @@ const BRIEF_CHARS: usize = 8_000;
 const FINDING_CHARS: usize = 1_500;
 /// Attempts of a planned episode that crashes before any eval (usually provider rate limits).
 const MAX_CRASHES: u32 = 3;
-/// Limits on the editable files of one snapshot: total bytes, file count and directory depth.
-const MAX_SNAPSHOT: usize = 16 << 20;
-const MAX_FILES: usize = 10_000;
-const MAX_DEPTH: usize = 32;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
@@ -134,38 +136,6 @@ impl Spec {
 #[serde(rename_all = "snake_case")]
 pub enum Role { Research, Explore, Exploit, Audit }
 
-/// What a child run needs to serve `ar`; written by the orchestrator, named by `HX_AR_EPISODE`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Episode {
-    /// The run directory; sealed from the child's agent.
-    pub dir: PathBuf,
-    pub label: String,
-    pub spec: Spec,
-    pub role: Role,
-    /// The candidate an exploit worker improves (0 for every other role).
-    pub idea: u32,
-    /// The snapshot the workspace starts from, and the score an improvement must beat (none: any valid score).
-    pub start: String,
-    pub best: Option<f64>,
-}
-
-/// A worker's progress inside its child run: its claim and its best score so far.
-pub struct Progress {
-    claim: Option<u32>,
-    best: Option<f64>,
-}
-pub static EPISODE: OnceLock<(Episode, Mutex<Progress>)> = OnceLock::new();
-
-/// Called once at startup: a child run of an autoresearch episode gets `ar`, and its policy seals the run.
-pub fn load_episode() -> Result<()> {
-    if let Some(path) = std::env::var_os("HX_AR_EPISODE") {
-        let episode: Episode = serde_json::from_slice(&std::fs::read(&path)?).context("HX_AR_EPISODE")?;
-        let best = episode.best;
-        let _ = EPISODE.set((episode, Mutex::new(Progress { claim: None, best })));
-    }
-    Ok(())
-}
-
 /// Paths a child's policy must seal, so that even with --yolo its agent cannot read or change them: every
 /// autoresearch run of the owner's workspace (this run included) and the evaluators' roots.
 pub fn sealed() -> Vec<PathBuf> {
@@ -229,437 +199,6 @@ fn append_line<T: Serialize>(path: &Path, record: &T) -> Result<()> {
     writeln!(file, "{}", serde_json::to_string(record)?)?;
     file.sync_all()?;
     Ok(())
-}
-
-/// Editable files, path -> bytes.
-type Files = BTreeMap<String, Vec<u8>>;
-
-/// Every regular file under the editable paths of `root`, within the snapshot limits. Symlinks and special files are
-/// skipped: they never leave an episode. Names must be UTF-8 so they are recreated exactly.
-fn capture(root: &Path, spec: &Spec) -> Result<Files> {
-    fn walk(path: &Path, rel: &str, depth: usize, out: &mut Files, total: &mut usize) -> Result<()> {
-        let Ok(meta) = std::fs::symlink_metadata(path) else { return Ok(()) };
-        if meta.is_dir() {
-            ensure!(depth < MAX_DEPTH, "editable directories nest deeper than {MAX_DEPTH} levels");
-            for entry in std::fs::read_dir(path)? {
-                let entry = entry?;
-                let name = entry.file_name().into_string().map_err(|n| anyhow::anyhow!("editable file name {n:?} is not UTF-8"))?;
-                walk(&entry.path(), &format!("{rel}/{name}"), depth + 1, out, total)?;
-            }
-        } else if meta.is_file() {
-            ensure!(out.len() < MAX_FILES, "editable paths hold more than {MAX_FILES} files");
-            // Read at most what is left of the limit, so a file that keeps growing cannot get past it.
-            let left = MAX_SNAPSHOT - *total;
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(path)?, left as u64 + 1), &mut bytes)?;
-            ensure!(bytes.len() <= left, "editable files exceed {} MiB", MAX_SNAPSHOT >> 20);
-            *total += bytes.len();
-            out.insert(rel.to_string(), bytes);
-        }
-        Ok(())
-    }
-    let (mut out, mut total) = (BTreeMap::new(), 0);
-    for e in &spec.editable {
-        let e = e.trim_end_matches('/');
-        // A symlinked parent directory is skipped like any symlink: nothing is read through it.
-        let linked = Path::new(e).ancestors().skip(1).filter(|a| !a.as_os_str().is_empty())
-            .any(|a| std::fs::symlink_metadata(root.join(a)).is_ok_and(|m| m.file_type().is_symlink()));
-        if linked { continue; }
-        walk(&root.join(e), e, 0, &mut out, &mut total)?;
-    }
-    Ok(out)
-}
-
-/// Kill every process that still has its working directory or an open file under `dir` (agents' and evaluators'
-/// detached leftovers), before the directory is deleted.
-fn reap(dir: &Path) {
-    let Ok(out) = std::process::Command::new("lsof").args(["-t", "+D"]).arg(dir).stderr(std::process::Stdio::null()).output() else { return };
-    let me = std::process::id() as i32;
-    for pid in String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<i32>().ok()).filter(|p| *p != me) {
-        unsafe { libc::kill(pid, libc::SIGKILL); }
-    }
-}
-
-/// Make the editable paths of `root` hold exactly `files`.
-fn place(root: &Path, spec: &Spec, files: &Files) -> Result<()> {
-    for e in &spec.editable {
-        let path = root.join(e.trim_end_matches('/'));
-        match std::fs::symlink_metadata(&path) {
-            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path)?,
-            Ok(_) => std::fs::remove_file(&path)?,
-            Err(_) => {}
-        }
-    }
-    for (rel, bytes) in files {
-        let path = root.join(rel);
-        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-        std::fs::write(path, bytes)?;
-    }
-    Ok(())
-}
-
-/// Store a snapshot content-addressed under `dir/snaps`; returns its id.
-fn save_snap(dir: &Path, files: &Files) -> Result<String> {
-    let encoded: BTreeMap<&String, String> = files.iter()
-        .map(|(k, v)| (k, base64::engine::general_purpose::STANDARD.encode(v))).collect();
-    let bytes = serde_json::to_vec(&encoded)?;
-    let id = crate::eventlog::sha_bytes(&bytes)[..16].to_string();
-    let path = dir.join("snaps").join(format!("{id}.json"));
-    if !path.exists() {
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(path, bytes)?;
-    }
-    Ok(id)
-}
-
-fn load_snap(dir: &Path, id: &str) -> Result<Files> {
-    let encoded: BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(dir.join("snaps").join(format!("{id}.json")))?)?;
-    encoded.into_iter().map(|(k, v)| Ok((k, base64::engine::general_purpose::STANDARD.decode(v)?))).collect()
-}
-
-/// A fresh private directory in the system temp dir; removed on drop.
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new(kind: &str) -> Result<Scratch> {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::fs::canonicalize(std::env::temp_dir())?.join(format!("hx-ar-{kind}-{}-{nanos}-{seq}", std::process::id()));
-        std::fs::create_dir(&path)?;
-        Ok(Scratch(path))
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        reap(&self.0);
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Copy the tree `from` to the new path `to` (APFS clones when available).
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    for flags in [&["-cR"][..], &["-R"][..]] {
-        let status = std::process::Command::new("cp").args(flags).arg(from).arg(to)
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status()?;
-        if status.success() { return Ok(()); }
-        let _ = std::fs::remove_dir_all(to);
-    }
-    bail!("could not copy {} to {}", from.display(), to.display())
-}
-
-/// Run an evaluator on `files` placed into a fresh copy of the frozen base. Returns (score, valid, se, report).
-/// Failures of the evaluator become invalid results, not errors.
-async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, holdout: bool) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
-    let scratch = Scratch::new("eval")?;
-    let tree = scratch.0.join("tree");
-    copy_tree(&run.join("base"), &tree)?;
-    place(&tree, spec, files)?;
-    let tmp = scratch.0.join("tmp");
-    std::fs::create_dir(&tmp)?;
-    let mut read = spec.roots(holdout)?;
-    read.push(scratch.0.clone());
-    let jail = crate::prims::Jail {
-        profile: crate::policy::evaluator_profile(&read, std::slice::from_ref(&scratch.0)),
-        env: Some(evaluator_env(&tmp)),
-    };
-    let (stdout, stderr, code, timed_out) = crate::prims::shell(&jail, cmd, tree, spec.timeout).await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let stdout = String::from_utf8_lossy(&stdout);
-    let tail = |s: &str| s.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>();
-    let parsed = stdout.lines().rev().find(|l| !l.trim().is_empty())
-        .and_then(|l| serde_json::from_str::<Value>(l).ok()).filter(Value::is_object);
-    let Some(obj) = parsed.filter(|_| code == Some(0) && !timed_out) else {
-        let why = if timed_out { "evaluator timed out".to_string() } else { format!("evaluator exit {code:?} or no JSON result line") };
-        return Ok((None, false, None, json!({"error": why, "stdout": tail(&stdout), "stderr": tail(&String::from_utf8_lossy(&stderr))})));
-    };
-    let score = obj["score"].as_f64().filter(|s| s.is_finite());
-    let valid = score.is_some() && obj["valid"].as_bool() != Some(false);
-    let se = obj["se"].as_f64().filter(|s| s.is_finite() && *s >= 0.0);
-    Ok((score, valid, se, obj.get("report").cloned().unwrap_or(Value::Null)))
-}
-
-/// The evaluator's environment: no credentials, nothing inherited beyond what locates tools.
-fn evaluator_env(tmp: &Path) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = ["PATH", "HOME", "LANG", "LC_ALL", "USER", "RUSTUP_HOME", "CARGO_HOME"].iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v))).collect();
-    env.push(("TMPDIR".into(), tmp.to_string_lossy().to_string()));
-    env
-}
-
-/// `ar.eval(note)` inside an episode: snapshot the editable files, score the snapshot, append to the ledger. Explore and
-/// exploit workers score only after their claim is accepted, and their states belong to their candidate.
-pub async fn eval(pol: &crate::policy::Policy, note: String) -> Result<Value> {
-    let (episode, progress) = EPISODE.get().context("ar.eval is only available inside an autoresearch episode")?;
-    let spec = &episode.spec;
-    let claim = progress.lock().unwrap().claim;
-    let idea = match (episode.role, claim) {
-        (Role::Explore | Role::Exploit, None) => bail!("claim your idea with ar.claim(\"...\") before scoring it"),
-        (Role::Explore, Some(n)) => n,
-        (Role::Exploit, Some(_)) => episode.idea,
-        (Role::Research | Role::Audit, _) => 0,
-    };
-    let files = capture(&pol.workspace, spec)?;
-    let snap = save_snap(&episode.dir, &files)?;
-    // An evaluator that reports no `se` is deterministic: a state it already scored validly keeps its stored result. A
-    // probe, or a state its candidate already has, gets that result and no new ledger row; a state only another
-    // candidate scored is recorded for this one, judged against its best, without running the evaluator again.
-    let rows = ledger(&episode.dir)?;
-    let stored = rows.iter().find(|r| r.snap == snap && r.valid && r.se.is_none());
-    if let Some(r) = stored.filter(|_| idea == 0 || rows.iter().any(|o| o.snap == snap && o.idea == idea && o.valid && o.se.is_none())) {
-        let best = progress.lock().unwrap().best;
-        return Ok(json!({"n": r.n, "score": r.score, "valid": true, "se": null, "improved": false, "best": best,
-            "report": r.report, "cached": true}));
-    }
-    let (score, valid, se, report) = match stored {
-        Some(r) => (r.score, true, None, r.report.clone()),
-        None => evaluate(spec, &episode.dir, &files, &spec.eval, false).await?,
-    };
-    // A worker's step counts when it beats its best by more than the evaluator's noise, so small steps add up across
-    // rounds; `min_delta` is the bar against the seed, applied at the gate.
-    let margin = se.unwrap_or(0.0);
-    let (improved, best) = {
-        let mut p = progress.lock().unwrap();
-        // The state a worker starts from never improves it, so an explore worker's bar is set by the first state it builds.
-        let improved = idea != 0 && valid && snap != episode.start
-            && spec.better(score.unwrap(), p.best, if p.best.is_some() { margin } else { 0.0 });
-        if improved { p.best = score; }
-        (improved, p.best)
-    };
-    let n = {
-        let _lock = lock_file(&episode.dir.join("ledger.lock"))?;
-        let n = ledger(&episode.dir)?.len() + 1;
-        append_line(&episode.dir.join("ledger.jsonl"), &Row { n, episode: episode.label.clone(), idea,
-            note: note.chars().take(300).collect(), snap, score, valid, se, improved, report: report.clone() })?;
-        n
-    };
-    let mut out = json!({"n": n, "score": score, "valid": valid, "se": se, "improved": improved, "best": best, "report": report});
-    if stored.is_some() { out["cached"] = json!(true); }
-    Ok(out)
-}
-
-/// `ar.claim(idea)`: claim the idea an explore worker will test, or the refinement an exploit worker will try. Claims
-/// are served one at a time in arrival order under the run's claim lock. A claim is rejected only when two independent
-/// judge calls both find that it shares the core approach of the same earlier claim in its scope, so a borderline idea
-/// gets the benefit of the doubt; a judge that cannot answer accepts. One accepted claim per worker.
-pub async fn claim(host: &crate::host::Host, idea: String) -> Result<Value> {
-    let (episode, progress) = EPISODE.get().context("ar.claim is only available inside an autoresearch episode")?;
-    let scope = match episode.role {
-        Role::Explore => "explore".to_string(),
-        Role::Exploit => format!("c{}", episode.idea),
-        Role::Research | Role::Audit => bail!("ar.claim is for explore and exploit workers"),
-    };
-    let idea: String = idea.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(1_000).collect();
-    // Agents probe a function with a dummy argument ("x"); an accepted claim is final, so a non-description is refused
-    // without using up the claim.
-    ensure!(idea.split(' ').count() >= 8, "describe the idea in two or three sentences (at least 8 words): an accepted \
-claim is final and is how other workers, auditors and the report know what you built");
-    let path = episode.dir.join("claims.lock");
-    let lock = tokio::task::spawn_blocking(move || lock_file(&path)).await??;
-    if let Some(n) = progress.lock().unwrap().claim { bail!("this worker already claimed #{n}: one idea per worker") }
-    let earlier: Vec<Claim> = read_lines::<Claim>(&episode.dir.join("claims.jsonl"))?.into_iter().filter(|c| c.scope == scope).collect();
-    // A retried episode (label `r1-w3.2`) continues the claim an earlier attempt of the same plan made.
-    let plan = |label: &str| label.split('.').next().unwrap_or(label).to_string();
-    if let Some(mine) = earlier.iter().find(|c| plan(&c.worker) == plan(&episode.label)) {
-        progress.lock().unwrap().claim = Some(mine.n);
-        return Ok(json!({"ok": true, "n": mine.n, "idea": mine.idea, "message": format!("Accepted as #{}: an earlier attempt \
-of this worker claimed this idea before it was interrupted. Continue with it: {}", mine.n, mine.idea)}));
-    }
-    // Plain text, so a printed result shows every claim (printers abbreviate nested tables).
-    let listed: String = earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
-    let what = if episode.role == Role::Exploit { "refinement" } else { "core approach" };
-    match judge(host, &earlier, &idea, episode.role == Role::Exploit).await {
-        Judged::New => {},
-        Judged::Same(i) => return Ok(json!({"ok": false, "same_as": earlier[i].n, "message": format!("Rejected: the same \
-{what} as #{} was claimed first. Claimed so far:\n{listed}Choose a different {what} and claim it.", earlier[i].n)})),
-        Judged::Placeholder => return Ok(json!({"ok": false, "message": format!("Rejected: this names no concrete \
-{what}. A claim is final and is how everyone knows what you built: claim the {what} you will build. `ar.claims()` lists \
-what is taken. Claimed so far:\n{listed}")})),
-    }
-    let n = earlier.len() as u32 + 1;
-    append_line(&episode.dir.join("claims.jsonl"), &Claim { scope, n, idea, worker: episode.label.clone() })?;
-    // Recorded before the lock is released, so a second claim of this worker waiting on the lock sees it.
-    progress.lock().unwrap().claim = Some(n);
-    drop(lock);
-    Ok(json!({"ok": true, "n": n, "message": format!("Accepted as #{n}. Build it now; ar.eval works from here on.")}))
-}
-
-/// What two independent judge calls agree a new claim is.
-enum Judged {
-    New,
-    /// The index of the earlier claim it duplicates: the same core approach for explore ideas, the same change for
-    /// refinements of one candidate.
-    Same(usize),
-    /// No concrete approach at all: a placeholder, a probe or a test of the tool.
-    Placeholder,
-}
-
-/// Judge a new claim against the earlier ones. Only an answer both calls agree on rejects it; anything else accepts.
-async fn judge(host: &crate::host::Host, earlier: &[Claim], idea: &str, refinement: bool) -> Judged {
-    let listed: String = if earlier.is_empty() { "(none)\n".into() } else { earlier.iter().map(|c| format!("{}. {}\n", c.n, c.idea)).collect() };
-    let prompt = if refinement {
-        format!("Several researchers each claim one refinement of the same solution. Claimed so far:\n{listed}\n\
-New claim:\n{idea}\n\nIs the new claim the same refinement as one already claimed? Same means the same change to the \
-same part of the solution (the same rule, component or parameter, changed the same way); a change to a different part, \
-or a different kind of change, is a different refinement even when both touch similar things. In one sentence, name \
-what the new claim changes and the closest claimed one. Then end with a line 'Answer: N', where N is the matching \
-claim's number, or 0 if it is a different refinement. If the new claim names no concrete change at all (a placeholder, \
-a probe or a test of the tool), end with 'Answer: none' instead.")
-    } else {
-        format!("Several researchers each claim one core approach to the same task. Claimed so far:\n{listed}\n\
-New claim:\n{idea}\n\nDoes the new claim use the same core approach as one already claimed? Same core means the same main \
-mechanism that decides what the solution does (the same kind of model, algorithm or signal); differing only in \
-parameters, filters, exits, sizing or added gates still counts as the same, while a different main mechanism is a \
-different core even when it shares ingredients. In one sentence, name the new claim's main mechanism and the closest \
-claimed one. Then end with a line 'Answer: N', where N is the matching claim's number, or 0 if it is a genuinely \
-different core approach. If the new claim names no concrete approach at all (a placeholder, a probe or a test of the \
-tool), end with 'Answer: none' instead.")
-    };
-    let request = json!({"system": "You compare research ideas and answer exactly in the format asked.", "prompt": prompt,
-        "effort": "none", "max_tokens": 2000});
-    let Ok(replies) = host.complete(json!([request, request])).await else { return Judged::New };
-    let picks: Vec<Option<usize>> = replies.as_array().into_iter().flatten().map(|r| r["value"].as_str().and_then(answer_number)).collect();
-    match picks.as_slice() {
-        [Some(0), Some(0)] => Judged::New,
-        [Some(a), Some(b)] if a == b && *a == usize::MAX => Judged::Placeholder,
-        [Some(a), Some(b)] if a == b && (1..=earlier.len()).contains(a) => Judged::Same(a - 1),
-        _ => Judged::New,
-    }
-}
-
-/// N from the last `Answer: N` in a judge's reply, tolerating markdown such as `**Answer:** #2`; `Answer: none` is
-/// `usize::MAX`.
-fn answer_number(text: &str) -> Option<usize> {
-    let at = text.to_ascii_lowercase().rfind("answer")?;
-    let rest = text[at + "answer".len()..].trim_start_matches(['*', ':', ' ', '#', '\t']);
-    if rest.to_ascii_lowercase().starts_with("none") { return Some(usize::MAX); }
-    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
-}
-
-/// `ar.claims()`: the claims made so far in this worker's scope, as plain text.
-pub fn claims() -> Result<Value> {
-    let (episode, _) = EPISODE.get().context("ar.claims is only available inside an autoresearch episode")?;
-    let scope = match episode.role {
-        Role::Explore => "explore".to_string(),
-        Role::Exploit => format!("c{}", episode.idea),
-        Role::Research | Role::Audit => bail!("ar.claims is for explore and exploit workers"),
-    };
-    let listed: String = read_lines::<Claim>(&episode.dir.join("claims.jsonl"))?.into_iter().filter(|c| c.scope == scope)
-        .map(|c| format!("{}. {}\n", c.n, c.idea)).collect();
-    Ok(json!({"message": if listed.is_empty() { "No claims yet.".to_string() } else { format!("Claimed so far:\n{listed}") }}))
-}
-
-/// An exclusive lock on `path`, held until the returned file is dropped: episodes running side by side number ledger
-/// rows without gaps or repeats, and claims are judged one at a time in arrival order.
-fn lock_file(path: &Path) -> Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
-    ensure!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0, "could not lock {}", path.display());
-    Ok(file)
-}
-
-/// `ar.reset()`: put this worker's best scored state back into the editable paths (the state it started from when it
-/// has not improved on it).
-pub fn reset(pol: &crate::policy::Policy) -> Result<Value> {
-    let (episode, progress) = EPISODE.get().context("ar.reset is only available inside an autoresearch episode")?;
-    let rows = ledger(&episode.dir)?;
-    let snap = rows.iter().rev().find(|r| r.improved && r.episode == episode.label)
-        .map_or_else(|| episode.start.clone(), |r| r.snap.clone());
-    let files = load_snap(&episode.dir, &snap)?;
-    // The agent controls this workspace, so every change goes the way its own `write` would: a policy-resolved path,
-    // and directories opened without following links.
-    let target = |rel: &str, create| -> Result<crate::atomic_file::Target> {
-        Ok(crate::atomic_file::Target::open(&pol.check_write(rel)?, create)?)
-    };
-    for rel in capture(&pol.workspace, &episode.spec)?.keys().filter(|rel| !files.contains_key(*rel)) {
-        target(rel, false)?.remove()?;
-    }
-    for (rel, bytes) in &files {
-        target(rel, true)?.replace(bytes)?;
-    }
-    Ok(json!({"best": progress.lock().unwrap().best}))
-}
-
-/// Git, configured so a repository's own config cannot run commands (owner context, launch only).
-fn git(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = std::process::Command::new("git")
-        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false"])
-        .args(args).current_dir(workspace)
-        .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output().context("git")?;
-    ensure!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
-    Ok(out.stdout)
-}
-
-/// Paths that differ from HEAD outside the editable set (owner's `.harness/` excepted).
-fn uncommitted(workspace: &Path, spec: &Spec) -> Result<Vec<String>> {
-    let out = git(workspace, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
-    let mut bad = vec![];
-    let mut entries = out.split(|b| *b == 0).filter(|e| !e.is_empty());
-    while let Some(entry) = entries.next() {
-        let entry = String::from_utf8_lossy(entry);
-        let (status, path) = entry.split_at(3.min(entry.len()));
-        let mut paths = vec![path.to_string()];
-        // A rename or copy names its source as the next entry; both must be in scope.
-        if status.starts_with('R') || status.starts_with('C') {
-            paths.extend(entries.next().map(|e| String::from_utf8_lossy(e).to_string()));
-        }
-        for p in paths {
-            let inside = spec.editable.iter().any(|e| p == *e || p.starts_with(&format!("{}/", e.trim_end_matches('/'))));
-            if !p.starts_with(".harness/") && !inside { bad.push(p); }
-        }
-    }
-    Ok(bad)
-}
-
-/// Freeze HEAD's tree (without `.harness`) into `run/base`, byte for byte: blobs are read directly, so export
-/// attributes (`export-ignore`, `export-subst`) cannot change what the evaluator sees. Submodules are not included.
-fn freeze(workspace: &Path, run: &Path) -> Result<String> {
-    use std::io::{BufRead, Read, Write};
-    let commit = String::from_utf8(git(workspace, &["rev-parse", "HEAD"])?)?.trim().to_string();
-    let listing = git(workspace, &["ls-tree", "-r", "-z", "--full-tree", &commit])?;
-    let entries: Vec<(String, String, String)> = listing.split(|b| *b == 0).filter(|e| !e.is_empty()).map(|e| {
-        let e = String::from_utf8(e.to_vec()).map_err(|_| anyhow::anyhow!("non-UTF-8 path in the committed tree"))?;
-        let (meta, path) = e.split_once('\t').context("ls-tree entry")?;
-        let mut parts = meta.split(' ');
-        let (mode, kind, sha) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-        Ok((mode.to_string(), if kind == "blob" { sha.to_string() } else { String::new() }, path.to_string()))
-    }).collect::<Result<_>>()?;
-    let base = run.join("base");
-    std::fs::create_dir_all(&base)?;
-    let mut child = std::process::Command::new("git")
-        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "cat-file", "--batch"])
-        .current_dir(workspace).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn()?;
-    let mut input = child.stdin.take().unwrap();
-    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
-    for (mode, sha, path) in entries.iter().filter(|(_, sha, _)| !sha.is_empty()) {
-        if path == ".harness" || path.starts_with(".harness/") {
-            continue;
-        }
-        ensure!(!path.split('/').any(|c| c == ".." || c.is_empty()), "unsafe path {path:?} in the committed tree");
-        writeln!(input, "{sha}")?;
-        input.flush()?;
-        let mut header = String::new();
-        output.read_line(&mut header)?;
-        let size: usize = header.trim().rsplit(' ').next().and_then(|n| n.parse().ok()).context("cat-file header")?;
-        let mut bytes = vec![0; size + 1];
-        output.read_exact(&mut bytes)?;
-        bytes.pop();
-        let target = base.join(path);
-        if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
-        if mode == "120000" {
-            std::os::unix::fs::symlink(String::from_utf8_lossy(&bytes).to_string(), &target)?;
-        } else {
-            std::fs::write(&target, &bytes)?;
-            if mode == "100755" {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
-            }
-        }
-    }
-    drop(input);
-    ensure!(child.wait()?.success(), "git cat-file failed");
-    Ok(commit)
 }
 
 /// Launch settings, frozen at the start and reused on resume.
@@ -1273,35 +812,6 @@ fn clip(text: &str, max: usize) -> String {
     if cut.len() < text.len() { cut + "\n... (truncated)" } else { cut }
 }
 
-/// Copy an episode workspace's journals into the run as `episodes/LABEL.log`; returns that directory.
-fn keep_logs(ws: &Path, episodes: &Path, label: &str) -> Result<PathBuf> {
-    let logs = episodes.join(format!("{label}.log"));
-    if ws.join(".harness/log").is_dir() && !logs.exists() {
-        std::fs::create_dir_all(episodes)?;
-        copy_tree(&ws.join(".harness/log"), &logs)?;
-    }
-    Ok(logs)
-}
-
-/// What a child without a report spent, and how often it was rate-limited: its journals' settled cost plus unsettled
-/// reservations, and their HTTP 429s. A child opens its journal before it can admit any model request, so no journal
-/// means nothing spent.
-fn logged(logs: &Path) -> (f64, u64) {
-    std::fs::read_dir(logs).into_iter().flatten().flatten().map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .map(|j| journal_books(&j).unwrap_or((0.0, 0)))
-        .fold((0.0, 0), |(c, r), (dc, dr)| (c + dc, r + dr))
-}
-
-/// Settled model cost of a run journal plus its unsettled reservations, and the requests refused with HTTP 429.
-fn journal_books(log: &Path) -> Option<(f64, u64)> {
-    let books = crate::eventlog::Books::of(&crate::eventlog::load(log).ok()?).ok()?;
-    let pending: f64 = books.reservations.values().map(|r| match r.cost {
-        crate::eventlog::ReservationCost::UpperBound(c) | crate::eventlog::ReservationCost::Allowance(c) => c,
-    }).sum();
-    Some((books.usage.cost + pending, books.usage.rate_limits))
-}
-
 fn show(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.6}")).unwrap_or_else(|| "none".into())
 }
@@ -1353,16 +863,8 @@ fn chrono_stamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{answer_number, verdict};
+    use super::verdict;
 
-    #[test]
-    fn judge_answers() {
-        assert_eq!(answer_number("Mechanism: breakout.\nAnswer: 2"), Some(2));
-        assert_eq!(answer_number("**Answer:** #3"), Some(3));
-        assert_eq!(answer_number("answer: 0"), Some(0));
-        assert_eq!(answer_number("It names no approach.\n**Answer:** none"), Some(usize::MAX));
-        assert_eq!(answer_number("I think 2 is closest."), None);
-    }
 
     #[test]
     fn audit_verdicts() {
