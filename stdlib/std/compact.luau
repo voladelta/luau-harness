@@ -17,8 +17,7 @@ M.enabled = true
 M.context_window = 1000000 -- used only when --context-window is not given
 M.max_trigger_tokens = 256000 -- compaction starts at this context size at the latest
 M.reserve_tokens = 16384 -- headroom kept free for the next reply and the summarizer's output (prime-agent/pi default)
-M.keep_recent_tokens = 64000 -- recent history kept verbatim (clamped to a quarter of the trigger)
-M.max_passes = 2 -- compactions allowed between two agent replies
+M.keep_recent_tokens = 64000 -- recent history kept verbatim, at most (clamped to a quarter of the trigger); the newest exchange is always kept
 
 local IMAGE_TOKENS = 1200
 
@@ -127,6 +126,11 @@ function M.reanchor(a, system_chars: number, messages)
 	return { tokens = math.ceil(estimate_all(system_chars, messages) * a.scale), count = #messages, scale = a.scale }
 end
 
+-- Provider tokens of the system prompt and the task message: what no compaction can remove.
+function M.fixed(a, system_chars: number, task): number
+	return math.ceil((system_chars / 4 + M.estimate(task)) * a.scale)
+end
+
 -- Context size of the next request in provider tokens.
 function M.measure(a, messages): number
 	local n = a.tokens
@@ -136,19 +140,25 @@ function M.measure(a, messages): number
 	return n
 end
 
--- Index of the first message to keep and the summarizer's prefix size, or nil when no cut works. Walks back from the end and returns the first assistant
--- message (a tool result is never cut away from its call) at which the kept messages reach `keep_tokens` and the
--- summarizer's prefix (`total` minus the kept messages) is at most `max_prefix`. keep_tokens = 0 keeps as little as fits.
--- messages[1] (the task) is never summarized, so the cut is at least 3.
+-- Index of the first message to keep and the summarizer's prefix size, or nil when no cut works. Cuts only at an
+-- assistant message (a tool result is never cut away from its call) whose summarizer prefix (`total` minus the kept
+-- messages) is at most `max_prefix`. Of those, it keeps the most recent history within `keep_tokens`, or else the
+-- least: the budget is a ceiling, so one huge exchange is never pinned in the tail, and the context after a compaction
+-- is at most the task, the summary and max(keep_tokens, the newest exchange). keep_tokens = 0 keeps as little as fits.
+-- messages[1] (the task) is never summarized, so the cut is at least 3; nil when no cut fits.
 function M.find_cut(messages, keep_tokens: number, scale: number, total: number, max_prefix: number): (number?, number?)
-	local kept = 0
+	local kept, best, size = 0, nil, nil
 	for i = #messages, 3, -1 do
 		kept += M.estimate(messages[i]) * scale
-		if messages[i].role == "assistant" and kept >= keep_tokens and total - kept <= max_prefix then
-			return i, total - kept
+		if messages[i].role == "assistant" and total - kept <= max_prefix then
+			if kept > keep_tokens then
+				if best then return best, size end
+				return i, total - kept
+			end
+			best, size = i, total - kept
 		end
 	end
-	return nil
+	return best, size
 end
 
 -- The summarizer request: the agent's own request prefix (same system prompt and tools, messages[1 .. cut-1] unchanged)

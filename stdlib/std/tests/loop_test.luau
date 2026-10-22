@@ -26,23 +26,18 @@ local function summary(s, text)
 	return loop.step(s, { kind = "model_reply", reply = { text = text, finish = "stop", calls = {} } })
 end
 
-test.case("a summary that leaves the context above the trigger compacts again, at most twice per agent reply", function()
+test.case("one compaction per agent reply; the next reply measures afresh", function()
 	local s, command = start()
 	for n = 1, 6 do s, command = turn(s, 1000 * n, n) end
-	-- a huge prompt count: one cut cannot get under the trigger, and every summary still shrinks what it replaces
-	s, command = turn(s, 30000, 7)
+	s, command = turn(s, 30000, 7) -- far over the trigger
 	test.eq(command.purpose, "compact")
-	s, command = summary(s, "SUMMARY-ONE " .. string.rep("s", 2000))
-	test.eq(s.passes, 1)
+	s, command = summary(s, "SUMMARY-ONE")
 	test.eq(command.kind, "next")
 	s, command = loop.step(s, { kind = "next" })
-	test.eq(command.purpose, "compact")
-	s, command = summary(s, "SUMMARY-TWO")
-	test.eq(s.passes, 2)
-	s, command = loop.step(s, { kind = "next" })
-	test.eq(command.purpose, "agent") -- the pass limit hands the turn back to the agent
-	s, command = turn(s, 5000, 8)
-	test.eq(s.passes, 0) -- an agent reply resets the count
+	test.eq(command.purpose, "agent") -- no second pass: the kept tail is already bounded
+	test.ok(s.messages[1].content:find("SUMMARY-ONE", 1, true))
+	test.eq(s.messages[2].role, "assistant")
+	test.ok(compact.measure(s.anchor, s.messages) < 30000)
 end)
 
 test.case("an accepted summary resets the failure count", function()
@@ -97,4 +92,24 @@ test.case("a tool call that reached the text as markup is nudged, not accepted a
 	test.eq(s.report.truncated_turns, 1)
 	test.eq(s.messages[#s.messages].content, require("std/prompt").nudge_markup)
 	test.eq(command.kind, "next")
+end)
+
+test.case("a large fixed part (system prompt + task) does not make compaction recur every turn", function()
+	hooks.clear()
+	hx.model_info = function() return {} end
+	compact.context_window = 40000 -- trigger 7232; a quarter is 1808
+	local s = loop.init({ task_message = string.rep("t", 24000), max_turns = 50 }) -- a 6000-token task, like an RPI packet
+	local command
+	s, command = loop.step(s, { kind = "next" })
+	local compactions = 0
+	for n = 1, 8 do
+		s, command = turn(s, 7000 + 1000 * n, n)
+		if command.purpose == "compact" then
+			compactions += 1
+			s, command = summary(s, "S" .. n)
+			s, command = loop.step(s, { kind = "next" })
+		end
+	end
+	test.ok(compactions >= 1 and compactions <= 3, "compacts only once the summarizable span is worth it: " .. compactions)
+	compact.context_window = 1000000
 end)

@@ -11,22 +11,33 @@ test.case("threshold", function()
 	test.ok(compact.threshold(10000, 16384, 16384) <= 0, "a window smaller than the reply budget disables compaction")
 end)
 
-test.case("find_cut walks back to an assistant message and never cuts the task or a tool exchange", function()
+test.case("find_cut cuts only at an assistant message, never the task or a tool exchange", function()
 	local pad = string.rep("x", 400) -- 100 tokens
 	local m = { user("task"), asst(pad, "a"), tool("a", "ok"), asst(pad, "b"), tool("b", "ok"), asst(pad, "c"), tool("c", "ok") }
 	for keep = 0, 400 do
 		local cut = compact.find_cut(m, keep, 1, 1000, 1000)
-		if cut then
-			test.eq(m[cut].role, "assistant")
-			test.ok(cut >= 3)
-		end
+		test.eq(m[cut].role, "assistant")
+		test.ok(cut >= 3)
 	end
-	test.eq(compact.find_cut(m, 0, 1, 1000, 1000), 6) -- keep 0: the newest complete exchange
-	test.eq(compact.find_cut(m, 101, 1, 1000, 1000), 6) -- "c" and its result are 101 tokens
-	test.eq(compact.find_cut(m, 102, 1, 1000, 1000), 4) -- one more token: back to "b"
-	test.eq(compact.find_cut(m, 1000, 1, 1000, 1000), nil) -- everything fits in the kept budget: nothing to summarize
 	test.eq(compact.find_cut({ user("task"), asst("x", "a"), tool("a", "ok") }, 0, 1, 1000, 1000), nil) -- only one exchange
 	test.eq(compact.find_cut({ user("task"), user("u"), user("tail") }, 0, 1, 1000, 1000), nil) -- no assistant message
+end)
+
+test.case("find_cut keeps the most recent history within the budget, always the newest exchange", function()
+	local pad = string.rep("x", 400)
+	local m = { user("task"), asst(pad, "a"), tool("a", "ok"), asst(pad, "b"), tool("b", "ok"), asst(pad, "c"), tool("c", "ok") }
+	test.eq(compact.find_cut(m, 0, 1, 1000, 1000), 6) -- keep 0: the newest exchange ("c" + result = 101)
+	test.eq(compact.find_cut(m, 101, 1, 1000, 1000), 6)
+	test.eq(compact.find_cut(m, 201, 1, 1000, 1000), 6) -- "b" would overshoot by one token
+	test.eq(compact.find_cut(m, 202, 1, 1000, 1000), 4)
+	test.eq(compact.find_cut(m, 100000, 1, 1000, 1000), 4) -- all of it fits: still summarize what precedes the oldest cut
+	test.eq(compact.find_cut(m, 150, 2, 1000, 1000), 6) -- the scale applies: "c" weighs 202, over budget, kept anyway
+end)
+
+test.case("find_cut never pins a huge exchange in the tail", function()
+	local m = { user("task"), asst("x", "a"), tool("a", "ok"), asst(string.rep("h", 40000), "b"), tool("b", "ok"),
+		asst(string.rep("x", 400), "c"), tool("c", "ok") }
+	test.eq(compact.find_cut(m, 500, 1, 20000, 20000), 6) -- "b" (10000) would blow the 500 budget: it is summarized
 end)
 
 test.case("find_cut keeps more until the summarizer prefix fits, and returns its size", function()
@@ -37,7 +48,6 @@ test.case("find_cut keeps more until the summarizer prefix fits, and returns its
 	cut, size = compact.find_cut(m, 0, 1, 1000, 850) -- 899 does not fit: keep "b" too
 	test.eq(cut, 4); test.eq(size, 1000 - 202)
 	test.eq(compact.find_cut(m, 0, 1, 1000, 100), nil) -- no cut leaves a prefix that small
-	test.eq(compact.find_cut(m, 150, 2, 1000, 1000), 6) -- the scale applies: "c" weighs 202
 end)
 
 test.case("request replays the agent prefix and appends one instruction", function()

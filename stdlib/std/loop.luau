@@ -38,7 +38,7 @@ function M.init(cfg)
 	return {
 		phase = { kind = "ready", compact = "auto" }, max_turns = cfg.max_turns, task_text = cfg.task_message, messages = { { role = "user", content = cfg.task_message } },
 		report = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" },
-		bad = 0, no_call = 0, recheck_asked = false, anchor = { tokens = 0, count = 0, scale = 1 }, passes = 0, compact_failures = 0,
+		bad = 0, no_call = 0, recheck_asked = false, anchor = { tokens = 0, count = 0, scale = 1 }, compact_failures = 0,
 		retried = false, hook_state = {},
 	}
 end
@@ -150,10 +150,9 @@ local function step(s, event, options)
 			s.previous_summary = event.reply.text
 			s.messages = kept
 			s.anchor = compact.reanchor(s.anchor, system_chars(s, options), s.messages)
-			s.passes += 1
 			s.compact_failures = 0
-			-- "auto": a history still above the trigger compacts again, up to compact.max_passes per agent reply
-			local next_state, command = ready(s)
+			-- one compaction per agent reply: the kept tail is bounded, so a second pass could not shrink it further
+			local next_state, command = ready(s, "skip")
 			if archive_enabled then command.archive = {kind="compaction", cut=cut} end
 			return next_state, command
 		end
@@ -162,7 +161,6 @@ local function step(s, event, options)
 		s.report.turns += 1
 		s.system_chars = event.system_chars or s.system_chars
 		s.anchor = compact.anchor(system_chars(s, options), s.messages, (resp.input or 0) + (resp.cache_read or 0) + (resp.cache_write or 0), resp.output or 0)
-		s.passes = 0
 		local reply = hooks.emit("after_model", { text = resp.text or "", finish = resp.finish, usage = {
 			input = resp.input, output = resp.output, cache_read = resp.cache_read, cache_write = resp.cache_write } })
 		local text, calls = reply.text, resp.calls or {}
@@ -230,12 +228,15 @@ local function step(s, event, options)
 	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, phase.bound or math.huge)
 	local max_output = info.max_output or 16384
 	local force = phase.compact == "force"
-	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" and (force or s.passes < compact.max_passes) then
+	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" then
 		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)
 		if force or (limit > 0 and total >= limit) then
 			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under its bound
 			local keep = if force then 0 else math.min(compact.keep_recent_tokens, math.floor(limit / 4))
 			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - compact.reserve_tokens)
+			-- under pressure, summarize at least a quarter of the trigger beyond the system prompt and task, so a compaction
+			-- frees real room and cannot recur every turn when they alone sit near the trigger (an overflow takes any cut)
+			if cut and not force and size - compact.fixed(s.anchor, system_chars(s, options), s.messages[1]) < limit / 4 then cut = nil end
 			if cut then
 				s.phase = { kind = "compact", cut = cut, size = size, overflow = phase.overflow }
 				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut), purpose = "compact" }
