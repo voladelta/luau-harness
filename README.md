@@ -23,7 +23,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 |---|---|
 | Code mode | One `luau` tool; globals persist across turns; `read`, `write`, `edit`, `sh`, `search` (ripgrep engine, embedded) |
 | Process execution | `sh` and local MCP servers run directly; run hx inside your own sandbox or container |
-| Approval gate | `git push`, publish, `ssh` and other recognized external commands pass a Rust approval gate |
+| Approvals | Workspace file tools run freely; outside paths and recognized external actions ask for approval. `--yes` approves ordinary requests automatically |
 | [RPI workflow](docs/workflows.md#rpi-research-design-implement-verify) | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds owner review gates |
 | [Autoresearch](docs/workflows.md#autoresearch) | `--ar` improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
 | [Recovery](docs/cli.md#checkpoints-and-resume) | `--resume` restores saved data and controller state into a fresh VM; old effectful chunks are never replayed |
@@ -95,6 +95,15 @@ cargo install --path .
    hx run --workspace . --prompt-file task.md --model anthropic/claude-sonnet-5.5 --max-tokens 2000000
    ```
 
+For a one-off task, pass the prompt directly. Add `--yes` for autopilot:
+
+```bash
+hx run "Fix the failing tests" --model MODEL
+hx run "Fix the failing tests" --model MODEL --yes
+```
+
+Workspace and configured file-tool paths are allowed without asking. Other file-tool paths and recognized external actions ask on the controlling terminal; without one they are refused. `--yes` automatically approves ordinary requests for that run without changing `policy.toml`. Protected harness files, sealed state, credential reads and capability checks still apply. Shell filesystem access is controlled by your external sandbox.
+
 hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens) and writes the event log to `.harness/log/`.
 
 hx uses the Responses API for every model. For another provider with a compatible `/responses` endpoint, pass its base URL and key variable:
@@ -143,8 +152,8 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 
 - `sh`, local MCP servers and autoresearch evaluators run directly. Filesystem, network and GPU isolation belong to the environment running hx; configure them in your Linux sandbox or container.
 - By default, `sh` and local MCP servers receive a minimal environment without inherited API keys. Shell commands run in their own process group, killed when the command ends, with a per-user process cap.
-- `read`, `write`, `edit` and `search` check canonical paths against allowed roots. File tools protect `.harness/`, `hx.lock` and the trust store, and writes refuse symlinks. These checks do not restrict shell commands or MCP server processes.
-- Workspace config is ignored until you [trust](docs/configuration.md#workspace-trust) it. Shell commands are classed read / local write / external / irreversible; obvious external commands such as `git push` pass an approval gate. This classifier is a tripwire, so process confinement must be supplied externally.
+- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools protect `.harness/`, `hx.lock` and the trust store, and writes refuse symlinks. These checks do not restrict shell commands or MCP server processes.
+- Workspace config is ignored until you [trust](docs/configuration.md#workspace-trust) it. Shell commands are classed read / local write / external / irreversible; obvious external commands such as `git push` ask for approval unless pre-approved or launched with `--yes`. This classifier is a tripwire, so process confinement must be supplied externally.
 
 ## Documentation
 

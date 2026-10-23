@@ -55,7 +55,7 @@ def run(path, *args, env=None, ok=True):
 def start(path, url, *flags, env=None, ok=True):
     return run(path, "run", "--rpi", "--prompt-file", str(path / "task.md"),
                "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY",
-               "--max-turns", "50", "--yolo", *flags, env=env, ok=ok)
+               "--max-turns", "50", "--yes", *flags, env=env, ok=ok)
 
 
 def report(result):
@@ -429,7 +429,7 @@ def native_admission_ceiling():
     with harness.provider(answer) as (url, calls):
         value = report(run(path, "run", "--rpi", "--prompt-file", str(path / "task.md"),
                            "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY",
-                           "--max-turns", "4", "--yolo"))
+                           "--max-turns", "4", "--yes"))
         assert not value["finished"] and "max_turns" in value.get("stopped", ""), value
         intents = [r for r in harness.records(Path(value["log"])) if r["kind"] == "model_intent"]
         assert child_calls > 0 and any(r.get("depth", 0) > 0 for r in intents), intents

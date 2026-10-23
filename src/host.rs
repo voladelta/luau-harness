@@ -125,7 +125,7 @@ impl Host {
     pub fn budget_status(&self) -> Value { self.supervisor.budget_status() }
     pub fn model_info(&self) -> Value {
         json!({"model": self.llm.model, "context_window": self.llm.context_window, "max_output": self.llm.max_output,
-            "history": self.depth == 0})
+            "history": self.depth == 0, "autopilot": self.policy.autopilot})
     }
 
     pub(crate) fn report(&self, mut report: Value, wall_secs: f64) -> Value {

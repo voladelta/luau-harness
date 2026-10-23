@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-// Process policy changed: older manifests freeze prompts and settings that assume OS confinement.
-pub const FORMAT: u64 = 7;
+// Approval policy and temporary grants are frozen under this format.
+pub const FORMAT: u64 = 8;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -435,7 +435,7 @@ mod checkpoint_tests {
         for (tag, limit) in [("capped", Some(102)), ("uncapped", None)] {
             let dir = std::env::temp_dir().join(format!("hx-billing-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+            let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
             let cfg = model();
             let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
                 Budget { max_tokens: limit, ..Budget::default() }, None).unwrap();
@@ -456,7 +456,7 @@ mod checkpoint_tests {
     async fn queued_model_admission_expires_without_a_settlement() {
         let dir = std::env::temp_dir().join(format!("hx-admission-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
         let cfg = model();
         let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
             Budget { max_tokens: Some(102), max_wall_secs: Some(0.5), ..Budget::default() }, None).unwrap();

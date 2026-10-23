@@ -11,6 +11,13 @@ test.case("runtime access is a named section independent of custom prose", funct
 	test.ok(with_mcp:find("MCP tools listed below work", 1, true) ~= nil)
 end)
 
+test.case("runtime access describes ordinary approval and autopilot separately", function()
+	local normal = prompt.runtime_access("", false, false)
+	local auto = prompt.runtime_access("", false, true)
+	test.ok(normal:find("other paths require owner approval", 1, true) ~= nil)
+	test.ok(auto:find("owner enabled automatic approval", 1, true) ~= nil)
+end)
+
 test.case("limits in the system prompt come from the values in force", function()
 	local text = prompt.fill("cap {{DEFAULT_HITS}}; cut at {{STR_TOP}}; {{file: string}} stays", { DEFAULT_HITS = 7 })
 	test.eq(text, "cap 7; cut at " .. require("std/printer").STR_TOP .. "; {{file: string}} stays")

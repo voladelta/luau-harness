@@ -27,8 +27,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Debug)]
+enum CliArg<'a> { Flag(&'a str, Option<&'a str>), Positional(&'a str) }
+
+/// Parse options once per query, skipping option values and honoring `--` for literal prompts/chunks.
+fn cli_args(args: &[String]) -> Vec<CliArg<'_>> {
+    let command = args.first().map(String::as_str).unwrap_or("");
+    let mut parsed = Vec::new();
+    let mut it = args.iter().skip(1).peekable();
+    while let Some(name) = it.next() {
+        if name == "--" { parsed.extend(it.map(|s| CliArg::Positional(s))); break; }
+        if (name.starts_with("--") && !(command == "exec" && name.chars().any(char::is_whitespace))) || name == "-h" {
+            let value = if flag_kind(command, name).is_some_and(|k| k != FlagKind::Switch)
+                && it.peek().is_some_and(|v| !v.starts_with("--")) { it.next().map(String::as_str) } else { None };
+            parsed.push(CliArg::Flag(name, value));
+        } else { parsed.push(CliArg::Positional(name)); }
+    }
+    parsed
+}
+
 fn arg(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    cli_args(args).into_iter().find_map(|a| match a { CliArg::Flag(n, v) if n == name => v.map(String::from), _ => None })
+}
+
+fn positionals(args: &[String]) -> Vec<&str> {
+    cli_args(args).into_iter().filter_map(|a| match a { CliArg::Positional(p) => Some(p), _ => None }).collect()
+}
+
+fn task_text(args: &[String]) -> Result<Option<String>> {
+    match arg(args, "--prompt-file") {
+        Some(path) => Ok(Some(std::fs::read_to_string(path)?)),
+        None => Ok(positionals(args).first().map(|p| p.to_string())),
+    }
 }
 
 const TOP_HELP: &str = "hx: Luau code-mode agent harness
@@ -58,7 +88,7 @@ const TOP_HELP_TAIL: &str = "    -h, --help            show help (also `hx <comm
 
 EXAMPLES:
     hx exec --workspace . 'print(1+1)'
-    hx run --prompt-file task.md --model claude-sonnet-5-5 --max-turns 20
+    hx run \"Fix the failing tests\" --yes --model claude-sonnet-5-5
     hx log verify .harness/run.jsonl
 
 ENVIRONMENT:
@@ -95,8 +125,8 @@ const FLAGS: &[Flag] = {
     const RUN: &[&str] = &["run"];
     &[
         flag(&[], "--workspace", Text, "DIR", "workspace root (default: .)"),
-        flag(&[], "--yolo", Switch, "", "no file-tool path limits or approval gate; file tools still protect .harness/ and hx.lock (prints a warning)"),
-        flag(&[], "--approval", Text, "MODE", "deny (default) or prompt: what happens to a command that needs approval"),
+        flag(&[], "--approval", Text, "MODE", "prompt (default) or deny: handle requests outside standing permissions"),
+        flag(&["run", "exec"], "--yes", Switch, "", "autopilot: approve ordinary path and tool requests for this run without asking"),
         flag(&["run", "exec"], "--pack", Text, "A,B", "extra packs: std/authoring (agent-written tools), std/vision (view() shows images)"),
         flag(RUN, "--resume", Text, "LOG", "restore frozen settings and checkpoint into a fresh VM; do not repeat flags"),
         flag(RUN, "--branch", Text, "LOG", "start a new run with current approved configuration and inherited durable data"),
@@ -152,7 +182,7 @@ fn command_help(cmd: &str) -> Option<String> {
 fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "exec" => "hx exec [flags] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
-        "run" => "hx run --prompt-file F --model M [flags]\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
+        "run" => "hx run PROMPT [--yes] [flags]\n       hx run --prompt-file F [flags]\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
         "review" => "hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]\n\nRecords a decision only; continue with hx run --resume LOG.\n",
         "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, model requests whose response was lost are charged their reserved tokens; none needs a decision.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
@@ -214,7 +244,7 @@ async fn main() {
 }
 
 fn has(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| a == flag)
+    cli_args(args).into_iter().any(|a| matches!(a, CliArg::Flag(n, _) if n == flag))
 }
 
 /// A comma-separated flag value as a list (empty when the flag is absent).
@@ -232,15 +262,12 @@ fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>
 fn validate_args(args: &[String]) -> Result<()> {
     let command = args[0].as_str();
     let mut seen = std::collections::BTreeSet::new();
-    let mut it = args.iter().skip(1);
-    while let Some(name) = it.next() {
-        if !name.starts_with("--") { continue; }
-        // A quoted Luau chunk may start with a multiline comment.
-        if command == "exec" && name.chars().any(char::is_whitespace) { continue; }
+    for argument in cli_args(args) {
+        let CliArg::Flag(name, value) = argument else { continue };
         let kind = flag_kind(command, name).ok_or_else(|| usage(&format!("unknown option {name} for hx {command}")))?;
-        if !seen.insert(name.as_str()) { return Err(usage(&format!("{name} may only be supplied once"))); }
+        if !seen.insert(name) { return Err(usage(&format!("{name} may only be supplied once"))); }
         if matches!(kind, FlagKind::Switch) { continue; }
-        let value = it.next().filter(|v| !v.starts_with("--")).ok_or_else(|| usage(&format!("{name} requires a value")))?;
+        let value = value.ok_or_else(|| usage(&format!("{name} requires a value")))?;
         match kind {
             FlagKind::Unsigned | FlagKind::Positive => {
                 let number = value.parse::<u64>().map_err(|_| usage(&format!("{name}: expected a nonnegative integer, got {value:?}")))?;
@@ -261,9 +288,17 @@ fn validate_args(args: &[String]) -> Result<()> {
     if seen.contains("--ar") && let Some(flag) = seen.iter().find(|f| matches!(**f, "--rpi" | "--branch" | "--trace" | "--max-tokens" | "--max-wall" | "--max-turns")) {
         return Err(usage(&format!("{flag} cannot be combined with --ar")));
     }
-    if seen.contains("--ar") && !seen.contains("--resume") && !seen.contains("--prompt-file") {
-        return Err(usage("--ar requires --prompt-file (the program), or --resume RUN_DIR"));
+    if command == "run" {
+        let prompts = positionals(args);
+        if prompts.len() > 1 { return Err(usage("supply one quoted prompt")); }
+        if !prompts.is_empty() && seen.contains("--prompt-file") { return Err(usage("use a positional prompt or --prompt-file, not both")); }
+        if !prompts.is_empty() && seen.contains("--resume") { return Err(usage("a prompt cannot override a resumed manifest; use --branch LOG")); }
+        if prompts.first().is_some_and(|p| p.trim().is_empty()) { return Err(usage("prompt must not be empty")); }
+        if prompts.is_empty() && !seen.contains("--prompt-file") && !seen.contains("--resume") && !seen.contains("--branch") {
+            return Err(usage("a new run requires a prompt or --prompt-file (the program with --ar)"));
+        }
     }
+    if seen.contains("--yes") && seen.contains("--approval") { return Err(usage("--yes and --approval cannot be combined")); }
     if list_arg(args, "--pack").iter().any(|p| p == "std/rpi" || p.starts_with("std/rpi/")) {
         return Err(usage("RPI must be activated explicitly with --rpi, not --pack"));
     }
@@ -281,7 +316,7 @@ fn print_info(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => print!("{}", top_help()),
         Some("-V" | "-v" | "--version" | "version") => println!("hx {}", env!("CARGO_PKG_VERSION")),
-        Some(c) if args.iter().skip(1).any(|a| a == "-h" || a == "--help") => match command_help(c) {
+        Some(c) if has(args, "-h") || has(args, "--help") => match command_help(c) {
             Some(h) => print!("{h}"),
             None => return false,
         },
@@ -301,13 +336,8 @@ async fn real_main() -> Result<()> {
     }
     validate_args(&args)?;
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
-    // The file-tool path policy and approval gate are ON by default; `--yolo` is an explicit opt-out (and says so on stderr).
-    let policy_enabled = !has(&args, "--yolo");
-    if !policy_enabled {
-        eprintln!("warning: --yolo: no file-tool path limits or approval gate (file tools still protect .harness/ and hx.lock)");
-    }
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
-    let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, policy_enabled, arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), episode)?)) };
+    let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, has(&args, "--yes"), arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), episode)?)) };
     match args[0].as_str() {
         "exec" => {
             trust::warn_if_untrusted(&workspace);
@@ -360,16 +390,7 @@ async fn real_main() -> Result<()> {
 
 /// The Luau chunks of `hx exec`: every argument after the command that is not a global flag or its value.
 fn exec_chunks(args: &[String]) -> Vec<&str> {
-    let mut out = vec![];
-    let mut it = args.iter().skip(1);
-    while let Some(a) = it.next() {
-        match flag_kind("exec", a) {
-            Some(FlagKind::Switch) => {},
-            Some(_) => { it.next(); },
-            None => out.push(a.as_str()),
-        }
-    }
-    out
+    positionals(args)
 }
 
 /// hx exec --workspace DIR 'chunk1' 'chunk2' : run chunks in one session (no API key needed; used for testing)
@@ -418,10 +439,8 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
                 .map(|b| supervisor::Checkpoint::load(&b)).transpose()?;
             Ok((journal, manifest, state))
         }).transpose()?;
-        let task = match arg(args, "--prompt-file") {
-            Some(path) => std::fs::read_to_string(path)?,
-            None => inherited.as_ref().map(|(_, m, _)| m.task.clone()).ok_or_else(|| usage("--prompt-file required for a new run"))?,
-        };
+        let task = task_text(args)?.or_else(|| inherited.as_ref().map(|(_, m, _)| m.task.clone()))
+            .ok_or_else(|| usage("a new run requires a prompt or --prompt-file"))?;
         let cfg = llm_cfg(args, policy.log.session.clone())?;
         let max_turns = parsed(args, "--max-turns")?.unwrap_or(DEFAULT_MAX_TURNS as usize);
         let budget = policy::Budget { max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
@@ -459,15 +478,13 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
         return ar::orchestrate(workspace, None, Some(PathBuf::from(dir))).await;
     }
     let mut child = vec![];
-    let mut it = args.iter().skip(1);
-    while let Some(name) = it.next() {
-        let kind = flag_kind("run", name);
-        let value = if matches!(kind, Some(FlagKind::Switch)) { None } else { it.next() };
-        if matches!(name.as_str(), "--ar" | "--prompt-file" | "--workspace") { continue; }
-        child.push(name.clone());
-        child.extend(value.cloned());
+    for argument in cli_args(args) {
+        let CliArg::Flag(name, value) = argument else { continue };
+        if matches!(name, "--ar" | "--prompt-file" | "--workspace") { continue; }
+        child.push(name.to_string());
+        child.extend(value.map(String::from));
     }
-    let program = std::fs::read_to_string(arg(args, "--prompt-file").unwrap())?;
+    let program = task_text(args)?.ok_or_else(|| usage("--ar requires a prompt or --prompt-file"))?;
     ar::orchestrate(workspace, Some((child, program)), None).await
 }
 
@@ -598,9 +615,23 @@ mod tests {
 
     #[test]
     fn exec_chunks_skip_global_flags_and_their_values() {
-        let a = argv("exec --workspace /w print(1) --pack a,b print(2) --approval prompt --yolo print(3)");
+        let a = argv("exec --workspace /w print(1) --pack a,b print(2) --yes print(3)");
         assert_eq!(exec_chunks(&a), vec!["print(1)", "print(2)", "print(3)"]);
         assert!(exec_chunks(&argv("exec")).is_empty());
+    }
+
+    #[test]
+    fn prompts_are_data_and_cannot_enable_flags() {
+        let args = vec!["run".into(), "Fix --yes and --help parsing".into(), "--model".into(), "mock".into()];
+        validate_args(&args).unwrap();
+        assert_eq!(task_text(&args).unwrap().as_deref(), Some("Fix --yes and --help parsing"));
+        assert!(!has(&args, "--yes"));
+        let args = argv("run --model mock -- --yes");
+        validate_args(&args).unwrap();
+        assert!(!has(&args, "--yes"));
+        assert_eq!(task_text(&args).unwrap().as_deref(), Some("--yes"));
+        assert_eq!(arg(&argv("run -- --model mock"), "--model"), None);
+        assert_eq!(exec_chunks(&argv("exec -- --yes")), vec!["--yes"]);
     }
 
     #[test]
@@ -611,7 +642,7 @@ mod tests {
         assert_eq!(parsed::<u32>(&a, "--max-turns").unwrap(), Some(7));
         assert_eq!(parsed::<u32>(&a, "--max-tokens").unwrap(), None);
         // Validation, not parsing, refuses a bad or missing value: a mistyped budget is a usage error, not unlimited.
-        for bad in ["run --max-wall x", "run --model m --max-wall", "run --max-wall --yolo"] {
+        for bad in ["run --max-wall x", "run --model m --max-wall", "run --max-wall --yes"] {
             let e = validate_args(&argv(bad)).unwrap_err();
             assert!(e.is::<Usage>() && e.to_string().contains("--max-wall"), "{bad}: {e}");
         }

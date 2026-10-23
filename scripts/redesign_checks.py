@@ -320,10 +320,10 @@ def unknown_abandon():
     with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
         # Obtain the actual journal position of this operation from a control run.
         control = workspace("abandon-control")
-        start(control, url, "--yolo")
+        start(control, url, "--yes")
         intent = next(r for r in records(journal(control)) if r["kind"] == "intent" and r["tool"] == "sh")
     with provider(lambda body, i: tool(code) if i == 0 or not (path / "again.txt").exists() else "done") as (url, _):
-        start(path, url, "--yolo", env={"HX_TEST_CRASH_AFTER_RECORD": str(intent["seq"])}, ok=False)
+        start(path, url, "--yes", env={"HX_TEST_CRASH_AFTER_RECORD": str(intent["seq"])}, ok=False)
         log = journal(path)
         original = next(r for r in records(log) if r["kind"] == "intent" and r["tool"] == "sh")
         assert f"UNKNOWN OUTCOME: #{original['seq']} sh" in run(path, "log", "verify", str(log), ok=False).stdout
@@ -476,7 +476,7 @@ print("CHILDREN_OK")'''
 def interrupted_sh_needs_owner():
     # Shell commands run directly and may act outside the workspace in either policy mode.
     code = 'print(sh("printf x >> again.txt").code)'
-    for name, flags in [("default", ()), ("yolo", ("--yolo",))]:
+    for name, flags in [("default", ()), ("autopilot", ("--yes",))]:
         with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
             control = workspace(f"sh-{name}-control")
             start(control, url, *flags, ok=False)
@@ -814,7 +814,7 @@ def controller_deadlines():
 
 def cli_preflight():
     for index, flags in enumerate([
-        ["--max-wall"], ["--max-wall", "--yolo"], ["--workspace"], ["--model"],
+        ["--max-wall"], ["--max-wall", "--yes"], ["--workspace"], ["--model"],
         ["--max-wall", "NaN"], ["--max-wall", "-1"], ["--max-output", "0"], ["--max-cost", "1"],
         ["--max-toknes", "10"], ["--net"], ["--no-net"],
         ["--max-wall", "1", "--max-wall", "2"], ["--resume", "absent.jsonl", "--model", "mock"],
@@ -837,7 +837,7 @@ def unsupported_run_format():
         saved = records(log)
         manifest = next(r for r in saved if r["kind"] == "manifest")
         content = json.loads((log.parent / "blobs" / manifest["blob"]).read_text())
-        content["format"] = manifest["format"] = 6
+        content["format"] = manifest["format"] = 7
         data = json.dumps(content).encode()
         manifest["blob"] = hashlib.sha256(data).hexdigest()
         (log.parent / "blobs" / manifest["blob"]).write_bytes(data)
@@ -851,7 +851,7 @@ def unsupported_run_format():
         count = len(calls)
         for flag in ("--resume", "--branch"):
             refused = run(path, "run", flag, str(log), ok=False)
-            assert refused.returncode and "unsupported run format 6" in refused.stderr, refused.stderr
+            assert refused.returncode and "unsupported run format 7" in refused.stderr, refused.stderr
             assert len(calls) == count
 
 

@@ -91,7 +91,7 @@ def main():
               ("std unit tests", ["target/release/hx", "test", "stdlib/std"])]
     for name in ("extension", "llm", "mcp", "vision", "compact", "harness", "journal", "budget", "caps", "upgrade", "trust"):
         suites.append((name + "_checks", ["bash", f"scripts/{name}_checks.sh"]))
-    for name in ("redesign", "custom_tool", "rpi", "history"):
+    for name in ("approval", "redesign", "custom_tool", "rpi", "history"):
         suites.append((name + "_checks", ["python3", f"scripts/{name}_checks.py"]))
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:

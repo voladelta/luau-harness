@@ -173,6 +173,7 @@ impl Effects {
 
     /// Authorize and record one synchronous effect.
     /// `f` receives the durable intent's ID (None for reads).
+    #[cfg(test)]
     pub fn sync(&self, _lua: &Lua, tool: Tool, class: Class, args: Value, f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
         self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
@@ -191,10 +192,22 @@ impl Effects {
         res
     }
 
+    /// Async authorization around a synchronous file executor. The intent ID still reaches atomic writes.
+    pub async fn run_sync(&self, lua: &Lua, tool: Tool, class: Class, args: Value,
+        f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
+        self.run_inner(lua, tool, class, args, |intent| async move { f(intent) }).await
+    }
+
     /// Authorize and record one asynchronous effect (sh, agent).
     pub async fn run<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
+    where F: FnOnce() -> Fut, Fut: Future<Output = mlua::Result<Ret>> {
+        self.run_inner(lua, tool, class, args, |_| f()).await
+    }
+
+    /// Authorize and record one asynchronous effect (sh, agent).
+    async fn run_inner<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(Option<u64>) -> Fut,
         Fut: Future<Output = mlua::Result<Ret>>,
     {
         self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
@@ -211,12 +224,40 @@ impl Effects {
         let call = Call { tool, class, args: &args, sha: &sha };
         let intent = self.begin(&call)?;
         let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
-        let mut res = {
-            match self.supervisor.remaining() {
-                Some(remaining) => tokio::time::timeout(remaining, f()).await
-                    .unwrap_or_else(|_| Err(unknown("absolute run deadline interrupted this effect; it may have acted"))),
-                None => f().await,
+        let authorization = async {
+            let path = match tool {
+                Tool::Sh => args["cwd"].as_str(),
+                Tool::Read | Tool::Search | Tool::View | Tool::Write | Tool::Edit => args["path"].as_str(),
+                _ => None,
+            };
+            if let Some(path) = path {
+                if tool == Tool::Edit && crate::policy::is_secret(std::path::Path::new(path)) {
+                    return Err(rt("edit: policy: a credential file cannot be read"));
+                }
+                self.pol.authorize_path(path, matches!(tool, Tool::Write | Tool::Edit)).await.map_err(mlua::Error::external)?;
             }
+            Ok(())
+        };
+        let allowed = match self.supervisor.remaining() {
+            Some(remaining) => tokio::time::timeout(remaining, authorization).await
+                .unwrap_or_else(|_| Err(rt("budget_exceeded: absolute run deadline reached while awaiting permission; effect was NOT run"))),
+            None => authorization.await,
+        };
+        let mut res = match allowed {
+            Err(e) => Err(e),
+            Ok(()) => {
+                // Recheck after an owner wait: a run may have been revoked or a stage may have ended.
+                let dispatch = async {
+                    self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
+                    self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
+                    f(intent).await
+                };
+                match self.supervisor.remaining() {
+                    Some(remaining) => tokio::time::timeout(remaining, dispatch).await
+                        .unwrap_or_else(|_| Err(unknown("absolute run deadline interrupted this effect; it may have acted"))),
+                    None => dispatch.await,
+                }
+            },
         };
         if let Ok(Ret::Sh {operation_id,..}) = &mut res { *operation_id = intent; }
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
@@ -274,7 +315,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hx-effects-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let pol = Policy::new(&dir, true, None, None, None).unwrap();
+        let pol = Policy::new(&dir, false, None, None, None).unwrap();
         (Effects::new(Arc::new(pol), 0, Arc::default()), dir)
     }
 

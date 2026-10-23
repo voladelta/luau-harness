@@ -60,7 +60,7 @@ struct FsSection {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
-    /// Refuse it (the headless default).
+    /// Refuse it without asking.
     Deny,
     /// Ask on the terminal.
     Prompt,
@@ -81,6 +81,8 @@ impl std::str::FromStr for ApprovalMode {
 pub struct Policy {
     cfg: Snapshot,
     pub log: Arc<EventLog>,
+    grants: std::sync::Mutex<Vec<PathGrant>>,
+    prompt: tokio::sync::Mutex<()>,
     /// An autoresearch worker's claim and best score, when `episode` is set.
     pub ar_progress: std::sync::Mutex<crate::ar::Progress>,
 }
@@ -92,7 +94,8 @@ impl std::ops::Deref for Policy {
 
 #[derive(Clone, Debug, serde::Serialize, Deserialize)]
 pub struct Snapshot {
-    pub enabled: bool,
+    #[serde(default)]
+    pub autopilot: bool,
     pub workspace: PathBuf,
     pub tmp: PathBuf,
     pub read_roots: Vec<PathBuf>,
@@ -166,10 +169,54 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+struct PathGrant {
+    path: PathBuf,
+    recursive: bool,
+    write: bool,
+}
+
+#[derive(Debug)]
+struct OutsideRoots { path: PathBuf, write: bool }
+impl std::fmt::Display for OutsideRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "policy: {} {} is outside the allowed roots", if self.write { "writing" } else { "reading" }, self.path.display())
+    }
+}
+impl std::error::Error for OutsideRoots {}
+
+/// Read only the owner's controlling terminal. Nonblocking IO lets cancellation/deadlines close it immediately.
+async fn ask(question: &str) -> Result<bool> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK)
+        .open("/dev/tty").map_err(|_| anyhow::anyhow!("no controlling terminal; configure policy.toml or use --yes"))?;
+    let mut tty = tty;
+    writeln!(tty, "\n[approval needed] {question}\napprove? [y/N] ")?;
+    let mut answer = Vec::new();
+    loop {
+        let mut buf = [0; 256];
+        match tty.read(&mut buf) {
+            Ok(0) => return Ok(false),
+            Ok(n) => {
+                answer.extend_from_slice(&buf[..n]);
+                if answer.contains(&b'\n') || answer.len() > 256 {
+                    return Ok(matches!(String::from_utf8_lossy(&answer).trim(), "y" | "Y" | "yes"));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 impl Policy {
-    /// `enabled = false` is `--yolo`: no file-tool path roots or approval gate. Protected paths (`.harness/`,
-    /// `hx.lock`, the trust store) stay read-only through file tools; shell confinement is provided externally.
-    pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, episode: Option<crate::ar::Episode>) -> Result<Policy> {
+    /// `autopilot` is the launching user's `--yes`: automatically approve ordinary requests.
+    /// Canonical paths, credentials, sealed state and protected configuration are checked in every mode.
+    pub fn new(workspace: &Path, autopilot: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, episode: Option<crate::ar::Episode>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
         if let Some(path) = resume {
             // Lock before reading any recovery state or repairing the log. Mutable workspace configuration is never
@@ -190,13 +237,15 @@ impl Policy {
             // The orchestrator retries an episode as a new child and never resumes one; a stale episode must not get `ar`.
             anyhow::ensure!(p.episode.is_none(), "this run was an autoresearch episode; continue the search with `hx run --ar --resume .harness/ar/RUN`");
             log.check()?;
-            return Ok(Policy { cfg: p, log, ar_progress: Default::default() });
+            let grants = crate::eventlog::load(path)?.iter().filter(|r| r["kind"] == "path_grant")
+                .map(|r| serde_json::from_value(r["grant"].clone())).collect::<std::result::Result<Vec<PathGrant>, _>>()?;
+            return Ok(Policy { cfg: p, log, grants: grants.into(), prompt: Default::default(), ar_progress: Default::default() });
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
-        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], episode: None, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
+        let mut p = Snapshot { autopilot, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], episode: None, ask: vec![], allow: vec![], mode: ApprovalMode::Prompt, budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
@@ -214,7 +263,7 @@ impl Policy {
             p.protected.push(d);
         }
         // check_write resolves aliases before comparing. Protect the resolved configuration too, including an
-        // untrusted workspace's symlinked .harness or hx.lock and --yolo runs without root confinement.
+        // untrusted workspace's symlinked .harness or hx.lock including automatically approved path requests.
         let canonical_protected: Vec<_> = p.protected.iter().filter_map(canon).collect();
         p.protected.extend(canonical_protected);
         let canonical_sealed: Vec<_> = p.sealed.iter().filter_map(canon).collect();
@@ -243,14 +292,14 @@ impl Policy {
                 p.read_roots.push(PathBuf::from(pk.dir));
             }
         }
-        // The audit log is independent of the policy flag: `--yolo` keeps the record of what ran.
+        // Automatic approval never disables the audit log.
         let log = EventLog::open(&workspace.join(".harness/log"))?;
-        log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "policy_enabled": enabled,
+        log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,
             "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
         let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
-        Ok(Policy { cfg: p, log, ar_progress })
+        Ok(Policy { cfg: p, log, grants: Default::default(), prompt: Default::default(), ar_progress })
     }
 
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
@@ -269,31 +318,53 @@ impl Policy {
     /// The approval gate. Returns the approval source, or the reason it was refused. The run's
     /// approval settings are frozen in Rust; Luau code and hooks cannot change them.
     pub async fn approve(&self, cmd: &str, class: Class) -> std::result::Result<&'static str, String> {
-        if !self.enabled || matches!(class, Class::Read | Class::LocalWrite) {
-            return Ok("not-required");
-        }
+        if self.autopilot { return Ok("auto"); }
+        if matches!(class, Class::Read | Class::LocalWrite) { return Ok("not-required"); }
         let preapproved = if class == Class::Irreversible { self.allow.iter().any(|a| a == cmd) } else { self.allow.iter().any(|a| cmd.contains(a.as_str())) };
-        if preapproved {
-            return Ok("policy-allow");
-        }
+        if preapproved { return Ok("policy-allow"); }
         if self.mode == ApprovalMode::Prompt {
-            let msg = format!("\n[approval needed] {} command:\n  {cmd}\napprove? [y/N] ", class.name());
-            let yes = tokio::task::spawn_blocking(move || {
-                use std::io::{BufRead, Write};
-                let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else { return false };
-                let _ = tty.write_all(msg.as_bytes());
-                let mut line = String::new();
-                let _ = std::io::BufReader::new(&tty).read_line(&mut line);
-                matches!(line.trim(), "y" | "Y" | "yes")
-            })
-            .await
-            .unwrap_or(false);
-            return if yes { Ok("prompt") } else { Err("the user declined".into()) };
+            let _guard = self.prompt.lock().await;
+            return match ask(&format!("{} command:\n  {cmd}", class.name())).await {
+                Ok(true) => Ok("prompt"),
+                Ok(false) => Err("the user declined; it was NOT run".into()),
+                Err(e) => Err(e.to_string()),
+            };
         }
-        Err(format!(
-            "this is an {} effect and needs the user's approval; it was NOT run. Tell the user what you wanted to do instead of retrying (approvals are granted in .harness/policy.toml or interactively, never by the agent)",
-            class.name()
-        ))
+        Err(format!("this is an {} effect and needs the user's approval; it was NOT run (set [approval] allow, use --approval prompt, or launch with --yes)", class.name()))
+    }
+
+    /// Request an ordinary missing path permission. Call only after principal/stage authorization.
+    /// Grants are shared by descendants and journaled before use, so resume restores the same permissions.
+    pub async fn authorize_path(&self, path: &str, write: bool) -> Result<()> {
+        let check = || if write { self.check_write(path) } else { self.check_read(path) };
+        let denied = match check() { Ok(_) => return Ok(()), Err(e) => e };
+        if !denied.is::<OutsideRoots>() { return Err(denied); }
+        let _guard = self.prompt.lock().await;
+        let denied = match check() { Ok(_) => return Ok(()), Err(e) => e };
+        let Some(outside) = denied.downcast_ref::<OutsideRoots>() else { return Err(denied) };
+        let grant = PathGrant {
+            path: if write { outside.path.parent().unwrap_or(&outside.path).to_path_buf() } else { outside.path.clone() },
+            recursive: write || outside.path.is_dir(), write,
+        };
+        let source = if self.autopilot { "auto" } else {
+            if self.mode == ApprovalMode::Deny { return Err(denied); }
+            let access = if write { "read/write" } else { "read" };
+            match ask(&format!("allow {access} access to {} for this run? (requested {path})", grant.path.display())).await {
+                Ok(true) => "prompt",
+                Ok(false) => bail!("approval_required: {denied}; the user declined"),
+                Err(e) => bail!("approval_required: {denied}; {e}"),
+            }
+        };
+        // Log before publishing a grant. Cancellation cannot grant unrecorded authority.
+        self.log.write("path_grant", json!({"grant": grant, "source": source}), true)?;
+        self.grants.lock().unwrap().push(grant);
+        check()?;
+        Ok(())
+    }
+
+    fn granted(&self, path: &Path, write: bool) -> bool {
+        self.grants.lock().unwrap().iter().any(|g| (!write || g.write)
+            && ((g.recursive && path.starts_with(&g.path)) || (path == g.path && !path.is_dir())))
     }
 
     pub fn is_sealed(&self, path: &Path) -> bool {
@@ -310,15 +381,12 @@ impl Policy {
         if self.is_sealed(&normalize(&full)) || std::fs::canonicalize(&full).is_ok_and(|c| self.is_sealed(&c)) {
             bail!("policy: {p} is sealed owner state and cannot be read");
         }
-        if !self.enabled {
-            return Ok(full);
-        }
         let c = std::fs::canonicalize(&full).map_err(|e| anyhow::anyhow!("{p}: {e}"))?;
-        if !Self::within(&c, &self.read_roots) {
-            bail!("policy: reading {p} is outside the allowed roots");
-        }
         if is_secret(&c) {
             bail!("policy: {p} is a credential file and cannot be read");
+        }
+        if !Self::within(&c, &self.read_roots) && !self.granted(&c, false) {
+            return Err(OutsideRoots { path: c, write: false }.into());
         }
         Ok(c)
     }
@@ -338,7 +406,7 @@ impl Policy {
                 _ => bail!("policy: cannot resolve {p}"),
             }
         }
-        if self.enabled && tail.is_empty() && std::fs::symlink_metadata(&existing)?.file_type().is_symlink() {
+        if tail.is_empty() && std::fs::symlink_metadata(&existing)?.file_type().is_symlink() {
             bail!("policy: refusing to write through the symlink {p}");
         }
         let mut c = std::fs::canonicalize(&existing)?;
@@ -348,11 +416,11 @@ impl Policy {
         if self.is_sealed(&full) || self.is_sealed(&c) {
             bail!("policy: {p} is sealed owner state and cannot be written");
         }
-        if self.enabled && !Self::within(&c, &self.write_roots) {
-            bail!("policy: writing {p} is outside the allowed roots");
-        }
         if Self::within(&c, &self.protected) {
             bail!("policy: {p} is protected (harness configuration cannot be modified by the model)");
+        }
+        if !Self::within(&c, &self.write_roots) && !self.granted(&c, true) {
+            return Err(OutsideRoots { path: c, write: true }.into());
         }
         Ok(c)
     }
@@ -447,7 +515,7 @@ mod tests {
         std::fs::write(victim.join("sentinel"), "KEEP").unwrap();
         let log = EventLog::open(&dir.join("log")).unwrap();
         log.write("session", json!({"workspace": dir, "tmp": victim}), true).unwrap();
-        let result = Policy::new(&dir, true, None, Some(&log.path), None);
+        let result = Policy::new(&dir, false, None, Some(&log.path), None);
         let accepted = result.is_ok();
         drop(result);
         assert!(victim.join("sentinel").exists(), "Policy::drop deleted unrelated data");
@@ -480,7 +548,7 @@ mod tests {
     fn classify_sh_orders_irreversible_before_external() {
         let dir = std::env::temp_dir().join(format!("hx-policy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = Policy::new(&dir, true, None, None, None).unwrap();
+        let p = Policy::new(&dir, false, None, None, None).unwrap();
         assert_eq!(p.classify_sh("git push --force origin main"), Class::Irreversible);
         assert_eq!(p.classify_sh("git push origin main"), Class::External);
         assert_eq!(p.classify_sh("ls -la"), Class::LocalWrite);

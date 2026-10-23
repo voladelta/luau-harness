@@ -251,7 +251,7 @@ impl Mcp {
     fn spawn_stdio(&self, server: &str, cfg: &ServerCfg) -> Result<Conn> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args);
-        if self.pol.enabled { cmd.env_clear().envs(self.pol.env()); }
+        cmd.env_clear().envs(self.pol.env());
         for k in &cfg.env {
             if let Ok(v) = std::env::var(k) {
                 cmd.env(k, v);

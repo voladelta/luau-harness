@@ -135,7 +135,7 @@ impl Spec {
 #[serde(rename_all = "snake_case")]
 pub enum Role { Research, Explore, Exploit, Audit }
 
-/// Paths a child's policy must seal, so that even with --yolo its agent cannot read or change them: every
+/// Paths a child's policy must seal, so that even with --yes its agent cannot read or change them: every
 /// autoresearch run of the owner's workspace (this run included) and the evaluators' roots.
 pub fn sealed(e: &Episode) -> Vec<PathBuf> {
     let mut out = vec![e.dir.parent().unwrap_or(&e.dir).to_path_buf()];

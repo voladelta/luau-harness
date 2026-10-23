@@ -6,7 +6,7 @@ Every command takes `--help`.
 
 | Command | What it does |
 |---|---|
-| `hx run` | Run an agent task; prints a JSON report |
+| `hx run "TASK" [--yes]` | Run an agent task; prints a JSON report |
 | `hx run --resume LOG` | Restore the saved manifest and latest checkpoint; no repeated launch flags |
 | `hx run --branch LOG --model M` | Start a new run using current approved configuration and inherited saved data |
 | `hx review LOG --gate ID --decision approve` | Record an RPI review decision; resume separately to continue |
@@ -23,14 +23,19 @@ Every command takes `--help`.
 
 ## `hx run` flags
 
+Supply one quoted positional prompt or `--prompt-file`, with flags before or after the prompt. Use `--` before a literal prompt starting with `--`. `--branch` inherits its task unless a new prompt is supplied; `--resume` restores its saved task, approval mode, autopilot setting and path grants, without repeated launch flags. `--yes` is also accepted by `hx exec`.
+
+The workspace, private temp directory and configured file-tool roots need no confirmation. Other paths ask for a temporary grant; recognized external commands, HTTP actions and MCP tools ask unless pre-approved. No controlling terminal means refusal. `--yes` grants ordinary requests automatically while retaining protected paths, credential-read restrictions, capabilities, budgets and the scrubbed environment. It does not answer manual workflow review gates or reconcile uncertain operations. Shell commands run directly under your external sandbox. The former `--yolo` option has been removed.
+
 hx always uses the Responses API. Requests go to `/responses` under the configured base URL.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--prompt-file F` | | Task text (not needed with `--resume` if the log recorded it) |
+| `--prompt-file F` | | Read the task from a file instead of a positional prompt |
+| `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run |
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
-| `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs `--prompt-file` (the program); runs until progress stops |
+| `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs a prompt or `--prompt-file` (the program); runs until progress stops |
 | `--model M` | `HX_MODEL` | Model id |
 | `--base-url U` | `HX_BASE_URL` | Responses API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
@@ -57,8 +62,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | Flag | Meaning |
 |---|---|
 | `--workspace DIR` | Workspace root (default `.`) |
-| `--yolo` | Disable file-tool path roots and the approval gate; file tools still protect `.harness/` and `hx.lock`; prints a warning |
-| `--approval prompt` | Ask on the terminal instead of refusing commands that need approval (default `deny`) |
+| `--approval prompt\|deny` | Override the configured approval mode (default `prompt`); cannot combine with `--yes` |
 
 Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=1` trusts the workspace for one launch (see [workspace trust](configuration.md#workspace-trust)).
 
@@ -70,7 +74,7 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Runs created before built-in OS sandboxing was removed use an older journal format; start a new run with this version.
+Runs created before per-run approvals were introduced use an older journal format; start a new run with this version.
 
 Interrupted local `write`/`edit` settle themselves from the evidence. Interrupted shell commands require owner reconciliation. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
 

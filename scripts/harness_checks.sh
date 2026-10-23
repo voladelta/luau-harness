@@ -127,7 +127,7 @@ W3=$T/ws3; mkdir -p $W3/pk/tests $W3/.harness/override/std
 cat > $W3/pk/tests/reload_test.luau <<'LUA'
 test.case("a run keeps its frozen printer", function()
 	test.eq(__format(5), "5")
-	-- the override is user-owned (protected even under --yolo): signal the script, which writes it like a user would
+	-- the override is user-owned (protected even under --yes): signal the script, which writes it like a user would
 	write("ready", "1")
 	for _ = 1, 100 do
 		if pcall(read, ".harness/override/std/printer.luau") then break end

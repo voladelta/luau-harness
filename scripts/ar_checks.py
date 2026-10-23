@@ -212,7 +212,7 @@ def hopeless(body, index, x=None):
 
 # 3. Editable code running inside the evaluator gets no inherited credentials.
 
-# 4. Agent file tools cannot read sealed owner state, even with --yolo.
+# 4. Agent file tools cannot read sealed owner state, even with --yes.
 
 # 5. A late writer cannot change what is scored: the evaluator reads a private copy of the snapshot.
 
@@ -252,7 +252,7 @@ def limited(body, index):
 
 # 12. Search and select invoke their configured evaluator commands.
 
-# 13. With --yolo an episode still scrubs credentials and file tools seal owner data.
+# 13. With --yes an episode still scrubs credentials and file tools seal owner data.
 
 # 14. Detached processes of agents and evaluators are reaped when their scratch copy is deleted.
 
@@ -435,17 +435,17 @@ def scenario_05():
               'write("search.py", "print(\'{\\"score\\": 1000}\')")\n'
               'write("json.py", "def dumps(o): return \'{\\"score\\": 999}\'\\n")\n'
               'return ar.eval("tamper")')
-    for mode in ("default", "yolo"):
+    for mode in ("default", "autopilot"):
         path = workspace(f"tamper-{mode}")
         with harness.provider(once(tamper)) as (url, _):
-            report = report_of(ar(path, url, extra=["--yolo"] if mode == "yolo" else []))
+            report = report_of(ar(path, url, extra=["--yes"] if mode == "autopilot" else []))
         rows = ledger(path, report)
         assert rows and all(r["score"] == -49 for r in rows), rows
         assert (path / "search.py").read_text() == SCORE % 7
         log = subprocess.run(["git", "log", "--oneline"], cwd=path, capture_output=True, text=True).stdout
         assert len(log.splitlines()) == 1, log
     assert not (BASE / "pwned").exists(), "a hook ran"
-    check("tampering outside the editable paths cannot change scores or the owner's repository (default and yolo)")
+    check("tampering outside the editable paths cannot change scores or the owner's repository (default and autopilot)")
 
 
 def scenario_06():
@@ -464,14 +464,14 @@ def scenario_06():
 
 def scenario_07():
     # File tools cannot read owner state in either policy mode; each episode gets its own journal.
-    for mode in ("default", "yolo"):
+    for mode in ("default", "autopilot"):
         path = workspace(f"sealed-{mode}")
         look = ('local r = sh("ls .harness/log/*.jsonl | wc -l")\n'
                 f'local ok, e = pcall(read, "{path}/.harness/ar")\n'
                 'print(ar.eval("baseline"))\n'
                 'return "OUT " .. r.stdout .. " READ " .. tostring(e)')
         with harness.provider(once(look, ("research", "r1-w1"))) as (url, requests):
-            ar(path, url, extra=["--yolo"] if mode == "yolo" else [])
+            ar(path, url, extra=["--yes"] if mode == "autopilot" else [])
         outs = [o for o in outputs(requests) if "OUT " in o]
         assert len(outs) >= 2, outs
         assert all("sealed owner state" in o for o in outs), outs
@@ -640,10 +640,10 @@ def scenario_16():
 
 
 def scenario_17():
-    # --yolo episodes scrub credentials and file tools still seal owner and grader data.
+    # --yes episodes scrub credentials and file tools still seal owner and grader data.
     grader, holdout = held_out_roots()
     spec = f'editable = ["x.txt"]\neval = "python3 search.py"\ngrader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n'
-    path = workspace("yolo-seal", spec=spec)
+    path = workspace("autopilot-seal", spec=spec)
     (path / ".harness/ar/old-run").mkdir(parents=True)
     (path / ".harness/ar/old-run/ledger.jsonl").write_text("secret ledger")
     look = ('local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'")\n'
@@ -652,11 +652,11 @@ def scenario_17():
             f'local c, ce = pcall(write, "{grader}/score.sh", "x")\n'
             'print(ar.eval("b"))\nreturn "OUT " .. r.stdout .. tostring(ae) .. tostring(be) .. tostring(ce)')
     with harness.provider(once(look)) as (url, requests):
-        ar(path, url, extra=["--yolo"])
+        ar(path, url, extra=["--yes"])
     outs = [o for o in outputs(requests) if "OUT " in o]
     assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and o.count("sealed owner state") == 3 for o in outs), outs
     assert (grader / "score.sh").read_text().count("\n") == 1, "grader root was modified"
-    check("--yolo episodes scrub credentials and file tools seal owner and grader data")
+    check("--yes episodes scrub credentials and file tools seal owner and grader data")
 
 
 def scenario_18():

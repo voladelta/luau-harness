@@ -61,7 +61,7 @@ mod session_budget_tests {
     async fn awaiting_an_effect_does_not_spend_the_luau_cpu_allowance() {
         let dir = std::env::temp_dir().join(format!("hx-chunk-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
         let vm = Vm::new(policy, Duration::from_millis(30), 32 << 20, None).unwrap();
         let waited = vm.session.run("local r=sh('sleep 0.1; echo waited'); assert(r.code==0); print(r.stdout)").await;
         assert!(waited.error.is_none(), "{:?}", waited.error);
@@ -75,7 +75,7 @@ mod session_budget_tests {
     async fn isolated_package_wait_preserves_the_callers_cpu_allowance() {
         let dir = std::env::temp_dir().join(format!("hx-package-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
         let vm = Vm::new(policy.clone(), Duration::from_millis(30), 32 << 20, None).unwrap();
         let mut registry = crate::modules::Registry::capture(&dir).unwrap();
         let caps = BTreeMap::from([("proc".into(), vec!["sh".into()])]);
@@ -559,26 +559,29 @@ impl Vm {
         // hx.view_image(path, max) -> { path, width, height, orig_width, orig_height, mime, data } for the vision pack.
         // Record the live image identity once and return the same loaded bytes.
         let vfx = fx.clone();
-        hx.set("view_image", lua.create_function(move |lua, (path, max): (String, Option<u32>)| {
-            let max = max.unwrap_or(1024).clamp(64, 2048);
-            let pol = vfx.pol.clone();
-            let mut live: Option<crate::prims::ViewImage> = None;
-            vfx.sync(lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), |_| {
-                let v = crate::prims::load_view_image(&pol, &path, max).map_err(mlua::Error::runtime)?;
-                let meta = json!({"sha256": v.sha256, "width": v.width, "height": v.height}).to_string();
-                live = Some(v);
-                Ok(Ret::Str(meta))
-            })?;
-            let v = live.ok_or_else(|| mlua::Error::runtime("view executor returned no image"))?;
-            let t = lua.create_table()?;
-            t.set("path", path)?;
-            t.set("width", v.width)?;
-            t.set("height", v.height)?;
-            t.set("orig_width", v.orig.0)?;
-            t.set("orig_height", v.orig.1)?;
-            t.set("mime", v.mime)?;
-            t.set("data", v.data_b64)?;
-            Ok(t)
+        hx.set("view_image", lua.create_async_function(move |lua, (path, max): (String, Option<u32>)| {
+            let vfx = vfx.clone();
+            async move {
+                let max = max.unwrap_or(1024).clamp(64, 2048);
+                let pol = vfx.pol.clone();
+                let mut live: Option<crate::prims::ViewImage> = None;
+                vfx.run_sync(&lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), |_| {
+                    let v = crate::prims::load_view_image(&pol, &path, max).map_err(mlua::Error::runtime)?;
+                    let meta = json!({"sha256": v.sha256, "width": v.width, "height": v.height}).to_string();
+                    live = Some(v);
+                    Ok(Ret::Str(meta))
+                }).await?;
+                let v = live.ok_or_else(|| mlua::Error::runtime("view executor returned no image"))?;
+                let t = lua.create_table()?;
+                t.set("path", path)?;
+                t.set("width", v.width)?;
+                t.set("height", v.height)?;
+                t.set("orig_width", v.orig.0)?;
+                t.set("orig_height", v.orig.1)?;
+                t.set("mime", v.mime)?;
+                t.set("data", v.data_b64)?;
+                Ok(t)
+            }
         })?)?;
         let h2 = host.clone();
         hx.set("log", lua.create_function(move |_, line: String| {
@@ -600,6 +603,7 @@ impl Vm {
         }
         // ---- extension API: installed packages, agent-defined tools, staging for promotion ----
         let pres = registry.clone();
+        hx.set("autopilot", policy.autopilot)?;
         hx.set("limits", crate::values::copy_in(&lua, &prims::prompt_limits())?)?;
         hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_names.clone()))?)?;
         hx.set("packages", lua.create_function(move |lua, ()| crate::values::copy_in(lua, &serde_json::to_value(&pres.packages).map_err(mlua::Error::external)?))?)?;

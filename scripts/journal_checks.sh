@@ -14,20 +14,20 @@ lastlog() { ls -t $W/.harness/log/*.jsonl | head -1; }
 
 # --- 0. the log is independent of the policy flag, and admin commands do not open a session
 newws n
-$H exec --workspace $W --yolo 'write("a.txt", "hi")' >/dev/null 2>&1
-check "--yolo still writes a log" "$(ls $W/.harness/log/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
+$H exec --workspace $W --yes 'write("a.txt", "hi")' >/dev/null 2>&1
+check "--yes still writes a log" "$(ls $W/.harness/log/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
 $H staged --workspace $W >/dev/null
 check "admin commands open no log session" "$(ls $W/.harness/log/*.jsonl | wc -l | tr -d ' ')" "1"
 
-# --- 0b. --yolo drops roots and the gate, but .harness/ and hx.lock stay read-only (through file tools)
+# --- 0b. --yes automatically grants ordinary paths and commands, but .harness/ and hx.lock stay read-only (through file tools)
 newws y
-O=$T/yolo-outside.txt
-check "--yolo writes outside the workspace" "$($H exec --workspace $W --yolo "write('$O', 'x')" >/dev/null 2>&1; cat $O 2>/dev/null)" "x"
-check "--yolo skips the approval gate" "$($H exec --workspace $W --yolo 'sh("./deploy.sh # git push")' >/dev/null 2>&1; cat $W/deployed.txt 2>/dev/null)" "deployed"
-check "--yolo write() to .harness refused" "$($H exec --workspace $W --yolo 'print((pcall(write, ".harness/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
-check "--yolo write() to hx.lock refused" "$($H exec --workspace $W --yolo 'print((pcall(write, "hx.lock", "x")))' 2>/dev/null | head -1)" "false"
+O=$T/autopilot-outside.txt
+check "--yes writes outside the workspace" "$($H exec --workspace $W --yes "write('$O', 'x')" >/dev/null 2>&1; cat $O 2>/dev/null)" "x"
+check "--yes automatically approves external commands" "$($H exec --workspace $W --yes 'sh("./deploy.sh # git push")' >/dev/null 2>&1; cat $W/deployed.txt 2>/dev/null)" "deployed"
+check "--yes write() to .harness refused" "$($H exec --workspace $W --yes 'print((pcall(write, ".harness/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
+check "--yes write() to hx.lock refused" "$($H exec --workspace $W --yes 'print((pcall(write, "hx.lock", "x")))' 2>/dev/null | head -1)" "false"
 ln -s .harness $W/link
-check "--yolo write() via symlink into .harness refused" "$($H exec --workspace $W --yolo 'print((pcall(write, "link/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
+check "--yes write() via symlink into .harness refused" "$($H exec --workspace $W --yes 'print((pcall(write, "link/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
 # --- 1. the log records effects write-ahead and the chain verifies
 newws a
 $H exec --workspace $W 'write("a.txt", "hi")

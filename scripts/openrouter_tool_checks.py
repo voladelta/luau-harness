@@ -193,10 +193,10 @@ class OpenRouterToolTests(unittest.TestCase):
         source = source.replace("https://openrouter.ai", self.base)
         (self.dir / "openrouter.lua").write_text(source)
 
-    def run_code(self, code, env=None, yolo=False):
+    def run_code(self, code, env=None, autopilot=False):
         cmd = [str(HX), "exec"]
-        if yolo:
-            cmd.append("--yolo")
+        if autopilot:
+            cmd.append("--yes")
         cmd.extend(["--workspace", str(self.ws), code])
         result = subprocess.run(cmd, env=self.env if env is None else env, text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
@@ -317,7 +317,7 @@ class OpenRouterToolTests(unittest.TestCase):
         env = dict(self.env, OPENROUTER_API_KEY="sk-or-test-key")
         out = self.run_code(
             'local r = openrouter.text{model="mock", prompt="hello", max_output_tokens=64, '
-            'text={format={type="text"}}}; print(r.id, r.text, r.usage.output_tokens)', env=env, yolo=True)
+            'text={format={type="text"}}}; print(r.id, r.text, r.usage.output_tokens)', env=env, autopilot=True)
         self.assertIn("gen-response-123\tMock text response\t5", out)
         method, path, query, body, auth = CALLS[-1]
         self.assertEqual((method, path, auth), ("POST", "/api/v1/responses", "Bearer sk-or-test-key"))
@@ -325,7 +325,7 @@ class OpenRouterToolTests(unittest.TestCase):
         self.assertEqual(body["max_output_tokens"], 64)
         self.assertEqual(body["text"], {"format": {"type": "text"}})
         self.assertNotIn("messages", body)
-        self.run_code('print(openrouter.text{model="mock", messages={{role="user",content="again"}}}.text)', env=env, yolo=True)
+        self.run_code('print(openrouter.text{model="mock", messages={{role="user",content="again"}}}.text)', env=env, autopilot=True)
         self.assertEqual(CALLS[-1][3]["input"], [{"role": "user", "content": "again"}])
 
     def test_help_on_demand_and_24h_caching(self):
@@ -377,7 +377,7 @@ class OpenRouterToolTests(unittest.TestCase):
         out_img = self.run_code(
             'local r = openrouter.image{model = "qwen/qwen-image-2.1-turbo", prompt = "a cat", save_to = "cat.png"};'
             'print(#r.images, r.saved_to[1], r.images[1].b64_json, r.images[1].media_type)',
-            env=env, yolo=True
+            env=env, autopilot=True
         )
         self.assertIn("1\tcat.png\tnil\timage/png", out_img)
 
@@ -392,7 +392,7 @@ class OpenRouterToolTests(unittest.TestCase):
         out_sound = self.run_code(
             'local r = openrouter.sound{model = "elevenlabs/eleven-v4", input = "Hello", save_to = "audio.mp3"};'
             'print(r.media_type, r.saved_to, r.base64)',
-            env=env, yolo=True
+            env=env, autopilot=True
         )
         self.assertIn("audio/mpeg\taudio.mp3\tnil", out_sound)
         audio_file = self.ws / "audio.mp3"
@@ -404,7 +404,7 @@ class OpenRouterToolTests(unittest.TestCase):
         out_failed = self.run_code(
             'local ok, err = pcall(function() return openrouter.image{model = "qwen/qwen-image-2.1-turbo", prompt = "a cat", save_to = ".harness/forbidden.png"} end);'
             'print("Saved:", ok, err)',
-            env=env, yolo=True  # .harness write is forbidden even under yolo
+            env=env, autopilot=True  # .harness write is forbidden even under autopilot
         )
         self.assertIn("Saved:\tfalse", out_failed)
         self.assertIn("forbidden.png", out_failed)

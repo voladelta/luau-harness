@@ -93,89 +93,98 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
 
     // read(path, {offset=1, limit=n}) -> string. offset/limit are in lines.
     let (f, o) = (fx.clone(), ops.clone());
-    g.set("read", lua.create_function(move |lua, (path, opts): (String, Option<Table>)| {
-        o.fetch_add(1, Ordering::Relaxed);
-        let (offset, limit) = (opt_num(&opts, "offset"), opt_num(&opts, "limit"));
-        let args = json!({"path": &path, "offset": offset, "limit": limit});
-        let pol = f.pol.clone();
-        match f.sync(lua, crate::supervisor::Tool::Read, Class::Read, args, |_| {
-            let p = pol.check_read(&path).map_err(|e| rt(format!("read {path}: {e}")))?;
-            let meta = std::fs::metadata(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
-            if meta.is_dir() {
-                return Err(rt(format!("read {path}: is a directory (use sh('ls') or search)")));
+    g.set("read", lua.create_async_function(move |lua, (path, opts): (String, Option<Table>)| {
+        let (f, o) = (f.clone(), o.clone());
+        async move {
+            o.fetch_add(1, Ordering::Relaxed);
+            let (offset, limit) = (opt_num(&opts, "offset"), opt_num(&opts, "limit"));
+            let args = json!({"path": &path, "offset": offset, "limit": limit});
+            let pol = f.pol.clone();
+            match f.run_sync(&lua, crate::supervisor::Tool::Read, Class::Read, args, |_| {
+                let p = pol.check_read(&path).map_err(|e| rt(format!("read {path}: {e}")))?;
+                let meta = std::fs::metadata(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
+                if meta.is_dir() {
+                    return Err(rt(format!("read {path}: is a directory (use sh('ls') or search)")));
+                }
+                if meta.len() > MAX_READ {
+                    return Err(rt(format!("read {path}: file is {} bytes, over the 10MB limit", meta.len())));
+                }
+                let bytes = std::fs::read(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
+                if bytes.iter().take(8192).any(|b| *b == 0) {
+                    return Err(rt(format!("read {path}: binary file")));
+                }
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if offset.is_none() && limit.is_none() {
+                    return Ok(Ret::Str(text));
+                }
+                let start = offset.unwrap_or(1.0).max(1.0) as usize - 1;
+                let take = limit.map(|l| l.max(0.0) as usize).unwrap_or(usize::MAX);
+                Ok(Ret::Str(text.split_inclusive('\n').skip(start).take(take).collect::<String>()))
+            }).await? {
+                Ret::Str(s) => Ok(s),
+                r => Err(bad(r)),
             }
-            if meta.len() > MAX_READ {
-                return Err(rt(format!("read {path}: file is {} bytes, over the 10MB limit", meta.len())));
-            }
-            let bytes = std::fs::read(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
-            if bytes.iter().take(8192).any(|b| *b == 0) {
-                return Err(rt(format!("read {path}: binary file")));
-            }
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            if offset.is_none() && limit.is_none() {
-                return Ok(Ret::Str(text));
-            }
-            let start = offset.unwrap_or(1.0).max(1.0) as usize - 1;
-            let take = limit.map(|l| l.max(0.0) as usize).unwrap_or(usize::MAX);
-            Ok(Ret::Str(text.split_inclusive('\n').skip(start).take(take).collect::<String>()))
-        })? {
-            Ret::Str(s) => Ok(s),
-            r => Err(bad(r)),
         }
     })?)?;
 
     // write(path, content) -> bytes written. Creates parent directories.
     let (f, o) = (fx.clone(), ops.clone());
-    g.set("write", lua.create_function(move |lua, (path, content): (String, mlua::LuaString)| {
-        o.fetch_add(1, Ordering::Relaxed);
-        let bytes = content.as_bytes().to_vec();
-        let args = json!({"path": &path, "bytes": bytes.len(), "sha256": crate::eventlog::sha_bytes(&bytes)});
-        let pol = f.pol.clone();
-        let sup = f.supervisor.clone();
-        match f.sync(lua, crate::supervisor::Tool::Write, Class::LocalWrite, args, |intent| {
-            let p = pol.check_write(&path).map_err(|e| rt(format!("write {path}: {e}")))?;
-            let target = crate::atomic_file::Target::open(&p, true).map_err(mlua::Error::external)?;
-            replace_file(&sup, intent, &p, &target, &bytes).map_err(crate::effects::effect_error)?;
-            Ok(Ret::Num(bytes.len() as f64))
-        })? {
-            Ret::Num(n) => Ok(n as i64),
-            r => Err(bad(r)),
+    g.set("write", lua.create_async_function(move |lua, (path, content): (String, mlua::LuaString)| {
+        let (f, o) = (f.clone(), o.clone());
+        async move {
+            o.fetch_add(1, Ordering::Relaxed);
+            let bytes = content.as_bytes().to_vec();
+            let args = json!({"path": &path, "bytes": bytes.len(), "sha256": crate::eventlog::sha_bytes(&bytes)});
+            let pol = f.pol.clone();
+            let sup = f.supervisor.clone();
+            match f.run_sync(&lua, crate::supervisor::Tool::Write, Class::LocalWrite, args, |intent| {
+                let p = pol.check_write(&path).map_err(|e| rt(format!("write {path}: {e}")))?;
+                let target = crate::atomic_file::Target::open(&p, true).map_err(mlua::Error::external)?;
+                replace_file(&sup, intent, &p, &target, &bytes).map_err(crate::effects::effect_error)?;
+                Ok(Ret::Num(bytes.len() as f64))
+            }).await? {
+                Ret::Num(n) => Ok(n as i64),
+                r => Err(bad(r)),
+            }
         }
     })?)?;
 
     // edit(path, old, new, {all=false}) -> "ok: N replacement(s), +A/-B lines". `old` must match exactly once unless all=true.
     let (f, o) = (fx.clone(), ops.clone());
-    g.set("edit", lua.create_function(move |lua, (path, old, new, opts): (String, mlua::LuaString, mlua::LuaString, Option<Table>)| {
-        o.fetch_add(1, Ordering::Relaxed);
-        let (old, new) = (old.to_string_lossy().to_string(), new.to_string_lossy().to_string());
-        let all = opt_bool(&opts, "all");
-        let args = json!({"path": &path, "old_sha": crate::eventlog::sha_bytes(old.as_bytes()), "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "old_bytes": old.len(), "new_bytes": new.len(), "all": all});
-        let pol = f.pol.clone();
-        let sup = f.supervisor.clone();
-        match f.sync(lua, crate::supervisor::Tool::Edit, Class::LocalWrite, args, |intent| {
-            let p = pol.check_write(&path).map_err(|e| rt(format!("edit {path}: {e}")))?;
-            // edit reads the file, and whether `old` matched would reveal its content
-            if pol.enabled && crate::policy::is_secret(&p) {
-                return Err(rt(format!("edit {path}: policy: a credential file cannot be read")));
+    g.set("edit", lua.create_async_function(move |lua, (path, old, new, opts): (String, mlua::LuaString, mlua::LuaString, Option<Table>)| {
+        let (f, o) = (f.clone(), o.clone());
+        async move {
+            o.fetch_add(1, Ordering::Relaxed);
+            let (old, new) = (old.to_string_lossy().to_string(), new.to_string_lossy().to_string());
+            let all = opt_bool(&opts, "all");
+            let args = json!({"path": &path, "old_sha": crate::eventlog::sha_bytes(old.as_bytes()), "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "old_bytes": old.len(), "new_bytes": new.len(), "all": all});
+            let pol = f.pol.clone();
+            let sup = f.supervisor.clone();
+            match f.run_sync(&lua, crate::supervisor::Tool::Edit, Class::LocalWrite, args, |intent| {
+                let p = pol.check_write(&path).map_err(|e| rt(format!("edit {path}: {e}")))?;
+                // edit reads the file, and whether `old` matched would reveal its content
+                if crate::policy::is_secret(&p) {
+                    return Err(rt(format!("edit {path}: policy: a credential file cannot be read")));
+                }
+                let target = crate::atomic_file::Target::open(&p, false).map_err(mlua::Error::external)?;
+                let text = target.read_to_string().map_err(|e| rt(format!("edit {path}: {e}")))?;
+                if old.is_empty() {
+                    return Err(rt(format!("edit {path}: `old` is empty")));
+                }
+                let n = text.matches(&old).count();
+                if n == 0 {
+                    return Err(rt(format!("edit_not_found: text not found in {path}; read the file and copy the exact text (whitespace matters)")));
+                }
+                if n > 1 && !all {
+                    return Err(rt(format!("edit_not_unique: text matches {n} times in {path}; include more surrounding lines or pass {{all=true}}")));
+                }
+                replace_file(&sup, intent, &p, &target, text.replace(&old, &new).as_bytes()).map_err(crate::effects::effect_error)?;
+                let (a, b) = (new.lines().count() * n, old.lines().count() * n);
+                Ok(Ret::Str(format!("ok: {n} replacement{}, +{a}/-{b} lines", if n == 1 { "" } else { "s" })))
+            }).await? {
+                Ret::Str(s) => Ok(s),
+                r => Err(bad(r)),
             }
-            let target = crate::atomic_file::Target::open(&p, false).map_err(mlua::Error::external)?;
-            let text = target.read_to_string().map_err(|e| rt(format!("edit {path}: {e}")))?;
-            if old.is_empty() {
-                return Err(rt(format!("edit {path}: `old` is empty")));
-            }
-            let n = text.matches(&old).count();
-            if n == 0 {
-                return Err(rt(format!("edit_not_found: text not found in {path}; read the file and copy the exact text (whitespace matters)")));
-            }
-            if n > 1 && !all {
-                return Err(rt(format!("edit_not_unique: text matches {n} times in {path}; include more surrounding lines or pass {{all=true}}")));
-            }
-            replace_file(&sup, intent, &p, &target, text.replace(&old, &new).as_bytes()).map_err(crate::effects::effect_error)?;
-            let (a, b) = (new.lines().count() * n, old.lines().count() * n);
-            Ok(Ret::Str(format!("ok: {n} replacement{}, +{a}/-{b} lines", if n == 1 { "" } else { "s" })))
-        })? {
-            Ret::Str(s) => Ok(s),
-            r => Err(bad(r)),
         }
     })?)?;
 
@@ -218,27 +227,30 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
 
     // __search_raw(pattern, opts) -> rows | nil, {kind, message, hint}; wrapped by the prelude so errors are tables.
     let (f, o) = (fx.clone(), ops);
-    g.set("__search_raw", lua.create_function(move |lua, (pat, opts): (String, Option<Table>)| {
-        o.fetch_add(1, Ordering::Relaxed);
-        let base = opt_str(&opts, "path").unwrap_or_else(|| ".".into());
-        let args = json!({"pattern": &pat, "path": &base, "glob": opt_str(&opts, "glob"), "max": opt_num(&opts, "max"), "ignore_case": opt_bool(&opts, "ignore_case"), "literal": opt_bool(&opts, "literal")});
-        let pol = f.pol.clone();
-        match f.sync(lua, crate::supervisor::Tool::Search, Class::Read, args, |_| {
-            pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-            Ok(match search(&pol.workspace, &pat, &opts, pol.enabled, f.supervisor.workflow_epoch().is_some(), &pol.sealed)? {
-                Ok((rows, truncated)) => Ret::Rows { rows, truncated },
-                Err((kind, message, hint)) => Ret::SearchErr { kind: kind.into(), message, hint: hint.into() },
-            })
-        })? {
-            Ret::Rows { rows, truncated } => Ok((Value::Table(rows_table(lua, &rows, truncated)?), Value::Nil)),
-            Ret::SearchErr { kind, message, hint } => {
-                let e = lua.create_table()?;
-                e.set("kind", kind)?;
-                e.set("message", message)?;
-                e.set("hint", hint)?;
-                Ok((Value::Nil, Value::Table(e)))
+    g.set("__search_raw", lua.create_async_function(move |lua, (pat, opts): (String, Option<Table>)| {
+        let (f, o) = (f.clone(), o.clone());
+        async move {
+            o.fetch_add(1, Ordering::Relaxed);
+            let base = opt_str(&opts, "path").unwrap_or_else(|| ".".into());
+            let args = json!({"pattern": &pat, "path": &base, "glob": opt_str(&opts, "glob"), "max": opt_num(&opts, "max"), "ignore_case": opt_bool(&opts, "ignore_case"), "literal": opt_bool(&opts, "literal")});
+            let pol = f.pol.clone();
+            match f.run_sync(&lua, crate::supervisor::Tool::Search, Class::Read, args, |_| {
+                pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
+                Ok(match search(&pol.workspace, &pat, &opts, true, f.supervisor.workflow_epoch().is_some(), &pol.sealed)? {
+                    Ok((rows, truncated)) => Ret::Rows { rows, truncated },
+                    Err((kind, message, hint)) => Ret::SearchErr { kind: kind.into(), message, hint: hint.into() },
+                })
+            }).await? {
+                Ret::Rows { rows, truncated } => Ok((Value::Table(rows_table(&lua, &rows, truncated)?), Value::Nil)),
+                Ret::SearchErr { kind, message, hint } => {
+                    let e = lua.create_table()?;
+                    e.set("kind", kind)?;
+                    e.set("message", message)?;
+                    e.set("hint", hint)?;
+                    Ok((Value::Nil, Value::Table(e)))
+                }
+                r => Err(bad(r)),
             }
-            r => Err(bad(r)),
         }
     })?)?;
     Ok(())
@@ -300,7 +312,9 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
         Ok(m) => m,
         Err(e) => return Ok(Err(("invalid_regex", e.to_string(), "escape special characters or pass literal=true"))),
     };
-    let base = resolve(root, &opt_str(opts, "path").unwrap_or_else(|| ".".into()));
+    // Walk the authorized canonical root so a root alias cannot hide sealed descendants.
+    let base = std::fs::canonicalize(resolve(root, &opt_str(opts, "path").unwrap_or_else(|| ".".into())))
+        .map_err(mlua::Error::external)?;
     let cap = opt_num(opts, "max").map(|m| m.max(1.0) as usize).unwrap_or(DEFAULT_HITS);
     let mut wb = WalkBuilder::new(&base);
     wb.follow_links(false).require_git(false).sort_by_file_path(|a, b| a.cmp(b));
@@ -355,16 +369,7 @@ pub struct ShellEnv {
 impl ShellEnv {
     /// The agent's `sh`: scrub credentials by default and in every autoresearch episode.
     pub fn agent(pol: &crate::policy::Policy) -> ShellEnv {
-        if pol.enabled { ShellEnv { env: Some(pol.env()) } }
-        else if pol.episode.is_some() {
-            // An autoresearch episode never hands credentials or its run's location to the agent, even with --yolo.
-            let env = std::env::vars().filter(|(k, _)| {
-                let k = k.to_ascii_uppercase();
-                !["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"].iter().any(|w| k.contains(w)) && k != "HX_AR_EPISODE"
-            }).collect();
-            ShellEnv { env: Some(env) }
-        }
-        else { ShellEnv { env: None } }
+        ShellEnv { env: Some(pol.env()) }
     }
 }
 
@@ -570,7 +575,7 @@ mod receipt_tests {
     async fn shell_receipt_identity_includes_the_command_after_character_2000() {
         let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
         let path = pol.log.path.clone();
         let prefix = format!(": #{}\n", "x".repeat(2100));
         let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));

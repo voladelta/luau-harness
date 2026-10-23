@@ -2,8 +2,10 @@
 local M = {}
 
 -- Process access is supplied by the environment running hx, independently of file-tool policy.
-function M.runtime_access(text: string, has_mcp: boolean): string
+function M.runtime_access(text: string, has_mcp: boolean, autopilot: boolean?): string
 	local line = "`sh` and local MCP servers run directly. Filesystem, network and GPU isolation are supplied by the environment running hx."
+	line ..= if autopilot then " The owner enabled automatic approval for ordinary file-tool path and tool requests in this run."
+		else " File tools allow workspace and configured paths; other paths require owner approval. Respect refused requests."
 	if has_mcp then
 		line ..= " The MCP tools listed below work."
 	end
@@ -23,7 +25,7 @@ function M.fill(text: string, limits): string
 end
 
 function M.system(options): string
-	local sections = { M.runtime_access(M.fill(hx.asset("std/system.md"), hx.limits), #hx.mcp_servers() > 0) }
+	local sections = { M.runtime_access(M.fill(hx.asset("std/system.md"), hx.limits), #hx.mcp_servers() > 0, hx.autopilot) }
 	local recheck = require("std/recheck")
 	if recheck.enabled and (not options or options.recheck ~= false) then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
 	if hx.prompt_contributions and hx.prompt_contributions ~= "" then table.insert(sections, hx.prompt_contributions) end
