@@ -1,11 +1,9 @@
 -- Prompt assembly: system sections, the model tool schema, and controller nudges.
 local M = {}
 
--- The sandbox section must match the run: with network on, say so, and never tell the model the listed MCP tools are
--- unreachable (they run in the harness, outside the sandbox, either way).
-function M.sandbox(text: string, net: boolean, has_mcp: boolean): string
-	local line = if net then "`/tmp` and your home directory are not available. `sh` has network access."
-		else "`/tmp`, your home directory, and the network are not available to `sh`."
+-- Process access is supplied by the environment running hx, independently of file-tool policy.
+function M.runtime_access(text: string, has_mcp: boolean): string
+	local line = "`sh` and local MCP servers run directly. Filesystem, network and GPU isolation are supplied by the environment running hx."
 	if has_mcp then
 		line ..= " The MCP tools listed below work."
 	end
@@ -25,7 +23,7 @@ function M.fill(text: string, limits): string
 end
 
 function M.system(options): string
-	local sections = { M.sandbox(M.fill(hx.asset("std/system.md"), hx.limits), hx.net, #hx.mcp_servers() > 0) }
+	local sections = { M.runtime_access(M.fill(hx.asset("std/system.md"), hx.limits), #hx.mcp_servers() > 0) }
 	local recheck = require("std/recheck")
 	if recheck.enabled and (not options or options.recheck ~= false) then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
 	if hx.prompt_contributions and hx.prompt_contributions ~= "" then table.insert(sections, hx.prompt_contributions) end

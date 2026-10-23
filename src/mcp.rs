@@ -1,12 +1,10 @@
-//! MCP client: stdio and Streamable HTTP. Stdio servers are user-configured third-party processes, run under their own
-//! Seatbelt profile. HTTP servers are remote; the `url` in the user-owned mcp.toml is the consent to reach them.
+//! MCP client: stdio and Streamable HTTP. Stdio servers are user-configured third-party processes, launched directly.
+//! Process isolation is supplied externally. HTTP servers are remote; the `url` in the user-owned mcp.toml is the consent to reach them.
 //!
-//! `.harness/mcp.toml` (user-owned; the model cannot write `.harness/`):
+//! `.harness/mcp.toml` (user-owned; file tools cannot write `.harness/`):
 //!   [server.NAME]
 //!   command = "/path/to/server"        args = ["--flag"]
 //!   env = ["SOME_VAR"]                 # env vars passed through from the harness (default: none, so no secrets)
-//!   write = ["/dir/it/may/write"]      # extra writable roots (besides the run's temp dir)
-//!   net = false                        # all-or-nothing network, like `sh`
 //!   read_only_tools = ["read_*", "list_*", "get_*", "search_*"]   # called without approval; everything else is an
 //!                                                                  # external effect that goes through the approval gate
 //!
@@ -14,14 +12,13 @@
 //!   url = "https://host/mcp"           # https only (http for localhost); redirects are not followed
 //!   headers_env = { "x-api-key" = "SOME_VAR" }   # header name -> env var holding the value (never written in the file)
 //!   bearer_env = "SOME_VAR"            # shorthand for Authorization: Bearer $SOME_VAR
-//!   read_only_tools = [...]            # args/env/write/net do not apply to a remote server and are rejected
-//!   No sandbox applies to a remote server: the approval gate and recorded effects are the controls. No OAuth.
+//!   read_only_tools = [...]            # args/env do not apply to a remote server and are rejected
+//!   For remote servers, the approval gate and recorded effects are the controls. No OAuth.
 use crate::policy::Policy;
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -42,10 +39,6 @@ pub struct ServerCfg {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: Vec<String>,
-    #[serde(default)]
-    pub write: Vec<String>,
-    #[serde(default)]
-    pub net: bool,
     #[serde(default)]
     pub read_only_tools: Vec<String>,
 }
@@ -114,8 +107,8 @@ fn validate(name: &str, c: &ServerCfg) -> Result<()> {
     if !c.command.is_empty() {
         bail!("MCP server {name}: `command` and `url` are mutually exclusive");
     }
-    if !c.args.is_empty() || !c.env.is_empty() || !c.write.is_empty() || c.net {
-        bail!("MCP server {name}: args/env/write/net do not apply to a `url` server (it is not a sandboxed process)");
+    if !c.args.is_empty() || !c.env.is_empty() {
+        bail!("MCP server {name}: args/env do not apply to a `url` server");
     }
     let url = reqwest::Url::parse(u).map_err(|e| anyhow!("MCP server {name}: bad url: {e}"))?;
     if !(url.scheme() == "https" || (url.scheme() == "http" && is_local(&url))) {
@@ -256,21 +249,9 @@ impl Mcp {
     }
 
     fn spawn_stdio(&self, server: &str, cfg: &ServerCfg) -> Result<Conn> {
-        let extra: Vec<PathBuf> = cfg.write.iter().filter_map(|w| std::fs::canonicalize(w).ok()).collect();
-        let mut cmd = if self.pol.enabled {
-            let mut c = Command::new("/usr/bin/sandbox-exec");
-            c.arg("-p").arg(self.pol.seatbelt_profile_with(cfg.net, &extra)).arg(&cfg.command).args(&cfg.args);
-            c.env_clear().envs(self.pol.env());
-            c
-        } else if let Some(profile) = self.pol.yolo_profile() {
-            let mut c = Command::new("/usr/bin/sandbox-exec");
-            c.arg("-p").arg(profile).arg(&cfg.command).args(&cfg.args);
-            c
-        } else {
-            let mut c = Command::new(&cfg.command);
-            c.args(&cfg.args);
-            c
-        };
+        let mut cmd = Command::new(&cfg.command);
+        cmd.args(&cfg.args);
+        if self.pol.enabled { cmd.env_clear().envs(self.pol.env()); }
         for k in &cfg.env {
             if let Ok(v) = std::env::var(k) {
                 cmd.env(k, v);

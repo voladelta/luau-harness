@@ -55,7 +55,7 @@ mk runner 'fs = ["read"]
 proc = ["sh"]'
 cat > $W/.harness/pkgs/runner/tests/t.luau <<'LUA'
 local m = require("runner")
-test.case("proc.sh granted: sh works (inside the sandbox)", function() test.eq(m.sh(), "done\n") end)
+test.case("proc.sh granted: sh works (direct shell)", function() test.eq(m.sh(), "done\n") end)
 test.case("fs.write still denied", function() local ok, e = pcall(m.write) test.ok(not ok and tostring(e):find("capability_denied", 1, true)) end)
 LUA
 check "unapproved packages are refused" "$($H test $W/.harness/pkgs/reader --workspace $W 2>&1 | grep -c 'is not locked')" "1"

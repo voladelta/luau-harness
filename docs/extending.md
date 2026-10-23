@@ -1,6 +1,6 @@
 # Extending hx
 
-The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/std/); you can override them, and add tools, packages, skills and MCP servers. Nothing the agent can call approves source, and accepted changes apply to new runs only (no hot reload).
+The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/std/); you can override them, and add tools, packages, skills and MCP servers. The Luau API cannot approve source, and accepted changes apply to new runs only (no hot reload).
 
 ## Extension kinds
 
@@ -10,7 +10,7 @@ The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/
 | Local tool | `.harness/tools/NAME.lua` or `NAME.luau` | `hx trust`; loads on a new run as `NAME.method(...)` after validation and credential checks |
 | Tool package | `.harness/pkgs/NAME/` with `hx.toml`, `kind = "tool"` | `hx approve NAME`; model calls `tools.NAME.fn(...)` |
 | Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx approve NAME`; model calls `skill("NAME")` (or finds it with `skills("words")`; skills are not listed in the prompt) |
-| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (no `hx.toml`; project shadows global) | `hx approve NAME` (`hx skills` lists them); its directory becomes read-only readable |
+| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (no `hx.toml`; project shadows global) | `hx approve NAME` (`hx skills` lists them); file tools gain read access to its directory |
 | MCP server | `.harness/mcp.toml` | On the next run (see [configuration](configuration.md#mcptoml)) |
 | Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Staged without execution; you review, run `hx test DIR`, accept it, and start a new run |
 | Agent-written module replacement | `propose_module("std/MODULE", source, {reason})` (with `--pack std/authoring`) | Staged; `hx accept std/MODULE` shows the reason, a structural check (it loads and keeps every export) and the diff, then makes it the override. `hx rollback std/MODULE` undoes it |
@@ -61,7 +61,7 @@ capabilities = { fs = {"read", "write"}, proc = {"sh"}, llm = {"agent", "chat"} 
 | `llm.agent` | `agent(task)` |
 | `llm.chat` | `llm{{system=..., prompt=..., effort=..., max_tokens=...}, ...}`: up to 32 single-shot requests sent concurrently to the run's provider and model, budgeted and journaled like any model call. `effort` defaults to the run's; `"none"` sends no reasoning setting. Returns `{ok, value}` or `{ok, error}` per request in input order. Needs `hx run` |
 
-Every tool also gets `nonce()`, 32 URL-safe characters of fresh OS entropy. Workspace trust grants these declarations; the path, sandbox, budget and approval checks still apply.
+Every tool also gets `nonce()`, 32 URL-safe characters of fresh OS entropy. Workspace trust grants these declarations; the file-tool path, budget and approval checks still apply.
 
 ### HTTP endpoints
 
@@ -81,7 +81,7 @@ Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose byte
 
 - HTTP errors raise with their status and a bounded response excerpt.
 - Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects.
-- Endpoint declarations grant access to those URLs independently of shell `--net`.
+- Endpoint declarations grant access to those URLs; the environment running hx controls network access.
 - HTTP calls use the supervisor's authorization, run deadline and journal.
 - Credentials are attached by Rust and never returned to tool code or saved in the run manifest. Credentials echoed in responses are redacted before journaling.
 
@@ -95,7 +95,7 @@ Credential lookup checks, in order:
 
 Secrets files contain top-level string assignments, for example `TINYFISH_API_KEY = "your-key"`. Blank values fall through to the next source. Without a usable key, the tool's whole registration fails and its methods stay unavailable.
 
-Secrets files are blocked from sandboxed reads, searches and shell commands; keep them out of version control. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
+Secrets files are blocked from file-tool reads and searches; the external sandbox must restrict shell access. Keep them out of version control. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
 
 ## Included example tools
 

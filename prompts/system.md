@@ -17,10 +17,10 @@ You are a software engineering agent in a project directory. You work by sending
 - Do not re-read a file you just edited: the `edit` and `write` results confirm the change.
 - Write the final reply in at most three short sentences that say what changed. Use no lists. Do not restate the task.
 
-# Sandbox
-- You can write only inside the project and in `tmpdir()`. `$TMPDIR` in `sh` points to `tmpdir()`.
-- The Runtime access section states the run's network policy. `sh` has a minimal environment with no API keys.
-- `.harness/` and `hx.lock` are read-only.
+# Runtime policy
+- File tools enforce allowed path roots and protect `.harness/` and `hx.lock`.
+- `sh` runs directly, with a minimal environment by default. `$TMPDIR` points to `tmpdir()`.
+- Filesystem and network confinement come from the environment running hx.
 - Not available: `io`, `os.execute`, `os.getenv`, `require`, `loadstring`, `dofile`. Use `sh` for anything outside the VM. `os.time()` and `os.clock()` work.
 
 # API

@@ -210,9 +210,9 @@ def hopeless(body, index, x=None):
 
 # 2. Tampering outside the editable paths never reaches the evaluator: no Git hooks, no ignore rules, no evaluator edits.
 
-# 3. Editable code running inside the evaluator gets no credentials and cannot read the run or the workspace.
+# 3. Editable code running inside the evaluator gets no inherited credentials.
 
-# 4. Agents cannot read the run directory, earlier episodes' logs, or the owner's workspace, even with --yolo.
+# 4. Agent file tools cannot read sealed owner state, even with --yolo.
 
 # 5. A late writer cannot change what is scored: the evaluator reads a private copy of the snapshot.
 
@@ -250,11 +250,9 @@ def limited(body, index):
     return once('return ar.eval("b")')(body, index)
 
 
-# 11. No sandboxed process can write a shared xcrun cache path (a channel between episodes); shims still run.
+# 12. Search and select invoke their configured evaluator commands.
 
-# 12. Held-out data is readable by the select evaluator only, never by a search evaluation.
-
-# 13. With --yolo an episode still gets no credentials, no run location, no other runs and no grader roots.
+# 13. With --yolo an episode still scrubs credentials and file tools seal owner data.
 
 # 14. Detached processes of agents and evaluators are reaped when their scratch copy is deleted.
 
@@ -437,7 +435,7 @@ def scenario_05():
               'write("search.py", "print(\'{\\"score\\": 1000}\')")\n'
               'write("json.py", "def dumps(o): return \'{\\"score\\": 999}\'\\n")\n'
               'return ar.eval("tamper")')
-    for mode in ("sandbox", "yolo"):
+    for mode in ("default", "yolo"):
         path = workspace(f"tamper-{mode}")
         with harness.provider(once(tamper)) as (url, _):
             report = report_of(ar(path, url, extra=["--yolo"] if mode == "yolo" else []))
@@ -447,29 +445,28 @@ def scenario_05():
         log = subprocess.run(["git", "log", "--oneline"], cwd=path, capture_output=True, text=True).stdout
         assert len(log.splitlines()) == 1, log
     assert not (BASE / "pwned").exists(), "a hook ran"
-    check("tampering outside the editable paths cannot change scores or the owner's repository (sandbox and yolo)")
+    check("tampering outside the editable paths cannot change scores or the owner's repository (default and yolo)")
 
 
 def scenario_06():
-    # 3. Editable code running inside the evaluator gets no credentials and cannot read the run or the workspace.
+    # Editable code in evaluators gets no inherited credentials or episode descriptor.
     files = {"cand.py": "value = 0\n",
              "search.py": 'import json, cand; print(json.dumps({"score": 0, "report": {"leak": repr(cand.value)}}))'}
     path = workspace("envleak", files, 'editable = ["cand.py"]\neval = "python3 search.py"\ntimeout = 30\n')
-    snoop = (f'write("cand.py", "import os, glob\\nvalue = [os.environ.get(\'HX_TEST_KEY\'), os.environ.get(\'HX_AR_EPISODE\'), '
-             f'glob.glob(\'{path}/.harness/ar/*/*\'), glob.glob(\'{path}/*\')]\\n")\n'
+    snoop = ('write("cand.py", "import os\\nvalue = [os.environ.get(\'HX_TEST_KEY\'), os.environ.get(\'HX_AR_EPISODE\')]\\n")\n'
              'return ar.eval("snoop")')
     with harness.provider(once(snoop)) as (url, requests):
         ar(path, url)
     leak = [o for o in outputs(requests) if "leak" in o]
-    assert leak and "[None, None, [], []]" in leak[0], leak
-    check("evaluators run with a scrubbed environment and cannot read the run or workspace")
+    assert leak and "[None, None]" in leak[0], leak
+    check("evaluators run with a scrubbed environment")
 
 
 def scenario_07():
-    # 4. Agents cannot read the run directory, earlier episodes' logs, or the owner's workspace, even with --yolo.
-    for mode in ("sandbox", "yolo"):
+    # File tools cannot read owner state in either policy mode; each episode gets its own journal.
+    for mode in ("default", "yolo"):
         path = workspace(f"sealed-{mode}")
-        look = (f'local r = sh("ls -R {path}/.harness/ar 2>&1; ls .harness/log/*.jsonl | wc -l")\n'
+        look = ('local r = sh("ls .harness/log/*.jsonl | wc -l")\n'
                 f'local ok, e = pcall(read, "{path}/.harness/ar")\n'
                 'print(ar.eval("baseline"))\n'
                 'return "OUT " .. r.stdout .. " READ " .. tostring(e)')
@@ -477,9 +474,9 @@ def scenario_07():
             ar(path, url, extra=["--yolo"] if mode == "yolo" else [])
         outs = [o for o in outputs(requests) if "OUT " in o]
         assert len(outs) >= 2, outs
-        assert all("snaps" not in o and "journal" not in o and "ledger" not in o for o in outs), outs
-        assert all(o.split("OUT ")[1].split("READ")[0].strip().endswith("1") for o in outs), outs  # only its own journal
-    check("agents cannot read autoresearch state or earlier episodes (sandbox and yolo)")
+        assert all("sealed owner state" in o for o in outs), outs
+        assert all(o.split("OUT ")[1].split("READ")[0].strip().endswith("1") for o in outs), outs
+    check("file tools cannot read autoresearch state; episodes have separate journals")
 
 
 def scenario_08():
@@ -630,48 +627,36 @@ def scenario_14():
     check("crashes are charged from child journals and retried; misconfiguration fails fast")
 
 
-def scenario_15():
-    # 11. No sandboxed process can write a shared xcrun cache path (a channel between episodes); shims still run.
-    T = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True).stdout.strip()
-    probe = f"{T}xcrun_dbAR{os.getpid()}"
-    files = {"x.txt": "0\n", "search.py": f'import json, os\nok = True\ntry:\n    os.makedirs("{probe}e", exist_ok=True)\nexcept OSError:\n    ok = False\nprint(json.dumps({{"score": 1 if not ok else 0}}))'}
-    path = workspace("xcrun", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
-    code = f'local r = sh("mkdir -p {probe}a 2>&1; echo leak > {probe}a/f 2>&1; /usr/bin/git --version")\nprint(r.stdout)\nreturn ar.eval("probe")'
-    with harness.provider(once(code)) as (url, requests):
-        report = report_of(ar(path, url))
-    assert not os.path.exists(probe + "a") and not os.path.exists(probe + "e"), "xcrun prefix is writable"
-    assert any("git version" in o for o in outputs(requests)), outputs(requests)
-    assert ledger(path, report)[0]["score"] == 1
-    check("no sandbox can write the shared xcrun cache prefix; tool shims still work")
-
-
 def scenario_16():
-    # 12. Held-out data is readable by the select evaluator only, never by a search evaluation.
+    # 12. Search and select invoke their configured evaluator commands.
     grader, holdout = held_out_roots()
-    spec = (f'editable = ["x.txt"]\neval = "sh {grader}/score.sh {holdout}"\nselect = "sh {grader}/score.sh {holdout}"\n'
+    spec = (f'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "sh {grader}/score.sh {holdout}"\n'
             f'grader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n')
     path = workspace("holdout", spec=spec)
     with harness.provider(once('return ar.eval("baseline")')) as (url, _):
         report = report_of(ar(path, url))
-    assert all(r["score"] == 0 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
-    check("held-out roots are readable by select only")
+    assert all(r["score"] == -49 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
+    check("search and select invoke their configured evaluator commands")
 
 
 def scenario_17():
-    # 13. With --yolo an episode still gets no credentials, no run location, no other runs and no grader roots.
+    # --yolo episodes scrub credentials and file tools still seal owner and grader data.
     grader, holdout = held_out_roots()
     spec = f'editable = ["x.txt"]\neval = "python3 search.py"\ngrader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n'
     path = workspace("yolo-seal", spec=spec)
     (path / ".harness/ar/old-run").mkdir(parents=True)
     (path / ".harness/ar/old-run/ledger.jsonl").write_text("secret ledger")
-    look = (f'local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'; cat {path}/.harness/ar/old-run/ledger.jsonl 2>&1; '
-            f'cat {holdout}/secret.txt 2>&1; echo x >> {grader}/score.sh 2>&1")\nprint(ar.eval("b"))\nreturn "OUT " .. r.stdout')
+    look = ('local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'")\n'
+            f'local a, ae = pcall(read, "{path}/.harness/ar/old-run/ledger.jsonl")\n'
+            f'local b, be = pcall(read, "{holdout}/secret.txt")\n'
+            f'local c, ce = pcall(write, "{grader}/score.sh", "x")\n'
+            'print(ar.eval("b"))\nreturn "OUT " .. r.stdout .. tostring(ae) .. tostring(be) .. tostring(ce)')
     with harness.provider(once(look)) as (url, requests):
         ar(path, url, extra=["--yolo"])
     outs = [o for o in outputs(requests) if "OUT " in o]
-    assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and "secret ledger" not in o and "held-out" not in o for o in outs), outs
+    assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and o.count("sealed owner state") == 3 for o in outs), outs
     assert (grader / "score.sh").read_text().count("\n") == 1, "grader root was modified"
-    check("--yolo episodes get no credentials and cannot read other runs or touch grader roots")
+    check("--yolo episodes scrub credentials and file tools seal owner and grader data")
 
 
 def scenario_18():

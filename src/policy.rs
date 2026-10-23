@@ -1,15 +1,6 @@
-//! Capability policy + macOS Seatbelt sandbox for model-reachable effects.
-//!
-//! Core guarantees (enforced here, in Rust, where no Luau code or hook can change them):
-//!  * `sh` runs under Seatbelt: writes only to the workspace and a per-run temp dir, reads only from an allowlist,
-//!    no network unless granted, a scrubbed environment, its own process group (killed on timeout), and a process cap.
-//!  * `read`/`write`/`edit`/`search` check the *canonical* path against the same roots, never write through symlinks.
-//!  * `.harness/` and `hx.lock` are protected: the model can read them but never write them (overrides, init, staging).
-//!
-//! User-owned config: `<workspace>/.harness/policy.toml` (protected from the model):
-//!     [fs]  read = ["/extra/read/root"]   write = ["/extra/write/root"]
-//!     [net] allow = true                   # Seatbelt cannot filter by host; this is all-or-nothing
-//!     [gpu] allow = true                   # let `sh` use Metal (GPU renderers such as Skia); off by default
+//! Capability policy for model-reachable effects. Process isolation belongs to the environment running hx.
+//! File tools check canonical paths, protect harness configuration, and reject credential files.
+//! Shell commands retain approval checks, a scrubbed environment and process cleanup, but run directly.
 use crate::eventlog::EventLog;
 use anyhow::{bail, Result};
 use serde_json::json;
@@ -22,21 +13,11 @@ struct PolicyFile {
     #[serde(default)]
     fs: FsSection,
     #[serde(default)]
-    net: NetSection,
-    #[serde(default)]
     approval: ApprovalSection,
     #[serde(default)]
     budget: BudgetSection,
     #[serde(default)]
     packs: PacksSection,
-    #[serde(default)]
-    gpu: GpuSection,
-}
-/// `[gpu] allow = true`: let `sh` open the GPU (Metal), e.g. for Skia/wgpu renderers. Off by default.
-#[derive(Deserialize, Default)]
-struct GpuSection {
-    #[serde(default)]
-    allow: bool,
 }
 #[derive(Deserialize, Default)]
 struct PacksSection {
@@ -75,12 +56,6 @@ struct FsSection {
     #[serde(default)]
     write: Vec<String>,
 }
-#[derive(Deserialize, Default)]
-struct NetSection {
-    #[serde(default)]
-    allow: bool,
-}
-
 /// What happens to a command that needs approval and is not pre-approved in `policy.toml`.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -129,8 +104,6 @@ pub struct Snapshot {
     /// The autoresearch episode this run serves (`ar.*`), recorded with the rest of the frozen policy.
     #[serde(default)]
     pub episode: Option<crate::ar::Episode>,
-    pub net: bool,
-    pub gpu: bool,
     pub ask: Vec<String>,
     pub allow: Vec<String>,
     pub mode: ApprovalMode,
@@ -157,16 +130,13 @@ impl Class {
     }
 }
 
-/// Commands that reach outside the machine or cannot be undone. A tripwire for the obvious cases; the sandbox (no
-/// network, writes confined to the project) is the real boundary.
+/// Commands that reach outside the machine or cannot be undone. A tripwire for obvious cases;
+/// arbitrary shell commands require isolation supplied by the environment running hx.
 const EXTERNAL: &[&str] = &["git push", "npm publish", "cargo publish", "twine upload", "docker push", "ssh ", "scp ", "rsync ", "kubectl apply", "kubectl delete", "terraform apply", "gh pr create", "gh release", "curl -X POST", "curl -X PUT", "curl -X DELETE", "aws ", "gcloud ", "sendmail"];
 const IRREVERSIBLE: &[&str] = &["git push --force", "git push -f", "rm -rf /", "rm -rf ~", "mkfs", "dd if="];
 
-const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/dev", "/opt", "/Applications", "/private/var/db"];
-/// Seatbelt rules for Metal: the GPU driver user clients and the shader compiler service.
-const GPU_RULES: &str = "(allow iokit-open)\n(allow iokit-get-properties)\n(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name-regex #\"^com\\.apple\\.(metal|gpu|iosurface|CARenderServer|cvmsServ)\"))\n(allow file-read* file-write* (regex #\"^/private/var/folders/[^/]+/[^/]+/C/com\\.apple\\.(metal|gpuarchiver)\"))\n";
-/// Credential files no model-reachable read may open, even inside a read root (e.g. `~/.cargo/credentials.toml`): `read`,
-/// `search` and `view` refuse them and the Seatbelt profile denies them to `sh`.
+const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/etc", "/dev", "/opt"];
+/// Credential files blocked by file tools, even inside an allowed read root.
 const SECRET_FILES: &[&str] = &["credentials", "credentials.toml", "secrets.toml", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519"];
 
 /// Is `path` (by file name) one of the credential files in SECRET_FILES?
@@ -197,9 +167,9 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 impl Policy {
-    /// `enabled = false` is `--yolo`: no Seatbelt confinement, path roots or approval gate. Protected paths (`.harness/`,
-    /// `hx.lock`, the trust store) stay read-only to the model, so a yolo run cannot rewrite config later runs apply.
-    pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, net: Option<bool>, episode: Option<crate::ar::Episode>) -> Result<Policy> {
+    /// `enabled = false` is `--yolo`: no file-tool path roots or approval gate. Protected paths (`.harness/`,
+    /// `hx.lock`, the trust store) stay read-only through file tools; shell confinement is provided externally.
+    pub fn new(workspace: &Path, enabled: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, episode: Option<crate::ar::Episode>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
         if let Some(path) = resume {
             // Lock before reading any recovery state or repairing the log. Mutable workspace configuration is never
@@ -210,7 +180,7 @@ impl Policy {
             let mut p = manifest.policy;
             validate_scratch(&p.tmp)?;
             std::fs::create_dir_all(&p.tmp)?;
-            // A journal may have been moved since launch. Its actual files and artifacts remain model-read-only.
+            // A journal may have been moved since launch. Its actual files and artifacts remain read-only to file tools.
             let actual = std::fs::canonicalize(path)?;
             p.protected.extend([actual.clone(), actual.with_extension("lock"), actual.with_extension("revoked"),
                 actual.parent().unwrap().join("blobs"), actual.parent().unwrap().join("registry")]);
@@ -226,7 +196,7 @@ impl Policy {
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
         std::fs::create_dir_all(&tmp)?;
         let tmp = std::fs::canonicalize(tmp)?;
-        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], episode: None, net: false, gpu: false, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
+        let mut p = Snapshot { enabled, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], episode: None, ask: vec![], allow: vec![], mode: ApprovalMode::Deny, budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
@@ -256,8 +226,6 @@ impl Policy {
             let w: Vec<PathBuf> = f.fs.write.iter().filter_map(canon).collect();
             p.read_roots.extend(w.clone());
             p.write_roots.extend(w);
-            p.net = f.net.allow;
-            p.gpu = f.gpu.allow;
             p.budget = Budget { max_tokens: f.budget.max_tokens, max_wall_secs: f.budget.max_wall_secs };
             p.packs = f.packs.enable;
             p.ask = f.approval.ask;
@@ -269,19 +237,16 @@ impl Policy {
         if let Some(m) = approval_mode {
             p.mode = m; // the launching user's choice beats the file
         }
-        if let Some(n) = net {
-            p.net = n; // so does --net / --no-net
-        }
         // Approved skills may live outside the workspace (~/.agents/skills); their files must be readable (read-only).
         for pk in crate::modules::Resolver::new(workspace.clone()).list_packages() {
             if pk.kind == "skill" && !pk.dir.is_empty() {
                 p.read_roots.push(PathBuf::from(pk.dir));
             }
         }
-        // The audit log is independent of the sandbox: `--yolo` drops confinement, not the record of what ran.
+        // The audit log is independent of the policy flag: `--yolo` keeps the record of what ran.
         let log = EventLog::open(&workspace.join(".harness/log"))?;
-        log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "sandbox": enabled,
-            "net": p.net, "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha}), true)?;
+        log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "policy_enabled": enabled,
+            "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
         let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
@@ -301,8 +266,8 @@ impl Policy {
         }
     }
 
-    /// The approval gate. Returns the approval source, or the reason it was refused. Lives here, in Rust: no Luau
-    /// code, hook or file the model can write can approve anything (`policy.toml` is protected).
+    /// The approval gate. Returns the approval source, or the reason it was refused. The run's
+    /// approval settings are frozen in Rust; Luau code and hooks cannot change them.
     pub async fn approve(&self, cmd: &str, class: Class) -> std::result::Result<&'static str, String> {
         if !self.enabled || matches!(class, Class::Read | Class::LocalWrite) {
             return Ok("not-required");
@@ -380,6 +345,9 @@ impl Policy {
         for t in tail.iter().rev() {
             c.push(t);
         }
+        if self.is_sealed(&full) || self.is_sealed(&c) {
+            bail!("policy: {p} is sealed owner state and cannot be written");
+        }
         if self.enabled && !Self::within(&c, &self.write_roots) {
             bail!("policy: writing {p} is outside the allowed roots");
         }
@@ -401,7 +369,6 @@ impl Policy {
         v.push(("HOME".into(), t.clone()));
         v.push(("TMPDIR".into(), t));
         // HOME is the temp dir, so rustup/cargo would not find the user's toolchain; point them at the real (readable) dirs.
-        // Writes there (registry cache) still need `[fs] write` in policy.toml.
         let home = std::env::var("HOME").unwrap_or_default();
         for (var, dir) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
             let val = std::env::var(var).ok().or_else(|| canon(Path::new(&home).join(dir)).map(|p| p.to_string_lossy().to_string()));
@@ -412,89 +379,6 @@ impl Policy {
         v
     }
 
-    /// The Seatbelt profile for `sh`. Later rules win, so protected-path denies come after the write allows.
-    pub fn seatbelt_profile(&self) -> String {
-        self.seatbelt_profile_with(self.net, &[])
-    }
-
-    /// `--yolo` profile: everything allowed except writes to protected paths. None where Seatbelt is unavailable.
-    pub fn yolo_profile(&self) -> Option<String> {
-        if !Path::new("/usr/bin/sandbox-exec").exists() {
-            return None;
-        }
-        let q = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""));
-        let mut s = String::from("(version 1)\n(allow default)\n");
-        for p in &self.protected {
-            s.push_str(&format!("(deny file-write* (subpath {}))\n", q(p)));
-        }
-        for p in &self.sealed {
-            s.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", q(p)));
-        }
-        Some(s)
-    }
-
-    /// Same profile with an explicit network setting and extra writable roots (used for MCP server processes).
-    pub fn seatbelt_profile_with(&self, net: bool, extra_write: &[PathBuf]) -> String {
-        let q = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""));
-        let mut s = String::from("(version 1)\n(deny default)\n(import \"system.sb\")\n");
-        s.push_str("(allow process-exec*)\n(allow process-fork)\n(allow signal (target same-sandbox))\n(allow sysctl-read)\n(allow file-read-metadata)\n");
-        for r in &self.read_roots {
-            s.push_str(&format!("(allow file-read* (subpath {}))\n", q(r)));
-        }
-        s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\") (regex #\"^/dev/fd/\"))\n");
-        // Apple's /usr/bin/git shim (xcrun) caches under the system user temp dir regardless of TMPDIR.
-        // Read-only and anchored: a writable prefix match would be a channel shared by every sandboxed process.
-        s.push_str(XCRUN_DB);
-        for w in self.write_roots.iter().chain(extra_write) {
-            s.push_str(&format!("(allow file-write* (subpath {}))\n", q(w)));
-        }
-        // `\.` in the profile: SBPL hands the #"..." string to the regex engine as is
-        let names: Vec<String> = SECRET_FILES.iter().map(|n| n.replace('.', "\\.")).collect();
-        s.push_str(&format!("(deny file-read* (regex #\"/({})$\"))\n", names.join("|")));
-        for p in &self.protected {
-            s.push_str(&format!("(deny file-write* (subpath {}))\n", q(p)));
-        }
-        for p in &self.sealed {
-            s.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", q(p)));
-        }
-        if self.gpu {
-            s.push_str(GPU_RULES);
-        }
-        if net {
-            s.push_str("(allow network*)\n");
-        } else {
-            s.push_str("(deny network*)\n");
-        }
-        s
-    }
-}
-
-/// Apple's tool shims (/usr/bin/git, python3) read a cache in the system user temp dir regardless of TMPDIR. Without
-/// it they still work, more slowly; writing it is never allowed.
-const XCRUN_DB: &str = "(allow file-read* (regex #\"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$\"))\n";
-
-/// Seatbelt profile for an owner's evaluator: no network, reads limited to the system, toolchains and `read`, writes to
-/// `write`. None where Seatbelt is unavailable (the evaluator then runs unconfined, still with a scrubbed environment).
-pub fn evaluator_profile(read: &[PathBuf], write: &[PathBuf]) -> Option<String> {
-    if !Path::new("/usr/bin/sandbox-exec").exists() {
-        return None;
-    }
-    let q = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""));
-    let mut s = String::from("(version 1)\n(deny default)\n(import \"system.sb\")\n");
-    s.push_str("(allow process-exec*)\n(allow process-fork)\n(allow signal (target same-sandbox))\n(allow sysctl-read)\n(allow file-read-metadata)\n");
-    let roots = SYSTEM_READ.iter().filter_map(canon).chain(toolchain_roots()).chain(read.iter().cloned());
-    for r in roots {
-        s.push_str(&format!("(allow file-read* (subpath {}))\n", q(&r)));
-    }
-    s.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/\"))\n");
-    s.push_str(XCRUN_DB);
-    for w in write {
-        s.push_str(&format!("(allow file-write* (subpath {}))\n", q(w)));
-    }
-    let names: Vec<String> = SECRET_FILES.iter().map(|n| n.replace('.', "\\.")).collect();
-    s.push_str(&format!("(deny file-read* (regex #\"/({})$\"))\n", names.join("|")));
-    s.push_str("(deny network*)\n");
-    Some(s)
 }
 
 /// A logged path is not authority to remove arbitrary directories on shutdown. Scratch paths must be direct,
@@ -520,7 +404,7 @@ impl Drop for Policy {
     }
 }
 
-/// Directories under $HOME that hold the user's toolchains (so `python3`, `git`, `cargo` work in the sandbox).
+/// Directories under $HOME that hold the user's toolchains (so `python3`, `git`, `cargo` are readable by file tools).
 fn toolchain_roots() -> Vec<PathBuf> {
     let home = std::env::var("HOME").ok().and_then(canon);
     let mut out = vec![];
@@ -563,7 +447,7 @@ mod tests {
         std::fs::write(victim.join("sentinel"), "KEEP").unwrap();
         let log = EventLog::open(&dir.join("log")).unwrap();
         log.write("session", json!({"workspace": dir, "tmp": victim}), true).unwrap();
-        let result = Policy::new(&dir, true, None, Some(&log.path), None, None);
+        let result = Policy::new(&dir, true, None, Some(&log.path), None);
         let accepted = result.is_ok();
         drop(result);
         assert!(victim.join("sentinel").exists(), "Policy::drop deleted unrelated data");
@@ -596,7 +480,7 @@ mod tests {
     fn classify_sh_orders_irreversible_before_external() {
         let dir = std::env::temp_dir().join(format!("hx-policy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = Policy::new(&dir, true, None, None, None, None).unwrap();
+        let p = Policy::new(&dir, true, None, None, None).unwrap();
         assert_eq!(p.classify_sh("git push --force origin main"), Class::Irreversible);
         assert_eq!(p.classify_sh("git push origin main"), Class::External);
         assert_eq!(p.classify_sh("ls -la"), Class::LocalWrite);
@@ -609,18 +493,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn gpu_rules_only_when_policy_allows() {
-        let base = std::env::temp_dir().join(format!("hx-policy-gpu-{}", std::process::id()));
-        let (off, on) = (base.join("off"), base.join("on"));
-        std::fs::create_dir_all(&off).unwrap();
-        std::fs::create_dir_all(on.join(".harness")).unwrap();
-        std::fs::write(on.join(".harness/policy.toml"), "[gpu]\nallow = true\n").unwrap();
-        // the launcher's consent to use workspace config (modules tests set the same value; no test needs it unset)
-        unsafe { std::env::set_var("HX_TRUST", "1") };
-        assert!(!Policy::new(&off, true, None, None, None, None).unwrap().seatbelt_profile().contains("iokit-open"));
-        let prof = Policy::new(&on, true, None, None, None, None).unwrap().seatbelt_profile();
-        assert!(prof.contains("(allow iokit-open)") && prof.contains("MTLCompilerService"));
-        let _ = std::fs::remove_dir_all(&base);
-    }
 }

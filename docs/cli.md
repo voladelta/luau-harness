@@ -57,8 +57,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | Flag | Meaning |
 |---|---|
 | `--workspace DIR` | Workspace root (default `.`) |
-| `--yolo` | No sandbox, open network, no path limits and no approval gate; `.harness/` and `hx.lock` stay read-only; prints a warning |
-| `--net` / `--no-net` | Allow or deny network access for `sh` |
+| `--yolo` | Disable file-tool path roots and the approval gate; file tools still protect `.harness/` and `hx.lock`; prints a warning |
 | `--approval prompt` | Ask on the terminal instead of refusing commands that need approval (default `deny`) |
 
 Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=1` trusts the workspace for one launch (see [workspace trust](configuration.md#workspace-trust)).
@@ -71,7 +70,9 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Interrupted local `write`/`edit` and sandboxed offline `sh` settle themselves from the evidence. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
+Runs created before built-in OS sandboxing was removed use an older journal format; start a new run with this version.
+
+Interrupted local `write`/`edit` settle themselves from the evidence. Interrupted shell commands require owner reconciliation. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
 
 `--branch LOG` starts a new run with new settings and the inherited saved data.
 

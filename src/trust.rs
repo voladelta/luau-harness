@@ -1,6 +1,6 @@
 //! Workspace trust (like `direnv allow`). Everything hx treats as user-owned config lives inside the workspace:
 //! `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/{override,tools}/` and `hx.lock`. The model cannot
-//! write them, but whoever wrote the repo can, so a cloned repo could widen the sandbox, start MCP commands or
+//! write them, but whoever wrote the repo can, so a cloned repo could widen file-tool access, start MCP commands or
 //! pre-approve its own packages and skills. hx therefore uses that config only when the user has trusted its exact
 //! content: `hx trust` records a hash per workspace in `~/.config/hx/trust.toml` (outside every repo, protected from
 //! the model). Untrusted config is ignored as if absent; a workspace with none of these files needs no trust.

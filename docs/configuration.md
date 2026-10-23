@@ -1,10 +1,10 @@
 # Configuration
 
-All configuration lives in `.harness/` in the workspace. The model can read it but never write it. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
+All configuration lives in `.harness/` in the workspace. File tools can read it but refuse writes; shell and MCP access are controlled by your external sandbox. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
 
 | File | Purpose |
 |---|---|
-| `.harness/policy.toml` | Sandbox roots, network, GPU, approval gate, budgets, packs |
+| `.harness/policy.toml` | File-tool roots, approval gate, budgets, packs |
 | `.harness/mcp.toml` | MCP servers |
 | `.harness/init.luau` | Toggles for `std` modules such as compaction and recheck |
 | `.harness/ar.toml` | Autoresearch setup (see [workflows](workflows.md#harnessartoml)) |
@@ -16,14 +16,8 @@ All configuration lives in `.harness/` in the workspace. The model can read it b
 
 ```toml
 [fs]
-read = ["/extra/read/root"]     # extra read roots for the sandbox
+read = ["/extra/read/root"]     # extra read roots for file tools
 write = ["/extra/write/root"]   # extra write roots
-
-[net]
-allow = false                   # all-or-nothing; Seatbelt cannot filter by host
-
-[gpu]
-allow = false                   # true lets `sh` use Metal (Skia/wgpu renderers such as fframes)
 
 [approval]
 mode = "deny"                   # "deny" (headless default) or "prompt"
@@ -43,17 +37,18 @@ Budgets are admission thresholds: each request reserves its upper bound in token
 ## `mcp.toml`
 
 ```toml
-[server.notes]                  # local server, runs under its own Seatbelt profile
+[server.notes]                  # local server, runs directly
 command = "python3"
 args = ["server.py"]
 read_only_tools = ["read_*"]    # these run freely; every other tool needs approval
 env = ["NOTES_DIR"]             # the only env vars passed through
-net = false
 
 [server.remote]                 # remote Streamable HTTP server (https, or http on localhost)
 url = "https://mcp.example.com/mcp"
 bearer_env = "REMOTE_TOKEN"     # or headers_env = {"x-api-key" = "VAR"}
 ```
+
+Filesystem, network and GPU access for shell commands, local MCP servers and evaluators are controlled by the environment running hx. hx does not provide an OS sandbox or network switches.
 
 MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`.
 
@@ -73,7 +68,7 @@ require("std/recheck").enabled = true
 
 ## Workspace trust
 
-`.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/` and `hx.lock` live in the repo, so whoever wrote the repo could widen the sandbox, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model).
+`.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/` and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model).
 
 - Any edit makes the workspace untrusted again.
 - `hx approve`, `hx accept` and `hx rollback` keep an already trusted workspace trusted.

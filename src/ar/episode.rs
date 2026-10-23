@@ -77,7 +77,7 @@ pub async fn eval(pol: &Policy, note: String) -> Result<Value> {
     }
     let (score, valid, se, report) = match stored {
         Some(r) => (r.score, true, None, r.report.clone()),
-        None => evaluate(spec, &episode.dir, &files, &spec.eval, false).await?,
+        None => evaluate(spec, &episode.dir, &files, &spec.eval).await?,
     };
     // A worker's step counts when it beats its best by more than the evaluator's noise, so small steps add up across
     // rounds; `min_delta` is the bar against the seed, applied at the gate.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# MCP client checks (no API key): binding, schema signatures, approval gate, sandboxed server, env scrubbing, prompt index.
+# MCP client checks (no API key): binding, schema signatures, approval gate, direct server execution, env scrubbing, prompt index.
 set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 R=$PWD; H=$R/target/release/hx
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T" "$HOME/hx-mcp-escape.txt"; kill $MOCK $LISTEN 2>/dev/null' EXIT
+T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T" "$T/outside.txt"; kill $MOCK $LISTEN 2>/dev/null' EXIT
 MOCK=; LISTEN=
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
@@ -33,17 +33,13 @@ out=$(x 'print(pcall(mcp.demo.boom, {}))' | head -1)
 check "a tool error becomes a Luau error with the server's message" "$(echo "$out" | grep -c 'mcp tool error (demo.boom): boom')" "1"
 check "tool names are also reachable with a safe alias" "$(x 'print(mcp.demo["read_note"] == mcp.demo.read_note)' | head -1)" "true"
 
-# --- the server itself is sandboxed
-check "server cannot write outside the project/temp dir" "$(x 'print(pcall(mcp.demo.write_file, {path = os.getenv and "" or "'$HOME'/hx-mcp-escape.txt", text = "x"}))' >/dev/null; [ -e $HOME/hx-mcp-escape.txt ] && echo ESCAPED || echo blocked)" "blocked"
-check "server tool error says the write failed" "$(x 'print(pcall(mcp.demo.write_file, {path = "'$HOME'/hx-mcp-escape.txt", text = "x"}))' | head -1 | grep -c 'cannot write')" "1"
+# --- local servers run directly; the outer environment controls access
+check "server writes beyond the workspace" "$(x 'print(mcp.demo.write_file{path = "'$T'/outside.txt", text = "x"})' | head -1)" "wrote $T/outside.txt"
 check "server can write inside the project" "$(x 'print(mcp.demo.write_file{path = "ok.txt", text = "x"}) ' | head -1)" "wrote ok.txt"
 python3 -c "
 import os,socket,time
 s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(5); open('$T/port.tmp','w').write(str(s.getsockname()[1])); os.replace('$T/port.tmp','$T/port'); time.sleep(60)" & LISTEN=$!; wait_for_file $T/port || exit 1; PORT=$(cat $T/port)
-check "no network for the server by default" "$(x 'print(pcall(mcp.demo.net_probe, {host = "127.0.0.1", port = '$PORT'}))' | head -1 | grep -c 'no network')" "1"
-cfg 'net = true' '[approval]
-allow = ["mcp demo."]'
-check "net = true in mcp.toml grants it" "$(x 'print(mcp.demo.net_probe{host = "127.0.0.1", port = '$PORT'})' | head -1)" "connected"
+check "server connects using the outer environment's network" "$(x 'print(mcp.demo.net_probe{host = "127.0.0.1", port = '$PORT'})' | head -1)" "connected"
 cfg "" '[approval]
 allow = ["mcp demo."]'
 out=$(x 'print(mcp.demo.env_names{})' | head -1)
@@ -105,8 +101,8 @@ hcfg "http://example.com/mcp" ''
 check "http: plain http to a remote host is refused" "$(hx 'print(1)' | grep -c 'must be https')" "1"
 hcfg "https://example.com/mcp" 'command = "python3"'
 check "http: command and url together are refused" "$(hx 'print(1)' | grep -c 'mutually exclusive')" "1"
-hcfg "https://example.com/mcp" 'net = true'
-check "http: sandbox-only keys are refused on a url server" "$(hx 'print(1)' | grep -c 'do not apply')" "1"
+hcfg "https://example.com/mcp" 'env = ["WEB_KEY"]'
+check "http: stdio-only keys are refused on a url server" "$(hx 'print(1)' | grep -c 'do not apply')" "1"
 
 # --- HTTP edge cases: split SSE stream, server request id collision, echoed secret, session expiry
 SESSION=1 EXPIRE=$T/expire HDR_LOG=$HL serve HP env -C $T python3 $R/scripts/mcp_http_server.py 0 sse-split || exit 1; SRV=$SERVED; : > $HL

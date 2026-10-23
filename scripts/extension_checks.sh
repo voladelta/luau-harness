@@ -94,11 +94,10 @@ check "unapproved tests are not executed by promotion" "$(echo "$out" | head -1)
 out=$(xt 'deftool("untested","return {}"); local r=promote("untested"); print(r.ok,r.message)')
 check "promotion still requires submitted tests" "$(echo "$out" | head -1 | grep -c 'must have tests')" "1"
 
-# --- the agent cannot approve or install anything itself
+# --- file tools cannot change installed or staged extensions
 check "cannot write into .harness/pkgs" "$(x 'print(pcall(write, ".harness/pkgs/evil/hx.toml", "x"))' | head -1 | grep -c protected)" "1"
 check "cannot write into .harness/staged" "$(x 'print(pcall(write, ".harness/staged/evil/init.luau", "x"))' | head -1 | grep -c protected)" "1"
 check "no accept/approve function exists for the agent" "$(x 'print(type(accept), type(approve), type(hx), type(require))' | head -1)" "nil	nil	nil	nil"
-check "sh cannot activate a tool either" "$(x 'sh("mkdir -p .harness/pkgs/evil && echo x > .harness/pkgs/evil/hx.toml")' >/dev/null; [ -e $W/.harness/pkgs/evil ] && echo CREATED || echo blocked)" "blocked"
 
 # --- extensions stay frozen when a user edits and re-approves a tool during a session
 ( x 'counter = 7
@@ -128,7 +127,7 @@ out=$(xa 'local s = skill("craft") print(s.text) print(s.files[1], s.files[2], s
 check "agent skill: text without frontmatter" "$(echo "$out" | sed -n 1p)" "Read references/beats.md first."
 check "agent skill: files listed, no module" "$(echo "$out" | sed -n 3p)" "SKILL.md	references/beats.md	nil"
 check "agent skill: reference file readable via dir" "$(echo "$out" | sed -n 4p)" "beat list"
-check "agent skill: readable from sh (Seatbelt)" "$(xa "print(sh('cat $FH/.agents/skills/craft/references/beats.md').stdout)" | head -1)" "beat list"
+check "agent skill: readable from sh (direct shell)" "$(xa "print(sh('cat $FH/.agents/skills/craft/references/beats.md').stdout)" | head -1)" "beat list"
 check "agent skill: global dir stays read-only" "$(xa "print(pcall(write, '$FH/.agents/skills/craft/x.md', 'x'))" | head -1 | grep -c 'outside the allowed roots')" "1"
 check "skills(query) finds by description, best first" "$(xa 'for _, h in skills("short videos") do print(h.name) end' | head -1)" "craft"
 check "skills() with no query lists approved names" "$(xa 'print(#skills())' | head -1)" "2"
@@ -138,7 +137,6 @@ check "project .agents/skills shadows global" "$(xa 'print(skill("vid").text)' |
 echo "secret" > $T/secret.txt; mkdir -p $FH/.agents/skills/linky; printf -- '---\ndescription: links out\n---\nx\n' > $FH/.agents/skills/linky/SKILL.md
 ln -s $T/secret.txt $FH/.agents/skills/linky/leak.md; HOME=$FH $H approve linky --workspace $A >/dev/null
 check "a symlink inside an approved skill is not readable (read)" "$(xa "print(pcall(read, '$FH/.agents/skills/linky/leak.md'))" | head -1 | grep -c 'outside the allowed roots')" "1"
-check "a symlink inside an approved skill is not readable (sh)" "$(xa "print(sh('cat $FH/.agents/skills/linky/leak.md').stdout)" | head -1 | grep -c secret)" "0"
 mkdir -p $A/.harness/pkgs/vid; printf '[package]\nversion = "1.0.0"\nkind = "skill"\ndescription = "pkg copy"\n' > $A/.harness/pkgs/vid/hx.toml; printf 'pkg vid\n' > $A/.harness/pkgs/vid/SKILL.md
 HOME=$FH $H approve vid --workspace $A >/dev/null
 check ".harness/pkgs shadows an agent skill of the same name" "$(xa 'print(skill("vid").text)' | head -1)" "pkg vid"

@@ -2,17 +2,17 @@
 //! a portfolio of distinct good candidates rather than one best state.
 //!
 //! The task supplies `.harness/ar.toml` (editable paths, evaluator commands, grader and holdout roots) and the program
-//! text (`--prompt-file`). At launch the committed tree is frozen into the run's `base`. Agents never touch the owner's
-//! workspace or its Git repository:
+//! text (`--prompt-file`). At launch the committed tree is frozen into the run's `base`. Episodes work in copies of the owner's
+//! workspace; filesystem isolation must be supplied externally:
 //!
 //! - Every episode is a fresh child `hx run` in a throwaway copy of `base` holding the state it starts from. Only
 //!   snapshots of the editable paths ever leave an episode.
 //! - `ar.eval` snapshots the editable files and scores the snapshot in a second throwaway copy of `base`, so the
 //!   evaluator sees exactly the recorded bytes and nothing else the agent did.
-//! - Evaluators run under their own sandbox: a scrubbed environment, no network, reads limited to the system,
-//!   toolchains, the evaluation copy and the declared grader (and, for `select`, holdout) roots.
+//! - Evaluators run directly with a scrubbed environment in a throwaway copy. Network and filesystem
+//!   restrictions, including held-out data isolation, must be supplied externally.
 //! - The run directory (`.harness/ar/RUN`, with `base`, snapshots, ledger, claims, journal and held-out scores) is
-//!   sealed from agents in every mode.
+//!   sealed from file tools in every mode; shell access must be confined externally.
 //!
 //! A run is research, then rounds. A research episode studies the task and writes the brief every worker gets. Round 1
 //! runs explore workers side by side; each derives its own idea from a host seed and claims it with `ar.claim`. Claims
@@ -31,7 +31,7 @@
 //! answers, since the single best score is the one most likely to be an overfit or an evaluator hole.
 //!
 //! `episode` holds what runs inside an episode (`ar.eval`, `ar.claim`, `ar.claims`, `ar.reset`); `files` holds what
-//! crosses its boundary (snapshots, throwaway copies, the sandboxed evaluator, the frozen base).
+//! crosses its boundary (snapshots, throwaway copies, the evaluator, the frozen base).
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -283,7 +283,7 @@ impl Orchestrator {
     /// Score the seed with the search evaluator before any episode, so every episode knows where it starts. Kept in
     /// `seed.json` (written whole or not at all), outside the ledger, which holds the agents' evaluations.
     async fn baseline(&self) -> Result<()> {
-        let (score, valid, _, report) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &self.seed()?)?, &self.spec().eval, false).await?;
+        let (score, valid, _, report) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &self.seed()?)?, &self.spec().eval).await?;
         eprintln!("hx ar: seed scores {}", if valid { show(score) } else { "invalid".into() });
         let tmp = self.dir.join("seed.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&json!({"score": score.filter(|_| valid), "report": report}))?)?;
@@ -305,7 +305,7 @@ impl Orchestrator {
         if let Some(score) = self.records()?.into_iter().find_map(|r| match r { Record::Selected { snap: s, score } if s == snap => Some(score), _ => None }) {
             return Ok(score);
         }
-        let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, snap)?, &cmd, true).await?;
+        let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, snap)?, &cmd).await?;
         let score = score.filter(|_| valid);
         self.journal(&Record::Selected { snap: snap.into(), score })?;
         Ok(score)

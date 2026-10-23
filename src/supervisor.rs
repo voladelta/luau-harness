@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-pub const FORMAT: u64 = 6;
+// Process policy changed: older manifests freeze prompts and settings that assume OS confinement.
+pub const FORMAT: u64 = 7;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,14 +90,11 @@ impl Manifest {
 /// Settle what the evidence settles without the owner, after a crash:
 /// - `write`/`edit` replace their file atomically after journaling an `expect` record, so no record means the file was
 ///   never touched; otherwise the file's hash says whether it landed. An unreadable file is left for the owner.
-/// - `sh` that ran under Seatbelt with the network off and no approval-gated command could only write inside the
-///   workspace and the run's temp dir, which the recovery turn can inspect: `unknown_local`.
 /// - A model request whose response was lost is charged its reserved tokens.
 ///
 /// Returns how many records were written.
-pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Result<usize> {
+pub fn reconcile(log: &EventLog, records: &[Value]) -> Result<usize> {
     let books = Books::of(records)?;
-    let confined = manifest.policy.enabled && !manifest.policy.net;
     let mut settled = 0;
     for (&id, intent) in &books.open {
         let (decision, evidence) = match intent["tool"].as_str() {
@@ -109,8 +107,6 @@ pub fn reconcile(log: &EventLog, records: &[Value], manifest: &Manifest) -> Resu
                     Err(_) => continue,
                 },
             },
-            Some("sh") if confined && intent["class"] == "local_write" => ("unknown_local",
-                "sandboxed with no network: it may have run, partly or fully, but could only change the workspace and the run's temp dir; inspect them before repeating it"),
             _ => continue,
         };
         log.write("resolution", json!({"of": id, "decision": decision, "tool": intent["tool"], "args_sha": intent["args_sha"], "by": "hx", "evidence": evidence}), true)?;
@@ -247,7 +243,7 @@ impl Supervisor {
         let path = policy.log.path.as_path();
         let manifest = Manifest::load(path)?;
         let mut records = eventlog::load(path)?;
-        if reconcile(&policy.log, &records, &manifest)? > 0 { records = eventlog::load(path)?; }
+        if reconcile(&policy.log, &records)? > 0 { records = eventlog::load(path)?; }
         let mut books = Books::of(&records)?;
         books.crashed();
         let (frontier, checkpoint) = match records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root") {
@@ -264,7 +260,7 @@ impl Supervisor {
         let workflow = checkpoint.as_ref().and_then(|c|c.workflow.clone()).or_else(||manifest.workflow.as_ref().map(|_|crate::workflow::ExecutionFrame::default()));
         let restored = checkpoint.map(|c| c.run);
         let recovery = Some(json!({"receipts": receipts, "log_directory":path.parent(), "uncertain_operations": books.open.values().cloned().collect::<Vec<_>>(),
-            "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work: a resolution `unknown_local` means a sandboxed `sh` may have run, so check the workspace before repeating it. Uncertain mutations require the owner's `hx recover` decision. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them."}));
+            "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work. Uncertain mutations require the owner's `hx recover` decision. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them."}));
         policy.log.write("resume", json!({"format": FORMAT, "checkpoint": frontier}), true)?;
         // The registry is restored from bytes in the protected journal, never from the workspace.
         let mut registry = manifest.registry.clone();
@@ -439,7 +435,7 @@ mod checkpoint_tests {
         for (tag, limit) in [("capped", Some(102)), ("uncapped", None)] {
             let dir = std::env::temp_dir().join(format!("hx-billing-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let policy = Arc::new(Policy::new(&dir, true, None, None, None, None).unwrap());
+            let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
             let cfg = model();
             let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
                 Budget { max_tokens: limit, ..Budget::default() }, None).unwrap();
@@ -460,7 +456,7 @@ mod checkpoint_tests {
     async fn queued_model_admission_expires_without_a_settlement() {
         let dir = std::env::temp_dir().join(format!("hx-admission-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, true, None, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dir, true, None, None, None).unwrap());
         let cfg = model();
         let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
             Budget { max_tokens: Some(102), max_wall_secs: Some(0.5), ..Budget::default() }, None).unwrap();

@@ -95,9 +95,7 @@ const FLAGS: &[Flag] = {
     const RUN: &[&str] = &["run"];
     &[
         flag(&[], "--workspace", Text, "DIR", "workspace root (default: .)"),
-        flag(&[], "--yolo", Switch, "", "no sandbox, network, path limits or approval gate; .harness/ stays read-only (prints a warning)"),
-        flag(&[], "--net", Switch, "", "allow network access"),
-        flag(&[], "--no-net", Switch, "", "deny network access"),
+        flag(&[], "--yolo", Switch, "", "no file-tool path limits or approval gate; file tools still protect .harness/ and hx.lock (prints a warning)"),
         flag(&[], "--approval", Text, "MODE", "deny (default) or prompt: what happens to a command that needs approval"),
         flag(&["run", "exec"], "--pack", Text, "A,B", "extra packs: std/authoring (agent-written tools), std/vision (view() shows images)"),
         flag(RUN, "--resume", Text, "LOG", "restore frozen settings and checkpoint into a fresh VM; do not repeat flags"),
@@ -156,13 +154,13 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "exec" => "hx exec [flags] CHUNK...\n\nRun each Luau CHUNK in one session and print its result.\n\nExample:\n    hx exec 'print(1+1)' 'print(2)'\n",
         "run" => "hx run --prompt-file F --model M [flags]\n\nBudgets are admission thresholds; reservations include in-flight and uncertain generations.\n",
         "review" => "hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]\n\nRecords a decision only; continue with hx run --resume LOG.\n",
-        "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, sandboxed offline sh is settled as unknown_local, and model requests whose response was lost are charged their reserved tokens; none needs a decision.\n",
+        "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, model requests whose response was lost are charged their reserved tokens; none needs a decision.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
         "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
         "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
         "staged" => "hx staged\n\nList what the agent staged: packages (NAME) and harness-module replacements (std/MODULE).\n",
-        "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp}.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, hx.lock) and trust its exact content. Until then hx ignores it: a cloned repo cannot widen the sandbox, start MCP\nservers or pre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=1 trusts the workspace for one launch.\n",
+        "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp}.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, hx.lock) and trust its exact content. Until then hx ignores it: a cloned repo cannot widen file-tool access, start MCP\nservers or pre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=1 trusts the workspace for one launch.\n",
         "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate it. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
@@ -230,17 +228,6 @@ fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>
     arg(args, name).map(|v| v.parse().map_err(|_| usage(&format!("{name}: expected a number, got {v:?}")))).transpose()
 }
 
-/// `--net` / `--no-net`, or None to let the policy decide.
-fn net_flag(args: &[String]) -> Option<bool> {
-    if has(args, "--net") {
-        Some(true)
-    } else if has(args, "--no-net") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 /// Reject malformed options before opening a journal, starting an MCP server, or contacting a provider.
 fn validate_args(args: &[String]) -> Result<()> {
     let command = args[0].as_str();
@@ -266,7 +253,6 @@ fn validate_args(args: &[String]) -> Result<()> {
             _ => {},
         }
     }
-    if seen.contains("--net") && seen.contains("--no-net") { return Err(usage("--net and --no-net are mutually exclusive")); }
     if seen.contains("--resume")
         && let Some(flag) = seen.iter().find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace" | "--ar")) {
         return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
@@ -315,13 +301,13 @@ async fn real_main() -> Result<()> {
     }
     validate_args(&args)?;
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
-    // The sandbox, path policy and approval gate are ON by default; `--yolo` is an explicit opt-out (and says so on stderr).
-    let sandbox = !has(&args, "--yolo");
-    if !sandbox {
-        eprintln!("warning: --yolo: no sandbox, network open, no path limits, no approval gate (.harness/ and hx.lock stay read-only)");
+    // The file-tool path policy and approval gate are ON by default; `--yolo` is an explicit opt-out (and says so on stderr).
+    let policy_enabled = !has(&args, "--yolo");
+    if !policy_enabled {
+        eprintln!("warning: --yolo: no file-tool path limits or approval gate (file tools still protect .harness/ and hx.lock)");
     }
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
-    let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, sandbox, arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), net_flag(&args), episode)?)) };
+    let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, policy_enabled, arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), episode)?)) };
     match args[0].as_str() {
         "exec" => {
             trust::warn_if_untrusted(&workspace);
@@ -423,7 +409,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         let inherited = arg(args, "--branch").map(|path| -> Result<_> {
             let journal = eventlog::EventLog::reopen(Path::new(&path))?;
             let manifest = supervisor::Manifest::inspect(Path::new(&path))?;
-            supervisor::reconcile(&journal, &eventlog::load(Path::new(&path))?, &manifest)?;
+            supervisor::reconcile(&journal, &eventlog::load(Path::new(&path))?)?;
             let recovery = eventlog::verify(Path::new(&path))?;
             anyhow::ensure!(recovery.unknown.is_empty() && recovery.unknown_models.is_empty(), "reconcile uncertain operations and model billing before branching");
             let records = eventlog::load(Path::new(&path))?;
@@ -555,7 +541,7 @@ fn cmd_trust(args: &[String], workspace: &Path) -> Result<()> {
         return Ok(());
     }
     if !has(args, "--yes") {
-        confirm("trust this config? hx will apply it (sandbox, MCP servers, packages, skills, overrides)")?;
+        confirm("trust this config? hx will apply it (file-tool policy, MCP servers, packages, skills, overrides)")?;
     }
     let h = trust::record(workspace)?.unwrap_or_default();
     println!("trusted {} ({}…)", workspace.display(), &h[..12.min(h.len())]);
@@ -612,26 +598,23 @@ mod tests {
 
     #[test]
     fn exec_chunks_skip_global_flags_and_their_values() {
-        let a = argv("exec --workspace /w print(1) --pack a,b --net print(2) --approval prompt --yolo --no-net print(3)");
+        let a = argv("exec --workspace /w print(1) --pack a,b print(2) --approval prompt --yolo print(3)");
         assert_eq!(exec_chunks(&a), vec!["print(1)", "print(2)", "print(3)"]);
         assert!(exec_chunks(&argv("exec")).is_empty());
     }
 
     #[test]
     fn flag_helpers() {
-        let a = argv("run --pack a,b --max-turns 7 --max-wall x --net");
+        let a = argv("run --pack a,b --max-turns 7 --max-wall x");
         assert_eq!(list_arg(&a, "--pack"), vec!["a", "b"]);
         assert!(list_arg(&a, "--provider-only").is_empty());
         assert_eq!(parsed::<u32>(&a, "--max-turns").unwrap(), Some(7));
         assert_eq!(parsed::<u32>(&a, "--max-tokens").unwrap(), None);
         // Validation, not parsing, refuses a bad or missing value: a mistyped budget is a usage error, not unlimited.
-        for bad in ["run --max-wall x", "run --model m --max-wall", "run --max-wall --net"] {
+        for bad in ["run --max-wall x", "run --model m --max-wall", "run --max-wall --yolo"] {
             let e = validate_args(&argv(bad)).unwrap_err();
             assert!(e.is::<Usage>() && e.to_string().contains("--max-wall"), "{bad}: {e}");
         }
-        assert_eq!(net_flag(&a), Some(true));
-        assert_eq!(net_flag(&argv("run --no-net")), Some(false));
-        assert_eq!(net_flag(&argv("run")), None);
     }
 
     #[test]

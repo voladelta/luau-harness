@@ -489,7 +489,7 @@ mod open_tests {
     #[test]
     fn failed_intent_write_prevents_the_effect_even_if_the_error_is_caught() {
         let path = three_records("write-failure");
-        let mut pol = crate::policy::Policy::new(path.parent().unwrap(), true, None, None, None, None).unwrap();
+        let mut pol = crate::policy::Policy::new(path.parent().unwrap(), true, None, None, None).unwrap();
         pol.log = Arc::new(EventLog {
             inner: Mutex::new(Inner { file: std::fs::File::open(&path).unwrap(), seq: 0, prev: "genesis".into() }),
             failure: Mutex::new(None),
@@ -512,7 +512,7 @@ mod open_tests {
     #[test]
     fn failed_outcome_blob_keeps_an_unknown_intent_and_blocks_later_effects() {
         let path = three_records("blob-failure");
-        let pol = crate::policy::Policy::new(path.parent().unwrap(), true, None, None, None, None).unwrap();
+        let pol = crate::policy::Policy::new(path.parent().unwrap(), true, None, None, None).unwrap();
         let log_path = pol.log.path.clone();
         std::fs::write(log_path.parent().unwrap().join("blobs"), "not a directory").unwrap();
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());

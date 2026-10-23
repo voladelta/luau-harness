@@ -6,7 +6,6 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
-![Sandbox: macOS](https://img.shields.io/badge/sandbox-macOS-lightgrey.svg)
 
 A headless coding-agent harness in which the model writes Luau instead of calling tools one at a time. Rust owns effects and recovery; Luau supplies composition and workflow decisions.
 
@@ -23,8 +22,8 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Feature | What it does |
 |---|---|
 | Code mode | One `luau` tool; globals persist across turns; `read`, `write`, `edit`, `sh`, `search` (ripgrep engine, embedded) |
-| Sandbox (macOS) | `sh` runs under Seatbelt: writes confined to the project and a temp dir, no network, no API keys in the environment |
-| Approval gate | `git push`, publish, `ssh` and other external commands need the user's approval; nothing the model writes can approve |
+| Process execution | `sh` and local MCP servers run directly; run hx inside your own sandbox or container |
+| Approval gate | `git push`, publish, `ssh` and other recognized external commands pass a Rust approval gate |
 | [RPI workflow](docs/workflows.md#rpi-research-design-implement-verify) | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds owner review gates |
 | [Autoresearch](docs/workflows.md#autoresearch) | `--ar` improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
 | [Recovery](docs/cli.md#checkpoints-and-resume) | `--resume` restores saved data and controller state into a fresh VM; old effectful chunks are never replayed |
@@ -62,7 +61,7 @@ print(sh("python -m pytest -q 2>&1 | tail -15").stdout)
 
 ## Installation
 
-Requires Rust 1.85 or newer (edition 2024). The sandbox requires macOS.
+Requires Rust 1.85 or newer (edition 2024), Bash and Unix process support. Run hx inside your own Linux sandbox or container to isolate filesystem and network access.
 
 ```bash
 cargo install --git https://github.com/voladelta/luau-harness
@@ -131,7 +130,7 @@ Every flag and exit code is in the [command reference](docs/cli.md).
                                 │ read write edit sh search agent
  ┌──────────────────────────────▼───────────────────────────────┐
  │ Rust supervisor, trusted, not modifiable by the model        │
- │   principals · policy · Seatbelt · approvals · reservations  │
+ │   principals · policy · approvals · reservations             │
  │   single-writer journal · receipts · checkpoints · adapters  │
  └──────────────────────────────────────────────────────────────┘
 ```
@@ -142,10 +141,10 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 
 ## Security model
 
-- `sh` runs under macOS Seatbelt: writes only to the project and a per-run temp dir, reads from an allowlist (project, system dirs, detected toolchains, approved skill dirs), no network unless `[net] allow = true`, a minimal environment with no API keys, its own process group killed when the command ends, and a per-user process cap.
-- `read`, `write`, `edit` and `search` check the canonical path against the same roots. Writes never go through symlinks.
-- `.harness/` and `hx.lock` are read-only to the model. Workspace config is ignored until you [trust](docs/configuration.md#workspace-trust) it.
-- Shell commands are classed read / local write / external / irreversible. The classifier is a tripwire for obvious commands such as `git push`; the sandbox is the real boundary.
+- `sh`, local MCP servers and autoresearch evaluators run directly. Filesystem, network and GPU isolation belong to the environment running hx; configure them in your Linux sandbox or container.
+- By default, `sh` and local MCP servers receive a minimal environment without inherited API keys. Shell commands run in their own process group, killed when the command ends, with a per-user process cap.
+- `read`, `write`, `edit` and `search` check canonical paths against allowed roots. File tools protect `.harness/`, `hx.lock` and the trust store, and writes refuse symlinks. These checks do not restrict shell commands or MCP server processes.
+- Workspace config is ignored until you [trust](docs/configuration.md#workspace-trust) it. Shell commands are classed read / local write / external / irreversible; obvious external commands such as `git push` pass an approval gate. This classifier is a tripwire, so process confinement must be supplied externally.
 
 ## Documentation
 
@@ -168,7 +167,7 @@ hx test stdlib/std               # Luau unit tests
 cargo test --release
 ```
 
-Suites run concurrently (mock servers bind free ports); the process-cap sandbox suite and the autoresearch suite run alone. Stalled suites fail with a diagnostic, and reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
+Suites run concurrently (mock servers bind free ports); the policy suite and the autoresearch suite run alone. Stalled suites fail with a diagnostic, and reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
 
 | Path | Contents |
 |---|---|
@@ -180,8 +179,7 @@ Suites run concurrently (mock servers bind free ports); the process-cap sandbox 
 
 ## Limitations
 
-- **macOS only for sandboxing.** The sandbox uses `sandbox-exec`, which Apple has deprecated. There is no Linux sandbox; on other systems you would need `--yolo`, which also removes the path limits and the approval gate, and there `sh` can write `.harness/` (on macOS `--yolo` still blocks that with Seatbelt). hx has not been tested on Linux.
-- **Network is all-or-nothing.** Seatbelt cannot filter by host.
+- **Process isolation is external.** hx supplies no OS sandbox. File-tool path checks and approvals do not confine arbitrary shell commands, MCP servers or evaluators. Autoresearch held-out data needs isolation configured by the owner.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
 - The Responses API is tested against a mock.
 - **Compaction and finish review are heuristics.** Summary and review quality depend on the model. Context size is configured, not detected; resume restores it. Disabling compaction is in [configuration](docs/configuration.md#initluau-compaction-and-recheck).

@@ -202,7 +202,7 @@ def immutable_manifest():
         start(path, url)
         log = journal(path)
         (path / ".harness/init.luau").write_text('error("new config must not execute")')
-        (path / ".harness/policy.toml").write_text('[net]\nallow=true\n')
+        (path / ".harness/policy.toml").write_text('[approval]\nallow=["git push"]\n')
         report = json.loads(run(path, "run", "--resume", str(log)).stdout)
         assert report["finished"] and len(calls) == 2
 
@@ -314,7 +314,7 @@ def branch_saved_state():
 
 
 def unknown_abandon():
-    # --yolo runs sh without Seatbelt, so this check also runs where the sandbox is unavailable.
+    # Shell commands run directly in either policy mode.
     path = workspace("abandon")
     code = 'print(sh("printf x >> again.txt").code)'
     with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
@@ -473,12 +473,10 @@ print("CHILDREN_OK")'''
         assert peak[0] == 2, peak
 
 
-def sandboxed_sh_settles():
-    # Sandboxed, no network: an interrupted sh is settled by hx as unknown_local and mutations continue on resume.
-    # With the network on it could have acted elsewhere, so it waits for the owner. The crash precedes the command,
-    # so this runs where Seatbelt is unavailable too.
+def interrupted_sh_needs_owner():
+    # Shell commands run directly and may act outside the workspace in either policy mode.
     code = 'print(sh("printf x >> again.txt").code)'
-    for name, flags, settled in [("offline", (), True), ("online", ("--net",), False)]:
+    for name, flags in [("default", ()), ("yolo", ("--yolo",))]:
         with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
             control = workspace(f"sh-{name}-control")
             start(control, url, *flags, ok=False)
@@ -488,13 +486,9 @@ def sandboxed_sh_settles():
         with provider(answer) as (url, _):
             start(path, url, *flags, env={"HX_TEST_CRASH_AFTER_RECORD": str(intent["seq"])}, ok=False)
             report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
-            resolutions = [(r["decision"], r.get("by")) for r in records(journal(path)) if r["kind"] == "resolution"]
-            if settled:
-                assert resolutions[0] == ("unknown_local", "hx") and report["uncertain_operations"] == [], (resolutions, report)
-                assert (path / "after.txt").read_text() == "ok", report
-            else:
-                assert not resolutions and report["uncertain_operations"] == [intent["seq"]], (resolutions, report)
-                assert not (path / "after.txt").exists()
+            resolutions = [r for r in records(journal(path)) if r["kind"] == "resolution"]
+            assert not resolutions and report["uncertain_operations"] == [intent["seq"]], (resolutions, report)
+            assert not (path / "after.txt").exists()
 
 
 def compaction_and_recovery():
@@ -688,15 +682,15 @@ def review_branch_and_revocation():
             report = json.loads(run(path, "run", "--resume", str(child)).stdout)
             assert report["finished"] and report["luau_errors"] == 0, report
 
-    # Networked sh interrupted by a crash could have acted elsewhere, so only the owner can settle it.
+    # Direct sh interrupted by a crash could have acted elsewhere, so only the owner can settle it.
     code = 'print(sh("printf x >> again.txt").code)'
     with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
         control = workspace("revoked-owner-reconciliation-control")
-        start(control, url, "--net", ok=False)
+        start(control, url, ok=False)
         op = next(r for r in records(journal(control)) if r["kind"] == "intent" and r["tool"] == "sh")["seq"]
     path = workspace("revoked-owner-reconciliation")
     with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, calls):
-        assert start(path, url, "--net", env={"HX_TEST_CRASH_AFTER_RECORD": str(op)}, ok=False).returncode
+        assert start(path, url, env={"HX_TEST_CRASH_AFTER_RECORD": str(op)}, ok=False).returncode
         log = journal(path)
         count = len(calls)
         result = run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY", ok=False)
@@ -820,9 +814,9 @@ def controller_deadlines():
 
 def cli_preflight():
     for index, flags in enumerate([
-        ["--max-wall"], ["--max-wall", "--net"], ["--workspace"], ["--model"],
+        ["--max-wall"], ["--max-wall", "--yolo"], ["--workspace"], ["--model"],
         ["--max-wall", "NaN"], ["--max-wall", "-1"], ["--max-output", "0"], ["--max-cost", "1"],
-        ["--max-toknes", "10"], ["--net", "--no-net"],
+        ["--max-toknes", "10"], ["--net"], ["--no-net"],
         ["--max-wall", "1", "--max-wall", "2"], ["--resume", "absent.jsonl", "--model", "mock"],
         ["--api", "responses"],
     ]):
@@ -843,7 +837,7 @@ def unsupported_run_format():
         saved = records(log)
         manifest = next(r for r in saved if r["kind"] == "manifest")
         content = json.loads((log.parent / "blobs" / manifest["blob"]).read_text())
-        content["format"] = manifest["format"] = 0
+        content["format"] = manifest["format"] = 6
         data = json.dumps(content).encode()
         manifest["blob"] = hashlib.sha256(data).hexdigest()
         (log.parent / "blobs" / manifest["blob"]).write_bytes(data)
@@ -857,7 +851,7 @@ def unsupported_run_format():
         count = len(calls)
         for flag in ("--resume", "--branch"):
             refused = run(path, "run", flag, str(log), ok=False)
-            assert refused.returncode and "unsupported run format 0" in refused.stderr, refused.stderr
+            assert refused.returncode and "unsupported run format 6" in refused.stderr, refused.stderr
             assert len(calls) == count
 
 
@@ -909,7 +903,7 @@ if __name__ == "__main__":
     check("lost responses are charged their reserved tokens; one new request follows", lost_response)
     check("cached reads and writes count toward the total token budget", cached_token_budget)
     check("children's requests run side by side under a cap that fits both", children_run_concurrently)
-    check("sandboxed offline sh settles itself; networked sh waits for the owner", sandboxed_sh_settles)
+    check("interrupted direct shell commands wait for the owner", interrupted_sh_needs_owner)
     check("compaction replaces previous summaries and checkpoints explicit state", compaction_and_recovery)
     check("MCP lost and oversized mutation responses stay uncertain without redispatch", mcp_transport_uncertainty)
     check("control hook failure prevents dispatch", control_hook_error)

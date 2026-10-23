@@ -1,5 +1,5 @@
 //! Native primitives: read, write, edit, sh and search. Every effect goes through
-//! `Effects` and every path through `Policy`; `sh` runs under Seatbelt.
+//! `Effects` and every path through `Policy`; process isolation is supplied externally.
 use crate::effects::{rt, Effects, Ret};
 use crate::policy::Class;
 use anyhow::Result;
@@ -197,7 +197,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
-                let (so, se, status, timed_out, truncated) = shell(&Jail::agent(&pol), &cmd, cwd, secs).await?;
+                let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol), &cmd, cwd, secs).await?;
                 Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None })
             }).await?;
             match ret {
@@ -348,43 +348,32 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
     Ok(Ok((rows, capped)))
 }
 
-/// How a shell command is confined: a Seatbelt profile (None: unconfined) and its environment (None: inherited).
-pub struct Jail {
-    pub profile: Option<String>,
+/// A shell command's environment (None: inherited).
+pub struct ShellEnv {
     pub env: Option<Vec<(String, String)>>,
 }
-impl Jail {
-    /// The agent's `sh`: the run's sandbox, or with --yolo the protected-paths profile.
-    pub fn agent(pol: &crate::policy::Policy) -> Jail {
-        if pol.enabled { Jail { profile: Some(pol.seatbelt_profile()), env: Some(pol.env()) } }
+impl ShellEnv {
+    /// The agent's `sh`: scrub credentials by default and in every autoresearch episode.
+    pub fn agent(pol: &crate::policy::Policy) -> ShellEnv {
+        if pol.enabled { ShellEnv { env: Some(pol.env()) } }
         else if pol.episode.is_some() {
             // An autoresearch episode never hands credentials or its run's location to the agent, even with --yolo.
             let env = std::env::vars().filter(|(k, _)| {
                 let k = k.to_ascii_uppercase();
                 !["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"].iter().any(|w| k.contains(w)) && k != "HX_AR_EPISODE"
             }).collect();
-            Jail { profile: pol.yolo_profile(), env: Some(env) }
+            ShellEnv { env: Some(env) }
         }
-        else { Jail { profile: pol.yolo_profile(), env: None } }
+        else { ShellEnv { env: None } }
     }
 }
 
-/// Run `cmd` with bash inside `jail`: own process group, capped output, killed at `secs`.
+/// Run `cmd` directly with bash: own process group, capped output, killed at `secs`.
 /// -> (stdout, stderr, exit code, timed out, either stream cut to its first and last MAX_CAPTURE / 2 bytes)
-pub async fn shell(jail: &Jail, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool, bool)> {
-    let mut command = match &jail.profile {
-        Some(profile) => {
-            let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
-            c.arg("-p").arg(profile).arg("/bin/bash").arg("-c").arg(cmd);
-            c
-        }
-        None => {
-            let mut c = tokio::process::Command::new("bash");
-            c.arg("-c").arg(cmd);
-            c
-        }
-    };
-    if let Some(env) = &jail.env { command.env_clear().envs(env.iter().cloned()); }
+pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool, bool)> {
+    let mut command = tokio::process::Command::new("bash");
+    command.arg("-c").arg(cmd);
+    if let Some(vars) = &env.env { command.env_clear().envs(vars.iter().cloned()); }
     let nproc_cap = user_process_count() + 300;
     command
         .current_dir(cwd)
@@ -581,7 +570,7 @@ mod receipt_tests {
     async fn shell_receipt_identity_includes_the_command_after_character_2000() {
         let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dir, true, None, None, None).unwrap());
         let path = pol.log.path.clone();
         let prefix = format!(": #{}\n", "x".repeat(2100));
         let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));

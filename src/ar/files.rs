@@ -1,5 +1,5 @@
 //! What crosses an episode's boundary: snapshots of the editable files, the throwaway copies episodes and evaluators
-//! run in, the sandboxed evaluator itself, and the committed tree frozen at launch.
+//! run in, the evaluator itself, and the committed tree frozen at launch.
 use super::*;
 use base64::Engine as _;
 use std::collections::BTreeMap;
@@ -128,20 +128,15 @@ pub(super) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 
 /// Run an evaluator on `files` placed into a fresh copy of the frozen base. Returns (score, valid, se, report).
 /// Failures of the evaluator become invalid results, not errors.
-pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, holdout: bool) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
+pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
     let scratch = Scratch::new("eval")?;
     let tree = scratch.0.join("tree");
     copy_tree(&run.join("base"), &tree)?;
     place(&tree, spec, files)?;
     let tmp = scratch.0.join("tmp");
     std::fs::create_dir(&tmp)?;
-    let mut read = spec.roots(holdout)?;
-    read.push(scratch.0.clone());
-    let jail = crate::prims::Jail {
-        profile: crate::policy::evaluator_profile(&read, std::slice::from_ref(&scratch.0)),
-        env: Some(evaluator_env(&tmp)),
-    };
-    let (stdout, stderr, code, timed_out, _) = crate::prims::shell(&jail, cmd, tree, spec.timeout).await
+    let env = crate::prims::ShellEnv { env: Some(evaluator_env(&tmp)) };
+    let (stdout, stderr, code, timed_out, _) = crate::prims::shell(&env, cmd, tree, spec.timeout).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let stdout = String::from_utf8_lossy(&stdout);
     let tail = |s: &str| s.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>();

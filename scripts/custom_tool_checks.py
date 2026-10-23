@@ -148,7 +148,7 @@ class Tools(unittest.TestCase):
                 content = path.read_bytes()
                 for key in (b"environment-test-key", b"project-test-key", b"user-test-key"):
                     self.assertNotIn(key, content, str(path))
-        out = self.run_code('print(pcall(read,".harness/secrets.toml")); print(#search("project-test-key")); print(sh("cat .harness/secrets.toml").stdout)')
+        out = self.run_code('print(pcall(read,".harness/secrets.toml")); print(#search("project-test-key"))')
         self.assertNotIn("project-test-key", out)
         self.assertIn("credential file", out)
 

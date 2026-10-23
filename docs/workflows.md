@@ -78,7 +78,7 @@ min_delta = 0.05
 
 ### How a search runs
 
-1. **Freeze.** The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it. `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, under a sandbox with no credentials or network. Only the editable paths carry between episodes.
+1. **Freeze.** The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it. `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, with a scrubbed environment; filesystem and network confinement must be supplied externally. Only the editable paths carry between episodes.
 2. **Research.** A research episode writes a brief.
 3. **Workers.** Eight workers (six after a provider rate limit) run side by side. Each derives its own idea from a host seed with [String Seed of Thought](https://pub.sakana.ai/ssot/) and claims it with `ar.claim`, first come, first served, so no two pursue the same core approach. `ar.claims()` lists what is taken; a placeholder claim is refused. Workers implement and fix their idea, then return without tuning it; depth comes from rounds.
 4. **Gate.** The three most promising candidates pass to the next rounds, even raw ones below the seed. Candidates that beat the seed on search and are not worse on `select` are audited for evaluator holes; only those can become results.

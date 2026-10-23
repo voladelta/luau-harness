@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def stop(process):
-    # Sandbox commands have their own process groups; stop descendants too.
+    # Shell commands have their own process groups; stop descendants too.
     rows = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=2).stdout
     children = {}
     for row in rows.splitlines():
@@ -85,8 +85,7 @@ def main():
 
     if not run("release build", ["cargo", "build", "--release", "--quiet"], cap=150):
         return 1
-    # Process-cap tests deliberately spawn hundreds of children: keep them isolated.
-    results = [run("sandbox_checks", ["bash", "scripts/sandbox_checks.sh"], cap=60)]
+    results = [run("policy_checks", ["bash", "scripts/policy_checks.sh"], cap=60)]
     # Mock servers bind free ports and every suite uses its own workspaces, so the rest run independently.
     suites = [("Rust tests", ["cargo", "test", "--release", "--quiet"]),
               ("std unit tests", ["target/release/hx", "test", "stdlib/std"])]

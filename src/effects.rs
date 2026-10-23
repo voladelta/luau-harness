@@ -274,7 +274,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hx-effects-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let pol = Policy::new(&dir, true, None, None, None, None).unwrap();
+        let pol = Policy::new(&dir, true, None, None, None).unwrap();
         (Effects::new(Arc::new(pol), 0, Arc::default()), dir)
     }
 

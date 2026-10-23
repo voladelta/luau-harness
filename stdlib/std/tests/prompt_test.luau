@@ -2,13 +2,13 @@ local prompt = require("std/prompt")
 
 test.case("runtime access is a named section independent of custom prose", function()
 	local custom = "My custom instructions."
-	local text = prompt.sandbox(custom, true, false)
+	local text = prompt.runtime_access(custom, false)
 	test.ok(text:sub(1, #custom) == custom)
 	test.ok(text:find("# Runtime access", 1, true) ~= nil)
-	test.ok(text:find("sh` has network access", 1, true) ~= nil)
-	local offline = prompt.sandbox(custom, false, true)
-	test.ok(offline:find("not available to `sh`", 1, true) ~= nil)
-	test.ok(offline:find("MCP tools listed below work", 1, true) ~= nil)
+	test.ok(text:find("`sh` and local MCP servers run directly", 1, true) ~= nil)
+	local with_mcp = prompt.runtime_access(custom, true)
+	test.ok(text:find("isolation are supplied by the environment", 1, true) ~= nil)
+	test.ok(with_mcp:find("MCP tools listed below work", 1, true) ~= nil)
 end)
 
 test.case("limits in the system prompt come from the values in force", function()
