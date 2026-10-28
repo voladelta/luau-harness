@@ -132,8 +132,12 @@ local function step(s, event, options)
 		end
 		if event.safe_context_rejection and compact.enabled and not s.retried and compact.overflow(event.error) then
 			s.retried = true
-			-- the rejected request bounds the window (in our measure) for this one compaction, which must fit under it
-			return ready(s, "force", event.error, compact.measure(s.anchor, s.messages))
+			-- the rejected request bounds the window (in our measure) for this one compaction, which must fit under it; an
+			-- image rejection of a history with images says nothing about tokens, and its compaction sends the summarizer
+			-- no images
+			local images = compact.image_overflow(event.error) and compact.images(s.messages) > 0
+			local bound = if images then nil else compact.measure(s.anchor, s.messages)
+			return ready(s, "force", event.error, bound)
 		end
 		error(if s.retried then "the model call failed again after one compact-and-retry: " .. event.error else event.error, 0)
 	elseif event.kind == "model_reply" then
@@ -239,17 +243,20 @@ local function step(s, event, options)
 	local force = phase.compact == "force"
 	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" then
 		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)
-		if force or (limit > 0 and total >= limit) then
+		local images_over = compact.images_over(s.messages)
+		if force or images_over or (limit > 0 and total >= limit) then
 			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under its bound
 			local keep = if force then 0 else compact.keep(window, max_output)
 			local reserve = compact.reserve(window)
-			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - reserve)
-			-- under pressure, summarize at least a quarter of the trigger beyond the system prompt and task, so a compaction
-			-- frees real room and cannot recur every turn when they alone sit near the trigger (an overflow takes any cut)
-			if cut and not force and size - compact.fixed(s.anchor, system_chars(s, options), s.messages[1]) < limit / 4 then cut = nil end
+			local cut, size = compact.find_cut(s.messages, keep, s.anchor.scale, total, window - reserve, compact.image_floor(s.messages))
+			-- under token pressure, summarize at least a quarter of the trigger beyond the system prompt and task, so a
+			-- compaction frees real room and cannot recur every turn when they alone sit near the trigger (an overflow or an
+			-- image budget takes any cut: the floor already halves the images)
+			if cut and not force and not images_over and size - compact.fixed(s.anchor, system_chars(s, options), s.messages[1]) < limit / 4 then cut = nil end
 			if cut then
 				s.phase = { kind = "compact", cut = cut, size = size, overflow = phase.overflow }
-				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut, reserve), purpose = "compact" }
+				local no_images = phase.overflow ~= nil and compact.image_overflow(phase.overflow)
+				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut, reserve, no_images), purpose = "compact" }
 			end
 		end
 	end

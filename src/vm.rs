@@ -562,7 +562,7 @@ impl Vm {
         hx.set("view_image", lua.create_async_function(move |lua, (path, max): (String, Option<u32>)| {
             let vfx = vfx.clone();
             async move {
-                let max = max.unwrap_or(1024).clamp(64, 2048);
+                let max = max.unwrap_or(1024).clamp(64, 2000);
                 let pol = vfx.pol.clone();
                 let mut live: Option<crate::prims::ViewImage> = None;
                 vfx.run_sync(&lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), |_| {

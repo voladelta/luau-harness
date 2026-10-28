@@ -493,8 +493,9 @@ fn render(message: &Value) -> Result<String> {
             text.push_str(&serde_json::to_string(&call["input"])?);
         }
     }
-    if message["images"].as_array().is_some_and(|a| !a.is_empty()) {
-        text.push_str("\n[media omitted]\n");
+    for image in message["images"].as_array().into_iter().flatten() {
+        let dim = |k: &str| image[k].as_u64().map_or("?".to_string(), |n| n.to_string());
+        text.push_str(&format!("\n[image {} {}x{} not kept; view() it again to look]\n", image["path"].as_str().unwrap_or("?"), dim("width"), dim("height")));
     }
     Ok(text)
 }
@@ -770,8 +771,8 @@ mod tests {
                 .is_err()
         );
         let public=render(&json!({"content":[{"type":"text","text":"visible"},{"type":"image","data":"SECRET"}],
-            "raw":"PRIVATE","images":[{"data":"SECRET"}],"calls":[{"name":"luau","id":"c","input":{"code":"print(42)"}}]})).unwrap();
-        assert!(public.contains("visible") && public.contains("print(42)"));
+            "raw":"PRIVATE","images":[{"data":"SECRET","path":"f.png","width":10,"height":5}],"calls":[{"name":"luau","id":"c","input":{"code":"print(42)"}}]})).unwrap();
+        assert!(public.contains("visible") && public.contains("print(42)") && public.contains("[image f.png 10x5 not kept"));
         assert!(!public.contains("PRIVATE") && !public.contains("SECRET"));
         for q in [
             json!({"q":""}),

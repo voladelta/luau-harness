@@ -34,6 +34,8 @@ check "the prompt documents view()" "$(tail -1 $T/req.jsonl | grep -c 'view(path
 check "without the pack: no view, no prompt line" "$(tail -1 $T/req.jsonl | grep -c 'view(path')" "0"
 check "without the pack: no images sent" "$(img_parts)" "0"
 check "event log has no pixels anywhere" "$(cat $W/.harness/log/*.jsonl | grep -c 'iVBORw0KGgo')" "0"
+ffmpeg -v error -f rawvideo -pix_fmt rgb24 -s 2000x2000 -i /dev/urandom -frames:v 1 $W/noise.png  # ~16 MB of base64
+check "one turn takes at most half the image byte budget" "$($H exec --workspace $W --pack std/vision 'print(pcall(view, "noise.png", {max = 2000}))' 2>&1 | grep -c 'over the 8 MB')" "1"
 check "at most 4 images per turn across calls" "$($H exec --workspace $W --pack std/vision 'view({"frame.png","frame.png","frame.png"})' 'print(pcall(view, {"frame.png","frame.png"}))' 2>&1 | grep -c 'per turn')" "1"
 
 # Completed recovery returns the saved report and captured conversation; it does not reread old images.
@@ -45,4 +47,32 @@ check "completed image run resumes without another model call" "$rc $([ "$before
 ffmpeg -v error -y -f lavfi -i testsrc=size=800x600 -frames:v 1 $W/frame.png
 resume tr3.txt; rc=$?
 check "changed original image does not alter committed history" "$rc $([ "$before" = "$(wc -l < $T/req.jsonl | tr -d ' ')" ] && echo no-call)" "0 no-call"
+
+# Image budget: passing it compacts; the summarizer sees the older image, the next request keeps only the newest.
+kill $M 2>/dev/null
+nth_imgs() { python3 -c "
+import json
+b=[json.loads(x) for x in open('$T/$1')][$2]
+print(sum(1 for m in b['input'] if isinstance(m.get('content'),list) for p in m['content'] if p.get('type')=='input_image'))"; }
+nth_has() { python3 -c "
+import json
+print(int('$3' in json.dumps([json.loads(x) for x in open('$T/$1')][$2])))"; }
+VIEW='```luau\nview(\"frame.png\")\n```'
+budget_run() {  # replies log init-lines
+    W2=$T/$2; rm -rf $W2; mkdir -p $W2/.harness; cp $W/frame.png $W2/
+    printf 'require("std/recheck").enabled = false\n%s\n' "$3" > $W2/.harness/init.luau
+    MOCK_REPLIES="$1" MOCK_LOG=$T/$2.jsonl serve MP python3 scripts/mock_llm.py 0 || exit 1; M=$SERVED
+    run $W2 --pack std/vision >/dev/null; echo $? > $T/$2.rc; kill $M 2>/dev/null
+}
+budget_run "[\"$VIEW\",\"$VIEW\",\"SUM\",\"done\"]" budget 'require("std/compact").max_image_bytes = 1'
+check "budget: run finishes" "$(cat $T/budget.rc)" "0"
+check "budget: the summarizer sees the older image" "$(nth_imgs budget.jsonl 2)" "1"
+check "budget: the summarizer is told images are not kept" "$(nth_has budget.jsonl 2 'not kept after this checkpoint')" "1"
+check "budget: the next request carries only the newest image" "$(nth_imgs budget.jsonl 3) $(nth_has budget.jsonl 3 'compaction-summary')" "1 1"
+
+# An image rejection (413) compacts without a token bound; the summarizer gets placeholders, then the agent retries.
+budget_run "[\"$VIEW\",\"$VIEW\",{\"status\":413,\"error\":\"Payload Too Large\"},\"SUM\",\"done\"]" reject ''
+check "413: run finishes after compact-and-retry" "$(cat $T/reject.rc)" "0"
+check "413: the summarizer gets no images, only placeholders" "$(nth_imgs reject.jsonl 3) $(nth_has reject.jsonl 3 '[image frame.png 800x600 not shown')" "0 1"
+check "413: the retry carries the newest image" "$(nth_imgs reject.jsonl 4) $(nth_has reject.jsonl 4 'compaction-summary')" "1 1"
 echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

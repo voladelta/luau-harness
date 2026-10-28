@@ -92,6 +92,67 @@ test.case("estimate counts the raw provider message (with its reasoning) instead
 	plain.raw = string.rep("r", 4000) -- reasoning echoed back each turn
 	test.eq(compact.estimate(plain), 1000)
 	test.eq(compact.estimate({ role = "user", content = "abcd", images = { {}, {} } }), 1 + 2 * 1200)
+	test.eq(compact.estimate({ role = "user", content = "abcd", images = { { width = 1024, height = 576 } } }), 1 + 787)
+	test.eq(compact.image_tokens({ width = 2000, height = 2000 }), 1600) -- providers downscale large images
+end)
+
+local function shot(path, bytes) return { mime = "image/png", data = string.rep("A", bytes), path = path, width = 10, height = 10 } end
+local function seen(bytes, n)
+	local images = {}
+	for i = 1, n or 1 do table.insert(images, shot("f" .. i .. ".png", bytes)) end
+	return { role = "user", content = "Images from view()", images = images }
+end
+
+test.case("the image budget counts images and their base64 bytes", function()
+	local max_images, max_bytes = compact.max_images, compact.max_image_bytes
+	compact.max_images, compact.max_image_bytes = 4, 1000
+	test.eq(compact.images_over({ user("task"), seen(500, 2) }), false)
+	test.eq(compact.images_over({ user("task"), seen(500, 2), seen(1) }), true) -- 1001 bytes
+	test.eq(compact.images_over({ user("task"), seen(1, 5) }), true) -- 5 images
+	compact.max_images, compact.max_image_bytes = max_images, max_bytes
+end)
+
+test.case("image_floor keeps at most half the image budget, never less than the newest exchange", function()
+	local max_images, max_bytes = compact.max_images, compact.max_image_bytes
+	compact.max_images, compact.max_image_bytes = 10, 1000
+	local m = { user("task"), asst("x", "a"), tool("a", "ok"), seen(300), asst("x", "b"), tool("b", "ok"), seen(300),
+		asst("x", "c"), tool("c", "ok"), seen(300) }
+	test.eq(compact.image_floor(m), 8) -- two images (600) pass half the budget: keep from "c"
+	test.eq(compact.find_cut(m, 100000, 1, 1000, 1000, compact.image_floor(m)), 8) -- the floor wins over a large keep
+	compact.max_image_bytes = 10000
+	test.eq(compact.image_floor(m), 1) -- all fit
+	compact.max_image_bytes = 100
+	test.eq(compact.image_floor(m), 8) -- the newest image alone is over: still keep the newest exchange
+	compact.max_images, compact.max_image_bytes = max_images, max_bytes
+end)
+
+test.case("the summarizer gets the images, or placeholders after an image rejection", function()
+	local m = { user("task"), asst("x", "a"), tool("a", "ok"), seen(4), asst("x", "b"), tool("b", "ok") }
+	local req = compact.request("SYS", {}, m, 5, 16384)
+	test.eq(#req.messages[4].images, 1)
+	test.ok(req.messages[5].content:find("not kept after this checkpoint", 1, true), "image rule added")
+	local plain = compact.request("SYS", {}, { user("task"), asst("x", "a"), tool("a", "ok"), asst("x", "b") }, 4, 16384)
+	test.ok(not plain.messages[4].content:find("not kept after this checkpoint", 1, true), "no image rule without images")
+	local stripped = compact.request("SYS", {}, m, 5, 16384, true)
+	test.eq(stripped.messages[4].images, nil)
+	test.ok(stripped.messages[4].content:find("[image f1.png 10x10 not shown; view() it again to look]", 1, true), "placeholder")
+	test.ok(not stripped.messages[5].content:find("not kept after this checkpoint", 1, true), "no image rule for unseen images")
+	test.eq(#m[4].images, 1) -- the history itself is unchanged
+end)
+
+test.case("a summary that removes images is accepted even when longer", function()
+	local m = { user("task"), asst("x", "a"), tool("a", "ok"), seen(4), asst("x", "b"), tool("b", "ok") }
+	test.ok(compact.accept({ text = string.rep("s", 5000) }, "TASK", m, 5, false) ~= nil, "images removed")
+	m[4].images = nil
+	test.eq(select(2, compact.accept({ text = string.rep("s", 5000) }, "TASK", m, 5, false)), "not smaller")
+end)
+
+test.case("image-limit rejections count as overflow", function()
+	test.ok(compact.overflow("API 413 Payload Too Large"))
+	test.ok(compact.image_overflow("API 400 Too many images in request. Maximum is 100"))
+	test.ok(compact.overflow("API 400 maximum context length is 128000 tokens"))
+	test.ok(not compact.image_overflow("API 400 maximum context length is 128000 tokens"))
+	test.ok(not compact.overflow("API 400 invalid model"))
 end)
 
 test.case("anchor calibrates on the provider count; measure adds later messages at that scale", function()
