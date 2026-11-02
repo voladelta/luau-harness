@@ -25,14 +25,14 @@ Every command takes `--help`.
 
 Supply one quoted positional prompt or `--prompt-file`, with flags before or after the prompt. Use `--` before a literal prompt starting with `--`. `--branch` inherits its task unless a new prompt is supplied; `--resume` restores its saved task, approval mode, autopilot setting and path grants, without repeated launch flags. `--yes` is also accepted by `hx exec`.
 
-The workspace, private temp directory and configured file-tool roots need no confirmation. Other paths ask for a temporary grant; recognized external commands, HTTP actions and MCP tools ask unless pre-approved. No controlling terminal means refusal. `--yes` grants ordinary requests automatically while retaining protected paths, credential-read restrictions, capabilities, budgets and the scrubbed environment. It does not answer manual workflow review gates or reconcile uncertain operations. Shell commands run directly under your external sandbox. The former `--yolo` option has been removed.
+The workspace, private temp directory and configured file-tool roots need no confirmation. Other paths ask for a temporary grant; recognized external commands, HTTP actions and MCP tools ask unless pre-approved. No controlling terminal means refusal. `--yes` grants ordinary requests automatically, never an irreversible command (force push, `rm -rf ~`, `mkfs`, `dd`), while retaining protected paths, credential-read restrictions, capabilities, budgets and the scrubbed environment. It does not answer manual workflow review gates or reconcile uncertain operations. Shell commands run directly under your external sandbox. The former `--yolo` option has been removed.
 
 hx always uses the Responses API. Requests go to `/responses` under the configured base URL.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--prompt-file F` | | Read the task from a file instead of a positional prompt |
-| `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run |
+| `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run; irreversible commands still need an exact `allow` entry or a terminal answer |
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
 | `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs a prompt or `--prompt-file` (the program); runs until progress stops |
@@ -74,7 +74,7 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Runs created before per-run approvals were introduced use an older journal format; start a new run with this version.
+Runs created before per-run approvals, or before shell outcomes recorded their approval source, use an older journal format; start a new run with this version.
 
 Interrupted local `write`/`edit` settle themselves from the evidence. Interrupted shell commands require owner reconciliation. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
 

@@ -243,6 +243,9 @@ impl Books {
         match kind {
             "model_intent" => anyhow::ensure!(r["reserved_tokens"].as_u64().is_some(), "missing reservation tokens"),
             "billing" => anyhow::ensure!(r["tokens"].as_u64().is_some(), "billing record missing tokens"),
+            // Every shell command that ran says who approved it.
+            "outcome" if r["ret"]["t"] == "sh" => anyhow::ensure!(
+                r["approval"].as_str().is_some_and(|a| crate::policy::APPROVAL_SOURCES.contains(&a)), "sh outcome record missing its approval source"),
             _ => {},
         }
         Ok(())

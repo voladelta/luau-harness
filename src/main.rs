@@ -126,7 +126,7 @@ const FLAGS: &[Flag] = {
     &[
         flag(&[], "--workspace", Text, "DIR", "workspace root (default: .)"),
         flag(&[], "--approval", Text, "MODE", "prompt (default) or deny: handle requests outside standing permissions"),
-        flag(&["run", "exec"], "--yes", Switch, "", "autopilot: approve ordinary path and tool requests for this run without asking"),
+        flag(&["run", "exec"], "--yes", Switch, "", "autopilot: approve ordinary path and tool requests for this run without asking (never irreversible commands)"),
         flag(&["run", "exec"], "--pack", Text, "A,B", "extra packs: std/authoring (agent-written tools), std/vision (view() shows images)"),
         flag(RUN, "--resume", Text, "LOG", "restore frozen settings and checkpoint into a fresh VM; do not repeat flags"),
         flag(RUN, "--branch", Text, "LOG", "start a new run with current approved configuration and inherited durable data"),

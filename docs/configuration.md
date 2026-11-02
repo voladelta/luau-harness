@@ -22,7 +22,7 @@ write = ["/extra/write/root"]   # extra write roots
 [approval]
 mode = "prompt"                 # default; "deny" refuses missing permissions without asking
 ask = ["terraform apply"]       # extra command substrings that need approval
-allow = ["git push origin"]     # pre-approved (substring; irreversible commands need an exact match)
+allow = ["git push origin"]     # pre-approved (substring of each external command; irreversible ones need an exact match)
 
 [budget]
 max_tokens = 600000
@@ -34,7 +34,9 @@ enable = []
 
 The workspace, private temp directory and `[fs]` roots are standing file-tool permissions. With `mode = "prompt"`, other file-tool paths ask on the owner's controlling terminal. A write grant covers the requested file's parent directory and its descendants, with read access; a read grant covers the requested file, or the subtree when a directory is requested. Home has no implicit grant. Refusal or a missing terminal leaves the operation unexecuted. Grants are shared by descendants and journaled for resume, and a new run starts with fresh grants.
 
-`hx run "TASK" --yes` automatically approves ordinary missing path permissions and external actions for one run. It overrides the configured approval mode, changes no configuration files and keeps the same scrubbed child environment. Protected configuration, sealed owner state, credential-read restrictions, symlink-write checks, capabilities and budgets still apply. Use `--approval deny` for strict refusal or `--approval prompt` to override the file; neither flag combines with `--yes`. Explicit manual workflow reviews and uncertain-operation reconciliation still need owner decisions.
+Shell commands are classed on their shell words, not substrings: each simple command of a pipeline or list (and the body of `$(...)`, backticks and `bash -c`) is classed read / local write / external / irreversible, and the command takes the highest class. A `git push` with `--force`, `--force-with-lease`, `-f`, `--delete`, `--mirror` or a `+`/`:` refspec anywhere in its arguments, `rm -r` of `/`, `~` or `$HOME`, `mkfs` and `dd` are irreversible. An `allow` entry must cover each external command in a chain, so `allow = ["git push origin"]` does not approve `git push origin main && curl -X POST ...`. The classifier decides when to ask; it is approval UX, not a guard. The journal records who approved each shell command (`approval` on its outcome: `not-required`, `policy-allow`, `auto` or `prompt`).
+
+`hx run "TASK" --yes` automatically approves ordinary missing path permissions and external actions for one run. It never approves an irreversible command: that still needs an exact `allow` entry or the owner's answer on the terminal, and is refused without one. It overrides the configured approval mode, changes no configuration files and keeps the same scrubbed child environment. Protected configuration, sealed owner state, credential-read restrictions, symlink-write checks, capabilities and budgets still apply. Use `--approval deny` for strict refusal or `--approval prompt` to override the file; neither flag combines with `--yes`. Explicit manual workflow reviews and uncertain-operation reconciliation still need owner decisions.
 
 Budgets are admission thresholds: each request reserves its upper bound in tokens (request bytes plus the output cap), and the deadline is absolute, so downtime counts. There is no dollar budget; an unknown key such as `max_cost` is an error. `hx run` flags override these values for a new run.
 

@@ -45,7 +45,8 @@ fn is_unknown(error: &mlua::Error) -> bool {
 pub enum Ret {
     Num(f64),
     Str(String),
-    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, truncated: bool, operation_id: Option<u64> },
+    /// `approval` is who approved the command (`Policy::approve`); the outcome record carries it.
+    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, truncated: bool, operation_id: Option<u64>, approval: &'static str },
     Rows { rows: Vec<(String, i64, String)>, truncated: bool },
     SearchErr { kind: String, message: String, hint: String },
     Agent { answer: String, finished: bool, turns: u64 },
@@ -150,6 +151,7 @@ impl Effects {
         r["ok"] = json!(res.is_ok());
         r["ms"] = json!(ms);
         r["ret"] = ret.to_json(self.log()).map_err(|e| rt(e.to_string()))?;
+        if let Ret::Sh { approval, .. } = &ret { r["approval"] = json!(approval); }
         self.supervisor.workflow_effect_metadata(tool, &mut r).map_err(mlua::Error::external)?;
         if let Ret::Err(m) = &ret {
             r["detail"] = json!({"error": m.chars().take(300).collect::<String>()});

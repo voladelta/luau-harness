@@ -202,7 +202,7 @@ class Approvals(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[0], "0", result.stdout)
 
     def test_external_command_approval_and_yes(self):
-        code = 'print(sh("echo approved # git push").stdout)'
+        code = 'print(sh("echo approved || git push").stdout)'  # git push is classed external but never runs
         status, out = terminal(self.command(code), ["y"])
         self.assertEqual(status, 0, out)
         self.assertEqual(out.count("[approval needed]"), 1, out)

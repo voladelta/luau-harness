@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-// Approval policy and temporary grants are frozen under this format.
-pub const FORMAT: u64 = 8;
+// Approval policy and temporary grants are frozen under this format; shell outcomes carry their approval source.
+pub const FORMAT: u64 = 9;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

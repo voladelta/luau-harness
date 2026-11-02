@@ -198,19 +198,17 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             let class = pol.classify_sh(&cmd);
             let args = json!({"cmd": &cmd, "cwd": opt_str(&opts, "cwd"), "timeout": opt_num(&opts, "timeout")});
             let ret = f.run(&lua, crate::supervisor::Tool::Sh, class, args, || async {
-                if let Err(why) = pol.approve(&cmd, class).await {
-                    return Err(rt(format!("approval_required: {why}")));
-                }
+                let approval = pol.approve(&cmd, class).await.map_err(|why| rt(format!("approval_required: {why}")))?;
                 let secs = opt_num(&opts, "timeout").unwrap_or(SH_TIMEOUT).clamp(1.0, SH_TIMEOUT_MAX);
                 let cwd = match opt_str(&opts, "cwd") {
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
                 let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol), &cmd, cwd, secs).await?;
-                Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None })
+                Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None, approval })
             }).await?;
             match ret {
-                Ret::Sh { stdout, stderr, code, timed_out, truncated, operation_id } => {
+                Ret::Sh { stdout, stderr, code, timed_out, truncated, operation_id, .. } => {
                     let t = lua.create_table()?;
                     t.set("stdout", lua.create_string(&stdout)?)?;
                     t.set("stderr", lua.create_string(&stderr)?)?;
@@ -590,6 +588,8 @@ mod receipt_tests {
         let intents: Vec<_> = records.iter().filter(|r| r["kind"] == "intent" && r["tool"] == "sh").collect();
         assert_eq!(intents.len(), 2);
         assert_ne!(intents[0]["args_sha"], intents[1]["args_sha"], "full command suffix participates in operation identity");
+        let outcomes: Vec<_> = records.iter().filter(|r| r["kind"] == "outcome" && r["ret"]["t"] == "sh").collect();
+        assert!(outcomes.len() == 2 && outcomes.iter().all(|r| r["approval"] == "not-required"), "each shell outcome records who approved it");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
