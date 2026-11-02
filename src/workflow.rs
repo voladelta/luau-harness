@@ -16,13 +16,15 @@ pub struct WorkflowConfig {
     pub mode: String,
     pub max_repairs: u8,
 }
+/// Repair cycles an RPI run may spend after failed verification. The frozen workflow config carries it to std/rpi.
+pub const MAX_REPAIRS: u8 = 3;
 impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
             name: "rpi".into(),
             version: 1,
             mode: "auto".into(),
-            max_repairs: 3,
+            max_repairs: MAX_REPAIRS,
         }
     }
 }
@@ -36,7 +38,7 @@ impl WorkflowConfig {
             matches!(self.mode.as_str(), "auto" | "manual"),
             "workflow mode must be auto or manual"
         );
-        ensure!(self.max_repairs <= 3, "workflow repair limit exceeds three");
+        ensure!(self.max_repairs <= MAX_REPAIRS, "workflow repair limit exceeds {MAX_REPAIRS}");
         Ok(())
     }
 }

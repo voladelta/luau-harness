@@ -17,6 +17,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use crate::supervisor::Capabilities;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -49,13 +50,22 @@ pub const EMBEDDED: &[(&str, &str, &str)] = &[
     ("std", "system.md", include_str!("../prompts/system.md")),
 ];
 
+/// A package's `hx.toml`. Unknown tables and unknown capabilities are load errors, so a typo cannot silently grant
+/// nothing (or less than intended).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub package: PackageInfo,
     #[serde(default)]
-    pub capabilities: BTreeMap<String, Vec<String>>,
+    pub capabilities: Capabilities,
     #[serde(default)]
     pub tool: ToolInfo,
+    /// `[exports]` and `[tests]`: written by older `promote()` manifests and read by nothing (the module is `init.luau`,
+    /// tests are `tests/*.luau`). Accepted so approved packages keep loading.
+    #[serde(default, rename = "exports")]
+    _exports: Option<toml::Table>,
+    #[serde(default, rename = "tests")]
+    _tests: Option<toml::Table>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -115,7 +125,7 @@ pub struct Source {
     /// true when this came from `.harness/override/` (the caller falls back to the built-in module if it is broken)
     pub is_override: bool,
     /// project packages: (name, capabilities) so the loader can run the code with only those primitives
-    pub pkg: Option<(String, BTreeMap<String, Vec<String>>)>,
+    pub pkg: Option<(String, Capabilities)>,
 }
 
 /// An immutable, approved byte snapshot. Runtime resolution never goes back to mutable workspace files.
@@ -128,7 +138,7 @@ pub struct Registry {
     pub sources: BTreeMap<String, Source>,
     pub assets: BTreeMap<String, Vec<u8>>,
     pub packages: Vec<PkgInfo>,
-    pub capabilities: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    pub capabilities: BTreeMap<String, Capabilities>,
     pub mcp: BTreeMap<String, crate::mcp::ServerCfg>,
     pub rejected: BTreeMap<String, String>,
 }
@@ -863,6 +873,17 @@ mod tests {
     }
 
     #[test]
+    fn a_misspelt_capability_or_table_is_a_load_error() {
+        let parse = |text: &str| toml::from_str::<Manifest>(text).map_err(|e| e.to_string());
+        assert!(parse("[package]\nversion = \"1\"\n[capabilities]\nfs = [\"read\"]\nllm = [\"*\"]\n").unwrap().capabilities.contains(crate::supervisor::Capability::LlmChat));
+        assert!(parse("[package]\nversion = \"1\"\n[capabilities]\nfs = [\"raed\"]\n").unwrap_err().contains("unknown capability fs.raed"));
+        assert!(parse("[package]\nversion = \"1\"\n[capabilities]\nprocess = [\"sh\"]\n").unwrap_err().contains("unknown capability process.sh"));
+        assert!(parse("[package]\nversion = \"1\"\n[capabilites]\nfs = [\"read\"]\n").is_err());
+        // Older generated manifests carry [exports] and [tests]; they still load.
+        assert!(parse("[package]\nversion = \"1\"\n[exports]\nmodule = \"init.luau\"\n[tests]\nfiles = [\"tests/*.luau\"]\n").is_ok());
+    }
+
+    #[test]
     fn approve_keeps_other_entries_and_rejects_unknown_names() {
         let root = ws("approve");
         install_pkg(&root, "foo");
@@ -912,7 +933,7 @@ mod tests {
         let source = registry.resolve("std/printer").unwrap();
         assert!(source.is_override && source.text == "return {}\n");
         assert!(!registry.resolve("base:std/printer").unwrap().is_override);
-        assert_eq!(registry.resolve("foo").unwrap().pkg.unwrap().1["fs"], vec!["read"]);
+        assert_eq!(registry.resolve("foo").unwrap().pkg.unwrap().1, crate::supervisor::Capabilities::from([crate::supervisor::Capability::FsRead]));
         assert!(err(registry.resolve("foo/missing")).contains("module not found"));
         write(root.join(".harness/override/std/printer.luau"), "return {changed=true}\n");
         assert_eq!(registry.resolve("std/printer").unwrap().text, "return {}\n");

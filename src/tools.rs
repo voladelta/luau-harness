@@ -1,5 +1,5 @@
 //! Single-file, workspace-trusted tools. Definitions and endpoint grants are frozen; secrets never are.
-use crate::{effects::{Effects, Ret}, modules::{Registry, Source}, policy::Class, supervisor::Tool, values};
+use crate::{effects::{Effects, Ret}, modules::{Registry, Source}, policy::Class, supervisor::{Capabilities, Capability, Tool}, values};
 use anyhow::{Context, Result, ensure};
 use mlua::{Function, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ pub struct Method { pub signature: String, pub description: String }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Definition {
     pub http: BTreeMap<String, Endpoint>,
-    pub capabilities: BTreeMap<String, Vec<String>>,
+    pub capabilities: Capabilities,
     pub tools: BTreeMap<String, Method>,
 }
 
@@ -152,11 +152,10 @@ pub fn install_codecs(lua: &Lua) -> mlua::Result<()> {
 pub fn definition(table: &Table) -> Result<Definition> {
     fields(table, &["http", "capabilities", "tools"])?;
     let http: BTreeMap<String, Endpoint> = data(table, "http")?;
-    let mut capabilities: BTreeMap<String, Vec<String>> = data(table, "capabilities")?;
-    for (cap, scopes) in &capabilities {
-        for scope in scopes {
-            ensure!(matches!((cap.as_str(), scope.as_str()), ("fs", "read" | "write") | ("proc", "sh") | ("llm", "agent" | "chat")), "unsupported tool capability {cap}.{scope}");
-        }
+    let mut capabilities: Capabilities = data(table, "capabilities")?;
+    // `http.request` comes with declared endpoints, and MCP is the agent's own; a tool cannot request either.
+    if let Some(cap) = capabilities.0.iter().find(|c| matches!(c, Capability::HttpRequest | Capability::McpCall)) {
+        anyhow::bail!("unsupported tool capability {cap}");
     }
     for (name, endpoint) in &http {
         ensure!(identifier(name), "invalid endpoint name {name:?}");
@@ -168,7 +167,7 @@ pub fn definition(table: &Table) -> Result<Definition> {
             ensure!(base.scheme() == "https" || matches!(base.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "authenticated endpoints require HTTPS (except loopback)");
         }
     }
-    if !http.is_empty() { capabilities.insert("http".into(), vec!["request".into()]); }
+    if !http.is_empty() { capabilities.0.insert(Capability::HttpRequest); }
     let methods: Table = table.get("tools")?;
     ensure!(methods.metatable().is_none(), "tools must be a plain table");
     let mut tools = BTreeMap::new();
@@ -187,13 +186,20 @@ pub fn definition(table: &Table) -> Result<Definition> {
     Ok(Definition { http, capabilities, tools })
 }
 
+/// Registration (`inspect`) runs a tool file under these: CPU seconds and memory.
+pub(crate) const REGISTER_SECS: u64 = 1;
+pub(crate) const REGISTER_MEMORY: usize = 16 << 20;
+/// An HTTP tool request's timeout (seconds) and largest response body.
+pub(crate) const HTTP_TIMEOUT_SECS: u64 = 120;
+pub(crate) const HTTP_MAX_BODY: usize = 8 << 20;
+
 fn inspect(text: &str) -> Result<Definition> {
     let lua = Lua::new();
     for key in ["_G", "os", "coroutine", "getfenv", "setfenv", "loadstring", "require", "print"] { lua.globals().set(key, Value::Nil)?; }
     let math: Table = lua.globals().get("math")?;
     math.set("random", Value::Nil)?; math.set("randomseed", Value::Nil)?;
-    lua.set_memory_limit(16 << 20)?;
-    let deadline = Instant::now() + Duration::from_secs(1);
+    lua.set_memory_limit(REGISTER_MEMORY)?;
+    let deadline = Instant::now() + Duration::from_secs(REGISTER_SECS);
     lua.set_interrupt(move |_| {
         if Instant::now() >= deadline { return Err(mlua::Error::runtime("tool registration time budget exceeded")); }
         Ok(mlua::VmState::Continue)
@@ -284,7 +290,7 @@ pub fn exports(lua: &Lua, table: Table, expected: &Definition) -> mlua::Result<T
 }
 
 pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definition) -> mlua::Result<()> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).user_agent(concat!("hx/", env!("CARGO_PKG_VERSION"))).redirect(reqwest::redirect::Policy::none())
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(HTTP_TIMEOUT_SECS)).user_agent(concat!("hx/", env!("CARGO_PKG_VERSION"))).redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never()).build().map_err(mlua::Error::external)?;
     lua.globals().set("http", lua.create_async_function(move |lua, (endpoint, args): (String, Value)| {
         let (fx, client, namespace, def) = (fx.clone(), client.clone(), namespace.clone(), def.clone());
@@ -318,7 +324,7 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
                 let status = response.status();
                 let mut body = Vec::new();
                 while let Some(chunk) = response.chunk().await.map_err(|_| unusable(class, "HTTP response interrupted"))? {
-                    if body.len() + chunk.len() > 8 << 20 { return Err(unusable(class, "HTTP response exceeds 8 MiB")); }
+                    if body.len() + chunk.len() > HTTP_MAX_BODY { return Err(unusable(class, format!("HTTP response exceeds {} MiB", HTTP_MAX_BODY >> 20))); }
                     body.extend_from_slice(&chunk);
                 }
                 let text = String::from_utf8_lossy(&body);

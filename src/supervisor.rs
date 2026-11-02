@@ -141,31 +141,97 @@ impl Tool {
         }
     }
 
-    fn capability(self) -> (&'static str, &'static str) {
+    fn capability(self) -> Capability {
         match self {
-            Self::Read | Self::Search | Self::History | Self::View => ("fs", "read"),
-            Self::Write | Self::Edit | Self::Promote | Self::ProposeModule => ("fs", "write"),
-            Self::Sh => ("proc", "sh"),
-            Self::Agent => ("llm", "agent"),
-            Self::McpList | Self::McpCall => ("mcp", "call"),
-            Self::Http => ("http", "request"),
-            Self::Llm => ("llm", "chat"),
+            Self::Read | Self::Search | Self::History | Self::View => Capability::FsRead,
+            Self::Write | Self::Edit | Self::Promote | Self::ProposeModule => Capability::FsWrite,
+            Self::Sh => Capability::ProcSh,
+            Self::Agent => Capability::LlmAgent,
+            Self::McpList | Self::McpCall => Capability::McpCall,
+            Self::Http => Capability::HttpRequest,
+            Self::Llm => Capability::LlmChat,
         }
+    }
+}
+
+/// Everything a principal can be granted: the capability each `Tool` needs. Package manifests and tools request them
+/// as `{fs = ["read"], proc = ["sh"]}` (`*` for every scope of one); an unknown one is a load error, never a no-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Capability { FsRead, FsWrite, ProcSh, LlmAgent, LlmChat, McpCall, HttpRequest }
+
+impl Capability {
+    pub const ALL: [Self; 7] = [Self::FsRead, Self::FsWrite, Self::ProcSh, Self::LlmAgent, Self::LlmChat, Self::McpCall, Self::HttpRequest];
+
+    /// The (capability, scope) pair manifests write.
+    pub fn parts(self) -> (&'static str, &'static str) {
+        match self {
+            Self::FsRead => ("fs", "read"), Self::FsWrite => ("fs", "write"), Self::ProcSh => ("proc", "sh"),
+            Self::LlmAgent => ("llm", "agent"), Self::LlmChat => ("llm", "chat"), Self::McpCall => ("mcp", "call"),
+            Self::HttpRequest => ("http", "request"),
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { let (c, s) = self.parts(); write!(f, "{c}.{s}") }
+}
+
+/// A set of capabilities, written as a map from capability to scopes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Capabilities(pub std::collections::BTreeSet<Capability>);
+
+impl Capabilities {
+    pub fn contains(&self, c: Capability) -> bool { self.0.contains(&c) }
+
+    pub fn from_map(map: &BTreeMap<String, Vec<String>>) -> Result<Self> {
+        let mut out = std::collections::BTreeSet::new();
+        for (cap, scopes) in map {
+            for scope in scopes {
+                let found: Vec<_> = Capability::ALL.into_iter().filter(|c| c.parts().0 == cap && (scope == "*" || c.parts().1 == scope)).collect();
+                anyhow::ensure!(!found.is_empty(), "unknown capability {cap}.{scope} (known: {})",
+                    Capability::ALL.map(|c| c.to_string()).join(", "));
+                out.extend(found);
+            }
+        }
+        Ok(Self(out))
+    }
+
+    pub fn to_map(&self) -> BTreeMap<&'static str, Vec<&'static str>> {
+        let mut map: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for c in &self.0 { let (cap, scope) = c.parts(); map.entry(cap).or_default().push(scope); }
+        map
+    }
+}
+
+impl<const N: usize> From<[Capability; N]> for Capabilities {
+    fn from(caps: [Capability; N]) -> Self { Self(caps.into_iter().collect()) }
+}
+
+impl Serialize for Capabilities {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> { self.to_map().serialize(s) }
+}
+
+impl<'de> Deserialize<'de> for Capabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Self::from_map(&BTreeMap::deserialize(d)?).map_err(serde::de::Error::custom)
     }
 }
 
 #[derive(Clone)]
 pub enum Principal {
     Agent { read_only: bool },
-    Package { name: String, caps: BTreeMap<String, Vec<String>>, active: Arc<AtomicBool> },
+    Package { name: String, caps: Capabilities, active: Arc<AtomicBool> },
 }
+
+/// What a read-only principal (a batch's subagent) keeps.
+const READ_ONLY: [Capability; 3] = [Capability::FsRead, Capability::LlmAgent, Capability::LlmChat];
 
 impl Principal {
     pub fn name(&self) -> &str { match self { Self::Agent { read_only: false } => "agent", Self::Agent { read_only: true } => "read-only agent", Self::Package { name, .. } => name } }
-    pub(crate) fn allows(&self, cap: &str, scope: &str) -> bool {
+    pub(crate) fn allows(&self, cap: Capability) -> bool {
         match self {
-            Self::Agent { read_only } => !read_only || matches!((cap, scope), ("fs", "read") | ("llm", "agent" | "chat")),
-            Self::Package { caps, active, .. } => active.load(Ordering::Acquire) && caps.get(cap).is_some_and(|s| s.iter().any(|s| s == scope || s == "*")),
+            Self::Agent { read_only } => !read_only || READ_ONLY.contains(&cap),
+            Self::Package { caps, active, .. } => active.load(Ordering::Acquire) && caps.contains(cap),
         }
     }
 
@@ -173,11 +239,8 @@ impl Principal {
         match self {
             Self::Agent { .. } => Self::Agent { read_only: true },
             Self::Package { name, active, .. } => {
-                let mut restricted = BTreeMap::new();
-                if self.allows("fs", "read") { restricted.insert("fs".into(), vec!["read".into()]); }
-                let llm: Vec<String> = ["agent", "chat"].into_iter().filter(|scope| self.allows("llm", scope)).map(String::from).collect();
-                if !llm.is_empty() { restricted.insert("llm".into(), llm); }
-                Self::Package { name: name.clone(), caps: restricted, active: active.clone() }
+                let caps = Capabilities(READ_ONLY.into_iter().filter(|c| self.allows(*c)).collect());
+                Self::Package { name: name.clone(), caps, active: active.clone() }
             },
         }
     }
@@ -283,8 +346,8 @@ impl Supervisor {
         if let Principal::Package { active, .. } = principal {
             anyhow::ensure!(active.load(Ordering::Acquire), "capability_denied: package initialization must be pure");
         }
-        let (cap, scope) = tool.capability();
-        anyhow::ensure!(principal.allows(cap, scope), "capability_denied: {} lacks {cap}.{scope} for {}", principal.name(), tool.name());
+        let cap = tool.capability();
+        anyhow::ensure!(principal.allows(cap), "capability_denied: {} lacks {cap} for {}", principal.name(), tool.name());
         if class != Class::Read && !self.books.lock().unwrap().uncertain.is_empty() {
             bail!("unknown_outcome: unresolved mutations block new mutations; inspect receipts and ask the owner to run `hx recover LOG OP --decision complete|abandon --yes`");
         }

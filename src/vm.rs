@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 /// Luau CPU allowance of one agent chunk (time waiting on effects does not count).
 pub const CHUNK_SECS: u64 = 120;
+/// `view(path, {max = N})`: the long side images are scaled to, by default and at least / at most.
+pub const VIEW_MAX: (u32, u32, u32) = (1024, 64, 2000);
 
 pub(crate) const PRELUDE: &str = r##"
 function print(...)
@@ -78,7 +80,7 @@ mod session_budget_tests {
         let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
         let vm = Vm::new(policy.clone(), Duration::from_millis(30), 32 << 20, None).unwrap();
         let mut registry = crate::modules::Registry::capture(&dir).unwrap();
-        let caps = BTreeMap::from([("proc".into(), vec!["sh".into()])]);
+        let caps = crate::supervisor::Capabilities::from([crate::supervisor::Capability::ProcSh]);
         registry.capabilities.insert("probe".into(), caps.clone());
         registry.sources.insert("probe".into(), crate::modules::Source {
             text: "return {run=function() return sh('sleep 0.1; echo waited').stdout end}".into(),
@@ -161,7 +163,7 @@ struct ToolDef {
     signature: String,
     types: String,
     tests: String,
-    caps: BTreeMap<String, Vec<String>>,
+    caps: crate::supervisor::Capabilities,
 }
 
 fn valid_name(n: &str) -> bool {
@@ -177,8 +179,8 @@ fn stderr_print(_: &Lua, args: Variadic<Value>) -> mlua::Result<()> {
     Ok(())
 }
 
-/// opts.caps = { fs = {"read"}, proc = {"sh"} }
-fn caps_of(o: &Option<Table>) -> mlua::Result<BTreeMap<String, Vec<String>>> {
+/// opts.caps = { fs = {"read"}, proc = {"sh"} }; an unknown capability is an error.
+fn caps_of(o: &Option<Table>) -> mlua::Result<crate::supervisor::Capabilities> {
     let mut out = BTreeMap::new();
     if let Some(Value::Table(caps)) = o.as_ref().map(|t| t.get::<Value>("caps")).transpose()? {
         for pair in caps.pairs::<String, Vec<String>>() {
@@ -186,7 +188,7 @@ fn caps_of(o: &Option<Table>) -> mlua::Result<BTreeMap<String, Vec<String>>> {
             out.insert(k, v);
         }
     }
-    Ok(out)
+    crate::supervisor::Capabilities::from_map(&out).map_err(mlua::Error::external)
 }
 
 fn toml_str(s: &str) -> String {
@@ -195,10 +197,9 @@ fn toml_str(s: &str) -> String {
 
 fn render_manifest(name: &str, d: &ToolDef) -> String {
     let mut t = format!("[package]\nname = {}\nversion = \"0.1.0\"\nkind = \"tool\"\ndescription = {}\n\n[tool]\nsignature = {}\ndoc = {}\n\n[capabilities]\n", toml_str(name), toml_str(&d.doc), toml_str(&d.signature), toml_str(&d.doc));
-    for (k, v) in &d.caps {
+    for (k, v) in d.caps.to_map() {
         t.push_str(&format!("{k} = [{}]\n", v.iter().map(|x| toml_str(x)).collect::<Vec<_>>().join(", ")));
     }
-    t.push_str("\n[exports]\nmodule = \"init.luau\"\n\n[tests]\nfiles = [\"tests/*.luau\"]\n");
     t
 }
 
@@ -562,7 +563,7 @@ impl Vm {
         hx.set("view_image", lua.create_async_function(move |lua, (path, max): (String, Option<u32>)| {
             let vfx = vfx.clone();
             async move {
-                let max = max.unwrap_or(1024).clamp(64, 2000);
+                let max = max.unwrap_or(VIEW_MAX.0).clamp(VIEW_MAX.1, VIEW_MAX.2);
                 let pol = vfx.pol.clone();
                 let mut live: Option<crate::prims::ViewImage> = None;
                 vfx.run_sync(&lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), |_| {

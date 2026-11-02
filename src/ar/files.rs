@@ -5,9 +5,9 @@ use base64::Engine as _;
 use std::collections::BTreeMap;
 
 /// Limits on the editable files of one snapshot: total bytes, file count and directory depth.
-pub(super) const MAX_SNAPSHOT: usize = 16 << 20;
-pub(super) const MAX_FILES: usize = 10_000;
-pub(super) const MAX_DEPTH: usize = 32;
+pub(crate) const MAX_SNAPSHOT: usize = 16 << 20;
+pub(crate) const MAX_FILES: usize = 10_000;
+pub(crate) const MAX_DEPTH: usize = 32;
 
 /// Editable files, path -> bytes.
 pub(super) type Files = BTreeMap<String, Vec<u8>>;

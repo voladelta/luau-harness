@@ -19,7 +19,8 @@ end
 -- from the value in force so prose and code cannot disagree. An unknown name is an error, never text the model reads.
 function M.fill(text: string, limits): string
 	local values = table.clone(limits or {})
-	values.STR_TOP = require("std/printer").STR_TOP
+	local printer = require("std/printer")
+	values.STR_TOP, values.ROWS = printer.STR_TOP, printer.ROWS
 	return (text:gsub("{{(%u[%u%d_]*)}}", function(name)
 		local value = values[name]
 		if value == nil then error("system prompt names unknown limit {{" .. name .. "}}") end

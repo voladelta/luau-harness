@@ -58,6 +58,8 @@ P=$W/.harness/pkgs/mypkg; mkdir -p $P/tests
 printf '[package]\nname = "mypkg"\nversion = "0.1.0"\n[capabilities]\nnet = ["example.com"]\n' > $P/hx.toml
 echo 'return { hello = function() return "hi" end }' > $P/init.luau
 echo 'test.case("loads", function() test.eq(require("mypkg").hello(), "hi") end)' > $P/tests/t.luau
+check "an unknown capability is a load error, not a silent grant of nothing" "$($H approve mypkg --workspace $W 2>&1 | grep -c 'unknown capability net.example.com')" "1"
+printf '[package]\nname = "mypkg"\nversion = "0.1.0"\n[capabilities]\nfs = ["read"]\n' > $P/hx.toml
 check "unlocked package refused" "$($H test $P --workspace $W 2>&1 | grep -c 'is not locked')" "1"
 $H approve mypkg --workspace $W >/dev/null
 check "approved package loads" "$($H test $P --workspace $W | tail -1)" "1 passed, 0 failed"

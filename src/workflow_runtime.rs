@@ -214,7 +214,7 @@ fn artifact_name(stage: &StageSpec) -> String {
         safe
     )
 }
-fn document_event(frame: &ExecutionFrame, log: &eventlog::EventLog) -> Result<Value> {
+fn document_event(frame: &ExecutionFrame, log: &eventlog::EventLog) -> Result<serde_json::Map<String, Value>> {
     let artifacts = frame.artifacts.iter().map(|a| -> Result<Value> {
         let name = if a.stage_id == "request" {"request"} else {a.stage_id.rsplit_once('-').map_or(a.stage_id.as_str(),|(name,_)|name)};
         Ok(json!({"id":a.id,"name":name,"path":a.name,"summary":a.summary,"submission":a.submission,
@@ -224,7 +224,7 @@ fn document_event(frame: &ExecutionFrame, log: &eventlog::EventLog) -> Result<Va
         let text = i.content_blob.as_ref().map(|b|eventlog::read_blob(log.dir(),b)).transpose()?.map(String::from_utf8).transpose()?.unwrap_or_default();
         Ok(json!({"id":i.id,"gate_id":i.gate_id,"decision":i.decision,"text":text,"check_ids":i.check_ids}))
     }).collect::<Result<Vec<_>>>()?;
-    Ok(json!({"artifacts":artifacts,"owner_inputs":owner_inputs}))
+    Ok(serde_json::Map::from_iter([("artifacts".into(), json!(artifacts)), ("owner_inputs".into(), json!(owner_inputs))]))
 }
 
 impl Host {
@@ -320,11 +320,8 @@ impl Host {
             artifacts: request.artifacts.clone(),
         });
         next.consumed_decisions.push(id);
-        let mut event = document_event(&next, &self.policy.log)?;
-        event["kind"] = json!("owner_decision");
-        event["decision"] = decision["decision"].clone();
-        event["text"] = json!(text);
-        event["request"] = serde_json::to_value(request)?;
+        let event = crate::controller::Event::OwnerDecision { document: document_event(&next, &self.policy.log)?,
+            decision: decision["decision"].clone(), text, request: serde_json::to_value(request)? }.to_json();
         next.pending_event = Some(event.clone());
         *self.supervisor.workflow.lock().unwrap() = Some(next);
         Ok(Some(event))
@@ -429,13 +426,9 @@ impl Host {
                 } else {
                     None
                 };
-                let mut event = document_event(&frame, &self.policy.log)?;
-                event["kind"] = json!("boundary_ready");
-                event["stage"] = serde_json::to_value(&stage)?;
-                if let Some(sealed) = sealed {
-                    event["sealed"] = sealed;
-                }
-                event["metadata"] = json!({"workspace":self.workspace,"files":crate::host::file_tree(&self.workspace),"check_plan":frame.check_plan,"project":frame.observation});
+                let event = crate::controller::Event::BoundaryReady { document: document_event(&frame, &self.policy.log)?,
+                    stage: serde_json::to_value(&stage)?, sealed,
+                    metadata: json!({"workspace":self.workspace,"files":crate::host::file_tree(&self.workspace),"check_plan":frame.check_plan,"project":frame.observation}) }.to_json();
                 frame.pending_event = Some(event);
                 RunState::Running {
                     controller: controller.clone(),

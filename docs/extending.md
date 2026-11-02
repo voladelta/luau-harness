@@ -61,6 +61,8 @@ capabilities = { fs = {"read", "write"}, proc = {"sh"}, llm = {"agent", "chat"} 
 | `llm.agent` | `agent(task)` |
 | `llm.chat` | `llm{{system=..., prompt=..., effort=..., max_tokens=...}, ...}`: up to 32 single-shot requests sent concurrently to the run's provider and model, budgeted and journaled like any model call. `effort` defaults to the run's; `"none"` sends no reasoning setting. Returns `{ok, value}` or `{ok, error}` per request in input order. Needs `hx run` |
 
+An unknown capability or scope (a typo such as `fs = {"raed"}`) is a registration error, never a silent grant of nothing; a package `hx.toml` with an unknown capability or table fails to load. `{"*"}` requests every scope of one capability.
+
 Every tool also gets `nonce()`, 32 URL-safe characters of fresh OS entropy. Workspace trust grants these declarations; the file-tool path, budget and approval checks still apply.
 
 ### HTTP endpoints

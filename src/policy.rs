@@ -9,6 +9,7 @@ use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct PolicyFile {
     #[serde(default)]
     fs: FsSection,
@@ -20,12 +21,14 @@ struct PolicyFile {
     packs: PacksSection,
 }
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct PacksSection {
     #[serde(default)]
     enable: Vec<String>,
 }
 
-/// `[budget]`: unknown keys are an error, so a removed or misspelled limit cannot silently run unlimited.
+/// `[budget]`: unknown keys are an error, so a removed or misspelled limit cannot silently run unlimited. Every other
+/// section (and the file's top level) refuses unknown keys too.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct BudgetSection {
@@ -40,6 +43,7 @@ pub struct Budget {
     pub max_wall_secs: Option<f64>,
 }
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ApprovalSection {
     /// extra command substrings that count as external effects (need approval)
     #[serde(default)]
@@ -50,6 +54,7 @@ struct ApprovalSection {
     mode: Option<ApprovalMode>,
 }
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FsSection {
     #[serde(default)]
     read: Vec<String>,

@@ -239,7 +239,7 @@ local function step(s, event, options)
 	local req = hooks.emit("before_model", { system = prompt.system(options), messages = s.messages, tools = prompt.tools })
 	local info = hx.model_info()
 	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, phase.bound or math.huge)
-	local max_output = info.max_output or 16384
+	local max_output = assert(info.max_output, "hx.model_info() lacks max_output")
 	local force = phase.compact == "force"
 	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" then
 		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)

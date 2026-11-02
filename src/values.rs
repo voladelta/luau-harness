@@ -19,8 +19,9 @@ fn array_metatable(lua: &Lua) -> mlua::Result<Table> {
     Ok(table)
 }
 
-const MAX_BYTES: usize = 16 << 20;
-const MAX_NODES: usize = 262_144;
+pub(crate) const MAX_BYTES: usize = 16 << 20;
+pub(crate) const MAX_NODES: usize = 262_144;
+pub(crate) const MAX_DEPTH: usize = 64;
 #[derive(Default)]
 pub(crate) struct Limit { bytes: usize, nodes: usize }
 impl Limit {
@@ -42,7 +43,7 @@ impl Limit {
 
 pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
     fn visit(value: Value, stack: &mut HashSet<usize>, depth: usize, limit: &mut Limit) -> mlua::Result<serde_json::Value> {
-        if depth > 64 { return Err(mlua::Error::runtime("data nesting exceeds 64 levels")); }
+        if depth > MAX_DEPTH { return Err(mlua::Error::runtime(format!("data nesting exceeds {MAX_DEPTH} levels"))); }
         limit.charge(1, 1)?;
         let bad = || mlua::Error::runtime("expected data only: finite numbers, strings, booleans, null, arrays or string-keyed objects; functions, handles, cycles and metatables are forbidden");
         Ok(match value {
@@ -99,7 +100,7 @@ pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
 }
 
 fn validate_with_limit(value: &serde_json::Value, depth: usize, limit: &mut Limit) -> mlua::Result<()> {
-        if depth > 64 { return Err(mlua::Error::runtime("data nesting exceeds 64 levels")); }
+        if depth > MAX_DEPTH { return Err(mlua::Error::runtime(format!("data nesting exceeds {MAX_DEPTH} levels"))); }
         limit.charge(1, 1)?;
         match value {
             serde_json::Value::String(s) => limit.string(s)?,

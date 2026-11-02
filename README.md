@@ -28,7 +28,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | [Autoresearch](docs/workflows.md#autoresearch) | `--ar` improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
 | [Recovery](docs/cli.md#checkpoints-and-resume) | `--resume` restores saved data and controller state into a fresh VM; old effectful chunks are never replayed |
 | [Budgets](docs/configuration.md#policytoml) | Token and wall-clock admission thresholds; each request reserves its upper bound in tokens |
-| [Compaction](docs/configuration.md#initluau-compaction-and-recheck) | On by default: from 256k tokens at the latest, older history becomes a structured summary; Luau globals stay |
+| [Compaction](docs/configuration.md#initluau-compaction-and-recheck) | On by default: at 80% of the context window (1M unless `--context-window` or the provider says otherwise), older history becomes a structured summary; Luau globals stay |
 | [Extensions](docs/extending.md) | Override any `std` module; add single-file tools, approved packages, skills and MCP servers |
 | Any provider | Responses API; any compatible base URL (OpenRouter by default) |
 

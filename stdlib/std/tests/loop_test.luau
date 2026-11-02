@@ -8,7 +8,7 @@ local SYSTEM = 4000
 
 local function start()
 	hooks.clear()
-	hx.model_info = function() return {} end -- the test VM has no host: no window, no history archive
+	hx.model_info = function() return { max_output = 16384 } end -- the test VM has no host: no window, no history archive
 	compact.context_window = 40000 -- the test VM reports no window: trigger = 40000 - 16384 - 16384 = 7232
 	local s = loop.init({ task_message = "TASK", max_turns = 50 })
 	return loop.step(s, { kind = "next" })
@@ -122,7 +122,7 @@ end)
 
 test.case("a large fixed part (system prompt + task) does not make compaction recur every turn", function()
 	hooks.clear()
-	hx.model_info = function() return {} end
+	hx.model_info = function() return { max_output = 16384 } end
 	compact.context_window = 40000 -- trigger 7232; a quarter is 1808
 	local s = loop.init({ task_message = string.rep("t", 24000), max_turns = 50 }) -- a 6000-token task, like an RPI packet
 	local command

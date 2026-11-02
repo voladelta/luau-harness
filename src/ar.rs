@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 mod episode;
-mod files;
+pub(crate) mod files;
 pub use episode::{Episode, Progress, claim, claims, eval, load_episode, reset};
 use files::*;
 

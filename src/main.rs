@@ -460,7 +460,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         }
         let host = host::Host::start(cfg, policy, host::StartOptions {
             task, max_turns, trace, budget, packs: list_arg(args, "--pack"), branch,
-            workflow: has(args,"--rpi").then(|| workflow::WorkflowConfig { name:"rpi".into(),version:1,mode:if has(args,"--manual") {"manual"} else {"auto"}.into(),max_repairs:3 }),
+            workflow: has(args,"--rpi").then(|| workflow::WorkflowConfig { name:"rpi".into(),version:1,mode:if has(args,"--manual") {"manual"} else {"auto"}.into(),max_repairs:workflow::MAX_REPAIRS }),
         })?;
         if let Some((parent, _, _)) = inherited {
             host.policy.log.write("branch", serde_json::json!({"parent":parent.path}), true)?;
@@ -672,6 +672,53 @@ mod tests {
             assert!(help.contains(f.name), "help for {:?} does not list {}", f.commands, f.name);
         }
         assert!(command_help("run").unwrap().contains("turn limit (default: 200)"));
+    }
+
+    /// A number from the embedded Luau source: the literal after `prefix` (e.g. `M.trigger_ratio = `).
+    fn luau_number(source: &str, prefix: &str) -> f64 {
+        let at = source.find(prefix).unwrap_or_else(|| panic!("{prefix:?} not in the Luau source")) + prefix.len();
+        source[at..].split(|c: char| !(c.is_ascii_digit() || c == '.')).next().unwrap().parse().unwrap()
+    }
+
+    /// Limits that docs state in prose, checked against the constants that enforce them, as
+    /// `every_flag_is_documented_and_shown_in_help` does for flags.
+    #[test]
+    fn documented_limits_match_the_code() {
+        let mib = |n: usize| format!("{} MiB", n >> 20);
+        let word = |n: usize| ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"].get(n).map(|w| w.to_string())
+            .unwrap_or_else(|| if n == 20 { "twenty".into() } else { panic!("no word for {n}") });
+        let thousands = |n: usize| { let s = n.to_string(); if s.len() > 3 { format!("{},{}", &s[..s.len() - 3], &s[s.len() - 3..]) } else { s } };
+        let compact = modules::Resolver::embedded("std", "compact.luau").unwrap();
+        let window = luau_number(&compact, "M.context_window = ") as usize;
+        let trigger = format!("{}%", (luau_number(&compact, "M.trigger_ratio = ") * 100.0).round());
+        let reserve_max = luau_number(&compact, "M.reserve_tokens = ") as usize;
+        let reserve_min = luau_number(&compact, "math.max(") as usize;
+        let reserve_share = match luau_number(&compact, "math.floor(window / ") as usize { 8 => "an eighth", 4 => "a quarter", d => panic!("1/{d}") };
+        let (readme, cli, config) = (include_str!("../README.md"), include_str!("../docs/cli.md"), include_str!("../docs/configuration.md"));
+        let (runtime, extending, workflows) = (include_str!("../docs/runtime-v2.md"), include_str!("../docs/extending.md"), include_str!("../docs/workflows.md"));
+        let checks = [
+            ("README.md", readme, format!("at {trigger} of the context window ({}M unless", window / 1_000_000)),
+            ("docs/cli.md", cli, format!("| `--context-window N` | {window} (assumed) |")),
+            ("docs/cli.md", cli, format!("compaction starts at {trigger} of it")),
+            ("docs/configuration.md", config, format!("At {trigger} of the context window ({}M is assumed", window / 1_000_000)),
+            ("docs/configuration.md", config, format!("{reserve_share} of the window, from {}k tokens up to {}k", reserve_min / 1024, reserve_max / 1024)),
+            ("docs/runtime-v2.md", runtime, format!("Copies stop during traversal at {} levels, {} nodes or a conservative {} encoded-size bound",
+                values::MAX_DEPTH, values::MAX_NODES, mib(values::MAX_BYTES))),
+            ("docs/runtime-v2.md", runtime, format!("Listing defaults to {} entries (maximum {})", word(history::DEFAULT_LIMIT), word(history::MAX_LIMIT))),
+            ("docs/runtime-v2.md", runtime, format!("Reads return at most {} UTF-8-safe text bytes", history::MAX_TEXT)),
+            ("docs/runtime-v2.md", runtime, format!("Serialized responses are capped at {} KiB", history::MAX_RESPONSE >> 10)),
+            ("docs/runtime-v2.md", runtime, format!("A search examines at most {} entries and charges at most {} of checkpoint source bytes", history::MAX_SCAN, mib(history::MAX_SOURCE))),
+            ("docs/runtime-v2.md", runtime, format!("a cache holds at most {} of encoded source bodies", mib(history::CACHE_BYTES))),
+            ("docs/runtime-v2.md", runtime, format!("under a {}-second CPU deadline and a {} memory limit", word(tools::REGISTER_SECS as usize), mib(tools::REGISTER_MEMORY))),
+            ("docs/extending.md", extending, format!("limited to {} second and {}", word(tools::REGISTER_SECS as usize), mib(tools::REGISTER_MEMORY))),
+            ("docs/extending.md", extending, format!("Requests have a {}-second timeout, an {} response limit", tools::HTTP_TIMEOUT_SECS, mib(tools::HTTP_MAX_BODY))),
+            ("docs/runtime-v2.md", runtime, format!("at most {}, {} files and {} levels", mib(ar::files::MAX_SNAPSHOT), thousands(ar::files::MAX_FILES), ar::files::MAX_DEPTH)),
+            ("docs/workflows.md", workflows, format!("at most {} repair cycles", word(workflow::MAX_REPAIRS as usize))),
+            ("README.md", readme, format!("up to {} repair cycles", word(workflow::MAX_REPAIRS as usize))),
+        ];
+        for (name, text, phrase) in checks {
+            assert!(text.contains(&phrase), "{name} should say {phrase:?} (the value in force)");
+        }
     }
 
     #[test]

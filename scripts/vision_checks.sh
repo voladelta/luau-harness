@@ -69,6 +69,7 @@ check "budget: run finishes" "$(cat $T/budget.rc)" "0"
 check "budget: the summarizer sees the older image" "$(nth_imgs budget.jsonl 2)" "1"
 check "budget: the summarizer is told images are not kept" "$(nth_has budget.jsonl 2 'not kept after this checkpoint')" "1"
 check "budget: the next request carries only the newest image" "$(nth_imgs budget.jsonl 3) $(nth_has budget.jsonl 3 'compaction-summary')" "1 1"
+check "the vision prompt states the limits in force" "$(nth_has budget.jsonl 0 'at most 4 and 8 MB per turn, scaled so the long side is at most `max`, 64..2000')$(nth_has budget.jsonl 0 '{max = 1024}')" "11"
 
 # An image rejection (413) compacts without a token bound; the summarizer gets placeholders, then the agent retries.
 budget_run "[\"$VIEW\",\"$VIEW\",{\"status\":413,\"error\":\"Payload Too Large\"},\"SUM\",\"done\"]" reject ''

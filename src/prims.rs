@@ -26,8 +26,8 @@ const SH_TIMEOUT_MAX: f64 = 600.0;
 /// them in, so the prose the model reads comes from the constants that enforce it.
 pub fn prompt_limits() -> serde_json::Value {
     serde_json::json!({
-        "MAX_READ_MB": MAX_READ >> 20, "DEFAULT_HITS": DEFAULT_HITS, "SH_TIMEOUT": SH_TIMEOUT, "SH_TIMEOUT_MAX": SH_TIMEOUT_MAX,
-        "CHUNK_SECS": crate::vm::CHUNK_SECS, "HISTORY_ENTRIES": crate::history::DEFAULT_LIMIT, "HISTORY_BYTES": crate::history::MAX_TEXT,
+        "MAX_READ_MB": MAX_READ >> 20, "MAX_CAPTURE_MB": MAX_CAPTURE >> 20, "CAPTURE_HALF_KB": (MAX_CAPTURE / 2) >> 10, "DEFAULT_HITS": DEFAULT_HITS, "SH_TIMEOUT": SH_TIMEOUT, "SH_TIMEOUT_MAX": SH_TIMEOUT_MAX,
+        "CHUNK_SECS": crate::vm::CHUNK_SECS, "VIEW_MAX": crate::vm::VIEW_MAX.0, "VIEW_MAX_MIN": crate::vm::VIEW_MAX.1, "VIEW_MAX_LIMIT": crate::vm::VIEW_MAX.2, "HISTORY_ENTRIES": crate::history::DEFAULT_LIMIT, "HISTORY_BYTES": crate::history::MAX_TEXT,
     })
 }
 
@@ -563,8 +563,8 @@ mod prompt_limit_tests {
             let name = part.split("}}").next().unwrap();
             if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) { continue; } // `{{file: string}}` is prose
             named += 1;
-            // STR_TOP belongs to the printer, an overridable Luau module, so std/prompt adds it.
-            assert!(limits.get(name).is_some() || name == "STR_TOP", "system.md names {{{{{name}}}}}, which has no value");
+            // STR_TOP and ROWS belong to the printer, an overridable Luau module, so std/prompt adds them.
+            assert!(limits.get(name).is_some() || matches!(name, "STR_TOP" | "ROWS"), "system.md names {{{{{name}}}}}, which has no value");
         }
         assert!(named >= 7, "placeholders went missing: {named}");
     }

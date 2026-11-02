@@ -5,17 +5,22 @@
 -- also compacts when they pass its image budget. A turn takes at most 4, so the newest exchange always fits that budget.
 local M = {}
 
-local MAX_PER_CALL = 4
--- base64 bytes one turn may add: half of std/compact's default image budget, the most a compaction keeps, so a compaction
--- frees room for the next turn instead of recurring every turn
-local MAX_BYTES_PER_TURN = 8 * 1024 * 1024
+M.MAX_PER_CALL = 4
+-- base64 bytes one turn may add. std/compact's image budget is twice this (the most a compaction keeps is half of it),
+-- so a compaction frees room for the next turn instead of recurring every turn.
+M.MAX_BYTES_PER_TURN = 8 * 1024 * 1024
+local MAX_PER_CALL, MAX_BYTES_PER_TURN = M.MAX_PER_CALL, M.MAX_BYTES_PER_TURN
 
-local DOCS = [==[
+-- The prompt section, from the limits in force: these constants and the host's scaling bounds (`hx.limits`).
+local function docs(): string
+	local l = hx.limits
+	return string.format([==[
 # Looking at images
-- view(path | {paths}, {max = 1024}) -> { {path, width, height} }  shows you PNG/JPEG/WebP/GIF files on your next turn
-  (at most 4 and 8 MB per turn, scaled so the long side is at most `max`, 64..2000). Use it to check rendered output instead of
+- view(path | {paths}, {max = %d}) -> { {path, width, height} }  shows you PNG/JPEG/WebP/GIF files on your next turn
+  (at most %d and %d MB per turn, scaled so the long side is at most `max`, %d..%d). Use it to check rendered output instead of
   guessing; prefer one contact sheet over many single frames. Each image costs about 1-2k input tokens.
-]==]
+]==], l.VIEW_MAX, MAX_PER_CALL, MAX_BYTES_PER_TURN // 2 ^ 20, l.VIEW_MAX_MIN, l.VIEW_MAX_LIMIT)
+end
 
 function M.install(ctx)
 	local pending = {}
@@ -63,7 +68,7 @@ function M.install(ctx)
 			hx.log("### VIEW\n" .. table.concat(names, "\n"))
 			pending = {}
 		end
-		req.system = req.system .. "\n\n" .. DOCS
+		req.system = req.system .. "\n\n" .. docs()
 		return req
 	end)
 end

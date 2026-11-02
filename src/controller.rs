@@ -16,6 +16,33 @@ pub enum Command {
     Finish { report: serde_json::Map<String, Json> },
 }
 
+/// What the host hands the controller's `step(state, event)`: the one place the host names event kinds, so it cannot
+/// emit one the controllers (std/loop, std/rpi) do not match. Events cross the boundary as data (`to_json`).
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Event {
+    Next,
+    NextCall,
+    /// Resume notice: receipts and uncertain operations, as pretty JSON.
+    Recover { message: String },
+    ModelReply { reply: Json, system_chars: Option<usize> },
+    ModelError { error: String, safe_context_rejection: bool },
+    RunResult { result: Json, notifications: Json },
+    /// An owner's review decision; `document` holds the workflow's artifacts and owner inputs.
+    OwnerDecision { #[serde(flatten)] document: serde_json::Map<String, Json>, decision: Json, text: String, request: Json },
+    /// A workflow stage is ready to start.
+    BoundaryReady {
+        #[serde(flatten)] document: serde_json::Map<String, Json>,
+        stage: Json,
+        #[serde(skip_serializing_if = "Option::is_none")] sealed: Option<Json>,
+        metadata: Json,
+    },
+}
+
+impl Event {
+    pub fn to_json(&self) -> Json { serde_json::to_value(self).expect("controller events serialize") }
+}
+
 pub fn validate_request(request: &Json) -> Result<()> {
     anyhow::ensure!(request.is_object() && request["system"].is_string(), "model request needs a string system prompt");
     let messages = request["messages"].as_array().ok_or_else(|| anyhow::anyhow!("model request needs a messages array"))?;

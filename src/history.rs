@@ -9,14 +9,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const MAX_SOURCE: usize = 64 << 20;
-const CACHE_BYTES: usize = 8 << 20;
-const MAX_RESPONSE: usize = 12 << 10;
+pub(crate) const MAX_SOURCE: usize = 64 << 20;
+pub(crate) const CACHE_BYTES: usize = 8 << 20;
+pub(crate) const MAX_RESPONSE: usize = 12 << 10;
 pub const MAX_TEXT: usize = 4096;
-const MAX_SCAN: usize = 128;
+pub(crate) const MAX_SCAN: usize = 128;
 /// Entries per page when `limit` is omitted, and the most a page may ask for.
 pub const DEFAULT_LIMIT: usize = 5;
-const MAX_LIMIT: usize = 20;
+pub(crate) const MAX_LIMIT: usize = 20;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

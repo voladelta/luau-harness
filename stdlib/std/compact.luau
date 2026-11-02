@@ -22,7 +22,8 @@ M.reserve_tokens = 65536 -- most headroom kept free for the summarizer's output,
 -- Image budget of one request, set below the common provider limits (about 100 images, 32 MB per request). Going over
 -- it compacts like token pressure does, and the kept tail carries at most half of it, so image compactions stay rare.
 M.max_images = 50
-M.max_image_bytes = 16 * 1024 * 1024 -- base64 characters, as sent; keep it at least twice std/vision's 8 MB per turn
+-- base64 characters, as sent: twice what std/vision lets one turn add, so the half a compaction keeps always fits a turn
+M.max_image_bytes = 2 * require("std/vision").MAX_BYTES_PER_TURN
 
 local IMAGE_TOKENS = 1200 -- an image without dimensions
 

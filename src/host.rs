@@ -1,5 +1,5 @@
 //! Model adapter and supervised agent/controller execution. Descendants share one admission ledger.
-use crate::{controller::Controller, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, RunState, Supervisor}, vm::Vm};
+use crate::{controller::{Controller, Event}, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, RunState, Supervisor}, vm::Vm};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
@@ -271,9 +271,9 @@ impl Host {
                     "task_message": format!("{task}\n\n[files in the working directory]\n{}", file_tree(&self.workspace))}))?,
             }
         } else {controller.init(&json!({"max_turns": max_turns, "task_message": task}))?};
-        let mut recovery = if self.depth==0 {self.supervisor.recovery.as_ref().map(|r|json!({"kind":"recover","message":serde_json::to_string_pretty(r).unwrap()}))} else {None};
+        let mut recovery = if self.depth==0 {self.supervisor.recovery.as_ref().map(|r|Event::Recover{message:serde_json::to_string_pretty(r).unwrap()}.to_json())} else {None};
         let pending=if workflow {self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f|f.pending_event.clone())} else {None};
-        let mut event=owner_event.or(pending).or_else(||recovery.take()).unwrap_or_else(||json!({"kind":"next"}));
+        let mut event=owner_event.or(pending).or_else(||recovery.take()).unwrap_or_else(||Event::Next.to_json());
         let mut vm:Option<Vm>=None;
         let mut compacting=false;
         // The system prompt of the last agent request as sent (VM hooks and local tools applied). A summarizer request
@@ -359,15 +359,15 @@ impl Host {
                 }
             }
             match command {
-                crate::controller::Command::Next{..}=>event=recovery.take().unwrap_or_else(||json!({"kind":"next"})),
-                crate::controller::Command::NextCall=>event=json!({"kind":"next_call"}),
+                crate::controller::Command::Next{..}=>event=recovery.take().unwrap_or_else(||Event::Next.to_json()),
+                crate::controller::Command::NextCall=>event=Event::NextCall.to_json(),
                 crate::controller::Command::Model{request,..}=>{
                     match self.chat(&request).await {
                         Ok(reply)=>{self.log(&format!("### MODEL\n{}",reply.text));
                             // the anchor's estimate covers the system prompt as sent, so its scale is not skewed by VM additions
                             let system_chars=agent_system.as_ref().and_then(Value::as_str).map(str::len);
-                            event=json!({"kind":"model_reply","reply":reply,"system_chars":system_chars});},
-                        Err(error)=>{let message=error.to_string();let safe_context_rejection=["API 400 ","API 413 ","API 422 "].iter().any(|p|message.starts_with(p));event=json!({"kind":"model_error","error":message,"safe_context_rejection":safe_context_rejection});},
+                            event=Event::ModelReply{reply:serde_json::to_value(&reply)?,system_chars}.to_json();},
+                        Err(error)=>{let message=error.to_string();let safe_context_rejection=["API 400 ","API 413 ","API 422 "].iter().any(|p|message.starts_with(p));event=Event::ModelError{error:message,safe_context_rejection}.to_json();},
                     }
                 },
                 crate::controller::Command::Run{code}=>{
@@ -379,7 +379,7 @@ impl Host {
                         if result["error"].as_str().is_some_and(|e|e.contains("stage.submit") || e.contains("submission")) {result["submission_error"]=json!(true);}
                     }
                     let notifications=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"tools":[]}))?;
-                    event=json!({"kind":"run_result","result":result,"notifications":notifications["messages"]});
+                    event=Event::RunResult{result,notifications:notifications["messages"].clone()}.to_json();
                 },
                 crate::controller::Command::Finish{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
                 crate::controller::Command::Boundary{..}=>unreachable!(),

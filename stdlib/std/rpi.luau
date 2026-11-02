@@ -1,6 +1,9 @@
 -- Pure RPI policy; the host owns submission provenance, artifacts, receipts and gates.
 local loop = require("std/loop")
 local M = {}
+-- Rejected submissions a stage may have before it stops (a protocol limit, separate from the repair cycles the
+-- host freezes in `cfg.workflow.max_repairs`).
+local MAX_CORRECTIONS = 3
 local route = { "research_questions", "research", "system_design", "program_design", "implementation", "verification" }
 local artifact_names = {
 	research_questions = "02-research-questions.md", research = "03-research.md",
@@ -92,7 +95,7 @@ local function valid(payload, name)
 end
 local function correct(s, message)
 	s.corrections += 1
-	if s.corrections >= 3 then return finish(s, "stopped", "Stage submission protocol failed: " .. message) end
+	if s.corrections >= MAX_CORRECTIONS then return finish(s, "stopped", "Stage submission protocol failed: " .. message) end
 	local command
 	s.worker, command = loop.continue(s.worker, "RPI stage is not complete. " .. message .. " Call stage.submit with the full document, summary, evidence array and required stage fields in the luau tool; plain text cannot finish this stage.")
 	s.messages = s.worker.messages
@@ -100,7 +103,7 @@ local function correct(s, message)
 end
 function M.init(cfg)
 	assert(cfg.workflow and cfg.workflow.name == "rpi", "RPI requires explicit workflow selection")
-	return { phase = "initial", cfg = cfg, mode = cfg.workflow.mode, max_repairs = cfg.workflow.max_repairs or 3,
+	return { phase = "initial", cfg = cfg, mode = cfg.workflow.mode, max_repairs = assert(cfg.workflow.max_repairs, "workflow config lacks max_repairs"),
 		turns = 0, repairs = 0, serial = 0, attempts = {}, artifacts = { request = "request" }, waived_checks = {}, corrections = 0, messages = {} }
 end
 local function describe(value, depth)
@@ -209,7 +212,7 @@ function M.step(s, event)
 		local error_text = if result and type(result.error) == "string" then result.error else ""
 		if result and (result.submission_error == true or error_text:find("stage.submit", 1, true) or error_text:find("submission", 1, true)) then
 			s.corrections += 1
-			if s.corrections >= 3 then return finish(s, "stopped", "Stage submission protocol failed: " .. error_text) end
+			if s.corrections >= MAX_CORRECTIONS then return finish(s, "stopped", "Stage submission protocol failed: " .. error_text) end
 		end
 		return s, outcome.command
 	end

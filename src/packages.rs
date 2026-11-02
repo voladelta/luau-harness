@@ -7,7 +7,7 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     let registry = supervisor.registry.clone();
     let mut caps = registry.capabilities.get(package).cloned().ok_or_else(|| mlua::Error::runtime("package not in frozen registry"))?;
     if let Some(host) = &host {
-        for (cap, scopes) in &mut caps { scopes.retain(|scope| host.principal.allows(cap, scope)); }
+        caps.0.retain(|cap| host.principal.allows(*cap));
     }
     let active = Arc::new(AtomicBool::new(false));
     let principal = Principal::Package { name: package.to_string(), caps, active: active.clone() };
