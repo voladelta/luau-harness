@@ -22,6 +22,21 @@ has() { grep -c "$1" $T/req.log | tr -d ' ' | sed 's/^0$/no/; s/^[1-9][0-9]*$/ye
 runq any/model;           check "responses: no markers (automatic caching)" "$(has cache_control)" "no"
 runq any/model;           check "responses: prompt_cache_key sent" "$(has prompt_cache_key)" "yes"
 runq any/model --provider-only anthropic,google; check "--provider-only pins providers" "$(has allow_fallbacks)" "yes"
+# --- without --context-window, the window and output cap come from the provider's model list (HX_TEST_MODELS: the
+# mock counts as OpenRouter); a failed lookup keeps the defaults and says so
+models() { # MOCK_MODELS json, then runq args -> request log and stderr in $T/models.err
+  MOCK_REPLIES='["done"]' MOCK_MODELS="$1" MOCK_LOG=$T/req.log serve LP python3 scripts/mock_llm.py 0 || return 1; local m=$SERVED; shift
+  W=$T/l-$RANDOM; mkdir -p $W/.harness; : > $T/req.log; echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
+  HX_TEST_MODELS=1 K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --base-url http://127.0.0.1:$LP --key-env K "$@" >/dev/null 2>$T/models.err
+  kill $m 2>/dev/null; wait $m 2>/dev/null
+}
+models '{"data":[{"id":"any/model","context_length":40000,"top_provider":{"max_completion_tokens":3000}}]}'
+check "the provider's listing sets the output cap" "$(has '"max_output_tokens": 3000')" "yes"
+check "...and the window, frozen in the manifest" "$(grep -h '"kind":"manifest"' $W/.harness/log/*.jsonl | head -1 | python3 -c "import json,sys,pathlib;r=json.loads(sys.stdin.read());print(json.loads(pathlib.Path('$W/.harness/log/blobs/'+r['blob']).read_text())['model']['context_window'])")" "40000"
+models '{"data":[{"id":"any/model","context_length":40000}]}' --context-window 200000
+check "--context-window wins over the listing" "$(has '"max_output_tokens": 50000')" "yes"
+models '{"data":[]}'
+check "an unlisted model keeps the defaults, with a note" "$(has '"max_output_tokens": 65536')$(grep -c 'could not read the context window' $T/models.err)" "yes1"
 # --- native tool calling: the loop answers every call id; bad calls get an error result, not a crash
 mockrun() { # replies-json -> "finished|final_answer|turns|code_turns|truncated_turns"
   MOCK_REPLIES="$1" MOCK_BY_LEN=${BYLEN:-1} MOCK_LOG=$T/tool.log serve TP python3 scripts/mock_llm.py 0 || return 1; local m=$SERVED; : > $T/tool.log

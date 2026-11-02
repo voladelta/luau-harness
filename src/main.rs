@@ -137,7 +137,7 @@ const FLAGS: &[Flag] = {
         flag(RUN, "--key-env", Text, "E", "environment variable holding the API key (default: OPENROUTER_API_KEY)"),
         flag(RUN, "--reasoning", Text, "R", "reasoning effort"),
         Flag { default: Some(DEFAULT_MAX_OUTPUT), ..flag(RUN, "--max-output", Positive, "N", "max output tokens per turn; with --context-window, at most a quarter of it") },
-        flag(RUN, "--context-window", Positive, "N", "the model's context window; compaction starts before it"),
+        flag(RUN, "--context-window", Positive, "N", "the model's context window; compaction starts before it (default: OpenRouter's listing)"),
         flag(RUN, "--provider-only", Text, "A,B", "OpenRouter only: route to these providers, no fallbacks"),
         Flag { default: Some(DEFAULT_MAX_TURNS), ..flag(RUN, "--max-turns", Unsigned, "N", "turn limit") },
         flag(RUN, "--max-tokens", Unsigned, "N", "token admission threshold"),
@@ -421,6 +421,19 @@ fn llm_cfg(args: &[String], session: String) -> Result<llm::LlmCfg> {
     })
 }
 
+/// Without `--context-window`, take the window (and the output cap, unless `--max-output` was given) that OpenRouter
+/// lists for the model. A failure keeps today's defaults.
+async fn with_provider_limits(mut cfg: llm::LlmCfg, args: &[String]) -> llm::LlmCfg {
+    if cfg.context_window.is_some() { return cfg; }
+    if let Some((window, completion)) = llm::provider_limits(&cfg).await {
+        cfg.context_window = Some(window);
+        if arg(args, "--max-output").is_none() {
+            cfg.max_output = DEFAULT_MAX_OUTPUT.min(window / 4).min(completion.unwrap_or(u64::MAX)).max(1);
+        }
+    }
+    cfg
+}
+
 /// hx run --workspace DIR --prompt-file F --model M [--base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
 async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy>) -> Result<()> {
     let _ = workspace;
@@ -442,7 +455,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         }).transpose()?;
         let task = task_text(args)?.or_else(|| inherited.as_ref().map(|(_, m, _)| m.task.clone()))
             .ok_or_else(|| usage("a new run requires a prompt or --prompt-file"))?;
-        let cfg = llm_cfg(args, policy.log.session.clone())?;
+        let cfg = with_provider_limits(llm_cfg(args, policy.log.session.clone())?, args).await;
         let max_turns = parsed(args, "--max-turns")?.unwrap_or(DEFAULT_MAX_TURNS as usize);
         let budget = policy::Budget { max_tokens: parsed(args, "--max-tokens")?, max_wall_secs: parsed(args, "--max-wall")? };
         let branch = inherited.as_ref().map(|(parent, manifest, state)| supervisor::Branch {
@@ -486,6 +499,14 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
         child.extend(value.map(String::from));
     }
     let program = task_text(args)?.ok_or_else(|| usage("--ar requires a prompt or --prompt-file"))?;
+    // Ask the provider once here rather than in every episode's child run.
+    if let Ok(cfg) = llm_cfg(args, String::new()).map(|c| c.context_window.is_none().then_some(c)) && let Some(cfg) = cfg {
+        let limited = with_provider_limits(cfg.clone(), args).await;
+        if let Some(window) = limited.context_window {
+            child.extend(["--context-window".into(), window.to_string()]);
+            if arg(args, "--max-output").is_none() { child.extend(["--max-output".into(), limited.max_output.to_string()]); }
+        }
+    }
     ar::orchestrate(workspace, Some((child, program)), None).await
 }
 
@@ -660,6 +681,16 @@ mod tests {
         assert_eq!(cap("run --model m"), DEFAULT_MAX_OUTPUT);
         assert_eq!(cap("run --model m --context-window 128000"), 32000); // a small window caps the default
         assert_eq!(cap("run --model m --context-window 1000000"), DEFAULT_MAX_OUTPUT);
+    }
+
+    #[test]
+    fn the_provider_listing_gives_the_window_and_output_cap() {
+        let models = serde_json::json!({"data": [{"id": "a/m", "context_length": 128000, "top_provider": {"max_completion_tokens": 8192}},
+            {"id": "b/m", "context_length": 1048576, "top_provider": {"max_completion_tokens": null}}]});
+        assert_eq!(llm::listed_limits(&models, "a/m"), Some((128000, Some(8192))));
+        assert_eq!(llm::listed_limits(&models, "b/m"), Some((1048576, None)));
+        assert_eq!(llm::listed_limits(&models, "c/m"), None);
+        assert_eq!(llm::listed_limits(&serde_json::json!({"error": "x"}), "a/m"), None);
     }
 
     #[test]

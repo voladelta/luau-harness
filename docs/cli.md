@@ -42,8 +42,8 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
 | `--reasoning R` | | Reasoning effort |
 | `--max-turns N` | 200 | Turn limit; the report says `stopped: "max_turns: N"` when it is hit |
-| `--max-output N` | 65536 | Max output tokens per turn, reasoning included; with `--context-window`, the default is at most a quarter of that window |
-| `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at 80% of it; give a smaller model's window so it compacts before an overflow |
+| `--max-output N` | 65536 | Max output tokens per turn, reasoning included; with a known context window, the default is at most a quarter of it and at most the provider's listed output cap |
+| `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at 80% of it. Without the flag, a run on OpenRouter (the default base URL) reads the model's `context_length` and `top_provider.max_completion_tokens` from `/models` once at launch; the manifest keeps them for resume. When that fails (another provider, an unlisted model, no network), hx says so on stderr and assumes the default; give a smaller model's window so it compacts before an overflow |
 | `--max-tokens N` `--max-wall SECS` | none | Admission thresholds and absolute deadline; flags override `policy.toml` for a new run |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
 | `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |

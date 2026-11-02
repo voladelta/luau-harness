@@ -9,12 +9,13 @@
 -- Below the trigger the pack adds nothing to the requests. It never writes files.
 -- Config (set in .harness/init.luau, which runs before packs install):
 --   require("std/compact").trigger_ratio = 0.5
--- The window comes from --context-window, else M.context_window; give a smaller model's window, or it overflows first.
+-- The window comes from --context-window or OpenRouter's model list, else M.context_window; give a smaller model's window, or
+-- it overflows first (the OVERFLOW substrings below are the fallback).
 -- The ratios are the DeepSeek harness defaults (compaction-basic), chosen by the DeepSeek team.
 local M = {}
 
 M.enabled = true
-M.context_window = 1000000 -- used only when --context-window is not given
+M.context_window = 1000000 -- used only when neither --context-window nor the provider gives the window
 M.trigger_ratio = 0.8 -- compaction starts at this share of the window
 M.keep_ratio = 0.16 -- recent history kept verbatim: at most this share of the window less the reply; the newest exchange always
 M.reserve_tokens = 65536 -- most headroom kept free for the summarizer's output, reasoning included (DeepSeek harness default)

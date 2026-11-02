@@ -11,7 +11,8 @@ pub struct LlmCfg {
     pub reasoning: Option<String>,
     /// default per-call output limit (a request can override it); a runaway reply costs at most this many tokens
     pub max_output: u64,
-    /// the model's context window in tokens, when the user says so (`--context-window`); modules read it via `hx.model_info()`
+    /// the model's context window in tokens: `--context-window`, else what OpenRouter lists for the model at launch
+    /// (`provider_limits`); frozen in the manifest, so resume keeps it. Modules read it via `hx.model_info()`
     pub context_window: Option<u64>,
     /// OpenAI-style `prompt_cache_key` (the run's session id, so every turn and subagent routes to one cache)
     pub cache_key: Option<String>,
@@ -56,6 +57,36 @@ pub struct Reply {
     pub cache_read: u64,
     pub cache_write: u64,
     pub output: u64,
+}
+
+/// The provider hx calls without `--base-url`.
+pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// A model's context window and output cap as OpenRouter's `/models` lists them: `context_length` and
+/// `top_provider.max_completion_tokens` (often null).
+pub fn listed_limits(models: &Value, model: &str) -> Option<(u64, Option<u64>)> {
+    let entry = models["data"].as_array()?.iter().find(|m| m["id"] == model)?;
+    Some((entry["context_length"].as_u64().filter(|n| *n > 0)?, entry["top_provider"]["max_completion_tokens"].as_u64().filter(|n| *n > 0)))
+}
+
+/// Ask an OpenRouter base URL for the model's limits, once at launch. Any failure keeps the defaults: it returns None
+/// and says so on stderr. (`HX_TEST_MODELS` treats any base URL as OpenRouter, for the check suites' mock.)
+pub async fn provider_limits(cfg: &LlmCfg) -> Option<(u64, Option<u64>)> {
+    let base = cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.into());
+    let openrouter = reqwest::Url::parse(&base).is_ok_and(|u| u.host_str() == Some("openrouter.ai")) || std::env::var_os("HX_TEST_MODELS").is_some();
+    if !openrouter { return None; }
+    let fetched = async {
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
+        let models: Value = client.get(format!("{}/models", base.trim_end_matches('/'))).send().await?.error_for_status()?.json().await?;
+        listed_limits(&models, &cfg.model).ok_or_else(|| anyhow::anyhow!("{} is not in its model list", cfg.model))
+    }.await;
+    match fetched {
+        Ok(limits) => Some(limits),
+        Err(e) => {
+            eprintln!("hx: note: could not read the context window of {} from the provider ({e}); compaction assumes std/compact's default, so pass --context-window if the model's is smaller", cfg.model);
+            None
+        },
+    }
 }
 
 impl LlmCfg {
@@ -147,7 +178,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     // Streamed, so a long reasoning reply keeps the connection busy: the client's read timeout bounds silence, not
     // the whole generation. Only the final response object is used.
     body["stream"] = json!(true);
-    let base = cfg.base_url.clone().unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
+    let base = cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.into());
     let url = format!("{base}/responses");
     // Generation can be billable even when its response is lost. The supervisor owns admission and recovery;
     // neither this adapter nor reqwest may silently dispatch a second attempt.

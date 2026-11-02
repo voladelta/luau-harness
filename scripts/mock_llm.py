@@ -8,7 +8,7 @@ An object may also carry "prompt_tokens": N (reported as the usage input tokens,
 "status": 400, "error": "<body>" (answer with that HTTP status and body).
 "reasoning": str adds a reasoning summary item that is echoed back on later turns; "finish": "length" marks the reply cut at max_output_tokens.
 A request with "stream": true is answered with server-sent events (the final response split across writes); "drop": true ends
-that stream before the response completes, like a lost connection."""
+that stream before the response completes, like a lost connection. GET /models answers with $MOCK_MODELS."""
 import json, os, re, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 R = json.loads(os.environ["MOCK_REPLIES"]); n = [0]
@@ -29,6 +29,12 @@ def turns(body):
     return sum(1 for m in body["input"] if m.get("role") == "assistant" or (m.get("type") == "function_call" and m["call_id"].endswith("_0")))
 
 class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """/models answers with $MOCK_MODELS (an OpenRouter-style model list), else 404."""
+        models = os.environ.get("MOCK_MODELS")
+        out = (models or "not found").encode()
+        self.send_response(200 if models and self.path.endswith("/models") else 404)
+        self.send_header("content-length", str(len(out))); self.end_headers(); self.wfile.write(out)
     def do_POST(self):
         assert self.path.endswith("/responses"), self.path
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
