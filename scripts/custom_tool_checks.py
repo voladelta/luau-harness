@@ -11,7 +11,7 @@ import unittest
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-HX = ROOT / "target/release/hx"
+HX = ROOT / "scripts/hx_trusted"  # trusts the config written for each launch under HX_TRUST=current
 CALLS = []
 
 
@@ -89,7 +89,7 @@ class Tools(unittest.TestCase):
         self.dir = self.ws / ".harness/tools"
         self.dir.mkdir(parents=True)
         self.env = {k: v for k, v in os.environ.items() if k not in ("TINYFISH_API_KEY", "HX_TRUST")}
-        self.env.update(HX_TRUST="1", XDG_CONFIG_HOME=str(self.root / "config"))
+        self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"))
         CALLS.clear()
 
     def command(self, *args, env=None):
@@ -195,18 +195,21 @@ class Tools(unittest.TestCase):
         self.tool()
         env = self.env.copy()
         env.pop("HX_TRUST")
-        self.assertIn("nil", self.run_code('print(probe)', env=env))
+        self.assertIn("nil", self.run_code('--ignore-config', 'print(probe)', env=env))
         self.command("trust", "--yes", env=env)
         self.assertIn("function", self.run_code('print(type(probe.get))', env=env))
         with (self.dir / "probe.lua").open("a") as file:
             file.write("\n-- edited\n")
-        self.assertIn("nil", self.run_code('print(probe)', env=env))
+        refused = subprocess.run([str(HX), "exec", "--workspace", str(self.ws), "print(probe)"], env=env, text=True, capture_output=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("not trusted (.harness/tools/probe.lua)", refused.stderr)
         self.command("trust", "--yes", env=env)
         (self.dir / "link.lua").symlink_to(self.dir / "probe.lua")
         result = subprocess.run([str(HX), "trust", "--yes", "--workspace", str(self.ws)], env=env, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("symlinks", result.stderr)
-        self.assertIn("tool must be a regular file", self.run_code('print(link)'))
+        # Only the deprecated HX_TRUST=1 still trusts a config with symlinks; registration refuses the link itself.
+        self.assertIn("tool must be a regular file", self.run_code('print(link)', env={**self.env, "HX_TRUST": "1"}))
 
     def test_effect_capabilities_and_endpoint_grants(self):
         (self.ws / "a.txt").write_text("hello")

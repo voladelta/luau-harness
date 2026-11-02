@@ -98,7 +98,7 @@ def run_agent(run_dir, args):
         'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()})
     started=time.monotonic()
     with (run_dir/'result.json').open('w') as out, (run_dir/'stderr.log').open('w') as err:
-        proc=subprocess.Popen(argv,cwd=ROOT,env={**os.environ,'HX_TRUST':'1'},stdout=out,stderr=err,start_new_session=True)
+        proc=subprocess.Popen(argv,cwd=ROOT,env={**os.environ,'HX_TRUST':'current'},stdout=out,stderr=err,start_new_session=True)
         try:
             code=proc.wait(timeout=args.max_wall+90)
         except subprocess.TimeoutExpired:
@@ -244,7 +244,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action',choices=['prepare','run','verify'])
     parser.add_argument('--run-dir',type=Path)
-    parser.add_argument('--hx',default=str(ROOT/'target/release/hx'))
+    parser.add_argument('--hx',default=str(ROOT/'scripts/hx_trusted'))
     parser.add_argument('--max-tokens',type=int,default=None)
     parser.add_argument('--max-wall',type=int,default=900)
     parser.add_argument('--reasoning',default='medium')

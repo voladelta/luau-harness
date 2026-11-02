@@ -12,7 +12,7 @@ import json, os, random, re, subprocess, sys, tempfile, threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HX = ROOT / "target/release/hx"
+HX = ROOT / "scripts/hx_trusted"  # trusts the config written for each launch under HX_TRUST=current
 
 
 def workspace(seed):
@@ -50,7 +50,7 @@ def run(model, base_url, key_env, seed, results):
     p = subprocess.run([str(HX), "run", "--workspace", str(ws), "--prompt-file", str(ws / "task.md"), "--model", model,
                         "--base-url", base_url, "--key-env", key_env, "--context-window", "36000", "--max-output", "6000",
                         "--max-turns", "40", "--max-tokens", "2000000", "--trace", str(trace)],
-                       capture_output=True, text=True, env={**os.environ, "HX_TRUST": "1"}, timeout=1800)
+                       capture_output=True, text=True, env={**os.environ, "HX_TRUST": "current"}, timeout=1800)
     report = {}
     try:
         report = json.loads(p.stdout.strip().splitlines()[-1])

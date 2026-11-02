@@ -2,8 +2,8 @@
 # Runtime capability enforcement: a project package only gets the primitives it requested AND the user granted.
 set -u
 cd "$(dirname "$0")/.."
-export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
-H=$PWD/target/release/hx
+export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
+H=$PWD/scripts/hx_trusted
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"' EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }

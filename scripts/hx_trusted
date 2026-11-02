@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# hx for check suites that write .harness config on purpose. With HX_TRUST=current, trusts the workspace's config as it
+# is right now for this one launch, the way an owner would: HX_TRUST set to the hash `hx trust` prints. Without it, plain
+# hx. HX_BIN overrides the binary (default: target/release/hx).
+real=${HX_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/hx}
+if [ "${HX_TRUST:-}" = current ]; then
+  ws=. prev=
+  for a in "$@"; do [ "$prev" = --workspace ] && ws=$a; prev=$a; done
+  HX_TRUST=$("$real" trust --workspace "$ws" </dev/null 2>/dev/null | sed -n 's/^config hash: \([0-9a-f]*\) .*/\1/p')
+  export HX_TRUST
+fi
+exec "$real" "$@"

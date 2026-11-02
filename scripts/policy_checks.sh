@@ -3,8 +3,8 @@
 set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
-H=$PWD/target/release/hx
+export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
+H=$PWD/scripts/hx_trusted
 W=$(mktemp -d); W=$(cd "$W" && pwd -P)
 OUT=$(mktemp -d)
 S1=$OUT/sentinel.txt; ESC=$OUT/outside.txt; ESC2=$OUT/dotdot.txt; ESC3=$OUT/viadir.txt

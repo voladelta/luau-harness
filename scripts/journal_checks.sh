@@ -3,8 +3,8 @@
 set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
-H=$PWD/target/release/hx
+export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
+H=$PWD/scripts/hx_trusted
 T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; pkill -f "sleep 4242" 2>/dev/null; kill $MOCK 2>/dev/null' EXIT
 MOCK=
 pass=0; fail=0

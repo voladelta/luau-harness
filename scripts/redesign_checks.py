@@ -17,7 +17,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
-HX = Path(os.environ.get("HX_BIN", ROOT / "target/release/hx")).resolve()
+# hx_trusted runs HX_BIN (default target/release/hx); with HX_TRUST=current it trusts the config written for each launch.
+HX = ROOT / "scripts/hx_trusted"
 if os.environ.get("HX_CHECK_ARTIFACTS"):
     _artifact_root = Path(os.environ["HX_CHECK_ARTIFACTS"])
     _artifact_root.mkdir(parents=True, exist_ok=True)
@@ -25,7 +26,7 @@ if os.environ.get("HX_CHECK_ARTIFACTS"):
 else:
     BASE = Path(tempfile.mkdtemp(prefix="hx-redesign-"))
 BASE.mkdir(parents=True, exist_ok=True)
-ENV = {**os.environ, "HX_TRUST": "1", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1"}  # backoff: host.rs unit test
+ENV = {**os.environ, "HX_TRUST": "current", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1"}  # backoff: host.rs unit test
 for key in ("HX_MODEL", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
     ENV.pop(key, None)
 passed = 0

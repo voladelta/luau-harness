@@ -94,12 +94,18 @@ require("std/recheck").enabled = true
 
 ## Workspace trust
 
-`.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/` and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands or pre-approve packages and skills. hx ignores that config until you review it with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model).
+`.harness/{policy,mcp,ar}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/`, `.harness/versions/` (what `hx rollback` restores) and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model), `hx run` and `hx exec` refuse to start:
 
+```text
+Error: this workspace's config is not trusted (.harness/policy.toml); review it and run `hx trust`, or pass --ignore-config to run without it
+```
+
+- `--ignore-config` runs without any of this workspace's config, trusted or not.
 - Any edit makes the workspace untrusted again.
+- `hx run --resume` is never refused: a resumed run uses only its frozen manifest.
 - `hx approve`, `hx accept` and `hx rollback` keep an already trusted workspace trusted.
 - A workspace without such files needs nothing.
-- `HX_TRUST=1` in hx's environment trusts the workspace for one launch (tests, throwaway copies).
+- `HX_TRUST=HASH` in hx's environment trusts exactly that config for one launch (throwaway copies, scripts); `hx trust` prints the hash. `HX_TRUST=1`, which trusted any config, is deprecated: it still works in this release and prints a note.
 
 ## Approvals and `hx.lock`
 

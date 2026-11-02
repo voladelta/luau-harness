@@ -3,8 +3,10 @@
 //! write them, but whoever wrote the repo can, so a cloned repo could widen file-tool access, start MCP commands or
 //! pre-approve its own packages and skills. hx therefore uses that config only when the user has trusted its exact
 //! content: `hx trust` records a hash per workspace in `~/.config/hx/trust.toml` (outside every repo, protected from
-//! the model). Untrusted config is ignored as if absent; a workspace with none of these files needs no trust.
-//! `HX_TRUST=1` in hx's own environment trusts the workspace for that launch (tests, throwaway copies).
+//! the model). `hx run` and `hx exec` refuse untrusted config unless `--ignore-config` asks to run without it; other
+//! commands ignore it as if absent. A workspace with none of these files needs no trust. `HX_TRUST=<hash>` in hx's own
+//! environment trusts that exact config for one launch (throwaway copies); `HX_TRUST=1`, which trusted any config, is
+//! deprecated and still accepted for one release.
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -120,18 +122,42 @@ fn read_store() -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// May hx use this workspace's config? Yes when there is none, when HX_TRUST=1, or when its hash was trusted.
+static IGNORE_CONFIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--ignore-config`: use none of this workspace's config for this launch, trusted or not.
+pub fn ignore_config() {
+    IGNORE_CONFIG.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// May hx use this workspace's config? Yes when there is none, when `HX_TRUST` names its hash (or is the deprecated
+/// `1`), or when its hash was trusted; never with `--ignore-config`.
 pub fn is_trusted(ws: &Path) -> bool {
-    if std::env::var("HX_TRUST").is_ok_and(|v| v == "1") {
-        return true;
-    }
-    if !symlinks(ws).is_empty() {
+    if IGNORE_CONFIG.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
-    match config_hash(ws) {
-        None => true,
-        Some(h) => read_store().get(&key(ws)) == Some(&h),
+    let Some(h) = config_hash(ws) else { return true };
+    match std::env::var("HX_TRUST").as_deref() {
+        Ok("1") => {
+            static NOTED: std::sync::Once = std::sync::Once::new();
+            NOTED.call_once(|| eprintln!("hx: note: HX_TRUST=1 is deprecated and will stop working in the next release; set HX_TRUST to the config hash `hx trust` shows"));
+            return true;
+        },
+        Ok(v) if v == h && symlinks(ws).is_empty() => return true,
+        _ => {},
     }
+    symlinks(ws).is_empty() && read_store().get(&key(ws)) == Some(&h)
+}
+
+/// `hx run` and `hx exec` refuse to start over workspace config the user has not trusted, rather than silently
+/// running without it.
+pub fn require_trusted(ws: &Path) -> Result<()> {
+    if IGNORE_CONFIG.load(std::sync::atomic::Ordering::Relaxed) || is_trusted(ws) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this workspace's config is not trusted ({}); review it and run `hx trust`, or pass --ignore-config to run without it",
+        config_files(ws).join(", ")
+    )
 }
 
 /// Record the workspace's current config as trusted. Returns the hash (None: nothing to trust).
@@ -166,7 +192,7 @@ pub struct Retrust {
 
 impl Retrust {
     pub fn before(ws: &Path) -> Retrust {
-        // HX_TRUST=1 is consent for one launch only: it must not make the trust permanent here
+        // HX_TRUST is consent for one launch only: it must not make the trust permanent here
         let stored = symlinks(ws).is_empty() && config_hash(ws).is_some_and(|h| read_store().get(&key(ws)) == Some(&h));
         Retrust { ws: ws.to_path_buf(), was: config_hash(ws).is_none() || stored }
     }
@@ -175,18 +201,8 @@ impl Retrust {
         if self.was {
             record(&self.ws)?;
         } else {
-            eprintln!("note: this workspace's .harness config is not trusted, so hx ignores it; review it and run `hx trust`");
+            eprintln!("note: this workspace's .harness config is not trusted, so `hx run` refuses it; review it and run `hx trust`");
         }
         Ok(())
-    }
-}
-
-/// One stderr line when a run or exec starts with config that is being ignored.
-pub fn warn_if_untrusted(ws: &Path) {
-    if !is_trusted(ws) {
-        eprintln!(
-            "warning: ignoring untrusted workspace config ({}); review it and run `hx trust` to use it",
-            config_files(ws).join(", ")
-        );
     }
 }

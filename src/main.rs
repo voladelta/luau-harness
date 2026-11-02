@@ -76,7 +76,7 @@ COMMANDS:
     test         run a package's tests/*.luau
     approve      lock a project package or skill and grant the capabilities it requests
     skills       list skills in .agents/skills and ~/.agents/skills and whether each is approved
-    trust        review this workspace's .harness config and hx.lock, then trust it (untrusted config is ignored)
+    trust        review this workspace's .harness config and hx.lock, then trust it (runs refuse untrusted config)
     staged       list what the agent staged: packages and harness-module replacements
     accept       review and activate something staged
     reject       discard something staged
@@ -128,6 +128,7 @@ const FLAGS: &[Flag] = {
         flag(&[], "--workspace", Text, "DIR", "workspace root (default: .)"),
         flag(&[], "--approval", Text, "MODE", "prompt (default) or deny: handle requests outside standing permissions"),
         flag(&["run", "exec"], "--yes", Switch, "", "autopilot: approve ordinary path and tool requests for this run without asking (never irreversible commands)"),
+        flag(&["run", "exec"], "--ignore-config", Switch, "", "run without this workspace's .harness config and hx.lock (instead of refusing untrusted config)"),
         flag(&["run", "exec"], "--pack", Text, "A,B", "extra packs: std/authoring (agent-written tools), std/vision (view() shows images)"),
         flag(RUN, "--resume", Text, "LOG", "restore frozen settings and checkpoint into a fresh VM; do not repeat flags"),
         flag(RUN, "--branch", Text, "LOG", "start a new run with current approved configuration and inherited durable data"),
@@ -191,7 +192,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
         "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
         "staged" => "hx staged\n\nList what the agent staged: packages (NAME) and harness-module replacements (std/MODULE).\n",
-        "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp}.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, hx.lock) and trust its exact content. Until then hx ignores it: a cloned repo cannot widen file-tool access, start MCP\nservers or pre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=1 trusts the workspace for one launch.\n",
+        "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp,ar}.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, .harness/versions/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n",
         "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate it. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
@@ -339,18 +340,16 @@ async fn real_main() -> Result<()> {
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
     let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, has(&args, "--yes"), arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), episode)?)) };
+    if has(&args, "--ignore-config") { trust::ignore_config(); }
+    // A resumed run uses only its frozen manifest, so workspace config edited since launch neither changes nor blocks it.
+    if matches!(args[0].as_str(), "exec" | "run") && !has(&args, "--resume") { trust::require_trusted(&workspace)?; }
     match args[0].as_str() {
-        "exec" => {
-            trust::warn_if_untrusted(&workspace);
-            cmd_exec(&args, mk_policy(None)?).await
-        }
+        "exec" => cmd_exec(&args, mk_policy(None)?).await,
         "run" if has(&args, "--ar") => {
-            trust::warn_if_untrusted(&workspace);
             confine::note();
             cmd_ar(&args, &workspace).await
         }
         "run" => {
-            trust::warn_if_untrusted(&workspace);
             confine::note();
             // A child run of an autoresearch episode: the episode becomes part of its frozen policy.
             cmd_run(&args, workspace.clone(), mk_policy(ar::load_episode()?)?).await
@@ -560,11 +559,12 @@ fn cmd_trust(args: &[String], workspace: &Path) -> Result<()> {
         println!("already trusted");
         return Ok(());
     }
+    println!("config hash: {} (HX_TRUST={0} trusts exactly this config for one launch)", trust::config_hash(workspace).unwrap_or_default());
     if !has(args, "--yes") {
         confirm("trust this config? hx will apply it (file-tool policy, MCP servers, packages, skills, overrides)")?;
     }
     let h = trust::record(workspace)?.unwrap_or_default();
-    println!("trusted {} ({}…)", workspace.display(), &h[..12.min(h.len())]);
+    println!("trusted {} ({h})", workspace.display());
     Ok(())
 }
 

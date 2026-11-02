@@ -93,7 +93,7 @@ def run_agent(run,args):
         'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()})
     started=time.monotonic()
     with (run/'result.json').open('w') as out,(run/'stderr.log').open('w') as err:
-        proc=subprocess.Popen(argv,cwd=ROOT,env={**os.environ,'HX_TRUST':'1'},stdout=out,stderr=err,start_new_session=True)
+        proc=subprocess.Popen(argv,cwd=ROOT,env={**os.environ,'HX_TRUST':'current'},stdout=out,stderr=err,start_new_session=True)
         try:code=proc.wait(timeout=args.max_wall+90)
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid,signal.SIGTERM)
@@ -115,7 +115,7 @@ def main():
     p.add_argument('--run-dir',type=Path)
     p.add_argument('--task-dir',type=Path,default=TASK)
     p.add_argument('--verifier-image',default=VERIFIER_IMAGE)
-    p.add_argument('--hx',default=str(ROOT/'target/release/hx'))
+    p.add_argument('--hx',default=str(ROOT/'scripts/hx_trusted'))
     p.add_argument('--model',default='deepseek-flash')
     p.add_argument('--base-url',default=None)
     p.add_argument('--key-env',default=None)

@@ -16,7 +16,7 @@ Every command takes `--help`.
 | `hx test PKG_DIR` | Run a package's `tests/*.luau`; exits 1 on failure |
 | `hx approve PKG` | Lock a project package's or skill's hash and grant the capabilities it requests |
 | `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and whether each is approved |
-| `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
+| `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, print its hash, then trust it; runs refuse untrusted config |
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
 | `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
 | `hx log verify FILE` | Check a log's hash chain and recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
@@ -32,6 +32,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | Flag | Default | Meaning |
 |---|---|---|
 | `--prompt-file F` | | Read the task from a file instead of a positional prompt |
+| `--ignore-config` | off | Run without this workspace's `.harness` config and `hx.lock`; without it, untrusted config makes `hx run` and `hx exec` exit with an error (see [workspace trust](configuration.md#workspace-trust)). Also accepted by `hx exec` |
 | `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run; irreversible commands still need an exact `allow` entry or a terminal answer |
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
@@ -64,7 +65,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--workspace DIR` | Workspace root (default `.`) |
 | `--approval prompt\|deny` | Override the configured approval mode (default `prompt`); cannot combine with `--yes` |
 
-Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=1` trusts the workspace for one launch (see [workspace trust](configuration.md#workspace-trust)).
+Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=HASH` trusts exactly the config with that hash for one launch (`HX_TRUST=1` is deprecated; see [workspace trust](configuration.md#workspace-trust)).
 
 ## Report and logs
 
