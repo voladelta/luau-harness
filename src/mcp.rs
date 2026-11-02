@@ -258,6 +258,10 @@ impl Mcp {
             }
         }
         cmd.current_dir(&self.pol.workspace).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+        // The server gets the run's file policy as it stands at its start, like a shell command.
+        if let Some(ruleset) = self.pol.confinement().prepare().map_err(|e| anyhow!("MCP server {server}: cannot prepare confinement: {e}"))? {
+            unsafe { cmd.pre_exec(move || ruleset.apply()); }
+        }
         let mut child = cmd.spawn().map_err(|e| anyhow!("cannot start MCP server {server}: {e}"))?;
         let stdin = child.stdin.take().unwrap();
         let out = BufReader::new(child.stdout.take().unwrap());

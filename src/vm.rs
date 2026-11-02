@@ -604,6 +604,7 @@ impl Vm {
         // ---- extension API: installed packages, agent-defined tools, staging for promotion ----
         let pres = registry.clone();
         hx.set("autopilot", policy.autopilot)?;
+        hx.set("confined", crate::confine::status().is_ok())?;
         hx.set("limits", crate::values::copy_in(&lua, &prims::prompt_limits())?)?;
         hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_names.clone()))?)?;
         hx.set("packages", lua.create_function(move |lua, ()| crate::values::copy_in(lua, &serde_json::to_value(&pres.packages).map_err(mlua::Error::external)?))?)?;

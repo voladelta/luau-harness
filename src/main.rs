@@ -1,5 +1,6 @@
 mod ar;
 mod atomic_file;
+mod confine;
 mod effects;
 mod eventlog;
 mod host;
@@ -345,10 +346,12 @@ async fn real_main() -> Result<()> {
         }
         "run" if has(&args, "--ar") => {
             trust::warn_if_untrusted(&workspace);
+            confine::note();
             cmd_ar(&args, &workspace).await
         }
         "run" => {
             trust::warn_if_untrusted(&workspace);
+            confine::note();
             // A child run of an autoresearch episode: the episode becomes part of its frozen policy.
             cmd_run(&args, workspace.clone(), mk_policy(ar::load_episode()?)?).await
         }

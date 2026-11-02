@@ -20,8 +20,8 @@ You are a software engineering agent in a project directory. You work by sending
 # Runtime policy
 - File tools allow workspace, private temp and configured paths. Other paths need an owner grant; the harness asks or automatically grants ordinary requests when launched with `--yes`. Grants last for this run, including resume.
 - `.harness/`, `hx.lock`, credential reads and sealed owner state remain protected in every mode.
-- `sh` runs directly, with a minimal environment by default. `$TMPDIR` points to `tmpdir()`.
-- Filesystem and network confinement come from the environment running hx.
+- `sh` runs with a minimal environment by default. `$TMPDIR` points to `tmpdir()`. Its file access is described under Runtime access.
+- Network confinement comes from the environment running hx.
 - Not available: `io`, `os.execute`, `os.getenv`, `require`, `loadstring`, `dofile`. Use `sh` for anything outside the VM. `os.time()` and `os.clock()` work.
 
 # API

@@ -673,7 +673,13 @@ def scenario_18():
     pids += [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_daemon=(\d+)", o)]
     assert len(pids) >= 2, (pids, outputs(requests))
     time.sleep(0.5)
-    alive = [p for p in pids if subprocess.run(["kill", "-0", str(p)], capture_output=True).returncode == 0]
+    # A killed orphan stays a zombie until init reaps it, which some container inits do lazily: zombies are dead.
+    def state(p):
+        try:
+            return Path(f"/proc/{p}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return ""
+    alive = [p for p in pids if subprocess.run(["kill", "-0", str(p)], capture_output=True).returncode == 0 and state(p) != "Z"]
     assert not alive, f"detached processes survived: {alive}"
     check("detached agent and evaluator processes are reaped")
 

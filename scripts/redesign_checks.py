@@ -314,7 +314,7 @@ def branch_saved_state():
 
 
 def unknown_abandon():
-    # Shell commands run directly in either policy mode.
+    # Shell commands run in either policy mode.
     path = workspace("abandon")
     code = 'print(sh("printf x >> again.txt").code)'
     with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
@@ -474,7 +474,7 @@ print("CHILDREN_OK")'''
 
 
 def interrupted_sh_needs_owner():
-    # Shell commands run directly and may act outside the workspace in either policy mode.
+    # Shell commands run and are uncertain after a crash in either policy mode.
     code = 'print(sh("printf x >> again.txt").code)'
     for name, flags in [("default", ()), ("autopilot", ("--yes",))]:
         with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):

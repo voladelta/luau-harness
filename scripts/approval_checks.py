@@ -9,6 +9,7 @@ import select
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -17,8 +18,9 @@ import redesign_checks as harness
 HX = str(harness.HX)
 
 
-def terminal(args, answers=(), env=None, timeout=10):
-    """Give hx a real controlling terminal; only the owner side supplies approval answers."""
+def terminal(args, answers=(), env=None, timeout=10, react=None):
+    """Give hx a real controlling terminal; only the owner side supplies approval answers. `react(output)` runs after
+    each chunk of output, so the owner side can change files between steps."""
     child_env = {**harness.ENV, **(env or {})}
     pid, fd = pty.fork()
     if pid == 0:
@@ -39,6 +41,8 @@ def terminal(args, answers=(), env=None, timeout=10):
                 if not chunk:
                     break
                 output.extend(chunk)
+                if react:
+                    react(bytes(output))
                 prompts = output.count(b"[y/N]")
                 while answered < min(prompts, len(answers)):
                     os.write(fd, (answers[answered] + "\n").encode())
@@ -162,9 +166,21 @@ class Approvals(unittest.TestCase):
         target = self.outside / "read-target"
         target.write_text("first")
         code = (f'print(read("{target}")); '
-                f'sh("rm {target}; mkdir {target}; echo hidden > {target}/child.txt"); '
+                f'sh("sleep 2"); '
                 f'print(pcall(search,"hidden",{{path="{target}"}}))')
-        status, out = terminal(self.command(code), ["y", "n"])
+
+        def replace():
+            target.unlink()
+            target.mkdir()
+            (target / "child.txt").write_text("hidden")
+        timer = threading.Timer(1, replace)
+
+        def swap(output):
+            # The owner side replaces the file while the agent sleeps after reading it (once the read is approved): a
+            # confined shell cannot write outside the roots.
+            if b"[y/N]" in output and not timer.is_alive() and not target.is_dir():
+                timer.start()
+        status, out = terminal(self.command(code), ["y", "n"], react=swap)
         self.assertEqual(status, 0, out)
         self.assertEqual(out.count("[approval needed]"), 2, out)
         self.assertIn("user declined", out)

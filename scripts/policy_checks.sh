@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# File-tool policy and direct shell execution checks. Run after `cargo build --release`.
+# File-tool policy and shell confinement checks. Run after `cargo build --release`.
 set -u
 cd "$(dirname "$0")/.."
+source scripts/check_helpers.sh
 export HX_TRUST=1 XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose; trust_checks.sh tests trust
 H=$PWD/target/release/hx
 W=$(mktemp -d); W=$(cd "$W" && pwd -P)
@@ -75,10 +76,26 @@ out=$(run 'print(sh("env").stdout)')
 check "no API keys in sh env" "$(echo "$out" | grep -ci 'API_KEY\|TOKEN\|SECRET_')" "0"
 check "HOME is the run's temp dir, not the real home" "$(echo "$out" | grep '^HOME=' | grep -c "$HOME\$")" "0"
 
-# --- shell access is controlled by the outer environment, independently of file-tool roots
-out=$(run "print(sh('cat $S1; echo written > $ESC').stdout)" | head -1)
-check "shell runs directly and can read beyond file-tool roots" "$out" "SECRET"
-check "shell writes beyond file-tool roots" "$(cat "$ESC")" "written"
+# --- shell confinement: Landlock applies the file policy to shell commands when the kernel offers it
+run 'print(1)' >/dev/null
+if unconfined "$W"; then
+  echo "skip Landlock is unavailable here: shell commands run unconfined, so only that is checked"
+  out=$(run "print(sh('cat $S1; echo written > $ESC').stdout)" | head -1)
+  check "unconfined shell reads and writes beyond file-tool roots" "$out$(cat "$ESC")" "SECRETwritten"
+else
+  echo CREDENTIAL > $W/.harness/secrets.toml; echo PUBLIC > $W/README.md
+  out=$(run 'local s, r = sh("cat .harness/secrets.toml"), sh("cat README.md") print(s.code ~= 0, s.stdout == "", r.stdout)' | head -1)
+  check "confined shell cannot read .harness/secrets.toml but reads README.md" "$(echo "$out" | tr '\t' '|')" "true|true|PUBLIC"
+  out=$(run 'sh("cp .harness/secrets.toml copied.txt; mkdir -p d; mv .harness/secrets.toml d/moved.txt; ln d/moved.txt linked.txt")' \
+    'print(sh("cat copied.txt d/moved.txt linked.txt 2>/dev/null").stdout == "")' | sed -n 3p)
+  check "a credential file copied, moved or hard-linked stays unreadable to later commands of the run" "$out" "true"
+  rm -rf $W/d $W/linked.txt $W/copied.txt
+  out=$(run "local r = sh('cat $S1; echo written > $ESC') print(r.code ~= 0, r.stdout == '')" | head -1)
+  check "confined shell cannot read or write beyond the roots" "$(echo "$out" | tr '\t' '|')$([ -e $ESC ] && echo WROTE)" "true|true"
+  out=$($H exec --workspace "$W" --yes "read(\"$S1\") print(sh('cat $S1').stdout)" 2>&1 | head -1)
+  check "a path grant approved mid-run applies to later shell commands" "$out" "SECRET"
+  rm -f $W/.harness/secrets.toml
+fi
 
 # --- timeout kills the whole process group
 out=$(run 'local r = sh("sleep 987 & sleep 987", {timeout = 1}) print(r.timed_out)')

@@ -127,15 +127,21 @@ pub(super) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Run an evaluator on `files` placed into a fresh copy of the frozen base. Returns (score, valid, se, report).
-/// Failures of the evaluator become invalid results, not errors.
-pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
+/// Failures of the evaluator become invalid results, not errors. Where Landlock is available the evaluator may read
+/// only the system, its scratch copy and its `grader` roots (plus `holdout` for the select evaluator), and write only
+/// its scratch copy.
+pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, holdout: bool) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
     let scratch = Scratch::new("eval")?;
     let tree = scratch.0.join("tree");
     copy_tree(&run.join("base"), &tree)?;
     place(&tree, spec, files)?;
     let tmp = scratch.0.join("tmp");
     std::fs::create_dir(&tmp)?;
-    let env = crate::prims::ShellEnv { env: Some(evaluator_env(&tmp)) };
+    let mut read = crate::policy::system_read_roots();
+    read.extend(spec.roots(holdout)?);
+    read.push(scratch.0.clone());
+    let rules = crate::confine::Rules { read, write: vec![scratch.0.clone()], hidden: vec![] }.with_system();
+    let env = crate::prims::ShellEnv { env: Some(evaluator_env(&tmp)), confine: rules.prepare()?.map(std::sync::Arc::new) };
     let (stdout, stderr, code, timed_out, _) = crate::prims::shell(&env, cmd, tree, spec.timeout).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let stdout = String::from_utf8_lossy(&stdout);

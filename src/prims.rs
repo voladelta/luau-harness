@@ -1,5 +1,5 @@
 //! Native primitives: read, write, edit, sh and search. Every effect goes through
-//! `Effects` and every path through `Policy`; process isolation is supplied externally.
+//! `Effects` and every path through `Policy`; shell commands are confined to the policy's roots where Landlock exists.
 use crate::effects::{rt, Effects, Ret};
 use crate::policy::Class;
 use anyhow::Result;
@@ -204,7 +204,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
-                let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol), &cmd, cwd, secs).await?;
+                let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol)?, &cmd, cwd, secs).await?;
                 Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None, approval })
             }).await?;
             match ret {
@@ -360,18 +360,21 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
     Ok(Ok((rows, capped)))
 }
 
-/// A shell command's environment (None: inherited).
+/// A shell command's environment (None: inherited) and its kernel confinement (None: unconfined).
 pub struct ShellEnv {
     pub env: Option<Vec<(String, String)>>,
+    pub confine: Option<Arc<crate::confine::Ruleset>>,
 }
 impl ShellEnv {
-    /// The agent's `sh`: scrub credentials by default and in every autoresearch episode.
-    pub fn agent(pol: &crate::policy::Policy) -> ShellEnv {
-        ShellEnv { env: Some(pol.env()) }
+    /// The agent's `sh`: scrub credentials by default and in every autoresearch episode, and confine it to the run's
+    /// current file policy (grants approved so far included).
+    pub fn agent(pol: &crate::policy::Policy) -> mlua::Result<ShellEnv> {
+        let confine = pol.confinement().prepare().map_err(|e| rt(format!("sh: cannot prepare confinement: {e}")))?;
+        Ok(ShellEnv { env: Some(pol.env()), confine: confine.map(Arc::new) })
     }
 }
 
-/// Run `cmd` directly with bash: own process group, capped output, killed at `secs`.
+/// Run `cmd` with bash: own process group, Landlock ruleset when given, capped output, killed at `secs`.
 /// -> (stdout, stderr, exit code, timed out, either stream cut to its first and last MAX_CAPTURE / 2 bytes)
 pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool, bool)> {
     let mut command = tokio::process::Command::new("bash");
@@ -384,13 +387,15 @@ pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // Own process group (killed as a whole), and a cap on how many processes this user may have, so a fork
-    // bomb inside `sh` hits EAGAIN instead of taking the machine down.
+    // Own process group (killed as a whole), a cap on how many processes this user may have, so a fork bomb inside
+    // `sh` hits EAGAIN instead of taking the machine down, and the Landlock ruleset (applied last, after setsid).
+    let confine = env.confine.clone();
     unsafe {
         command.pre_exec(move || {
             libc::setsid();
             let lim = libc::rlimit { rlim_cur: nproc_cap, rlim_max: nproc_cap };
             libc::setrlimit(libc::RLIMIT_NPROC, &lim);
+            if let Some(ruleset) = &confine { ruleset.apply()?; }
             Ok(())
         });
     }

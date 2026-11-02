@@ -3,16 +3,16 @@
 //!
 //! The task supplies `.harness/ar.toml` (editable paths, evaluator commands, grader and holdout roots) and the program
 //! text (`--prompt-file`). At launch the committed tree is frozen into the run's `base`. Episodes work in copies of the owner's
-//! workspace; filesystem isolation must be supplied externally:
+//! workspace; on Linux, Landlock confines their processes to their files (network isolation is external):
 //!
 //! - Every episode is a fresh child `hx run` in a throwaway copy of `base` holding the state it starts from. Only
 //!   snapshots of the editable paths ever leave an episode.
 //! - `ar.eval` snapshots the editable files and scores the snapshot in a second throwaway copy of `base`, so the
 //!   evaluator sees exactly the recorded bytes and nothing else the agent did.
-//! - Evaluators run directly with a scrubbed environment in a throwaway copy. Network and filesystem
-//!   restrictions, including held-out data isolation, must be supplied externally.
+//! - Evaluators run with a scrubbed environment in a throwaway copy, confined (Landlock) to that copy, the system and
+//!   their grader roots; only the select evaluator may read the holdout roots.
 //! - The run directory (`.harness/ar/RUN`, with `base`, snapshots, ledger, claims, journal and held-out scores) is
-//!   sealed from file tools in every mode; shell access must be confined externally.
+//!   sealed from file tools and from confined shell commands in every mode.
 //!
 //! A run is research, then rounds. A research episode studies the task and writes the brief every worker gets. Round 1
 //! runs explore workers side by side; each derives its own idea from a host seed and claims it with `ar.claim`. Claims
@@ -283,7 +283,7 @@ impl Orchestrator {
     /// Score the seed with the search evaluator before any episode, so every episode knows where it starts. Kept in
     /// `seed.json` (written whole or not at all), outside the ledger, which holds the agents' evaluations.
     async fn baseline(&self) -> Result<()> {
-        let (score, valid, _, report) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &self.seed()?)?, &self.spec().eval).await?;
+        let (score, valid, _, report) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &self.seed()?)?, &self.spec().eval, false).await?;
         eprintln!("hx ar: seed scores {}", if valid { show(score) } else { "invalid".into() });
         let tmp = self.dir.join("seed.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&json!({"score": score.filter(|_| valid), "report": report}))?)?;
@@ -305,7 +305,7 @@ impl Orchestrator {
         if let Some(score) = self.records()?.into_iter().find_map(|r| match r { Record::Selected { snap: s, score } if s == snap => Some(score), _ => None }) {
             return Ok(score);
         }
-        let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, snap)?, &cmd).await?;
+        let (score, valid, _, _) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, snap)?, &cmd, true).await?;
         let score = score.filter(|_| valid);
         self.journal(&Record::Selected { snap: snap.into(), score })?;
         Ok(score)

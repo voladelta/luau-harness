@@ -20,3 +20,8 @@ while time.monotonic() < deadline:
 sys.exit("test synchronization file did not appear within 5s: " + sys.argv[1])
 PY
 }
+
+# unconfined DIR: did hx runs in workspace DIR record that Landlock is unavailable (children run unconfined)?
+unconfined() {
+  grep -qh '"confinement":"off' "$1"/.harness/log/*.jsonl 2>/dev/null
+}

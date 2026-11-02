@@ -1,6 +1,6 @@
-//! Capability policy for model-reachable effects. Process isolation belongs to the environment running hx.
-//! File tools check canonical paths, protect harness configuration, and reject credential files.
-//! Shell commands retain approval checks, a scrubbed environment and process cleanup, but run directly.
+//! Capability policy for model-reachable effects. File tools check canonical paths, protect harness configuration, and
+//! reject credential files. Shell commands keep approval checks, a scrubbed environment and process cleanup, and on
+//! Linux the same file roots through Landlock (`confinement`, `crate::confine`). Network isolation is external.
 use crate::eventlog::EventLog;
 use anyhow::{bail, Result};
 use serde_json::json;
@@ -82,6 +82,9 @@ pub struct Policy {
     cfg: Snapshot,
     pub log: Arc<EventLog>,
     grants: std::sync::Mutex<Vec<PathGrant>>,
+    /// Files and directories hidden from children, by (device, inode), with where each was last seen: a child may move
+    /// or hard-link a hidden file it cannot read, and the next command's ruleset must still hide it.
+    hidden: std::sync::Mutex<std::collections::BTreeMap<(u64, u64), PathBuf>>,
     prompt: tokio::sync::Mutex<()>,
     /// An autoresearch worker's claim and best score, when `episode` is set.
     pub ar_progress: std::sync::Mutex<crate::ar::Progress>,
@@ -387,9 +390,12 @@ impl Policy {
             // The orchestrator retries an episode as a new child and never resumes one; a stale episode must not get `ar`.
             anyhow::ensure!(p.episode.is_none(), "this run was an autoresearch episode; continue the search with `hx run --ar --resume .harness/ar/RUN`");
             log.check()?;
+            if crate::confine::status().is_err() {
+                log.write("confinement", json!({"confinement": crate::confine::describe()}), true)?;
+            }
             let grants = crate::eventlog::load(path)?.iter().filter(|r| r["kind"] == "path_grant")
                 .map(|r| serde_json::from_value(r["grant"].clone())).collect::<std::result::Result<Vec<PathGrant>, _>>()?;
-            return Ok(Policy { cfg: p, log, grants: grants.into(), prompt: Default::default(), ar_progress: Default::default() });
+            return Ok(Policy { cfg: p, log, grants: grants.into(), hidden: Default::default(), prompt: Default::default(), ar_progress: Default::default() });
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
@@ -445,14 +451,64 @@ impl Policy {
         // Automatic approval never disables the audit log.
         let log = EventLog::open(&workspace.join(".harness/log"))?;
         log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,
-            "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha}), true)?;
+            "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha,
+            "confinement": crate::confine::describe()}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
         let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
-        Ok(Policy { cfg: p, log, grants: Default::default(), prompt: Default::default(), ar_progress })
+        Ok(Policy { cfg: p, log, grants: Default::default(), hidden: Default::default(), prompt: Default::default(), ar_progress })
     }
 
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
+
+    /// What a child process (`sh`, a local MCP server) may touch, from the current policy and the grants approved so
+    /// far: the read roots minus credentials, sealed owner state and the trust store; the write roots. Built per spawn,
+    /// so a grant approved mid-run applies to later commands. Protected configuration inside a write root stays
+    /// writable by children: Landlock cannot carve a hole in a writable tree without breaking file creation in it.
+    pub fn confinement(&self) -> crate::confine::Rules {
+        let (mut read, mut write) = (self.read_roots.clone(), self.write_roots.clone());
+        for g in self.grants.lock().unwrap().iter() {
+            read.push(g.path.clone());
+            if g.write { write.push(g.path.clone()); }
+        }
+        let mut hidden = self.sealed.clone();
+        hidden.push(self.workspace.join(".harness/secrets.toml"));
+        hidden.extend(crate::trust::store_dir_canonical());
+        hidden.extend(self.track_hidden(&hidden, &write));
+        crate::confine::Rules { read, write, hidden }.with_system()
+    }
+
+    /// Where the hidden files seen so far are now. A file moved away from its hidden path, or given a second name by a
+    /// hard link, is found again by its inode under the write roots (the only places a child can put it).
+    fn track_hidden(&self, paths: &[PathBuf], write_roots: &[PathBuf]) -> Vec<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let mut seen = self.hidden.lock().unwrap();
+        let mut linked = false;
+        for p in paths {
+            if let Ok(m) = std::fs::symlink_metadata(p) {
+                seen.insert((m.dev(), m.ino()), p.clone());
+                linked |= !m.is_dir() && m.nlink() > 1;
+            }
+        }
+        let moved = seen.iter().any(|(&(dev, ino), p)| !std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (dev, ino)));
+        if !moved && !linked { return seen.values().cloned().collect(); }
+        let mut found = vec![];
+        fn walk(dir: &Path, seen: &std::collections::BTreeMap<(u64, u64), PathBuf>, found: &mut Vec<(u64, u64, PathBuf)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let Ok(m) = std::fs::symlink_metadata(entry.path()) else { continue };
+                if seen.contains_key(&(m.dev(), m.ino())) { found.push((m.dev(), m.ino(), entry.path())); }
+                if m.is_dir() { walk(&entry.path(), seen, found); }
+            }
+        }
+        for root in write_roots { walk(root, &seen, &mut found); }
+        let mut out: Vec<PathBuf> = found.iter().map(|(_, _, p)| p.clone()).collect();
+        // Keep one known place per inode; an inode found nowhere was deleted.
+        seen.retain(|key, _| found.iter().any(|(d, i, _)| (*d, *i) == *key) || paths.iter().any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == *key)));
+        for (dev, ino, p) in found { seen.insert((dev, ino), p); }
+        out.extend(seen.values().cloned());
+        out
+    }
 
     /// Effect class of a shell command: the highest class of its simple commands.
     pub fn classify_sh(&self, cmd: &str) -> Class {
@@ -618,6 +674,11 @@ impl Policy {
         v
     }
 
+}
+
+/// The system and toolchain directories every child may read (autoresearch evaluators, which have no run policy).
+pub fn system_read_roots() -> Vec<PathBuf> {
+    SYSTEM_READ.iter().filter_map(canon).chain(toolchain_roots()).collect()
 }
 
 /// A logged path is not authority to remove arbitrary directories on shutdown. Scratch paths must be direct,

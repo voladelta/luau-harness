@@ -1,9 +1,12 @@
 -- Prompt assembly: system sections, the model tool schema, and controller nudges.
 local M = {}
 
--- Process access is supplied by the environment running hx, independently of file-tool policy.
-function M.runtime_access(text: string, has_mcp: boolean, autopilot: boolean?): string
-	local line = "`sh` and local MCP servers run directly. Filesystem, network and GPU isolation are supplied by the environment running hx."
+-- Where the kernel offers Landlock (`confined`), shell commands and local MCP servers get the file-tool policy;
+-- network access is always supplied by the environment running hx.
+function M.runtime_access(text: string, has_mcp: boolean, autopilot: boolean?, confined: boolean?): string
+	local line = if confined
+		then "`sh` and local MCP servers are confined to the file-tool policy: they read and write only where file tools can (plus system directories), and cannot read credential files or sealed owner state. Network access is supplied by the environment running hx."
+		else "`sh` and local MCP servers run directly. Filesystem, network and GPU isolation are supplied by the environment running hx."
 	line ..= if autopilot then " The owner enabled automatic approval for ordinary file-tool path and tool requests in this run."
 		else " File tools allow workspace and configured paths; other paths require owner approval. Respect refused requests."
 	if has_mcp then
@@ -25,7 +28,7 @@ function M.fill(text: string, limits): string
 end
 
 function M.system(options): string
-	local sections = { M.runtime_access(M.fill(hx.asset("std/system.md"), hx.limits), #hx.mcp_servers() > 0, hx.autopilot) }
+	local sections = { M.runtime_access(M.fill(hx.asset("std/system.md"), hx.limits), #hx.mcp_servers() > 0, hx.autopilot, hx.confined) }
 	local recheck = require("std/recheck")
 	if recheck.enabled and (not options or options.recheck ~= false) then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
 	if hx.prompt_contributions and hx.prompt_contributions ~= "" then table.insert(sections, hx.prompt_contributions) end

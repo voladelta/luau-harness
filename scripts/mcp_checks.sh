@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MCP client checks (no API key): binding, schema signatures, approval gate, direct server execution, env scrubbing, prompt index.
+# MCP client checks (no API key): binding, schema signatures, approval gate, server confinement, env scrubbing, prompt index.
 set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
@@ -33,8 +33,13 @@ out=$(x 'print(pcall(mcp.demo.boom, {}))' | head -1)
 check "a tool error becomes a Luau error with the server's message" "$(echo "$out" | grep -c 'mcp tool error (demo.boom): boom')" "1"
 check "tool names are also reachable with a safe alias" "$(x 'print(mcp.demo["read_note"] == mcp.demo.read_note)' | head -1)" "true"
 
-# --- local servers run directly; the outer environment controls access
-check "server writes beyond the workspace" "$(x 'print(mcp.demo.write_file{path = "'$T'/outside.txt", text = "x"})' | head -1)" "wrote $T/outside.txt"
+# --- local servers get the run's file policy through Landlock when the kernel offers it, else run unconfined
+if unconfined "$W"; then
+  echo "skip Landlock is unavailable here: the server runs unconfined"
+  check "unconfined server writes beyond the workspace" "$(x 'print(mcp.demo.write_file{path = "'$T'/outside.txt", text = "x"})' | head -1)" "wrote $T/outside.txt"
+else
+  check "confined server cannot write beyond the workspace" "$(x 'print(pcall(mcp.demo.write_file, {path = "'$T'/outside.txt", text = "x"}))' | head -1 | grep -c 'Permission denied')$([ -e $T/outside.txt ] && echo WROTE)" "1"
+fi
 check "server can write inside the project" "$(x 'print(mcp.demo.write_file{path = "ok.txt", text = "x"}) ' | head -1)" "wrote ok.txt"
 python3 -c "
 import os,socket,time

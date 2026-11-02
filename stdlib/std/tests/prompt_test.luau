@@ -9,6 +9,9 @@ test.case("runtime access is a named section independent of custom prose", funct
 	local with_mcp = prompt.runtime_access(custom, true)
 	test.ok(text:find("isolation are supplied by the environment", 1, true) ~= nil)
 	test.ok(with_mcp:find("MCP tools listed below work", 1, true) ~= nil)
+	local confined = prompt.runtime_access(custom, false, false, true)
+	test.ok(confined:find("confined to the file-tool policy", 1, true) ~= nil)
+	test.ok(confined:find("Network access is supplied by the environment", 1, true) ~= nil)
 end)
 
 test.case("runtime access describes ordinary approval and autopilot separately", function()

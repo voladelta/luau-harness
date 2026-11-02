@@ -95,7 +95,7 @@ Credential lookup checks, in order:
 
 Secrets files contain top-level string assignments, for example `TINYFISH_API_KEY = "your-key"`. Blank values fall through to the next source. Without a usable key, the tool's whole registration fails and its methods stay unavailable.
 
-Secrets files are blocked from file-tool reads and searches; the external sandbox must restrict shell access. Keep them out of version control. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
+Secrets files are blocked from file-tool reads and searches, and on Linux shell commands and MCP servers cannot read them either ([shell confinement](configuration.md#shell-confinement)); without Landlock, your sandbox must restrict shell access. Keep them out of version control. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
 
 ## Included example tools
 
