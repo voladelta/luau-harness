@@ -4,14 +4,10 @@
 # (prompt_tokens) decide when the threshold is crossed.
 # Window 40000, max output 1000 => threshold min(38000, 40000-1000-16384) = 22616; a reply with prompt_tokens 23000 crosses it,
 # and the summarizer prefix still fits under 40000-16384 = 23616.
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); MP=""; trap 'rm -rf "$T"; kill $MP 2>/dev/null' EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
+MP=""
+cleanup() { kill $MP 2>/dev/null; }
 echo "TASKTEXT-SCRIPTED" > $T/p.txt
 
 # reply builders (C: a luau call with ~2000 chars of padding, so a summary is smaller than what it replaces; S: plain text; E: HTTP 400)
@@ -143,4 +139,4 @@ S8=$(R 'dump({"text": "", "calls": [{"code": "local r = agent(\"sub\")\nprint(r.
 newws a8; mock "$S8" $T/a8.req; run $W $PORT $T/a8.tr --pack std/compact; rc=$?; unmock
 check "A8 subagent crossing the threshold sends a summarizer request with the child's history" "$rc $(field finished) $(Q 's = sums("'$T'/a8.req"); print(len(s), "CHILD-MARK" in conv(s[0]), "agent(" in conv(s[0]))')" "0 True 1 True False"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

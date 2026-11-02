@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 # Extension checks, no API key: skills, tool packages, agent-written tools (deftool/promote/accept),
 # no self-approval, frozen extensions with live session state. Build first: cargo build --release
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $MOCK 2>/dev/null; pkill -f "sleep 4243" 2>/dev/null' EXIT
+cleanup() { kill $MOCK 2>/dev/null; pkill -f "sleep 4243" 2>/dev/null; }
 MOCK=
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 W=$T/ws; mkdir -p $W/.harness/pkgs/release $W/.harness/pkgs/slug
 x() { $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
 # agent-written tools are an opt-in pack: xt runs with it
@@ -144,4 +139,4 @@ echo "tampered" >> $FH/.agents/skills/craft/references/beats.md
 check "a changed agent skill disappears" "$(xa 'print(pcall(skill, "craft"))' | head -1 | grep -c 'no installed skill')" "1"
 check "hx skills reports the change" "$(HOME=$FH $H skills --workspace $A | grep -c 'craft .*changed since approval')" "1"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

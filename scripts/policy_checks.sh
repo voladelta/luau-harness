@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
 # File-tool policy and shell confinement checks. Run after `cargo build --release`.
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
 W=$(mktemp -d); W=$(cd "$W" && pwd -P)
 OUT=$(mktemp -d)
 S1=$OUT/sentinel.txt; ESC=$OUT/outside.txt; ESC2=$OUT/dotdot.txt; ESC3=$OUT/viadir.txt
 cleanup() { rm -rf "$W" "$OUT"; pkill -f "sleep 987" 2>/dev/null; }
-trap cleanup EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 run() { $H exec --workspace "$W" "$@" 2>&1; }
 
 echo SECRET > $S1; echo ORIGINAL > $W/inside.txt
@@ -101,4 +95,4 @@ fi
 out=$(run 'local r = sh("sleep 987 & sleep 987", {timeout = 1}) print(r.timed_out)')
 check "timeout kills the whole process group" "$(echo "$out" | head -1)$(sleep 1; pgrep -f 'sleep 987' | wc -l | tr -d ' ')" "true0"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

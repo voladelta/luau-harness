@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
 # Workspace trust: `hx run`/`hx exec` refuse a cloned repo's .harness config and hx.lock until the user runs `hx trust`
 # (or ignore it with --ignore-config).
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
 H=$PWD/target/release/hx
 unset HX_TRUST
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"' EXIT
 export XDG_CONFIG_HOME=$T/cfg
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 x() { $H exec --workspace $W "$@" 2>/dev/null | grep -v "^-- ops="; }
 xi() { x --ignore-config "$@"; }   # run without the workspace config
 
@@ -118,4 +114,4 @@ $H trust --workspace $W --yes >/dev/null; mrun
 check "trusted control: system.md override is used" "$(tail -1 $T/req.jsonl | grep -c PLANTED)" "1"
 check "trusted control: init.luau runs" "$(tail -1 $T/req.jsonl | grep -c 'INIT RAN')" "1"
 kill $MK 2>/dev/null
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

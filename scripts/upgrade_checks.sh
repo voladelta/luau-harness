@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 # Harness-module replacement, no API key: the agent stages -> the user reviews and accepts -> rollback.
-set -u
 cd "$(dirname "$0")/.."
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-R=$PWD; H=$R/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"' EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
+source scripts/check_helpers.sh
 W=$T/proj; mkdir -p $W/.harness
 x() { $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
 stage() { x --pack std/authoring "local r = propose_module('$1', [==[$(cat $2)]==], { reason = '${3:-}' }) print(r.ok)" | head -1; }
@@ -59,4 +54,4 @@ check "a replacement staged against a since-changed module is refused" "$($H acc
 check "the audit trail records accept and rollback" "$(python3 -c "import json;print([json.loads(l)['action'] for l in open('$W/.harness/upgrades.jsonl')])")" "['accept', 'rollback']"
 check "rollback with nothing left says so" "$($H rollback std/printer --workspace $W 2>&1 | grep -c 'nothing to roll back')" "1"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

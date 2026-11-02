@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 # Budget checks (scripted model: every call costs 10+5 tokens). No API key needed.
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M1 $M2 2>/dev/null' EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
+cleanup() { kill $M1 $M2 2>/dev/null; }
 CHUNKS='["```luau\nprint(1)\n```","```luau\nprint(2)\n```","```luau\nprint(3)\n```","```luau\nprint(4)\n```","```luau\nprint(5)\n```","done"]'
 MOCK_REPLIES="$CHUNKS" MOCK_BY_LEN=1 serve P1 python3 scripts/mock_llm.py 0 || exit 1; M1=$SERVED
 SUB='["```luau\nlocal r = agent(\"sub\")\nprint(r.answer)\n```","```luau\nprint(1)\n```","```luau\nprint(2)\n```","```luau\nprint(3)\n```","done","done"]'
@@ -48,4 +43,4 @@ check "no budget: run completes normally" "$(echo "$out" | field finished)$(echo
 check "model cannot create arbitrary coroutines" "$($H exec --workspace $W 'print(type(coroutine))' | head -1)" "nil"
 check "parallel API is absent" "$($H exec --workspace $W 'print(parallel == nil)' 2>&1 | head -1)" "true"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

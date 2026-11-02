@@ -69,22 +69,13 @@ local function repair(s, submission)
 	s.waived_checks = {}
 	return start(s, "repair", submission)
 end
+-- The host's stage.submit already refused a payload without a valid outcome, nonempty summary, evidence array, owner
+-- questions (when not complete) or well-formed checks (workflow.rs validate_submission). What remains is which fields
+-- each RPI stage requires, which only this workflow knows.
 local function valid(payload, name)
-	if type(payload) ~= "table" then return "Missing structured submission payload." end
-	if payload.outcome ~= "complete" and payload.outcome ~= "needs_input" and payload.outcome ~= "blocked" then return "Invalid outcome." end
-	if type(payload.summary) ~= "string" or payload.summary:match("^%s*$") then return "A nonempty summary is required." end
-	if type(payload.evidence) ~= "table" then return "evidence must be an array, including when empty." end
-	if payload.outcome ~= "complete" then
-		if type(payload.questions) ~= "table" or #payload.questions == 0 then return "Provide concrete owner questions for blocked or needs_input." end
-	elseif name == "program_design" then
+	if payload.outcome ~= "complete" then return nil end
+	if name == "program_design" then
 		if type(payload.checks) ~= "table" then return "Program design requires a structured checks array." end
-		local ids = {}
-		for _, check in payload.checks do
-			if type(check.id) ~= "string" or ids[check.id] or type(check.command) ~= "string" or type(check.requirements) ~= "table" then
-				return "Every check needs a unique id, command and requirements array."
-			end
-			ids[check.id] = true
-		end
 	elseif name == "verification" then
 		if type(payload.findings) ~= "table" then return "Verification requires a findings array (empty only when clean)." end
 		if type(payload.verification) ~= "table" then return "Host verification evidence is missing." end

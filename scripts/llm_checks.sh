@@ -2,14 +2,9 @@
 # Responses successes include "error": null, as real providers do.
 # LLM client checks (also: loop nudge on garbled tool-call markup): the Responses API completes a run against a scripted
 # server, and an openrouter-looking URL does not restrict the upstream provider. No API key needed.
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M 2>/dev/null' EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
+cleanup() { kill $M 2>/dev/null; }
 MOCK_REPLIES='["```luau\nprint(7)\n```","all done"]' MOCK_BY_LEN=1 MOCK_LOG=$T/req.log serve MP python3 scripts/mock_llm.py 0 || exit 1; M=$SERVED
 echo go > $T/p.txt
 W=$T/responses; mkdir -p $W/.harness; : > $T/req.log
@@ -51,4 +46,4 @@ check "the luau tool is declared in the request" "$(grep -c '"luau"' $T/tool.log
 check "requests ask for a streamed response" "$(grep -c '"stream": true' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
 check "a dropped stream is a lost response: one new request, run finishes" "$(BYLEN=0 mockrun '[{"text":"","calls":[{"code":"print(1)"}],"drop":true},"```luau\nprint(2)\n```","all done"]')" "True|all done|2|1|0"
 check "an empty reply is resent unchanged, not nudged" "$(BYLEN=0 mockrun '["```luau\nprint(7)\n```","","all done"]')|$(grep -c 'cut off or empty' $T/tool.log | tr -d ' ')" "True|all done|3|1|1|0"
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

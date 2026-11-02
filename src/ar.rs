@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 mod episode;
 pub(crate) mod files;
+mod ssot;
 pub use episode::{Episode, Progress, claim, claims, eval, load_episode, reset};
 use files::*;
 
@@ -704,7 +705,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
                     let plans = if explore {
                         (1..=workers).map(|w| -> Result<Plan> {
                             Ok(Plan { label: format!("r{round}-w{w}"), role: Role::Explore, idea: 0, start: seed.clone(), best: None,
-                                seed: Some(crate::ssot::seed()?) })
+                                seed: Some(ssot::seed()?) })
                         }).collect::<Result<Vec<_>>>()?
                     } else {
                         let (candidates, chosen) = self.last_gate()?.unwrap_or_default();

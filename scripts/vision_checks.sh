@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # Vision pack checks (scripted model, no API key): view() queues images and the next request carries them, for
 # Responses; completed resume does not reread images; without the pack nothing changes.
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; kill $M 2>/dev/null' EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
+cleanup() { kill $M 2>/dev/null; }
 W=$T/ws; mkdir -p $W
 ffmpeg -v error -f lavfi -i testsrc=size=1600x900 -frames:v 1 $W/frame.png
 REPLIES='["```luau\nlocal r = view(\"frame.png\")\nprint(r[1].width, r[1].height)\n```","done"]'
@@ -76,4 +71,4 @@ budget_run "[\"$VIEW\",\"$VIEW\",{\"status\":413,\"error\":\"Payload Too Large\"
 check "413: run finishes after compact-and-retry" "$(cat $T/reject.rc)" "0"
 check "413: the summarizer gets no images, only placeholders" "$(nth_imgs reject.jsonl 3) $(nth_has reject.jsonl 3 '[image frame.png 800x600 not shown')" "0 1"
 check "413: the retry carries the newest image" "$(nth_imgs reject.jsonl 4) $(nth_has reject.jsonl 4 'compaction-summary')" "1 1"
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

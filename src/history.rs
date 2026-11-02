@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    io::Read,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -382,6 +381,7 @@ fn load(
         hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
         "history: invalid blob hash"
     );
+    // The budget is charged per call, cache hits included, from the size on disk.
     let size = std::fs::metadata(dir.join("blobs").join(hash))?.len() as usize;
     ensure!(
         size <= MAX_SOURCE && size <= *budget,
@@ -394,25 +394,8 @@ fn load(
         index.cache.push_back(item);
         return Ok(value);
     }
-    let mut file = std::fs::File::open(dir.join("blobs").join(hash))?;
-    let mut data = Vec::with_capacity(size.min(1 << 20));
-    let mut chunk = [0u8; 65536];
-    loop {
-        check_deadline(deadline)?;
-        let n = file.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        ensure!(
-            data.len() + n <= MAX_SOURCE,
-            "history: source read limit exceeded"
-        );
-        data.extend_from_slice(&chunk[..n]);
-    }
-    ensure!(
-        crate::eventlog::sha_bytes(&data) == hash,
-        "history: content hash mismatch"
-    );
+    let data = crate::eventlog::read_blob_bounded(dir, hash, MAX_SOURCE, || check_deadline(deadline))
+        .map_err(|e| if e.to_string().starts_with("history:") { e } else { anyhow::anyhow!("history: {e}") })?;
     let value: Arc<Value> =
         Arc::new(serde_json::from_slice(&data).context("history: invalid checkpoint JSON")?);
     check_deadline(deadline)?;

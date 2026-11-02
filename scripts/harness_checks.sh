@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 # Harness checks: std tests, module overrides, sealed batches, package locks, hooks and subagents (no API key needed). Run after `cargo build --release`.
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); trap 'rm -rf "$T"; kill $MOCK 2>/dev/null' EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
+cleanup() { kill $MOCK 2>/dev/null; }
 
 # 1. std package tests (printer, hooks, mcp)
 out=$($H test stdlib/std --workspace "$T"); status=$?
@@ -144,4 +139,4 @@ LUA
   printf 'local b = require("base:std/printer")\nlocal M = {}\nfor k, v in b do M[k] = v end\nfunction M.top(v) return "X" .. b.top(v) end\nreturn M' > $W3/.harness/override/std/printer.luau ) &
 check "frozen printer refuses hot reload" "$($H test $W3/pk --workspace $W3 2>/dev/null | tail -1)" "1 passed, 0 failed"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

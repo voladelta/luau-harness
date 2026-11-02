@@ -140,13 +140,15 @@ pub fn install_codecs(lua: &Lua) -> mlua::Result<()> {
     })?)?;
     b64.set_readonly(true);
     lua.globals().set("base64", b64)?;
-    // Fresh OS entropy, for a seed that no earlier call or fixed PRNG state can predict.
-    lua.globals().set("nonce", lua.create_function(|_, ()| {
-        use base64::Engine;
-        let mut bytes = [0u8; 24];
-        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut bytes)?;
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-    })?)
+    lua.globals().set("nonce", lua.create_function(|_, ()| Ok(nonce()?))?)
+}
+
+/// Fresh OS entropy, for a seed that no earlier call or fixed PRNG state can predict: 32 URL-safe characters.
+pub fn nonce() -> std::io::Result<String> {
+    use base64::Engine;
+    let mut bytes = [0u8; 24];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut bytes)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 pub fn definition(table: &Table) -> Result<Definition> {

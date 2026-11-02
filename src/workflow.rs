@@ -225,8 +225,12 @@ pub fn validate_submission(value: &Value) -> Result<()> {
         "stage document must be nonempty text"
     );
     ensure!(
-        value["summary"].as_str().is_some_and(|s| s.len() <= 16_384),
-        "stage summary must be text up to 16 KiB"
+        value["summary"].as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 16_384),
+        "stage summary must be nonempty text up to 16 KiB"
+    );
+    ensure!(
+        value.get("evidence").is_some(),
+        "evidence must be an array, including when empty"
     );
     for q in list(value, "questions")? {
         ensure!(q.is_string(), "stage questions must be strings");
@@ -244,10 +248,10 @@ pub fn validate_submission(value: &Value) -> Result<()> {
     }
     list(value, "findings")?;
     planned_checks(value)?;
-    if value["outcome"] == "needs_input" {
+    if value["outcome"] != "complete" {
         ensure!(
             !list(value, "questions")?.is_empty(),
-            "needs_input requires questions"
+            "blocked and needs_input require concrete owner questions"
         );
     }
     Ok(())
@@ -802,6 +806,16 @@ mod tests {
         v["evidence"] = json!([]);
         v["document"] = json!("a".repeat(2 * 1024 * 1024));
         assert!(validate_submission(&v).is_err());
+        let ok = json!({"outcome":"complete","document":"# D","summary":"done","evidence":[]});
+        validate_submission(&ok).unwrap();
+        for (field, value) in [("summary", json!("  ")), ("outcome", json!("blocked"))] {
+            let mut bad = ok.clone();
+            bad[field] = value;
+            assert!(validate_submission(&bad).is_err(), "{field}");
+        }
+        let mut bad = ok.clone();
+        bad.as_object_mut().unwrap().remove("evidence");
+        assert!(validate_submission(&bad).is_err(), "evidence is required");
     }
     #[test]
     fn observation_excludes_logs_and_artifacts_and_tracks_source_and_links() {

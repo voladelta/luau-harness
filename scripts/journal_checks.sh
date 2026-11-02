@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # Journal checks: event log (hash chain, write-ahead intents), approval gate, crash consistency. No API key needed.
-set -u
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"; pkill -f "sleep 4242" 2>/dev/null; kill $MOCK 2>/dev/null' EXIT
+cleanup() { pkill -f "sleep 4242" 2>/dev/null; kill $MOCK 2>/dev/null; }
 MOCK=
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf '#!/bin/bash\necho deployed > deployed.txt\n' > $W/deploy.sh; chmod +x $W/deploy.sh; }
 lastlog() { ls -t $W/.harness/log/*.jsonl | head -1; }
 
@@ -122,4 +117,4 @@ print("yes" if c[("llm",None)]==2 and c[("chunk_begin",None)]==1 and c[("checkpo
 PY
 )$($H log verify $L | head -1 | grep -c intact)" "yes1"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

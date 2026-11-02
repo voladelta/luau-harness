@@ -1,5 +1,5 @@
 //! Model adapter and supervised agent/controller execution. Descendants share one admission ledger.
-use crate::{controller::{Controller, Event}, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, RunState, Supervisor}, vm::Vm};
+use crate::{controller::{Command, Controller, Event}, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, RunState, Supervisor}, vm::Vm};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
@@ -286,11 +286,11 @@ impl Host {
             let was_compacting = compacting;
             let source_stage = self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f| f.stage.as_ref().map(|a| a.spec.id.clone()));
             let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
-            let (next_state,mut command)=controller.step(&state,&event)?;
+            let (next_state,command)=controller.step(&state,&event)?;
             ensure_object(&next_state)?;
-            crate::controller::command(&command)?;
+            let mut command=crate::controller::command(&command)?;
             state=next_state;
-            if workflow && event["kind"]=="run_result" && command["kind"]!="boundary" {self.supervisor.finish_stage_chunk(false);}
+            if workflow && event["kind"]=="run_result" && !matches!(command,Command::Boundary{..}) {self.supervisor.finish_stage_chunk(false);}
             if workflow && admin {self.supervisor.workflow.lock().unwrap().as_mut().unwrap().pending_event=None;}
             if std::mem::take(&mut compacting) {
                 let failed=state["messages"].get(0)==previous_messages.first();
@@ -304,7 +304,7 @@ impl Host {
                     }
                 }
             }
-            if command["kind"]=="model" || command["kind"]=="run" {
+            if matches!(command,Command::Model{..}|Command::Run{..}) {
                 self.supervisor.check()?;
                 if vm.is_none() {
                     let fresh=Vm::new(self.policy.clone(),Duration::from_secs(crate::vm::CHUNK_SECS),512<<20,Some(self.clone()))?;
@@ -313,19 +313,23 @@ impl Host {
                     fresh.install_packs(&packs).await?;vm=Some(fresh);
                 }
             }
-            if command["kind"]=="model" && command["purpose"]=="agent" {
-                let request=vm.as_ref().unwrap().prepare_request(&command["request"])?;
-                state["messages"]=request["messages"].clone();
-                if workflow {state["worker"]["messages"]=request["messages"].clone();}
-                agent_system=Some(request["system"].clone());
-                command["request"]=request;
+            if let Command::Model{request,purpose}=&mut command {
+                match purpose.as_deref() {
+                    Some("agent") => {
+                        // VM hooks and local tools shape the request as sent; validate it again after them.
+                        let prepared=vm.as_ref().unwrap().prepare_request(request)?;
+                        crate::controller::validate_request(&prepared)?;
+                        state["messages"]=prepared["messages"].clone();
+                        if workflow {state["worker"]["messages"]=prepared["messages"].clone();}
+                        agent_system=Some(prepared["system"].clone());
+                        *request=prepared;
+                    },
+                    Some("compact") if request["replay"]==true => if let Some(system)=&agent_system {request["system"]=system.clone();},
+                    _ => {},
+                }
             }
-            if command["kind"]=="model" && command["purpose"]=="compact" && command["request"]["replay"]==true {
-                if let Some(system)=&agent_system {command["request"]["system"]=system.clone();}
-            }
-            compacting=command["kind"]=="model" && command["purpose"]=="compact";
-            let command=crate::controller::command(&command)?;
-            let archive = if let crate::controller::Command::Next {archive:Some(directive)} = &command {
+            compacting=matches!(&command,Command::Model{purpose:Some(p),..} if p=="compact");
+            let archive = if let Command::Next {archive:Some(directive)} = &command {
                 anyhow::ensure!(self.depth == 0, "history_archive_invalid: only root history is supported");
                 anyhow::ensure!(was_compacting && event["kind"] == "model_reply" && event["reply"]["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
                     "history_archive_invalid: no successful compaction reply");
@@ -333,11 +337,11 @@ impl Host {
                 Some(self.supervisor.history.prepare(directive, &previous_messages, &state, source_stage, self.policy.log.dir())?)
             } else {None};
             let saved=match &command {
-                crate::controller::Command::Boundary{id,submission,next}=>self.apply_boundary(crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()},&state)?,
-                crate::controller::Command::Finish{report}=>{anyhow::ensure!(!workflow,"RPI must finish through a durable workflow boundary");RunState::Finished{report:report.clone()}},
+                Command::Boundary{id,submission,next}=>self.apply_boundary(crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()},&state)?,
+                Command::Finish{report}=>{anyhow::ensure!(!workflow,"RPI must finish through a durable workflow boundary");RunState::Finished{report:report.clone()}},
                 _=>RunState::Running{controller:state.clone()},
             };
-            if workflow && matches!(&command,crate::controller::Command::Model{..}) {
+            if workflow && matches!(&command,Command::Model{..}) {
                 let at_limit={
                     let mut store=self.supervisor.workflow.lock().unwrap();
                     let frame=store.as_mut().unwrap();
@@ -350,7 +354,7 @@ impl Host {
                 }
             }
             self.supervisor.checkpoint_archived(&self.lane,saved.clone(),&self.durable.lock().unwrap(),archive)?;
-            if let crate::controller::Command::Boundary{..}=&command {
+            if let Command::Boundary{..}=&command {
                 vm=None;self.project_workflow_artifacts()?;
                 match saved {
                     RunState::Finished{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
@@ -359,9 +363,9 @@ impl Host {
                 }
             }
             match command {
-                crate::controller::Command::Next{..}=>event=recovery.take().unwrap_or_else(||Event::Next.to_json()),
-                crate::controller::Command::NextCall=>event=Event::NextCall.to_json(),
-                crate::controller::Command::Model{request,..}=>{
+                Command::Next{..}=>event=recovery.take().unwrap_or_else(||Event::Next.to_json()),
+                Command::NextCall=>event=Event::NextCall.to_json(),
+                Command::Model{request,..}=>{
                     match self.chat(&request).await {
                         Ok(reply)=>{self.log(&format!("### MODEL\n{}",reply.text));
                             // the anchor's estimate covers the system prompt as sent, so its scale is not skewed by VM additions
@@ -370,7 +374,7 @@ impl Host {
                         Err(error)=>{let message=error.to_string();let safe_context_rejection=["API 400 ","API 413 ","API 422 "].iter().any(|p|message.starts_with(p));event=Event::ModelError{error:message,safe_context_rejection}.to_json();},
                     }
                 },
-                crate::controller::Command::Run{code}=>{
+                Command::Run{code}=>{
                     self.supervisor.check()?;self.log(&format!("### CODE\n{code}"));
                     self.policy.log.write("chunk_begin",json!({"lane":self.lane,"depth":self.depth,"code":code}),true)?;
                     let mut result=vm.as_ref().unwrap().run_chunk(&code).await?;
@@ -381,8 +385,8 @@ impl Host {
                     let notifications=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"tools":[]}))?;
                     event=Event::RunResult{result,notifications:notifications["messages"].clone()}.to_json();
                 },
-                crate::controller::Command::Finish{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
-                crate::controller::Command::Boundary{..}=>unreachable!(),
+                Command::Finish{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
+                Command::Boundary{..}=>unreachable!(),
             }
         }
     }

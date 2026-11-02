@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 # Runtime capability enforcement: a project package only gets the primitives it requested AND the user granted.
-set -u
 cd "$(dirname "$0")/.."
-export HX_TRUST=current XDG_CONFIG_HOME=$(mktemp -d)  # these suites write .harness config on purpose: scripts/hx_trusted trusts it per launch; trust_checks.sh tests trust
-H=$PWD/scripts/hx_trusted
-T=$(mktemp -d); T=$(cd "$T" && pwd -P); trap 'rm -rf "$T"' EXIT
-pass=0; fail=0
-check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
+source scripts/check_helpers.sh
 W=$T/ws; mkdir -p $W/.harness/pkgs/reader/tests $W/.harness/pkgs/runner/tests; echo hello > $W/a.txt
 
 mk() { # name, capabilities toml
@@ -75,4 +70,4 @@ check "widening capabilities after approval is refused (hash changed)" "$($H tes
 out=$($H exec --workspace $W 'print(getfenv, setfenv, loadstring, require)' | head -1)
 check "model session: getfenv/setfenv/loadstring/require are gone" "$out" "nil	nil	nil	nil"
 
-echo "$pass passed, $fail failed"; [ $fail -eq 0 ]
+finish

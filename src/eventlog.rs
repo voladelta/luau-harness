@@ -328,8 +328,23 @@ fn crash_hook() -> Option<u64> {
 }
 
 pub fn read_blob(log_dir: &Path, sha: &str) -> Result<Vec<u8>> {
+    read_blob_bounded(log_dir, sha, usize::MAX, || Ok(()))
+}
+
+/// Read a blob of at most `max` bytes, calling `check` (a deadline) between chunks, and verify its content hash.
+pub fn read_blob_bounded(log_dir: &Path, sha: &str, max: usize, mut check: impl FnMut() -> Result<()>) -> Result<Vec<u8>> {
+    use std::io::Read;
     anyhow::ensure!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "invalid blob hash {sha:?}");
-    let bytes = std::fs::read(log_dir.join("blobs").join(sha))?;
+    let mut file = std::fs::File::open(log_dir.join("blobs").join(sha))?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        check()?;
+        let n = file.read(&mut chunk)?;
+        if n == 0 { break; }
+        anyhow::ensure!(bytes.len() + n <= max, "blob {sha}: over the {max}-byte read limit");
+        bytes.extend_from_slice(&chunk[..n]);
+    }
     anyhow::ensure!(sha_bytes(&bytes) == sha, "blob {sha}: content hash mismatch");
     Ok(bytes)
 }
