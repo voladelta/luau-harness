@@ -40,8 +40,9 @@ needs it, the files it links, and nothing from the conversation that produced it
 Each is checked by the check named in its phase.
 
 - A1. In every run, each `planned` journal record for batch `round{n}` with role `explore` is followed, before the
-  `gate` record of round `n`, by a `planned` record for batch `round{n}p`. That batch has one `exploit` plan per probation
-  candidate of round `n` (defined in Phase 2), capped at the round's width, and no other plans.
+  `gate` record of round `n`, by exactly one `planned` record for batch `round{n}p`, also after a resume. That batch has
+  one `exploit` plan per probation candidate of round `n` (defined in Phase 2), capped at `self.width()?` as evaluated
+  when `round{n}p` is planned, and no other plans.
 - A2. After an explore round that comes after an exploit round (a re-explore), the new round's candidates have exploit
   plans in `round{n}p`. This fixes today's behavior, where a run can stop right after a re-explore and those ideas get no
   refinement.
@@ -50,8 +51,8 @@ Each is checked by the check named in its phase.
 - A4. `report.json` has `diagnosis.likely`, one of `harness`, `validity`, `holes`, `noise`, `generalization`,
   `unclaimed`, `search`, chosen by the rules in Phase 3. `diagnosis.counts` holds every count those rules read.
 - A5. A second run in a workspace with a finished first run, and with an identical spec, has a non-empty
-  `launch.json["prior"]`. Its `episodes/r0-research.md` contains `<prior_runs>` with exactly that text. A run whose spec
-  differs in any field gets `prior == ""` and no `<prior_runs>` block.
+  `launch.json["prior"]`. Its `episodes/r0-research.md` contains `<prior_runs>` with exactly that text. A run for which
+  no earlier finished run has an identical spec gets `prior == ""` and no `<prior_runs>` block.
 - A6. The `prior` text contains no held-out (`select`) score and does not say which candidates the held-out veto
   rejected.
 - A7. `cargo test --release --quiet` and `python3 scripts/ar_checks.py` pass. `python3 scripts/all_checks.py` passes
@@ -103,7 +104,11 @@ These were decided against. Do not build them in this task.
 - `src/ar/files.rs`: snapshots, copies, the evaluator. The digest reader can live here or in a new `src/ar/prior.rs`.
 - `scripts/ar_checks.py`: offline integration checks. The real CLI runs against a scripted mock provider (`scripted`,
   `climbing` and others) and a toy task: `x.txt` holds an integer, search scores `-(x-7)^2`, held-out scores `-(x-5)^2`.
-  Scenarios run four at a time.
+  Scenarios run four at a time. It imports `scripts/redesign_checks.py` as `harness`, for `harness.provider` (the
+  mock provider context manager), `harness.HX` (`scripts/hx_trusted`, which runs `target/release/hx`), `harness.ENV`
+  and `harness.BASE`. The `workspace()` helper writes `.gitignore` with `.harness/`, so `.harness/ar.toml` is never
+  committed: `Spec::load` reads it from disk.
+- `scripts/all_checks.py`: runs every offline suite (Rust tests, std tests, all `scripts/*_checks.*`), about 5 minutes.
 - Docs that describe this behavior and must change with it: `docs/runtime-v2.md` section "Autoresearch workflow",
   `docs/workflows.md` section "Autoresearch" ("How a search runs"), and the module comment at the top of `src/ar.rs`.
 
@@ -136,13 +141,17 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
   | Audit | yes | **no** | **yes** |
 
   Factor the inline exploit ledger into `fn ledger_table(rows: &[Row], idea: u32) -> String` (same format, same
-  `SHOWN` cap) and use it for exploit and audit. Auditors keep the claim text and `<starting_state>`.
+  `SHOWN` cap) and use it for exploit and audit. Place it in the audit task where the exploit task has it: after
+  `context` (which ends with `<starting_state>`) and before the tools. Auditors keep the claim text and
+  `<starting_state>`.
 - Docs: in `docs/runtime-v2.md` "Episodes", say that auditors get the brief and the candidate's ledger, not the
   findings, so their verdict isn't anchored on the workers' own account.
 
 **Checks (owner: implementer):**
 - In `scenario_00` of `scripts/ar_checks.py`, assert that every `run/episodes/a*.md` contains `<ledger>` and not
-  `<findings>`, and that `run/episodes/r2-w1.md` contains `<findings>`.
+  `<findings>`; that every exploit task (`r{n}-w*.md` of an exploit batch, and every `r{n}p-w*.md`) contains both
+  `<ledger>` and `<findings>`; and that explore tasks contain `<findings>` once findings exist (round 2 onward) and
+  never `<ledger>`.
 - The scripted auditor fails the candidate whose claim is `go(3)` by matching `({go(3)})` in the task text. That must
   keep working, so the claim must stay in the auditor's task.
 - `cargo test --release --quiet`, then `python3 scripts/ar_checks.py`.
@@ -156,7 +165,10 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
   meaning the label up to its first `-` is `r{n}` (retries like `r3-w2.2` count). Of those, keep the ones that have a
   valid improved ledger row (`r.idea == claim.n && r.valid && r.improved`) and whose best such score differs from the
   seed's search score. A candidate scoring exactly the seed is the seed in other bytes, which the gate already drops.
-  Rank by best score using `spec.better`, best first, and take at most `self.width()?`.
+  Rank by best score using `spec.better`, best first, and take at most `self.width()?`, evaluated when `round{n}p` is
+  planned (so a rate limit hit during the explore batch already narrows probation; the planned batch is journaled, so
+  resume reuses it). `scenario_01`'s assertion `widths[1] == 6` then still holds, because `round1p` is the second
+  planned round batch and `r1-w1` was rate-limited.
 - *Probation plan:* `Plan { label: "r{n}p-w{k}" (k from 1), role: Exploit, idea: claim.n, start: <snap of its best
   row>, best: <its best score>, seed: None }`.
 
@@ -168,7 +180,9 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
 - In `run`'s round loop: when this round's batch is an explore batch and no gate is journaled yet for this round, then
   after `run_batch("round{n}")`, plan batch `round{n}p` with `probation(...)` and run it. Plan it **even when it is
   empty**, so a resumed run sees the decision. Then call `gate(round)`. Reuse the batch if `planned("round{n}p")`
-  already exists (resume). Compute `seed_search` with `self.known(&rows, &seed).0`.
+  already exists (resume). Compute `seed_search` from a fresh ledger read, as `candidates()` does:
+  `self.known(&ledger(&self.dir)?, &seed).0`. Do not use the `rows` variable at the top of `run`; it is read before
+  resume closes open episodes and is stale. Pass the same fresh rows to `probation`.
 - Leave alone: `explore`, `moved`, `quiet`, progress and the stop rule. The loop's `plans` variable must still hold the
   `round{n}` plans, so that `explore = !moved && plans.first().role == Exploit` behaves as today.
 - These already handle `r{n}p-*` labels correctly; don't change them, but re-read them to confirm:
@@ -195,6 +209,10 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
     sequence in the comment above it.
   - Add the A1 invariant as a helper that runs over the journal of every scenario run that reaches a gate (at least
     `scenario_00`, `scenario_01` and `scenario_fallback`).
+  - Resume across the new batch: add a scenario modeled on the one that uses the `slow` provider (comment "7. A killed
+    run resumes from its journal"). Its provider sleeps in the first attempt of `r1p-w1`. Kill the orchestrator's
+    process group while that episode runs, then resume. Assert: `round1p` is planned exactly once, its unfinished plan
+    is retried as `r1p-w1.2`, its finished plans are not re-run, and the A1 helper passes on the final journal.
   - A2: in `scenario_00`, the re-explore round (round 4 today) must have a `round{n}p` batch whose plan ideas equal
     that round's probation candidates. The toy makes them valid and below the seed (x = 40 + w).
   - The replay check in `scenario_00` (resume of a finished run journals nothing) must pass unchanged.
@@ -211,20 +229,22 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
   It returns `{"counts": {...}, "likely": "<label>"}`. It is called in `run` when `report.json` is built, and its line
   is printed to stderr before the report is written.
 - Counts. Every count comes from the journal, ledger and claims; nothing comes from model text:
-  - `episodes`: `finished` records. `crashed`: those with `crashed: true`. `rate_limited`: those with `rate_limits > 0`.
+  - `episodes`: `finished` records (every attempt). `troubled`: those with `crashed: true` **or** `rate_limits > 0`,
+    each counted once.
   - `evals`: ledger rows with `idea != 0` (worker evals; probes excluded). `invalid`: those with `valid == false`.
   - `audits_failed`: `audited` records with `pass == false`.
   - `vetoed`: candidates in the last `gate` record that beat the seed on search by more than `min_delta` and are not
     `good`.
-  - `noisy`: candidates in the last gate's `chosen` whose best snap has a ledger row with `se >= min_delta` (only when
-    `se` is reported).
-  - `workers`: finished episodes whose plan role is explore or exploit (labels `r{n}-*` and `r{n}p-*`, not `r0-*`).
-    `unclaimed`: those whose label (and every retry of the plan) has no row in `claims`.
+  - `noisy`: 0 when `min_delta == 0`. Otherwise, candidates in the last gate's `chosen` whose best snap has a ledger
+    row with `se` reported and `se >= min_delta`.
+  - `workers`: counted **per plan**, not per attempt. Take worker plans (role explore or exploit in `planned` records)
+    with at least one attempt that has a `finished` record. `unclaimed`: those plans where no attempt's label (`label`,
+    `label.2`, ...) appears as `worker` in `claims`.
 - `likely` is the first rule that holds, checked in this order:
 
   | likely | Holds when | Message suggests |
   |---|---|---|
-  | `harness` | `crashed + rate_limited > episodes / 2` | provider or configuration |
+  | `harness` | `troubled > episodes / 2` | provider or configuration |
   | `validity` | `evals > 0 && invalid > evals / 2` | program rules unclear or evaluator brittle |
   | `holes` | `audits_failed > 0` | fix the evaluator before searching more |
   | `noise` | `noisy > 0` | the evaluator can't resolve `min_delta`: more cases or a lower `min_delta` |
@@ -239,11 +259,16 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
 
 **Checks (owner: implementer):**
 - Rust unit tests: build `Vec<Record>`, `Vec<Row>` and `Vec<Claim>` in memory for each row of the table, plus one case
-  where two rules hold (the earlier one wins). `Record`, `Row`, `Claim` and `Candidate` are private structs in
-  `src/ar.rs`, so the tests live in its `mod tests`.
-- `scripts/ar_checks.py`: `scenario_00` (one audit fails by design) asserts `report["diagnosis"]["likely"] == "holes"`.
-  The run that ends with ideas below the seed (the `hopeless` provider) asserts `"search"`. Both assert that every
-  count key is present.
+  where two rules hold (the earlier one wins), one where an episode is both crashed and rate-limited (it counts once),
+  one with a retried plan (one worker), and one with `min_delta == 0` and a reported `se` (`noisy == 0`). Each test
+  asserts the **whole** `counts` object, not just `likely`. `Record`, `Row`, `Claim` and `Candidate` are private
+  structs in `src/ar.rs`, so the tests live in its `mod tests`.
+- `scripts/ar_checks.py`:
+  - `scenario_00` (one audit fails by design) asserts `likely == "holes"`, `audits_failed >= 1`, and `troubled == 0`.
+  - The `hopeless` run asserts `likely == "unclaimed"`, **not** `"search"`. Its exploit workers never claim, and its
+    re-explore workers re-claim the same `go(30+w)` text, which the judge rejects. So most worker plans end without a
+    claim, and no earlier rule holds (no crashes, no invalid evals, no audits, no `se`, nothing beats the seed).
+  - If an observed value differs from what these rules give, find which side is wrong before changing either.
 - `cargo test --release --quiet`, then `python3 scripts/ar_checks.py`.
 
 ### Phase 4: digest of earlier runs
@@ -264,8 +289,9 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
       (`gate` records);
     - one line per explore claim: claim number, claim text (clipped to about 200 characters), depth (the number of
       exploit plans with that `idea` in the run's `planned` records), best valid search score from its `ledger.jsonl`
-      rows, and **status**, taken from that run's records:
-      - `result`: its idea is in `report.json["portfolio"]`;
+      rows (formatted with `show()`), and **status**, taken from that run's records:
+      - `result`: its idea is in `report.json["portfolio"]`. Parse the portfolio as `serde_json::Value` and extract
+        only each entry's `idea`; no other portfolio field may affect the output;
       - `below seed after {depth} refinements`: no valid state, or its best search score doesn't beat the seed's by
         more than `min_delta`;
       - `not kept`: anything else. This deliberately merges "vetoed on held-out", "lower rank" and "unaudited";
@@ -274,8 +300,10 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
   - Adds the newest kept run's brief (the `final_answer` of the last finished attempt of plan `r0-research`, read from
     `episodes/<label>.report.json` as `Orchestrator::answer` does), labeled
     `Brief from run <name> (an earlier run; check it before relying on it)`.
-  - Clips the whole text to `PRIOR_CHARS = 8_000`, the newest run first, using the existing `clip()`.
-  - Never reads or writes `select`, `Selected` records, `good` or a candidate's `select` field.
+  - Clips the whole text to `PRIOR_CHARS = 8_000`, the newest run first, using the existing `clip()`. `clip()`
+    appends `"\n... (truncated)"` after the cut, so the bound is `PRIOR_CHARS + 16` characters.
+  - Never reads `Selected` records, the `select` evaluator, or a candidate's `good` or `select` field. Statuses come
+    only from the portfolio's `idea`s, ledger search scores, `seed.json`, `planned` and `audited` records, and `min_delta`.
 - In `task()` for `Role::Research` only: when `launch.prior` is non-empty, add `<prior_runs>\n{prior}\n</prior_runs>`
   after the program. Add one rule to the research instructions: earlier runs with the same evaluator are summarized in
   `<prior_runs>`; check what you rely on; carry known evaluator holes into Traps; an idea that stayed below the seed
@@ -290,15 +318,23 @@ Each phase is one verifiable unit: code, docs and checks land together in one co
   - unfinished run (no `report.json`) → skipped;
   - a corrupt `journal.jsonl` → that run is skipped, others still appear;
   - statuses `result`, `below seed after N refinements`, `not kept`, and one failed-audit reason;
-  - newest first, and the size cap holds;
-  - a fixture whose `select` scores are distinctive numbers (for example `-12345.678`): neither the numbers nor the
-    word "veto" appear in the output (A6).
-- `scripts/ar_checks.py`: a new scenario runs the toy task twice in one workspace (a fast scripted provider). Assert:
+  - newest first, and the size cap (`PRIOR_CHARS + 16`) holds;
+  - a fixture whose `select` scores are distinctive numbers (for example `-12345.678`): those numbers don't appear in
+    the output (A6);
+  - **veto blindness:** two fixture runs that are identical except that in one, candidate #2 is `good: false` with a
+    held-out veto (`select` worse than the seed's) and in the other it is `good: true` but outside the portfolio. Both
+    must produce byte-identical digests (A6). This catches any status derived from `good` or `select`, whatever its
+    wording.
+- `scripts/ar_checks.py`: a new scenario runs the toy task twice in one workspace with the existing `scripted`
+  provider. Its workspace replaces `select.py` with
+  `import json; x = int(open("x.txt").read()); print(json.dumps({"score": -(x - 5) ** 2 - 0.5}))`, so every held-out
+  score ends in `.5` while every search score is an integer (printed by `show()` as `-1.000000`). Assert:
   - the second run's `launch.json["prior"]` is non-empty and appears verbatim inside `<prior_runs>` in
     `episodes/r0-research.md`;
-  - it names the first run's claims;
-  - the first run's `-(x-5)^2` held-out scores (from its `journal.jsonl` `selected` records) don't appear in it.
-  Then change `timeout` in `ar.toml`, commit, and run a third time: `prior == ""` and no `<prior_runs>`.
+  - it names the first run's claims (for example `go(6)`'s text);
+  - `re.search(r"\d\.5", prior)` finds nothing (A6).
+  Then edit `timeout` in `.harness/ar.toml` on disk (it is gitignored, so there is nothing to commit) and run a third
+  time: `prior == ""` and no `<prior_runs>`, because no finished run has that spec.
 - `cargo test --release --quiet`, `python3 scripts/ar_checks.py`, then `python3 scripts/all_checks.py`.
 
 ## Decisions and why
@@ -337,8 +373,11 @@ The design flagged this; it doesn't block any phase.
 
 ## State
 
-- Branch `plan/ar-hyra`, created from `main` at `deff054`. Only this file is added. No code changes yet.
-- Self-containment: see the commit that adds this file.
+- Branch `plan/ar-hyra` (pushed to `origin`), created from `main` at `deff054`. Only this file is added. No code
+  changes yet.
+- Self-containment: a fresh reader given only this file and its linked files reviewed it. Its findings were folded in
+  (width rule, fresh seed score, diagnosis counting, the `hopeless` expectation, leak-check fixture, resume coverage).
+  The changed sections have not been re-reviewed.
 
 ## Next
 
