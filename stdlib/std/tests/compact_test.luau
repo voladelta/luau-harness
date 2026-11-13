@@ -170,3 +170,36 @@ test.case("anchor calibrates on the provider count; measure adds later messages 
 	test.eq(r.tokens, 400); test.eq(r.count, 1); test.eq(r.scale, 2)
 end)
 
+
+test.case("the image budget and what a compaction keeps fit the data boundary with room for text", function()
+	local vision = require("std/vision")
+	-- before a compaction the state holds at most the budget plus one reply's images
+	test.ok(compact.max_image_bytes + vision.MAX_BYTES_PER_TURN <= hx.limits.DATA_BYTES / 2)
+	test.ok(compact.max_image_bytes / 2 >= vision.MAX_BYTES_PER_TURN, "the half a compaction keeps fits a turn")
+end)
+
+test.case("view limits one model reply, however many calls collect its images", function()
+	local hooks = require("std/hooks")
+	local saved = { expose = hx.expose, view_image = hx.view_image, log = hx.log }
+	local exposed = {}
+	hx.expose = function(name, fn) exposed[name] = fn end
+	hx.view_image = function(path) return { path = path, width = 1, height = 1, mime = "image/png", data = "AAAA" } end
+	hx.log = function() end
+	hooks.clear()
+	local ok, err = pcall(function()
+		require("std/vision").install({ hooks = hooks })
+		local view = exposed.view
+		local function collect() return hooks.emit("before_model", { system = "", messages = {}, tools = {} }).messages end
+		for _ = 1, 4 do -- four parallel calls of one reply, each collected after its chunk
+			view("a.png")
+			test.eq(#collect(), 1)
+		end
+		local refused, why = pcall(view, "a.png")
+		test.ok(not refused and tostring(why):find("per turn", 1, true), "a fifth image in the same reply is refused")
+		hooks.emit("before_model", { system = "", messages = { { role = "user", content = "task" } }, tools = {} })
+		view({ "a.png", "b.png", "c.png", "d.png" }) -- an agent request starts the next turn
+	end)
+	hx.expose, hx.view_image, hx.log = saved.expose, saved.view_image, saved.log
+	hooks.clear()
+	assert(ok, err)
+end)

@@ -30,7 +30,7 @@ check "without the pack: no view, no prompt line" "$(tail -1 $T/req.jsonl | grep
 check "without the pack: no images sent" "$(img_parts)" "0"
 check "event log has no pixels anywhere" "$(cat $W/.harness/log/*.jsonl | grep -c 'iVBORw0KGgo')" "0"
 ffmpeg -v error -f rawvideo -pix_fmt rgb24 -s 2000x2000 -i /dev/urandom -frames:v 1 $W/noise.png  # ~16 MB of base64
-check "one turn takes at most half the image byte budget" "$($H exec --workspace $W --pack std/vision 'print(pcall(view, "noise.png", {max = 2000}))' 2>&1 | grep -c 'over the 8 MB')" "1"
+check "one turn takes at most half the image byte budget" "$($H exec --workspace $W --pack std/vision 'print(pcall(view, "noise.png", {max = 2000}))' 2>&1 | grep -c 'over the 2.7 MB')" "1"
 check "at most 4 images per turn across calls" "$($H exec --workspace $W --pack std/vision 'view({"frame.png","frame.png","frame.png"})' 'print(pcall(view, {"frame.png","frame.png"}))' 2>&1 | grep -c 'per turn')" "1"
 
 # Completed recovery returns the saved report and captured conversation; it does not reread old images.
@@ -64,7 +64,7 @@ check "budget: run finishes" "$(cat $T/budget.rc)" "0"
 check "budget: the summarizer sees the older image" "$(nth_imgs budget.jsonl 2)" "1"
 check "budget: the summarizer is told images are not kept" "$(nth_has budget.jsonl 2 'not kept after this checkpoint')" "1"
 check "budget: the next request carries only the newest image" "$(nth_imgs budget.jsonl 3) $(nth_has budget.jsonl 3 'compaction-summary')" "1 1"
-check "the vision prompt states the limits in force" "$(nth_has budget.jsonl 0 'at most 4 and 8 MB per turn, scaled so the long side is at most `max`, 64..2000')$(nth_has budget.jsonl 0 '{max = 1024}')" "11"
+check "the vision prompt states the limits in force" "$(nth_has budget.jsonl 0 'at most 4 and 2.7 MB per turn, scaled so the long side is at most `max`, 64..2000')$(nth_has budget.jsonl 0 '{max = 1024}')" "11"
 
 # An image rejection (413) compacts without a token bound; the summarizer gets placeholders, then the agent retries.
 budget_run "[\"$VIEW\",\"$VIEW\",{\"status\":413,\"error\":\"Payload Too Large\"},\"SUM\",\"done\"]" reject ''
