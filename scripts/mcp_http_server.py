@@ -2,12 +2,14 @@
 """The demo MCP tools over Streamable HTTP, for testing hx's HTTP transport.
 usage: mcp_http_server.py PORT [json|sse] (0 picks a free port, written to $PORT_FILE) ; env: NEED_HEADER=name:value (401 without it), HDR_LOG=file (one JSON line of
 request headers per POST), SESSION=1 (issue Mcp-Session-Id, 404 on a wrong one), ECHO_KEY=1 (401 body echoes the
-rejected header value), EXPIRE=file (if it exists: delete it, rotate the session, 404 once). Mode sse-split sends the
+rejected header value), EXPIRE=file (if it exists: delete it, rotate the session, 404 once), DROP=file (if it exists:
+delete it and close the connection without answering one tools/call), CLOSE_AFTER_LIST=1 (stop listening once
+tools/list is answered, so later connections are refused). Mode sse-split sends the
 stream in 3-byte chunks, ends without the final blank line, and precedes the response with a server request using id 1. POST /redir answers 302 to /elsewhere."""
 import json, os, sys, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mcp_demo_server import TOOLS, call
+from mcp_demo_server import TOOLS, RpcError, call
 
 MODE = sys.argv[2] if len(sys.argv) > 2 else "json"
 NEED = os.environ.get("NEED_HEADER"); SID = str(uuid.uuid4()) if os.environ.get("SESSION") else None
@@ -34,14 +36,24 @@ class H(BaseHTTPRequestHandler):
         if SID and exp and os.path.exists(exp) and m.get("method") == "tools/call":
             os.remove(exp); SID = str(uuid.uuid4()); return self.reply(404)
         if SID and m.get("method") != "initialize" and self.headers.get("Mcp-Session-Id") != SID: return self.reply(404)
-        if "id" not in m: return self.reply(202)
+        drop = os.environ.get("DROP")
+        if drop and os.path.exists(drop) and m.get("method") == "tools/call":
+            os.remove(drop); call(m["params"]["name"], m["params"].get("arguments", {}))  # acted, then the answer is lost
+            self.close_connection = True; return
+        if "id" not in m or "method" not in m: return self.reply(202)  # a notification, or the client's answer to our request
         meth = m["method"]; extra = [("Mcp-Session-Id", SID)] if SID and meth == "initialize" else []
         if meth == "initialize": INITS[0] += 1
         if meth == "initialize": r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "demo", "version": "1"}}
         elif meth == "tools/list": r = {"tools": TOOLS}
-        elif meth == "tools/call": r = call(m["params"]["name"], m["params"].get("arguments", {}))
+        elif meth == "tools/call":
+            try: r = call(m["params"]["name"], m["params"].get("arguments", {}))
+            except RpcError as e: return self.reply(200, json.dumps({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32602, "message": str(e)}}).encode(), extra=extra)
         else: return self.reply(200, json.dumps({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "no such method"}}).encode(), extra=extra)
         out = json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r})
+        if meth == "tools/list" and os.environ.get("CLOSE_AFTER_LIST"):
+            self.reply(200, out.encode(), extra=extra); self.wfile.flush()
+            server.socket.close()  # refuse every later connection
+            return
         if MODE == "sse-split":
             req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
             body = f"data: {req}\n\ndata: {out}".encode()  # no final blank line

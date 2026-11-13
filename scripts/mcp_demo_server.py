@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""A tiny MCP server (stdio, JSON-RPC 2.0) for testing hx's MCP client. Every tools/call is appended to calls.log."""
+"""A tiny MCP server (stdio, JSON-RPC 2.0) for testing hx's MCP client. Every tools/call is appended to calls.log.
+Over stdio, tools/list answers in pages of three (nextCursor); `exit` answers and then exits; `ask_ping` sends the
+client a ping request and answers only once the client has replied to it. `rpc_error` answers with a JSON-RPC error."""
 import json, os, socket, sys
 
 def schema(**props):
@@ -13,7 +15,15 @@ TOOLS = [
     {"name": "net_probe", "description": "Try an outbound TCP connection", "inputSchema": schema(host="string", port="number")},
     {"name": "env_names", "description": "List environment variable names", "inputSchema": {"type": "object"}},
     {"name": "boom", "description": "Always fails", "inputSchema": {"type": "object"}},
+    {"name": "rpc_error", "description": "Answers with a JSON-RPC error", "inputSchema": {"type": "object"}},
+    {"name": "exit", "description": "Answers, then the server exits", "inputSchema": {"type": "object"}},
+    {"name": "ask_ping", "description": "Pings the client before answering", "inputSchema": {"type": "object"}},
 ]
+PAGE = 3
+
+
+class RpcError(Exception):
+    """A tools/call answered with a JSON-RPC error instead of a result."""
 
 def text(t, err=False):
     return {"content": [{"type": "text", "text": t}], "isError": err}
@@ -44,10 +54,29 @@ def call(name, a):
         return text(",".join(sorted(os.environ)))
     if name == "boom":
         return text("boom", True)
+    if name == "exit":
+        return text("bye")
+    if name == "rpc_error":
+        raise RpcError("Invalid params: missing key")
     return text("unknown tool", True)
 
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def await_reply(lines, rid):
+    """Read until the client's response to our request `rid`; True if it answered with a result."""
+    for line in lines:
+        m = json.loads(line)
+        if m.get("id") == rid and "method" not in m:
+            return "result" in m
+    return False
+
+
 def main():
-    for line in sys.stdin:
+    lines = iter(sys.stdin)
+    for line in lines:
         try:
             m = json.loads(line)
         except ValueError:
@@ -57,15 +86,26 @@ def main():
         if m["method"] == "initialize":
             r = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "demo", "version": "1"}}
         elif m["method"] == "tools/list":
-            r = {"tools": TOOLS}
+            start = int(m.get("params", {}).get("cursor") or 0)
+            r = {"tools": TOOLS[start:start + PAGE]}
+            if start + PAGE < len(TOOLS):
+                r["nextCursor"] = str(start + PAGE)
+        elif m["method"] == "tools/call" and m["params"]["name"] == "ask_ping":
+            send({"jsonrpc": "2.0", "id": "srv-1", "method": "ping"})
+            r = text("pong received" if await_reply(lines, "srv-1") else "no pong", False)
         elif m["method"] == "tools/call":
-            r = call(m["params"]["name"], m["params"].get("arguments", {}))
+            try:
+                r = call(m["params"]["name"], m["params"].get("arguments", {}))
+            except RpcError as e:
+                send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32602, "message": str(e)}})
+                continue
         else:
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "no such method"}}) + "\n")
-            sys.stdout.flush()
+            send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "no such method"}})
             continue
-        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\n")
-        sys.stdout.flush()
+        send({"jsonrpc": "2.0", "id": m["id"], "result": r})
+        if m["method"] == "tools/call" and m["params"]["name"] == "exit":
+            sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

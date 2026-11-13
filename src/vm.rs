@@ -411,8 +411,8 @@ impl Vm {
                 let (fx, m) = (lfx.clone(), lm.clone());
                 async move {
                     let ret = fx.run(&lua, crate::supervisor::Tool::McpList, Class::Read, json!({"server": server}), || async {
-                        let r = m.request(&server, "tools/list", json!({})).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
-                        Ok(Ret::Json(r["tools"].clone()))
+                        let tools = m.list_tools(&server).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                        Ok(Ret::Json(serde_json::Value::Array(tools)))
                     }).await?;
                     prims::json_value(&lua, ret)
                 }
@@ -431,7 +431,7 @@ impl Vm {
                             return Err(mlua::Error::runtime(format!("approval_required: {why}")));
                         }
                         let r = m.request(&server, "tools/call", json!({"name": tool, "arguments": args_json})).await
-                            .map_err(|e| if class == Class::Read { mlua::Error::runtime(e.to_string()) } else { crate::effects::unknown(format!("MCP request failed; the server may have acted: {e}")) })?;
+                            .map_err(|e| crate::net::effect_error(class, e.delivery, e.to_string()))?;
                         Ok(Ret::Json(r))
                     }).await?;
                     prims::json_value(&lua, ret)

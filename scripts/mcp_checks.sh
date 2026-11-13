@@ -27,6 +27,12 @@ check "a server-wide allow covers its tools" "$(x 'print(mcp.demo.delete_note{na
 out=$(x 'print(pcall(mcp.demo.boom, {}))' | head -1)
 check "a tool error becomes a Luau error with the server's message" "$(echo "$out" | grep -c 'mcp tool error (demo.boom): boom')" "1"
 check "tool names are also reachable with a safe alias" "$(x 'print(mcp.demo["read_note"] == mcp.demo.read_note)' | head -1)" "true"
+check "tools/list pages are followed to the last tool" "$(x 'print(mcp.demo.ask_ping ~= nil and mcp.demo.add ~= nil)' | head -1)" "true"
+check "a server ping during a call is answered" "$(x 'print(mcp.demo.ask_ping{})' | head -1)" "pong received"
+out=$(x 'print(pcall(mcp.demo.rpc_error, {})); print(mcp.demo.add{a = 1, b = 2})' | tr '\n' ' ')
+check "a JSON-RPC error is a definite failure: the next mutation runs" "$(echo "$out" | grep -c 'false.*Invalid params: missing key.* 3 $')$(echo "$out" | grep -c unknown_outcome)" "10"
+out=$(x 'print(mcp.demo.exit{}); print(mcp.demo.add{a = 2, b = 2}); print(mcp.demo.add{a = 3, b = 3})' | tr '\n' ' ')
+check "a server that exits between calls is restarted for the next one" "$out" "bye 4 6 "
 
 # --- local servers get the run's file policy through Landlock when the kernel offers it, else run unconfined
 if unconfined "$W"; then
@@ -99,6 +105,8 @@ hcfg "https://127.0.0.1:1/mcp" ''
 check "http: unreachable server is a Luau error, VM survives" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=2} end)); print("alive")' | tail -1)" "alive"
 hcfg "http://example.com/mcp" ''
 check "http: plain http to a remote host is refused" "$(hx 'print(1)' | grep -c 'must be https')" "1"
+hcfg "https://example.com/mcp" 'bearer-env = "WEB_KEY"'
+check "http: an unknown mcp.toml key (a typo) is refused" "$(hx 'print(1)' | grep -m1 -c 'unknown field `bearer-env`')" "1"
 hcfg "https://example.com/mcp" 'command = "python3"'
 check "http: command and url together are refused" "$(hx 'print(1)' | grep -c 'mutually exclusive')" "1"
 hcfg "https://example.com/mcp" 'env = ["WEB_KEY"]'
@@ -109,8 +117,20 @@ SESSION=1 EXPIRE=$T/expire HDR_LOG=$HL serve HP env -C $T python3 $R/scripts/mcp
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
 check "http/sse-split: 3-byte chunks, server request with our id, no final blank line" "$(hx 'print(mcp.web.add{a = 6, b = 7})' | head -1)" "13"
 touch $T/expire
-check "http: lost mutation response stays uncertain and blocks another mutation" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'session expired.*unknown_outcome.*unresolved mutations')" "1"
+check "http: an expired session is re-established and the call goes through" "$(hx 'print(mcp.web.add{a=1,b=1}); print(mcp.web.add{a=1,b=2})' | tr '\n' ' ')" "2 3 "
 kill $SRV; wait $SRV 2>/dev/null
+DROP=$T/drop serve HP env -C $T python3 $R/scripts/mcp_http_server.py 0 json || exit 1; SRV=$SERVED
+hcfg "http://127.0.0.1:$HP/mcp" ''
+touch $T/drop
+check "http: lost mutation response stays uncertain and blocks another mutation" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'unknown_outcome.*unresolved mutations')" "1"
+kill $SRV; wait $SRV 2>/dev/null
+W=$T/ws2; mkdir -p $W/.harness
+CLOSE_AFTER_LIST=1 serve HP env -C $T python3 $R/scripts/mcp_http_server.py 0 json || exit 1; SRV=$SERVED
+hcfg "http://127.0.0.1:$HP/mcp" ''
+out=$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(write, "after.txt", "x"))' | tr '\n' ' ')
+check "http: a refused connection is a definite failure: the next mutation runs" "$(echo "$out" | grep -c '^false.*true')$(echo "$out" | grep -c unknown_outcome)$(cat $W/after.txt 2>/dev/null)" "10x"
+kill $SRV; wait $SRV 2>/dev/null
+W=$T/ws
 NEED_HEADER="authorization:Bearer other-key" ECHO_KEY=1 serve HP env -C $T python3 $R/scripts/mcp_http_server.py 0 json || exit 1; SRV=$SERVED
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'  # each server gets a fresh port
 out=$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end))' | head -1)
