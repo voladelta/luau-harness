@@ -34,7 +34,6 @@ pub enum Event {
     BoundaryReady {
         #[serde(flatten)] document: serde_json::Map<String, Json>,
         stage: Json,
-        #[serde(skip_serializing_if = "Option::is_none")] sealed: Option<Json>,
         metadata: Json,
     },
 }

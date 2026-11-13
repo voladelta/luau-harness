@@ -151,7 +151,6 @@ impl Host {
             if report.get("status").is_none() {report["status"]=json!(if report["finished"]==true {"completed"} else {"stopped"});}
             if let Some(frame)=self.supervisor.workflow.lock().unwrap().as_ref() {
                 if report.get("stage").is_none() {report["stage"]=json!(frame.stage.as_ref().map(|a|&a.spec.name));}
-                report["root_model_admissions"]=json!(frame.root_turns);
                 report["artifact_directory"]=json!(self.workspace.join(".agents/artifacts").join(format!("rpi-{}",self.policy.log.session)));
             }
         }
@@ -250,14 +249,22 @@ impl Host {
     async fn execute_task(self: Arc<Self>, task: String, max_turns: usize) -> Result<Value> {
         self.policy.log.check()?;
         let workflow=self.is_workflow_root();
-        self.project_workflow_artifacts()?;
+        self.project_workflow_artifacts();
         if self.depth == 0 && let Some(RunState::Finished { report }) = &self.supervisor.restored {
             return Ok(self.report(Value::Object(report.clone()), 0.0));
         }
-        let owner_event = if workflow && let Some(RunState::AwaitingReview{report,gate,..})=&self.supervisor.restored {
+        let owner_event = if workflow && let Some(paused@RunState::AwaitingReview{report,gate,..})=&self.supervisor.restored {
+            use crate::workflow_runtime::OwnerResume;
             match self.resume_owner_decision(gate) {
-                Ok(Some(event))=>Some(event),
-                Ok(None)=>return Ok(self.workflow_pause_report(report)),
+                Ok(OwnerResume::Deliver(event))=>Some(event),
+                Ok(OwnerResume::Waiting)=>return Ok(self.workflow_pause_report(report)),
+                Ok(OwnerResume::Rejected(reason))=>{
+                    // Commit the consumption, so the gate reopens for a new decision.
+                    self.supervisor.checkpoint(&self.lane,paused.clone(),&self.durable.lock().unwrap())?;
+                    let mut report=report.clone();
+                    report.insert("decision_rejected".into(),json!(reason));
+                    return Ok(self.workflow_pause_report(&report));
+                },
                 Err(error) if error.to_string().starts_with("budget_exceeded")=>return Ok(self.workflow_pause_report(report)),
                 Err(error)=>return Err(error),
             }
@@ -323,7 +330,6 @@ impl Host {
                         let prepared=vm.as_ref().unwrap().prepare_request(request)?;
                         crate::controller::validate_request(&prepared)?;
                         state["messages"]=prepared["messages"].clone();
-                        if workflow {state["worker"]["messages"]=prepared["messages"].clone();}
                         agent_system=Some(prepared["system"].clone());
                         *request=prepared;
                     },
@@ -344,21 +350,9 @@ impl Host {
                 Command::Finish{report}=>{anyhow::ensure!(!workflow,"RPI must finish through a durable workflow boundary");RunState::Finished{report:report.clone()}},
                 _=>RunState::Running{controller:state.clone()},
             };
-            if workflow && matches!(&command,Command::Model{..}) {
-                let at_limit={
-                    let mut store=self.supervisor.workflow.lock().unwrap();
-                    let frame=store.as_mut().unwrap();
-                    if frame.root_turns >= self.max_turns as u64 {true} else {frame.root_turns+=1;false}
-                };
-                if at_limit {
-                    let report=json!({"finished":false,"final_answer":"","status":"stopped","workflow":"rpi","stopped":"max_turns: run-wide model admission limit reached"});
-                    self.supervisor.checkpoint(&self.lane,RunState::Finished{report:report.as_object().unwrap().clone()},&self.durable.lock().unwrap())?;
-                    return Ok(self.report(report,t0.elapsed().as_secs_f64()));
-                }
-            }
             self.supervisor.checkpoint_archived(&self.lane,saved.clone(),&self.durable.lock().unwrap(),archive)?;
             if let Command::Boundary{..}=&command {
-                vm=None;self.project_workflow_artifacts()?;
+                vm=None;self.project_workflow_artifacts();
                 match saved {
                     RunState::Finished{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
                     RunState::AwaitingReview{report,..}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
@@ -382,8 +376,9 @@ impl Host {
                     self.policy.log.write("chunk_begin",json!({"lane":self.lane,"depth":self.depth,"code":code}),true)?;
                     let mut result=vm.as_ref().unwrap().run_chunk(&code).await?;
                     if workflow {
-                        if let Some(submission)=self.supervisor.finish_stage_chunk(result["error"].is_null()) {result["submission"]=submission;}
-                        if result["error"].as_str().is_some_and(|e|e.contains("stage.submit") || e.contains("submission")) {result["submission_error"]=json!(true);}
+                        let end=self.supervisor.finish_stage_chunk(result["error"].is_null());
+                        if let Some(submission)=end.submission {result["submission"]=submission;}
+                        if end.refused {result["submission_error"]=json!(true);}
                     }
                     let notifications=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"tools":[]}))?;
                     event=Event::RunResult{result,notifications:notifications["messages"].clone()}.to_json();

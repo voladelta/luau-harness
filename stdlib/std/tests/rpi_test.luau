@@ -8,9 +8,9 @@ local function initial(mode, max_turns)
 	s, command = rpi.step(s, { kind = "next" })
 	return s, command
 end
-local function deliver(s, command, owner_inputs)
-	return rpi.step(s, { kind = "boundary_ready", stage = command.next.stage, sealed = if type(newproxy) == "function" then newproxy() else nil,
-		artifacts = { { id = "request", name = "request", document = "Add a feature" } }, owner_inputs = owner_inputs or {} })
+local function deliver(s, command, owner_inputs, artifacts)
+	return rpi.step(s, { kind = "boundary_ready", stage = command.next.stage,
+		artifacts = artifacts or { { id = "request", name = "request", document = "Add a feature" } }, owner_inputs = owner_inputs or {} })
 end
 local function submit(s, payload, id)
 	s.worker.phase = { kind = "run", calls = { { id = "call", name = "luau", input = { code = "stage.submit({})" } }, { id = "trailing", name = "luau", input = { code = "error('must not run')" } } }, index = 1 }
@@ -26,9 +26,12 @@ test.case("auto runs all stages with fresh workers and explicit verification", f
 		test.eq(command.kind, "boundary")
 		test.eq(command.next.stage.name, name)
 		test.eq(command.next.stage.access, if name == "implementation" or name == "verification" then "workspace" else "inspect")
+		test.eq(command.next.stage.instructions, nil)
+		test.eq(command.next.stage.plans_checks, name == "program_design")
 		s = deliver(s, command)
 		test.eq(#s.messages, 1)
-		test.eq(s.messages, s.worker.messages)
+		-- The transcript is stored once; the worker holds it only while std/loop runs.
+		test.eq(s.worker.messages, nil)
 		test.eq(s.worker.report.turns, 0)
 		s, command = submit(s, complete(name))
 	end
@@ -161,7 +164,7 @@ test.case("submission validation errors count across unrelated successful tool c
 	s = deliver(s, command)
 	for i = 1, 3 do
 		s.worker.phase = { kind = "run", calls = { { id = "invalid" } }, index = 1 }
-		s, command = rpi.step(s, { kind = "run_result", result = { ops = 0, feedback = "invalid", error = "stage.submit: malformed payload" } })
+		s, command = rpi.step(s, { kind = "run_result", result = { ops = 0, feedback = "invalid", error = "stage.submit: malformed payload", submission_error = true } })
 		if i < 3 then
 			s.worker.phase = { kind = "run", calls = { { id = "ordinary" } }, index = 1 }
 			s, command = rpi.step(s, { kind = "run_result", result = { ops = 1, feedback = "read succeeded" } })
@@ -194,4 +197,105 @@ test.case("RPI explicitly suppresses optional recheck system instructions", func
 	recheck.enabled = previous
 	test.ok(ordinary:find("# Finish review", 1, true))
 	test.ok(not rpi_system:find("# Finish review", 1, true))
+end)
+
+test.case("chunk errors that merely mention submissions are not protocol failures", function()
+	local s, command = initial()
+	s = deliver(s, command)
+	for _ = 1, 4 do
+		s.worker.phase = { kind = "run", calls = { { id = "read" } }, index = 1 }
+		s, command = rpi.step(s, { kind = "run_result", result = { ops = 0, feedback = "error", error = "src/submission.ts: No such file or directory (stage.submit)" } })
+		test.eq(command.kind, "next")
+	end
+	test.eq(s.corrections, 0)
+end)
+
+-- Runs the automatic route to the first verification stage, with each stage's artifact submitted under its own ID.
+local function to_verification()
+	local s, command = initial()
+	for _ = 1, 5 do
+		s = deliver(s, command)
+		s, command = submit(s, complete(s.stage.name), s.stage.name .. "-doc")
+	end
+	return s, command
+end
+local function verification_artifact(id, findings)
+	return { id = id, name = "verification", document = "# Verification " .. id,
+		submission = { findings = {}, verification = { passed = #findings == 0, findings = findings } } }
+end
+local function failed_verification(s, command, id, finding)
+	s = deliver(s, command)
+	local payload = complete("failed verification")
+	payload.verification = { passed = false, findings = { finding } }
+	s, command = submit(s, payload, id)
+	return s, command
+end
+
+test.case("the repair packet shows only the latest verification's findings", function()
+	local s, command = to_verification()
+	s, command = failed_verification(s, command, "verify-1", "OLD_FINDING")
+	s = deliver(s, command)
+	s, command = submit(s, complete("repair"), "repair-1")
+	s, command = failed_verification(s, command, "verify-2", "NEW_FINDING")
+	test.eq(command.next.stage.name, "repair")
+	s = deliver(s, command, {}, { verification_artifact("verify-1", { "OLD_FINDING" }), verification_artifact("verify-2", { "NEW_FINDING" }) })
+	local text = s.messages[1].content
+	test.ok(text:find("NEW_FINDING", 1, true))
+	test.ok(not text:find("OLD_FINDING", 1, true))
+end)
+
+test.case("a redesign stage receives the repair record and the failed verification", function()
+	local s, command = to_verification()
+	s, command = failed_verification(s, command, "verify-1", "DESIGN_FINDING")
+	s = deliver(s, command)
+	local payload = complete("needs redesign")
+	payload.redesign_stage = "system_design"
+	s, command = submit(s, payload, "repair-1")
+	local inputs = command.next.stage.inputs
+	test.ok(table.find(inputs, "verify-1") and table.find(inputs, "repair-1") and table.find(inputs, "system_design-doc"))
+	s = deliver(s, command, {}, { verification_artifact("verify-1", { "DESIGN_FINDING" }),
+		{ id = "repair-1", name = "repair", document = "# Repair REPAIR_RECORD", submission = {} },
+		{ id = "system_design-doc", name = "system_design", document = "# Old design", submission = {} } })
+	local text = s.messages[1].content
+	test.ok(text:find("DESIGN_FINDING", 1, true) and text:find("REPAIR_RECORD", 1, true))
+	test.ok(text:find("<previous-version name=system_design", 1, true))
+	-- The detour carries the context through implementation, and verification starts clean.
+	s, command = submit(s, complete("system_design"))
+	s = deliver(s, command)
+	s, command = submit(s, complete("program_design"))
+	test.ok(table.find(command.next.stage.inputs, "repair-1"))
+	s = deliver(s, command)
+	s, command = submit(s, complete("implementation"))
+	test.eq(command.next.stage.name, "verification")
+	test.ok(not table.find(command.next.stage.inputs, "repair-1"))
+end)
+
+test.case("a stage rerun after an owner answer sees its draft and its question", function()
+	local s, command = initial()
+	s = deliver(s, command)
+	s, command = submit(s, { outcome = "needs_input", summary = "Need API", evidence = {}, questions = { "WHICH_API?" } }, "draft-1")
+	s, command = rpi.step(s, { kind = "owner_decision", decision = "answer", request = command.next.request, text = "v2" })
+	test.ok(table.find(command.next.stage.inputs, "draft-1"))
+	s = deliver(s, command, { { decision = "answer", text = "ANSWER_V2" } }, { { id = "request", name = "request", document = "Add a feature" },
+		{ id = "draft-1", name = "research_questions", document = "DRAFT_TEXT", submission = { questions = { "WHICH_API?" } } } })
+	local text = s.messages[1].content
+	test.ok(text:find("DRAFT_TEXT", 1, true) and text:find("WHICH_API?", 1, true) and text:find("ANSWER_V2", 1, true))
+end)
+
+test.case("an owner revision at acceptance repairs without spending a repair cycle", function()
+	local s, command = initial("manual")
+	for _ = 1, 4 do
+		s = deliver(s, command)
+		s, command = submit(s, complete(s.stage.name))
+		s, command = rpi.step(s, { kind = "owner_decision", decision = "approve", request = command.next.request, text = "" })
+	end
+	s.repairs = s.max_repairs
+	for _ = 1, 2 do
+		s = deliver(s, command)
+		s, command = submit(s, complete(s.stage.name))
+	end
+	test.eq(command.next.request.kind, "acceptance")
+	s, command = rpi.step(s, { kind = "owner_decision", decision = "revise", request = command.next.request, text = "Rename the flag" })
+	test.eq(command.next.stage.name, "repair")
+	test.eq(s.repairs, s.max_repairs)
 end)

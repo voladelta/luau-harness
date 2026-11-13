@@ -1,4 +1,5 @@
-//! Data-only workflow protocol and bounded host validation. Stage routing belongs to Luau.
+//! The RPI workflow's host protocol: stage specs, boundaries, submissions, check plans, receipts and project
+//! observation. Stage routing and prompts belong to `std/rpi`; the types here encode what that workflow needs.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -48,19 +49,25 @@ pub enum StageAccess {
     Inspect,
     Workspace,
 }
+/// One stage as std/rpi declares it. The stage's instructions stay in Luau; the host needs only what it enforces.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StageSpec {
     pub id: String,
     pub name: String,
     pub access: StageAccess,
+    /// Artifact IDs whose documents the stage receives.
     #[serde(default)]
     pub inputs: Vec<String>,
-    pub instructions: String,
+    /// The verification stage: shell receipts carry project digests and the submission gets host check results.
     #[serde(default)]
     pub verify: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_name: Option<String>,
+    /// The program-design stage: its submission must carry `checks`, which become the frozen check plan. Every other
+    /// stage is refused a nonempty `checks`.
+    #[serde(default)]
+    pub plans_checks: bool,
+    /// The Markdown filename of the stage's projection under `.agents/artifacts/rpi-RUN/`.
+    pub artifact_name: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +82,7 @@ pub struct ReviewRequest {
     pub check_ids: Vec<String>,
     pub decisions: Vec<String>,
     pub continuation: String,
+    /// Acceptance gates only: the project the verification stage observed. Approval requires it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectObservation>,
 }
@@ -107,8 +115,6 @@ pub struct ArtifactRef {
     pub summary: String,
     pub submission: Value,
     pub stage_id: String,
-    #[serde(default)]
-    pub dependencies: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OwnerInputRef {
@@ -118,8 +124,6 @@ pub struct OwnerInputRef {
     pub content_blob: Option<String>,
     #[serde(default)]
     pub check_ids: Vec<String>,
-    #[serde(default)]
-    pub artifacts: Vec<String>,
 }
 /// The stage whose effects are admitted, and its prepared submission. A submission cannot exist without its stage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,6 +131,9 @@ pub struct ActiveStage {
     pub spec: StageSpec,
     #[serde(default)]
     pub submission: Option<Submission>,
+    /// `stage.submit` refused a payload during the current chunk. Lives for one chunk, so it is never checkpointed.
+    #[serde(skip)]
+    pub refused: bool,
 }
 /// No stage is active before the first boundary or while an owner gate is open: the open gate lives only in
 /// `RunState::AwaitingReview`, so a paused run admits no stage effects by construction.
@@ -140,10 +147,10 @@ pub struct ExecutionFrame {
     pub consumed_decisions: Vec<String>,
     pub stage_epoch: u64,
     pub check_plan: Vec<PlannedCheck>,
-    pub evidence: Vec<CheckEvidence>,
     pub boundaries: BTreeMap<String, String>,
+    /// The project as the current verification stage started. `None` outside verification, or when the project could
+    /// not be observed then (the stage is told why, and its submission is refused until it can be).
     pub observation: Option<ProjectObservation>,
-    pub root_turns: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -166,11 +173,10 @@ pub struct CheckEvidence {
     pub stage_id: String,
     pub project_digest: String,
 }
+/// A digest of the observed project inventory, and the explicit check inputs it covered beyond Git's inventory.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectObservation {
     pub digest: String,
-    pub inventory: BTreeMap<String, String>,
-    pub root: PathBuf,
     #[serde(default)]
     pub extra_inputs: Vec<String>,
 }
@@ -271,7 +277,17 @@ pub fn planned_checks(value: &Value) -> Result<Vec<PlannedCheck>> {
             let check: PlannedCheck = serde_json::from_value(v).context("invalid planned check")?;
             identifier(&check.id)?;
             for input in &check.inputs {
-                relative(Path::new(input))?;
+                relative(Path::new(input)).with_context(|| format!("check {}: input {input:?}", check.id))?;
+            }
+            if let Some(cwd) = &check.cwd {
+                ensure!(
+                    !cwd.is_empty()
+                        && Path::new(cwd)
+                            .components()
+                            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
+                    "check {}: cwd must be a relative path inside the workspace without `..`",
+                    check.id
+                );
             }
             ensure!(seen.insert(check.id.clone()), "duplicate check ID");
             ensure!(
@@ -318,12 +334,15 @@ pub fn validate_review_decision(
     );
     Ok(())
 }
+/// Whether one journaled `sh` receipt satisfies `check`: same stage, exact invocation, success, and taken while the
+/// project had digest `digest`. `root` is the canonical workspace, against which check cwds resolve.
 pub fn validate_check_receipt(
     check: &PlannedCheck,
     intent: &Value,
     outcome: &Value,
     stage_id: &str,
-    observation: &ProjectObservation,
+    root: &Path,
+    digest: &str,
 ) -> Result<CheckEvidence> {
     let operation_id = intent["seq"]
         .as_u64()
@@ -349,7 +368,7 @@ pub fn validate_check_receipt(
         "check belongs to another stage"
     );
     ensure!(
-        intent["project_observation"]["digest"].as_str() == Some(observation.digest.as_str()),
+        intent["project_digest"].as_str() == Some(digest),
         "check evidence is stale for the current project (workspace digest changed during verification)"
     );
     ensure!(
@@ -357,7 +376,7 @@ pub fn validate_check_receipt(
         "check outcome belongs to another stage"
     );
     ensure!(
-        outcome["project_observation"]["digest"].as_str() == Some(observation.digest.as_str()),
+        outcome["project_digest"].as_str() == Some(digest),
         "check changed the observed project revision (command mutated workspace files)"
     );
     ensure!(
@@ -374,16 +393,8 @@ pub fn validate_check_receipt(
     );
     let cwd = |s: Option<&str>| -> Result<PathBuf> {
         let path = Path::new(s.unwrap_or("."));
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            observation.root.join(path)
-        };
-        let path = std::fs::canonicalize(path)?;
-        ensure!(
-            path.starts_with(&observation.root),
-            "check cwd escapes project"
-        );
+        let path = std::fs::canonicalize(root.join(path))?;
+        ensure!(path.starts_with(root), "check cwd escapes project");
         Ok(path)
     };
     ensure!(
@@ -394,7 +405,7 @@ pub fn validate_check_receipt(
         check_id: check.id.clone(),
         operation_id,
         stage_id: stage_id.into(),
-        project_digest: observation.digest.clone(),
+        project_digest: digest.into(),
     })
 }
 
@@ -409,11 +420,9 @@ fn relative(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn excluded(path: &Path, exclusions: &[PathBuf]) -> bool {
-    path.starts_with(".git")
-        || path.starts_with(".harness")
-        || path.starts_with(".agents/artifacts")
-        || exclusions.iter().any(|e| path.starts_with(e))
+/// Harness state and artifact projections are never project content.
+fn excluded(path: &Path) -> bool {
+    path.starts_with(".git") || path.starts_with(".harness") || path.starts_with(".agents/artifacts")
 }
 /// Fixed Git metadata command, with bounded output and a five second deadline.
 fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
@@ -513,82 +522,68 @@ pub(crate) fn git_inventory(root: &Path) -> Result<Option<Vec<PathBuf>>> {
             .collect(),
     ))
 }
-/// Observe exactly the same bounded inventory for verification receipts and owner acceptance.
-/// Tracked ignored/deleted files remain in scope. Build outputs ignored by Git are omitted.
-pub fn observe_project(
-    root: &Path,
-    exclusions: &[PathBuf],
-    extra_inputs: &[String],
-) -> Result<ProjectObservation> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let root = std::fs::canonicalize(root)?;
-    let exclusions: Vec<PathBuf> = exclusions
-        .iter()
-        .map(|p| p.strip_prefix(&root).unwrap_or(p).to_path_buf())
+/// Every path the observation covers, relative to the canonical `root`: Git's tracked and nonignored files plus the
+/// explicit check inputs, where a directory input stands for every entry below it.
+fn inventory_paths(root: &Path, extra_inputs: &[String]) -> Result<BTreeSet<PathBuf>> {
+    let mut paths: BTreeSet<PathBuf> = git_inventory(root)?
+        .context("project observation requires a Git repository at the workspace root")?
+        .into_iter()
         .collect();
-    let mut paths: BTreeSet<PathBuf> = match git_inventory(&root)? {
-        Some(paths) => paths.into_iter().collect(),
-        None => {
-            let exclude = exclusions.clone();
-            let base = root.clone();
-            let mut builder = ignore::WalkBuilder::new(&root);
-            builder
-                .hidden(false)
-                .parents(false)
-                .follow_links(false)
-                .require_git(false)
-                .filter_entry(move |e| {
-                    e.path()
-                        .strip_prefix(&base)
-                        .is_ok_and(|p| p.as_os_str().is_empty() || !excluded(p, &exclude))
-                });
-            let mut paths = BTreeSet::new();
-            for entry in builder.build() {
-                let entry = entry.context("project inventory traversal")?;
-                if entry.file_type().is_some_and(|t| !t.is_dir()) {
-                    paths.insert(entry.path().strip_prefix(&root)?.to_path_buf());
-                }
-                ensure!(
-                    paths.len() <= MAX_FILES,
-                    "project inventory exceeds {MAX_FILES} files"
-                );
-            }
-            paths
-        }
-    };
     for input in extra_inputs {
-        let p = Path::new(input);
-        relative(p)?;
+        let input = Path::new(input);
+        relative(input)?;
         ensure!(
-            !excluded(p, &exclusions),
-            "explicit check input is excluded from project observation"
+            !excluded(input),
+            "check input {} is harness state, not project content",
+            input.display()
         );
-        paths.insert(p.to_path_buf());
+        let absolute = root.join(input);
+        if !std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir()) {
+            paths.insert(input.to_path_buf());
+            continue;
+        }
+        ensure!(
+            std::fs::canonicalize(&absolute)?.starts_with(root),
+            "check input {} escapes the project",
+            input.display()
+        );
+        let walk = ignore::WalkBuilder::new(&absolute)
+            .standard_filters(false)
+            .follow_links(false)
+            .build();
+        for entry in walk {
+            let entry = entry.with_context(|| format!("walking check input {}", input.display()))?;
+            if entry.file_type().is_some_and(|t| !t.is_dir()) {
+                paths.insert(entry.path().strip_prefix(root)?.to_path_buf());
+            }
+            ensure!(paths.len() <= MAX_FILES, "project inventory exceeds {MAX_FILES} files");
+        }
     }
-    ensure!(
-        paths.len() <= MAX_FILES,
-        "project inventory exceeds {MAX_FILES} files"
-    );
+    ensure!(paths.len() <= MAX_FILES, "project inventory exceeds {MAX_FILES} files");
+    Ok(paths)
+}
+/// The observed inventory: path to `file:MODE:SHA`, `symlink:SHA`, or `deleted` for a listed path that is gone.
+fn inventory(root: &Path, extra_inputs: &[String]) -> Result<BTreeMap<String, String>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut inventory = BTreeMap::new();
     let mut total = 0u64;
-    for path in paths {
+    for path in inventory_paths(root, extra_inputs)? {
         relative(&path)?;
-        if excluded(&path, &exclusions) {
+        if excluded(&path) {
             continue;
         }
         let name = path
             .to_str()
-            .context("project inventory requires UTF-8 file paths")?
+            .with_context(|| format!("project inventory requires UTF-8 file paths: {}", path.display()))?
             .to_string();
         let absolute = root.join(&path);
+        let parent = absolute.parent().expect("a joined relative path has a parent");
         // Resolve parents only: hash a symlink's identity without following it.
-        if let Some(parent) = absolute.parent() {
-            if parent.exists() {
-                ensure!(
-                    std::fs::canonicalize(parent)?.starts_with(&root),
-                    "inventory parent escapes project"
-                );
-            }
+        if parent.exists() {
+            ensure!(
+                std::fs::canonicalize(parent)?.starts_with(root),
+                "inventory parent escapes project: {name}"
+            );
         }
         let meta = match std::fs::symlink_metadata(&absolute) {
             Ok(m) => m,
@@ -596,23 +591,19 @@ pub fn observe_project(
                 inventory.insert(name, "deleted".into());
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).with_context(|| format!("observing {name}")),
         };
         let hash = if meta.file_type().is_symlink() {
             let target = std::fs::read_link(&absolute)?;
-            let resolved = absolute.parent().unwrap().join(&target);
-            if let Ok(resolved) = std::fs::canonicalize(&resolved) {
-                ensure!(
-                    resolved.starts_with(&root),
-                    "inventory symlink escapes project"
-                );
+            if let Ok(resolved) = std::fs::canonicalize(parent.join(&target)) {
+                ensure!(resolved.starts_with(root), "inventory symlink escapes project: {name}");
             } else {
                 ensure!(
                     !target.is_absolute()
                         && target
                             .components()
                             .all(|c| !matches!(c, Component::ParentDir)),
-                    "unresolved inventory symlink escapes scope"
+                    "unresolved inventory symlink escapes scope: {name}"
                 );
             }
             format!(
@@ -631,14 +622,15 @@ pub fn observe_project(
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&absolute)?;
+                .open(&absolute)
+                .with_context(|| format!("observing {name}"))?;
             let before = file.metadata()?;
-            ensure!(before.is_file(), "project entry changed type");
+            ensure!(before.is_file(), "project entry changed type: {name}");
             let mut bytes = Vec::new();
             file.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
             ensure!(
                 bytes.len() as u64 <= MAX_FILE,
-                "project file grew beyond observation bound"
+                "project file grew beyond observation bound: {name}"
             );
             let after = std::fs::symlink_metadata(&absolute)?;
             ensure!(
@@ -654,23 +646,28 @@ pub fn observe_project(
                 crate::eventlog::sha_bytes(&bytes)
             )
         } else {
-            anyhow::bail!("unsupported project inventory entry: {name}");
+            anyhow::bail!("unsupported project inventory entry (not a file or symlink): {name}");
         };
         inventory.insert(name, hash);
     }
-    let digest = crate::eventlog::sha_bytes(&serde_json::to_vec(&inventory)?);
+    Ok(inventory)
+}
+/// Observe exactly the same bounded inventory for verification receipts and owner acceptance. Git tracked files
+/// (including ignored and deleted ones) and nonignored untracked files are in scope; build outputs ignored by Git are
+/// in scope only as explicit `extra_inputs`.
+pub fn observe_project(root: &Path, extra_inputs: &[String]) -> Result<ProjectObservation> {
+    let root = std::fs::canonicalize(root)?;
+    let inventory = inventory(&root, extra_inputs)?;
     Ok(ProjectObservation {
-        digest,
-        inventory,
-        root,
+        digest: crate::eventlog::sha_bytes(&serde_json::to_vec(&inventory)?),
         extra_inputs: extra_inputs.to_vec(),
     })
 }
 
-/// Include ignored input files explicitly declared by the accepted check plan.
+/// Observe the project with the ignored input files explicitly declared by the accepted check plan.
 pub fn observe_checks(root: &Path, plan: &[PlannedCheck]) -> Result<ProjectObservation> {
     let inputs: BTreeSet<String> = plan.iter().flat_map(|c| c.inputs.iter().cloned()).collect();
-    observe_project(root, &[], &inputs.into_iter().collect::<Vec<_>>())
+    observe_project(root, &inputs.into_iter().collect::<Vec<_>>())
 }
 
 /// Materialize a verified journal blob under the workflow's dedicated projection directory.
@@ -724,6 +721,23 @@ pub fn project_artifact(
     Ok(path)
 }
 
+/// A Markdown section showing the check plan exactly as the host parsed and froze it, appended to the program-design
+/// document so the owner approves the plan that verification enforces, not only the prose describing it.
+pub fn check_plan_section(plan: &[PlannedCheck]) -> Result<String> {
+    let json = serde_json::to_string_pretty(plan)?;
+    // A fence longer than any backtick run in the content cannot be closed by the content.
+    let longest = json
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    Ok(format!(
+        "\n\n## Frozen check plan (generated by hx)\n\nVerification must run each command exactly, with this cwd \
+         and timeout (seconds); `inputs` are ignored files the project observation also covers.\n\n{fence}json\n{json}\n{fence}\n"
+    ))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VerificationSummary {
     pub passed: Vec<String>,
@@ -736,7 +750,8 @@ pub fn check_result(
     payload: &Value,
     records: &[Value],
     stage_id: &str,
-    observation: &ProjectObservation,
+    root: &Path,
+    digest: &str,
 ) -> Result<VerificationSummary> {
     let mut result = VerificationSummary::default();
     let mut supplied = BTreeMap::new();
@@ -773,7 +788,7 @@ pub fn check_result(
             .iter()
             .find(|r| r["kind"] == "outcome" && r["of"].as_u64() == Some(*operation_id))
             .context("check has no recorded outcome")?;
-        match validate_check_receipt(check, intent, outcome, stage_id, observation) {
+        match validate_check_receipt(check, intent, outcome, stage_id, root, digest) {
             Ok(evidence) => {
                 result.passed.push(check.id.clone());
                 result.evidence.push(evidence);
@@ -782,183 +797,6 @@ pub fn check_result(
         }
     }
     Ok(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn workspace(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hx-workflow-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::canonicalize(dir).unwrap()
-    }
-    #[test]
-    fn submission_rejects_unsupported_and_unbounded_payloads() {
-        let mut v = json!({"outcome":"complete","document":"# Complete","summary":"done","questions":{},"checks":{},"evidence":{}});
-        validate_submission(&v).unwrap();
-        v["outcome"] = json!("needs_input");
-        assert!(validate_submission(&v).is_err());
-        v["questions"] = json!(["Which account?"]);
-        validate_submission(&v).unwrap();
-        v["evidence"] = json!([{"check_id":"unit","operation_id":0}]);
-        assert!(validate_submission(&v).is_err());
-        v["evidence"] = json!([]);
-        v["document"] = json!("a".repeat(2 * 1024 * 1024));
-        assert!(validate_submission(&v).is_err());
-        let ok = json!({"outcome":"complete","document":"# D","summary":"done","evidence":[]});
-        validate_submission(&ok).unwrap();
-        for (field, value) in [("summary", json!("  ")), ("outcome", json!("blocked"))] {
-            let mut bad = ok.clone();
-            bad[field] = value;
-            assert!(validate_submission(&bad).is_err(), "{field}");
-        }
-        let mut bad = ok.clone();
-        bad.as_object_mut().unwrap().remove("evidence");
-        assert!(validate_submission(&bad).is_err(), "evidence is required");
-    }
-    #[test]
-    fn observation_excludes_logs_and_artifacts_and_tracks_source_and_links() {
-        let root = workspace("observation");
-        std::fs::write(root.join("app.js"), "one").unwrap();
-        let a = observe_project(&root, &[], &[]).unwrap();
-        std::fs::create_dir_all(root.join(".harness/log")).unwrap();
-        std::fs::write(root.join(".harness/log/run"), "log").unwrap();
-        std::fs::create_dir_all(root.join(".agents/artifacts/rpi-run")).unwrap();
-        std::fs::write(root.join(".agents/artifacts/rpi-run/one.md"), "doc").unwrap();
-        assert_eq!(a.digest, observe_project(&root, &[], &[]).unwrap().digest);
-        std::fs::write(root.join("app.js"), "two").unwrap();
-        assert_ne!(a.digest, observe_project(&root, &[], &[]).unwrap().digest);
-        std::os::unix::fs::symlink("/etc/passwd", root.join("escape")).unwrap();
-        assert!(observe_project(&root, &[], &[]).is_err());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn nested_workspace_ignores_parent_rules_but_honors_local_ignores() {
-        let parent = workspace("nested-inventory");
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&parent)
-                .status()
-                .unwrap()
-                .success()
-        );
-        std::fs::write(parent.join(".gitignore"), ".harness/\n").unwrap();
-        let root = parent.join(".harness/live");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("app.js"), "one").unwrap();
-        std::fs::write(root.join(".gitignore"), "build\n").unwrap();
-        std::fs::write(root.join("build"), "generated").unwrap();
-        let first = observe_project(&root, &[], &[]).unwrap();
-        assert!(first.inventory.contains_key("app.js"));
-        assert!(!first.inventory.contains_key("build"));
-        std::fs::write(root.join("app.js"), "two").unwrap();
-        assert_ne!(
-            first.digest,
-            observe_project(&root, &[], &[]).unwrap().digest
-        );
-        std::fs::remove_dir_all(parent).unwrap();
-    }
-    #[test]
-    fn git_observation_retains_ignored_tracked_and_deleted_files() {
-        use std::process::Command;
-        let root = workspace("git");
-        assert!(
-            Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        std::fs::write(root.join("tracked"), "one").unwrap();
-        assert!(
-            Command::new("git")
-                .args(["add", "tracked"])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        std::fs::write(root.join(".gitignore"), "tracked\nbuild\n").unwrap();
-        std::fs::write(root.join("build"), "ignored").unwrap();
-        let a = observe_project(&root, &[], &[]).unwrap();
-        assert!(a.inventory.contains_key("tracked"));
-        assert!(!a.inventory.contains_key("build"));
-        let explicit = observe_project(&root, &[], &["build".into()]).unwrap();
-        assert!(explicit.inventory.contains_key("build"));
-        assert_eq!(explicit.extra_inputs, vec!["build".to_string()]);
-        std::fs::write(root.join("build"), "changed ignored input").unwrap();
-        assert_ne!(
-            explicit.digest,
-            observe_project(&root, &[], &explicit.extra_inputs)
-                .unwrap()
-                .digest
-        );
-        assert_eq!(a.digest, observe_project(&root, &[], &[]).unwrap().digest);
-        std::fs::remove_file(root.join("tracked")).unwrap();
-        let b = observe_project(&root, &[], &[]).unwrap();
-        assert_ne!(a.digest, b.digest);
-        assert_eq!(b.inventory["tracked"], "deleted");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn evidence_requires_success_exact_invocation_and_fresh_revision() {
-        let root = workspace("evidence");
-        let observation = observe_project(&root, &[], &[]).unwrap();
-        let check = PlannedCheck {
-            id: "unit".into(),
-            command: "bun test".into(),
-            cwd: None,
-            timeout: None,
-            requirements: vec![],
-            inputs: vec![],
-        };
-        let mut intent = json!({"kind":"intent","seq":4,"tool":"sh","args":{"cmd":"bun test","cwd":null,"timeout":null},"workflow_stage":"verify","project_observation":observation});
-        let mut outcome = json!({"kind":"outcome","of":4,"tool":"sh","ok":true,"ret":{"t":"sh","code":0,"timed_out":false},"workflow_stage":"verify","project_observation":observation});
-        validate_check_receipt(&check, &intent, &outcome, "verify", &observation).unwrap();
-        outcome["ret"]["code"] = json!(1);
-        assert!(validate_check_receipt(&check, &intent, &outcome, "verify", &observation).is_err());
-        outcome["ret"]["code"] = json!(0);
-        outcome["ret"]["timed_out"] = json!(true);
-        assert!(validate_check_receipt(&check, &intent, &outcome, "verify", &observation).is_err());
-        outcome["ret"]["timed_out"] = json!(false);
-        intent["args"]["cmd"] = json!("true");
-        assert!(validate_check_receipt(&check, &intent, &outcome, "verify", &observation).is_err());
-        intent["args"]["cmd"] = json!("bun test");
-        intent["project_observation"]["digest"] = json!("old");
-        assert!(validate_check_receipt(&check, &intent, &outcome, "verify", &observation).is_err());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn projection_refuses_unowned_files_and_regenerates_owned_views() {
-        let root = workspace("projection");
-        let log = crate::eventlog::EventLog::open(&root.join(".harness/log")).unwrap();
-        let blob = log.blob(b"# Canonical").unwrap();
-        let artifact = ArtifactRef {
-            id: "request".into(),
-            name: "01-request.md".into(),
-            document_blob: blob,
-            summary: "request".into(),
-            submission: json!({}),
-            stage_id: "request".into(),
-            dependencies: vec![],
-        };
-        let path = root.join(".agents/artifacts/rpi-test/01-request.md");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "foreign").unwrap();
-        assert!(project_artifact(&root, "test", log.dir(), &artifact).is_err());
-        std::fs::remove_file(&path).unwrap();
-        project_artifact(&root, "test", log.dir(), &artifact).unwrap();
-        std::fs::write(&path, "edited projection").unwrap();
-        project_artifact(&root, "test", log.dir(), &artifact).unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "# Canonical");
-        let mut invalid = artifact;
-        invalid.name = "../outside.md".into();
-        assert!(project_artifact(&root, "test", log.dir(), &invalid).is_err());
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }
 
 impl Boundary {
@@ -974,21 +812,15 @@ impl Boundary {
         match &self.next {
             BoundaryNext::Stage { stage } => {
                 identifier(&stage.id)?;
-                if let Some(name) = &stage.artifact_name {
-                    relative(Path::new(name))?;
-                    ensure!(
-                        Path::new(name).components().count() == 1 && name.ends_with(".md"),
-                        "artifact_name must be one Markdown filename"
-                    );
-                }
+                let name = Path::new(&stage.artifact_name);
+                relative(name)?;
+                ensure!(
+                    name.components().count() == 1 && stage.artifact_name.ends_with(".md"),
+                    "artifact_name must be one Markdown filename"
+                );
                 ensure!(
                     !stage.name.trim().is_empty() && stage.name.len() <= 200,
                     "invalid stage name"
-                );
-                ensure!(
-                    !stage.instructions.trim().is_empty()
-                        && stage.instructions.len() <= 1024 * 1024,
-                    "invalid stage instructions"
                 );
                 ensure!(stage.inputs.len() <= 1000, "too many stage input artifacts");
                 for id in &stage.inputs {
@@ -1025,5 +857,213 @@ impl Boundary {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn workspace(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hx-workflow-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+    fn repository(tag: &str) -> PathBuf {
+        let root = workspace(tag);
+        git(&root, &["init", "-q"]);
+        root
+    }
+    #[test]
+    fn submission_rejects_unsupported_and_unbounded_payloads() {
+        let mut v = json!({"outcome":"complete","document":"# Complete","summary":"done","questions":{},"checks":{},"evidence":{}});
+        validate_submission(&v).unwrap();
+        v["outcome"] = json!("needs_input");
+        assert!(validate_submission(&v).is_err());
+        v["questions"] = json!(["Which account?"]);
+        validate_submission(&v).unwrap();
+        v["evidence"] = json!([{"check_id":"unit","operation_id":0}]);
+        assert!(validate_submission(&v).is_err());
+        v["evidence"] = json!([]);
+        v["document"] = json!("a".repeat(2 * 1024 * 1024));
+        assert!(validate_submission(&v).is_err());
+        let ok = json!({"outcome":"complete","document":"# D","summary":"done","evidence":[]});
+        validate_submission(&ok).unwrap();
+        for (field, value) in [("summary", json!("  ")), ("outcome", json!("blocked"))] {
+            let mut bad = ok.clone();
+            bad[field] = value;
+            assert!(validate_submission(&bad).is_err(), "{field}");
+        }
+        let mut bad = ok.clone();
+        bad.as_object_mut().unwrap().remove("evidence");
+        assert!(validate_submission(&bad).is_err(), "evidence is required");
+    }
+    #[test]
+    fn check_plans_refuse_escaping_cwds_and_inputs() {
+        let plan = |check: Value| planned_checks(&json!({"checks":[check]}));
+        plan(json!({"id":"unit","command":"true","cwd":"."})).unwrap();
+        plan(json!({"id":"unit","command":"true","cwd":"src/./app","inputs":["dist"]})).unwrap();
+        for bad in [
+            json!({"id":"unit","command":"true","cwd":".."}),
+            json!({"id":"unit","command":"true","cwd":"/tmp"}),
+            json!({"id":"unit","command":"true","cwd":"src/../.."}),
+            json!({"id":"unit","command":"true","inputs":["../outside"]}),
+            json!({"id":"unit","command":"true","inputs":["/etc"]}),
+        ] {
+            assert!(plan(bad.clone()).is_err(), "{bad}");
+        }
+    }
+    #[test]
+    fn observation_excludes_logs_and_artifacts_and_tracks_source_and_links() {
+        let root = repository("observation");
+        std::fs::write(root.join("app.js"), "one").unwrap();
+        let a = observe_project(&root, &[]).unwrap();
+        std::fs::create_dir_all(root.join(".harness/log")).unwrap();
+        std::fs::write(root.join(".harness/log/run"), "log").unwrap();
+        std::fs::create_dir_all(root.join(".agents/artifacts/rpi-run")).unwrap();
+        std::fs::write(root.join(".agents/artifacts/rpi-run/one.md"), "doc").unwrap();
+        assert_eq!(a.digest, observe_project(&root, &[]).unwrap().digest);
+        std::fs::write(root.join("app.js"), "two").unwrap();
+        assert_ne!(a.digest, observe_project(&root, &[]).unwrap().digest);
+        std::os::unix::fs::symlink("/etc/passwd", root.join("escape")).unwrap();
+        assert!(observe_project(&root, &[]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn observation_requires_the_workspace_to_be_its_own_repository() {
+        let parent = repository("nested-inventory");
+        std::fs::write(parent.join(".gitignore"), ".harness/\n").unwrap();
+        let root = parent.join(".harness/live");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("app.js"), "one").unwrap();
+        std::fs::write(root.join(".gitignore"), "build\n").unwrap();
+        std::fs::write(root.join("build"), "generated").unwrap();
+        let error = observe_project(&root, &[]).unwrap_err();
+        assert!(error.to_string().contains("requires a Git repository"), "{error}");
+        git(&root, &["init", "-q"]);
+        let first = inventory(&root, &[]).unwrap();
+        assert!(first.contains_key("app.js") && !first.contains_key("build"));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+    #[test]
+    fn git_observation_retains_ignored_tracked_and_deleted_files() {
+        let root = repository("git");
+        std::fs::write(root.join("tracked"), "one").unwrap();
+        git(&root, &["add", "tracked"]);
+        std::fs::write(root.join(".gitignore"), "tracked\nbuild\n").unwrap();
+        std::fs::write(root.join("build"), "ignored").unwrap();
+        let a = observe_project(&root, &[]).unwrap();
+        let listed = inventory(&root, &[]).unwrap();
+        assert!(listed.contains_key("tracked") && !listed.contains_key("build"));
+        let explicit = observe_project(&root, &["build".into()]).unwrap();
+        assert!(inventory(&root, &["build".into()]).unwrap().contains_key("build"));
+        assert_eq!(explicit.extra_inputs, vec!["build".to_string()]);
+        std::fs::write(root.join("build"), "changed ignored input").unwrap();
+        assert_ne!(
+            explicit.digest,
+            observe_project(&root, &explicit.extra_inputs).unwrap().digest
+        );
+        assert_eq!(a.digest, observe_project(&root, &[]).unwrap().digest);
+        std::fs::remove_file(root.join("tracked")).unwrap();
+        let b = observe_project(&root, &[]).unwrap();
+        assert_ne!(a.digest, b.digest);
+        assert_eq!(inventory(&root, &[]).unwrap()["tracked"], "deleted");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_directory_input_covers_every_file_below_it() {
+        let root = repository("directory-input");
+        std::fs::write(root.join(".gitignore"), "dist/\n").unwrap();
+        std::fs::create_dir_all(root.join("dist/js")).unwrap();
+        std::fs::write(root.join("dist/js/a.js"), "1").unwrap();
+        std::os::unix::fs::symlink("js/a.js", root.join("dist/link")).unwrap();
+        let inputs = vec!["dist".to_string()];
+        let listed = inventory(&root, &inputs).unwrap();
+        assert!(listed.contains_key("dist/js/a.js") && listed.contains_key("dist/link"), "{listed:?}");
+        assert!(!listed.contains_key("dist"));
+        let before = observe_project(&root, &inputs).unwrap();
+        std::fs::write(root.join("dist/js/a.js"), "2").unwrap();
+        assert_ne!(before.digest, observe_project(&root, &inputs).unwrap().digest);
+        std::fs::write(root.join("dist/js/b.js"), "new").unwrap();
+        assert!(inventory(&root, &inputs).unwrap().contains_key("dist/js/b.js"));
+        std::fs::remove_dir_all(root.join("dist")).unwrap();
+        std::os::unix::fs::symlink("/etc", root.join("dist")).unwrap();
+        assert!(observe_project(&root, &inputs).is_err(), "a symlinked input directory must not lead outside");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn evidence_requires_success_exact_invocation_and_fresh_revision() {
+        let root = repository("evidence");
+        let digest = observe_project(&root, &[]).unwrap().digest;
+        let check = PlannedCheck {
+            id: "unit".into(),
+            command: "bun test".into(),
+            cwd: None,
+            timeout: None,
+            requirements: vec![],
+            inputs: vec![],
+        };
+        let valid = |intent: &Value, outcome: &Value| validate_check_receipt(&check, intent, outcome, "verify", &root, &digest);
+        let mut intent = json!({"kind":"intent","seq":4,"tool":"sh","args":{"cmd":"bun test","cwd":null,"timeout":null},"workflow_stage":"verify","project_digest":digest});
+        let mut outcome = json!({"kind":"outcome","of":4,"tool":"sh","ok":true,"ret":{"t":"sh","code":0,"timed_out":false},"workflow_stage":"verify","project_digest":digest});
+        valid(&intent, &outcome).unwrap();
+        outcome["ret"]["code"] = json!(1);
+        assert!(valid(&intent, &outcome).is_err());
+        outcome["ret"]["code"] = json!(0);
+        outcome["ret"]["timed_out"] = json!(true);
+        assert!(valid(&intent, &outcome).is_err());
+        outcome["ret"]["timed_out"] = json!(false);
+        intent["args"]["cmd"] = json!("true");
+        assert!(valid(&intent, &outcome).is_err());
+        intent["args"]["cmd"] = json!("bun test");
+        intent["project_digest"] = json!("old");
+        assert!(valid(&intent, &outcome).is_err());
+        intent["project_digest"] = json!(digest);
+        outcome["project_digest"] = json!("changed");
+        assert!(valid(&intent, &outcome).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn check_plan_section_shows_the_frozen_plan_in_an_unbreakable_fence() {
+        let plan = planned_checks(&json!({"checks":[{"id":"unit","command":"echo ```` done","cwd":".","timeout":30,"inputs":["dist"]}]})).unwrap();
+        let section = check_plan_section(&plan).unwrap();
+        assert!(section.contains("`````json\n"), "{section}");
+        assert!(section.contains("\"command\": \"echo ```` done\"") && section.contains("\"timeout\": 30.0"));
+        assert!(section.contains("\"inputs\": [\n      \"dist\"\n    ]"), "{section}");
+    }
+    #[test]
+    fn projection_refuses_unowned_files_and_regenerates_owned_views() {
+        let root = workspace("projection");
+        let log = crate::eventlog::EventLog::open(&root.join(".harness/log")).unwrap();
+        let blob = log.blob(b"# Canonical").unwrap();
+        let artifact = ArtifactRef {
+            id: "request".into(),
+            name: "01-request.md".into(),
+            document_blob: blob,
+            summary: "request".into(),
+            submission: json!({}),
+            stage_id: "request".into(),
+        };
+        let path = root.join(".agents/artifacts/rpi-test/01-request.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "foreign").unwrap();
+        assert!(project_artifact(&root, "test", log.dir(), &artifact).is_err());
+        std::fs::remove_file(&path).unwrap();
+        project_artifact(&root, "test", log.dir(), &artifact).unwrap();
+        std::fs::write(&path, "edited projection").unwrap();
+        project_artifact(&root, "test", log.dir(), &artifact).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "# Canonical");
+        let mut invalid = artifact;
+        invalid.name = "../outside.md".into();
+        assert!(project_artifact(&root, "test", log.dir(), &invalid).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

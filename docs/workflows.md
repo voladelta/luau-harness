@@ -18,7 +18,7 @@ hx run --rpi --prompt-file task.md --model MODEL
 hx run --rpi --manual --prompt-file task.md --model MODEL
 ```
 
-> **Git required.** `--rpi` requires the workspace to be an initialized Git repository (with a `.git` root) and an appropriate `.gitignore`. The harness uses Git's inventory (`git ls-files --exclude-standard`) to track source modifications without being invalidated by build outputs (`build/`, `target/`, `*.o`). Unversioned directories are rejected at launch with an explicit error.
+> **Git required.** `--rpi` requires the workspace to be an initialized Git repository (with a `.git` root) and an appropriate `.gitignore`. The harness uses Git's inventory (`git ls-files --exclude-standard`) to track source modifications without being invalidated by build outputs (`build/`, `target/`, `*.o`). Unversioned directories, and projects the inventory cannot read (a file over 32 MiB, a non-UTF-8 path, a symlink leading outside), are rejected at launch with an explicit error.
 
 ### Automatic and manual mode
 
@@ -40,17 +40,19 @@ hx run --resume .harness/log/RUN.jsonl
 | `answer --input-file answers.md` | Answer an input gate |
 | `waive --input-file reason.md` | Validation input gates only: waive that gate's listed checks; the waiver stays distinct from passing checks |
 
-Use the actions the reported gate allows. `hx review` records the decision; it does not execute the task. Final acceptance needs no model call.
+Use the actions the reported gate allows. `hx review` records the decision; it does not execute the task. Final acceptance needs no model call. Review and acceptance reports include the frozen `check_plan`, and the program-design document ends with a generated "Frozen check plan" section: approve the plan verification will enforce, not only the prose.
+
+If the project changes after you approve final acceptance but before `--resume`, the resume discards that approval and reports `decision_rejected`; the gate stays open, so record `revise` to repair and verify again. Revising at acceptance does not use up one of the three repair cycles.
 
 ### Documents, resume and permissions
 
-Documents appear under `.agents/artifacts/rpi-RUN_ID/`. They are views of journal-backed artifacts; edit requests belong in review feedback.
+Documents appear under `.agents/artifacts/rpi-RUN_ID/`. They are views of journal-backed artifacts; edit requests belong in review feedback. If they cannot be written, hx warns and the run continues.
 
 Resume restores the frozen workflow mode, sources and budgets, so do not repeat `--rpi` or `--manual` with `--resume`. A branch chooses its workflow anew and does not inherit approvals. All stages share the run's limits; review downtime counts toward its deadline.
 
 Research and design stages can inspect source and approved read-only web tools but cannot execute shell commands or change the project. Implementation, verification and repair use the run's ordinary permissions.
 
-Verification checks exact planned commands, successful receipts and a bounded source inventory. This does not establish a hermetic build or protect against every concurrent external writer. See [runtime details](runtime-v2.md#rpi-workflow).
+Verification checks exact planned commands, successful receipts and a bounded source inventory. Build outputs ignored by Git are covered only when a check lists them in `inputs`; a directory there covers every file below it. This does not establish a hermetic build or protect against every concurrent external writer. See [runtime details](runtime-v2.md#rpi-workflow).
 
 ## Autoresearch
 

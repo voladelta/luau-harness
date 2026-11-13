@@ -473,6 +473,8 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
                 "--rpi requires a Git repository at workspace root ({}); initialize git with a .gitignore first",
                 policy.workspace.display()
             );
+            // Verification and acceptance observe the project; one that cannot be observed fails before any work.
+            workflow::observe_project(&policy.workspace, &[]).map_err(|e| e.context("--rpi cannot observe the project"))?;
         }
         let host = host::Host::start(cfg, policy, host::StartOptions {
             task, max_turns, trace, budget, packs: list_arg(args, "--pack"), branch,

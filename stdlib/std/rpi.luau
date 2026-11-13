@@ -36,15 +36,24 @@ end
 local function instruction(name)
 	return hx.asset("std/rpi/common.md") .. "\n\n" .. hx.asset("std/rpi/" .. name .. ".md")
 end
-local function start(s, name, submission)
+-- `revisit`: the stage replaces its own earlier document (owner answer or revision, manual results, a redesign), so it
+-- receives that document too.
+local function start(s, name, submission, revisit)
 	s.attempts[name] = (s.attempts[name] or 0) + 1
 	local refs = {}
 	for _, input in inputs[name] do
 		if s.artifacts[input] then table.insert(refs, s.artifacts[input]) end
 	end
+	if revisit and s.artifacts[name] then table.insert(refs, s.artifacts[name]) end
+	-- A redesign detour carries the repair record and the failed verification it answers until verification runs again.
+	if name == "verification" then
+		s.redesign = nil
+	elseif s.redesign then
+		for _, id in s.redesign do table.insert(refs, id) end
+	end
 	s.stage = { id = name .. "-" .. s.attempts[name], name = name,
 		access = if name == "implementation" or name == "verification" or name == "repair" then "workspace" else "inspect",
-		inputs = refs, instructions = instruction(name), verify = name == "verification", artifact_name = artifact_names[name] }
+		inputs = refs, verify = name == "verification", plans_checks = name == "program_design", artifact_name = artifact_names[name] }
 	s.corrections = 0
 	return boundary(s, { kind = "stage", stage = s.stage }, submission)
 end
@@ -70,26 +79,35 @@ local function repair(s, submission)
 	return start(s, "repair", submission)
 end
 -- The host's stage.submit already refused a payload without a valid outcome, nonempty summary, evidence array, owner
--- questions (when not complete) or well-formed checks (workflow.rs validate_submission). What remains is which fields
--- each RPI stage requires, which only this workflow knows.
+-- questions (when not complete) or well-formed checks (workflow.rs validate_submission), and added the verification
+-- stage's check results. What remains is which fields each RPI stage requires, which only this workflow knows.
 local function valid(payload, name)
 	if payload.outcome ~= "complete" then return nil end
 	if name == "program_design" then
 		if type(payload.checks) ~= "table" then return "Program design requires a structured checks array." end
 	elseif name == "verification" then
 		if type(payload.findings) ~= "table" then return "Verification requires a findings array (empty only when clean)." end
-		if type(payload.verification) ~= "table" then return "Host verification evidence is missing." end
 	elseif name == "repair" and type(payload.redesign_stage) == "string" and payload.redesign_stage ~= "system_design" and payload.redesign_stage ~= "program_design" then
 		return "redesign_stage must be system_design or program_design."
 	end
 	return nil
 end
+-- The worker transcript lives once, in `s.messages` (which the host and history read); `s.worker.messages` is set only
+-- while std/loop runs.
+local function with_worker(s, run)
+	s.worker.messages = s.messages
+	local result = table.pack(run(s.worker))
+	s.worker = result[1]
+	s.messages = s.worker.messages
+	s.worker.messages = nil
+	return table.unpack(result, 2, result.n)
+end
 local function correct(s, message)
 	s.corrections += 1
 	if s.corrections >= MAX_CORRECTIONS then return finish(s, "stopped", "Stage submission protocol failed: " .. message) end
-	local command
-	s.worker, command = loop.continue(s.worker, "RPI stage is not complete. " .. message .. " Call stage.submit with the full document, summary, evidence array and required stage fields in the luau tool; plain text cannot finish this stage.")
-	s.messages = s.worker.messages
+	local command = with_worker(s, function(worker)
+		return loop.continue(worker, "RPI stage is not complete. " .. message .. " Call stage.submit with the full document, summary, evidence array and required stage fields in the luau tool; plain text cannot finish this stage.")
+	end)
 	return s, command
 end
 function M.init(cfg)
@@ -106,38 +124,57 @@ local function describe(value, depth)
 	for _, key in keys do table.insert(parts, tostring(key) .. ": " .. describe(value[key], (depth or 0) + 1)) end
 	return "{ " .. table.concat(parts, ", ") .. " }"
 end
-local function packet(s, event)
-	local parts = { s.stage.instructions }
+local function strings(value)
+	return if type(value) == "table" then value else {}
+end
+-- The findings of a failed verification artifact, or nil when it passed.
+local function failed_verification(s, artifact)
+	local sub = artifact.submission
+	if artifact.name ~= "verification" or type(sub) ~= "table" or type(sub.verification) ~= "table" then return nil end
+	local host_findings, agent_findings = strings(sub.verification.findings), strings(sub.findings)
+	if sub.verification.passed == true and #host_findings == 0 and #agent_findings == 0 then return nil end
+	local lines = { "<host-verification-findings>\nThe latest verification stage was REJECTED by the harness." }
+	if #host_findings > 0 then
+		table.insert(lines, "Host verification findings:")
+		for _, f in host_findings do table.insert(lines, "- " .. tostring(f)) end
+	end
+	if #agent_findings > 0 then
+		table.insert(lines, "Agent self-reported findings:")
+		for _, f in agent_findings do table.insert(lines, "- " .. tostring(f)) end
+	end
 	if s.stage.name == "repair" then
-		for _, artifact in event.artifacts or {} do
-			if artifact.name == "verification" and type(artifact.submission) == "table" then
-				local sub = artifact.submission
-				local v = if type(sub.verification) == "table" then sub.verification else nil
-				local host_findings = if v and type(v.findings) == "table" then v.findings else {}
-				local agent_findings = if type(sub.findings) == "table" then sub.findings else {}
-				if (v and v.passed == false) or #host_findings > 0 or #agent_findings > 0 then
-					local lines = { "<host-verification-findings>\nThe previous verification stage was REJECTED by the harness." }
-					if #host_findings > 0 then
-						table.insert(lines, "Host verification findings:")
-						for _, f in host_findings do table.insert(lines, "- " .. tostring(f)) end
-					end
-					if #agent_findings > 0 then
-						table.insert(lines, "Agent self-reported findings:")
-						for _, f in agent_findings do table.insert(lines, "- " .. tostring(f)) end
-					end
-					table.insert(lines, "\nINSTRUCTIONS FOR REPAIR:\nAddress the specific verification failures listed above.\nIf automated tests passed (exit 0) but check receipts or working tree integrity failed (e.g. stale receipts or unexpected file modifications), fix the command sequence or workspace cleanliness; do not speculate on unobserved code bugs.\n</host-verification-findings>")
-					table.insert(parts, table.concat(lines, "\n"))
+		table.insert(lines, "\nINSTRUCTIONS FOR REPAIR:\nAddress the specific verification failures listed above.\nIf automated tests passed (exit 0) but check receipts or working tree integrity failed (e.g. stale receipts or unexpected file modifications), fix the command sequence or workspace cleanliness; do not speculate on unobserved code bugs.")
+	else
+		table.insert(lines, "\nA repair returned the work to this stage because the design must change; the repair record explains why.")
+	end
+	table.insert(lines, "</host-verification-findings>")
+	return table.concat(lines, "\n")
+end
+local function packet(s, event)
+	local parts = { instruction(s.stage.name) }
+	local selected = {}
+	for _, id in s.stage.inputs do selected[id] = true end
+	local documents = {}
+	for _, artifact in event.artifacts or {} do
+		if selected[artifact.id] then
+			local findings = failed_verification(s, artifact)
+			if findings then table.insert(parts, findings) end
+			if artifact.name == s.stage.name then
+				local lines = { "<previous-version name=" .. tostring(artifact.name) .. " id=" .. artifact.id .. ">",
+					"This stage's earlier document, which this run replaces. Owner input below says what changed.", artifact.document }
+				local questions = if type(artifact.submission) == "table" then strings(artifact.submission.questions) else {}
+				if #questions > 0 then
+					table.insert(lines, "Questions it asked the owner:")
+					for _, q in questions do table.insert(lines, "- " .. tostring(q)) end
 				end
+				table.insert(lines, "</previous-version>")
+				table.insert(documents, table.concat(lines, "\n"))
+			else
+				table.insert(documents, "<artifact name=" .. tostring(artifact.name) .. " id=" .. artifact.id .. ">\n" .. artifact.document .. "\n</artifact>")
 			end
 		end
 	end
-	local selected = {}
-	for _, id in s.stage.inputs do selected[id] = true end
-	for _, artifact in event.artifacts or {} do
-		if selected[artifact.id] then
-			table.insert(parts, "<artifact name=" .. tostring(artifact.name) .. " id=" .. artifact.id .. ">\n" .. artifact.document .. "\n</artifact>")
-		end
-	end
+	for _, document in documents do table.insert(parts, document) end
 	table.insert(parts, "<owner-inputs>\nLatest explicit owner feedback takes precedence over older design assumptions.")
 	for _, input in event.owner_inputs or {} do table.insert(parts, tostring(input.decision) .. ": " .. tostring(input.text or "")) end
 	table.insert(parts, "</owner-inputs>")
@@ -147,63 +184,54 @@ end
 function M.step(s, event)
 	if s.phase == "initial" then return start(s, "research_questions") end
 	if event.kind == "boundary_ready" then
-		for _, artifact in event.artifacts or {} do
-			if artifact.name == "request" then s.artifacts.request = artifact.id end
-		end
-		if type(event.sealed) == "table" then
-			-- Host may replace provisional submission refs with canonical artifact refs.
-			for name, id in s.artifacts do
-				if id == event.sealed.submission then s.artifacts[name] = event.sealed.id end
-			end
-		end
-		if type(event.stage) ~= "table" then return s, { kind = "next" } end
 		s.stage = event.stage
-		-- First boundary is created before the host request artifact exists.
-		if s.stage.name == "research_questions" and #s.stage.inputs == 0 and s.artifacts.request then s.stage.inputs = { s.artifacts.request } end
 		s.worker = loop.init({ max_turns = s.cfg.max_turns - s.turns, task_message = packet(s, event) })
 		s.messages = s.worker.messages
+		s.worker.messages = nil
 		s.phase = "worker"
 		return s, { kind = "next" }
 	elseif event.kind == "owner_decision" then
-		local request = event.request or s.pending
-		assert(request and request.gate_id == s.pending.gate_id, "unexpected owner decision")
+		local request = event.request
+		assert(s.pending and request.gate_id == s.pending.gate_id, "unexpected owner decision")
 		local continuation = request.continuation
 		s.pending = nil
 		if event.decision == "revise" then
 			s.waived_checks = {}
-			if s.stage.name == "verification" then return repair(s) end
+			-- Only verification has an acceptance gate. An owner revision is not a failed verification, so its repair
+			-- spends no repair cycle.
+			if s.stage.name == "verification" then return start(s, "repair") end
 			local p = position[s.stage.name]
 			for i = p + 1, #route do s.artifacts[route[i]] = nil end
 			s.artifacts.repair = nil
-			return start(s, s.stage.name)
+			return start(s, s.stage.name, nil, true)
 		elseif continuation == "finish" then
-			if request.kind == "input" and s.mode == "manual" then return gate(s, "acceptance", {}, {}, "finish") end
 			return finish(s, "completed", "Implementation verified and accepted.")
 		elseif continuation == "manual_results" then
 			if event.decision == "waive" then
 				for _, id in request.check_ids do s.waived_checks[id] = true end
 			end
-			return start(s, "verification")
+			return start(s, "verification", nil, true)
 		elseif continuation == "same_stage" then
-			return start(s, s.stage.name)
+			return start(s, s.stage.name, nil, true)
 		else
 			return next_stage(s)
 		end
 	end
 	assert(s.phase == "worker", "worker event received outside active stage")
 	-- Host additions (including images) update this same worker transcript.
-	s.worker.messages = s.messages
 	local before = s.worker.report.turns
-	local outcome
-	s.worker, outcome = loop.advance(s.worker, event, { submissions = true, recheck = false })
+	local outcome = with_worker(s, function(worker)
+		return loop.advance(worker, event, { submissions = true, recheck = false })
+	end)
 	s.turns += s.worker.report.turns - before
-	s.messages = s.worker.messages
 	if outcome.kind == "command" then
 		local result = if event.kind == "run_result" then event.result else nil
-		local error_text = if result and type(result.error) == "string" then result.error else ""
-		if result and (result.submission_error == true or error_text:find("stage.submit", 1, true) or error_text:find("submission", 1, true)) then
+		-- The host sets submission_error only when stage.submit refused a payload in this chunk.
+		if result and result.submission_error == true then
 			s.corrections += 1
-			if s.corrections >= MAX_CORRECTIONS then return finish(s, "stopped", "Stage submission protocol failed: " .. error_text) end
+			if s.corrections >= MAX_CORRECTIONS then
+				return finish(s, "stopped", "Stage submission protocol failed: " .. (if type(result.error) == "string" then result.error else "stage.submit refused the submission"))
+			end
 		end
 		return s, outcome.command
 	end
@@ -219,15 +247,15 @@ function M.step(s, event)
 	if s.stage.name == "repair" and type(payload.redesign_stage) == "string" then
 		local name = payload.redesign_stage
 		-- The repair entry already consumed one cycle; returning to design cannot reset it.
-		for i = position[name], #route do s.artifacts[route[i]] = nil end
+		s.redesign = { s.artifacts.verification, submission.id }
+		for i = position[name] + 1, #route do s.artifacts[route[i]] = nil end
 		s.artifacts.repair = nil
-		return start(s, name, submission.id)
+		return start(s, name, submission.id, true)
 	end
 	if s.stage.name == "verification" then
-		local verification = payload.verification
-		if verification.passed ~= true or #verification.findings > 0 or #payload.findings > 0 then return repair(s, submission.id) end
+		if payload.verification.passed ~= true or #payload.findings > 0 then return repair(s, submission.id) end
 		local manual = {}
-		for _, id in (if type(payload.manual_check_ids) == "table" then payload.manual_check_ids else {}) do
+		for _, id in strings(payload.manual_check_ids) do
 			if not s.waived_checks[id] then table.insert(manual, id) end
 		end
 		if #manual > 0 then return gate(s, "input", payload.questions, manual, "manual_results", submission.id) end
