@@ -64,7 +64,14 @@ pub fn options<T: DeserializeOwned + Default>(name: &str, value: Value) -> mlua:
     if value.is_nil() {
         return Ok(T::default());
     }
-    let json = crate::values::copy_out(value).map_err(|e| rt(format!("{name}: options: {e}")))?;
+    let json = crate::values::copy_out(value).map_err(|e| match e {
+        mlua::Error::RuntimeError(message) => rt(format!("{name}: options: {message}")),
+        other => rt(format!("{name}: options: {other}")),
+    })?;
+    // serde would also fill a struct from an array (`{5}`), by position
+    if !json.is_object() {
+        return Err(rt(format!("{name}: options: expected a table of named options")));
+    }
     serde_json::from_value(json).map_err(|e| rt(format!("{name}: options: {e}")))
 }
 
@@ -319,11 +326,12 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
 
     // sh(cmd, {timeout=seconds, cwd=dir}) -> {stdout, stderr, code, timed_out}
     let (f, o) = (fx.clone(), ops.clone());
-    g.set("sh", lua.create_async_function(move |lua, (cmd, opts): (String, Option<Table>)| {
+    g.set("sh", lua.create_async_function(move |lua, (cmd, opts): (String, Value)| {
         let (f, o) = (f.clone(), o.clone());
+        let opts = ShOpts::parse(opts);
         async move {
             o.fetch_add(1, Ordering::Relaxed);
-            let opts = ShOpts::parse(opts)?;
+            let opts = opts?;
             let pol = f.pol.clone();
             let class = pol.classify_sh(&cmd);
             let args = json!({"cmd": &cmd, "cwd": &opts.cwd, "timeout": opts.timeout});
@@ -476,42 +484,30 @@ fn search_files(root: &Path, base: &Path, pat: &str, opts: &SearchOptions, workf
     Ok(Hits { rows, truncated: false })
 }
 
-/// `sh`'s options, read once when the call is made. Raw access runs no metamethod, so reading them can neither loop
-/// nor run model code, and nothing touches a Lua value once the command is under way.
-#[derive(Debug, Default, PartialEq)]
+/// `sh`'s options, read once when the call is made (see `options`).
+#[derive(Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct ShOpts {
-    /// Seconds, as requested (finite); `secs` applies the default and the bounds.
+    /// Seconds, from 1 to `SH_TIMEOUT_MAX`; `SH_TIMEOUT` when not given.
     timeout: Option<f64>,
     cwd: Option<String>,
 }
 
 impl ShOpts {
-    /// An unknown key or a value of the wrong type is an error, so a typo or a bad value never silently becomes the
-    /// default.
-    fn parse(opts: Option<Table>) -> mlua::Result<ShOpts> {
-        let mut parsed = ShOpts::default();
-        let Some(opts) = opts else { return Ok(parsed) };
-        for pair in opts.pairs::<Value, Value>() {
-            let (key, value) = pair?;
-            let Value::String(name) = &key else {
-                return Err(rt(format!("sh: option keys are names (timeout, cwd), got a {}", key.type_name())));
-            };
-            match (&*name.to_string_lossy(), value) {
-                ("timeout", Value::Number(n)) if n.is_finite() => parsed.timeout = Some(n),
-                ("timeout", Value::Integer(n)) => parsed.timeout = Some(n as f64),
-                ("timeout", Value::Number(n)) => return Err(rt(format!("sh: timeout must be a finite number of seconds, got {n}"))),
-                ("timeout", v) => return Err(rt(format!("sh: timeout must be a number of seconds, got a {}", v.type_name()))),
-                ("cwd", Value::String(s)) => parsed.cwd = Some(s.to_str()?.to_owned()),
-                ("cwd", v) => return Err(rt(format!("sh: cwd must be a string, got a {}", v.type_name()))),
-                (other, _) => return Err(rt(format!("sh: unknown option `{other}` (options: timeout, cwd)"))),
-            }
+    /// Parse `sh`'s options; a timeout outside its range is an error, never silently clamped.
+    fn parse(value: Value) -> mlua::Result<ShOpts> {
+        let opts: ShOpts = options("sh", value)?;
+        if let Some(secs) = opts.timeout
+            && !(1.0..=SH_TIMEOUT_MAX).contains(&secs)
+        {
+            return Err(rt(format!("sh: options: timeout must be from 1 to {SH_TIMEOUT_MAX} seconds, got {secs}")));
         }
-        Ok(parsed)
+        Ok(opts)
     }
 
-    /// The command's time limit in seconds: the default when none was given, clamped to [1, SH_TIMEOUT_MAX].
+    /// The command's time limit in seconds.
     fn secs(&self) -> f64 {
-        self.timeout.unwrap_or(SH_TIMEOUT).clamp(1.0, SH_TIMEOUT_MAX)
+        self.timeout.unwrap_or(SH_TIMEOUT)
     }
 }
 
@@ -960,17 +956,19 @@ mod shell_tests {
     #[test]
     fn options_are_typed_and_read_raw() {
         let lua = Lua::new();
-        let parse = |src: &str| ShOpts::parse(lua.load(src).eval::<Option<Table>>().unwrap());
+        let parse = |src: &str| ShOpts::parse(lua.load(src).eval::<Value>().unwrap());
         assert_eq!(parse("nil").unwrap(), ShOpts::default());
+        assert_eq!(parse("nil").unwrap().secs(), SH_TIMEOUT);
         assert_eq!(parse("{timeout = 5, cwd = 'sub'}").unwrap(), ShOpts { timeout: Some(5.0), cwd: Some("sub".into()) });
-        for bad in ["{timeout = 0/0}", "{timeout = math.huge}", "{timeout = 'abc'}", "{timeout = '5'}", "{cwd = 1}", "{tiemout = 5}", "{5}"] {
+        assert_eq!(parse("{timeout = 600}").unwrap().secs(), SH_TIMEOUT_MAX);
+        for bad in ["{timeout = 0/0}", "{timeout = math.huge}", "{timeout = 'abc'}", "{timeout = '5'}", "{cwd = 1}", "{tiemout = 5}", "{5}",
+            "setmetatable({}, {})"] {
             assert!(parse(bad).is_err(), "{bad} must be rejected");
         }
-        // An __index that never returns is never called.
-        let looping = parse("setmetatable({}, {__index = function() while true do end end})").unwrap();
-        assert_eq!(looping, ShOpts::default());
-        assert_eq!(ShOpts { timeout: Some(-3.0), cwd: None }.secs(), 1.0);
-        assert_eq!(ShOpts { timeout: Some(1e9), cwd: None }.secs(), SH_TIMEOUT_MAX);
+        for out_of_range in ["{timeout = 0}", "{timeout = -1}", "{timeout = 0.5}", "{timeout = 600.5}", "{timeout = 1e12}"] {
+            let error = parse(out_of_range).unwrap_err().to_string();
+            assert!(error.contains("timeout must be from 1 to 600 seconds"), "{out_of_range}: {error}");
+        }
     }
 
     #[tokio::test]
@@ -989,14 +987,17 @@ mod shell_tests {
     }
 
     #[tokio::test]
-    async fn options_with_a_looping_index_do_not_escape_the_chunk_deadline() {
+    async fn options_with_a_metatable_are_refused_without_running_it() {
         let dir = scratch("index");
         let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(5), 32 << 20, None).unwrap();
-        let code = "print(sh('echo hi', setmetatable({}, {__index = function() while true do end end})).stdout)";
+        let code = "sh('touch ran', setmetatable({}, {__index = function() while true do end end, __pairs = function() while true do end end}))";
+        let t0 = std::time::Instant::now();
         let r = tokio::time::timeout(Duration::from_secs(30), vm.session.run(code)).await.expect("the chunk must finish");
-        assert!(r.error.is_none(), "{:?}", r.error);
-        assert_eq!(r.output, "hi\n\n");
+        let error = r.error.expect("options with a metatable are an error");
+        assert!(error.starts_with("runtime error: sh: options: expected data only") && error.contains("metatables are forbidden"), "{error}");
+        assert!(t0.elapsed() < Duration::from_secs(4), "a metamethod ran: {:?}", t0.elapsed());
+        assert!(!dir.join("ran").exists(), "the command must not run");
         let _ = std::fs::remove_dir_all(dir);
     }
 
