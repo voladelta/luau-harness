@@ -134,6 +134,42 @@ def outputs(requests):
     return [item.get("output", "") for body in requests for item in body.get("input", []) if item.get("type") == "function_call_output"]
 
 
+def audit(body, passed, reason=""):
+    """An auditor's reply: its verdict through `ar.verdict{pass, reason}` (passed=None: it gives none). An hx whose
+    episodes do not have `ar.verdict` yet gets the verdict file `ar.verdict` writes from the check itself, found through
+    the auditor's working directory (its scratch copy, journaled when the episode started)."""
+    if passed is None: return "Checked the state; ran out of steps before deciding."
+    if not answered(body):
+        return {"code": f'if ar.verdict then ar.verdict{{pass = {str(passed).lower()}, reason = {json.dumps(reason)}}}; return "RECORDED" end\n'
+                        'return "PWD " .. sh("pwd").stdout'}
+    pwd = next((o.split("PWD ", 1)[1].split()[0] for o in outputs([body]) if "PWD " in o), None)
+    if pwd:
+        label = role_of(body)[1]
+        for journal in (harness.BASE / "xdg-state").rglob("ar/*/journal.jsonl"):
+            lines = [json.loads(l) for l in journal.read_text().splitlines() if l.endswith("}")]
+            if any(r["kind"] == "started" and r["label"] == label and r.get("scratch") and pwd.startswith(r["scratch"] + "/") for r in lines):
+                path = journal.parent / "episodes" / f"{label}.verdict.json"
+                (path.parent / f".{label}.tmp").write_text(json.dumps({"pass": passed, "reason": reason}))
+                (path.parent / f".{label}.tmp").rename(path)
+    return "Checked the state."
+
+
+def journal_of(path, report=None):
+    run = ar_runs(path) / report["run"] if report else sorted(ar_runs(path).glob("*/journal.jsonl"))[-1].parent
+    return [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines() if l.endswith("}")]
+
+
+def snap_x(path, report, snap):
+    """x of a snapshot of the toy task."""
+    return int(base64.b64decode(json.loads((ar_runs(path) / report["run"] / "snaps" / f"{snap}.json").read_text())["x.txt"]))
+
+
+def workers(n, rounds=None, extra=""):
+    """A toy spec with `n` workers per round (and at most `rounds` rounds), for scenarios that need few episodes."""
+    return (f'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "python3 select.py"\ntimeout = 30\nworkers = {n}\n'
+            + (f"max_rounds = {rounds}\n" if rounds else "") + extra)
+
+
 AUDIT_GATE = BASE / "resume-audit-gate"
 
 
@@ -162,12 +198,12 @@ def scripted(body, index):
     role, label = role_of(body)
     if role == "judge":
         return judge_same(body)
+    if role == "audit":
+        return audit(body, False, "probe trick") if f"({go(3)})" in text_of(body) else audit(body, True)
     if answered(body):
         return f"FINDING from {label}: done"
     if role == "research":
         return "BRIEF: the score rewards x close to the hidden target; avoid huge x."
-    if role == "audit":
-        return "Checked the state.\nVERDICT: FAIL: probe trick" if f"({go(3)})" in text_of(body) else "Checked.\nVERDICT: PASS"
     if role == "explore":
         w = int(label.split("-w")[1].split(".")[0])
         t, alt = TARGETS[w], 40 + w
@@ -186,15 +222,11 @@ def scripted(body, index):
 
 # 1b. While refining keeps making progress, rounds go on; the score tops out at 12, and then the run stops by itself.
 CLIMB = 'import json; x = int(open("x.txt").read()); print(json.dumps({"score": min(x, 12)}))'
-limited_once = [True]
 def climbing(body, index):
     role, label = role_of(body)
     if role == "judge": return judge_same(body)
-    if label == "r1-w1" and limited_once[0]:
-        limited_once[0] = False
-        return {"status": 429, "error": "slow down"}
+    if role == "audit": return audit(body, True)
     if answered(body): return f"FINDING from {label}: done"
-    if role == "audit": return "Checked.\nVERDICT: PASS"
     if role == "explore":
         # Three ideas work (more would keep the run climbing until its round cap); the others build nothing valid.
         w = int(label.split("-w")[1].split(".")[0])
@@ -314,9 +346,11 @@ def scenario_00():
     assert any(r["kind"] == "audited" and r["idea"] == three and not r["pass"] for r in records)
     assert not any(c["idea"] == three for g in gates for c in g["candidates"] if c["idea"] in g["chosen"])
     bad = {c["n"] for c in explore if c["idea"] in (go(20), go(40 + loser), go(12), go(13))}
-    vetoed = [c for c in gates[0]["candidates"] if c["idea"] in bad and c["search"] > -49]
-    assert vetoed and all(c["select"] < -25 for c in vetoed), vetoed  # beat the seed on search, lose on held-out
-    assert all(not c["good"] for c in gates[0]["candidates"] if c["idea"] in bad), gates[0]["candidates"]
+    selected = {r["snap"]: r["score"] for r in records if r["kind"] == "selected"}
+    vetoed = [r for r in rows if r["idea"] in bad and r["valid"] and r["score"] > -49]
+    assert vetoed and all(selected[r["snap"]] < -25 for r in vetoed), vetoed  # beat the seed on search, lose on held-out
+    assert all(not c["good"] and c["frontier"]["snap"] not in {r["snap"] for r in vetoed}
+               for c in gates[0]["candidates"] if c["idea"] in bad), gates[0]["candidates"]
     check("research briefs every worker; the gate keeps good candidates, audits them and drops the one that fails")
 
     for g in gates[:2]:
@@ -354,9 +388,10 @@ def scenario_00():
 
     portfolio = report["portfolio"]
     assert 1 <= len(portfolio) <= 3 and len({p["snap"] for p in portfolio}) == len(portfolio), portfolio
-    assert all(p["audit"] is True and p["idea"] != three for p in portfolio), portfolio
+    passed = {r["snap"] for r in records if r["kind"] == "audited" and r["pass"]}
+    assert all(p["snap"] in passed and p["idea"] != three for p in portfolio), portfolio
     assert [p["search"] for p in portfolio] == sorted((p["search"] for p in portfolio), reverse=True), portfolio
-    assert all(p["good"] and p["select"] >= -25 for p in portfolio), portfolio  # nothing the held-out veto rejects
+    assert all(p["search"] > -49 and p["select"] >= -25 for p in portfolio), portfolio  # nothing the held-out veto rejects
     x = int((path / "x.txt").read_text())
     assert report["select"] == portfolio[0]["select"] == -(x - 5) ** 2, (x, report["select"], portfolio)
     assert all((run / "portfolio" / f"c{p['idea']}" / "x.txt").exists() for p in portfolio)
@@ -375,8 +410,7 @@ def scenario_01():
     # 1b. While refining keeps making progress, rounds go on; the score tops out at 12, and then the run stops by itself.
     # Each refining round adds 1, below min_delta = 1.5: progress only counts once two steps add up, so a run that judged
     # each round alone would stop after round 3.
-    path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIMB},
-                     'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "python3 select.py"\ntimeout = 30\nmin_delta = 1.5\n')
+    path = workspace("climb", {"x.txt": "0\n", "search.py": CLIMB, "select.py": CLIMB}, workers(5, extra="min_delta = 1.5\n"))
     with harness.provider(climbing) as (url, _):
         result = ar(path, url)
     report = report_of(result)
@@ -386,16 +420,17 @@ def scenario_01():
 
     records = [json.loads(l) for l in (ar_runs(path) / report["run"] / "journal.jsonl").read_text().splitlines()]
     widths = [len(r["episodes"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("round")]
-    assert widths[0] == 8 and widths[1] == 6 and max(widths[1:]) == 6, widths
-    limited = [r for r in records if r["kind"] == "finished" and r.get("rate_limits")]
-    assert [r["label"] for r in limited] == ["r1-w1"] and "1 rate-limited" in result.stderr, limited
-    check("eight workers per round, six once the provider rate-limits an episode")
+    assert set(widths) == {5}, widths
+    # The candidate that passed its audit early climbed past it by more than min_delta: the last gate audited the lift.
+    assert any(r["kind"] == "planned" and r["batch"] == "audit-last" for r in records), [r.get("batch") for r in records if r["kind"] == "planned"]
+    check("the spec sets the workers per round; the last gate audits a result's lift beyond the margin")
 
 
 def scenario_02():
     # 2. Ideas below the seed still go on to refinement, but never become results: the workspace keeps the seed. With no
     # valid idea at all the run stops after round 1.
     path = workspace("hopeless")
+    before = (path / "x.txt").stat().st_mtime_ns
     with harness.provider(hopeless) as (url, _):
         result = ar(path, url)
     report = report_of(result)
@@ -403,15 +438,16 @@ def scenario_02():
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
     gates = [r for r in records if r["kind"] == "gate"]
     assert len(gates[0]["chosen"]) == 3 and not any(c["good"] for c in gates[0]["candidates"]), gates[0]
-    copy = next(c for c in gates[0]["candidates"] if c["search"] == -49)
-    first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["search"]) if c is not copy][:3]
-    assert copy["idea"] not in gates[0]["chosen"], gates[0]
+    copy = next(c for c in gates[0]["candidates"] if c["frontier"]["search"] == -49)
+    first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: (-c["frontier"]["search"], c["idea"]))][:3]
+    assert copy["idea"] == gates[0]["chosen"][0] and not copy["good"], gates[0]  # a tie with the seed: not good, ranked by search
     assert gates[0]["chosen"] == first, (gates[0]["chosen"], first)
     round2 = next(r for r in records if r["kind"] == "planned" and r["batch"] == "round2")
     assert {p["role"] for p in round2["episodes"]} == {"exploit"} and {p["idea"] for p in round2["episodes"]} == set(first), round2
     assert report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n" and "no candidate beat the seed" in result.stderr, report
-    assert not any(p.name.startswith("a") for p in (run / "episodes").iterdir()), "a candidate below the seed was audited"
-    check("ideas below the seed go on to refinement unaudited, a copy of the seed never; the workspace keeps the seed")
+    assert (path / "x.txt").stat().st_mtime_ns == before, "the workspace was rewritten although the result is the seed"
+    assert not any(p.name.startswith(("a", "f")) for p in (run / "episodes").iterdir()), "a candidate below the seed was audited"
+    check("ideas below the seed (and a tie with it) go on to refinement unaudited; a seed result leaves the workspace untouched")
 
     path = workspace("invalid")
     with harness.provider(lambda body, index: hopeless(body, index, "nope")) as (url, _):
@@ -424,7 +460,7 @@ def scenario_02():
 def scenario_03():
     # 2c. An auditor that gives no verdict leaves its candidate unaudited: nothing becomes a result without a passing audit.
     path = workspace("noverdict")
-    with harness.provider(lambda body, index: "Checked the state." if role_of(body)[0] == "audit" else scripted(body, index)) as (url, _):
+    with harness.provider(lambda body, index: audit(body, None) if role_of(body)[0] == "audit" else scripted(body, index)) as (url, _):
         report = report_of(ar(path, url))
     records = [json.loads(l) for l in (ar_runs(path) / report["run"] / "journal.jsonl").read_text().splitlines()]
     assert any(r["kind"] == "planned" and r["batch"].startswith("audit") for r in records), "no audit ran"
@@ -551,7 +587,7 @@ def scenario_10():
         assert result.returncode == 0, result.stderr[-3000:]
     report = report_of(result)
     records = [json.loads(l) for l in journal.read_text().splitlines()]
-    interrupted = [r for r in records if r["kind"] == "finished" and r.get("interrupted")]
+    interrupted = [r for r in records if r["kind"] == "finished" and r["outcome"] == "interrupted"]
     assert [r["label"] for r in interrupted] == ["r1-w6"], interrupted
     killed = next(r for r in records if r["kind"] == "started" and r["label"] == "r1-w6")
     assert not Path(killed["scratch"]).exists(), "killed episode's scratch copy left behind"
@@ -633,7 +669,7 @@ def scenario_14():
     report = report_of(result)
     assert "retrying" in result.stderr and report["evals"] > 0, result.stderr[-1500:]
     records = [json.loads(l) for l in (ar_runs(path) / report["run"] / "journal.jsonl").read_text().splitlines()]
-    crashed = next(r for r in records if r["kind"] == "finished" and r.get("crashed"))
+    crashed = next(r for r in records if r["kind"] == "finished" and r["outcome"] == "crashed")
     assert any(r["kind"] == "started" and r["label"] == "r0-research.2" for r in records), records
     path = workspace("misconfigured")
     start = time.time()
@@ -826,9 +862,8 @@ def scenario_24():
 def scenario_fallback():
     # A refinement whose state fails its audit costs only itself: the candidate falls back to its best state that passed.
     def strict(body, index):
-        if role_of(body)[0] == "audit" and not answered(body):
-            start = text_of(body).split("<starting_state>")[1].split("</starting_state>")[0]
-            if '"x": 7' in start: return "x is seven here.\nVERDICT: FAIL: x is seven"
+        if role_of(body)[0] == "audit" and '"x": 7' in text_of(body).split("<starting_state>")[1].split("</starting_state>")[0]:
+            return audit(body, False, "x is seven")
         return scripted(body, index)
 
     path = workspace("fallback")
@@ -841,8 +876,231 @@ def scenario_fallback():
     assert any(r["kind"] == "audited" and r["idea"] == six and not r["pass"] for r in records), "the x = 7 state was never failed"
     kept = next(p for p in report["portfolio"] if p["idea"] == six)
     snap = json.loads((run / "snaps" / f"{kept['snap']}.json").read_text())
-    assert base64.b64decode(snap["x.txt"]) == b"6\n" and kept["audit"] is True, kept
+    assert base64.b64decode(snap["x.txt"]) == b"6\n" and any(r["kind"] == "audited" and r["snap"] == kept["snap"] and r["pass"] for r in records), kept
     check("a refinement that fails its audit costs only itself: the candidate keeps its best state that passed")
+
+
+# Review findings: the gate, interrupts, confinement, the watchdog, --finish and the binary episodes run. These use the
+# linear task (search = x) and few workers, so each takes seconds.
+LINEAR = 'import json; x = int(open("x.txt").read()); print(json.dumps({"score": %s, "report": {"x": x}}))'
+CONST = 'import json; print(json.dumps({"score": 0}))'
+
+
+def lanes(steps, verdicts=lambda x: True, other=None):
+    """A provider whose workers follow `steps` ({plan label: [x, ...]}: claim, then score each x in turn) and whose
+    auditors judge the x of the state they audit (`verdicts(x)`: True, False, or None for no verdict). Episodes without
+    a lane go to `other` if given, else finish at once."""
+    def reply(body, index):
+        role, label = role_of(body)
+        if role == "judge": return "Answer: 0"
+        if role == "audit":
+            x = int(re.search(r'"x": (-?\d+)', text_of(body).split("<starting_state>")[1]).group(1))
+            v = verdicts(x)
+            return audit(body, v, "" if v else f"x = {x} breaks the rules")
+        steps_ = steps.get((label or "").split(".")[0])
+        if steps_ is None: return other(body, index) if other else ("BRIEF" if role == "research" else "done")
+        if answered(body): return f"FINDING from {label}"
+        code = f'ar.claim("move x through {steps_} as worker {label} does it today")\n'
+        return {"code": code + "".join(f'write("x.txt", "{x}\\n")\nprint(ar.eval("x={x}"))\n' for x in steps_) + 'return "ok"'}
+    return reply
+
+
+def scenario_veto():
+    # Finding 1: a refinement the held-out veto rejects costs only itself; the candidate keeps its passed result, its
+    # next workers are told why, and max_rounds ends the run.
+    path = workspace("veto", {"x.txt": "0\n", "search.py": LINEAR % "x", "select.py": SCORE % 5}, workers(2, 3))
+    with harness.provider(lanes({"r1-w1": [3], "r2-w1": [11], "r2-w2": [4]})) as (url, requests):
+        result = ar(path, url)
+    report, records = report_of(result), journal_of(path)
+    rows = ledger(path, report)
+    x11 = next(r["snap"] for r in rows if r["note"] == "x=11")
+    assert [r["score"] for r in records if r["kind"] == "selected" and r["snap"] == x11] == [-36], records
+    gates = [r for r in records if r["kind"] == "gate"]
+    assert all(c["frontier"]["snap"] != x11 for g in gates for c in g["candidates"]), gates
+    assert not any(p["start"] == x11 for r in records if r["kind"] == "planned" for p in r["episodes"])
+    task = (ar_runs(path) / report["run"] / "episodes/r3-w1.md").read_text()
+    assert "was vetoed" in task and "-36" not in task, task.split("<checks>")[-1][:500]
+    assert [snap_x(path, report, p["snap"]) for p in report["portfolio"]] == [4] and (path / "x.txt").read_text() == "4\n", report["portfolio"]
+    assert "3 rounds, the most this run takes" in result.stderr and gates[-1]["last"], result.stderr[-800:]
+    check("a vetoed refinement falls back like a failed audit: the candidate keeps a result and its workers learn why (finding 1)")
+
+
+def scenario_noverdict_keeps_result():
+    # Finding 1: an audit that ends without a verdict leaves the candidate's earlier passed result in place.
+    path = workspace("noverdict2", {"x.txt": "0\n", "search.py": LINEAR % "x", "select.py": LINEAR % "x"}, workers(2, 2))
+    with harness.provider(lanes({"r1-w1": [3], "r2-w1": [4]}, lambda x: True if x == 3 else None)) as (url, _):
+        result = ar(path, url)
+    report, records = report_of(result), journal_of(path)
+    assert any(r["kind"] == "planned" and r["batch"] == "audit-last" for r in records), "the lift was never audited"
+    assert [snap_x(path, report, p["snap"]) for p in report["portfolio"]] == [3] and (path / "x.txt").read_text() == "3\n", report
+    assert "no verdict; it stays unaudited" in result.stderr
+    check("an audit without a verdict keeps the candidate's passed result (finding 1)")
+
+
+def scenario_fallback_derived():
+    # Finding 8 and 7: after a failed audit the candidate falls back to its best surviving state (5, not 3), whether or
+    # not that state was `improved` when scored, and the exploit task names the failed audit's reason.
+    path = workspace("fallback2", {"x.txt": "0\n", "search.py": LINEAR % "x", "select.py": CONST}, workers(1, 2))
+    with harness.provider(lanes({"r1-w1": [3, 6, 5]}, lambda x: x != 6)) as (url, _):
+        result = ar(path, url)
+    report, records = report_of(result), journal_of(path)
+    round2 = next(r for r in records if r["kind"] == "planned" and r["batch"] == "round2")
+    assert snap_x(path, report, round2["episodes"][0]["start"]) == 5, round2
+    task = (ar_runs(path) / report["run"] / "episodes/r2-w1.md").read_text()
+    assert "failed its audit: x = 6 breaks the rules" in task, task[:2000]
+    assert [snap_x(path, report, p["snap"]) for p in report["portfolio"]] == [5] and (path / "x.txt").read_text() == "5\n", report
+    check("a failed audit falls back to the best surviving state, and its reason reaches the candidate's workers (findings 7, 8)")
+
+
+def scenario_tie():
+    # Finding 9: a state that ties the seed's score is a candidate like any other: not good, ranked by search.
+    path = workspace("tie", {"x.txt": "0\n", "search.py": LINEAR % "x // 10", "select.py": CONST}, workers(2, 2))
+    with harness.provider(lanes({"r1-w1": [5], "r1-w2": [-5]})) as (url, _):
+        result = ar(path, url)
+    report, records = report_of(result), journal_of(path)
+    gate = next(r for r in records if r["kind"] == "gate")
+    ties = [c for c in gate["candidates"] if c["frontier"]["search"] == 0]
+    assert len(ties) == 1 and not ties[0]["good"] and gate["chosen"][0] == ties[0]["idea"] and len(gate["chosen"]) == 2, gate
+    round2 = next(r for r in records if r["kind"] == "planned" and r["batch"] == "round2")
+    assert {p["idea"] for p in round2["episodes"]} == set(gate["chosen"]), round2
+    check("a tie with the seed is not good and ranks by search; only the seed's own bytes are excluded (finding 9)")
+
+
+def scenario_interrupt():
+    # Finding 2: stopping the orchestrator three times before round 1's workers score uses up nothing; once the provider
+    # works, the run finishes. Each killed child's temp directory was inside its scratch copy and went with it (15).
+    path = workspace("interrupt", spec=workers(2, 1))
+    def sleepy(body, index):
+        role = role_of(body)[0]
+        if role == "explore" and not answered(body): return {"code": 'sh("sleep 120")\nreturn "late"'}
+        return "Answer: 0" if role == "judge" else "BRIEF" if role == "research" else "done"
+    def started(n):
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            js = list(ar_runs(path).glob("*/journal.jsonl"))
+            if js and sum(r["kind"] == "started" and r["label"].startswith("r1-") for r in
+                          (json.loads(l) for l in js[0].read_text().splitlines() if l.endswith("}"))) >= n:
+                return js[0].parent
+            time.sleep(0.1)
+        raise AssertionError(f"round 1 never started {n} attempts")
+    resume = lambda run: [str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)]
+    with harness.provider(sleepy) as (url, _):
+        p = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        for n in (2, 4, 6):
+            run = started(n)
+            time.sleep(1)
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            if n < 6:
+                p = subprocess.Popen(resume(run), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    with harness.provider(lanes({"r1-w1": [3], "r1-w2": [2]})) as (url, requests):
+        result = subprocess.run(resume(run), env=harness.ENV, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0 and requests, result.stderr[-2000:]
+    records = journal_of(path)
+    assert [r["label"] for r in records if r["kind"] == "started" and r["label"].startswith("r1-w1")] == ["r1-w1", "r1-w1.2", "r1-w1.3", "r1-w1.4"]
+    killed = [r for r in records if r["kind"] == "finished" and r["outcome"] == "interrupted"]
+    assert len(killed) == 6 and [g["chosen"] for g in records if g["kind"] == "gate"][0], records
+    for r in killed:
+        scratch = next(s["scratch"] for s in records if s["kind"] == "started" and s["label"] == r["label"])
+        session = (run / "episodes" / f"{r['label']}.log").read_text() if (run / "episodes" / f"{r['label']}.log").is_file() else \
+            "".join(j.read_text() for j in (run / "episodes" / f"{r['label']}.log").glob("*.jsonl"))
+        tmp = re.search(r'"tmp":"([^"]+)"', session).group(1)
+        assert tmp.startswith(scratch + "/tmp/") and not Path(tmp).exists() and not Path(scratch).exists(), (tmp, scratch)
+    check("interrupted attempts are not crashes: a run stopped three times mid-round still finishes, and killed children leave no temp directory (findings 2, 15)")
+
+
+def scenario_unconfined():
+    # Finding 3: without Landlock a spec with held-out or grader data refuses to launch or resume, unless acknowledged.
+    grader, holdout = held_out_roots()
+    spec = (f'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "sh {grader}/score.sh {holdout}"\n'
+            f'grader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\nworkers = 1\nmax_rounds = 1\n')
+    path = workspace("unconfined", spec=spec)
+    off = {"HX_TEST_NO_LANDLOCK": "1"}
+    with harness.provider(once('return ar.eval("b")', ("r1-w1",))) as (url, requests):
+        refused = ar(path, url, ok=False, env=off)
+        assert refused.returncode != 0 and "--ar-unconfined" in refused.stderr and not requests, refused.stderr[-800:]
+        assert not list(ar_runs(path).glob("*")), "a refused launch left a run"
+        report = report_of(ar(path, url, env=off, extra=["--ar-unconfined"]))
+        run = ar_runs(path) / report["run"]
+        (run / "report.json").unlink()
+        before = len(requests)
+        resume = [str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)]
+        result = subprocess.run(resume, env={**harness.ENV, **off}, capture_output=True, text=True, timeout=120)
+        assert result.returncode != 0 and "--ar-unconfined" in result.stderr, result.stderr[-800:]
+        result = subprocess.run(resume + ["--ar-unconfined"], env={**harness.ENV, **off}, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0 and len(requests) == before, result.stderr[-800:]
+    check("without confinement, held-out data refuses launch and resume unless --ar-unconfined acknowledges it (finding 3)")
+
+
+def scenario_watchdog():
+    # Finding 11: a child that outlives its wall-clock cap is killed and journaled as timed out, an outcome, not a crash.
+    path = workspace("watchdog", spec='editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\nworkers = 1\nmax_rounds = 1\n')
+    def stuck(body, index):
+        if role_of(body)[0] == "research" and not answered(body):
+            time.sleep(20)
+        return lanes({"r1-w1": [3]})(body, index)
+    with harness.provider(stuck) as (url, _):
+        result = ar(path, url, env={"HX_AR_WATCHDOG_SECS": "4"})
+    records = journal_of(path)
+    research = [r for r in records if r["kind"] == "finished" and r["label"].startswith("r0-research")]
+    assert [(r["label"], r["outcome"]) for r in research] == [("r0-research", "timed_out")], research
+    assert "outlived its" in result.stderr and report_of(result)["evals"] >= 1, result.stderr[-800:]
+    check("the watchdog kills a child past its cap and journals it as timed out, not crashed (finding 11)")
+
+
+def scenario_finish():
+    # Finding 14: `--resume RUN --finish` writes the result from the last gate and starts nothing.
+    path = workspace("finish", {"x.txt": "0\n", "search.py": LINEAR % "x", "select.py": LINEAR % "x"}, workers(2))
+    slow = lambda body, index: {"code": 'sh("sleep 60")\nreturn "late"'} if role_of(body)[0] == "exploit" and not answered(body) else "done"
+    with harness.provider(lanes({"r1-w1": [3]}, other=slow)) as (url, requests):
+        p = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        deadline = time.time() + 120
+        while time.time() < deadline and not any(r["kind"] == "started" and r["label"] == "r2-w1" for r in (journal_of(path) if list(ar_runs(path).glob("*/journal.jsonl")) else [])):
+            time.sleep(0.1)
+        time.sleep(1)
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        before = len(requests)
+        run = sorted(ar_runs(path).glob("*/journal.jsonl"))[-1].parent
+        resume = [str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)]
+        result = subprocess.run(resume + ["--finish"], env=harness.ENV, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0 and len(requests) == before, result.stderr[-1500:]
+        report = report_of(result)
+        assert [snap_x(path, report, p["snap"]) for p in report["portfolio"]] == [3] and (path / "x.txt").read_text() == "3\n", report
+        assert (run / "report.json").exists() and (run / "portfolio").is_dir()
+        again = subprocess.run(resume, env=harness.ENV, capture_output=True, text=True, timeout=120)
+        assert again.returncode != 0 and "already finished" in again.stderr, again.stderr[-800:]
+    check("--resume RUN --finish writes the last gate's result and starts nothing (finding 14)")
+
+
+def scenario_bad_seed():
+    # Finding 5: a seed the search evaluator cannot score stops the run before spending, and nothing touches the workspace.
+    path = workspace("badseed", {"x.txt": "zero\n", "search.py": SCORE % 7, "select.py": SCORE % 5})
+    with harness.provider(scripted) as (url, requests):
+        result = ar(path, url, ok=False)
+    assert result.returncode != 0 and "no valid score for the seed" in result.stderr and not requests, result.stderr[-800:]
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=path, capture_output=True, text=True).stdout
+    assert not status.strip() and (path / "x.txt").read_text() == "zero\n", status
+    check("a seed the evaluator cannot score fails fast; the workspace is untouched (finding 5)")
+
+
+def scenario_rebuild():
+    # Finding 15: episodes run the binary the orchestrator started as, even once the file at its path is gone (a rebuild
+    # replaces it); an episode's shell gets a temp directory inside its scratch copy.
+    copy = BASE / "hx-rebuilt"
+    shutil.copy2(os.environ.get("HX_BIN") or harness.ROOT / "target/release/hx", copy)
+    path = workspace("rebuild", spec='editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\nworkers = 1\nmax_rounds = 1\n')
+    def reply(body, index):
+        if role_of(body)[0] == "research" and not answered(body):
+            copy.unlink(missing_ok=True)
+            return {"code": 'return "TMP " .. sh("echo $TMPDIR").stdout'}
+        return lanes({"r1-w1": [3]})(body, index)
+    with harness.provider(reply) as (url, requests):
+        result = ar(path, url, env={"HX_BIN": str(copy)})
+    assert not copy.exists() and report_of(result)["evals"] >= 1, result.stderr[-1500:]
+    tmp = next(o for o in outputs(requests) if "TMP " in o).split("TMP ")[1].split()[0]
+    assert re.search(r"/hx-ar-ws-[^/]+/tmp/hx-\d+-\d+$", tmp), tmp
+    check("episodes keep running the orchestrator's own binary after it is replaced, with temp directories in their copies (finding 15)")
 
 
 # Scenarios are independent (own workspace, own mock provider), so a few run side by side; more would load the machine.
