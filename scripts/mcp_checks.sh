@@ -32,7 +32,8 @@ check "tools/list pages are followed to the last tool" "$(x 'print(mcp.demo.ask_
 check "a server ping during a call is answered" "$(x 'print(mcp.demo.ask_ping{})' | head -1)" "pong received"
 out=$(x 'print(pcall(mcp.demo.rpc_error, {})); print(mcp.demo.add{a = 1, b = 2})' | tr '\n' ' ')
 check "a JSON-RPC error is a definite failure: the next mutation runs" "$(echo "$out" | grep -c 'false.*Invalid params: missing key.* 3 $')$(echo "$out" | grep -c unknown_outcome)" "10"
-out=$(x 'print(mcp.demo.exit{}); local t = os.clock(); while os.clock() - t < 0.5 do end; print(mcp.demo.add{a = 2, b = 2}); print(mcp.demo.add{a = 3, b = 3})' | tr '\n' ' ')
+rm -f $W/exited
+out=$(x 'print(mcp.demo.exit{}); sh("while [ ! -e exited ]; do sleep 0.01; done", { timeout = 10 }); print(mcp.demo.add{a = 2, b = 2}); print(mcp.demo.add{a = 3, b = 3})' | tr '\n' ' ')
 check "a server that exits between calls is restarted for the next one" "$out" "bye 4 6 "
 # alive: is the process in spawned.pid running? (a zombie is not: this container's init may not reap orphans)
 alive() { [ -s $W/spawned.pid ] || { echo "no pid"; return; }; case "$(ps -o stat= -p "$(cat $W/spawned.pid 2>/dev/null)" 2>/dev/null)" in ""|Z*) echo gone;; *) echo alive;; esac; }

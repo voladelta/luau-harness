@@ -384,11 +384,14 @@ class Tools(unittest.TestCase):
         source = 'return {tools={go={signature="go(): string",description="version",run=function() return "original" end}}}'
         file = self.dir / "version.lua"
         file.write_text(source)
-        process = subprocess.Popen([str(HX), "exec", "--workspace", str(self.ws), 'print(version.go())', 'sh("sleep 0.2"); print(version.go())'], env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # the second chunk waits until the file has been edited, so it always calls the tool after the edit
+        wait = 'sh("while [ ! -e edited ]; do sleep 0.01; done", { timeout = 10 }); print(version.go())'
+        process = subprocess.Popen([str(HX), "exec", "--workspace", str(self.ws), 'print(version.go())', wait], env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(lambda: process.poll() is None and process.kill())
         first = process.stdout.readline()
         self.assertIn("original", first)
         file.write_text(source.replace("original", "edited"))
+        (self.ws / "edited").touch()
         out, err = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 0, err)
         self.assertIn("original", out)

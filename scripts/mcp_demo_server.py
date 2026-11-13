@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A tiny MCP server (stdio, JSON-RPC 2.0) for testing hx's MCP client. Every tools/call is appended to calls.log.
-Over stdio, tools/list answers in pages of three (nextCursor); `exit` answers and then exits; `ask_ping` sends the
+Over stdio, tools/list answers in pages of three (nextCursor); `exit` answers, closes its input, creates `exited` and
+then exits, so a check can wait for `exited` and know the next write finds no reader; `ask_ping` sends the
 client a ping request and answers only once the client has replied to it. `rpc_error` answers with a JSON-RPC error.
 `read_spawn` starts a long-lived child (as a wrapper like npx would) and writes its pid to spawned.pid."""
 import json, os, socket, subprocess, sys
@@ -111,6 +112,8 @@ def main():
             continue
         send({"jsonrpc": "2.0", "id": m["id"], "result": r})
         if m["method"] == "tools/call" and m["params"]["name"] == "exit":
+            os.close(0)
+            open("exited", "w").close()
             sys.exit(0)
 
 
