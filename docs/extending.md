@@ -72,20 +72,21 @@ HTTP tools declare named, fixed endpoints in `http`, then call `http("endpoint",
 | Field | Default | Meaning |
 |---|---|---|
 | `url` | | Fixed origin and path; a `{name}` placeholder fills one whole path segment (`/videos/{job_id}`, not `/v{id}`) from the argument of that name, percent-encoded |
-| `method` | `GET` | Remaining GET arguments become encoded query parameters; other methods send JSON |
+| `method` | `GET` | `GET` and `DELETE` send the remaining arguments as encoded query parameters and no body; `POST`, `PUT` and `PATCH` send them as a JSON body |
 | `secret` | | Credential name |
 | `header` | `Authorization` | Header the secret is sent in, verbatim |
 | `bearer` | `false` | Send `Bearer <secret>` (store the bare token) |
-| `raw` | `false` | Return `{text, media_type}` for UTF-8 bodies or `{base64, media_type}` for audio, image, video and other bytes, instead of decoded JSON |
+| `raw` | `false` | Return `{text, media_type}` for UTF-8 bodies or `{base64, media_type}` for audio, image, video and other bytes, instead of decoded JSON. Without it, an empty success (such as 204) returns `nil` and a success whose body is not JSON returns `{status, text}` |
 | `read_only` | `false` | Mark only endpoints that read data; others go through the approval gate, matched as `http NAMESPACE.ENDPOINT` |
 
 Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose bytes can go straight to `write`.
 
 - HTTP errors raise with their status and a bounded response excerpt.
-- Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects.
+- Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects. A loopback endpoint is never reached through a proxy.
+- A failed request to a non-read-only endpoint is uncertain only when it was sent and its answer was lost (a dropped connection, a timeout, a cut-off or oversized success body, a 5xx other than 503): the server may have acted, so new mutations wait for `hx recover`. A refused connection, a 4xx or a 503 is a definite failure.
 - Endpoint declarations grant access to those URLs; the environment running hx controls network access.
 - HTTP calls use the supervisor's authorization, run deadline and journal.
-- Credentials are attached by Rust and never returned to tool code or saved in the run manifest. Credentials echoed in responses are redacted before journaling.
+- Credentials are attached by Rust and never returned to tool code or saved in the run manifest. Literal echoes of a credential in responses are redacted before journaling; an echo in another encoding (base64, percent-encoding) is not.
 
 ### Credentials
 

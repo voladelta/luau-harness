@@ -56,7 +56,9 @@ bearer_env = "REMOTE_TOKEN"     # or headers_env = {"x-api-key" = "VAR"}
 
 A local server is [confined](#shell-confinement) like a shell command, to the file policy at its start. Network and GPU access are controlled by the environment running hx; hx has no network switches.
 
-MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`.
+An unknown key (a typo such as `bearer-env`) is an error. A server that exits is started again on the next call.
+
+MCP tools bind as `mcp.SERVER.tool{...}`; a name that is not a Luau identifier also gets an alias with `_` for each other character (`a.b` as `a_b`) unless another tool already has that name. Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`.
 
 ## Shell confinement
 

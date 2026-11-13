@@ -166,7 +166,7 @@ pub fn definition(table: &Table) -> Result<Definition> {
         reqwest::header::HeaderName::from_bytes(endpoint.header.as_bytes())?;
         if let Some(secret) = &endpoint.secret {
             ensure!(!secret.is_empty() && secret.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'), "invalid secret name");
-            ensure!(base.scheme() == "https" || matches!(base.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")), "authenticated endpoints require HTTPS (except loopback)");
+            ensure!(base.scheme() == "https" || crate::net::is_loopback(&base), "authenticated endpoints require HTTPS (except loopback)");
         }
     }
     if !http.is_empty() { capabilities.0.insert(Capability::HttpRequest); }
@@ -292,26 +292,32 @@ pub fn exports(lua: &Lua, table: Table, expected: &Definition) -> mlua::Result<T
 }
 
 pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definition) -> mlua::Result<()> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(HTTP_TIMEOUT_SECS)).user_agent(concat!("hx/", env!("CARGO_PKG_VERSION"))).redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never()).build().map_err(mlua::Error::external)?;
+    // One client per endpoint: its fixed origin decides the proxy rule (a loopback origin never goes through one).
+    let clients = def.http.iter().map(|(name, spec)| {
+        let base = template(&spec.url).map_err(mlua::Error::external)?.base;
+        let client = crate::net::client(&base).timeout(Duration::from_secs(HTTP_TIMEOUT_SECS)).build().map_err(mlua::Error::external)?;
+        Ok((name.clone(), client))
+    }).collect::<mlua::Result<BTreeMap<_, _>>>()?;
+    let clients = Arc::new(clients);
     lua.globals().set("http", lua.create_async_function(move |lua, (endpoint, args): (String, Value)| {
-        let (fx, client, namespace, def) = (fx.clone(), client.clone(), namespace.clone(), def.clone());
+        let (fx, clients, namespace, def) = (fx.clone(), clients.clone(), namespace.clone(), def.clone());
         async move {
-            let spec = def.http.get(&endpoint).ok_or_else(|| mlua::Error::runtime("undeclared HTTP endpoint"))?;
-            let mut args = values::copy_out(args)?;
-            if !args.is_object() { return Err(mlua::Error::runtime("http arguments must be an object")); }
+            let (Some(spec), Some(client)) = (def.http.get(&endpoint), clients.get(&endpoint)) else { return Err(mlua::Error::runtime("undeclared HTTP endpoint")) };
+            let args = values::copy_out(args)?;
+            let serde_json::Value::Object(mut fields) = args.clone() else { return Err(mlua::Error::runtime("http arguments must be an object")) };
             let key = spec.secret.as_ref().map(|name| secret(&fx.pol.workspace, name)).transpose().map_err(mlua::Error::external)?;
-            let orig_args = args.clone();
-            let mut url = template(&spec.url).map_err(mlua::Error::external)?.url(args.as_object_mut().unwrap())?;
-            if spec.method == "GET" {
-                let query = args.as_object().unwrap().iter().map(|(k, v)| {
-                    let value = match v { serde_json::Value::String(s) => s.clone(), serde_json::Value::Bool(_) | serde_json::Value::Number(_) => v.to_string(), _ => return Err(mlua::Error::runtime("GET parameters must be strings, numbers or booleans")) };
+            let mut url = template(&spec.url).map_err(mlua::Error::external)?.url(&mut fields)?;
+            // GET and DELETE carry no body: their remaining arguments are the query. The others send them as JSON.
+            let bodiless = matches!(spec.method.as_str(), "GET" | "DELETE");
+            if bodiless && !fields.is_empty() {
+                let query = fields.iter().map(|(k, v)| {
+                    let value = match v { serde_json::Value::String(s) => s.clone(), serde_json::Value::Bool(_) | serde_json::Value::Number(_) => v.to_string(), _ => return Err(mlua::Error::runtime(format!("{} parameters must be strings, numbers or booleans", spec.method))) };
                     Ok((k.clone(), value))
                 }).collect::<mlua::Result<Vec<_>>>()?;
                 url.query_pairs_mut().extend_pairs(&query);
             }
             let mut request = client.request(spec.method.parse().map_err(mlua::Error::external)?, url);
-            if spec.method != "GET" { request = request.json(&args); }
+            if !bodiless { request = request.json(&fields); }
             if let Some(key) = &key {
                 let value = if spec.bearer { format!("Bearer {key}") } else { key.clone() };
                 let mut header = reqwest::header::HeaderValue::from_str(&value).map_err(|_| mlua::Error::runtime("invalid credential header value"))?;
@@ -319,26 +325,30 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
                 request = request.header(&spec.header, header);
             }
             let class = if spec.read_only { Class::Read } else { Class::External };
-            let ret = fx.run(&lua, Tool::Http, class, json!({"namespace":namespace, "endpoint":endpoint, "arguments":orig_args}), || async {
+            let ret = fx.run(&lua, Tool::Http, class, json!({"namespace":namespace, "endpoint":endpoint, "arguments":args}), || async {
                 let label = format!("http {namespace}.{endpoint}");
                 fx.pol.approve(&label, class).await.map_err(|e| mlua::Error::runtime(format!("approval_required: {e}")))?;
-                let mut response = request.send().await.map_err(|e| unusable(class, format!("HTTP transport failed: {}", e.without_url())))?;
+                let failed = |delivery, message: String| crate::net::effect_error(class, delivery, message);
+                let mut response = request.send().await.map_err(|e| {
+                    let error = crate::net::Error::send("HTTP transport failed", e);
+                    failed(error.delivery, error.message)
+                })?;
                 let status = response.status();
-                let mut body = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(|_| unusable(class, "HTTP response interrupted"))? {
-                    if body.len() + chunk.len() > HTTP_MAX_BODY { return Err(unusable(class, format!("HTTP response exceeds {} MiB", HTTP_MAX_BODY >> 20))); }
-                    body.extend_from_slice(&chunk);
-                }
-                let text = String::from_utf8_lossy(&body);
+                let body = crate::net::ResponseBudget::new(HTTP_MAX_BODY).body(&mut response).await;
                 if !status.is_success() {
-                    let mut excerpt = text.into_owned();
+                    let mut excerpt = match &body {
+                        Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                        Err(e) => format!("({e})"),
+                    };
                     if let Some(key) = &key {
                         let encoded = serde_json::to_string(key).map_err(mlua::Error::external)?;
                         excerpt = excerpt.replace(&encoded[1..encoded.len()-1], "[redacted]").replace(key, "[redacted]");
                     }
                     let message = format!("HTTP {}: {}", status.as_u16(), excerpt.chars().take(1000).collect::<String>());
-                    return Err(if status.is_client_error() { mlua::Error::runtime(message) } else { unusable(class, message) });
+                    return Err(failed(crate::net::Delivery::of_status(status), message));
                 }
+                // The server accepted the request; only an answer that did not arrive whole leaves its outcome unknown.
+                let body = body.map_err(|e| failed(crate::net::Delivery::Lost, format!("HTTP {e}")))?;
                 // Raw bodies cross the data boundary as UTF-8 text, or base64 for media and non-UTF-8 bytes.
                 let mut result = if spec.raw {
                     use base64::Engine;
@@ -348,21 +358,18 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
                         Ok(text) if !media => json!({"text": text, "media_type": ct}),
                         _ => json!({"base64": base64::engine::general_purpose::STANDARD.encode(&body), "media_type": ct}),
                     }
+                } else if body.iter().all(u8::is_ascii_whitespace) {
+                    serde_json::Value::Null // 204 No Content and other empty successes
                 } else {
-                    serde_json::from_str(&text).map_err(|_| unusable(class, "HTTP response is not valid JSON"))?
+                    serde_json::from_slice(&body).unwrap_or_else(|_| json!({"status": status.as_u16(), "text": String::from_utf8_lossy(&body)}))
                 };
                 if let Some(key) = &key { redact(&mut result, key); }
-                values::validate(&result).map_err(|e| unusable(class, e.to_string()))?;
+                values::validate(&result).map_err(|e| failed(crate::net::Delivery::Lost, e.to_string()))?;
                 Ok(Ret::Json(result))
             }).await?;
             crate::prims::json_value(&lua, ret)
         }
     })?)
-}
-
-// A mutation with an unreadable response may have happened. Keep its intent open for owner reconciliation.
-fn unusable(class: Class, message: impl AsRef<str>) -> mlua::Error {
-    if class == Class::Read { mlua::Error::runtime(message.as_ref()) } else { crate::effects::unknown(message.as_ref()) }
 }
 
 fn redact(value: &mut serde_json::Value, key: &str) {

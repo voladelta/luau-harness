@@ -3,6 +3,7 @@
 import http.server
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 HX = ROOT / "scripts/hx_trusted"  # trusts the config written for each launch under HX_TRUST=current
 CALLS = []
+RAW = []  # (method, raw request path, Content-Length header) per request
 
 
 def text(content):
@@ -43,8 +45,12 @@ class API(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.reply()
 
+    def do_DELETE(self):
+        self.reply()
+
     def reply(self):
         url = urlsplit(self.path)
+        RAW.append((self.command, self.path, self.headers.get("Content-Length")))
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"null")
         key = self.headers.get("X-API-Key")
         CALLS.append((self.command, url.path, parse_qs(url.query), body, key))
@@ -53,6 +59,13 @@ class API(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"output": model_reply(body), "usage": {"input_tokens": 10, "output_tokens": 5}}).encode())
+            return
+        if url.path == "/drop":  # acted, then the answer is lost
+            self.close_connection = True
+            return
+        if url.path == "/empty":
+            self.send_response(204)
+            self.end_headers()
             return
         status = 401 if url.path == "/unauthorized" else 302 if url.path == "/redirect" else 200
         self.send_response(status)
@@ -91,6 +104,7 @@ class Tools(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if k not in ("TINYFISH_API_KEY", "HX_TRUST")}
         self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"))
         CALLS.clear()
+        RAW.clear()
 
     def command(self, *args, env=None):
         result = subprocess.run([str(HX), *args, "--workspace", str(self.ws)],
@@ -101,8 +115,8 @@ class Tools(unittest.TestCase):
     def run_code(self, *code, env=None):
         return self.command("exec", *code, env=env)
 
-    def tool(self, name="probe", path="/search", read_only=True, secret=None):
-        spec = {"url": self.base + path, "method": "GET", "header": "X-API-Key", "read_only": read_only}
+    def tool(self, name="probe", path="/search", read_only=True, secret=None, method="GET", base=None):
+        spec = {"url": (base or self.base) + path, "method": method, "header": "X-API-Key", "read_only": read_only}
         if secret:
             spec["secret"] = secret
         fields = ",".join(k + "=" + (str(v).lower() if isinstance(v, bool) else json.dumps(v)) for k, v in spec.items())
@@ -303,14 +317,66 @@ class Tools(unittest.TestCase):
         self.assertIn("[redacted]", out)
         self.assertNotIn("quoted", out)
 
-    def test_unreadable_external_response_remains_uncertain(self):
-        self.tool(path="/invalid", read_only=False)
+    def allow_probe(self):
         (self.ws / ".harness/policy.toml").write_text('[approval]\nallow=["http probe.get"]\n')
+
+    def test_non_json_success_is_a_definite_result(self):
+        self.tool(path="/invalid", read_only=False)
+        self.allow_probe()
+        out = self.run_code('local r = probe.get{}; print(r.status, r.text); print(pcall(write,"after.txt","ok"))')
+        self.assertIn("200\tnot json", out)
+        self.assertNotIn("unknown_outcome", out)
+        self.assertEqual((self.ws / "after.txt").read_text(), "ok")
+
+    def test_empty_success_is_nil(self):
+        self.tool(path="/empty", read_only=False, method="DELETE")
+        (self.ws / ".harness/policy.toml").write_text('[approval]\nallow=["http probe.get"]\n')
+        out = self.run_code('print(probe.get{} == nil); print(pcall(write,"after.txt","ok"))')
+        self.assertIn("true\ntrue", out)
+        self.assertTrue((self.ws / "after.txt").exists())
+
+    def test_lost_response_remains_uncertain(self):
+        self.tool(path="/drop", read_only=False)
+        self.allow_probe()
         out = self.run_code('print(pcall(probe.get,{})); print(pcall(write,"after.txt","bad"))')
-        self.assertIn("unknown_outcome: HTTP response is not valid JSON", out)
+        self.assertIn("unknown_outcome: HTTP transport failed", out)
         self.assertIn("unresolved mutations block new mutations", out)
         self.assertFalse((self.ws / "after.txt").exists())
-        self.assertEqual(len(CALLS), 1)
+        self.assertEqual(len(RAW), 1)
+
+    def test_refused_connection_is_a_definite_failure(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.close()
+        self.tool(read_only=False, base=f"http://127.0.0.1:{port}")
+        self.allow_probe()
+        out = self.run_code('print(pcall(probe.get,{})); print(pcall(write,"after.txt","ok"))')
+        self.assertIn("HTTP transport failed", out)
+        self.assertNotIn("unknown_outcome", out)
+        self.assertTrue((self.ws / "after.txt").exists())
+
+    def test_bodiless_methods_send_no_body_and_no_empty_query(self):
+        self.tool()
+        self.run_code('probe.get{}')
+        self.tool(method="DELETE")
+        self.run_code('pcall(probe.get, {})', 'pcall(probe.get, {id = 7})')
+        self.assertEqual(RAW, [("GET", "/search", None), ("DELETE", "/search", None), ("DELETE", "/search?id=7", None)])
+
+    def test_loopback_endpoint_bypasses_the_proxy(self):
+        proxy = socket.socket()
+        proxy.bind(("127.0.0.1", 0))
+        proxy.listen(1)
+        proxy.settimeout(0.5)
+        self.addCleanup(proxy.close)
+        proxy_url = f"http://127.0.0.1:{proxy.getsockname()[1]}"
+        env = dict(self.env, TINYFISH_API_KEY="fake-private-key", HTTP_PROXY=proxy_url, http_proxy=proxy_url,
+                   HTTPS_PROXY=proxy_url, https_proxy=proxy_url, ALL_PROXY=proxy_url, NO_PROXY="", no_proxy="")
+        self.tool(secret="TINYFISH_API_KEY")
+        self.assertIn("example", self.run_code('print(probe.get{}.results[1].title)', env=env))
+        self.assertEqual(len(RAW), 1)
+        with self.assertRaises(socket.timeout):
+            proxy.accept()
 
     def test_frozen_source_survives_edit_during_session(self):
         source = 'return {tools={go={signature="go(): string",description="version",run=function() return "original" end}}}'
