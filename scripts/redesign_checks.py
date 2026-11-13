@@ -70,6 +70,19 @@ def logs(path):
     return state_dir(path) / "log"
 
 
+def stored(log, sha):
+    """A checkpoint or manifest blob with its shared subtrees ({"$hx.blob": SHA}) expanded and hash-checked."""
+    data = (Path(log).parent / "blobs" / sha).read_bytes()
+    assert hashlib.sha256(data).hexdigest() == sha, sha
+    def expand(v):
+        if isinstance(v, dict):
+            if list(v) == ["$hx.blob"]:
+                return stored(log, v["$hx.blob"])
+            return {k: expand(x) for k, x in v.items()}
+        return [expand(x) for x in v] if isinstance(v, list) else v
+    return expand(json.loads(data))
+
+
 def journal(path):
     files = list(logs(path).glob("*.jsonl"))
     assert len(files) == 1, files
@@ -707,7 +720,7 @@ assert(#durable.get("1")==#s); print("BOUNDED_OK")'''
         assert intent["args"]["model"] == "mock" and intent["args"]["effort"] == "medium", intent
         log = journal(path)
         checkpoint = next(r for r in reversed(records(log)) if r["kind"] == "checkpoint" and r["lane"] == "root")
-        saved = json.loads((log.parent / "blobs" / checkpoint["blob"]).read_text())
+        saved = stored(log, checkpoint["blob"])
         assert saved["durable"]["report"]["uncertain_operations"] == [], saved["durable"]
 
 
@@ -820,7 +833,7 @@ end}''')
             log = journal(path)
             saved = records(log)
             last = next(r for r in reversed(saved) if r["kind"] == "checkpoint")
-            checkpoint = json.loads((log.parent / "blobs" / last["blob"]).read_text())
+            checkpoint = stored(log, last["blob"])
             assert checkpoint["status"] == "finished" and "controller" not in checkpoint, checkpoint
             manifest = next(r for r in saved if r["kind"] == "manifest")
             deadline = json.loads((log.parent / "blobs" / manifest["blob"]).read_text())["deadline"]

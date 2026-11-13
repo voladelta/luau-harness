@@ -122,6 +122,23 @@ rs=[json.loads(l) for l in open(sys.argv[1])]; c=collections.Counter((r["kind"],
 print("yes" if c[("llm",None)]==2 and c[("chunk_begin",None)]==1 and c[("checkpoint",None)]>=3 and c[("intent","write")]==1 and c[("session",None)]==1 else str(dict(c)))
 PY
 )$($H log verify $L | head -1 | grep -c intact)" "yes1"
+# Checkpoints and the manifest are trees of shared blobs: a missing one is damage verify reports, not a hash-chain matter.
+check "stored state verifies" "$($H log verify $L | grep -c 'stored state: .* blobs verified')" "1"
+shared=$(python3 - "$L" <<'PY'
+import json,sys,pathlib
+log=pathlib.Path(sys.argv[1]); rs=[json.loads(l) for l in open(log)]
+root=json.loads((log.parent/"blobs"/next(r["blob"] for r in rs if r["kind"]=="manifest")).read_text())
+refs=[]
+def walk(v):
+    if isinstance(v,dict):
+        if list(v)==["$hx.blob"]: refs.append(v["$hx.blob"])
+        else: [walk(x) for x in v.values()]
+    elif isinstance(v,list): [walk(x) for x in v]
+walk(root); print(log.parent/"blobs"/refs[0])
+PY
+)
+mv "$shared" $T/held; $H log verify $L >$T/verify.out; rc=$?; mv $T/held "$shared"
+check "a missing shared blob fails verify (exit 1)" "$(grep -c 'INVALID STORED STATE' $T/verify.out)$rc" "11"
 
 # --- 6. run state lives outside the workspace: listed by `hx runs`, out of reach of shell commands, old journals still work
 check "the report names the journal in the state directory, none in the workspace" "$(echo "$report" | python3 -c "import json,sys;print(json.load(sys.stdin)['log'])")$([ -e $W/.harness/log ] && echo IN-WORKSPACE)" "$L"

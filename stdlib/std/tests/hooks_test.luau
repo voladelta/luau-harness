@@ -58,10 +58,10 @@ test.case("the host's drain collects notification sources and runs no before_mod
 	hooks.on("before_model", function(req) requests += 1; return req end)
 	local queued = { { role = "user", content = "Images from view(), in order: a.png (1x1)" } }
 	hooks.source(function() local out = queued; queued = {}; return out end)
-	test.eq(#hooks.emit("before_model", { system = "", messages = {}, drain = true }).messages, 1)
+	test.eq(#hooks.drain(), 1)
 	test.eq(requests, 0)
-	test.eq(#hooks.emit("before_model", { system = "", messages = {}, drain = true }).messages, 0) -- delivered once
-	hooks.emit("before_model", { system = "", messages = {} })
-	test.eq(requests, 1) -- a real request runs the hooks
+	test.eq(#hooks.drain(), 0) -- delivered once
+	hooks.emit("before_model", { system = "", messages = {}, drain = true })
+	test.eq(requests, 1) -- a payload's fields cannot turn a request into a drain
 	hooks.clear()
 end)

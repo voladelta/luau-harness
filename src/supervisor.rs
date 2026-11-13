@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
 // Approval policy and temporary grants are frozen under this format; every mutating intent carries its approval
-// source, asked before the intent is written.
-pub const FORMAT: u64 = 10;
+// source, asked before the intent is written. Since 11, checkpoints and manifests are stored as trees of blobs (`cas`).
+pub const FORMAT: u64 = 11;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,13 +32,14 @@ pub struct Manifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Branch { pub parent: std::path::PathBuf, pub durable: Value }
 
-/// Host-owned lifecycle, independent of the customizable controller's private state.
+/// Host-owned lifecycle, independent of the customizable controller's private state. A checkpoint is written from a
+/// `RunState<&Value>`, borrowing the live controller state instead of copying it per transition.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum RunState {
-    Running { controller: Value },
+pub enum RunState<C = Value> {
+    Running { controller: C },
     /// The open owner gate is stored here and nowhere else.
-    AwaitingReview { controller: Value, report: serde_json::Map<String, Value>, gate: crate::workflow::ReviewRequest },
+    AwaitingReview { controller: C, report: serde_json::Map<String, Value>, gate: crate::workflow::ReviewRequest },
     Finished { report: serde_json::Map<String, Value> },
 }
 
@@ -52,8 +53,11 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    pub fn load(bytes: &[u8]) -> Result<Self> {
-        let checkpoint: Self = serde_json::from_slice(bytes)?;
+    /// The checkpoint stored under `sha` in `log_dir`, its tree expanded and every blob's hash verified.
+    pub fn read(log_dir: &Path, sha: &str) -> Result<Self> { Self::load(crate::cas::load(log_dir, sha)?) }
+
+    pub fn load(value: Value) -> Result<Self> {
+        let checkpoint: Self = serde_json::from_value(value)?;
         anyhow::ensure!(checkpoint.durable.is_object(), "invalid durable checkpoint");
         crate::values::validate(&checkpoint.durable)?;
         match &checkpoint.run {
@@ -80,8 +84,10 @@ impl Manifest {
         let records = eventlog::load(path)?;
         let record = records.iter().find(|r| r["kind"] == "manifest")
             .context("this journal has no manifest record; start a new run")?;
-        let bytes = eventlog::read_blob(path.parent().context("log has no parent")?, record["blob"].as_str().context("manifest blob missing")?)?;
-        let manifest: Self = serde_json::from_slice(&bytes)?;
+        let tree = crate::cas::load(path.parent().context("log has no parent")?, record["blob"].as_str().context("manifest blob missing")?)?;
+        // The format is read before the whole manifest, so an older run is refused for its format, not its shape.
+        anyhow::ensure!(tree["format"] == FORMAT, "unsupported run format {} (this binary resumes format {FORMAT}); start a new run", tree["format"]);
+        let manifest: Self = serde_json::from_value(tree)?;
         anyhow::ensure!(manifest.format == FORMAT, "unsupported run format {} (this binary resumes format {FORMAT}); start a new run", manifest.format);
         if let Some(config)=&manifest.workflow {config.validate()?;}
         Ok(manifest)
@@ -293,7 +299,8 @@ impl Supervisor {
         let durable = manifest.branch.as_ref().map(|b| b.durable.clone()).unwrap_or_else(|| json!({}));
         anyhow::ensure!(durable.is_object(), "invalid branch durable data");
         crate::values::validate(&durable)?;
-        let blob = policy.log.blob(&serde_json::to_vec(&manifest)?)?;
+        // Stored as a tree: the registry's sources and assets are blobs shared by every run of this blob store.
+        let blob = crate::cas::store(&policy.log, &serde_json::to_value(&manifest)?)?;
         policy.log.write("manifest", json!({"format": FORMAT, "blob": blob}), true)?;
         Ok(Arc::new(Self { policy, history: crate::history::History::default(), registry: Arc::new(registry), manifest: Some(manifest), books: Mutex::new(Books::default()), settled: tokio::sync::Notify::new(), mutations: Arc::new(tokio::sync::Semaphore::new(1)), durable: Arc::new(Mutex::new(durable)), restored: None, recovery: None, workflow:Mutex::new(workflow.map(|_|crate::workflow::ExecutionFrame::default())),active_effects:std::sync::atomic::AtomicUsize::new(0) }))
     }
@@ -312,7 +319,7 @@ impl Supervisor {
         books.crashed();
         let (frontier, checkpoint) = match records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root") {
             Some(r) => (r["seq"].as_u64().context("missing record sequence")?,
-                Some(Checkpoint::load(&eventlog::read_blob(path.parent().unwrap(), r["blob"].as_str().context("missing checkpoint blob")?)?)?)),
+                Some(Checkpoint::read(path.parent().unwrap(), r["blob"].as_str().context("missing checkpoint blob")?)?)),
             None => (0, None),
         };
         let receipts: Vec<_> = records.iter().filter(|r| r["seq"].as_u64().unwrap_or(0) > frontier && matches!(r["kind"].as_str(), Some("chunk_begin" | "intent" | "outcome" | "call" | "llm" | "model_intent" | "resolution" | "uncertain" | "billing")))
@@ -356,18 +363,44 @@ impl Supervisor {
         Ok(())
     }
 
-    pub fn checkpoint(&self, lane: &str, run: RunState, durable: &Value) -> Result<()> {
+    pub fn checkpoint(&self, lane: &str, run: RunState<&Value>, durable: &Value) -> Result<()> {
         self.checkpoint_archived(lane, run, durable, None)
     }
 
-    pub fn checkpoint_archived(&self, lane: &str, run: RunState, durable: &Value, archive: Option<crate::history::Archive>) -> Result<()> {
+    /// Commit a transition. The checkpoint is a tree of blobs (`cas::store`): what did not change since the last one
+    /// (earlier messages, images, artifact documents) is referenced, not written again. Every blob of the tree is durable
+    /// before the synced record that names its root, so the record commits the whole checkpoint or none of it.
+    pub fn checkpoint_archived(&self, lane: &str, run: RunState<&Value>, durable: &Value, archive: Option<crate::history::Archive>) -> Result<()> {
         self.policy.log.check()?;
-        let blob = self.policy.log.blob(&serde_json::to_vec(&Checkpoint { run, durable: durable.clone(), workflow: if lane == "root" {self.workflow.lock().unwrap().clone()} else {None} })?)?;
+        let blob = crate::cas::store_root(&self.policy.log, self.checkpoint_root(lane, run, durable)?)?;
         let mut fields = json!({"lane": lane, "blob": blob});
         if let Some(archive) = &archive { fields["archive"] = serde_json::to_value(archive)?; }
         let seq = self.policy.log.write("checkpoint", fields, true)?;
         if lane == "root" { self.history.committed(crate::history::CheckpointRef {seq,blob}, archive)?; }
         Ok(())
+    }
+
+    /// `Checkpoint`'s encoding, assembled around the borrowed controller state and durable data: each field is shared
+    /// (`cas::share`), which copies no more than its inline, small part.
+    fn checkpoint_root(&self, lane: &str, run: RunState<&Value>, durable: &Value) -> Result<serde_json::Map<String, Value>> {
+        let log = &self.policy.log;
+        let mut root = serde_json::Map::new();
+        let (status, controller) = match run {
+            RunState::Running { controller } => ("running", Some(controller)),
+            RunState::AwaitingReview { controller, report, gate } => {
+                root.insert("report".into(), crate::cas::share(log, &Value::Object(report))?);
+                root.insert("gate".into(), crate::cas::share(log, &serde_json::to_value(gate)?)?);
+                ("awaiting_review", Some(controller))
+            },
+            RunState::Finished { report } => { root.insert("report".into(), crate::cas::share(log, &Value::Object(report))?); ("finished", None) },
+        };
+        root.insert("status".into(), json!(status));
+        if let Some(controller) = controller { root.insert("controller".into(), crate::cas::share(log, controller)?); }
+        root.insert("durable".into(), crate::cas::share(log, durable)?);
+        if lane == "root" && let Some(frame) = self.workflow.lock().unwrap().as_ref() {
+            root.insert("workflow".into(), crate::cas::share(log, &serde_json::to_value(frame)?)?);
+        }
+        Ok(root)
     }
 
     /// `approval` is who approved the operation (`Policy::approve`); it was asked before this record is written.
@@ -535,9 +568,57 @@ mod checkpoint_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Checkpoints share subtrees across transitions and with durable data; resume, branch and the manifest restore them
+    /// exactly, and blobs written for a checkpoint whose record never landed change nothing.
+    #[test]
+    fn shared_checkpoints_round_trip_through_resume_and_branch() {
+        let dir = std::env::temp_dir().join(format!("hx-shared-checkpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let supervisor = Supervisor::start(policy.clone(), model(), "task".into(), 1, vec![], Budget::default(), None).unwrap();
+        let image = "data:image/png;base64,".to_string() + &"A".repeat(300_000);
+        let message = |n: usize| json!({"role":"tool","content":format!("{n} {}", "out ".repeat(500)),"images":[{"data":image,"path":"a.png","width":1,"height":1}]});
+        let mut state = json!({"messages":[{"role":"user","content":"task"}, message(1)],"turns":1});
+        let durable = json!({"same_image":image,"notes":{"n":1}});
+        supervisor.checkpoint("root", RunState::Running { controller: &state }, &durable).unwrap();
+        let blobs = || std::fs::read_dir(policy.log.dir().join("blobs")).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum::<u64>();
+        let before = blobs();
+        state["messages"].as_array_mut().unwrap().push(message(2));
+        state["turns"] = json!(2);
+        supervisor.checkpoint("root", RunState::Running { controller: &state }, &durable).unwrap();
+        assert!(blobs() - before < 8_000, "the second transition rewrote {} bytes", blobs() - before);
+        // a crash after a checkpoint's blobs but before its record: the blobs are orphans, the record before rules
+        let mut lost = state.clone();
+        lost["turns"] = json!(3);
+        crate::cas::store(&policy.log, &lost).unwrap();
+        let path = policy.log.path.clone();
+        drop(supervisor);
+        drop(policy);
+        let reopened = Arc::new(Policy::new(&dir, false, None, Some(&path), None).unwrap());
+        let resumed = Supervisor::resume(reopened.clone()).unwrap();
+        assert!(matches!(&resumed.restored, Some(RunState::Running { controller }) if *controller == state));
+        assert_eq!(*resumed.durable.lock().unwrap(), durable);
+        // branch: the parent's checkpoint is read by reference, and the child's manifest stores the inherited data the same way
+        let records = eventlog::load(&path).unwrap();
+        let latest = records.iter().rev().find(|r| r["kind"] == "checkpoint").unwrap();
+        let parent = Checkpoint::read(path.parent().unwrap(), latest["blob"].as_str().unwrap()).unwrap();
+        assert_eq!(parent.durable, durable);
+        drop(resumed);
+        let child = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let branched = Supervisor::start(child.clone(), model(), "task".into(), 1, vec![], Budget::default(),
+            Some(Branch { parent: path.clone(), durable: parent.durable })).unwrap();
+        let manifest = Manifest::inspect(&child.log.path).unwrap();
+        assert_eq!(manifest.branch.unwrap().durable, durable);
+        assert_eq!(manifest.registry.sources.len(), branched.registry.sources.len());
+        assert_eq!(manifest.registry.assets, branched.registry.assets);
+        drop(branched);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn checkpoints_require_explicit_lifecycle_and_valid_data() {
-        let checkpoint = Checkpoint::load(br#"{"status":"running","controller":{"custom":3},"durable":{"saved":7}}"#).unwrap();
+        let checkpoint = Checkpoint::load(json!({"status":"running","controller":{"custom":3},"durable":{"saved":7}})).unwrap();
         assert_eq!(checkpoint.durable["saved"], 7);
         assert!(matches!(checkpoint.run, RunState::Running { controller } if controller["custom"] == 3));
         for invalid in [
@@ -546,7 +627,7 @@ mod checkpoint_tests {
             br#"{"status":"running","controller":[],"durable":{}}"#,
             br#"{"status":"running","controller":{},"durable":[]}"#,
         ] {
-            assert!(Checkpoint::load(invalid).is_err());
+            assert!(Checkpoint::load(serde_json::from_slice(invalid).unwrap()).is_err());
         }
     }
 }

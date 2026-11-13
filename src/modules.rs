@@ -183,6 +183,21 @@ pub struct Source {
     pub pkg: Option<(String, Capabilities)>,
 }
 
+/// Assets are bytes (skills may ship binaries) kept in the frozen manifest as base64 strings: as JSON number arrays they
+/// were most of every manifest.
+mod base64_assets {
+    use base64::Engine;
+    use std::collections::BTreeMap;
+    const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+    pub fn serialize<S: serde::Serializer>(assets: &BTreeMap<String, Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_map(assets.iter().map(|(k, v)| (k, B64.encode(v))))
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Vec<u8>>, D::Error> {
+        let encoded: BTreeMap<String, String> = serde::Deserialize::deserialize(d)?;
+        encoded.into_iter().map(|(k, v)| B64.decode(v).map(|v| (k, v)).map_err(serde::de::Error::custom)).collect()
+    }
+}
+
 /// An immutable, approved byte snapshot. Runtime resolution never goes back to mutable workspace files.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Registry {
@@ -191,6 +206,7 @@ pub struct Registry {
     #[serde(default)]
     pub tool_errors: BTreeMap<String, String>,
     pub sources: BTreeMap<String, Source>,
+    #[serde(with = "base64_assets")]
     pub assets: BTreeMap<String, Vec<u8>>,
     pub packages: Vec<PkgInfo>,
     pub capabilities: BTreeMap<String, Capabilities>,

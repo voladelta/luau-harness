@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -191,12 +191,11 @@ impl History {
             .latest
             .clone()
             .context("history_archive_invalid: no committed source")?;
-        let saved = load(&mut index, dir, &source.blob, &mut Budget::default(), None)?;
+        // Compared by content address: the source's message list is not read back (its images least of all).
+        let controller = Reader { index: &mut index, dir, budget: Budget::default(), deadline: None }
+            .at(&source.blob, &[Step::Key("controller")])?;
         ensure!(
-            saved["controller"]["messages"]
-                .as_array()
-                .map(Vec::as_slice)
-                == Some(before),
+            controller["messages"] == crate::cas::digest_list(before)?,
             "history_archive_invalid: source differs"
         );
         Ok(Archive {
@@ -227,7 +226,7 @@ impl History {
                 ordinal == 0 || (2..record.archive.cut).contains(&ordinal),
                 "history: unknown id"
             );
-            let (role, text) = entry(&mut index, &record, ordinal, dir, &mut Budget::default(), deadline)?;
+            let (role, text) = Reader { index: &mut index, dir, budget: Budget::default(), deadline }.entry(&record, ordinal)?;
             let offset = query.offset.unwrap_or(0);
             ensure!(
                 offset <= text.len() && text.is_char_boundary(offset),
@@ -276,31 +275,26 @@ impl History {
         }
         let mut entries = Vec::new();
         let mut examined = 0;
-        let mut budget = Budget::default();
+        let mut reader = Reader { index: &mut index, dir, budget: Budget::default(), deadline };
         while seq != 0 && entries.len() < query.limit.unwrap_or(DEFAULT_LIMIT) && examined < MAX_SCAN {
             check_deadline(deadline)?;
-            let pos = index
+            let pos = reader
+                .index
                 .records
                 .binary_search_by_key(&seq, |r| r.seq)
                 .map_err(|_| anyhow::anyhow!("history: invalid cursor position"))?;
             ensure!(seq <= frontier, "history: invalid cursor frontier");
-            let record = index.records[pos].clone();
+            let record = reader.index.records[pos].clone();
             ensure!(
                 ordinal == 0 || (2..record.archive.cut).contains(&ordinal),
                 "history: invalid cursor ordinal"
             );
-            // Never consume a candidate when its source will exceed this call's work budget.
-            let blob = if ordinal == 0 {
-                &record.blob
-            } else {
-                &record.archive.source.blob
+            // Never consume a candidate whose sources would exceed this call's work budget: the page ends before it.
+            // A call that cannot read even one entry fails rather than return a cursor that never advances.
+            let (role, text) = match reader.entry(&record, ordinal) {
+                Err(e) if e.is::<Exhausted>() && examined > 0 => break,
+                result => result?,
             };
-            let cost = std::fs::metadata(dir.join("blobs").join(blob))?.len() as usize;
-            ensure!(cost <= MAX_SOURCE, "history: source read limit exceeded");
-            if budget.charges(&index, blob) && cost > budget.left {
-                break;
-            }
-            let (role, text) = entry(&mut index, &record, ordinal, dir, &mut budget, deadline)?;
             let old_position = (seq, ordinal);
             let current = ordinal;
             if ordinal == 0 {
@@ -309,7 +303,7 @@ impl History {
                 ordinal -= 1;
             } else {
                 seq = if pos > 0 {
-                    index.records[pos - 1].seq
+                    reader.index.records[pos - 1].seq
                 } else {
                     0
                 };
@@ -367,150 +361,162 @@ fn check_deadline(deadline: Option<f64>) -> Result<()> {
     Ok(())
 }
 
-/// One call's source allowance. A source is charged its size on disk the first time the call uses it, cache hit or
-/// not, and again only when it must be re-read from disk. The last source stays at hand for the call, so the messages
-/// of one checkpoint too large for the cache are read and parsed once, not once per message.
+/// One call's source allowance, charged per blob: a checkpoint is a tree of blobs (`cas`), and an entry reads only the
+/// blobs on its path (root, controller, the message list, the message and the parts it renders; never an image).
+/// A blob is charged its size on disk the first time the call uses it, cache hit or not. Blobs the call has used stay
+/// at hand for the rest of it, so what it holds is bounded by MAX_SOURCE and no source is read twice in one call.
 struct Budget {
     left: usize,
-    charged: Vec<String>,
-    last: Option<(String, Arc<Value>)>,
+    held: HashMap<String, Arc<Value>>,
 }
 
 impl Default for Budget {
     fn default() -> Self {
-        Self { left: MAX_SOURCE, charged: Vec::new(), last: None }
+        Self { left: MAX_SOURCE, held: HashMap::new() }
     }
 }
 
-impl Budget {
-    fn held(&self, index: &Index, hash: &str) -> bool {
-        self.last.as_ref().is_some_and(|(h, _)| h == hash) || index.cache.iter().any(|(h, _, _)| h == hash)
-    }
-    /// Whether using `hash` now costs its size.
-    fn charges(&self, index: &Index, hash: &str) -> bool {
-        !(self.charged.iter().any(|h| h == hash) && self.held(index, hash))
-    }
+/// This call's budget would be exceeded: a listing ends its page before the entry instead of failing.
+#[derive(Debug)]
+struct Exhausted;
+impl std::fmt::Display for Exhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("history: source read limit exceeded") }
 }
+impl std::error::Error for Exhausted {}
 
-fn load(
-    index: &mut Index,
-    dir: &Path,
-    hash: &str,
-    budget: &mut Budget,
+enum Step<'a> { Key(&'a str), Index(usize) }
+
+/// Reads checkpoint trees for one call, under its budget and deadline, through the shared cache.
+struct Reader<'a> {
+    index: &'a mut Index,
+    dir: &'a Path,
+    budget: Budget,
     deadline: Option<f64>,
-) -> Result<Arc<Value>> {
-    check_deadline(deadline)?;
-    ensure!(
-        hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
-        "history: invalid blob hash"
-    );
-    if budget.charges(index, hash) {
-        let size = std::fs::metadata(dir.join("blobs").join(hash))?.len() as usize;
-        ensure!(
-            size <= MAX_SOURCE && size <= budget.left,
-            "history: source read limit exceeded"
-        );
-        budget.left -= size;
-        if !budget.charged.iter().any(|h| h == hash) {
-            budget.charged.push(hash.into());
+}
+
+impl Reader<'_> {
+    /// One blob as stored: its large subtrees are still references.
+    fn load(&mut self, hash: &str) -> Result<Arc<Value>> {
+        check_deadline(self.deadline)?;
+        ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "history: invalid blob hash");
+        if let Some(value) = self.budget.held.get(hash) {
+            return Ok(value.clone());
+        }
+        let size = std::fs::metadata(self.dir.join("blobs").join(hash))
+            .map_err(|e| anyhow::anyhow!("history: blob {hash}: {e}"))?.len() as usize;
+        ensure!(size <= MAX_SOURCE, "history: source read limit exceeded");
+        if size > self.budget.left {
+            return Err(Exhausted.into());
+        }
+        self.budget.left -= size;
+        let cache = &mut self.index.cache;
+        let value = if let Some(pos) = cache.iter().position(|(h, _, _)| h == hash) {
+            let item = cache.remove(pos).unwrap();
+            let value = item.1.clone();
+            cache.push_back(item);
+            value
+        } else {
+            let deadline = self.deadline;
+            let data = crate::eventlog::read_blob_bounded(self.dir, hash, MAX_SOURCE, || check_deadline(deadline))
+                .map_err(|e| if e.to_string().starts_with("history:") { e } else { anyhow::anyhow!("history: {e}") })?;
+            let value: Arc<Value> = Arc::new(serde_json::from_slice(&data).context("history: invalid checkpoint JSON")?);
+            check_deadline(deadline)?;
+            if data.len() <= CACHE_BYTES {
+                while cache.iter().map(|(_, _, n)| n).sum::<usize>() + data.len() > CACHE_BYTES {
+                    cache.pop_front();
+                }
+                cache.push_back((hash.into(), value.clone(), data.len()));
+            }
+            value
+        };
+        self.budget.held.insert(hash.into(), value.clone());
+        Ok(value)
+    }
+
+    /// `value`, or the subtree it references. An inline node is small (`cas::SPLIT`), so copying it is cheap.
+    fn open(&mut self, value: &Value) -> Result<Arc<Value>> {
+        match crate::cas::reference(value).map_err(|e| anyhow::anyhow!("history: {e}"))? {
+            Some(hash) => self.load(hash),
+            None => Ok(Arc::new(value.clone())),
         }
     }
-    if let Some((_, value)) = budget.last.as_ref().filter(|(h, _)| h == hash) {
-        return Ok(value.clone());
-    }
-    if let Some(pos) = index.cache.iter().position(|(h, _, _)| h == hash) {
-        let item = index.cache.remove(pos).unwrap();
-        let value = item.1.clone();
-        index.cache.push_back(item);
-        budget.last = Some((hash.into(), value.clone()));
-        return Ok(value);
-    }
-    let data = crate::eventlog::read_blob_bounded(dir, hash, MAX_SOURCE, || check_deadline(deadline))
-        .map_err(|e| if e.to_string().starts_with("history:") { e } else { anyhow::anyhow!("history: {e}") })?;
-    let value: Arc<Value> =
-        Arc::new(serde_json::from_slice(&data).context("history: invalid checkpoint JSON")?);
-    check_deadline(deadline)?;
-    if data.len() <= CACHE_BYTES {
-        while index.cache.iter().map(|(_, _, n)| n).sum::<usize>() + data.len() > CACHE_BYTES {
-            index.cache.pop_front();
+
+    /// The subtree at `path` under the tree stored as `hash`, reading only the blobs along it.
+    fn at(&mut self, hash: &str, path: &[Step]) -> Result<Arc<Value>> {
+        let mut node = self.load(hash)?;
+        for step in path {
+            let child = match step { Step::Key(k) => node.get(*k), Step::Index(i) => node.get(*i) }.cloned().unwrap_or(Value::Null);
+            node = self.open(&child)?;
         }
-        index
-            .cache
-            .push_back((hash.into(), value.clone(), data.len()));
+        Ok(node)
     }
-    budget.last = Some((hash.into(), value.clone()));
-    Ok(value)
+
+    fn entry(&mut self, record: &Record, ordinal: usize) -> Result<(String, String)> {
+        if ordinal == 0 {
+            let controller = self.at(&record.blob, &[Step::Key("controller")])?;
+            let owner = match controller.get("worker") { Some(worker) => self.open(worker)?, None => controller };
+            let summary = self.open(&owner["previous_summary"])?;
+            return Ok(("summary".into(), summary.as_str().context("history: missing summary")?.into()));
+        }
+        let message = self.at(&record.archive.source.blob, &[Step::Key("controller"), Step::Key("messages"), Step::Index(ordinal - 1)])?;
+        ensure!(!message.is_null(), "history: missing archived message");
+        let role = self.open(&message["role"])?;
+        Ok((role.as_str().context("history: invalid message role")?.into(), render(&message, &mut |v| self.open(v))?))
+    }
 }
 
-fn entry(
-    index: &mut Index,
-    record: &Record,
-    ordinal: usize,
-    dir: &Path,
-    budget: &mut Budget,
-    deadline: Option<f64>,
-) -> Result<(String, String)> {
-    let hash = if ordinal == 0 {
-        &record.blob
-    } else {
-        &record.archive.source.blob
-    };
-    let saved = load(index, dir, hash, budget, deadline)?;
-    if ordinal == 0 {
-        return Ok((
-            "summary".into(),
-            summary(&saved["controller"])
-                .context("history: missing summary")?
-                .into(),
-        ));
-    }
-    let message = saved["controller"]["messages"]
-        .get(ordinal - 1)
-        .context("history: missing archived message")?;
-    Ok((
-        message["role"]
-            .as_str()
-            .context("history: invalid message role")?
-            .into(),
-        render(message)?,
-    ))
+/// `value` with every reference `open` resolves expanded.
+fn expand(value: &Value, open: &mut dyn FnMut(&Value) -> Result<Arc<Value>>) -> Result<Value> {
+    let node = open(value)?;
+    Ok(match &*node {
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| Ok((k.clone(), expand(v, open)?))).collect::<Result<_>>()?),
+        Value::Array(items) => Value::Array(items.iter().map(|v| expand(v, open)).collect::<Result<_>>()?),
+        other => other.clone(),
+    })
 }
 
-fn render(message: &Value) -> Result<String> {
+/// The public text of a message. `open` resolves each part as it is reached, so media payloads and provider fields are
+/// never read.
+fn render(message: &Value, open: &mut dyn FnMut(&Value) -> Result<Arc<Value>>) -> Result<String> {
     let mut text = String::new();
-    match &message["content"] {
+    let string = |v: &Value, open: &mut dyn FnMut(&Value) -> Result<Arc<Value>>| -> Result<Option<String>> { Ok(open(v)?.as_str().map(str::to_string)) };
+    let content = open(&message["content"])?;
+    match &*content {
         Value::String(s) => text.push_str(s),
         Value::Null => {}
         Value::Array(parts) => {
             for p in parts {
-                if let Some(s) = p["text"].as_str() {
-                    text.push_str(s);
-                } else {
-                    text.push_str("\n[media omitted]\n");
+                let p = open(p)?;
+                match string(&p["text"], open)? {
+                    Some(s) => text.push_str(&s),
+                    None => text.push_str("\n[media omitted]\n"),
                 }
             }
         }
         _ => bail!("history: invalid public content"),
     }
-    for call in message["calls"].as_array().into_iter().flatten() {
-        text.push_str(&format!(
-            "\n[tool call {} id={}]\n",
-            call["name"].as_str().unwrap_or("unknown"),
-            call["id"].as_str().unwrap_or("unknown")
-        ));
-        if let Some(code) = call["input"]["code"].as_str() {
-            if let Some(description) = call["input"]["description"].as_str() {
-                text.push_str(description);
+    let calls = open(&message["calls"])?;
+    for call in calls.as_array().into_iter().flatten() {
+        let call = open(call)?;
+        let (name, id) = (string(&call["name"], open)?, string(&call["id"], open)?);
+        text.push_str(&format!("\n[tool call {} id={}]\n", name.as_deref().unwrap_or("unknown"), id.as_deref().unwrap_or("unknown")));
+        let input = open(&call["input"])?;
+        if let Some(code) = string(&input["code"], open)? {
+            if let Some(description) = string(&input["description"], open)? {
+                text.push_str(&description);
                 text.push('\n');
             }
-            text.push_str(code);
+            text.push_str(&code);
         } else {
-            text.push_str(&serde_json::to_string(&call["input"])?);
+            text.push_str(&serde_json::to_string(&expand(&input, open)?)?);
         }
     }
-    for image in message["images"].as_array().into_iter().flatten() {
+    let images = open(&message["images"])?;
+    for image in images.as_array().into_iter().flatten() {
+        let image = open(image)?;
         let dim = |k: &str| image[k].as_u64().map_or("?".to_string(), |n| n.to_string());
-        text.push_str(&format!("\n[image {} {}x{} not kept; view() it again to look]\n", image["path"].as_str().unwrap_or("?"), dim("width"), dim("height")));
+        let path = string(&image["path"], open)?;
+        text.push_str(&format!("\n[image {} {}x{} not kept; view() it again to look]\n", path.as_deref().unwrap_or("?"), dim("width"), dim("height")));
     }
     Ok(text)
 }
@@ -593,10 +599,7 @@ mod tests {
             f
         }
         fn save(&self, controller: Value, archive: Option<Archive>) {
-            let blob = self
-                .log
-                .blob(&serde_json::to_vec(&json!({"controller":controller})).unwrap())
-                .unwrap();
+            let blob = crate::cas::store(&self.log, &json!({"controller":controller})).unwrap();
             let mut fields = json!({"lane":"root","blob":blob});
             if let Some(a) = &archive {
                 fields["archive"] = json!(a);
@@ -768,6 +771,41 @@ mod tests {
     }
 
     #[test]
+    fn entries_read_only_their_blobs_and_pages_end_at_the_budget() {
+        // 70 one-MiB tool results, each its own blob: more than one call's 64 MiB, so a search pages by budget
+        let image = "I".repeat(4 << 20);
+        let mut messages = vec![message("user", "task")];
+        for i in 0..70 {
+            messages.push(json!({"role":"assistant","content":"call","calls":[{"name":"luau","id":format!("c{i}"),"input":{"code":format!("-- {i} {}", "c".repeat(3000))}}]}));
+            messages.push(json!({"role":"tool","content":format!("{i}:{}", "x".repeat(1 << 20)),"images":[{"data":image,"path":"big.png","width":1,"height":1}]}));
+        }
+        messages.extend([message("assistant", "keep"), message("tool", "keep")]);
+        let cut = messages.len() - 1;
+        let mut f = Fixture::new(messages);
+        f.compact(cut, "summary");
+        // the image is stored once, and never read: rendering does not need it
+        let image_blob = f.dir.join("blobs").join(crate::eventlog::sha_bytes(&serde_json::to_vec(&image).unwrap()));
+        std::fs::remove_file(&image_blob).unwrap();
+        let first = f.query(json!({"q":"absent","limit":20})).unwrap();
+        assert_eq!(first["scan_complete"], false, "{first}");
+        let rest = f.query(json!({"q":"absent","limit":20,"before":first["next"]})).unwrap();
+        assert_eq!(rest["scan_complete"], true, "{rest}");
+        let hit = f.query(json!({"q":"69:xxx"})).unwrap();
+        let id = hit["entries"][0]["id"].as_str().unwrap();
+        let page = f.query(json!({"id":id})).unwrap();
+        assert!(page["text"].as_str().unwrap().starts_with("69:x") && page["bytes"].as_u64().unwrap() > 1 << 20, "{page}");
+        // an early entry is reached by following the cursor across budget-bounded pages
+        let (mut q, mut found) = (json!({"q":"-- 3 ccc"}), 0);
+        loop {
+            let page = f.query(q.clone()).unwrap();
+            found += page["entries"].as_array().unwrap().len();
+            let Some(next) = page.get("next") else { break };
+            q["before"] = next.clone();
+        }
+        assert_eq!(found, 1);
+    }
+
+    #[test]
     fn a_large_source_is_charged_once_per_call() {
         // a 20 MiB checkpoint: over the cache limit, and three times over the budget would leave three entries a call
         let mut messages = vec![message("user", "task")];
@@ -804,7 +842,8 @@ mod tests {
                 .is_err()
         );
         let public=render(&json!({"content":[{"type":"text","text":"visible"},{"type":"image","data":"SECRET"}],
-            "raw":"PRIVATE","images":[{"data":"SECRET","path":"f.png","width":10,"height":5}],"calls":[{"name":"luau","id":"c","input":{"code":"print(42)"}}]})).unwrap();
+            "raw":"PRIVATE","images":[{"data":"SECRET","path":"f.png","width":10,"height":5}],"calls":[{"name":"luau","id":"c","input":{"code":"print(42)"}}]}),
+            &mut |v| Ok(Arc::new(v.clone()))).unwrap();
         assert!(public.contains("visible") && public.contains("print(42)") && public.contains("[image f.png 10x5 not kept"));
         assert!(!public.contains("PRIVATE") && !public.contains("SECRET"));
         for q in [
