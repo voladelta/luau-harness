@@ -1,5 +1,5 @@
 //! One owner for admission, immutable run configuration, receipts, and recovery.
-use crate::{eventlog::{self, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, BudgetExceeded, Class, Policy, Snapshot}};
+use crate::{eventlog::{self, EventLog, LedgerKind}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, BudgetExceeded, Class, Policy, Snapshot}};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -293,13 +293,13 @@ impl Books {
     }
 }
 
-/// Append one ledger record (`eventlog::LEDGER_KINDS`) and apply it to `books`. Every ledger record goes through here,
+/// Append one ledger record and apply it to `books`. Every ledger record goes through here,
 /// so books kept live and books folded from the journal agree. A record the books reject is never written, and stops
 /// the run.
-fn append(log: &EventLog, books: &mut Books, kind: &str, fields: Value, sync: bool) -> Result<u64> {
-    books.validate(kind, &fields).map_err(|e| log.fail(format!("invalid journal record: {e}")))?;
+fn append(log: &EventLog, books: &mut Books, kind: LedgerKind, fields: Value, sync: bool) -> Result<u64> {
+    books.validate(kind.name(), &fields).map_err(|e| log.fail(format!("invalid journal record: {e}")))?;
     let seq = log.append_ledger(kind, fields.clone(), sync)?;
-    books.apply(seq, kind, &fields).map_err(|e| log.fail(format!("journal ledger update failed: {e}")))?;
+    books.apply(seq, kind.name(), &fields).map_err(|e| log.fail(format!("journal ledger update failed: {e}")))?;
     Ok(seq)
 }
 
@@ -333,7 +333,7 @@ pub fn resolve(log: &EventLog, books: &mut Books, records: &[Value], id: u64, de
         fields["by"] = json!("hx");
         fields["evidence"] = json!(evidence);
     }
-    append(log, books, "resolution", fields, true)?;
+    append(log, books, LedgerKind::Resolution, fields, true)?;
     if let Some(expect) = records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
         remove_temp(expect)?;
     }
@@ -390,7 +390,7 @@ pub fn reconcile(log: &EventLog, records: &[Value]) -> Result<(Books, usize)> {
     }
     let reservations: Vec<(u64, u64)> = books.reservations.iter().map(|(&id, &tokens)| (id, tokens)).collect();
     for (id, tokens) in reservations {
-        append(log, &mut books, "billing", bound_billing(id, tokens), true)?;
+        append(log, &mut books, LedgerKind::Billing, bound_billing(id, tokens), true)?;
         settled += 1;
     }
     Ok((books, settled))
@@ -650,7 +650,7 @@ impl Supervisor {
             "args_sha":args_sha, "depth":depth, "principal":principal.name(),
             "summary":args.to_string().chars().take(300).collect::<String>()});
         self.workflow_effect_metadata(tool, &mut fields)?;
-        self.record("intent", fields, true)
+        self.record(LedgerKind::Intent, fields, true)
     }
 
     /// Replace the file `target` (at `path`) with `bytes` for the write intent `intent`. First journal an `expect`
@@ -666,18 +666,18 @@ impl Supervisor {
     }
 
     pub fn uncertain(&self, id: u64, tool: Tool, args: &Value, message: &str) -> Result<()> {
-        self.record("uncertain", json!({"of":id, "tool":tool.name(), "args":args, "error":message}), true)?;
+        self.record(LedgerKind::Uncertain, json!({"of":id, "tool":tool.name(), "args":args, "error":message}), true)?;
         Ok(())
     }
 
     pub fn uncertain_operations(&self) -> Vec<u64> { self.books.lock().unwrap().uncertain.iter().copied().collect() }
 
     /// Append a journal record and apply it to the books under one lock, so the live books are the journal's fold.
-    pub fn record(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
+    pub fn record(&self, kind: LedgerKind, fields: Value, sync: bool) -> Result<u64> {
         self.record_in(&mut self.books.lock().unwrap(), kind, fields, sync)
     }
 
-    fn record_in(&self, books: &mut Books, kind: &str, fields: Value, sync: bool) -> Result<u64> {
+    fn record_in(&self, books: &mut Books, kind: LedgerKind, fields: Value, sync: bool) -> Result<u64> {
         append(&self.policy.log, books, kind, fields, sync)
     }
 
@@ -719,7 +719,7 @@ impl Supervisor {
             self.policy.log.write("budget", json!({"reason":exceeded.to_string(),"depth":depth}), true)?;
             return Err(exceeded.into());
         }
-        let seq = self.record_in(&mut books, "model_intent", json!({"model": cfg.model, "depth": depth,
+        let seq = self.record_in(&mut books, LedgerKind::ModelIntent, json!({"model": cfg.model, "depth": depth,
             "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens}), true)?;
         Ok(Some(seq))
     }
@@ -729,8 +729,8 @@ impl Supervisor {
     pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, status: Option<u16>, unbilled: bool, depth: usize) -> Result<bool> {
         let mut books = self.books.lock().unwrap();
         let bound = books.reservations.get(&op).filter(|_| !unbilled).copied();
-        let result = self.record_in(&mut books, "llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "status": status, "billing_uncertain": !unbilled}), true)
-            .and_then(|_| bound.map(|tokens| self.record_in(&mut books, "billing", bound_billing(op, tokens), true)).transpose());
+        let result = self.record_in(&mut books, LedgerKind::Llm, json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "status": status, "billing_uncertain": !unbilled}), true)
+            .and_then(|_| bound.map(|tokens| self.record_in(&mut books, LedgerKind::Billing, bound_billing(op, tokens), true)).transpose());
         drop(books);
         self.settled.notify_waiters();
         result.map(|_| unbilled || bound.is_some())
@@ -738,7 +738,7 @@ impl Supervisor {
 
     pub fn settle_model(&self, op: u64, cfg: &LlmCfg, reply: &Reply, depth: usize) -> Result<()> {
         let mut books = self.books.lock().unwrap();
-        let written = self.policy.log.blob(&serde_json::to_vec(reply)?).and_then(|blob| self.record_in(&mut books, "llm", json!({"of": op, "model": cfg.model,
+        let written = self.policy.log.blob(&serde_json::to_vec(reply)?).and_then(|blob| self.record_in(&mut books, LedgerKind::Llm, json!({"of": op, "model": cfg.model,
             "depth": depth, "reply": blob, "input": reply.input, "cache_read": reply.cache_read, "cache_write": reply.cache_write,
             "output": reply.output, "finish": reply.finish}), true));
         drop(books);
@@ -852,7 +852,7 @@ mod checkpoint_tests {
         let (supervisor, dir) = journal("invalid-append");
         let path = supervisor.policy.log.path.clone();
         let before = std::fs::read(&path).unwrap();
-        assert!(supervisor.record("billing", json!({"of": 1}), true).is_err());
+        assert!(supervisor.record(LedgerKind::Billing, json!({"of": 1}), true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(supervisor.policy.log.check().is_err());
         assert!(supervisor.policy.log.write("note", json!({}), false).is_err());

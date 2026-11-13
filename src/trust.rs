@@ -233,10 +233,10 @@ pub fn record(ws: &Path) -> Result<Option<String>> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     // Concurrent `hx trust` runs would otherwise lose each other's entries: read-modify-write under an exclusive lock,
     // replacing the file atomically.
-    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
         .custom_flags(libc::O_NOFOLLOW).open(path.with_extension("lock"))?;
-    anyhow::ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "cannot lock the trust store");
+    lock.lock().context("cannot lock the trust store")?;
     let mut all = read_store();
     all.insert(key(ws), h.clone());
     let body = toml::to_string(&BTreeMap::from([("workspaces", all)]))?;

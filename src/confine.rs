@@ -167,6 +167,7 @@ mod tests {
             let mut cmd = std::process::Command::new("cat");
             cmd.arg(dir.join(file));
             use std::os::unix::process::CommandExt;
+            // SAFETY: `apply` is async-signal-safe (two syscalls on an fd prepared before the fork).
             unsafe { cmd.pre_exec(move || r.apply()); }
             cmd.output().unwrap()
         };

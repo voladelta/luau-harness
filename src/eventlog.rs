@@ -16,9 +16,41 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Record kinds that change the books (`supervisor::Books`). `EventLog::write` refuses them: they reach the journal only
-/// through `EventLog::append_ledger`, which the supervisor's ledger calls after checking each record against its books.
-pub const LEDGER_KINDS: [&str; 7] = ["intent", "outcome", "resolution", "uncertain", "model_intent", "llm", "billing"];
+/// Record kinds that change the books (`supervisor::Books`). They reach the journal only through
+/// `EventLog::append_ledger`, which the supervisor's ledger calls after checking each record against its books;
+/// `EventLog::write` refuses their names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerKind {
+    Intent,
+    Outcome,
+    Resolution,
+    Uncertain,
+    ModelIntent,
+    Llm,
+    Billing,
+}
+
+impl LedgerKind {
+    pub const ALL: [Self; 7] = [Self::Intent, Self::Outcome, Self::Resolution, Self::Uncertain, Self::ModelIntent, Self::Llm, Self::Billing];
+
+    /// The record's `kind` in the journal.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Outcome => "outcome",
+            Self::Resolution => "resolution",
+            Self::Uncertain => "uncertain",
+            Self::ModelIntent => "model_intent",
+            Self::Llm => "llm",
+            Self::Billing => "billing",
+        }
+    }
+
+    /// The ledger kind a journal `kind` names, if any.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name() == name)
+    }
+}
 
 /// The journal key's file name in hx's configuration directory (`trust::store_dir`), which confined children cannot see
 /// and file tools refuse.
@@ -66,13 +98,16 @@ impl FileId {
     }
 }
 
+/// Take the journal's single-writer lock: an exclusive lock on `PATH.lock`, a file of its own so replacing the journal
+/// cannot drop it. Fails at once when another process holds it; released when the returned file is dropped.
 fn lock_writer(path: &Path) -> Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
         .custom_flags(libc::O_NOFOLLOW).open(path.with_extension("lock"))?;
-    anyhow::ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "run is already open by another process: {}", path.display());
-    Ok(lock)
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!("run is already open by another process: {}", path.display()),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("lock {}", path.display())),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -273,21 +308,22 @@ impl EventLog {
         Ok(h)
     }
 
-    /// Append a record of any kind but the ledger's (`LEDGER_KINDS`); `sync` forces it to disk. Returns its seq.
+    /// Append a record of any kind but the ledger's (`LedgerKind`); `sync` forces it to disk. Returns its seq.
     pub fn write(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
-        anyhow::ensure!(!LEDGER_KINDS.contains(&kind), "{kind} records change the books; the supervisor's ledger appends them");
+        anyhow::ensure!(LedgerKind::parse(kind).is_none(), "{kind} records change the books; the supervisor's ledger appends them");
+        anyhow::ensure!(!self.owner_reconciliation, "owner reconciliation can only record resolutions or billing");
         self.append(kind, fields, sync)
     }
 
     /// Append a ledger record. Only `supervisor`'s ledger calls this, after checking the record against the books it
     /// then applies it to, so the live books stay the journal's fold.
-    pub(crate) fn append_ledger(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
-        anyhow::ensure!(LEDGER_KINDS.contains(&kind), "{kind} is not a ledger record");
-        self.append(kind, fields, sync)
+    pub(crate) fn append_ledger(&self, kind: LedgerKind, fields: Value, sync: bool) -> Result<u64> {
+        anyhow::ensure!(!self.owner_reconciliation || matches!(kind, LedgerKind::Resolution | LedgerKind::Billing),
+            "owner reconciliation can only record resolutions or billing");
+        self.append(kind.name(), fields, sync)
     }
 
     fn append(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
-        anyhow::ensure!(!self.owner_reconciliation || matches!(kind, "resolution" | "billing"), "owner reconciliation can only record resolutions or billing");
         self.check()?;
         if !fields.as_object().is_some_and(|fields| ["seq", "prev", "kind", "session", "ts_ms"].iter().all(|key| !fields.contains_key(*key))) {
             return Err(self.fail("journal fields cannot replace record metadata"));
@@ -311,6 +347,7 @@ impl EventLog {
         g.prev = self.key.link(&line);
         if self.crash_after == Some(seq) {
             let _ = g.file.sync_data();
+            // SAFETY: kill takes only integers and touches no memory of this process before it ends it.
             unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
         }
         Ok(seq)
@@ -565,13 +602,27 @@ mod open_tests {
     }
 
     #[test]
+    fn the_writer_lock_is_exclusive_does_not_wait_and_ends_with_its_file() {
+        let dir = std::env::temp_dir().join(format!("hx-eventlog-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.jsonl");
+        let held = lock_writer(&path).unwrap();
+        let err = lock_writer(&path).unwrap_err().to_string();
+        assert!(err.contains("already open by another process"), "{err}");
+        drop(held);
+        assert!(lock_writer(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ledger_kinds_are_refused_outside_the_ledger() {
         let path = three_records("ledger-kinds");
         let log = EventLog::reopen(&path).unwrap();
-        for kind in LEDGER_KINDS {
-            assert!(log.write(kind, json!({"of": 1, "tokens": 1}), false).is_err(), "{kind}");
+        for kind in LedgerKind::ALL {
+            assert_eq!(LedgerKind::parse(kind.name()), Some(kind));
+            assert!(log.write(kind.name(), json!({"of": 1, "tokens": 1}), false).is_err(), "{kind:?}");
         }
-        assert!(log.append_ledger("note", json!({}), false).is_err());
+        assert_eq!(LedgerKind::parse("note"), None);
         assert_eq!(load(&path).unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

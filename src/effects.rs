@@ -172,7 +172,7 @@ impl Effects {
         match intent {
             Some(id) => {
                 r["of"] = json!(id);
-                self.supervisor.record("outcome", r, false)
+                self.supervisor.record(crate::eventlog::LedgerKind::Outcome, r, false)
             }
             None => {
                 r["class"] = json!(class.name());
