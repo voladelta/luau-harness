@@ -242,7 +242,7 @@ impl Host {
     }
 
     pub(crate) fn controller(&self) -> Result<Controller> {
-        Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs,
+        Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(),
             self.supervisor.manifest.as_ref().and_then(|m| m.deadline), if self.is_workflow_root() {"std/rpi"} else {"std/loop"})
     }
 
@@ -272,7 +272,7 @@ impl Host {
         if owner_event.is_none() {self.supervisor.check()?;}
         let t0 = Instant::now();
         let administrative = owner_event.is_some();
-        let controller = if administrative {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
+        let controller = if administrative {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),None,"std/rpi")?} else {self.controller()?};
         let mut state = if self.depth == 0 {
             match &self.supervisor.restored {
                 Some(RunState::Running { controller }|RunState::AwaitingReview{controller,..}) => controller.clone(),
@@ -295,7 +295,7 @@ impl Host {
             let previous_messages=state["messages"].as_array().cloned().unwrap_or_default();
             let was_compacting = compacting;
             let source_stage = self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f| f.stage.as_ref().map(|a| a.spec.id.clone()));
-            let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
+            let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),None,"std/rpi")?} else {self.controller()?};
             let (next_state,command)=controller.step(&state,&event)?;
             ensure_object(&next_state)?;
             let mut command=crate::controller::command(&command)?;
@@ -318,9 +318,7 @@ impl Host {
                 self.supervisor.check()?;
                 if vm.is_none() {
                     let fresh=Vm::new(self.policy.clone(),Duration::from_secs(crate::vm::CHUNK_SECS),512<<20,Some(self.clone()))?;
-                    let mut packs=vec!["std/packages".into(),"std/mcp".into()];
-                    for name in &self.packs {if matches!(name.as_str(),"std/vision"|"std/authoring") && !packs.contains(name) {packs.push(name.clone());}}
-                    fresh.install_packs(&packs).await?;vm=Some(fresh);
+                    fresh.install_packs(&self.packs).await?;vm=Some(fresh);
                 }
             }
             if let Command::Model{request,purpose}=&mut command {

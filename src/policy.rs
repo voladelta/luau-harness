@@ -657,6 +657,7 @@ impl Policy {
             p.read_roots.extend(w.clone());
             p.write_roots.extend(w);
             p.budget = Budget { max_tokens: f.budget.max_tokens, max_wall_secs: f.budget.max_wall_secs };
+            crate::vm::check_packs(&f.packs.enable).context("bad .harness/policy.toml")?;
             p.packs = f.packs.enable;
             p.ask = f.approval.ask;
             p.allow = f.approval.allow;

@@ -387,9 +387,7 @@ fn validate_args(args: &[String]) -> Result<()> {
         }
     }
     if seen.contains("--yes") && seen.contains("--approval") { return Err(usage("--yes and --approval cannot be combined")); }
-    if list_arg(args, "--pack").iter().any(|p| p == "std/rpi" || p.starts_with("std/rpi/")) {
-        return Err(usage("RPI must be activated explicitly with --rpi, not --pack"));
-    }
+    vm::check_packs(&list_arg(args, "--pack")).map_err(|e| usage(&e.to_string()))?;
     operands(args)?;
     if command == "review" && (arg(args, "--gate").is_none() || arg(args, "--decision").is_none()) {
         return Err(usage(operand_count("review").expect("review takes operands").1));
@@ -485,9 +483,7 @@ async fn real_main() -> Result<std::process::ExitCode> {
 /// hx exec --workspace DIR 'chunk1' 'chunk2' : run chunks in one session (no API key needed; used for testing)
 async fn cmd_exec(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
     let vm = vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?;
-    let mut packs = vec!["std/packages".to_string(), "std/mcp".to_string()];
-    packs.extend(list_arg(args, "--pack"));
-    vm.install_packs(&packs).await?;
+    vm.install_packs(&list_arg(args, "--pack")).await?;
     // The chunks: every argument after the command that is not a flag or its value.
     for chunk in positionals(args) {
         outln!("{}", vm.exec_text(chunk).await?)?;
@@ -806,6 +802,19 @@ mod tests {
             assert!(validate_args(&argv(bad)).unwrap_err().is::<Usage>(), "{bad}");
         }
         assert!(cmd_recover(&argv("recover LOG abc --decision complete")).unwrap_err().is::<Usage>());
+    }
+
+    #[test]
+    fn only_optional_packs_can_be_enabled() {
+        for ok in ["exec --pack std/vision", "run --model m --pack std/authoring,std/vision task"] {
+            validate_args(&argv(ok)).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in ["std/compact", "std/recheck", "std/rpi", "std/packages", "std/loop", "mypkg"] {
+            for command in ["exec", "run --model m task"] {
+                let a = argv(&format!("{command} --pack {bad}"));
+                assert!(validate_args(&a).unwrap_err().is::<Usage>(), "{a:?}");
+            }
+        }
     }
 
     #[test]

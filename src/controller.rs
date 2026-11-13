@@ -99,7 +99,7 @@ pub struct Controller {
 const STEP_TIME: Duration = Duration::from_secs(10);
 
 impl Controller {
-    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, packs: &[String], run_deadline: Option<f64>, entrypoint: &str) -> Result<Self> {
+    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, run_deadline: Option<f64>, entrypoint: &str) -> Result<Self> {
         let lua = Lua::new();
         let g = lua.globals();
         g.set("print", lua.create_function(|_, args: MultiValue| { eprintln!("{}", args.into_iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t")); Ok(()) })?)?;
@@ -138,15 +138,6 @@ impl Controller {
         env.set("hx", hx)?;
         lua.sandbox(true)?;
         if registry.sources.contains_key("project/init") { require.call::<Table>("project/init")?; }
-        // Controller packs are trusted pure std modules. Agent-facing packs are installed in the agent VM instead.
-        for name in packs {
-            if matches!(name.as_str(), "std/packages" | "std/mcp" | "std/authoring" | "std/vision" | "std/recheck" | "std/compact") { continue; }
-            let module: Table = require.call(name.as_str())?;
-            if let Ok(install) = module.get::<Function>("install") {
-                let ctx = lua.create_table()?; ctx.set("hooks", require.call::<Table>("std/hooks")?)?;
-                install.call::<()>(ctx)?;
-            }
-        }
         let module: Table = require.call(entrypoint)?;
         Ok(Self { lua, module, deadline })
     }
@@ -181,7 +172,7 @@ mod tests {
         let mut registry = Registry::default();
         let text = format!("return {{init = function(cfg) return {{}} end, step = function(state, event) {step} end}}");
         registry.sources.insert("t".into(), crate::modules::Source { text, origin: "t.luau".into(), is_override: false, pkg: None });
-        Controller::new(Arc::new(registry), json!({}), String::new(), &[], None, "t").unwrap()
+        Controller::new(Arc::new(registry), json!({}), String::new(), None, "t").unwrap()
     }
 
     #[test]

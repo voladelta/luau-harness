@@ -560,7 +560,7 @@ impl Supervisor {
 
     pub fn start_workflow(policy: Arc<Policy>, model: LlmCfg, task: String, max_turns: usize, packs: Vec<String>, budget: Budget, branch: Option<Branch>, workflow: Option<crate::workflow::WorkflowConfig>) -> Result<Arc<Self>> {
         if let Some(config)=&workflow {config.validate()?;}
-        anyhow::ensure!(!packs.iter().any(|p|p == "std/rpi" || p.starts_with("std/rpi/")),"RPI requires --rpi, not a configured pack");
+        crate::vm::check_packs(&packs)?;
         let mut registry = Registry::capture(&policy.workspace)?;
         registry.materialize_skills(&policy.log)?;
         let manifest = Manifest { format: FORMAT, runtime: env!("CARGO_PKG_VERSION").into(), binary_sha: binary_sha()?,

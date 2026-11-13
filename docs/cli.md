@@ -47,7 +47,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at 80% of it. Without the flag, a run on OpenRouter (the default base URL) reads the model's `context_length` and `top_provider.max_completion_tokens` from `/models` once at launch; the manifest keeps them for resume. When that fails (another provider, an unlisted model, no network), hx says so on stderr and assumes the default; give a smaller model's window so it compacts before an overflow |
 | `--max-tokens N` `--max-wall SECS` | none | Admission thresholds and absolute deadline; flags override `policy.toml` for a new run |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
-| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model) |
+| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model); any other name is an error (compaction and recheck are set in `.harness/init.luau`, RPI with `--rpi`). Also accepted by `hx exec` |
 | `--trace FILE` | | Write a readable trace |
 
 ## Owner command flags

@@ -545,6 +545,23 @@ fn render_manifest(name: &str, d: &ToolDef) -> String {
     t
 }
 
+/// Packs every agent VM installs: the package bindings and the MCP binding.
+const BASE_PACKS: [&str; 2] = ["std/packages", "std/mcp"];
+
+/// The packs a run or `hx exec` may add (`--pack`, `[packs] enable` in policy.toml), installed in the agent VM after
+/// the base packs. Every other `std` module is part of the loop and is configured in `.harness/init.luau`.
+pub const OPTIONAL_PACKS: [&str; 2] = ["std/authoring", "std/vision"];
+
+/// Refuse any pack that is not one of `OPTIONAL_PACKS`, rather than enable nothing.
+pub fn check_packs(packs: &[String]) -> Result<()> {
+    for pack in packs {
+        anyhow::ensure!(OPTIONAL_PACKS.contains(&pack.as_str()),
+            "unknown pack {pack:?}: the packs are {} (compaction and recheck are set in .harness/init.luau; RPI is --rpi)",
+            OPTIONAL_PACKS.join(", "));
+    }
+    Ok(())
+}
+
 pub struct Vm {
     pub lua: Lua,
     pub session: Session,
@@ -989,15 +1006,18 @@ impl Vm {
         Ok(Vm { lua, session, modenv, tool_prompt, #[cfg(test)] effects: fx })
     }
 
-    /// Install packs (`require(name).install(ctx)`) the way the loop does, for `hx exec --pack`.
-    pub async fn install_packs(&self, packs: &[String]) -> Result<()> {
+    /// Install the base packs, then the opt-in `extra` ones (`require(name).install(ctx)`), in this agent VM.
+    pub async fn install_packs(&self, extra: &[String]) -> Result<()> {
+        check_packs(extra)?;
+        let mut packs: Vec<&str> = BASE_PACKS.to_vec();
+        for pack in extra { if !packs.contains(&pack.as_str()) { packs.push(pack); } }
         let f = self
             .lua
             .load("for _, name in {...} do require(name).install({ hooks = require('std/hooks') }) end")
             .set_name("=host")
             .set_environment(self.modenv.clone())
             .into_function()?;
-        f.call_async::<()>(MultiValue::from_iter(packs.iter().map(|p| Value::String(self.lua.create_string(p).unwrap())))).await?;
+        f.call_async::<()>(packs.into_iter().map(|p| self.lua.create_string(p).map(Value::String)).collect::<mlua::Result<MultiValue>>()?).await?;
         Ok(())
     }
 
