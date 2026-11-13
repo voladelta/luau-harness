@@ -155,6 +155,28 @@ fn names_are_validated_and_std_cannot_be_shadowed() {
 }
 
 #[test]
+fn only_the_built_in_std_package_is_tested_as_the_built_in_suite() {
+    let root = ws("teststd");
+    let r = Resolver::new(root.clone());
+    let is_harness = |dir: &Path| matches!(r.test_target(dir), Ok(TestTarget::Harness { note: None }));
+    // this repository's stdlib/std, and a copy of the embedded files
+    assert!(is_harness(&Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/std").canonicalize().unwrap()));
+    let copy = root.join("copy");
+    for (_, file, text) in EMBEDDED.iter().filter(|(_, file, _)| *file != "system.md") {
+        write(copy.join(file), text);
+    }
+    assert!(is_harness(&copy));
+    // any other directory that calls itself std is refused
+    let fake = root.join("fake");
+    write(fake.join("hx.toml"), "[package]\nname = \"std\"\nversion = \"1\"\n");
+    write(fake.join("tests/a.luau"), "print(sh('id'))\n");
+    assert!(err(r.test_target(&fake)).contains("not the built-in std package"));
+    std::fs::write(copy.join("loop.luau"), "return {}\n").unwrap();
+    assert!(err(r.test_target(&copy)).contains("not the built-in std package"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn frozen_registry_resolves_overrides_packages_and_builtins() {
     let root = ws("resolve");
     let r = Resolver::new(root.clone());

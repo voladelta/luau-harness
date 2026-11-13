@@ -174,6 +174,17 @@ pub enum TestTarget {
     Harness { note: Option<String> },
 }
 
+/// Whether `dir` is the built-in std package: this binary's own source tree, or a copy whose files are exactly the
+/// embedded ones (`system.md` is embedded from `prompts/`, so it is not part of the directory).
+fn is_builtin_std(dir: &Path, snap: &Snapshot) -> bool {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/std");
+    if source.canonicalize().is_ok_and(|source| source == dir) {
+        return true;
+    }
+    EMBEDDED.iter().filter(|(pkg, file, _)| *pkg == "std" && *file != "system.md")
+        .all(|(_, file, text)| snap.files.get(*file).is_some_and(|bytes| bytes == text.as_bytes()))
+}
+
 impl Resolver {
     /// What `hx test DIR` runs: see `TestTarget`. `dir` must be canonical.
     pub fn test_target(&self, dir: &Path) -> Result<TestTarget> {
@@ -193,7 +204,11 @@ impl Resolver {
             Some(name) => name.clone(),
             None => dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
         };
-        if name == "std" && !inside_harness {
+        if name == "std" {
+            // The name alone proves nothing: any directory can claim it, and the built-in suite runs with the agent's
+            // authority.
+            anyhow::ensure!(!inside_harness && is_builtin_std(dir, &snap),
+                "{} calls itself std, but it is not the built-in std package; give it another name", dir.display());
             return Ok(TestTarget::Harness { note: None });
         }
         anyhow::ensure!(valid_package_name(&name), "{name:?} is not a valid package name");
