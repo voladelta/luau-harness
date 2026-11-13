@@ -109,6 +109,15 @@ impl Target {
         Ok(text)
     }
 
+    /// Unlink the target name itself (a link is removed, never followed).
+    pub fn remove(&self) -> io::Result<()> {
+        // SAFETY: `dir` is an open directory descriptor and `name` a NUL-terminated string; both outlive the call.
+        if unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// The target's whole content, opened through the pinned directory without following a link. Refuses a directory
     /// (`IsADirectory`), anything else that is not a regular file (a FIFO would block, a device may never end;
     /// `InvalidInput`) and content over `max` bytes (`FileTooLarge`), reading at most `max + 1` bytes either way.
