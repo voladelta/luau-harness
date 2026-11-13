@@ -45,7 +45,7 @@ check "batch operations count as ops and carry search truncation" "$($H exec --w
 # 3b. An effect called where Luau cannot yield fails before it exists: no command, no held mutation permit, no open intent.
 W4=$T/ws4; mkdir -p $W4
 out=$(timeout 30 $H exec --workspace $W4 'print(pcall(string.gsub,"a","a",function() return sh("touch ran").stdout end))' 'print(pcall(sh,"echo again"))' 2>&1)
-check "effect in a gsub callback is refused with a clear error" "$(echo "$out" | grep -c 'sh: cannot run inside a callback that cannot yield')" "1"
+check "effect in a gsub callback is refused" "$(echo "$out" | grep -c 'attempt to yield across metamethod/C-call boundary')" "1"
 check "effect in a gsub callback does not run" "$([ -e $W4/ran ] && echo ran || echo absent)" "absent"
 check "a later mutation still runs" "$(echo "$out" | grep -cF 'stdout="again\n"')" "1"
 check "no intent is left without an outcome" "$(python3 -c '
