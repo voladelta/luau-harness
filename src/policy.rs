@@ -209,8 +209,9 @@ const PUSH_DESTRUCTIVE: &[&str] = &["--force", "--force-with-lease", "--force-if
 const WRAPPERS: &[&str] = &["sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice", "chrt",
     "taskset", "timeout", "xargs", "parallel", "stdbuf", "setsid", "setpriv", "unshare", "nsenter", "chroot", "busybox",
     "flock", "strace", "ltrace", "find"];
-/// How many words after a wrapper are tried as its program. Real wrapper options are short; the bound keeps a long
-/// model-written command from making classification quadratic.
+/// How far after a wrapper its program may start. Every word up to the program is tried as the program, and each try
+/// reads the rest of the command, so the bound keeps classification linear in the command's length. Real wrapper
+/// options are short; a command whose program may start beyond the bound needs approval.
 const WRAPPED_OFFSETS: usize = 32;
 /// Shell reserved words. At the start of a simple command they open or close a compound command and run nothing
 /// themselves (`{ git push; }`, `then git push`, `do git push`), so they are skipped.
@@ -231,9 +232,11 @@ pub fn is_secret(path: &Path) -> bool {
 const ENV_ALLOW: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL"];
 const TOOLS: &[&str] = &["python3", "python", "pip3", "node", "npm", "npx", "git", "cargo", "rustc", "go", "uv", "ruby", "java", "make", "gcc", "clang", "deno", "bun"];
 
-/// Split a shell command line into its simple commands, each a list of words. POSIX-ish: single and double quotes,
-/// backslash escapes, comments, the operators `; & | ( )` and newlines between commands, and redirections. The bodies
-/// of `$(...)` and backticks become commands of their own. It does not expand variables or aliases.
+/// Split a shell command line into its simple commands, each a list of words. POSIX-ish: single, double and `$'...'`
+/// quotes, backslash escapes, comments, the operators `; & | ( )` and newlines between commands, and redirections. The
+/// bodies of `$(...)` and backticks become commands of their own. It does not expand variables or aliases: a word keeps
+/// a `$` wherever the shell would substitute text at run time (`$x`, `$'...'`, and a `$` in place of each command
+/// substitution), so `is_literal` can tell the words whose text is known.
 fn commands(line: &str) -> Vec<Vec<String>> {
     fn body(chars: &[char], mut i: usize, close: char) -> (String, usize) {
         // From just after `$(` or a backtick to its matching close; returns the body and the index after the close.
@@ -276,8 +279,18 @@ fn commands(line: &str) -> Vec<Vec<String>> {
                 while i < chars.len() && chars[i] != '"' {
                     match chars[i] {
                         '\\' if i + 1 < chars.len() && matches!(chars[i + 1], '"' | '\\' | '$' | '`') => { word.as_mut().unwrap().push(chars[i + 1]); i += 2; },
-                        '$' if chars.get(i + 1) == Some(&'(') => { let (b, next) = body(&chars, i + 2, ')'); cmds.extend(commands(&b)); i = next; },
-                        '`' => { let (b, next) = body(&chars, i + 1, '`'); cmds.extend(commands(&b)); i = next; },
+                        '$' if chars.get(i + 1) == Some(&'(') => {
+                            word.as_mut().unwrap().push('$');
+                            let (b, next) = body(&chars, i + 2, ')');
+                            cmds.extend(commands(&b));
+                            i = next;
+                        },
+                        '`' => {
+                            word.as_mut().unwrap().push('$');
+                            let (b, next) = body(&chars, i + 1, '`');
+                            cmds.extend(commands(&b));
+                            i = next;
+                        },
                         ch => { word.as_mut().unwrap().push(ch); i += 1; },
                     }
                 }
@@ -288,8 +301,31 @@ fn commands(line: &str) -> Vec<Vec<String>> {
                     i += 1;
                 }
             },
-            '$' if chars.get(i + 1) == Some(&'(') => { let (b, next) = body(&chars, i + 2, ')'); cmds.extend(commands(&b)); i = next; continue; },
-            '`' => { let (b, next) = body(&chars, i + 1, '`'); cmds.extend(commands(&b)); i = next; continue; },
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                word.get_or_insert_with(String::new).push('$');
+                let (b, next) = body(&chars, i + 2, ')');
+                cmds.extend(commands(&b));
+                i = next;
+                continue;
+            },
+            '`' => {
+                word.get_or_insert_with(String::new).push('$');
+                let (b, next) = body(&chars, i + 1, '`');
+                cmds.extend(commands(&b));
+                i = next;
+                continue;
+            },
+            '$' if chars.get(i + 1) == Some(&'\'') => {
+                // ANSI-C quoting: a backslash escapes the next character, `\'` included.
+                let w = word.get_or_insert_with(String::new);
+                w.push('$');
+                i += 2;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' && i + 1 < chars.len() { i += 1; }
+                    w.push(chars[i]);
+                    i += 1;
+                }
+            },
             ch => word.get_or_insert_with(String::new).push(ch),
         }
         i += 1;
@@ -321,12 +357,76 @@ fn command_words_after_reserved(words: &[String]) -> &[String] {
 fn class_of(words: &[String]) -> Class {
     let words = command_words(words);
     let Some(first) = words.first() else { return Class::LocalWrite };
-    if WRAPPERS.contains(&program(first)) {
-        // Nested wrappers are covered too: every later word is tried as the program.
-        return (1..words.len().min(WRAPPED_OFFSETS + 1)).map(|k| program_class(command_words(&words[k..]))).max()
-            .unwrap_or(Class::LocalWrite);
+    if !WRAPPERS.contains(&program(first)) { return program_class(words); }
+    // Which word a wrapper runs depends on its options (`sudo -u root git`), so every word up to the last one that can
+    // be the program is tried as the program; that covers nested wrappers too. Past the bound nothing is known.
+    let (last, unknown) = match last_program_offset(words) {
+        Some(last) => (last, Class::LocalWrite),
+        None => (WRAPPED_OFFSETS, Class::External),
+    };
+    (1..words.len().min(last + 1)).map(|k| program_class(command_words(&words[k..]))).fold(unknown, Class::max)
+}
+
+/// Can the shell run `word` as written? `commands` leaves a `$` wherever the shell substitutes text at run time, so a
+/// word with one names a program (or subcommand) the classifier cannot know.
+fn is_literal(word: &str) -> bool {
+    !word.contains('$')
+}
+
+/// Operands a wrapper takes before the program it runs (`timeout 5 git`, `chroot /srv git`).
+fn leading_operands(wrapper: &str) -> usize {
+    match wrapper {
+        "timeout" | "chroot" | "chrt" | "taskset" | "flock" => 1,
+        _ => 0,
     }
-    program_class(words)
+}
+
+/// The last offset in `words` (a simple command whose first word is a wrapper) at which the wrapped program can start,
+/// following nested wrappers; None when that may lie beyond `WRAPPED_OFFSETS`. Options and their values come first,
+/// so the first word that is neither an option, an assignment nor the value of an option is the wrapper's first
+/// operand, and the program follows its leading operands. `find` runs the word after each `-exec`, `-execdir`, `-ok`
+/// and `-okdir`; `command -v` and `command -V` run nothing.
+fn last_program_offset(words: &[String]) -> Option<usize> {
+    let (mut wrapper, mut furthest) = (0, 0);
+    loop {
+        let name = program(&words[wrapper]);
+        // The words that can be this wrapper's program.
+        let (from, last) = if name == "find" {
+            let mut last = None;
+            for (k, w) in words.iter().enumerate().skip(wrapper + 1) {
+                if matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") && k + 1 < words.len() {
+                    if k + 1 > WRAPPED_OFFSETS { return None; }
+                    last = Some(k + 1);
+                }
+            }
+            let Some(last) = last else { return Some(furthest) };
+            (last, last)
+        } else {
+            let mut operand = None;
+            for k in wrapper + 1..words.len() {
+                if k > WRAPPED_OFFSETS { return None; }
+                let w = &words[k];
+                if name == "command" && w.starts_with('-') && !w.starts_with("--") && (w.contains('v') || w.contains('V')) {
+                    return Some(furthest.max(k));
+                }
+                if !w.starts_with('-') && !is_assignment(w) && !words[k - 1].starts_with('-') {
+                    operand = Some(k);
+                    break;
+                }
+            }
+            let Some(first) = operand else { return Some(words.len() - 1) };
+            let last = first + leading_operands(name);
+            if last >= words.len() { return Some(words.len() - 1); }
+            if last > WRAPPED_OFFSETS { return None; }
+            (first, last)
+        };
+        furthest = furthest.max(last);
+        // A nested wrapper (`sudo nice -n 5 git`) has options of its own; its program comes later still.
+        match (from..=last).rev().find(|&k| WRAPPERS.contains(&program(&words[k]))) {
+            Some(k) => wrapper = k,
+            None => return Some(furthest),
+        }
+    }
 }
 
 /// Is an `rm` argument the whole filesystem or the home directory (`/`, `//`, `/.`, `~/`, `$HOME/.`, `/*`, ...)?
@@ -347,6 +447,7 @@ fn push_class(args: &[String]) -> Class {
 /// The effect class of a simple command whose first word is the program.
 fn program_class(words: &[String]) -> Class {
     let Some(first) = words.first() else { return Class::LocalWrite };
+    if !is_literal(first) { return Class::External; }
     let (prog, args) = (program(first), &words[1..]);
     match prog {
         "bash" | "sh" | "zsh" | "dash" | "ksh" => {
@@ -370,7 +471,11 @@ fn program_class(words: &[String]) -> Class {
             for (j, a) in args.iter().enumerate() {
                 if a.starts_with('-') { continue; }
                 if a == "push" { class = class.max(push_class(&args[j + 1..])); }
-                if j == 0 || !args[j - 1].starts_with('-') { break; }
+                if j == 0 || !args[j - 1].starts_with('-') {
+                    // Not an option's value, so the subcommand; one the shell substitutes could be `push`.
+                    if !is_literal(a) { class = class.max(Class::External); }
+                    break;
+                }
             }
             return class;
         },
@@ -1175,6 +1280,45 @@ mod tests {
             "if [ -f x ]; then rm -rf build; fi", "git --no-pager log --oneline", "git commit -m push", "env FOO=1 make",
             "rm -rf ./build/.", "xargs echo < list"] {
             assert_eq!(p.classify_sh(cmd), Class::LocalWrite, "{cmd}");
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_programs_need_approval_and_everyday_commands_do_not() {
+        let (p, dir) = test_policy("unknown", false, &[]);
+        let padded = |wrapper: &str, pad: &str, n: usize| format!("{wrapper} {} git push --force origin main", vec![pad; n].join(" "));
+        let mut must_ask = vec![
+            "g$'i't push origin main".to_string(), "$x push origin main".into(), "\"$(echo git)\" push origin main".into(),
+            "`echo git` push origin main".into(), "$(echo git) push origin main".into(), "${GIT} push origin main".into(),
+            "$'git' push origin main".into(), "sudo $x push origin main".into(), "env A=1 \"$PROG\" push".into(),
+            "git $'push' --force origin main".into(), "echo $'it\\'s' ; git push origin main".into(),
+            "find . -exec \"$x\" push \\;".into(), "command -v git; git push".into(), "sudo command git push".into(),
+        ];
+        for (wrapper, pad) in [("env", "-u A"), ("env", "A=1"), ("sudo", "-E"), ("nice", "-n"), ("timeout -k 1", "-v"),
+            ("xargs", "-0"), ("sudo env", "-i"), ("timeout 5 env", "-u A")] {
+            must_ask.push(padded(wrapper, pad, 40));
+        }
+        must_ask.push(format!("find . {} -exec git push --force \\;", vec!["-name x -o"; 20].join(" ")));
+        for cmd in &must_ask {
+            assert!(p.classify_sh(cmd) >= Class::External, "{cmd}");
+        }
+        // Inside the bound, the same wrappers still see the force push itself.
+        for wrapper in ["env -u A", "env A=1", "sudo -E", "timeout 5 env -u A"] {
+            assert_eq!(p.classify_sh(&padded(wrapper, "", 0)), Class::Irreversible, "{wrapper}");
+        }
+        let long_args = format!("timeout 60 pytest -q {}", vec!["tests/test_x.py"; 60].join(" "));
+        let long_find = format!("find . {} -print", vec!["-name '*.rs' -o"; 30].join(" "));
+        let everyday = ["cargo test", "cargo build --release", "git status", "git diff", "git add -A && git commit -m \"x\"",
+            "for f in *.rs; do wc -l \"$f\"; done", "timeout 60 pytest -q", "find . -name '*.py' -exec grep -l foo {} +",
+            "env RUST_BACKTRACE=1 cargo test", "FOO=bar make", "cat \"$HOME/.bashrc\"", "echo \"$PATH\"", "ls $(pwd)",
+            "python3 -c 'print(1)'", "sed -n 1,5p file", "xargs -n1 echo < list", "nice -n 10 make -j4", "command -v ssh",
+            "command -V aws", "command -v aws || echo none", "env RUST_BACKTRACE=1 cargo test \"$name\"", "timeout 60 cat \"$f\"",
+            "git log --oneline -n 3 -- src/push.rs", "git -C \"$dir\" status", "FOO=$(date) make", "echo `date`",
+            long_args.as_str(), long_find.as_str()];
+        for cmd in everyday {
+            assert!(p.classify_sh(cmd) <= Class::LocalWrite, "{cmd}");
         }
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);

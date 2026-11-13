@@ -104,6 +104,16 @@ ORIG"
   rm -f $W/.harness/secrets.toml
 fi
 
+# --- approval classes: a program the classifier cannot read needs approval; everyday commands do not
+pad=$(printf -- '-u A %.0s' $(seq 40))
+for cmd in "env $pad touch padded.txt" "\"\$(echo touch)\" substituted.txt" "tou\$'c'h quoted.txt"; do
+  out=$(run "print(pcall(sh, [[$cmd]]))" | head -1)
+  check "unreadable program needs approval and does not run: ${cmd:0:24}" "$(echo "$out" | grep -c 'approval_required')$(ls $W/*ed.txt 2>/dev/null)" "1"
+done
+out=$(run 'local a, b, c = sh("command -v sh"), sh("env RUST_BACKTRACE=1 timeout 60 true"), sh("for f in *.txt; do wc -l \"$f\" >/dev/null; done")
+print(a.code, b.code, c.code)' | head -1)
+check "command -v, wrapped and looping commands run unasked" "$(echo "$out" | tr '\t' '|')" "0|0|0"
+
 # --- timeout kills the whole process group
 out=$(run 'local r = sh("sleep 987 & sleep 987", {timeout = 1}) print(r.timed_out)')
 check "timeout kills the whole process group" "$(echo "$out" | head -1)$(sleep 1; pgrep -f 'sleep 987' | wc -l | tr -d ' ')" "true0"
