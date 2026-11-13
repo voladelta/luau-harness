@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""A tiny MCP server (stdio, JSON-RPC 2.0) for testing hx's MCP client. Every tools/call is appended to calls.log."""
+"""A tiny MCP server (stdio, JSON-RPC 2.0) for testing hx's MCP client. Every tools/call is appended to calls.log.
+A call to an unlisted tool is a JSON-RPC error (-32602). Files in the working directory switch on test behavior:
+demo_extra adds tools (quit: answer, then exit; x-y and x_y, whose safe names collide; a long non-ASCII description),
+demo_pages makes tools/list return pages of three tools linked by nextCursor."""
 import json, os, socket, sys
 
 def schema(**props):
@@ -14,6 +17,16 @@ TOOLS = [
     {"name": "env_names", "description": "List environment variable names", "inputSchema": {"type": "object"}},
     {"name": "boom", "description": "Always fails", "inputSchema": {"type": "object"}},
 ]
+
+EXTRA = [
+    {"name": "quit", "description": "Answer, then exit", "inputSchema": {"type": "object"}},
+    {"name": "x-y", "description": "Dashed name", "inputSchema": {"type": "object"}},
+    {"name": "x_y", "description": "Underscored name", "inputSchema": {"type": "object"}},
+    {"name": "long_desc", "description": "\u00e9" * 200, "inputSchema": {"type": "object"}},
+]
+
+def tools():
+    return TOOLS + (EXTRA if os.path.exists("demo_extra") else [])
 
 def text(t, err=False):
     return {"content": [{"type": "text", "text": t}], "isError": err}
@@ -44,6 +57,8 @@ def call(name, a):
         return text(",".join(sorted(os.environ)))
     if name == "boom":
         return text("boom", True)
+    if name in ("quit", "x-y", "x_y", "long_desc"):
+        return text(name)
     return text("unknown tool", True)
 
 def main():
@@ -57,7 +72,18 @@ def main():
         if m["method"] == "initialize":
             r = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "demo", "version": "1"}}
         elif m["method"] == "tools/list":
-            r = {"tools": TOOLS}
+            listed = tools()
+            if os.path.exists("demo_pages"):
+                start = int(m.get("params", {}).get("cursor") or 0)
+                r = {"tools": listed[start:start + 3]}
+                if start + 3 < len(listed):
+                    r["nextCursor"] = str(start + 3)
+            else:
+                r = {"tools": listed}
+        elif m["method"] == "tools/call" and m["params"]["name"] not in [t["name"] for t in tools()]:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32602, "message": "unknown tool: " + m["params"]["name"]}}) + "\n")
+            sys.stdout.flush()
+            continue
         elif m["method"] == "tools/call":
             r = call(m["params"]["name"], m["params"].get("arguments", {}))
         else:
@@ -66,6 +92,8 @@ def main():
             continue
         sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\n")
         sys.stdout.flush()
+        if m["method"] == "tools/call" and m["params"]["name"] == "quit":
+            sys.exit(0)
 
 if __name__ == "__main__":
     main()

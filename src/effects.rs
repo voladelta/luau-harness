@@ -1,6 +1,6 @@
 //! Authorized effect dispatch with durable intents and receipts. Recovery never re-executes old chunks.
 use crate::eventlog::{self, EventLog};
-use crate::policy::{Class, Policy};
+use crate::policy::{Class, Policy, Request};
 use anyhow::Result;
 use mlua::Lua;
 use serde_json::{json, Value};
@@ -45,8 +45,7 @@ fn is_unknown(error: &mlua::Error) -> bool {
 pub enum Ret {
     Num(f64),
     Str(String),
-    /// `approval` is who approved the command (`Policy::approve`); the outcome record carries it.
-    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, truncated: bool, operation_id: Option<u64>, approval: &'static str },
+    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, truncated: bool, operation_id: Option<u64> },
     Rows { rows: Vec<(String, i64, String)>, truncated: bool },
     SearchErr { kind: String, message: String, hint: String },
     Agent { answer: String, finished: bool, turns: u64 },
@@ -128,9 +127,10 @@ impl Effects {
         json!({"depth": self.depth, "args_sha": sha})
     }
 
-    fn begin(&self, c: &Call) -> mlua::Result<Option<u64>> {
+    /// Journal a mutation's intent with who approved it: the journal's one record of that.
+    fn begin(&self, c: &Call, approval: &str) -> mlua::Result<Option<u64>> {
         let Call { tool, class, args, sha } = *c;
-        (class != Class::Read).then(|| self.supervisor.intent(tool, class, args, sha, self.depth, &self.principal))
+        (class != Class::Read).then(|| self.supervisor.intent(tool, class, args, sha, self.depth, &self.principal, approval))
             .transpose().map_err(|e| rt(e.to_string()))
     }
 
@@ -151,7 +151,6 @@ impl Effects {
         r["ok"] = json!(res.is_ok());
         r["ms"] = json!(ms);
         r["ret"] = ret.to_json(self.log()).map_err(|e| rt(e.to_string()))?;
-        if let Ret::Sh { approval, .. } = &ret { r["approval"] = json!(approval); }
         self.supervisor.workflow_effect_metadata(tool, &mut r).map_err(mlua::Error::external)?;
         if let Ret::Err(m) = &ret {
             r["detail"] = json!({"error": m.chars().take(300).collect::<String>()});
@@ -187,7 +186,7 @@ impl Effects {
         let sha = args_sha(&args);
         let t0 = std::time::Instant::now();
         let call = Call { tool, class, args: &args, sha: &sha };
-        let intent = self.begin(&call)?;
+        let intent = self.begin(&call, "not-required")?;
         let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
         let res = f(intent);
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
@@ -197,17 +196,25 @@ impl Effects {
     /// Async authorization around a synchronous file executor. The intent ID still reaches atomic writes.
     pub async fn run_sync(&self, lua: &Lua, tool: Tool, class: Class, args: Value,
         f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
-        self.run_inner(lua, tool, class, args, |intent| async move { f(intent) }).await
+        self.run_inner(lua, tool, class, args, None, |intent| async move { f(intent) }).await
     }
 
-    /// Authorize and record one asynchronous effect (sh, agent).
+    /// Authorize and record one asynchronous effect outside the approval gate (agent, promote).
     pub async fn run<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where F: FnOnce() -> Fut, Fut: Future<Output = mlua::Result<Ret>> {
-        self.run_inner(lua, tool, class, args, |_| f()).await
+        self.run_inner(lua, tool, class, args, None, |_| f()).await
     }
 
-    /// Authorize and record one asynchronous effect (sh, agent).
-    async fn run_inner<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
+    /// Authorize, approve (`Policy::approve`) and record one effect that can act beyond the workspace: sh, MCP, HTTP.
+    pub async fn run_approved<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, request: Request<'_>, f: F) -> mlua::Result<Ret>
+    where F: FnOnce() -> Fut, Fut: Future<Output = mlua::Result<Ret>> {
+        self.run_inner(lua, tool, class, args, Some(request), |_| f()).await
+    }
+
+    /// Owner waits (a path permission, the approval gate) come before the intent is journaled, so a refusal, an
+    /// interrupt or the run deadline while one is open is a definite non-effect (a `call` receipt), never an uncertain
+    /// operation that blocks the run's mutations until `hx recover`.
+    async fn run_inner<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, request: Option<Request<'_>>, f: F) -> mlua::Result<Ret>
     where
         F: FnOnce(Option<u64>) -> Fut,
         Fut: Future<Output = mlua::Result<Ret>>,
@@ -224,9 +231,7 @@ impl Effects {
         let t0 = std::time::Instant::now();
         let _wait = self.awaiting(lua);
         let call = Call { tool, class, args: &args, sha: &sha };
-        let intent = self.begin(&call)?;
-        let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
-        let authorization = async {
+        let admission = async {
             let path = match tool {
                 Tool::Sh => args["cwd"].as_str(),
                 Tool::Read | Tool::Search | Tool::View | Tool::Write | Tool::Edit => args["path"].as_str(),
@@ -238,28 +243,36 @@ impl Effects {
                 }
                 self.pol.authorize_path(path, matches!(tool, Tool::Write | Tool::Edit)).await.map_err(mlua::Error::external)?;
             }
-            Ok(())
+            match request {
+                Some(request) => self.pol.approve(request, class).await.map_err(|why| rt(format!("approval_required: {why}"))),
+                None => Ok("not-required"),
+            }
         };
-        let allowed = match self.supervisor.remaining() {
-            Some(remaining) => tokio::time::timeout(remaining, authorization).await
+        let admitted = match self.supervisor.remaining() {
+            Some(remaining) => tokio::time::timeout(remaining, admission).await
                 .unwrap_or_else(|_| Err(rt("budget_exceeded: absolute run deadline reached while awaiting permission; effect was NOT run"))),
-            None => authorization.await,
+            None => admission.await,
         };
-        let mut res = match allowed {
-            Err(e) => Err(e),
-            Ok(()) => {
-                // Recheck after an owner wait: a run may have been revoked or a stage may have ended.
-                let dispatch = async {
-                    self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
-                    self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
-                    f(intent).await
-                };
-                match self.supervisor.remaining() {
-                    Some(remaining) => tokio::time::timeout(remaining, dispatch).await
-                        .unwrap_or_else(|_| Err(unknown("absolute run deadline interrupted this effect; it may have acted"))),
-                    None => dispatch.await,
-                }
+        // Recheck after an owner wait: a run may have been revoked or a stage may have ended.
+        let admitted = admitted.and_then(|approval| {
+            self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
+            self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
+            Ok(approval)
+        });
+        let approval = match admitted {
+            Ok(approval) => approval,
+            Err(e) => {
+                let res = Err(e);
+                self.finish(None, &call, &res, t0.elapsed().as_millis() as u64)?;
+                return res;
             },
+        };
+        let intent = self.begin(&call, approval)?;
+        let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
+        let mut res = match self.supervisor.remaining() {
+            Some(remaining) => tokio::time::timeout(remaining, f(intent)).await
+                .unwrap_or_else(|_| Err(unknown("absolute run deadline interrupted this effect; it may have acted"))),
+            None => f(intent).await,
         };
         if let Ok(Ret::Sh {operation_id,..}) = &mut res { *operation_id = intent; }
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
@@ -326,7 +339,7 @@ mod tests {
         let (fx, dir) = effects("queued");
         let lua = Lua::new();
         let permit = fx.supervisor.mutations.clone().acquire_owned().await.unwrap();
-        let id = fx.supervisor.intent(Tool::McpCall, Class::External, &json!({}), "hash", 0, &fx.principal).unwrap();
+        let id = fx.supervisor.intent(Tool::McpCall, Class::External, &json!({}), "hash", 0, &fx.principal, "auto").unwrap();
         let executed = std::cell::Cell::new(false);
         let queued = fx.run(&lua, Tool::Sh, Class::LocalWrite, json!({}), || async {
             executed.set(true);
@@ -343,6 +356,32 @@ mod tests {
         assert!(queued.await.is_err());
         assert!(!executed.get());
         assert!(fx.sync(&lua, Tool::Read, Class::Read, json!({}), |_| Ok(Ret::Num(0.0))).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn approval_is_asked_before_the_intent_is_journaled() {
+        let dir = std::env::temp_dir().join(format!("hx-effects-approve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = Policy::new(&dir, false, Some(crate::policy::ApprovalMode::Deny), None, None).unwrap();
+        let fx = Effects::new(Arc::new(pol), 0, Arc::default());
+        let lua = Lua::new();
+        let executed = std::cell::Cell::new(false);
+        let refused = fx.run_approved(&lua, Tool::Sh, Class::External, json!({"cmd": "git push"}), Request::Shell("git push"), || async {
+            executed.set(true);
+            Ok(Ret::Num(1.0))
+        }).await;
+        assert!(refused.is_err_and(|e| e.to_string().contains("approval_required")) && !executed.get());
+        let records = crate::eventlog::load(&fx.log().path).unwrap();
+        assert!(!records.iter().any(|r| r["kind"] == "intent"), "a refusal journals no intent");
+        assert!(records.iter().any(|r| r["kind"] == "call" && r["denied"] == true && r["class"] == "external"), "the refusal has a receipt");
+        assert!(fx.supervisor.uncertain_operations().is_empty() && crate::eventlog::verify(&fx.log().path).unwrap().unknown.is_empty());
+        // An effect that was approved names who approved it on its intent.
+        fx.run_approved(&lua, Tool::Sh, Class::LocalWrite, json!({"cmd": "true"}), Request::Shell("true"), || async { Ok(Ret::Num(0.0)) }).await.unwrap();
+        let records = crate::eventlog::load(&fx.log().path).unwrap();
+        assert_eq!(records.iter().filter(|r| r["kind"] == "intent").map(|r| r["approval"].clone()).collect::<Vec<_>>(), [json!("not-required")]);
+        drop(fx);
         let _ = std::fs::remove_dir_all(dir);
     }
 

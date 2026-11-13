@@ -319,24 +319,27 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
                 request = request.header(&spec.header, header);
             }
             let class = if spec.read_only { Class::Read } else { Class::External };
-            let ret = fx.run(&lua, Tool::Http, class, json!({"namespace":namespace, "endpoint":endpoint, "arguments":orig_args}), || async {
-                let label = format!("http {namespace}.{endpoint}");
-                fx.pol.approve(&label, class).await.map_err(|e| mlua::Error::runtime(format!("approval_required: {e}")))?;
-                let mut response = request.send().await.map_err(|e| unusable(class, format!("HTTP transport failed: {}", e.without_url())))?;
+            let (label, shown) = (format!("http {namespace}.{endpoint}"), orig_args.to_string());
+            let approval = crate::policy::Request::Tool { name: &label, args: &shown };
+            let ret = fx.run_approved(&lua, Tool::Http, class, json!({"namespace":namespace, "endpoint":endpoint, "arguments":orig_args}), approval, || async {
+                // A connection that was never made sent nothing: a definite failure, not an uncertain one.
+                let mut response = request.send().await.map_err(|e| {
+                    let unsent = e.is_connect() || e.is_builder();
+                    let message = format!("HTTP transport failed: {}", e.without_url());
+                    if unsent { mlua::Error::runtime(message) } else { unusable(class, message) }
+                })?;
                 let status = response.status();
                 let mut body = Vec::new();
                 while let Some(chunk) = response.chunk().await.map_err(|_| unusable(class, "HTTP response interrupted"))? {
                     if body.len() + chunk.len() > HTTP_MAX_BODY { return Err(unusable(class, format!("HTTP response exceeds {} MiB", HTTP_MAX_BODY >> 20))); }
                     body.extend_from_slice(&chunk);
                 }
+                // Redact the raw bytes first, so a key inside a body that is returned as base64 is caught too.
+                if let Some(key) = &key { body = redact_bytes(body, key); }
                 let text = String::from_utf8_lossy(&body);
                 if !status.is_success() {
-                    let mut excerpt = text.into_owned();
-                    if let Some(key) = &key {
-                        let encoded = serde_json::to_string(key).map_err(mlua::Error::external)?;
-                        excerpt = excerpt.replace(&encoded[1..encoded.len()-1], "[redacted]").replace(key, "[redacted]");
-                    }
-                    let message = format!("HTTP {}: {}", status.as_u16(), excerpt.chars().take(1000).collect::<String>());
+                    let message = format!("HTTP {}: {}", status.as_u16(), text.chars().take(1000).collect::<String>());
+                    // A 4xx is the server refusing the request; a 5xx (often a gateway timing out) may follow the action.
                     return Err(if status.is_client_error() { mlua::Error::runtime(message) } else { unusable(class, message) });
                 }
                 // Raw bodies cross the data boundary as UTF-8 text, or base64 for media and non-UTF-8 bytes.
@@ -363,6 +366,22 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
 // A mutation with an unreadable response may have happened. Keep its intent open for owner reconciliation.
 fn unusable(class: Class, message: impl AsRef<str>) -> mlua::Error {
     if class == Class::Read { mlua::Error::runtime(message.as_ref()) } else { crate::effects::unknown(message.as_ref()) }
+}
+
+/// Replace the key, and its JSON-escaped form, in raw response bytes.
+fn redact_bytes(body: Vec<u8>, key: &str) -> Vec<u8> {
+    let escaped = serde_json::to_string(key).unwrap_or_default();
+    let mut body = body;
+    for needle in [key.as_bytes(), escaped.as_bytes().get(1..escaped.len().saturating_sub(1)).unwrap_or_default()] {
+        if needle.is_empty() { continue; }
+        let mut out = Vec::with_capacity(body.len());
+        let mut i = 0;
+        while i < body.len() {
+            if body[i..].starts_with(needle) { out.extend_from_slice(b"[redacted]"); i += needle.len(); } else { out.push(body[i]); i += 1; }
+        }
+        body = out;
+    }
+    body
 }
 
 fn redact(value: &mut serde_json::Value, key: &str) {
@@ -432,6 +451,14 @@ mod tests {
         template("https://openrouter.ai/videos/{job_id}").unwrap().url(&mut args).unwrap();
         assert_eq!(serde_json::Value::Object(args), json!({"q": "keep"}));
         for bad in [json!({}), json!({"p": {}}), json!({"p": ".."}), json!({"p": ""})] { assert!(url("https://openrouter.ai/{p}", bad).is_err()); }
+    }
+
+    #[test]
+    fn raw_bytes_are_redacted_before_they_can_be_base64_encoded() {
+        let body = [b"\x89PNG\0".as_slice(), b"k\"ey", b"\xff", br#"{"t":"k\"ey"}"#].concat();
+        let out = redact_bytes(body, "k\"ey");
+        assert_eq!(out, [b"\x89PNG\0".as_slice(), b"[redacted]\xff", br#"{"t":"[redacted]"}"#].concat());
+        assert_eq!(redact_bytes(b"abc".to_vec(), ""), b"abc");
     }
 
     #[test]

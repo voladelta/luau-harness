@@ -52,13 +52,24 @@ local function ty(schema, depth: number): string
 	return "any"
 end
 
--- e.g.  mcp.demo.add{ a: number, b: number }
-function M.sig(server: string, tool): string
+-- At most n characters of s, cut on a character boundary (a split UTF-8 sequence would make the prompt invalid).
+local function clip(s: string, n: number): string
+	local cut = utf8.offset(s, n + 1)
+	return if cut then s:sub(1, cut - 1) else s
+end
+
+-- How the model reaches a key: `.key` when it is an identifier, else `["key"]`.
+local function path(key: string): string
+	return if key:match("^[%a_][%w_]*$") then "." .. key else "[" .. string.format("%q", key) .. "]"
+end
+
+-- e.g.  mcp.demo.add{ a: number, b: number }. `key` is the binding the tool got (its safe name unless that collided).
+function M.sig(server: string, tool, key: string?): string
 	local args = ty(tool.inputSchema or { type = "object" }, 0)
 	if args == "table" or args == "{  }" then
 		args = ""
 	end
-	return "mcp." .. safe(server) .. "." .. safe(tool.name) .. "{" .. (args:match("^{ (.*) }$") or args) .. "}"
+	return "mcp" .. path(safe(server)) .. path(key or safe(tool.name)) .. "{" .. (args:match("^{ (.*) }$") or args) .. "}"
 end
 
 -- tools/call result -> a Luau value: text when it is one text block, otherwise the content table; errors raise.
@@ -89,21 +100,49 @@ function M.install(ctx)
 	local mcp = {}
 	local lines = {}
 	for _, server in servers do
-		local ok, tools = pcall(__mcp_list, server)
-		if not ok then
-			hx.log("mcp server " .. server .. " unavailable: " .. tostring(tools))
+		-- Names that differ only in characters `safe` replaces would overwrite each other: the first keeps the name.
+		if mcp[safe(server)] ~= nil then
+			hx.log("mcp server " .. server .. " skipped: its name collides with another server's as " .. safe(server))
 			continue
 		end
+		local ok, listed = pcall(__mcp_list, server)
+		if not ok then
+			hx.log("mcp server " .. server .. " unavailable: " .. tostring(listed))
+			continue
+		end
+		if listed.truncated then
+			hx.log("mcp server " .. server .. " lists more tools than hx follows; only the first " .. #listed.tools .. " are bound")
+		end
 		local bound = {}
-		for _, tool in tools do
+		local keys = {}
+		for _, tool in listed.tools do
+			if type(tool.name) ~= "string" or bound[tool.name] ~= nil then
+				hx.log("mcp server " .. server .. ": skipped a tool with a missing or repeated name " .. tostring(tool.name))
+				continue
+			end
 			local label = server .. "." .. tool.name
-			local fn = function(args)
+			bound[tool.name] = function(args)
 				return M.unwrap(__mcp_call(server, tool.name, args or {}), label)
 			end
-			bound[safe(tool.name)] = fn
-			bound[tool.name] = fn
-			local desc = (tool.description or ""):match("^[^\n]*") :: string
-			table.insert(lines, "- " .. M.sig(server, tool) .. (if desc ~= "" then "  -- " .. desc:sub(1, 120) else ""))
+			keys[tool] = tool.name
+		end
+		for _, tool in listed.tools do
+			local key = keys[tool]
+			local alias = if key then safe(key) else nil
+			if alias and alias ~= key then
+				if bound[alias] == nil then
+					bound[alias] = bound[key]
+					keys[tool] = alias
+				else
+					hx.log("mcp tool " .. server .. "." .. key .. " is reachable only as mcp." .. safe(server) .. '["' .. key .. '"]: ' .. alias .. " is another tool's name")
+				end
+			end
+		end
+		for _, tool in listed.tools do
+			if keys[tool] then
+				local desc = (tool.description or ""):match("^[^\n]*") :: string
+				table.insert(lines, "- " .. M.sig(server, tool, keys[tool]) .. (if desc ~= "" then "  -- " .. clip(desc, 120) else ""))
+			end
 		end
 		mcp[safe(server)] = bound
 	end

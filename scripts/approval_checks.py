@@ -227,6 +227,26 @@ class Approvals(unittest.TestCase):
         self.assertNotIn("[approval needed]", out)
         self.assertIn("approved", out)
 
+    def verify_no_uncertainty(self):
+        log, = (self.ws / ".harness/log").glob("*.jsonl")
+        result = self.headless(["log", "verify", str(log)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse([r for r in harness.records(log) if r["kind"] == "intent" and r["tool"] == "sh"])
+
+    def test_interrupt_at_a_command_approval_leaves_no_uncertain_operation(self):
+        # Ctrl-C at the prompt: the command was never dispatched, so resume must not wait for `hx recover`.
+        status, out = terminal(self.command('print(sh("echo approved || git push").stdout)'), ["\x03"])
+        self.assertEqual(status, 130, out)
+        self.assertEqual(out.count("[approval needed]"), 1, out)
+        self.verify_no_uncertainty()
+
+    def test_deadline_at_a_command_approval_is_a_definite_refusal(self):
+        code = 'print(pcall(sh, "echo approved || git push"))'
+        with harness.provider(lambda body, i: harness.tool(code)) as (url, _):
+            status, out = terminal(self.run_args(url, "Wait for approval", "--max-wall", "0.5"))
+        self.assertIn("[approval needed]", out)
+        self.verify_no_uncertainty()
+
     def test_yes_keeps_the_scrubbed_environment(self):
         for flags in ((), ("--yes",)):
             result = self.headless(self.command('print(sh("env").stdout)', *flags))

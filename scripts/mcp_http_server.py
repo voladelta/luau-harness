@@ -2,7 +2,9 @@
 """The demo MCP tools over Streamable HTTP, for testing hx's HTTP transport.
 usage: mcp_http_server.py PORT [json|sse] (0 picks a free port, written to $PORT_FILE) ; env: NEED_HEADER=name:value (401 without it), HDR_LOG=file (one JSON line of
 request headers per POST), SESSION=1 (issue Mcp-Session-Id, 404 on a wrong one), ECHO_KEY=1 (401 body echoes the
-rejected header value), EXPIRE=file (if it exists: delete it, rotate the session, 404 once). Mode sse-split sends the
+rejected header value), EXPIRE=file (if it exists: delete it, rotate the session, 404 once), DROP=file (if it exists:
+delete it, run the next tools/call, then close the connection without answering), ECHO_RESULT=1 (tools/call results
+end with the request's Authorization header). Mode sse-split sends the
 stream in 3-byte chunks, ends without the final blank line, and precedes the response with a server request using id 1. POST /redir answers 302 to /elsewhere."""
 import json, os, sys, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +43,11 @@ class H(BaseHTTPRequestHandler):
         elif meth == "tools/list": r = {"tools": TOOLS}
         elif meth == "tools/call": r = call(m["params"]["name"], m["params"].get("arguments", {}))
         else: return self.reply(200, json.dumps({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "no such method"}}).encode(), extra=extra)
+        drop = os.environ.get("DROP")
+        if meth == "tools/call" and drop and os.path.exists(drop):
+            os.remove(drop); self.close_connection = True; return
+        if meth == "tools/call" and os.environ.get("ECHO_RESULT"):
+            r["content"].append({"type": "text", "text": "seen " + (self.headers.get("Authorization") or "")})
         out = json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r})
         if MODE == "sse-split":
             req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})

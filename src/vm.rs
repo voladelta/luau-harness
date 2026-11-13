@@ -427,9 +427,21 @@ impl Vm {
             g.set("__mcp_list", lua.create_async_function(move |lua, server: String| {
                 let (fx, m) = (lfx.clone(), lm.clone());
                 async move {
+                    // Follows `nextCursor` up to a page cap; `truncated` says the server had more.
                     let ret = fx.run(&lua, crate::supervisor::Tool::McpList, Class::Read, json!({"server": server}), || async {
-                        let r = m.request(&server, "tools/list", json!({})).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
-                        Ok(Ret::Json(r["tools"].clone()))
+                        let (mut tools, mut cursor, mut truncated) = (vec![], None::<String>, false);
+                        for page in 0..crate::mcp::MAX_LIST_PAGES {
+                            let params = match &cursor { Some(c) => json!({"cursor": c}), None => json!({}) };
+                            let r = m.request(&server, "tools/list", params).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                            tools.extend(r["tools"].as_array().cloned().unwrap_or_default());
+                            match r["nextCursor"].as_str().filter(|c| !c.is_empty()) {
+                                Some(next) if cursor.as_deref() != Some(next) => cursor = Some(next.to_string()),
+                                Some(_) => break, // a server repeating its cursor would loop forever
+                                None => break,
+                            }
+                            truncated = page + 1 == crate::mcp::MAX_LIST_PAGES;
+                        }
+                        Ok(Ret::Json(json!({"tools": tools, "truncated": truncated})))
                     }).await?;
                     prims::json_value(&lua, ret)
                 }
@@ -442,13 +454,14 @@ impl Vm {
                     let class = if m.is_read_only(&server, &tool) { Class::Read } else { Class::External };
                     let text = args_json.to_string();
                     let a = json!({"server": server, "tool": tool, "args": args_json});
-                    let ret = fx.run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
-                        let cmd = format!("mcp {server}.{tool} {}", text.chars().take(500).collect::<String>());
-                        if let Err(why) = fx.pol.approve(&cmd, class).await {
-                            return Err(mlua::Error::runtime(format!("approval_required: {why}")));
-                        }
+                    // Approved by identity (`mcp server.tool`); the arguments are shown to the owner, never matched.
+                    let name = format!("mcp {server}.{tool}");
+                    let request = crate::policy::Request::Tool { name: &name, args: &text };
+                    let ret = fx.run_approved(&lua, crate::supervisor::Tool::McpCall, class, a, request, || async {
                         let r = m.request(&server, "tools/call", json!({"name": tool, "arguments": args_json})).await
-                            .map_err(|e| if class == Class::Read { mlua::Error::runtime(e.to_string()) } else { crate::effects::unknown(format!("MCP request failed; the server may have acted: {e}")) })?;
+                            .map_err(|e| if class != Class::Read && crate::mcp::may_have_acted(&e) {
+                                crate::effects::unknown(format!("MCP request failed; the server may have acted: {e}"))
+                            } else { mlua::Error::runtime(e.to_string()) })?;
                         Ok(Ret::Json(r))
                     }).await?;
                     prims::json_value(&lua, ret)

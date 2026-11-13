@@ -75,7 +75,7 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Runs created before per-run approvals, or before shell outcomes recorded their approval source, use an older journal format; start a new run with this version.
+Runs created before per-run approvals, or before intents recorded their approval source, use an older journal format; start a new run with this version.
 
 Interrupted local `write`/`edit` settle themselves from the evidence. Interrupted shell commands require owner reconciliation. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
 

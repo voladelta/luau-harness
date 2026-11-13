@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Custom tool registration, transport, trust and recovery checks. No live API keys."""
+import base64
 import http.server
 import json
 import os
@@ -63,6 +64,9 @@ class API(http.server.BaseHTTPRequestHandler):
         if url.path == "/invalid":
             self.wfile.write(b"not json")
             return
+        if url.path == "/media":  # served as JSON above, but the tool is raw: binary bytes echoing the key
+            self.wfile.write(b"\x89PNG\r\n\x1a\n\xff" + (key or "").encode() + b"\xfe")
+            return
         self.wfile.write(json.dumps({"results": [{"title": "example", "text": "page"}],
                                     "errors": [{"url": "https://bad.test", "error": "timeout"}],
                                     "query": parse_qs(url.query), "body": body, "echo": key}).encode())
@@ -101,10 +105,12 @@ class Tools(unittest.TestCase):
     def run_code(self, *code, env=None):
         return self.command("exec", *code, env=env)
 
-    def tool(self, name="probe", path="/search", read_only=True, secret=None):
-        spec = {"url": self.base + path, "method": "GET", "header": "X-API-Key", "read_only": read_only}
+    def tool(self, name="probe", path="/search", read_only=True, secret=None, raw=False, base=None):
+        spec = {"url": (base or self.base) + path, "method": "GET", "header": "X-API-Key", "read_only": read_only}
         if secret:
             spec["secret"] = secret
+        if raw:
+            spec["raw"] = True
         fields = ",".join(k + "=" + (str(v).lower() if isinstance(v, bool) else json.dumps(v)) for k, v in spec.items())
         source = 'return {http={get={' + fields + '}},tools={get={signature="get(args: table): table",description="mock get",run=function(args) return http("get",args) end}}}'
         (self.dir / f"{name}.lua").write_text(source)
@@ -302,6 +308,29 @@ class Tools(unittest.TestCase):
         out = self.run_code('print(probe.get{}.echo)', env=env)
         self.assertIn("[redacted]", out)
         self.assertNotIn("quoted", out)
+
+    def test_credential_in_a_base64_body_is_redacted(self):
+        self.tool(path="/media", secret="TINYFISH_API_KEY", raw=True)
+        env = dict(self.env, TINYFISH_API_KEY="binary-echo-key")
+        out = self.run_code('local r = probe.get{}; print(r.media_type, r.base64)', env=env)
+        media_type, encoded = out.splitlines()[0].split("\t")
+        self.assertEqual(media_type, "application/json")
+        self.assertIn(b"[redacted]", base64.b64decode(encoded))
+        for path in (self.ws / ".harness/log").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"binary-echo-key", path.read_bytes(), str(path))
+
+    def test_a_request_that_never_connected_is_a_definite_failure(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            closed = f"http://127.0.0.1:{s.getsockname()[1]}"
+        self.tool(path="/x", read_only=False, base=closed)
+        (self.ws / ".harness/policy.toml").write_text('[approval]\nallow=["http probe.get"]\n')
+        out = self.run_code('print(pcall(probe.get,{})); print(pcall(write,"after.txt","ok"))')
+        self.assertIn("HTTP transport failed", out)
+        self.assertNotIn("unknown_outcome", out)
+        self.assertTrue((self.ws / "after.txt").exists(), out)
 
     def test_unreadable_external_response_remains_uncertain(self):
         self.tool(path="/invalid", read_only=False)

@@ -197,15 +197,14 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             let pol = f.pol.clone();
             let class = pol.classify_sh(&cmd);
             let args = json!({"cmd": &cmd, "cwd": opt_str(&opts, "cwd"), "timeout": opt_num(&opts, "timeout")});
-            let ret = f.run(&lua, crate::supervisor::Tool::Sh, class, args, || async {
-                let approval = pol.approve(&cmd, class).await.map_err(|why| rt(format!("approval_required: {why}")))?;
+            let ret = f.run_approved(&lua, crate::supervisor::Tool::Sh, class, args, crate::policy::Request::Shell(&cmd), || async {
                 let secs = opt_num(&opts, "timeout").unwrap_or(SH_TIMEOUT).clamp(1.0, SH_TIMEOUT_MAX);
                 let cwd = match opt_str(&opts, "cwd") {
                     Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
                 let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol)?, &cmd, cwd, secs).await?;
-                Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None, approval })
+                Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id: None })
             }).await?;
             match ret {
                 Ret::Sh { stdout, stderr, code, timed_out, truncated, operation_id, .. } => {
@@ -402,48 +401,80 @@ pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::
     let mut child = command.spawn().map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
     let group = child.id().map(|p| GroupKill::new(p as i32)); // killpg on drop: also covers cancellation
     let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-    /// The whole stream, or its first and last MAX_CAPTURE / 2 bytes around a marker (the end is where a failing
-    /// test or build says why); reads to EOF so the child never blocks on a full pipe.
-    async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R) -> (Vec<u8>, bool) {
-        let half = MAX_CAPTURE / 2;
-        let (mut head, mut tail, mut total) = (Vec::new(), Vec::new(), 0usize);
+    /// Reads to EOF so the child never blocks on a full pipe. The capture is shared, so what was read survives a reader
+    /// abandoned because a daemonized descendant still holds the pipe.
+    async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R, into: Arc<std::sync::Mutex<Capture>>) {
         let mut chunk = vec![0u8; 64 * 1024];
         while let Ok(n) = s.read(&mut chunk).await {
             if n == 0 { break }
-            total += n;
-            let take = n.min(half - head.len());
-            head.extend_from_slice(&chunk[..take]);
-            tail.extend_from_slice(&chunk[take..n]);
-            if tail.len() > 2 * half { tail.drain(..tail.len() - half); }
+            into.lock().unwrap().push(&chunk[..n]);
         }
-        if total <= MAX_CAPTURE { head.append(&mut tail); return (head, false) }
-        let omitted = total - head.len() - half;
-        head.extend_from_slice(format!("\n…[hx: {omitted} bytes omitted from the middle of this output]…\n").as_bytes());
-        head.extend_from_slice(&tail[tail.len() - half..]);
-        (head, true)
     }
-    let (out_h, err_h) = (tokio::spawn(drain(out)), tokio::spawn(drain(err)));
+    let (cap_out, cap_err) = (Arc::new(std::sync::Mutex::new(Capture::default())), Arc::new(std::sync::Mutex::new(Capture::default())));
+    let (out_h, err_h) = (tokio::spawn(drain(out, cap_out.clone())), tokio::spawn(drain(err, cap_err.clone())));
     let (status, timed_out) = match tokio::time::timeout(Duration::from_secs_f64(secs), child.wait()).await {
         Ok(st) => (st.ok().and_then(|s| s.code()), false),
         Err(_) => (None, true),
     };
-    // The command is over: kill stragglers and background jobs now. That also closes the pipes they held,
-    // so the readers finish; whatever was printed before a timeout is kept.
+    // The command is over: kill stragglers and background jobs now. That also closes the pipes they held, so the
+    // readers finish; whatever was printed before a timeout is kept. A descendant that left the process group
+    // (`setsid cmd &`) survives and can keep a pipe open: after one shared grace period the stream is cut, keeping
+    // what was read, and says so.
     drop(group);
-    let grace = Duration::from_secs(2);
-    let (so, cut_out) = tokio::time::timeout(grace, out_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-    let (se, cut_err) = tokio::time::timeout(grace, err_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-    Ok((so, se, status.map(i64::from), timed_out, cut_out || cut_err))
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut cut_open = false;
+    for (mut handle, capture) in [(out_h, &cap_out), (err_h, &cap_err)] {
+        if tokio::time::timeout_at(until, &mut handle).await.is_err() {
+            handle.abort(); // closes this end of the pipe
+            capture.lock().unwrap().held_open = true;
+            cut_open = true;
+        }
+    }
+    let ((so, cut_out), (se, cut_err)) = (cap_out.lock().unwrap().take(), cap_err.lock().unwrap().take());
+    Ok((so, se, status.map(i64::from), timed_out, cut_out || cut_err || cut_open))
 }
 
-/// Processes currently owned by this user (the baseline for the fork-bomb cap).
+/// One captured stream: the whole of it, or its first and last MAX_CAPTURE / 2 bytes (the end is where a failing test
+/// or build says why).
+#[derive(Default)]
+struct Capture { head: Vec<u8>, tail: Vec<u8>, total: usize, held_open: bool }
+
+impl Capture {
+    fn push(&mut self, bytes: &[u8]) {
+        let half = MAX_CAPTURE / 2;
+        self.total += bytes.len();
+        let take = bytes.len().min(half - self.head.len());
+        self.head.extend_from_slice(&bytes[..take]);
+        self.tail.extend_from_slice(&bytes[take..]);
+        if self.tail.len() > 2 * half { self.tail.drain(..self.tail.len() - half); }
+    }
+
+    /// The captured bytes with a marker where any were left out; true when something was.
+    fn take(&mut self) -> (Vec<u8>, bool) {
+        let half = MAX_CAPTURE / 2;
+        let Capture { mut head, mut tail, total, held_open } = std::mem::take(self);
+        let cut = total > MAX_CAPTURE;
+        if cut {
+            let omitted = total - head.len() - half;
+            head.extend_from_slice(format!("\n…[hx: {omitted} bytes omitted from the middle of this output]…\n").as_bytes());
+            tail.drain(..tail.len() - half);
+        }
+        head.append(&mut tail);
+        if held_open {
+            head.extend_from_slice("\n…[hx: stream cut here: a background process kept it open after the command ended]…\n".as_bytes());
+        }
+        (head, cut || held_open)
+    }
+}
+
+/// Processes currently owned by this user (the baseline for the fork-bomb cap): the /proc entries owned by the uid,
+/// read on every `sh`, so no helper process is spawned to count.
 fn user_process_count() -> u64 {
+    use std::os::unix::fs::MetadataExt;
     let uid = unsafe { libc::getuid() };
-    std::process::Command::new("/bin/ps")
-        .args(["-u", &uid.to_string(), "-o", "pid="])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() as u64)
-        .unwrap_or(500)
+    let Ok(entries) = std::fs::read_dir("/proc") else { return 500 };
+    entries.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())))
+        .filter(|e| e.metadata().is_ok_and(|m| m.uid() == uid)).count() as u64
 }
 
 /// Kills the whole process group of an `sh` command (or evaluator) when dropped.
@@ -571,6 +602,38 @@ mod prompt_limit_tests {
 }
 
 #[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_daemonized_descendant_holding_the_pipes_keeps_the_partial_capture() {
+        let env = ShellEnv { env: None, confine: None };
+        let started = std::time::Instant::now();
+        let (so, se, code, timed_out, cut) = shell(&env, "echo before; setsid sleep 5 & sleep .3; echo after", std::env::temp_dir(), 10.0).await.unwrap();
+        let so = String::from_utf8(so).unwrap();
+        assert!(so.starts_with("before\nafter\n") && so.contains("a background process kept it open"), "{so}");
+        assert!(String::from_utf8_lossy(&se).contains("a background process kept it open"));
+        assert_eq!((code, timed_out, cut), (Some(0), false, true));
+        assert!(started.elapsed() < Duration::from_secs(4), "one shared grace period: {:?}", started.elapsed());
+        let (so, _, _, _, cut) = shell(&env, "echo plain", std::env::temp_dir(), 10.0).await.unwrap();
+        assert_eq!((so.as_slice(), cut), (&b"plain\n"[..], false));
+    }
+
+    #[test]
+    fn user_processes_are_counted_from_proc() {
+        // This process is one of them; a failure to read /proc would fall back to 500.
+        if std::path::Path::new(&format!("/proc/{}", std::process::id())).exists() {
+            let before = user_process_count();
+            let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+            let during = user_process_count();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(before >= 1 && during > before.saturating_sub(5), "{before} {during}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod receipt_tests {
     use super::*;
 
@@ -593,8 +656,7 @@ mod receipt_tests {
         let intents: Vec<_> = records.iter().filter(|r| r["kind"] == "intent" && r["tool"] == "sh").collect();
         assert_eq!(intents.len(), 2);
         assert_ne!(intents[0]["args_sha"], intents[1]["args_sha"], "full command suffix participates in operation identity");
-        let outcomes: Vec<_> = records.iter().filter(|r| r["kind"] == "outcome" && r["ret"]["t"] == "sh").collect();
-        assert!(outcomes.len() == 2 && outcomes.iter().all(|r| r["approval"] == "not-required"), "each shell outcome records who approved it");
+        assert!(intents.iter().all(|r| r["approval"] == "not-required"), "each shell intent records who approved it");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

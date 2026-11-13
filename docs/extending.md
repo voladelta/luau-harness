@@ -77,7 +77,7 @@ HTTP tools declare named, fixed endpoints in `http`, then call `http("endpoint",
 | `header` | `Authorization` | Header the secret is sent in, verbatim |
 | `bearer` | `false` | Send `Bearer <secret>` (store the bare token) |
 | `raw` | `false` | Return `{text, media_type}` for UTF-8 bodies or `{base64, media_type}` for audio, image, video and other bytes, instead of decoded JSON |
-| `read_only` | `false` | Mark only endpoints that read data; others go through the approval gate, matched as `http NAMESPACE.ENDPOINT` |
+| `read_only` | `false` | Mark only endpoints that read data; others go through the approval gate, matched as `http NAMESPACE.ENDPOINT` (or `http NAMESPACE.*`) |
 
 Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose bytes can go straight to `write`.
 
@@ -85,7 +85,8 @@ Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose byte
 - Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects.
 - Endpoint declarations grant access to those URLs; the environment running hx controls network access.
 - HTTP calls use the supervisor's authorization, run deadline and journal.
-- Credentials are attached by Rust and never returned to tool code or saved in the run manifest. Credentials echoed in responses are redacted before journaling.
+- Credentials are attached by Rust and never returned to tool code or saved in the run manifest. A credential echoed in a response (raw bytes, its JSON-escaped form, or a decoded string or key) is redacted before the result is returned or journaled; one the server transforms otherwise (encoded, hashed, split) is not recognized.
+- A request that never connected, or a 4xx, is an ordinary error; a lost or unreadable response or a 5xx from a non-read-only endpoint leaves the operation uncertain until `hx recover`.
 
 ### Credentials
 
