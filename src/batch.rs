@@ -45,7 +45,9 @@ pub async fn run(lua: &Lua, fx: Arc<Effects>, host: Option<Arc<Host>>, ops: Arc<
                     let args = json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": options.max_turns, "model": options.model, "effort": options.effort});
                     let mut report = None;
                     let slot = &mut report;
-                    fx.run(&lua, Tool::Agent, Class::LocalWrite, args, move || async move {
+                    // A batch agent is read-only, so it is a read: receipted as a `call`, and still admitted while an
+                    // uncertain mutation awaits the owner, when inspection is what the recovery notice asks for.
+                    fx.run(&lua, Tool::Agent, Class::Read, args, move || async move {
                         child.log(&format!("### SUBAGENT (depth {}, model {}, effort {}, batch)\n{task}", child.depth, child.llm.model, child.llm.reasoning.as_deref().unwrap_or("default")));
                         let rep = child.run_task(task, options.max_turns).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
                         let ret = Ret::Agent { answer: rep["final_answer"].as_str().unwrap_or("").to_string(), finished: rep["finished"].as_bool().unwrap_or(false), turns: rep["turns"].as_u64().unwrap_or(0) };

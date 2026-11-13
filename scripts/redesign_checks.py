@@ -295,10 +295,10 @@ assert(not pcall(tools.writer.run)); print("READONLY_OK")'''
         assert report["finished"] and report["luau_errors"] == 0 and report["llm_calls"] == 6, report
         assert not (path / "escape.txt").exists()
         assert len(calls) == 6
-        # batch agents record the same intent and receipt as agent()
+        # batch agents are read-only: each leaves a read receipt (`call`), never an intent an interruption could leave open
         log = records(journal(path))
-        intents = [r["seq"] for r in log if r["kind"] == "intent" and r["tool"] == "agent"]
-        assert len(intents) == 2 and sorted(r["of"] for r in log if r["kind"] == "outcome" and r["of"] in intents) == intents, log
+        assert not [r for r in log if r["kind"] == "intent" and r["tool"] == "agent"], log
+        assert len([r for r in log if r["kind"] == "call" and r["tool"] == "agent" and r["ok"]]) == 2, log
     path = workspace("concurrent-budget")
     with provider(lambda body, i: tool(parent_code) if i == 0 else (time.sleep(0.15) or tool('print("child")'))) as (url, calls):
         report = json.loads(start(path, url, "--max-tokens", "30").stdout)
