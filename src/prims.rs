@@ -684,10 +684,14 @@ impl Drop for Child {
     }
 }
 
-/// Kill every running command's process group, ask every child run to stop, and exit.
+/// Kill every running command's process group, ask every child run to stop, end the live policies' sessions (journal
+/// record, private temp directory) and exit. Exiting here runs no destructors, so everything that must not outlive
+/// hx is registered where this can reach it.
 pub fn stop(code: i32) -> ! {
+    // SAFETY: killpg(2) and kill(2) take plain integers and have no memory-safety preconditions.
     for group in GROUPS.lock().unwrap().iter() { unsafe { libc::killpg(*group, libc::SIGKILL) }; }
     for child in CHILDREN.lock().unwrap().iter() { unsafe { libc::kill(*child, libc::SIGTERM) }; }
+    crate::policy::end_live_sessions();
     std::process::exit(code)
 }
 

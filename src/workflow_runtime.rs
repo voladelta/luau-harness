@@ -604,16 +604,16 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
             old["decision"] == decision && old["content_blob"] == json!(content_blob),
             "conflicting decision already recorded"
         );
-        println!(
+        outln!(
             "{}",
             json!({"recorded":true,"duplicate":true,"gate_id":gate_id})
-        );
+        )?;
         return Ok(());
     }
     log.write("owner_decision",json!({"gate_id":gate_id,"decision":decision,"content_blob":content_blob,"artifacts":request.artifacts}),true)?;
-    println!(
+    outln!(
         "{}",
         json!({"recorded":true,"gate_id":gate_id,"next_command":format!("hx run --resume {}",path.display())})
-    );
+    )?;
     Ok(())
 }

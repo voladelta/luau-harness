@@ -1,6 +1,17 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("hx supports Linux only");
 
+/// `print!` that returns `Result` instead of panicking: see `write_stdout`. Defined before the modules so they can use
+/// it too.
+macro_rules! out {
+    ($($arg:tt)*) => { $crate::write_stdout(format_args!($($arg)*)) };
+}
+
+/// `println!` that returns `Result` instead of panicking: see `write_stdout`.
+macro_rules! outln {
+    ($($arg:tt)*) => { $crate::write_stdout(format_args!("{}\n", format_args!($($arg)*))) };
+}
+
 mod ar;
 mod atomic_file;
 mod confine;
@@ -25,7 +36,7 @@ mod tools;
 mod workflow;
 mod workflow_runtime;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -262,8 +273,31 @@ fn confirm(question: &str) -> Result<()> {
     Ok(())
 }
 
+/// stdout was closed by its reader (`hx run ... | head -1`): hx stops writing and exits quietly.
+#[derive(Debug)]
+struct ClosedStdout;
+impl std::fmt::Display for ClosedStdout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("stdout is closed") }
+}
+impl std::error::Error for ClosedStdout {}
+
+/// The exit status after stdout was closed: what a process killed by SIGPIPE reports to its shell. hx keeps SIGPIPE
+/// ignored (Rust's default) because it writes to child pipes, such as an MCP server's stdin, that may close.
+const CLOSED_STDOUT_STATUS: u8 = 128 + libc::SIGPIPE as u8;
+
+/// Write to stdout and flush, for the `out!` and `outln!` macros. A closed stdout is `ClosedStdout`, which `main`
+/// turns into a quiet exit; `print!` would panic instead, and the panic hook aborts.
+fn write_stdout(text: std::fmt::Arguments<'_>) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_fmt(text).and_then(|()| stdout.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(ClosedStdout.into()),
+        result => Ok(result.context("cannot write to stdout")?),
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     // Every panic takes the crash path, which resume already handles: an executor that panics after its intent is
     // journaled must not leave the run going with an open intent nothing treats as uncertain, which is what mlua's
     // conversion of a callback panic into a Luau error would do. (`panic = "abort"` in the profile cannot do this:
@@ -274,17 +308,26 @@ async fn main() {
         std::process::abort();
     }));
     prims::stop_on_signals();
-    if let Err(e) = real_main().await {
-        eprintln!("Error: {e}");
-        if std::env::var_os("HX_DEBUG").is_some() {
-            eprintln!("{e:?}");
-        } else if e.chain().nth(1).is_some() {
-            for c in e.chain().skip(1) {
-                eprintln!("  caused by: {c}");
-            }
-            eprintln!("(set HX_DEBUG=1 for a full trace)");
+    match real_main().await {
+        Ok(status) => status,
+        Err(e) if e.is::<ClosedStdout>() => std::process::ExitCode::from(CLOSED_STDOUT_STATUS),
+        Err(e) => {
+            report_error(&e);
+            std::process::ExitCode::from(if e.is::<Usage>() { 2 } else { 1 })
         }
-        std::process::exit(if e.is::<Usage>() { 2 } else { 1 });
+    }
+}
+
+/// Print an error for the owner: its message, then its causes (or the full chain with HX_DEBUG).
+fn report_error(e: &anyhow::Error) {
+    eprintln!("Error: {e}");
+    if std::env::var_os("HX_DEBUG").is_some() {
+        eprintln!("{e:?}");
+    } else if e.chain().nth(1).is_some() {
+        for c in e.chain().skip(1) {
+            eprintln!("  caused by: {c}");
+        }
+        eprintln!("(set HX_DEBUG=1 for a full trace)");
     }
 }
 
@@ -361,27 +404,29 @@ fn validate_args(args: &[String]) -> Result<()> {
 }
 
 /// Top-level help, version, or `<command> --help`: printed, and the caller is done.
-fn print_info(args: &[String]) -> bool {
+fn print_info(args: &[String]) -> Result<bool> {
     match args.first().map(String::as_str) {
-        None | Some("-h" | "--help" | "help") => print!("{}", top_help()),
-        Some("-V" | "-v" | "--version" | "version") => println!("hx {}", env!("CARGO_PKG_VERSION")),
+        None | Some("-h" | "--help" | "help") => out!("{}", top_help())?,
+        Some("-V" | "-v" | "--version" | "version") => outln!("hx {}", env!("CARGO_PKG_VERSION"))?,
         Some(c) if has(args, "-h") || has(args, "--help") => match command_help(c) {
-            Some(h) => print!("{h}"),
-            None => return false,
+            Some(h) => out!("{h}")?,
+            None => return Ok(false),
         },
-        _ => return false,
+        _ => return Ok(false),
     }
-    true
+    Ok(true)
 }
 
-async fn real_main() -> Result<()> {
+/// Run the command in `std::env::args` and return its exit status. Every path returns here rather than exiting, so
+/// destructors run: a policy ends its journal session and removes its private temp directory.
+async fn real_main() -> Result<std::process::ExitCode> {
+    use std::process::ExitCode;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if print_info(&args) {
-        return Ok(());
+    if print_info(&args)? {
+        return Ok(ExitCode::SUCCESS);
     }
-    if args.first().is_some_and(|c| help_for(c).is_none()) {
-        eprintln!("Error: unknown command `{}`\n\nRun `hx --help` for usage.", args[0]);
-        std::process::exit(2);
+    if let Some(command) = args.first().filter(|c| help_for(c).is_none()) {
+        return Err(usage(&format!("unknown command `{command}`\n\nRun `hx --help` for usage.")));
     }
     validate_args(&args)?;
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
@@ -390,7 +435,7 @@ async fn real_main() -> Result<()> {
     if has(&args, "--ignore-config") { trust::ignore_config(); }
     // A resumed run uses only its frozen manifest, so workspace config edited since launch neither changes nor blocks it.
     if matches!(args[0].as_str(), "exec" | "run") && !has(&args, "--resume") { trust::require_trusted(&workspace)?; }
-    match args[0].as_str() {
+    let done = match args[0].as_str() {
         "exec" => cmd_exec(&args, mk_policy(None)?).await,
         "run" if has(&args, "--ar") => {
             confine::note();
@@ -410,34 +455,31 @@ async fn real_main() -> Result<()> {
             let path = PathBuf::from(operands(&args)?[0]);
             anyhow::ensure!(path.is_file(), "run log does not exist");
             std::fs::write(path.with_extension("revoked"), "revoked by owner\n")?;
-            println!("revoked {}", path.display());
-            Ok(())
+            outln!("revoked {}", path.display())
         },
-        "test" => cmd_test(&args, &workspace, mk_policy(None)?).await,
+        "test" => return cmd_test(&args, &workspace, mk_policy(None)?).await,
         "approve" => cmd_approve(&args, &workspace),
         "trust" => cmd_trust(&args, &workspace),
         // hx skills : agent skills on disk and their approval state
         "skills" => {
-            print!("{}", modules::Resolver::new(workspace).skills_status()?);
-            Ok(())
+            out!("{}", modules::Resolver::new(workspace).skills_status()?)
         }
         // hx staged | accept NAME [--yes] | reject NAME | rollback MODULE : the user's side of staging (nothing the agent can call does this)
         "staged" => {
             let l = modules::Resolver::new(workspace).list_staged();
-            println!("{}", if l.is_empty() { "nothing staged".to_string() } else { l.join("\n") });
-            Ok(())
+            outln!("{}", if l.is_empty() { "nothing staged".to_string() } else { l.join("\n") })
         }
         "reject" => {
             let n = operands(&args)?[0];
             modules::Resolver::new(workspace).reject(n)?;
-            println!("rejected {n}");
-            Ok(())
+            outln!("rejected {n}")
         }
         "accept" => cmd_accept(&args, &workspace),
         "rollback" => cmd_rollback(&args, &workspace),
-        "log" => cmd_log_verify(&args),
+        "log" => return cmd_log_verify(&args),
         other => unreachable!("help_for lists {other} but nothing dispatches it"),
-    }
+    };
+    done.map(|()| ExitCode::SUCCESS)
 }
 
 /// hx exec --workspace DIR 'chunk1' 'chunk2' : run chunks in one session (no API key needed; used for testing)
@@ -448,7 +490,7 @@ async fn cmd_exec(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
     vm.install_packs(&packs).await?;
     // The chunks: every argument after the command that is not a flag or its value.
     for chunk in positionals(args) {
-        println!("{}", vm.exec_text(chunk).await?);
+        outln!("{}", vm.exec_text(chunk).await?)?;
     }
     Ok(())
 }
@@ -530,8 +572,7 @@ async fn cmd_run(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
     let task = host.supervisor.manifest.as_ref().unwrap().task.clone();
     let max_turns = host.max_turns;
     let report = host.run_task(task, max_turns).await?;
-    println!("{}", serde_json::to_string(&report)?);
-    Ok(())
+    outln!("{}", serde_json::to_string(&report)?)
 }
 
 /// hx run --ar: every flag except the program passes through to the episodes' child runs.
@@ -578,12 +619,11 @@ fn cmd_recover(args: &[String]) -> Result<()> {
     }
     if !has(args, "--yes") { confirm(&format!("Record {} for operation {id}? This is your assertion about its external state.", decision.name()))?; }
     supervisor::resolve(&log, &mut books, &records, id, decision, None)?;
-    println!("recorded {} for {id}; no operation was executed", decision.name());
-    Ok(())
+    outln!("recorded {} for {id}; no operation was executed", decision.name())
 }
 
 /// hx test PKG_DIR : run the package's tests/*.luau inside its boundary (see `modules::TestTarget`)
-async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>) -> Result<()> {
+async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>) -> Result<std::process::ExitCode> {
     let dir = PathBuf::from(operands(args)?[0]).canonicalize()?;
     let report = match modules::Resolver::new(workspace.to_path_buf()).test_target(&dir)? {
         modules::TestTarget::Harness { note } => {
@@ -602,19 +642,16 @@ async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>
             packages::run_tests(supervisor::Supervisor::ephemeral(policy, Arc::new(registry)), &name, &tests).await?
         }
     };
-    print!("{}", report.text);
-    println!("{} passed, {} failed", report.passed, report.failed);
-    if report.failed > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    out!("{}", report.text)?;
+    outln!("{} passed, {} failed", report.passed, report.failed)?;
+    Ok(if report.failed > 0 { std::process::ExitCode::FAILURE } else { std::process::ExitCode::SUCCESS })
 }
 
 /// hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
 fn cmd_approve(args: &[String], workspace: &Path) -> Result<()> {
     let pkg = operands(args)?[0];
     let rt = trust::Retrust::before(workspace);
-    println!("{}", modules::Resolver::new(workspace.to_path_buf()).approve(pkg)?);
+    outln!("{}", modules::Resolver::new(workspace.to_path_buf()).approve(pkg)?)?;
     rt.after()
 }
 
@@ -622,38 +659,35 @@ fn cmd_approve(args: &[String], workspace: &Path) -> Result<()> {
 fn cmd_trust(args: &[String], workspace: &Path) -> Result<()> {
     let files = trust::config_files(workspace);
     if files.is_empty() {
-        println!("nothing to trust: this workspace has no .harness config or hx.lock");
-        return Ok(());
+        return outln!("nothing to trust: this workspace has no .harness config or hx.lock");
     }
     let links = trust::symlinks(workspace);
     if !links.is_empty() {
         bail!("cannot trust this config: it has symlinks ({}), whose targets the trust hash does not cover; replace them with real files", links.join(", "));
     }
     for f in &files {
-        println!("===== {f}");
+        outln!("===== {f}")?;
         match std::fs::read_to_string(workspace.join(f)) {
-            Ok(t) => print!("{t}{}", if t.ends_with('\n') { "" } else { "\n" }),
-            Err(_) => println!("(binary or unreadable)"),
+            Ok(t) => out!("{t}{}", if t.ends_with('\n') { "" } else { "\n" })?,
+            Err(_) => outln!("(binary or unreadable)")?,
         }
     }
     if trust::is_trusted(workspace) && std::env::var("HX_TRUST").is_err() {
-        println!("already trusted");
-        return Ok(());
+        return outln!("already trusted");
     }
-    println!("config hash: {} (HX_TRUST={0} trusts exactly this config for one launch)", trust::config_hash(workspace).unwrap_or_default());
+    outln!("config hash: {} (HX_TRUST={0} trusts exactly this config for one launch)", trust::config_hash(workspace).unwrap_or_default())?;
     if !has(args, "--yes") {
         confirm("trust this config? hx will apply it (file-tool policy, MCP servers, packages, skills, overrides)")?;
     }
     let h = trust::record(workspace)?.unwrap_or_default();
-    println!("trusted {} ({h})", workspace.display());
-    Ok(())
+    outln!("trusted {} ({h})", workspace.display())
 }
 
 /// hx rollback MODULE : undo the last accepted replacement of a harness module
 fn cmd_rollback(args: &[String], workspace: &Path) -> Result<()> {
     let module = operands(args)?[0];
     let rt = trust::Retrust::before(workspace);
-    println!("{}", modules::Resolver::new(workspace.to_path_buf()).rollback(module)?);
+    outln!("{}", modules::Resolver::new(workspace.to_path_buf()).rollback(module)?)?;
     rt.after()
 }
 
@@ -662,49 +696,43 @@ fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
     let n = operands(args)?[0];
     let r = modules::Resolver::new(workspace.to_path_buf());
     let review = r.review(n)?;
-    println!("{}", review.text);
+    outln!("{}", review.text)?;
     if !has(args, "--yes") {
         confirm(&review.question())?;
     }
     let rt = trust::Retrust::before(workspace);
-    println!("{}", r.accept(review)?);
+    outln!("{}", r.accept(review)?)?;
     rt.after()
 }
 
 /// hx log verify FILE : check the keyed chain, the referenced blobs and the accounting, and list effects with an unknown
 /// outcome (exit 1 damaged, 3 unknown)
-fn cmd_log_verify(args: &[String]) -> Result<()> {
+fn cmd_log_verify(args: &[String]) -> Result<std::process::ExitCode> {
     let f = PathBuf::from(operands(args)?[1]);
     let r = eventlog::verify(&f)?;
     match &r.broken {
-        None => println!("{} records, hash chain intact", r.records),
-        Some((line, why)) => println!("{} records, hash chain BROKEN at line {line}: {why}", r.records),
+        None => outln!("{} records, hash chain intact", r.records)?,
+        Some((line, why)) => outln!("{} records, hash chain BROKEN at line {line}: {why}", r.records)?,
     }
-    for error in &r.blob_errors { println!("BAD BLOB: {error}"); }
+    for error in &r.blob_errors { outln!("BAD BLOB: {error}")?; }
     let mut damaged = r.broken.is_some() || !r.blob_errors.is_empty();
     let mut unknown = false;
     if r.broken.is_none() {
         match supervisor::Books::of(&eventlog::load(&f)?) {
             Ok(books) => {
                 for (seq, intent) in &books.open {
-                    println!("UNKNOWN OUTCOME: #{seq} {}: {}", intent["tool"].as_str().unwrap_or("?"), intent["summary"].as_str().unwrap_or(""));
+                    outln!("UNKNOWN OUTCOME: #{seq} {}: {}", intent["tool"].as_str().unwrap_or("?"), intent["summary"].as_str().unwrap_or(""))?;
                 }
-                for seq in books.reservations.keys() { println!("UNKNOWN BILLING: #{seq} model request (charged its reserved tokens on resume)"); }
+                for seq in books.reservations.keys() { outln!("UNKNOWN BILLING: #{seq} model request (charged its reserved tokens on resume)")?; }
                 unknown = !books.open.is_empty() || !books.reservations.is_empty();
             },
             Err(error) => {
-                println!("INVALID RECOVERY ACCOUNTING: {error:#}");
+                outln!("INVALID RECOVERY ACCOUNTING: {error:#}")?;
                 damaged = true;
             },
         }
     }
-    if damaged {
-        std::process::exit(1);
-    }
-    if unknown {
-        std::process::exit(3);
-    }
-    Ok(())
+    Ok(std::process::ExitCode::from(if damaged { 1 } else if unknown { 3 } else { 0 }))
 }
 
 #[cfg(test)]
@@ -889,10 +917,10 @@ mod tests {
 
     #[test]
     fn print_info_handles_help_and_version_only() {
-        assert!(print_info(&argv("")));
-        assert!(print_info(&argv("--version")));
-        assert!(print_info(&argv("run --help")));
-        assert!(!print_info(&argv("bogus --help")), "unknown command help falls through to the error");
-        assert!(!print_info(&argv("run --model m")));
+        assert!(print_info(&argv("")).unwrap());
+        assert!(print_info(&argv("--version")).unwrap());
+        assert!(print_info(&argv("run --help")).unwrap());
+        assert!(!print_info(&argv("bogus --help")).unwrap(), "unknown command help falls through to the error");
+        assert!(!print_info(&argv("run --model m")).unwrap());
     }
 }

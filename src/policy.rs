@@ -618,7 +618,7 @@ impl Policy {
             }
             let grants = crate::eventlog::load(path)?.iter().filter(|r| r["kind"] == "path_grant")
                 .map(|r| serde_json::from_value(r["grant"].clone())).collect::<std::result::Result<Vec<PathGrant>, _>>()?;
-            return Ok(Policy { cfg: p, log, grants: grants.into(), hidden: Default::default(), prompt: Default::default(), ar_progress: Default::default() });
+            return Ok(Policy { cfg: p, log, grants: grants.into(), hidden: Default::default(), prompt: Default::default(), ar_progress: Default::default() }.live());
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
@@ -675,7 +675,7 @@ impl Policy {
         p.read_roots.sort();
         p.read_roots.dedup();
         let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
-        Ok(Policy { cfg: p, log, grants: Default::default(), hidden: Default::default(), prompt: Default::default(), ar_progress })
+        Ok(Policy { cfg: p, log, grants: Default::default(), hidden: Default::default(), prompt: Default::default(), ar_progress }.live())
     }
 
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
@@ -966,10 +966,33 @@ fn validate_scratch(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The journal and private temp directory of every live `Policy`, so that `end_live_sessions` can end them when hx
+/// is stopped by a signal: the stop path exits without running destructors.
+static LIVE: std::sync::Mutex<Vec<(Arc<EventLog>, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+impl Policy {
+    fn live(self) -> Self {
+        LIVE.lock().unwrap().push((self.log.clone(), self.tmp.clone()));
+        self
+    }
+}
+
+/// Close a session: a final journal record (best effort: the journal may already have failed) and the private temp
+/// directory removed.
+fn end_session(log: &EventLog, tmp: &Path) {
+    let _ = log.write("session_end", json!({}), true);
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// End every live policy's session, as dropping it would. For the signal stop path only.
+pub fn end_live_sessions() {
+    for (log, tmp) in std::mem::take(&mut *LIVE.lock().unwrap()) { end_session(&log, &tmp); }
+}
+
 impl Drop for Policy {
     fn drop(&mut self) {
-        let _ = self.log.write("session_end", json!({}), true);
-        let _ = std::fs::remove_dir_all(&self.tmp);
+        LIVE.lock().unwrap().retain(|(_, tmp)| *tmp != self.tmp);
+        end_session(&self.log, &self.tmp);
     }
 }
 

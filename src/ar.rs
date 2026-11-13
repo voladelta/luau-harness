@@ -991,7 +991,7 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>,
     let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, launch };
     eprintln!("hx ar: run {}{}", o.dir.display(), if records.is_empty() { "" } else { ", resumed" });
     let report = o.run(records).await?;
-    println!("{}", serde_json::to_string(&report)?);
+    outln!("{}", serde_json::to_string(&report)?)?;
     Ok(())
 }
 

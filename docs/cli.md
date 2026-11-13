@@ -69,6 +69,17 @@ Flags and positional operands may come in any order; `--` ends the flags. A comm
 
 Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=HASH` trusts exactly the config with that hash for one launch (`HX_TRUST=1` is deprecated; see [workspace trust](configuration.md#workspace-trust)).
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Done. `hx run` exits 0 whenever it prints a report, finished or not; read `finished` and `stopped` in it |
+| 1 | An error (printed on stderr); `hx test`: a test failed; `hx log verify`: a broken chain, a bad blob or invalid recovery accounting |
+| 2 | A usage error: an unknown command or flag, a missing or surplus operand, a malformed value |
+| 3 | `hx log verify`: effects or model requests with an unknown outcome |
+| 129, 130, 143 | Stopped by SIGHUP, SIGINT or SIGTERM; running commands, MCP servers and child runs are stopped too |
+| 141 | stdout was closed before hx finished writing (`hx run ... \| head -1`); nothing more is written |
+
 ## Report and logs
 
 `hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer` and tokens. The event log is written to `.harness/log/`. The log stores file contents and command output as blobs in `.harness/log/blobs/`, so treat it as sensitive.

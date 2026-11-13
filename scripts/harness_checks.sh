@@ -169,4 +169,21 @@ LUA
   printf 'local b = require("base:std/printer")\nlocal M = {}\nfor k, v in b do M[k] = v end\nfunction M.top(v) return "X" .. b.top(v) end\nreturn M' > $W3/.harness/override/std/printer.luau ) &
 check "frozen printer refuses hot reload" "$($H test $W3/pk --workspace $W3 2>/dev/null | tail -1)" "1 passed, 0 failed"
 
+# 9. Exits end the session: a failing `hx test`, a signal stop and a closed stdout still write session_end and remove
+# the private temp directory; a closed stdout is a quiet exit, not a panic.
+W5=$T/ws5; mkdir -p $W5/pkg/tests $T/tmp5; echo 'assert(false, "nope")' > $W5/pkg/tests/fail_test.luau
+ended() { python3 -c '
+import json, sys, glob
+print(all(json.loads(open(f).readlines()[-1])["kind"] == "session_end" for f in glob.glob(sys.argv[1] + "/.harness/log/*.jsonl")))' "$1"; }
+(cd $W5 && TMPDIR=$T/tmp5 $H test pkg >/dev/null 2>&1); status=$?
+check "a failing hx test exits 1 and ends its session" "$status $(ended $W5) $(ls $T/tmp5 | wc -l)" "1 True 0"
+rm -rf $W5/.harness
+TMPDIR=$T/tmp5 $H exec --workspace $W5 'print("up")' 'local t = os.clock(); while os.clock() - t < 20 do end' > $T/up.txt 2>&1 & HX=$!
+for _ in $(seq 100); do [ -s $T/up.txt ] && break; sleep 0.1; done
+kill -TERM $HX; wait $HX; status=$?
+check "a signal stop ends the session" "$status $(ended $W5) $(ls $T/tmp5 | wc -l)" "143 True 0"
+rm -rf $W5/.harness
+out=$(TMPDIR=$T/tmp5 $H exec --workspace $W5 'print(1)' 'local t = os.clock(); while os.clock() - t < 1 do end; print(2)' 2>$T/err5 | head -1; echo " ${PIPESTATUS[0]}")
+check "a closed stdout is a quiet exit" "$(echo $out) $(wc -c < $T/err5) $(ended $W5) $(ls $T/tmp5 | wc -l)" "1 141 0 True 0"
+
 finish
