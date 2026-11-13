@@ -88,7 +88,7 @@ pub struct Effects {
     pub principal: Principal,
     pub stage_epoch: Option<u64>,
     /// The chunk's time budget guards against Luau loops, not waiting: time spent awaiting an effect moves it forward.
-    pub deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    pub deadline: Arc<crate::vm::Deadline>,
     /// Luau threads (by pointer) awaiting an effect, with a count per thread; the interrupt skips only those threads,
     /// so suspended native work does not spend the caller's Lua CPU allowance.
     /// The entry holds the thread itself so its address cannot be reused by another thread while it is marked.
@@ -119,15 +119,15 @@ impl Effects {
     /// Suspend the caller's Lua CPU clock across isolated worker/provider waits.
     pub fn awaiting(&self, lua: &Lua) -> AwaitGuard {
         AwaitGuard { _wait: WaitGuard::enter(&self.waiting, lua.current_thread()), deadline: self.deadline.clone(),
-            initial: *self.deadline.lock().unwrap(), started: std::time::Instant::now() }
+            initial: self.deadline.get(), started: crate::vm::coarse_now() }
     }
     #[cfg(test)]
-    pub fn new(pol: Arc<Policy>, depth: usize, deadline: Arc<Mutex<Option<std::time::Instant>>>) -> Arc<Effects> {
+    pub fn new(pol: Arc<Policy>, depth: usize, deadline: Arc<crate::vm::Deadline>) -> Arc<Effects> {
         let supervisor = Supervisor::ephemeral(pol.clone(), Arc::new(crate::modules::Registry::default()));
         Self::supervised(supervisor, Principal::Agent { read_only: false }, depth, deadline)
     }
 
-    pub fn supervised(supervisor: Arc<Supervisor>, principal: Principal, depth: usize, deadline: Arc<Mutex<Option<std::time::Instant>>>) -> Arc<Self> {
+    pub fn supervised(supervisor: Arc<Supervisor>, principal: Principal, depth: usize, deadline: Arc<crate::vm::Deadline>) -> Arc<Self> {
         Arc::new(Self { pol: supervisor.policy.clone(), stage_epoch:supervisor.workflow_epoch(), depth, supervisor, principal, deadline, waiting: Arc::default() })
     }
 
@@ -278,15 +278,14 @@ fn yieldable(lua: &Lua) -> bool {
 /// `sh` and later collected) cannot leave a stale mark behind.
 pub struct AwaitGuard {
     _wait: WaitGuard,
-    deadline: Arc<Mutex<Option<std::time::Instant>>>,
-    initial: Option<std::time::Instant>,
-    started: std::time::Instant,
+    deadline: Arc<crate::vm::Deadline>,
+    initial: Option<u64>,
+    started: u64,
 }
 impl Drop for AwaitGuard {
     fn drop(&mut self) {
         if let Some(initial) = self.initial {
-            let mut deadline = self.deadline.lock().unwrap();
-            if let Some(current) = *deadline { *deadline = Some(current.max(initial + self.started.elapsed())); }
+            self.deadline.extend_to(initial.saturating_add(crate::vm::coarse_now().saturating_sub(self.started)));
         }
     }
 }

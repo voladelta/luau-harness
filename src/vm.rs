@@ -15,7 +15,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Luau CPU allowance of one agent chunk (time waiting on effects does not count).
 pub const CHUNK_SECS: u64 = 120;
@@ -133,16 +133,72 @@ fn whole_prefix(b: &[u8]) -> usize {
 /// Threads awaiting an effect, as `Effects::waiting` holds them.
 type Waiting = Arc<Mutex<HashMap<usize, (usize, mlua::Thread)>>>;
 
-/// Interrupts between two budget checks. Luau interrupts on every loop backedge and call, so most interrupts must
-/// cost no more than a counter; a deadline is noticed at most this many interrupts late.
-const INTERRUPT_STRIDE: u32 = 1024;
+/// Nanoseconds on `CLOCK_MONOTONIC_COARSE`: the clock budgets are kept on. Luau interrupts on every loop backedge
+/// and call, so the interrupt reads the time on each one; this clock is a vDSO read of a few nanoseconds, a fraction of
+/// what `Instant::now` costs, and is accurate to a scheduler tick (a few milliseconds), which is plenty for budgets.
+pub(crate) fn coarse_now() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: clock_gettime(2) writes one timespec through a pointer to a live local and has no other effect.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts) };
+    debug_assert_eq!(rc, 0, "Linux has had CLOCK_MONOTONIC_COARSE since 2.6.32");
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64)
+}
+
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// When the code a Lua state runs now (a chunk, a package call, a controller step) must stop, on `coarse_now`'s
+/// clock, or none while nothing is timed. An atomic, so the interrupt reads it without a lock.
+#[derive(Debug)]
+pub struct Deadline(AtomicU64);
+
+/// `Deadline`'s value while nothing is timed: later than any time.
+const UNTIMED: u64 = u64::MAX;
+
+impl Default for Deadline {
+    /// No deadline.
+    fn default() -> Self {
+        Deadline(AtomicU64::new(UNTIMED))
+    }
+}
+
+impl Deadline {
+    /// A deadline `budget` from now.
+    pub fn after(budget: Duration) -> Self {
+        let deadline = Deadline::default();
+        deadline.start(budget);
+        deadline
+    }
+
+    /// Time the code that runs next: it must stop `budget` from now.
+    pub fn start(&self, budget: Duration) {
+        self.0.store(coarse_now().saturating_add(nanos(budget)), Ordering::Relaxed);
+    }
+
+    /// Nothing is timed until the next `start`.
+    pub fn clear(&self) {
+        self.0.store(UNTIMED, Ordering::Relaxed);
+    }
+
+    /// The deadline, or `None` while nothing is timed.
+    pub(crate) fn get(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::Relaxed)).filter(|&at| at != UNTIMED)
+    }
+
+    /// Move a timed deadline to `at` if that is later; an untimed one stays untimed.
+    pub(crate) fn extend_to(&self, at: u64) {
+        // An error is the documented no-op: untimed, or already as late.
+        let _ = self.0.try_update(Ordering::Relaxed, Ordering::Relaxed, |now| (now != UNTIMED && now < at).then_some(at));
+    }
+}
 
 /// The time budgets one Lua state's interrupt enforces.
 pub(crate) struct Budget {
     /// The run's absolute deadline on the `supervisor::now()` clock.
     pub run_deadline: Option<f64>,
-    /// Deadline of the code running now (a chunk, a package call, a controller step); `None` while nothing is timed.
-    pub deadline: Arc<Mutex<Option<Instant>>>,
+    /// Deadline of the code running now.
+    pub deadline: Arc<Deadline>,
     /// Threads awaiting an effect do not spend the allowance (see `Effects::awaiting`).
     pub waiting: Option<Waiting>,
     /// The error raised when `deadline` has passed.
@@ -150,32 +206,28 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
-    fn check(&self, lua: &Lua) -> mlua::Result<VmState> {
-        if self.run_deadline.is_some_and(|d| crate::supervisor::now() >= d) {
-            return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached"));
-        }
-        let deadline = *self.deadline.lock().unwrap();
-        if deadline.is_none_or(|d| Instant::now() < d) {
-            return Ok(VmState::Continue);
-        }
-        if let Some(waiting) = &self.waiting
-            && waiting.lock().unwrap().contains_key(&(lua.current_thread().to_pointer() as usize))
-        {
-            return Ok(VmState::Continue);
-        }
-        Err(mlua::Error::runtime(self.exceeded))
-    }
-
-    /// Make this the interrupt of `lua`.
+    /// Make this the interrupt of `lua`. Every interrupt compares the time with both deadlines; only one that finds a
+    /// deadline passed does more.
     pub(crate) fn install(self, lua: &Lua) {
-        let ticks = std::cell::Cell::new(0u32);
+        // The run deadline is wall-clock time; within this process it is the same distance away on the budget clock.
+        let run_end = self.run_deadline.map_or(UNTIMED, |end| {
+            let left = Duration::try_from_secs_f64(end - crate::supervisor::now()).unwrap_or(Duration::ZERO);
+            coarse_now().saturating_add(nanos(left))
+        });
         lua.set_interrupt(move |lua| {
-            let tick = ticks.get().wrapping_add(1);
-            ticks.set(tick);
-            if !tick.is_multiple_of(INTERRUPT_STRIDE) {
+            let now = coarse_now();
+            if now < self.deadline.0.load(Ordering::Relaxed).min(run_end) {
                 return Ok(VmState::Continue);
             }
-            self.check(lua)
+            if now >= run_end {
+                return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached"));
+            }
+            if let Some(waiting) = &self.waiting
+                && waiting.lock().unwrap().contains_key(&(lua.current_thread().to_pointer() as usize))
+            {
+                return Ok(VmState::Continue);
+            }
+            Err(mlua::Error::runtime(self.exceeded))
         });
     }
 }
@@ -218,6 +270,21 @@ mod session_budget_tests {
     }
 
     #[tokio::test]
+    async fn a_loop_of_slow_native_calls_stops_at_its_budget() {
+        let dir = std::env::temp_dir().join(format!("hx-slow-native-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let vm = Vm::new(policy, Duration::from_millis(300), 64 << 20, None).unwrap();
+        // Each iteration is one interrupt and a sort of tens of milliseconds.
+        let code = "local t = table.create(1e6, 0); for i = 1, 1e6 do t[i] = i end; while true do table.sort(t) end";
+        let t0 = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(20), vm.session.run(code)).await.expect("the chunk must stop");
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")), "{:?}", r.error);
+        assert!(t0.elapsed() < Duration::from_secs(2), "a 300 ms budget took {:?}", t0.elapsed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn isolated_package_wait_preserves_the_callers_cpu_allowance() {
         let dir = std::env::temp_dir().join(format!("hx-package-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -245,6 +312,7 @@ mod session_budget_tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use std::time::Instant;
 
     fn vm(name: &str, budget: Duration, mem_limit: usize) -> (Vm, PathBuf) {
         let dir = std::env::temp_dir().join(format!("hx-boundary-{name}-{}", std::process::id()));
@@ -297,7 +365,7 @@ mod boundary_tests {
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
         assert!(error.to_string().contains("time budget exceeded"), "{error}");
         // the deadline is cleared again: harness code between chunks is not left on a stale clock
-        assert!(vm.session.deadline.lock().unwrap().is_none());
+        assert!(vm.session.deadline.get().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -392,7 +460,7 @@ pub struct Session {
     env: Table,
     out: Arc<Mutex<Printed>>,
     ops: Arc<AtomicUsize>,
-    deadline: Arc<Mutex<Option<Instant>>>,
+    deadline: Arc<Deadline>,
     budget: Duration,
     mem_limit: usize,
     /// chunks run so far (see `hx.retain`)
@@ -422,12 +490,12 @@ impl Session {
         self.out.lock().unwrap().take();
         self.ops.store(0, Ordering::Relaxed);
         self.chunks.fetch_add(1, Ordering::Relaxed);
-        *self.deadline.lock().unwrap() = Some(Instant::now() + self.budget);
+        self.deadline.start(self.budget);
         let result = match self.compile(code) {
             Ok(f) => f.call_async::<MultiValue>(()).await,
             Err(e) => Err(e),
         };
-        *self.deadline.lock().unwrap() = None;
+        self.deadline.clear();
         let (output, omitted) = self.out.lock().unwrap().take();
         let (values, error) = match result {
             Ok(vals) => (vals.into_iter().filter(|v| !v.is_nil()).collect(), None),
@@ -442,7 +510,7 @@ impl Session {
     fn harness(&self) -> HarnessGuard<'_> {
         let used = self.lua.used_memory();
         self.lua.set_memory_limit(used.max(self.mem_limit).saturating_add(HARNESS_HEADROOM)).expect(MEMORY_CONTROL);
-        *self.deadline.lock().unwrap() = Some(Instant::now() + self.budget.min(HARNESS_TIME));
+        self.deadline.start(self.budget.min(HARNESS_TIME));
         HarnessGuard { session: self }
     }
 }
@@ -458,7 +526,7 @@ struct HarnessGuard<'a> {
 
 impl Drop for HarnessGuard<'_> {
     fn drop(&mut self) {
-        *self.session.deadline.lock().unwrap() = None;
+        self.session.deadline.clear();
         self.session.lua.set_memory_limit(self.session.mem_limit).expect(MEMORY_CONTROL);
     }
 }
@@ -577,7 +645,7 @@ impl Vm {
         let lua = Lua::new();
         let out = Arc::new(Mutex::new(Printed::default()));
         let ops = Arc::new(AtomicUsize::new(0));
-        let deadline: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let deadline = Arc::new(Deadline::default());
         let resolver = Arc::new(Resolver::new(root.clone()));
         let supervisor = match &host {
             Some(h) => h.supervisor.clone(),

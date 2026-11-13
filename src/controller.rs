@@ -3,7 +3,7 @@ use crate::{modules::Registry, values};
 use anyhow::Result;
 use mlua::{Function, Lua, MultiValue, Table, Value};
 use serde_json::Value as Json;
-use std::{sync::{Arc, Mutex}, time::{Duration, Instant}};
+use std::{sync::Arc, time::Duration};
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -92,7 +92,7 @@ pub struct Controller {
     lua: Lua,
     module: Table,
     /// Deadline of the transition running now; each `init` and `step` gets `STEP_TIME`.
-    deadline: Arc<Mutex<Option<Instant>>>,
+    deadline: Arc<crate::vm::Deadline>,
 }
 
 /// CPU allowance of one controller transition: no controller can hang effect admission.
@@ -106,7 +106,7 @@ impl Controller {
         for name in ["_G", "os", "coroutine", "getfenv", "setfenv", "loadstring", "require"] { g.set(name, Value::Nil)?; }
         let math: Table = g.get("math")?;
         math.set("random", Value::Nil)?; math.set("randomseed", Value::Nil)?;
-        let deadline = Arc::new(Mutex::new(Some(Instant::now() + STEP_TIME)));
+        let deadline = Arc::new(crate::vm::Deadline::after(STEP_TIME));
         crate::vm::Budget { run_deadline, deadline: deadline.clone(), waiting: None, exceeded: "controller time budget exceeded" }.install(&lua);
         lua.set_memory_limit(128 << 20)?;
         let env = lua.create_table()?;
@@ -143,7 +143,7 @@ impl Controller {
     }
 
     fn start_transition(&self) {
-        *self.deadline.lock().unwrap() = Some(Instant::now() + STEP_TIME);
+        self.deadline.start(STEP_TIME);
     }
 
     pub fn init(&self, cfg: &Json) -> Result<Json> {
@@ -167,6 +167,7 @@ impl Controller {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Instant;
 
     fn controller(step: &str) -> Controller {
         let mut registry = Registry::default();

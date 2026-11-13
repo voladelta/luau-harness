@@ -1,7 +1,7 @@
 //! Package calls cross a data-only boundary and get a fresh VM and an unforgeable Rust principal.
 use crate::{effects::Effects, host::Host, prims, supervisor::{Principal, Supervisor}, values};
 use mlua::{Lua, MultiValue, Table, Value};
-use std::{collections::HashSet, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, time::{Duration, Instant}};
+use std::{collections::HashSet, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, time::Duration};
 
 /// A fresh VM for one package invocation: (the VM, the package's module, the principal's active flag, the package
 /// environment the module was loaded in).
@@ -14,7 +14,7 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     let active = Arc::new(AtomicBool::new(false));
     let principal = Principal::Package { name: package.to_string(), caps, active: active.clone() };
     let lua = Lua::new();
-    let deadline = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(30))));
+    let deadline = Arc::new(crate::vm::Deadline::after(Duration::from_secs(30)));
     let fx = Effects::supervised(supervisor.clone(), principal.clone(), host.as_ref().map(|h| h.depth).unwrap_or(0), deadline.clone());
     prims::install(&lua, fx.clone(), Arc::new(AtomicUsize::new(0))).map_err(mlua::Error::external)?;
     if let Some(name) = package.strip_prefix("tool:") {
