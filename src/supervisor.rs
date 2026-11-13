@@ -1,5 +1,5 @@
 //! One owner for admission, immutable run configuration, receipts, and recovery.
-use crate::{eventlog::{self, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
+use crate::{eventlog::{self, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, BudgetExceeded, Class, Policy, Snapshot}};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -245,7 +245,7 @@ impl Books {
             "billing" => anyhow::ensure!(r["tokens"].as_u64().is_some(), "billing record missing tokens"),
             // Every shell command that ran says who approved it.
             "outcome" if r["ret"]["t"] == "sh" => anyhow::ensure!(
-                r["approval"].as_str().is_some_and(|a| crate::policy::APPROVAL_SOURCES.contains(&a)), "sh outcome record missing its approval source"),
+                r["approval"].as_str().and_then(crate::policy::ApprovalSource::parse).is_some(), "sh outcome record missing its approval source"),
             _ => {},
         }
         Ok(())
@@ -609,7 +609,7 @@ impl Supervisor {
 
     pub fn check(&self) -> Result<()> {
         self.policy.log.check()?;
-        if self.manifest.as_ref().and_then(|m| m.deadline).is_some_and(|d| now() >= d) { bail!("budget_exceeded: absolute run deadline reached (downtime counts)"); }
+        if self.manifest.as_ref().and_then(|m| m.deadline).is_some_and(|d| now() >= d) { return Err(BudgetExceeded("absolute run deadline reached (downtime counts)").into()); }
         Ok(())
     }
 
@@ -703,7 +703,7 @@ impl Supervisor {
         self.check()?;
         let mut books = self.books.lock().unwrap();
         if let Some(manifest)=self.manifest.as_ref().filter(|m|m.workflow.is_some()) {
-            anyhow::ensure!(books.model_admissions < manifest.max_turns as u64,"budget_exceeded: run-wide max_turns admission threshold reached (including descendants and retries)");
+            anyhow::ensure!(books.model_admissions < manifest.max_turns as u64,BudgetExceeded("run-wide max_turns admission threshold reached (including descendants and retries)"));
         }
         let budget = self.manifest.as_ref().map(|m| &m.budget).unwrap_or(&self.policy.budget);
         let used = books.usage.total_tokens();
@@ -715,8 +715,9 @@ impl Supervisor {
         let over_tokens = budget.max_tokens.is_some_and(|m| used.saturating_add(pending_tokens) >= m);
         if over_tokens && !books.reservations.is_empty() { return Ok(None); }
         if over_tokens {
-            self.policy.log.write("budget", json!({"reason":"budget_exceeded: token admission threshold reached","depth":depth}), true)?;
-            bail!("budget_exceeded: token admission threshold reached");
+            let exceeded = BudgetExceeded("token admission threshold reached");
+            self.policy.log.write("budget", json!({"reason":exceeded.to_string(),"depth":depth}), true)?;
+            return Err(exceeded.into());
         }
         let seq = self.record_in(&mut books, "model_intent", json!({"model": cfg.model, "depth": depth,
             "req_sha": eventlog::sha_bytes(&serde_json::to_vec(req)?), "reserved_tokens": tokens}), true)?;

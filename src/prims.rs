@@ -328,7 +328,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
             let class = pol.classify_sh(&cmd);
             let args = json!({"cmd": &cmd, "cwd": &opts.cwd, "timeout": opts.timeout});
             let ret = f.run(&lua, crate::supervisor::Tool::Sh, class, args, || async {
-                let approval = pol.approve(&cmd, class).await.map_err(|why| rt(format!("approval_required: {why}")))?;
+                let approval = pol.approve(&cmd, class).await.map_err(mlua::Error::external)?;
                 let cwd = match &opts.cwd {
                     Some(c) => pol.check_read(c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),

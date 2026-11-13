@@ -44,6 +44,9 @@ impl Answered {
     pub fn unbilled(&self) -> bool { (400..500).contains(&self.status) || self.status == 503 }
     /// Worth one more attempt: rate limits, server errors and malformed 200 bodies. Other 4xx repeat identically.
     pub fn retryable(&self) -> bool { matches!(self.status, 408 | 429 | 200) || self.status >= 500 }
+    /// A rejection a provider gives for a request over the model's context (400, 413 or 422): nothing was generated,
+    /// so the loop may compact and send a smaller request.
+    pub fn may_be_context_overflow(&self) -> bool { matches!(self.status, 400 | 413 | 422) }
 }
 
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]

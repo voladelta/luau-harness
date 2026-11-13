@@ -1,6 +1,6 @@
 //! Authorized effect dispatch with durable intents and receipts. Recovery never re-executes old chunks.
 use crate::eventlog::{self, EventLog};
-use crate::policy::{Class, Policy};
+use crate::policy::{ApprovalRequired, ApprovalSource, Class, Policy};
 use anyhow::Result;
 use mlua::Lua;
 use serde_json::{json, Value};
@@ -25,17 +25,24 @@ pub fn unknown(message: impl Into<String>) -> mlua::Error {
     mlua::Error::external(UnknownOutcome(message.into()))
 }
 
+/// `error` as a Luau error, keeping an `UnknownOutcome` or `ApprovalRequired` inside it recognisable by type (an
+/// `anyhow::Error` boxed as it is would hide its type from `caused_by`).
 pub fn effect_error(error: anyhow::Error) -> mlua::Error {
-    match error.downcast::<UnknownOutcome>() {
+    let error = match error.downcast::<UnknownOutcome>() {
+        Ok(error) => return mlua::Error::external(error),
+        Err(error) => error,
+    };
+    match error.downcast::<ApprovalRequired>() {
         Ok(error) => mlua::Error::external(error),
         Err(error) => mlua::Error::external(error),
     }
 }
 
-fn is_unknown(error: &mlua::Error) -> bool {
+/// Is `error`, or the error it wraps, an `E` raised from Rust?
+fn caused_by<E: std::error::Error + 'static>(error: &mlua::Error) -> bool {
     match error {
-        mlua::Error::ExternalError(error) => error.downcast_ref::<UnknownOutcome>().is_some(),
-        mlua::Error::CallbackError { cause, .. } | mlua::Error::WithContext { cause, .. } => is_unknown(cause),
+        mlua::Error::ExternalError(error) => error.downcast_ref::<E>().is_some(),
+        mlua::Error::CallbackError { cause, .. } | mlua::Error::WithContext { cause, .. } => caused_by::<E>(cause),
         _ => false,
     }
 }
@@ -48,7 +55,7 @@ pub enum Ret {
     /// File content, byte-exact (journaled like `Str`).
     Bytes(Vec<u8>),
     /// `approval` is who approved the command (`Policy::approve`); the outcome record carries it.
-    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, truncated: bool, operation_id: Option<u64>, approval: &'static str },
+    Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, truncated: bool, operation_id: Option<u64>, approval: ApprovalSource },
     Rows { rows: Vec<(String, i64, String)>, truncated: bool },
     SearchErr { kind: String, message: String, hint: String },
     Agent { answer: String, finished: bool, turns: u64 },
@@ -141,7 +148,7 @@ impl Effects {
         let Call { tool, class, args, sha } = *c;
         if let (Some(id), Err(error)) = (intent, res) {
             let message = err_text(error);
-            if is_unknown(error) {
+            if caused_by::<UnknownOutcome>(error) {
                 return self.supervisor.uncertain(id, tool, args, &message).map_err(mlua::Error::external);
             }
         }
@@ -154,13 +161,13 @@ impl Effects {
         r["ok"] = json!(res.is_ok());
         r["ms"] = json!(ms);
         r["ret"] = ret.to_json(self.log()).map_err(|e| rt(e.to_string()))?;
-        if let Ret::Sh { approval, .. } = &ret { r["approval"] = json!(approval); }
+        if let Ret::Sh { approval, .. } = &ret { r["approval"] = json!(approval.name()); }
         self.supervisor.workflow_effect_metadata(tool, &mut r).map_err(mlua::Error::external)?;
         if let Ret::Err(m) = &ret {
             r["detail"] = json!({"error": m.chars().take(300).collect::<String>()});
-            if m.starts_with("approval_required") {
-                r["denied"] = json!(true);
-            }
+        }
+        if res.as_ref().is_err_and(caused_by::<ApprovalRequired>) {
+            r["denied"] = json!(true);
         }
         match intent {
             Some(id) => {
@@ -225,7 +232,7 @@ impl Effects {
                 _ => None,
             };
             if let Some(path) = path {
-                self.pol.authorize_path(path, matches!(tool, Tool::Write | Tool::Edit)).await.map_err(mlua::Error::external)?;
+                self.pol.authorize_path(path, matches!(tool, Tool::Write | Tool::Edit)).await.map_err(effect_error)?;
             }
             Ok(())
         };

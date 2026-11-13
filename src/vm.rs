@@ -775,9 +775,7 @@ impl Vm {
                     let a = json!({"server": server, "tool": tool, "args": args_json});
                     let ret = fx.run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
                         let call = crate::policy::Call::Mcp { server: &server, tool: &tool };
-                        if let Err(why) = fx.pol.approve_call(call, &args_json, class).await {
-                            return Err(mlua::Error::runtime(format!("approval_required: {why}")));
-                        }
+                        fx.pol.approve_call(call, &args_json, class).await.map_err(mlua::Error::external)?;
                         let r = m.request(&server, "tools/call", json!({"name": tool, "arguments": args_json})).await
                             .map_err(|e| crate::net::effect_error(class, e.delivery, e.to_string()))?;
                         Ok(Ret::Json(r))

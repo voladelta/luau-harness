@@ -1,5 +1,5 @@
 //! Model adapter and supervised agent/controller execution. Descendants share one admission ledger.
-use crate::{controller::{Command, Controller, Event}, llm::{self, LlmCfg, Reply}, policy::{Budget, Policy}, supervisor::{Principal, RunState, Supervisor}, vm::Vm};
+use crate::{controller::{Command, Controller, Event}, llm::{self, LlmCfg, Reply}, policy::{Budget, BudgetExceeded, Policy}, supervisor::{Principal, RunState, Supervisor}, vm::Vm};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
@@ -169,7 +169,7 @@ impl Host {
             let op = self.supervisor.reserve_model(cfg, req, self.depth).await?;
             let call = llm::chat(&self.http, cfg, &key, req);
             let result = match self.supervisor.remaining() {
-                Some(remaining) => tokio::time::timeout(remaining, call).await.map_err(|_| anyhow::anyhow!("budget_exceeded: absolute run deadline reached during model request")).and_then(|r| r),
+                Some(remaining) => tokio::time::timeout(remaining, call).await.map_err(|_| BudgetExceeded("absolute run deadline reached during model request").into()).and_then(|r| r),
                 None => call.await,
             };
             let error = match result {
@@ -230,7 +230,7 @@ impl Host {
             let started = Instant::now();
             let result = self.clone().execute_task(task, max_turns).await;
             if result.is_err() && let Err(error) = self.supervisor.check()
-                && error.to_string().starts_with("budget_exceeded:") {
+                && error.is::<BudgetExceeded>() {
                 // Controller state is opaque; unavailable workflow counters must not masquerade as zero.
                 let report = json!({"finished":false,"final_answer":"","stopped":error.to_string()});
                 self.policy.log.write("budget", json!({"reason":error.to_string(),"depth":self.depth}), true)?;
@@ -265,7 +265,7 @@ impl Host {
                     report.insert("decision_rejected".into(),json!(reason));
                     return Ok(self.workflow_pause_report(&report));
                 },
-                Err(error) if error.to_string().starts_with("budget_exceeded")=>return Ok(self.workflow_pause_report(report)),
+                Err(error) if error.is::<BudgetExceeded>()=>return Ok(self.workflow_pause_report(report)),
                 Err(error)=>return Err(error),
             }
         } else {None};
@@ -368,7 +368,7 @@ impl Host {
                             // the anchor's estimate covers the system prompt as sent, so its scale is not skewed by VM additions
                             let system_chars=agent_system.as_ref().and_then(Value::as_str).map(str::len);
                             event=Event::ModelReply{reply:serde_json::to_value(&reply)?,system_chars}.to_json();},
-                        Err(error)=>{let message=error.to_string();let safe_context_rejection=["API 400 ","API 413 ","API 422 "].iter().any(|p|message.starts_with(p));event=Event::ModelError{error:message,safe_context_rejection}.to_json();},
+                        Err(error)=>{let safe_context_rejection=error.downcast_ref::<llm::Answered>().is_some_and(llm::Answered::may_be_context_overflow);event=Event::ModelError{error:error.to_string(),safe_context_rejection}.to_json();},
                     }
                 },
                 Command::Run{code}=>{
