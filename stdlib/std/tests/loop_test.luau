@@ -198,14 +198,17 @@ test.case("a run about to stop asks for the final answer once: by time or by tur
 			reply = { text = "", finish = "stop", input = 100, output = 10, calls = { { id = "w" .. n, name = "luau", input = { code = "x = 1" } } } } })
 		s = loop.step(s, { kind = "run_result", result = { ops = 1, feedback = "ok" }, time = time })
 		local tool = s.messages[#s.messages].content
-		return loop.step(s, { kind = "next" }), tool
+		local state, command = loop.step(s, { kind = "next" })
+		return state, tool, command
 	end
+	local command
 	local s = start()
 	local tool
 	s, tool = reply(s, 1, { remaining = 200, total = 240 })
 	test.eq(tool, "ok")
-	s, tool = reply(s, 2, { remaining = 55, total = 240 })
+	s, tool, command = reply(s, 2, { remaining = 55, total = 240 })
 	test.ok(tool:find("about 55 seconds", 1, true) and tool:find("final answer", 1, true), tool)
+	test.eq(#command.request.tools, 0) -- the model ignores notices: the reply after it can only be text
 	s, tool = reply(s, 3, { remaining = 20, total = 240 })
 	test.eq(tool, "ok") -- once
 	hooks.clear()
@@ -213,6 +216,9 @@ test.case("a run about to stop asks for the final answer once: by time or by tur
 	s = loop.step(loop.init({ task_message = "TASK", max_turns = 4 }), { kind = "next" })
 	s, tool = reply(s, 1)
 	test.eq(tool, "ok")
-	s, tool = reply(s, 2)
+	s, tool, command = reply(s, 2)
 	test.ok(tool:find("2 model turns", 1, true), tool)
+	test.ok(#command.request.tools > 0) -- the second-to-last turn still has tools
+	s, tool, command = reply(s, 3)
+	test.eq(#command.request.tools, 0) -- the last turn has no tools: its reply is the final answer
 end)

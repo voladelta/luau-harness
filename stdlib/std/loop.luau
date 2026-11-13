@@ -71,7 +71,8 @@ end
 
 -- One notice, appended to a tool result, when the run is about to stop the model: two turns before max_turns, or with
 -- the last fifth of a wall-clock allowance left (at least a minute). Without it a capped run ends mid-work and returns
--- no final answer. A workflow stage ends by submission, not by prose, so it gets none.
+-- no final answer. Models do ignore it, so the request after a time notice, and the last turn, go without tools: the
+-- reply can only be text, the final answer. A workflow stage ends by submission, not by prose, so it gets neither.
 local function wrap_up(s, event, options): string
 	if s.wrapped or options.submissions then return "" end
 	local time = event.time
@@ -80,8 +81,10 @@ local function wrap_up(s, event, options): string
 		and time.remaining <= math.max(60, time.total / 5) then time.remaining else nil
 	if turns_left > 2 and not secs_left then return "" end
 	s.wrapped = true
+	if secs_left then s.final_reply = true end
 	local left = if secs_left then string.format("about %d seconds", math.floor(secs_left)) else string.format("%d model turns", turns_left)
-	return "\n\n[hx] The run stops in " .. left .. ". Stop starting new work: give your final answer in your next reply."
+	return "\n\n[hx] The run stops in " .. left .. ". Stop starting new work: your "
+		.. (if secs_left then "next" else "last") .. " reply gets no tools, so it must be your final answer."
 end
 
 local function next_call(s)
@@ -292,6 +295,7 @@ local function step(s, event, options)
 	end
 	if phase.overflow then error(phase.overflow, 0) end
 	s.phase = { kind = "model" }
+	if not options.submissions and (s.final_reply or s.report.turns + 1 >= s.max_turns) then req.tools = {} end
 	return s, { kind = "model", request = req, purpose = "agent" }
 end
 
