@@ -182,13 +182,13 @@ def dedupe(body):
     return f"Each names its mechanism.\nDuplicates: {', '.join(dupes) or 'none'}"
 
 
-def provider(reply, ideas=None):
+def provider(reply, ideas=None, judge=None):
     """A scripted endpoint whose idea calls answer with `ideas(body, label)` (default: an idea of its own per worker) and
     whose dedupe calls find identical ideas the same; every other request goes to `reply`."""
     def wrapped(body, index):
         role, label = role_of(body)
         if role == "idea": return (ideas or (lambda b, l: f"Dimensions: none.\nIDEA: the idea planned for worker {l}"))(body, label)
-        if role == "dedupe": return dedupe(body)
+        if role == "dedupe": return (judge or dedupe)(body)
         return reply(body, index)
     return harness.provider(wrapped)
 
@@ -1011,6 +1011,20 @@ def scenario_tie():
     assert len(ties) == 1 and not ties[0]["good"] and gate["chosen"][0] == ties[0]["candidate"] and len(gate["chosen"]) == 2, (gate, report["candidates"])
     assert {p["candidate"] for p in plans(records, "round2")} == set(gate["chosen"]), plans(records, "round2")
     check("a tie with the seed is not good and ranks by search; only the seed's own bytes are excluded (finding 9)")
+
+
+def scenario_stubborn_duplicates():
+    # Every idea call answers the same idea and the dedupe model notices nothing: the exact comparison still catches it,
+    # re-sampling cannot fix it, and the duplicates are dropped rather than planned twice.
+    path = workspace("dupes", {"x.txt": "0\n", "search.py": LINEAR % "x", "select.py": CONST}, workers(3, 1))
+    same = lambda body, label: "IDEA: " + go(7)
+    blind = lambda body: "Each names its mechanism.\nDuplicates: none"
+    with provider(lanes({"r1-w1": [7], "r1-w2": [7], "r1-w3": [7]}), ideas=same, judge=blind) as (url, _):
+        result = ar(path, url)
+    round1 = plans(journal_of(path), "round1")
+    assert len(round1) == 1 and round1[0]["idea"] == go(7), round1
+    assert "dropping 2 worker(s) whose idea stayed a duplicate" in result.stderr, result.stderr[-2000:]
+    check("ideas that stay identical after every re-sample are dropped, even when the dedupe model sees no duplicate")
 
 
 def scenario_interrupt():

@@ -897,13 +897,15 @@ impl Orchestrator {
 
     /// One idea per plan in `plans` (all of one kind: explore ideas, or refinements of one candidate from one state).
     /// Each is sampled with String Seed of Thought from its own OS seed, all side by side; one dedupe call then compares
-    /// them with each other and with `taken`. A duplicate is sampled again, with everything accepted so far listed as
-    /// taken, at most `RESAMPLES` times; then it is accepted as it is. A sample that fails is sampled again the same way.
-    async fn ideas(&self, plans: &mut [Plan], view: &View, taken: &[String]) -> Result<()> {
+    /// them with each other and with `taken`, after an exact comparison that needs no model. A duplicate is sampled again,
+    /// with everything accepted so far listed as taken, at most `RESAMPLES` times; one that is still a duplicate then is
+    /// dropped (its label is returned, its idea left unset): two workers on one idea is the waste planning exists to
+    /// avoid. A sample that fails is sampled again the same way, and a plan that never gets an idea stops the run.
+    async fn ideas(&self, plans: &mut [Plan], view: &View, taken: &[String]) -> Result<Vec<String>> {
         let host = self.planner()?;
         let mut accepted: Vec<String> = taken.to_vec();
         let mut todo: Vec<usize> = (0..plans.len()).collect();
-        let mut error = String::new();
+        let (mut error, mut dropped) = (String::new(), vec![]);
         for pass in 0..=RESAMPLES {
             let asks = todo.iter().map(|i| -> Result<Value> {
                 let plan = &plans[*i];
@@ -923,16 +925,23 @@ impl Orchestrator {
                     None => error = reply["error"].as_str().unwrap_or("an empty answer").to_string(),
                 }
             }
-            let dupes = if pass == RESAMPLES { vec![] } else { self.duplicates(&host, plans[0].role, &accepted, &fresh.iter().map(|i| plans[*i].idea.clone().unwrap_or_default()).collect::<Vec<_>>()).await };
+            let new: Vec<String> = fresh.iter().map(|i| plans[*i].idea.clone().unwrap_or_default()).collect();
+            let mut dupes = exact_duplicates(&accepted, &new);
+            for d in self.duplicates(&host, plans[0].role, &accepted, &new).await { if !dupes.contains(&d) { dupes.push(d); } }
             let again: Vec<usize> = todo.iter().copied().filter(|i| !fresh.contains(i) || dupes.contains(&(fresh.iter().position(|f| f == i).unwrap() + 1))).collect();
             accepted.extend(fresh.iter().filter(|i| !again.contains(i)).filter_map(|i| plans[*i].idea.clone()));
-            if again.is_empty() { return Ok(()); }
-            if pass < RESAMPLES { eprintln!("hx ar: sampling {} idea(s) again: {}", again.len(), if error.is_empty() { "duplicates" } else { &error }); }
+            if again.is_empty() { return Ok(dropped); }
+            if pass == RESAMPLES {
+                for i in again.iter().filter(|i| fresh.contains(i)) { plans[*i].idea = None; dropped.push(plans[*i].label.clone()); }
+                if !dropped.is_empty() { eprintln!("hx ar: dropping {} worker(s) whose idea stayed a duplicate: {}", dropped.len(), dropped.join(", ")); }
+            } else {
+                eprintln!("hx ar: sampling {} idea(s) again: {}", again.len(), if error.is_empty() { "duplicates" } else { &error });
+            }
             todo = again;
         }
-        let missing: Vec<&str> = plans.iter().filter(|p| p.idea.is_none()).map(|p| p.label.as_str()).collect();
+        let missing: Vec<&str> = plans.iter().filter(|p| p.idea.is_none() && !dropped.contains(&p.label)).map(|p| p.label.as_str()).collect();
         ensure!(missing.is_empty(), "could not plan an idea for {}: {error}", missing.join(", "));
-        Ok(())
+        Ok(dropped)
     }
 
     /// The new ideas (numbered from 1) that one dedupe call finds the same as a taken one or an earlier new one. A call
@@ -960,7 +969,8 @@ impl Orchestrator {
             // scored one is free again.
             let taken: Vec<String> = book.candidates.iter().filter(|(id, _)| book.evals.iter().any(|e| e.2 == *id && book.search(&e.3).is_some()))
                 .map(|c| c.1.clone()).collect();
-            self.ideas(&mut plans, &view, &taken).await?;
+            let dropped = self.ideas(&mut plans, &view, &taken).await?;
+            plans.retain(|p| !dropped.contains(&p.label));
             return Ok(plans);
         }
         let (decisions, chosen) = self.gated(None).unwrap_or_default();
@@ -982,6 +992,8 @@ impl Orchestrator {
         for group in futures::future::join_all(groups).await {
             for p in group? { if let Some(slot) = plans.iter_mut().find(|q| q.label == p.label) { *slot = p; } }
         }
+        // A refinement dropped as a duplicate leaves its worker without an idea: it does not run.
+        plans.retain(|p| p.idea.is_some());
         Ok(plans)
     }
 
@@ -1168,6 +1180,14 @@ fn idea_of(text: &str) -> Option<String> {
 }
 
 /// The numbers (1..=n) a dedupe call's last `Duplicates:` (or `Answer:`) line names; `none` or 0 is none.
+/// The new ideas (numbered from 1) that are, ignoring case and spacing, the same text as a taken idea or an earlier new
+/// one: no model call needed, so a model that fails to notice cannot let them through.
+fn exact_duplicates(taken: &[String], new: &[String]) -> Vec<usize> {
+    let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let mut seen: std::collections::HashSet<String> = taken.iter().map(|t| norm(t)).collect();
+    new.iter().enumerate().filter_map(|(i, t)| (!seen.insert(norm(t))).then_some(i + 1)).collect()
+}
+
 fn duplicates_of(text: &str, n: usize) -> Vec<usize> {
     let lower = text.to_ascii_lowercase();
     let Some(at) = lower.rfind("duplicates").or_else(|| lower.rfind("answer")) else { return vec![] };
@@ -1650,6 +1670,13 @@ mod tests {
             assert!(!dedupe.contains("{{") && !dedupe.contains("[[") && dedupe.contains("Duplicates: none"), "{dedupe}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exact_duplicates_need_no_model() {
+        let (taken, new) = (vec!["Use  a TRIE".to_string()], vec!["use a trie".into(), "hash map".into(), "Hash  Map".into(), "heap".into()]);
+        assert_eq!(exact_duplicates(&taken, &new), vec![1, 3]);
+        assert!(exact_duplicates(&[], &["a".into(), "b".into()]).is_empty());
     }
 
     #[test]
