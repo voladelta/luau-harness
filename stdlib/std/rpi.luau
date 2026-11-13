@@ -36,15 +36,23 @@ end
 local function instruction(name)
 	return hx.asset("std/rpi/common.md") .. "\n\n" .. hx.asset("std/rpi/" .. name .. ".md")
 end
-local function start(s, name, submission)
+-- A restarted stage is a fresh worker, so `cause` carries why it restarted ({text, artifacts}): the earlier documents it
+-- names become inputs (a draft, the reviewed document, the failing verification) and the text joins the instructions.
+local function start(s, name, submission, cause)
 	s.attempts[name] = (s.attempts[name] or 0) + 1
-	local refs = {}
-	for _, input in inputs[name] do
-		if s.artifacts[input] then table.insert(refs, s.artifacts[input]) end
+	local refs, seen = {}, {}
+	local function add(id)
+		if id and not seen[id] then seen[id] = true; table.insert(refs, id) end
+	end
+	for _, input in inputs[name] do add(s.artifacts[input]) end
+	local instructions = instruction(name)
+	if cause then
+		for _, id in cause.artifacts or {} do add(id) end
+		instructions ..= "\n\n<restart-cause>\n" .. cause.text .. "\n</restart-cause>"
 	end
 	s.stage = { id = name .. "-" .. s.attempts[name], name = name,
 		access = if name == "implementation" or name == "verification" or name == "repair" then "workspace" else "inspect",
-		inputs = refs, instructions = instruction(name), verify = name == "verification", artifact_name = artifact_names[name] }
+		inputs = refs, instructions = instructions, verify = name == "verification", artifact_name = artifact_names[name] }
 	s.corrections = 0
 	return boundary(s, { kind = "stage", stage = s.stage }, submission)
 end
@@ -63,11 +71,21 @@ local function next_stage(s, submission)
 	local i = position[name]
 	return start(s, route[i + 1], submission)
 end
-local function repair(s, submission)
+local function repair(s, submission, cause)
 	if s.repairs >= s.max_repairs then return finish(s, "stopped", "Repair limit exhausted; verification still has findings.", submission) end
 	s.repairs += 1
 	s.waived_checks = {}
-	return start(s, "repair", submission)
+	return start(s, "repair", submission, cause)
+end
+local function ids(list)
+	local out = {}
+	for _, id in list or {} do table.insert(out, "id=" .. tostring(id)) end
+	return table.concat(out, ", ")
+end
+local function bullets(list)
+	local out = {}
+	for _, item in list or {} do table.insert(out, "- " .. tostring(item)) end
+	return table.concat(out, "\n")
 end
 -- The host's stage.submit already refused a payload without a valid outcome, nonempty summary, evidence array, owner
 -- questions (when not complete) or well-formed checks (workflow.rs validate_submission). What remains is which fields
@@ -76,6 +94,8 @@ local function valid(payload, name)
 	if payload.outcome ~= "complete" then return nil end
 	if name == "program_design" then
 		if type(payload.checks) ~= "table" then return "Program design requires a structured checks array." end
+		-- Verification cannot pass an empty plan; accepting one would only spend every repair cycle.
+		if #payload.checks == 0 then return "Program design requires at least one executable check: verification cannot pass without one. Plan a command that checks the delivered result." end
 	elseif name == "verification" then
 		if type(payload.findings) ~= "table" then return "Verification requires a findings array (empty only when clean)." end
 		if type(payload.verification) ~= "table" then return "Host verification evidence is missing." end
@@ -109,8 +129,9 @@ end
 local function packet(s, event)
 	local parts = { s.stage.instructions }
 	if s.stage.name == "repair" then
+		-- Only the latest verification is the rejection being repaired; older ones were already repaired.
 		for _, artifact in event.artifacts or {} do
-			if artifact.name == "verification" and type(artifact.submission) == "table" then
+			if artifact.id == s.artifacts.verification and type(artifact.submission) == "table" then
 				local sub = artifact.submission
 				local v = if type(sub.verification) == "table" then sub.verification else nil
 				local host_findings = if v and type(v.findings) == "table" then v.findings else {}
@@ -150,12 +171,6 @@ function M.step(s, event)
 		for _, artifact in event.artifacts or {} do
 			if artifact.name == "request" then s.artifacts.request = artifact.id end
 		end
-		if type(event.sealed) == "table" then
-			-- Host may replace provisional submission refs with canonical artifact refs.
-			for name, id in s.artifacts do
-				if id == event.sealed.submission then s.artifacts[name] = event.sealed.id end
-			end
-		end
 		if type(event.stage) ~= "table" then return s, { kind = "next" } end
 		s.stage = event.stage
 		-- First boundary is created before the host request artifact exists.
@@ -169,23 +184,27 @@ function M.step(s, event)
 		assert(request and request.gate_id == s.pending.gate_id, "unexpected owner decision")
 		local continuation = request.continuation
 		s.pending = nil
+		-- The gate's artifact is the document it showed the owner: a draft, a reviewed document or a verification.
+		local shown = request.artifacts or {}
+		local feedback = "The owner's " .. tostring(event.decision) .. " is the latest entry in <owner-inputs>."
 		if event.decision == "revise" then
 			s.waived_checks = {}
-			if s.stage.name == "verification" then return repair(s) end
+			if s.stage.name == "verification" then
+				return repair(s, nil, { artifacts = shown, text = "The owner did not accept the verified result (artifact " .. ids(shown) .. "). " .. feedback .. " Repair what the feedback asks for." })
+			end
 			local p = position[s.stage.name]
 			for i = p + 1, #route do s.artifacts[route[i]] = nil end
 			s.artifacts.repair = nil
-			return start(s, s.stage.name)
+			return start(s, s.stage.name, nil, { artifacts = shown, text = "The owner asked for a revision of this stage's document (artifact " .. ids(shown) .. "). " .. feedback .. " Revise that document; keep what the feedback does not change." })
 		elseif continuation == "finish" then
-			if request.kind == "input" and s.mode == "manual" then return gate(s, "acceptance", {}, {}, "finish") end
 			return finish(s, "completed", "Implementation verified and accepted.")
 		elseif continuation == "manual_results" then
 			if event.decision == "waive" then
 				for _, id in request.check_ids do s.waived_checks[id] = true end
 			end
-			return start(s, "verification")
+			return start(s, "verification", nil, { artifacts = shown, text = "The previous verification (artifact " .. ids(shown) .. ") asked the owner about manual checks " .. table.concat(request.check_ids or {}, ", ") .. ":\n" .. bullets(request.questions) .. "\n" .. feedback .. " Verify afresh; record waived checks as waived, not passed." })
 		elseif continuation == "same_stage" then
-			return start(s, s.stage.name)
+			return start(s, s.stage.name, nil, { artifacts = shown, text = "Your previous attempt at this stage paused for owner input; its draft is artifact " .. ids(shown) .. ". It asked:\n" .. bullets(request.questions) .. "\n" .. feedback .. " Continue from the draft rather than starting over." })
 		else
 			return next_stage(s)
 		end
@@ -201,9 +220,10 @@ function M.step(s, event)
 	if outcome.kind == "command" then
 		local result = if event.kind == "run_result" then event.result else nil
 		local error_text = if result and type(result.error) == "string" then result.error else ""
-		if result and (result.submission_error == true or error_text:find("stage.submit", 1, true) or error_text:find("submission", 1, true)) then
+		-- The host sets submission_error only when stage.submit itself raised; other errors are ordinary feedback.
+		if result and result.submission_error == true then
 			s.corrections += 1
-			if s.corrections >= MAX_CORRECTIONS then return finish(s, "stopped", "Stage submission protocol failed: " .. error_text) end
+			if s.corrections >= MAX_CORRECTIONS then return finish(s, "stopped", "Stage submission protocol failed: " .. (if error_text ~= "" then error_text else "stage.submit refused the payload")) end
 		end
 		return s, outcome.command
 	end
@@ -218,10 +238,13 @@ function M.step(s, event)
 	if payload.outcome ~= "complete" then return gate(s, "input", payload.questions, {}, "same_stage", submission.id) end
 	if s.stage.name == "repair" and type(payload.redesign_stage) == "string" then
 		local name = payload.redesign_stage
+		-- The redesign sees the design it replaces, the failing verification and this repair's diagnosis.
+		local evidence = { s.artifacts[name], s.artifacts.verification, submission.id }
 		-- The repair entry already consumed one cycle; returning to design cannot reset it.
 		for i = position[name], #route do s.artifacts[route[i]] = nil end
 		s.artifacts.repair = nil
-		return start(s, name, submission.id)
+		return start(s, name, submission.id, { artifacts = evidence, text = "Repair (artifact id=" .. submission.id .. ") found that verification (artifact id="
+			.. tostring(evidence[2]) .. ") failed because of this design (artifact id=" .. tostring(evidence[1]) .. "). Revise the design to resolve those findings; keep decisions they do not affect. Downstream stages restart from your revision." })
 	end
 	if s.stage.name == "verification" then
 		local verification = payload.verification

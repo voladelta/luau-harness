@@ -18,7 +18,7 @@ hx run --rpi --prompt-file task.md --model MODEL
 hx run --rpi --manual --prompt-file task.md --model MODEL
 ```
 
-> **Git required.** `--rpi` requires the workspace to be an initialized Git repository (with a `.git` root) and an appropriate `.gitignore`. The harness uses Git's inventory (`git ls-files --exclude-standard`) to track source modifications without being invalidated by build outputs (`build/`, `target/`, `*.o`). Unversioned directories are rejected at launch with an explicit error.
+> **Git required.** `--rpi` requires the workspace to be an initialized Git repository (with a `.git` root) and an appropriate `.gitignore`. The harness uses Git's inventory (`git ls-files --exclude-standard`) to track source modifications without being invalidated by build outputs (`build/`, `target/`, `*.o`). Unversioned directories are rejected at launch with an explicit error, as is an inventory entry verification could not observe (such as a tracked symlink pointing outside the project), named so you can remove or untrack it. Submodules and nested Git repositories are recorded as unobserved: their presence is checked, their files are not, and launch prints a note listing them.
 
 ### Automatic and manual mode
 
@@ -50,7 +50,7 @@ Resume restores the frozen workflow mode, sources and budgets, so do not repeat 
 
 Research and design stages can inspect source and approved read-only web tools but cannot execute shell commands or change the project. Implementation, verification and repair use the run's ordinary permissions.
 
-Verification checks exact planned commands, successful receipts and a bounded source inventory. This does not establish a hermetic build or protect against every concurrent external writer. See [runtime details](runtime-v2.md#rpi-workflow).
+Program design must plan at least one executable check. Verification checks exact planned commands, successful receipts and a bounded source inventory; a project it cannot observe fails verification with the reason, so repair can fix it. This does not establish a hermetic build or protect against every concurrent external writer. See [runtime details](runtime-v2.md#rpi-workflow).
 
 ## Autoresearch
 

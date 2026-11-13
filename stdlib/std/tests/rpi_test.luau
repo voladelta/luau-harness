@@ -8,16 +8,22 @@ local function initial(mode, max_turns)
 	s, command = rpi.step(s, { kind = "next" })
 	return s, command
 end
-local function deliver(s, command, owner_inputs)
+local function deliver(s, command, owner_inputs, artifacts)
+	local all = { { id = "request", name = "request", document = "Add a feature" } }
+	for _, a in artifacts or {} do table.insert(all, a) end
 	return rpi.step(s, { kind = "boundary_ready", stage = command.next.stage, sealed = if type(newproxy) == "function" then newproxy() else nil,
-		artifacts = { { id = "request", name = "request", document = "Add a feature" } }, owner_inputs = owner_inputs or {} })
+		artifacts = all, owner_inputs = owner_inputs or {} })
 end
 local function submit(s, payload, id)
 	s.worker.phase = { kind = "run", calls = { { id = "call", name = "luau", input = { code = "stage.submit({})" } }, { id = "trailing", name = "luau", input = { code = "error('must not run')" } } }, index = 1 }
 	return rpi.step(s, { kind = "run_result", result = { ops = 0, feedback = "accepted", submission = { id = id or s.stage.id, payload = payload } } })
 end
 local function complete(name)
-	return { outcome = "complete", summary = name, evidence = {}, checks = {}, findings = {}, verification = { passed = true, findings = {} } }
+	return { outcome = "complete", summary = name, evidence = {}, checks = { { id = "unit", command = "true" } }, findings = {}, verification = { passed = true, findings = {} } }
+end
+local function has(list, value)
+	for _, v in list do if v == value then return true end end
+	return false
 end
 
 test.case("auto runs all stages with fresh workers and explicit verification", function()
@@ -156,12 +162,98 @@ test.case("redesign detours consume existing repair budget and invalidate downst
 	test.eq(s.artifacts.verification, nil)
 end)
 
+test.case("program design with an empty check plan is a correctable error", function()
+	local s, command = initial()
+	for _ = 1, 3 do s = deliver(s, command); s, command = submit(s, complete("phase")) end
+	test.eq(s.stage.name, "program_design")
+	s = deliver(s, command)
+	local payload = complete("no checks")
+	payload.checks = {}
+	s, command = submit(s, payload)
+	test.ok(command.kind ~= "boundary")
+	test.eq(s.corrections, 1)
+	test.ok(s.messages[#s.messages].content:find("at least one executable check", 1, true))
+end)
+
+test.case("only stage.submit's own failure counts as a protocol failure", function()
+	local s, command = initial()
+	s = deliver(s, command)
+	for _ = 1, 4 do
+		s.worker.phase = { kind = "run", calls = { { id = "read" } }, index = 1 }
+		s, command = rpi.step(s, { kind = "run_result", result = { ops = 0, feedback = "failed", error = "read src/submission_form.py: stage.submit not found" } })
+	end
+	test.ok(command.kind ~= "boundary")
+	test.eq(s.corrections, 0)
+end)
+
+test.case("answered input restarts with the draft and its questions", function()
+	local s, command = initial()
+	s = deliver(s, command)
+	s, command = submit(s, { outcome = "needs_input", document = "draft", summary = "Need API", evidence = {}, questions = { "Which API version?" } }, "draft-1")
+	local request = command.next.request
+	test.eq(request.artifacts[1], "draft-1")
+	s, command = rpi.step(s, { kind = "owner_decision", decision = "answer", request = request, text = "v2" })
+	local stage = command.next.stage
+	test.ok(has(stage.inputs, "draft-1"))
+	test.ok(stage.instructions:find("Which API version?", 1, true))
+	test.ok(stage.instructions:find("<restart-cause>", 1, true))
+	s = deliver(s, command, { { decision = "answer", text = "v2" } }, { { id = "draft-1", name = "research_questions", document = "DRAFT_BODY" } })
+	test.ok(s.messages[1].content:find("DRAFT_BODY", 1, true))
+	test.ok(s.messages[1].content:find("Which API version?", 1, true))
+end)
+
+test.case("owner revision restarts with the reviewed document", function()
+	local s, command = initial("manual")
+	s = deliver(s, command)
+	s, command = submit(s, complete("questions"), "reviewed-1")
+	s, command = rpi.step(s, { kind = "owner_decision", request = command.next.request, decision = "revise", text = "narrow it" })
+	test.eq(command.next.stage.name, "research_questions")
+	test.ok(has(command.next.stage.inputs, "reviewed-1"))
+	test.ok(command.next.stage.instructions:find("revision", 1, true))
+end)
+
+test.case("redesign sees the failing verification and the repair diagnosis", function()
+	local s, command = initial()
+	local names = { "research_questions", "research", "system_design", "program_design", "implementation" }
+	for _, name in names do s = deliver(s, command); s, command = submit(s, complete(name), name .. "-doc") end
+	s = deliver(s, command)
+	local payload = complete("failed verification")
+	payload.findings = { "wrong design assumption" }
+	s, command = submit(s, payload, "verify-1")
+	s = deliver(s, command)
+	payload = complete("needs redesign")
+	payload.redesign_stage = "program_design"
+	s, command = submit(s, payload, "repair-1")
+	local stage = command.next.stage
+	test.eq(stage.name, "program_design")
+	for _, id in { "program_design-doc", "verify-1", "repair-1", "system_design-doc" } do test.ok(has(stage.inputs, id), id) end
+	test.ok(stage.instructions:find("repair-1", 1, true))
+end)
+
+test.case("repair shows only the latest verification as the rejection", function()
+	local s, command = initial()
+	for _ = 1, 5 do s = deliver(s, command); s, command = submit(s, complete("phase")) end
+	local history = {}
+	for cycle = 1, 2 do
+		s = deliver(s, command)
+		local payload = complete("failed verification")
+		payload.verification = { passed = false, findings = { "FINDING_CYCLE_" .. cycle } }
+		s, command = submit(s, payload, "verify-" .. cycle)
+		table.insert(history, { id = "verify-" .. cycle, name = "verification", document = "verification " .. cycle, submission = payload })
+		s = deliver(s, command, {}, history)
+		if cycle == 1 then s, command = submit(s, complete("repair"), "repair-1") end
+	end
+	local text = s.messages[1].content
+	test.ok(text:find("FINDING_CYCLE_2", 1, true))
+	test.ok(not text:find("FINDING_CYCLE_1", 1, true))
+end)
+
 test.case("submission validation errors count across unrelated successful tool calls", function()
 	local s, command = initial()
 	s = deliver(s, command)
 	for i = 1, 3 do
 		s.worker.phase = { kind = "run", calls = { { id = "invalid" } }, index = 1 }
-		s, command = rpi.step(s, { kind = "run_result", result = { ops = 0, feedback = "invalid", error = "stage.submit: malformed payload" } })
+		s, command = rpi.step(s, { kind = "run_result", result = { ops = 0, feedback = "invalid", error = "stage.submit: malformed payload", submission_error = true } })
 		if i < 3 then
 			s.worker.phase = { kind = "run", calls = { { id = "ordinary" } }, index = 1 }
 			s, command = rpi.step(s, { kind = "run_result", result = { ops = 1, feedback = "read succeeded" } })

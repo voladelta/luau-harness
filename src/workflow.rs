@@ -13,8 +13,34 @@ use std::{
 pub struct WorkflowConfig {
     pub name: String,
     pub version: u32,
-    pub mode: String,
+    pub mode: WorkflowMode,
     pub max_repairs: u8,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMode {
+    Auto,
+    Manual,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    Review,
+    Input,
+    Acceptance,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Approve,
+    Revise,
+    Answer,
+    Waive,
+}
+impl Decision {
+    pub fn parse(value: &str) -> Result<Self> {
+        serde_json::from_value(json!(value)).map_err(|_| anyhow::anyhow!("unknown review decision {value:?}"))
+    }
 }
 /// Repair cycles an RPI run may spend after failed verification. The frozen workflow config carries it to std/rpi.
 pub const MAX_REPAIRS: u8 = 3;
@@ -23,7 +49,7 @@ impl Default for WorkflowConfig {
         Self {
             name: "rpi".into(),
             version: 1,
-            mode: "auto".into(),
+            mode: WorkflowMode::Auto,
             max_repairs: MAX_REPAIRS,
         }
     }
@@ -33,10 +59,6 @@ impl WorkflowConfig {
         ensure!(
             self.name == "rpi" && self.version == 1,
             "unsupported workflow configuration"
-        );
-        ensure!(
-            matches!(self.mode.as_str(), "auto" | "manual"),
-            "workflow mode must be auto or manual"
         );
         ensure!(self.max_repairs <= MAX_REPAIRS, "workflow repair limit exceeds {MAX_REPAIRS}");
         Ok(())
@@ -66,17 +88,17 @@ pub struct StageSpec {
 #[serde(deny_unknown_fields)]
 pub struct ReviewRequest {
     pub gate_id: String,
-    pub kind: String,
+    pub kind: GateKind,
     #[serde(default)]
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub questions: Vec<String>,
     #[serde(default)]
     pub check_ids: Vec<String>,
-    pub decisions: Vec<String>,
+    pub decisions: Vec<Decision>,
     pub continuation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<ProjectObservation>,
+    pub project: Option<ProjectRef>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -114,7 +136,7 @@ pub struct ArtifactRef {
 pub struct OwnerInputRef {
     pub id: String,
     pub gate_id: String,
-    pub decision: String,
+    pub decision: Decision,
     pub content_blob: Option<String>,
     #[serde(default)]
     pub check_ids: Vec<String>,
@@ -140,10 +162,18 @@ pub struct ExecutionFrame {
     pub consumed_decisions: Vec<String>,
     pub stage_epoch: u64,
     pub check_plan: Vec<PlannedCheck>,
-    pub evidence: Vec<CheckEvidence>,
     pub boundaries: BTreeMap<String, String>,
-    pub observation: Option<ProjectObservation>,
+    /// The verify stage's starting observation, by reference: the inventory itself lives once in a blob.
+    pub observation: Option<ProjectRef>,
     pub root_turns: u64,
+    /// Process-local: `stage.submit` itself raised during the current chunk, so the chunk's error is a protocol
+    /// failure rather than ordinary tool feedback that merely mentions a submission.
+    #[serde(skip)]
+    pub submit_failed: bool,
+    /// Process-local: the observation the latest verify-stage effect record carries. A shell intent reuses it when no
+    /// other effect intent intervened, so each check hashes the project once (after it ran) instead of twice.
+    #[serde(skip)]
+    pub last_observation: Option<ProjectRef>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -173,6 +203,34 @@ pub struct ProjectObservation {
     pub root: PathBuf,
     #[serde(default)]
     pub extra_inputs: Vec<String>,
+}
+/// Inventory value of a submodule or nested Git repository: its presence is observed, its contents are not.
+pub const UNOBSERVED_REPOSITORY: &str = "unobserved:repository";
+impl ProjectObservation {
+    pub fn unobserved(&self) -> Vec<String> {
+        self.inventory.iter().filter(|(_, v)| *v == UNOBSERVED_REPOSITORY).map(|(k, _)| k.clone()).collect()
+    }
+    /// Store the full inventory (one hash per file) once as a blob; records, prompts and checkpoints carry the reference.
+    pub fn record(&self, log: &crate::eventlog::EventLog) -> Result<ProjectRef> {
+        Ok(ProjectRef {
+            digest: self.digest.clone(),
+            blob: log.blob(&serde_json::to_vec(self)?)?,
+            extra_inputs: self.extra_inputs.clone(),
+            unobserved: self.unobserved(),
+        })
+    }
+}
+/// What effect records, the frame and acceptance gates keep of an observation. Only the digest is compared;
+/// `extra_inputs` reproduces the observation and `blob` holds the inventory for audit.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectRef {
+    pub digest: String,
+    #[serde(default)]
+    pub blob: String,
+    #[serde(default)]
+    pub extra_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unobserved: Vec<String>,
 }
 
 fn identifier(value: &str) -> Result<()> {
@@ -281,7 +339,7 @@ pub fn planned_checks(value: &Value) -> Result<Vec<PlannedCheck>> {
             ensure!(
                 check
                     .timeout
-                    .is_none_or(|t| t.is_finite() && (1.0..=600.0).contains(&t)),
+                    .is_none_or(|t| t.is_finite() && (1.0..=SH_TIMEOUT_MAX).contains(&t)),
                 "invalid check timeout"
             );
             Ok(check)
@@ -290,23 +348,21 @@ pub fn planned_checks(value: &Value) -> Result<Vec<PlannedCheck>> {
 }
 pub fn validate_review_decision(
     request: &ReviewRequest,
-    decision: &str,
+    decision: Decision,
     input: Option<&str>,
 ) -> Result<()> {
     identifier(&request.gate_id)?;
     ensure!(
-        request.decisions.iter().any(|d| d == decision),
+        request.decisions.contains(&decision),
         "decision is not permitted by this gate"
     );
     let valid = match decision {
-        "approve" => matches!(request.kind.as_str(), "review" | "acceptance"),
-        "revise" => matches!(request.kind.as_str(), "review" | "acceptance"),
-        "answer" => request.kind == "input",
-        "waive" => request.kind == "input" && !request.check_ids.is_empty(),
-        _ => false,
+        Decision::Approve | Decision::Revise => matches!(request.kind, GateKind::Review | GateKind::Acceptance),
+        Decision::Answer => request.kind == GateKind::Input,
+        Decision::Waive => request.kind == GateKind::Input && !request.check_ids.is_empty(),
     };
     ensure!(valid, "decision is invalid for this gate kind");
-    if matches!(decision, "revise" | "answer" | "waive") {
+    if decision != Decision::Approve {
         ensure!(
             input.is_some_and(|s| !s.trim().is_empty()),
             "decision requires feedback in --input-file"
@@ -318,6 +374,9 @@ pub fn validate_review_decision(
     );
     Ok(())
 }
+/// `sh`'s default and maximum timeout. prims.rs keeps its copies private; a planned check is compared as `sh` clamps it.
+const SH_TIMEOUT: f64 = 60.0;
+const SH_TIMEOUT_MAX: f64 = 600.0;
 pub fn validate_check_receipt(
     check: &PlannedCheck,
     intent: &Value,
@@ -366,10 +425,10 @@ pub fn validate_check_receipt(
     );
     let actual_timeout = intent["args"]["timeout"]
         .as_f64()
-        .unwrap_or(60.0)
-        .clamp(1.0, 600.0);
+        .unwrap_or(SH_TIMEOUT)
+        .clamp(1.0, SH_TIMEOUT_MAX);
     ensure!(
-        actual_timeout == check.timeout.unwrap_or(60.0),
+        actual_timeout == check.timeout.unwrap_or(SH_TIMEOUT),
         "check timeout differs from plan"
     );
     let cwd = |s: Option<&str>| -> Result<PathBuf> {
@@ -509,7 +568,8 @@ pub(crate) fn git_inventory(root: &Path) -> Result<Option<Vec<PathBuf>>> {
         bytes
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
-            .map(|s| PathBuf::from(std::ffi::OsString::from_vec(s.to_vec())))
+            // Git lists an untracked nested repository as `dir/`.
+            .map(|s| PathBuf::from(std::ffi::OsString::from_vec(s.strip_suffix(b"/").unwrap_or(s).to_vec())))
             .collect(),
     ))
 }
@@ -526,7 +586,9 @@ pub fn observe_project(
         .iter()
         .map(|p| p.strip_prefix(&root).unwrap_or(p).to_path_buf())
         .collect();
-    let mut paths: BTreeSet<PathBuf> = match git_inventory(&root)? {
+    let git = git_inventory(&root)?;
+    let from_git = git.is_some();
+    let mut paths: BTreeSet<PathBuf> = match git {
         Some(paths) => paths.into_iter().collect(),
         None => {
             let exclude = exclusions.clone();
@@ -586,7 +648,7 @@ pub fn observe_project(
             if parent.exists() {
                 ensure!(
                     std::fs::canonicalize(parent)?.starts_with(&root),
-                    "inventory parent escapes project"
+                    "inventory parent escapes project: {name}"
                 );
             }
         }
@@ -604,7 +666,7 @@ pub fn observe_project(
             if let Ok(resolved) = std::fs::canonicalize(&resolved) {
                 ensure!(
                     resolved.starts_with(&root),
-                    "inventory symlink escapes project"
+                    "inventory symlink escapes project: {name}"
                 );
             } else {
                 ensure!(
@@ -612,7 +674,7 @@ pub fn observe_project(
                         && target
                             .components()
                             .all(|c| !matches!(c, Component::ParentDir)),
-                    "unresolved inventory symlink escapes scope"
+                    "unresolved inventory symlink escapes scope: {name}"
                 );
             }
             format!(
@@ -653,8 +715,12 @@ pub fn observe_project(
                 before.mode() & 0o111,
                 crate::eventlog::sha_bytes(&bytes)
             )
+        } else if meta.is_dir() && from_git {
+            // Git lists a directory only for a submodule or a nested repository. Its files belong to another
+            // inventory; recording the boundary keeps the exclusion explicit instead of failing verification late.
+            UNOBSERVED_REPOSITORY.into()
         } else {
-            anyhow::bail!("unsupported project inventory entry: {name}");
+            anyhow::bail!("unsupported project inventory entry (not a regular file or symlink): {name}");
         };
         inventory.insert(name, hash);
     }
@@ -904,6 +970,49 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn nested_repositories_are_recorded_unobserved_and_escapes_name_their_entry() {
+        use std::process::Command;
+        let root = workspace("nested-repo");
+        let git = |dir: &Path, args: &[&str]| assert!(Command::new("git").args(args).current_dir(dir).status().unwrap().success());
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join("app.js"), "one").unwrap();
+        let nested = root.join("vendor/lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q"]);
+        std::fs::write(nested.join("code.js"), "nested").unwrap();
+        let first = observe_project(&root, &[], &[]).unwrap();
+        assert_eq!(first.inventory["vendor/lib"], UNOBSERVED_REPOSITORY);
+        assert_eq!(first.unobserved(), vec!["vendor/lib".to_string()]);
+        assert!(!first.inventory.keys().any(|k| k.starts_with("vendor/lib/")));
+        std::os::unix::fs::symlink("/etc/passwd", root.join("escape")).unwrap();
+        let error = observe_project(&root, &[], &[]).unwrap_err().to_string();
+        assert!(error.contains("escape"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn project_refs_keep_the_digest_and_read_full_legacy_observations() {
+        let root = workspace("project-ref");
+        std::fs::write(root.join("app.js"), "one").unwrap();
+        let log = crate::eventlog::EventLog::open(&root.join(".harness/log")).unwrap();
+        let observation = observe_project(&root, &[], &[]).unwrap();
+        let reference = observation.record(&log).unwrap();
+        assert_eq!(reference.digest, observation.digest);
+        let stored: ProjectObservation = serde_json::from_slice(&crate::eventlog::read_blob(log.dir(), &reference.blob).unwrap()).unwrap();
+        assert_eq!(stored, observation);
+        let legacy: ProjectRef = serde_json::from_value(serde_json::to_value(&observation).unwrap()).unwrap();
+        assert_eq!(legacy.digest, observation.digest);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn gate_decisions_are_typed() {
+        let request: ReviewRequest = serde_json::from_value(json!({"gate_id":"g","kind":"input","decisions":["answer"],"continuation":"same_stage"})).unwrap();
+        validate_review_decision(&request, Decision::parse("answer").unwrap(), Some("v2")).unwrap();
+        assert!(validate_review_decision(&request, Decision::Approve, None).is_err());
+        assert!(Decision::parse("accept").is_err());
+        assert!(serde_json::from_value::<ReviewRequest>(json!({"gate_id":"g","kind":"other","decisions":["answer"],"continuation":"x"})).is_err());
+        assert!(serde_json::from_value::<WorkflowConfig>(json!({"name":"rpi","version":1,"mode":"fast","max_repairs":3})).is_err());
+    }
+    #[test]
     fn evidence_requires_success_exact_invocation_and_fresh_revision() {
         let root = workspace("evidence");
         let observation = observe_project(&root, &[], &[]).unwrap();
@@ -997,10 +1106,6 @@ impl Boundary {
             }
             BoundaryNext::Review { request } => {
                 identifier(&request.gate_id)?;
-                ensure!(
-                    matches!(request.kind.as_str(), "review" | "input" | "acceptance"),
-                    "invalid review gate kind"
-                );
                 identifier(&request.continuation)?;
                 ensure!(
                     !request.decisions.is_empty(),
@@ -1010,7 +1115,7 @@ impl Boundary {
                 for decision in &request.decisions {
                     ensure!(decisions.insert(decision), "duplicate gate decision");
                     // Feedback is validated at decision recording; here validate the declared action shape.
-                    validate_review_decision(request, decision, Some("gate validation"))?;
+                    validate_review_decision(request, *decision, Some("gate validation"))?;
                 }
                 for id in request.artifacts.iter().chain(&request.check_ids) {
                     identifier(id)?;

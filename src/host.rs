@@ -380,7 +380,8 @@ impl Host {
                     let mut result=vm.as_ref().unwrap().run_chunk(&code).await?;
                     if workflow {
                         if let Some(submission)=self.supervisor.finish_stage_chunk(result["error"].is_null()) {result["submission"]=submission;}
-                        if result["error"].as_str().is_some_and(|e|e.contains("stage.submit") || e.contains("submission")) {result["submission_error"]=json!(true);}
+                        // Only stage.submit's own refusal is a protocol failure; ordinary errors are tool feedback whatever they mention.
+                        if self.supervisor.take_submit_failure() {result["submission_error"]=json!(true);}
                     }
                     let notifications=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"tools":[]}))?;
                     event=Event::RunResult{result,notifications:notifications["messages"].clone()}.to_json();
