@@ -237,3 +237,41 @@ test.case("hooks.state survives in-place changes and reassignment", function()
 	test.eq(s.hook_state.replies, 2) -- counted by reassignment
 	test.eq(s.hook_state.runs, 1) -- counted in place since the last reassignment
 end)
+
+local function three_calls(s)
+	return loop.step(s, { kind = "model_reply", system_chars = SYSTEM, reply = { text = "", finish = "stop", input = 10, output = 1,
+		calls = { { id = "a", name = "luau", input = { code = "x=1" } }, { id = "b", name = "luau", input = { code = "y=2" } },
+			{ id = "c", name = "luau", input = { code = "z=3" } } } } })
+end
+
+local function tool_ids(s)
+	local ids = {}
+	for _, m in s.messages do if m.role == "tool" then table.insert(ids, m.id) end end
+	return table.concat(ids, ",")
+end
+
+test.case("recover answers every pending call of the interrupted reply and runs none of them", function()
+	local s, command = start()
+	s, command = three_calls(s)
+	test.eq(command.kind, "run")
+	s, command = loop.step(s, { kind = "recover", message = "RECEIPTS" })
+	test.eq(command.kind, "next")
+	test.eq(tool_ids(s), "a,b,c")
+	test.eq(s.messages[#s.messages].content, "RECEIPTS")
+	s, command = loop.step(s, { kind = "next" })
+	test.eq(command.purpose, "agent")
+end)
+
+test.case("a native submission answers the trailing calls without running them", function()
+	local s, outcome = start()
+	s, outcome = loop.advance(s, { kind = "model_reply", system_chars = SYSTEM, reply = { text = "", finish = "stop", input = 10, output = 1,
+		calls = { { id = "a", name = "luau", input = { code = "stage.submit{}" } }, { id = "b", name = "luau", input = { code = "y=2" } },
+			{ id = "c", name = "luau", input = { code = "z=3" } } } } }, { submissions = true })
+	test.eq(outcome.command.kind, "run")
+	s, outcome = loop.advance(s, { kind = "run_result", result = { ops = 1, feedback = "ok", submission = { id = "S1" } } }, { submissions = true })
+	test.eq(outcome.kind, "submission")
+	test.eq(outcome.submission.id, "S1")
+	test.eq(tool_ids(s), "a,b,c")
+	test.ok(s.messages[#s.messages].content:find("not executed", 1, true))
+	test.eq(#s.report.ops_per_turn, 1) -- only the submitting chunk ran
+end)
