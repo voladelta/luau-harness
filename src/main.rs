@@ -894,12 +894,12 @@ mod tests {
             .unwrap_or_else(|| if n == 20 { "twenty".into() } else { panic!("no word for {n}") });
         let thousands = |n: usize| { let s = n.to_string(); if s.len() > 3 { format!("{},{}", &s[..s.len() - 3], &s[s.len() - 3..]) } else { s } };
         let compact = modules::Resolver::embedded("std", "compact.luau").unwrap();
-        let window = luau_number(&compact, "M.context_window = ") as usize;
-        let trigger = format!("{}%", (luau_number(&compact, "M.trigger_ratio = ") * 100.0).round());
-        let reserve_max = luau_number(&compact, "M.reserve_tokens = ") as usize;
-        let reserve_min = luau_number(&compact, "math.max(") as usize;
-        let retry_turns = luau_number(&compact, "M.retry_turns = ") as usize;
-        let reserve_share = match luau_number(&compact, "math.floor(window / ") as usize { 8 => "an eighth", 4 => "a quarter", d => panic!("1/{d}") };
+        let window = luau_number(compact, "M.context_window = ") as usize;
+        let trigger = format!("{}%", (luau_number(compact, "M.trigger_ratio = ") * 100.0).round());
+        let reserve_max = luau_number(compact, "M.reserve_tokens = ") as usize;
+        let reserve_min = luau_number(compact, "math.max(") as usize;
+        let retry_turns = luau_number(compact, "M.retry_turns = ") as usize;
+        let reserve_share = match luau_number(compact, "math.floor(window / ") as usize { 8 => "an eighth", 4 => "a quarter", d => panic!("1/{d}") };
         let (readme, cli, config) = (include_str!("../README.md"), include_str!("../docs/cli.md"), include_str!("../docs/configuration.md"));
         let (runtime, extending, workflows) = (include_str!("../docs/runtime-v2.md"), include_str!("../docs/extending.md"), include_str!("../docs/workflows.md"));
         let checks = [
