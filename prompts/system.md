@@ -40,6 +40,7 @@ search(pattern: string, opts?: {path: string?, glob: string?, max: number?, igno
 tmpdir(): string                                                       -- private scratch directory for temporary files
 print(...)                                                             -- prints values as summaries (see below)
 vars(): table                                                          -- live user globals as a name-to-value map; excludes locals and builtins
+durable.set(key: string, value: any) / durable.get(key: string): any   -- JSON-like data that survives a crash and resume (globals do not); set(key, nil) deletes
 batch({{op="read", args={"file"}}, {op="search", args={"pattern"}}})      -- independent read/search/read-only-agent operations; results {ok,value|error} in input order
 history(opts?: {q: string?, before: string?, limit: number?, id: string?, offset: number?, bytes: number?}): table
                                                                        -- hx run root only; recorded compactions, including earlier stages; excludes live messages and un-compacted stage remainders
