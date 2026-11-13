@@ -675,9 +675,15 @@ impl Vm {
             }
             let owner = supervisor.clone();
             let epoch = supervisor.workflow_epoch();
-            stage.set("submit",lua.create_function(move |_,value:Value| {
-                let payload=crate::values::copy_out(value)?;
-                owner.submit_stage(epoch,payload).map_err(mlua::Error::external)
+            // Preparing a submission hashes the project and reads the journal: blocking work, kept off the VM's thread.
+            stage.set("submit",lua.create_async_function(move |_,value:Value| {
+                let owner = owner.clone();
+                let payload = crate::values::copy_out(value);
+                async move {
+                    let payload = payload?;
+                    tokio::task::spawn_blocking(move || owner.submit_stage(epoch, payload)).await
+                        .map_err(mlua::Error::external)?.map_err(mlua::Error::external)
+                }
             })?)?;
             stage.set_readonly(true);
             g.set("stage",stage)?;
