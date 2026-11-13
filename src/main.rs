@@ -233,6 +233,15 @@ fn confirm(question: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() {
+    // Every panic takes the crash path, which resume already handles: an executor that panics after its intent is
+    // journaled must not leave the run going with an open intent nothing treats as uncertain, which is what mlua's
+    // conversion of a callback panic into a Luau error would do. (`panic = "abort"` in the profile cannot do this:
+    // Luau raises its errors as C++ exceptions through Rust frames, which an abort strategy turns into a crash.)
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        std::process::abort();
+    }));
     prims::stop_on_signals();
     if let Err(e) = real_main().await {
         eprintln!("Error: {e}");
