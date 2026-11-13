@@ -18,6 +18,13 @@ local function copy_data(value)
 	return result
 end
 
+-- The longest prefix of `text` within `max` bytes that ends on a character boundary: state crosses a data boundary
+-- that accepts only valid UTF-8.
+local function clip(text: string, max: number): string
+	if #text <= max then return text end
+	return text:sub(1, utf8.offset(text, 0, max + 1) - 1)
+end
+
 local function code_of(call)
 	return if type(call.input) == "table" and type(call.input.code) == "string" then call.input.code else nil
 end
@@ -182,14 +189,14 @@ local function step(s, event, options)
 			if text:match("^%s*$") or resp.finish == "length" or markup then
 				if options.submissions then
 					s.report.truncated_turns += 1
-					table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
+					table.insert(s.messages, { role = "assistant", content = clip(text, 1500) })
 					s.phase = { kind = "candidate" }
 					return s, { kind = "candidate", text = text }
 				end
 				s.bad += 1
 				s.report.truncated_turns += 1
 				if s.bad > 3 then s.report.stopped = "protocol: repeated empty or truncated replies"; return finish(s) end
-				table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
+				table.insert(s.messages, { role = "assistant", content = clip(text, 1500) })
 				table.insert(s.messages, { role = "user", content = if markup then prompt.nudge_markup else prompt.nudge_cut })
 				return ready(s)
 			end

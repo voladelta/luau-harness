@@ -139,3 +139,16 @@ test.case("a large fixed part (system prompt + task) does not make compaction re
 	test.ok(compactions >= 1 and compactions <= 3, "compacts only once the summarizable span is worth it: " .. compactions)
 	compact.context_window = 1000000
 end)
+
+test.case("a cut-off reply is shortened on a character boundary", function()
+	local s, command = start()
+	s, command = turn(s, 1000, 1)
+	local text = "x" .. string.rep("é", 1000) -- the 1500-byte mark falls inside a character
+	s, command = loop.step(s, { kind = "model_reply", system_chars = SYSTEM,
+		reply = { text = text, finish = "length", input = 1100, output = 10, calls = {} } })
+	test.eq(command.kind, "next")
+	local kept = s.messages[#s.messages - 1].content
+	test.ok(utf8.len(kept) ~= nil, "valid UTF-8")
+	test.eq(#kept, 1499)
+	test.eq(kept, text:sub(1, 1499))
+end)
