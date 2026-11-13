@@ -211,7 +211,8 @@ const WRAPPERS: &[&str] = &["sudo", "doas", "env", "command", "builtin", "exec",
     "flock", "strace", "ltrace", "find"];
 /// How far after a wrapper its program may start. Every word up to the program is tried as the program, and each try
 /// reads the rest of the command, so the bound keeps classification linear in the command's length. Real wrapper
-/// options are short; a command whose program may start beyond the bound needs approval.
+/// options are short; a command whose program may start beyond the bound could hide anything, so it is classed
+/// irreversible: autopilot never approves it.
 const WRAPPED_OFFSETS: usize = 32;
 /// Shell reserved words. At the start of a simple command they open or close a compound command and run nothing
 /// themselves (`{ git push; }`, `then git push`, `do git push`), so they are skipped.
@@ -359,10 +360,11 @@ fn class_of(words: &[String]) -> Class {
     let Some(first) = words.first() else { return Class::LocalWrite };
     if !WRAPPERS.contains(&program(first)) { return program_class(words); }
     // Which word a wrapper runs depends on its options (`sudo -u root git`), so every word up to the last one that can
-    // be the program is tried as the program; that covers nested wrappers too. Past the bound nothing is known.
+    // be the program is tried as the program; that covers nested wrappers too. Past the bound nothing is known, and
+    // what cannot be seen is assumed to be the worst.
     let (last, unknown) = match last_program_offset(words) {
         Some(last) => (last, Class::LocalWrite),
-        None => (WRAPPED_OFFSETS, Class::External),
+        None => (WRAPPED_OFFSETS, Class::Irreversible),
     };
     (1..words.len().min(last + 1)).map(|k| program_class(command_words(&words[k..]))).fold(unknown, Class::max)
 }
@@ -1296,13 +1298,17 @@ mod tests {
             "git $'push' --force origin main".into(), "echo $'it\\'s' ; git push origin main".into(),
             "find . -exec \"$x\" push \\;".into(), "command -v git; git push".into(), "sudo command git push".into(),
         ];
-        for (wrapper, pad) in [("env", "-u A"), ("env", "A=1"), ("sudo", "-E"), ("nice", "-n"), ("timeout -k 1", "-v"),
-            ("xargs", "-0"), ("sudo env", "-i"), ("timeout 5 env", "-u A")] {
-            must_ask.push(padded(wrapper, pad, 40));
-        }
-        must_ask.push(format!("find . {} -exec git push --force \\;", vec!["-name x -o"; 20].join(" ")));
         for cmd in &must_ask {
             assert!(p.classify_sh(cmd) >= Class::External, "{cmd}");
+        }
+        // A program hidden past the bound is never approved by autopilot.
+        let mut hidden = vec![format!("find . {} -exec git push --force \\;", vec!["-name x -o"; 20].join(" "))];
+        for (wrapper, pad) in [("env", "-u A"), ("env", "A=1"), ("sudo", "-E"), ("nice", "-n"), ("timeout -k 1", "-v"),
+            ("xargs", "-0"), ("sudo env", "-i"), ("timeout 5 env", "-u A")] {
+            hidden.push(padded(wrapper, pad, 40));
+        }
+        for cmd in &hidden {
+            assert_eq!(p.classify_sh(cmd), Class::Irreversible, "{cmd}");
         }
         // Inside the bound, the same wrappers still see the force push itself.
         for wrapper in ["env -u A", "env A=1", "sudo -E", "timeout 5 env -u A"] {
