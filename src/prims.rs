@@ -21,6 +21,8 @@ use tokio::io::AsyncReadExt;
 const MAX_READ: u64 = 10 * 1024 * 1024;
 const MAX_CAPTURE: usize = 1024 * 1024;
 const DEFAULT_HITS: usize = 200;
+/// The most rows one search returns: the rows are built in Rust, outside the Lua memory limit, and journaled whole.
+const MAX_HITS: usize = 2000;
 const SH_TIMEOUT: f64 = 60.0;
 const SH_TIMEOUT_MAX: f64 = 600.0;
 
@@ -28,7 +30,7 @@ const SH_TIMEOUT_MAX: f64 = 600.0;
 /// them in, so the prose the model reads comes from the constants that enforce it.
 pub fn prompt_limits() -> serde_json::Value {
     serde_json::json!({
-        "MAX_READ_MB": MAX_READ >> 20, "MAX_CAPTURE_MB": MAX_CAPTURE >> 20, "CAPTURE_HALF_KB": (MAX_CAPTURE / 2) >> 10, "DEFAULT_HITS": DEFAULT_HITS, "SH_TIMEOUT": SH_TIMEOUT, "SH_TIMEOUT_MAX": SH_TIMEOUT_MAX,
+        "MAX_READ_MB": MAX_READ >> 20, "MAX_CAPTURE_MB": MAX_CAPTURE >> 20, "CAPTURE_HALF_KB": (MAX_CAPTURE / 2) >> 10, "DEFAULT_HITS": DEFAULT_HITS, "MAX_HITS": MAX_HITS, "SH_TIMEOUT": SH_TIMEOUT, "SH_TIMEOUT_MAX": SH_TIMEOUT_MAX,
         "CHUNK_SECS": crate::vm::CHUNK_SECS, "VIEW_MAX": crate::vm::VIEW_MAX.0, "VIEW_MAX_MIN": crate::vm::VIEW_MAX.1, "VIEW_MAX_LIMIT": crate::vm::VIEW_MAX.2, "HISTORY_ENTRIES": crate::history::DEFAULT_LIMIT, "HISTORY_BYTES": crate::history::MAX_TEXT, "DATA_BYTES": crate::values::MAX_BYTES,
     })
 }
@@ -164,6 +166,17 @@ pub struct SearchOptions {
     pub literal: bool,
 }
 
+impl SearchOptions {
+    /// The rows to return at most: `max`, from 1 to `MAX_HITS`, or `DEFAULT_HITS`.
+    pub fn cap(&self) -> Result<usize> {
+        match self.max {
+            None => Ok(DEFAULT_HITS),
+            Some(max) if (1.0..=MAX_HITS as f64).contains(&max) => Ok(max as usize),
+            Some(max) => anyhow::bail!("search: options: max must be from 1 to {MAX_HITS} rows, got {max}"),
+        }
+    }
+}
+
 pub type Rows = Vec<(String, i64, String)>;
 
 /// A search the pattern or glob made impossible; the prelude raises it as a `{kind, message, hint}` table.
@@ -188,11 +201,12 @@ pub struct Hits {
 /// Search files under the read policy (`search(pattern, opts)`).
 pub async fn search(fx: &Effects, lua: &Lua, pattern: String, opts: SearchOptions) -> mlua::Result<Result<Hits, SearchError>> {
     let base = opts.path.clone().unwrap_or_else(|| ".".into());
+    let cap = opts.cap().map_err(|e| rt(e.to_string()))?;
     let args = json!({"pattern": &pattern, "path": &base, "glob": opts.glob, "max": opts.max, "ignore_case": opts.ignore_case, "literal": opts.literal});
     let (pol, workflow) = (fx.pol.clone(), fx.supervisor.workflow_epoch().is_some());
     let ret = fx.run(lua, Tool::Search, Class::Read, args, || blocking(move || {
         let root = pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-        Ok(match search_files(&pol.workspace, &root, &pattern, &opts, workflow, &pol.unreadable()) {
+        Ok(match search_files(&pol.workspace, &root, &pattern, &opts, cap, workflow, &pol.unreadable()) {
             Ok(Hits { rows, truncated }) => Ret::Rows { rows, truncated },
             Err(SearchError { kind, message, hint }) => Ret::SearchErr { kind, message, hint },
         })
@@ -411,7 +425,7 @@ impl Sink for Collect<'_> {
 
 /// Search the files under `base` (canonical and policy-checked) for `pattern`, gitignore-aware, skipping binary
 /// files, credential files, sealed paths and `INTERNAL_DIRS`. Rows name files relative to `root`.
-fn search_files(root: &Path, base: &Path, pat: &str, opts: &SearchOptions, workflow: bool, sealed: &[PathBuf]) -> Result<Hits, SearchError> {
+fn search_files(root: &Path, base: &Path, pat: &str, opts: &SearchOptions, cap: usize, workflow: bool, sealed: &[PathBuf]) -> Result<Hits, SearchError> {
     if !opts.literal {
         for tok in ["(?=", "(?!", "(?<=", "(?<!"] {
             if pat.contains(tok) {
@@ -439,7 +453,6 @@ fn search_files(root: &Path, base: &Path, pat: &str, opts: &SearchOptions, workf
         .fixed_strings(opts.literal)
         .build(pat)
         .map_err(|e| SearchError::new("invalid_regex", e.to_string(), "escape special characters or pass literal=true"))?;
-    let cap = opts.max.map(|m| m.max(1.0) as usize).unwrap_or(DEFAULT_HITS);
     let mut wb = WalkBuilder::new(base);
     wb.hidden(false).follow_links(false).require_git(false).sort_by_file_path(|a, b| a.cmp(b));
     if workflow {
@@ -868,12 +881,17 @@ mod file_tests {
         std::fs::write(dir.join("b"), "hit\n").unwrap();
         let search = |max: f64| {
             let opts = SearchOptions { max: Some(max), ..Default::default() };
-            search_files(&dir, &dir, "hit", &opts, false, &[]).ok().unwrap()
+            search_files(&dir, &dir, "hit", &opts, opts.cap().unwrap(), false, &[]).ok().unwrap()
         };
         let exact = search(3.0);
         assert_eq!((exact.rows.len(), exact.truncated), (3, false));
         let capped = search(2.0);
         assert_eq!((capped.rows.len(), capped.truncated), (2, true));
+        for max in [0.0, -1.0, 2001.0, 1e9] {
+            let error = SearchOptions { max: Some(max), ..Default::default() }.cap().unwrap_err().to_string();
+            assert!(error.contains("max must be from 1 to 2000 rows"), "{max}: {error}");
+        }
+        assert_eq!(SearchOptions { max: Some(2000.0), ..Default::default() }.cap().unwrap(), MAX_HITS);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -886,9 +904,9 @@ mod file_tests {
             std::fs::write(p, "needle\n").unwrap();
         }
         let opts = SearchOptions { literal: true, ..Default::default() };
-        let files: Vec<String> = search_files(&dir, &dir, "needle", &opts, false, &[]).ok().unwrap().rows.into_iter().map(|r| r.0).collect();
+        let files: Vec<String> = search_files(&dir, &dir, "needle", &opts, DEFAULT_HITS, false, &[]).ok().unwrap().rows.into_iter().map(|r| r.0).collect();
         assert_eq!(files, [".envrc", ".github/ci.yml", "src/.keep"]);
-        let inside = search_files(&dir, &dir.join(".harness"), "needle", &opts, false, &[]).ok().unwrap();
+        let inside = search_files(&dir, &dir.join(".harness"), "needle", &opts, DEFAULT_HITS, false, &[]).ok().unwrap();
         assert_eq!(inside.rows.len(), 1, "a search that starts inside .harness covers it");
         let _ = std::fs::remove_dir_all(dir);
     }

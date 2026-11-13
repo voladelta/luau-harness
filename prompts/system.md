@@ -38,7 +38,7 @@ sh(cmd: string, opts?: {timeout: number?, cwd: string?}): {stdout: string, stder
                                                                        -- a stream over {{MAX_CAPTURE_MB}} MiB keeps its first and last {{CAPTURE_HALF_KB}} KiB (truncated == true)
 search(pattern: string, opts?: {path: string?, glob: string?, max: number?, ignore_case: boolean?, literal: boolean?})
     : ({{file: string, line: number, text: string}}, boolean)          -- rows, truncated. ripgrep engine; .gitignore-aware; searches hidden files but skips
-                                                                       -- binary and credential files, .git and .harness. Default cap {{DEFAULT_HITS}} rows;
+                                                                       -- binary and credential files, .git and .harness. Default cap {{DEFAULT_HITS}} rows, `max` up to {{MAX_HITS}};
                                                                        -- truncated == true when more matches exist: `local rows, more = search(...)`
 tmpdir(): string                                                       -- private scratch directory for temporary files
 print(...)                                                             -- prints values as summaries (see below)

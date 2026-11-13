@@ -43,7 +43,11 @@ fn parse(input: Json, agents: bool) -> Result<Vec<Operation>> {
         if let Some(opts) = &opts { anyhow::ensure!(opts.is_object() || opts.is_null(), "batch options must be an object"); }
         Ok(match op.as_str() {
             "read" => Operation::Read { path: first, options: options(&op, opts)? },
-            "search" => Operation::Search { pattern: first, options: options(&op, opts)? },
+            "search" => {
+                let options: prims::SearchOptions = options(&op, opts)?;
+                options.cap().map_err(|e| anyhow::anyhow!("batch {e}"))?;
+                Operation::Search { pattern: first, options }
+            }
             _ => {
                 anyhow::ensure!(agents, "batch agent requires hx run");
                 Operation::Agent { task: first, options: AgentOptions::parse(opts.unwrap_or(Json::Null))? }
@@ -120,5 +124,7 @@ mod tests {
         assert_eq!(error.to_string(), "batch read: options: unknown field `bogus`, expected `offset` or `limit`");
         let error = parse(json!([{"op": "search", "args": ["x", {"max": "lots"}]}]), false).err().expect("a mistyped option is refused");
         assert!(error.to_string().starts_with("batch search: options: invalid type: string \"lots\""), "{error}");
+        let error = parse(json!([{"op": "search", "args": ["x", {"max": 1e9}]}]), false).err().expect("too many rows are refused");
+        assert_eq!(error.to_string(), "batch search: options: max must be from 1 to 2000 rows, got 1000000000");
     }
 }
