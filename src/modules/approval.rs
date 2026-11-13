@@ -15,11 +15,46 @@ pub(super) struct Lockfile {
     package: Vec<LockEntry>,
 }
 
+/// One approval. `kind` says what the content was approved as, so content approved as an inert agent skill can never
+/// load as a package (with its hx.toml's capabilities and its Luau) from `.harness/pkgs`. An entry without one was
+/// written before approvals recorded it and matches nothing.
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
 struct LockEntry {
     name: String,
     version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<Kind>,
     hash: String,
+}
+
+/// What content is approved as. It decides how the content is read (see `Location`) and is bound into both the digest
+/// and the lock entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum Kind {
+    /// A directory with an `hx.toml`: its Luau runs with the capabilities the manifest requests.
+    Package,
+    /// SKILL.md and plain files: no Luau, no capabilities.
+    AgentSkill,
+}
+
+impl Kind {
+    /// The digest's domain tag: the same files hash differently as a package and as a skill.
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::Package => b"hx package v3\0",
+            Self::AgentSkill => b"hx agent-skill v3\0",
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Package => "a package",
+            Self::AgentSkill => "an agent skill",
+        })
+    }
 }
 
 impl Lockfile {
@@ -45,8 +80,12 @@ impl Lockfile {
     pub(super) fn approved(&self, name: &str, location: Location) -> Result<Snapshot> {
         // checked before reading anything: ~/.agents/skills can be large
         let entry = self.entry(name).ok_or_else(|| LockError::NotLocked(name.to_string()))?;
+        let kind = location.kind();
+        if let Some(approved) = entry.kind.filter(|approved| *approved != kind) {
+            return Err(LockError::OtherKind { name: name.to_string(), approved, now: kind }.into());
+        }
         let snap = snapshot(location)?;
-        if entry.hash != snap.digest || entry.version != snap.manifest.package.version {
+        if entry.kind != Some(kind) || entry.hash != snap.digest || entry.version != snap.manifest.package.version {
             return Err(LockError::Changed { name: name.to_string(), locked: entry.hash.clone(), now: snap.digest }.into());
         }
         Ok(snap)
@@ -58,6 +97,8 @@ impl Lockfile {
 pub enum LockError {
     NotLocked(String),
     Changed { name: String, locked: String, now: String },
+    /// Approved as one kind of thing and now found as another (a skill copied into `.harness/pkgs`).
+    OtherKind { name: String, approved: Kind, now: Kind },
 }
 
 impl std::fmt::Display for LockError {
@@ -67,6 +108,8 @@ impl std::fmt::Display for LockError {
             Self::Changed { name, locked, now } => write!(f,
                 "package {name} changed since it was approved (locked {}…, now {}…); review it and run `hx approve {name}` again",
                 locked.get(..8).unwrap_or(locked), now.get(..8).unwrap_or(now)),
+            Self::OtherKind { name, approved, now } => write!(f,
+                "{name} was approved as {approved}, not as {now}; review it and run `hx approve {name}` again"),
         }
     }
 }
@@ -86,6 +129,13 @@ impl Location {
     pub fn dir(&self) -> &Path {
         match self {
             Self::Package(dir) | Self::AgentSkill(dir) => dir,
+        }
+    }
+
+    pub(super) fn kind(&self) -> Kind {
+        match self {
+            Self::Package(_) => Kind::Package,
+            Self::AgentSkill(_) => Kind::AgentSkill,
         }
     }
 }
@@ -124,7 +174,7 @@ pub fn snapshot(location: Location) -> Result<Snapshot> {
             Manifest::agent_skill(&String::from_utf8_lossy(text))
         },
     };
-    Ok(Snapshot { digest: digest(&files), files, manifest, location })
+    Ok(Snapshot { digest: digest(location.kind(), &files), files, manifest, location })
 }
 
 fn read_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -169,11 +219,12 @@ fn read_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
     Ok(files)
 }
 
-/// The approval digest: SHA-256 over every file as length-prefixed path and content, in path order. The framing makes
-/// the encoding unambiguous, so no other set of files (bytes moved between names or files) shares a digest.
-pub(super) fn digest(files: &BTreeMap<String, Vec<u8>>) -> String {
+/// The approval digest: SHA-256 over the kind's domain tag, then every file as length-prefixed path and content, in path
+/// order. The framing makes the encoding unambiguous, so no other set of files (bytes moved between names or files)
+/// shares a digest, and the tag keeps a skill's digest from ever matching a package's.
+pub(super) fn digest(kind: Kind, files: &BTreeMap<String, Vec<u8>>) -> String {
     let mut h = Sha256::new();
-    h.update(b"hx package v2\0");
+    h.update(kind.domain());
     for (path, bytes) in files {
         h.update((path.len() as u64).to_le_bytes());
         h.update(path.as_bytes());
@@ -300,7 +351,7 @@ impl Resolver {
                     Ok(_) => "approved".into(),
                     Err(e) => match e.downcast_ref::<LockError>() {
                         Some(LockError::NotLocked(_)) => "not approved".into(),
-                        Some(LockError::Changed { .. }) => "changed since approval".into(),
+                        Some(LockError::Changed { .. } | LockError::OtherKind { .. }) => "changed since approval".into(),
                         None => format!("error: {}", terminal_safe(e.to_string().lines().next().unwrap_or(""))),
                     },
                 }
@@ -318,7 +369,12 @@ impl Resolver {
         let lock_path = self.root.join("hx.lock");
         let mut entries = Lockfile::read(&lock_path)?.package;
         entries.retain(|e| e.name != name);
-        entries.push(LockEntry { name: name.into(), version: snap.manifest.package.version.clone(), hash: snap.digest.clone() });
+        entries.push(LockEntry {
+            name: name.into(),
+            version: snap.manifest.package.version.clone(),
+            kind: Some(snap.location.kind()),
+            hash: snap.digest.clone(),
+        });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         write_atomic(&lock_path, toml::to_string(&Lockfile { package: entries })?.as_bytes())
     }
@@ -336,7 +392,7 @@ impl Resolver {
         if snap.is_agent_skill() {
             out.push_str(": an agent skill, so SKILL.md and its files only, with no Luau and no capabilities");
             if snap.files.contains_key("hx.toml") {
-                out.push_str(" (its hx.toml is an ordinary file; move the skill to .harness/pkgs to use one)");
+                out.push_str(" (its hx.toml is an ordinary file)");
             }
         } else {
             out.push_str(&format!(" with capabilities {:?}", snap.manifest.capabilities));

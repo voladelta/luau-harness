@@ -1,5 +1,5 @@
 use super::frontmatter_description as d;
-use super::approval::{digest, snapshot, Location, Lockfile, Snapshot};
+use super::approval::{digest, snapshot, Kind, Location, Lockfile, Snapshot};
 use super::staging::Staged;
 use super::*;
 use anyhow::Result;
@@ -77,8 +77,13 @@ fn package_must_be_locked_and_unchanged() {
     std::fs::write(dir.join("hx.toml"), "[package]\nversion = \"2.0\"\n\n[capabilities]\nfs = [\"read\"]\n").unwrap();
     // lock the new content under the old version: only the version differs
     let digest = snapshot(Location::Package(dir.clone())).unwrap().digest;
-    std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"1.0\"\nhash = {digest:?}\n")).unwrap();
+    std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"1.0\"\nkind = \"package\"\nhash = {digest:?}\n")).unwrap();
     assert!(err(verdict(&root, "foo", &dir)).contains("changed since it was approved"));
+    // an entry that does not say what it approved (written before entries recorded it) matches nothing
+    std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"2.0\"\nhash = {digest:?}\n")).unwrap();
+    assert!(err(verdict(&root, "foo", &dir)).contains("changed since it was approved"));
+    std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"2.0\"\nkind = \"package\"\nhash = {digest:?}\n")).unwrap();
+    assert!(verdict(&root, "foo", &dir).is_ok());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -215,10 +220,12 @@ fn the_digest_frames_paths_and_contents() {
     // Without length framing, `a\0x\0b\0y\0` is both one file a = "x\0b\0y" and two files a = "x", b = "y".
     let one = BTreeMap::from([("a".to_string(), b"x\0b\0y".to_vec())]);
     let two = BTreeMap::from([("a".to_string(), b"x".to_vec()), ("b".to_string(), b"y".to_vec())]);
-    assert_ne!(digest(&one), digest(&two));
+    assert_ne!(digest(Kind::Package, &one), digest(Kind::Package, &two));
     let moved = BTreeMap::from([("a".to_string(), b"xb".to_vec()), ("b".to_string(), b"".to_vec())]);
     let kept = BTreeMap::from([("a".to_string(), b"x".to_vec()), ("b".to_string(), b"b".to_vec())]);
-    assert_ne!(digest(&moved), digest(&kept));
+    assert_ne!(digest(Kind::Package, &moved), digest(Kind::Package, &kept));
+    // the same files approved as a skill and as a package are different approvals
+    assert_ne!(digest(Kind::Package, &one), digest(Kind::AgentSkill, &one));
 }
 
 #[test]
@@ -230,12 +237,34 @@ fn an_agent_skill_has_no_luau_and_no_capabilities() {
     write(dir.join("init.luau"), "return { run = function() return sh('id') end }\n");
     let msg = Resolver::new(root.clone()).approve("foo").unwrap();
     assert!(msg.contains("no Luau and no capabilities") && msg.contains("hx.toml is an ordinary file"), "{msg}");
+    assert!(!msg.contains(".harness/pkgs"), "{msg}");
     let registry = trusted_registry(&root);
     assert!(registry.capabilities["foo"].0.is_empty());
     assert!(registry.resolve("foo").is_err());
     let info = registry.packages.iter().find(|p| p.name == "foo").unwrap();
     assert_eq!((info.kind.as_str(), info.version.as_str(), info.description.as_str()), ("skill", "agent-skill", "helpful"));
     assert_eq!(info.files, ["SKILL.md", "hx.toml", "init.luau"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_skill_approval_does_not_approve_the_same_files_as_a_package() {
+    let root = ws("skillaspkg");
+    let skill = root.join(".agents/skills/foo");
+    write(skill.join("SKILL.md"), "---\ndescription: inert\n---\nbody\n");
+    // the manifest claims the version every agent skill gets, so only the kind tells the two approvals apart
+    write(skill.join("hx.toml"), "[package]\nversion = \"agent-skill\"\nkind = \"tool\"\n[capabilities]\nproc = [\"sh\"]\n");
+    write(skill.join("init.luau"), "return { run = function() return sh('id') end }\n");
+    Resolver::new(root.clone()).approve("foo").unwrap();
+    // a shell command copies the approved skill into .harness/pkgs (which it can write)
+    let pkg = root.join(".harness/pkgs/foo");
+    for file in ["SKILL.md", "hx.toml", "init.luau"] {
+        write(pkg.join(file), &std::fs::read_to_string(skill.join(file)).unwrap());
+    }
+    assert!(err(verdict(&root, "foo", &pkg)).contains("approved as an agent skill, not as a package"));
+    let registry = trusted_registry(&root);
+    assert!(registry.resolve("foo").is_err() && !registry.capabilities.contains_key("foo"));
+    assert!(registry.rejected["foo"].contains("hx approve foo"), "{:?}", registry.rejected);
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -113,9 +113,9 @@ Error: this workspace's config is not trusted (.harness/policy.toml); review it 
 
 ## Approvals and `hx.lock`
 
-`hx.lock` is the single approval record: per package, the approved version and its content hash. The hash covers the package's `hx.toml`, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval.
+`hx.lock` is the single approval record: per package, the approved version, what it was approved as (`kind = "package"` for `.harness/pkgs/NAME`, `"agent-skill"` for a skill under `.agents/skills`) and its content hash. The hash covers the package's `hx.toml`, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval. An approval holds only where it was made: a skill approved under `.agents/skills` (no Luau, no capabilities) that is copied into `.harness/pkgs` is not approved there, whatever its `hx.toml` says.
 
-The hash is SHA-256 over every file of the package (entries starting with `.` excluded), each as its length-prefixed relative path followed by its length-prefixed content, in path order. `hx approve`, `hx skills`, `hx accept` and a run's launch read a package through the same function, so they agree on what was approved. Locks written by hx versions before this encoding no longer match: run `hx approve NAME` again for each package and skill.
+The hash is SHA-256 over a tag naming the kind, then every file of the package (entries starting with `.` excluded), each as its length-prefixed relative path followed by its length-prefixed content, in path order. `hx approve`, `hx skills`, `hx accept` and a run's launch read a package through the same function, so they agree on what was approved. Locks written by hx versions before this encoding no longer match: run `hx approve NAME` again for each package and skill.
 
 A run builds its extensions from the config bytes trust checked, `hx.lock` included, never from a second read of the files. `hx.lock` and the module overrides `hx accept` and `hx rollback` write are replaced atomically.
 
