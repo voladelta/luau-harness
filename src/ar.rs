@@ -656,6 +656,7 @@ impl Orchestrator {
         std::fs::write(&task_path, task)?;
         self.journal(Record::Episode { plan: plan.label.clone(), attempt, role: plan.role, outcome: Outcome::Started, report_ref: None })?;
         let scratch = Scratch::episode(&self.run_name(), &label)?;
+        keep_on_stop(&scratch.0, &self.dir.join("episodes").join(format!("{label}.log")));
         let ws = scratch.0.join("ws");
         copy_tree(&self.dir.join("base"), &ws)?;
         place(&ws, &self.spec().editable, &load_snap(&self.dir, &plan.start)?)?;
@@ -732,6 +733,7 @@ impl Orchestrator {
         if copy.join("log").is_dir() && !to.exists() && copy_tree(&copy.join("log"), &to).is_err() {
             eprintln!("hx ar: could not keep the journal of {label}");
         }
+        kept(copy);
     }
 
     /// What a child's policy seals: this workspace's runs and both evaluators' roots (`sealed`).

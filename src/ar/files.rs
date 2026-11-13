@@ -261,9 +261,23 @@ impl Drop for Scratch {
     }
 }
 
+/// Episode copies whose child journal (`COPY/log`) must reach the run before the copy goes, with where it goes: a child
+/// cannot write the run directory, so its journal lives in its copy until the orchestrator keeps it.
+static KEEP: std::sync::Mutex<std::collections::BTreeMap<PathBuf, PathBuf>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Keep `copy`'s child journal at `to` if the copy is removed by `remove_scratch` (a stop) before it is kept normally.
+pub(super) fn keep_on_stop(copy: &Path, to: &Path) { KEEP.lock().unwrap().insert(copy.to_path_buf(), to.to_path_buf()); }
+
+/// The copy's journal was kept (or the copy is gone): nothing to do on a stop.
+pub(super) fn kept(copy: &Path) { KEEP.lock().unwrap().remove(copy); }
+
 /// Remove every scratch directory this process holds; `crate::prims::stop` calls it on SIGTERM, SIGINT or SIGHUP, after
-/// killing the commands that use them.
+/// killing the commands that use them. An episode copy's child journal is kept with the run first, as when an episode
+/// ends normally or resume closes it.
 pub(crate) fn remove_scratch() {
+    for (copy, to) in std::mem::take(&mut *KEEP.lock().unwrap()) {
+        if copy.join("log").is_dir() && !to.exists() { let _ = copy_tree(&copy.join("log"), &to); }
+    }
     let live = std::mem::take(&mut *LIVE.lock().unwrap());
     for dir in live { remove(&dir); }
 }

@@ -293,6 +293,16 @@ def scenario_sigterm():
     assert not [r for r in records if r["kind"] == "score" and not r["valid"]], records
     assert not [r for r in records if r["kind"] == "eval"], records
     assert not running(marker), "the evaluation's processes outlived the run"
+    # The episode the stop cut short keeps its journal with the run, as one that ends or one a resume closes does.
+    for journal in (harness.state_dir(path) / "ar").glob("*/journal.jsonl"):
+        last = {}
+        for line in journal.read_text().splitlines():
+            r = json.loads(line)
+            if r["kind"] == "episode": last[(r["plan"], r["attempt"])] = r["outcome"]
+        cut = [p if a <= 1 else f"{p}.{a}" for (p, a), o in last.items() if o == "started"]
+        assert cut, "the stop cut no episode short"
+        missing = [l for l in cut if not (journal.parent / "episodes" / f"{l}.log").is_dir()]
+        assert not missing, f"journals of episodes the stop cut short were not kept: {missing}"
     check("SIGTERM leaves no episode or evaluation copy and no evaluation process behind")
 
 
