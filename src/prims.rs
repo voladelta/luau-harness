@@ -35,7 +35,7 @@ pub fn prompt_limits() -> serde_json::Value {
 
 
 /// Run blocking file work off the async worker threads.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> mlua::Result<T> + Send + 'static) -> mlua::Result<T> {
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> mlua::Result<T> + Send + 'static) -> mlua::Result<T> {
     tokio::task::spawn_blocking(f).await.map_err(mlua::Error::external)?
 }
 

@@ -184,12 +184,6 @@ impl Effects {
         Ok(())
     }
 
-    /// Async authorization around a synchronous file executor. The intent ID still reaches atomic writes.
-    pub async fn run_sync(&self, lua: &Lua, tool: Tool, class: Class, args: Value,
-        f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
-        self.run_with_intent(lua, tool, class, args, |intent| async move { f(intent) }).await
-    }
-
     /// Authorize and record one asynchronous effect (sh, agent).
     pub async fn run<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where F: FnOnce() -> Fut, Fut: Future<Output = mlua::Result<Ret>> {

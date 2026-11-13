@@ -1034,15 +1034,17 @@ impl Vm {
             let vfx = vfx.clone();
             async move {
                 let max = max.unwrap_or(VIEW_MAX.0).clamp(VIEW_MAX.1, VIEW_MAX.2);
-                let pol = vfx.pol.clone();
-                let mut live: Option<crate::prims::ViewImage> = None;
-                vfx.run_sync(&lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), |_| {
-                    let v = crate::prims::load_view_image(&pol, &path, max).map_err(mlua::Error::runtime)?;
+                let (pol, image_path) = (vfx.pol.clone(), path.clone());
+                // The journal records the image's identity; the image itself comes back through `live`.
+                let live: Arc<Mutex<Option<crate::prims::ViewImage>>> = Arc::default();
+                let slot = live.clone();
+                vfx.run(&lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), || prims::blocking(move || {
+                    let v = crate::prims::load_view_image(&pol, &image_path, max).map_err(mlua::Error::runtime)?;
                     let meta = json!({"sha256": v.sha256, "width": v.width, "height": v.height}).to_string();
-                    live = Some(v);
+                    *slot.lock().unwrap() = Some(v);
                     Ok(Ret::Str(meta))
-                }).await?;
-                let v = live.ok_or_else(|| mlua::Error::runtime("view executor returned no image"))?;
+                })).await?;
+                let v = live.lock().unwrap().take().ok_or_else(|| mlua::Error::runtime("view executor returned no image"))?;
                 let t = lua.create_table()?;
                 t.set("path", path)?;
                 t.set("width", v.width)?;

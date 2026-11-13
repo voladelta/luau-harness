@@ -755,7 +755,7 @@ mod open_tests {
         let lua = mlua::Lua::new();
         let mut executed = false;
         for _ in 0..2 {
-            let result = fx.run_sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
+            let result = fx.run(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), || async {
                 executed = true;
                 Ok(crate::effects::Ret::Num(0.0))
             }).await;
@@ -775,7 +775,7 @@ mod open_tests {
         let lua = mlua::Lua::new();
         let mut executions = 0;
         for _ in 0..2 {
-            let result = fx.run_sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
+            let result = fx.run(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), || async {
                 executions += 1;
                 Ok(crate::effects::Ret::Str("result".into()))
             }).await;
