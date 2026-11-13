@@ -189,11 +189,21 @@ impl Effects {
     }
 
     /// Authorize and record one asynchronous effect; `f` receives the durable intent's ID (None for reads).
+    ///
+    /// Nothing is authorized, queued or journaled before the first await, so a caller that cannot yield (a Luau
+    /// callback run by `string.gsub`, `table.sort` or a metamethod) fails before the effect exists, rather than
+    /// leaving behind a dispatched effect that holds the mutation permit after its yield failed.
     pub async fn run_with_intent<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where
         F: FnOnce(Option<u64>) -> Fut,
         Fut: Future<Output = mlua::Result<Ret>>,
     {
+        if !yieldable(lua) {
+            let name = tool.name();
+            return Err(rt(format!("{name}: cannot run inside a callback that cannot yield (a string.gsub replacement \
+                function, a table.sort comparator or a metamethod); call {name} outside it and use the result")));
+        }
+        tokio::task::yield_now().await;
         self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
         let _permit = if class != Class::Read && tool != Tool::Agent {
@@ -244,6 +254,14 @@ impl Effects {
         self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
         res
     }
+}
+
+/// Can the Luau thread running the current callback yield? Not inside a callback that C code invoked without a
+/// continuation (`string.gsub`, `table.sort`, metamethods); `pcall` and coroutines can.
+fn yieldable(lua: &Lua) -> bool {
+    // SAFETY: inside a callback mlua's state pointer is the running thread, alive for the whole call;
+    // lua_isyieldable only compares two of its counters.
+    lua.exec_raw_lua(|raw| unsafe { mlua::ffi::lua_isyieldable(raw.state()) != 0 })
 }
 
 /// Marks a thread as awaiting an effect; unmarks on drop, so an abandoned future (a coroutine left suspended inside
@@ -312,10 +330,13 @@ mod tests {
             Ok(Ret::Num(1.0))
         });
         tokio::pin!(queued);
-        tokio::select! {
-            biased;
-            _ = &mut queued => panic!("mutation must wait for its permit"),
-            _ = tokio::task::yield_now() => {},
+        // Two rounds: the first poll only yields; the second passes authorization and queues for the permit.
+        for _ in 0..2 {
+            tokio::select! {
+                biased;
+                _ = &mut queued => panic!("mutation must wait for its permit"),
+                _ = tokio::task::yield_now() => {},
+            }
         }
         fx.supervisor.uncertain(id, Tool::McpCall, &json!({}), "lost response").unwrap();
         drop(permit);

@@ -42,6 +42,17 @@ echo batch-data > $W/batch.txt
 check "sealed read batch" "$($H exec --workspace $W 'print(batch({{op="read",args={"batch.txt"}}})[1].value)' | head -1)" "batch-data"
 check "batch operations count as ops and carry search truncation" "$($H exec --workspace $W 'local r=batch({{op="read",args={"batch.txt"}},{op="search",args={"batch",{path="batch.txt",max=1}}}}); print(r[2].ok, #r[2].value, r[2].truncated)' | head -2 | tr '\n' ' ')" "true	1	false -- ops=2 error=false "
 
+# 3b. An effect called where Luau cannot yield fails before it exists: no command, no held mutation permit, no open intent.
+W4=$T/ws4; mkdir -p $W4
+out=$(timeout 30 $H exec --workspace $W4 'print(pcall(string.gsub,"a","a",function() return sh("touch ran").stdout end))' 'print(pcall(sh,"echo again"))' 2>&1)
+check "effect in a gsub callback is refused with a clear error" "$(echo "$out" | grep -c 'sh: cannot run inside a callback that cannot yield')" "1"
+check "effect in a gsub callback does not run" "$([ -e $W4/ran ] && echo ran || echo absent)" "absent"
+check "a later mutation still runs" "$(echo "$out" | grep -cF 'stdout="again\n"')" "1"
+check "no intent is left without an outcome" "$(python3 -c '
+import json, sys, glob
+seen = [json.loads(l) for f in glob.glob(sys.argv[1] + "/.harness/log/*.jsonl") for l in open(f)]
+print(len({r["seq"] for r in seen if r["kind"] == "intent"} - {r.get("of") for r in seen}))' $W4)" "0"
+
 # 3c. search returns plain data: capped rows cross the data boundary, and hidden files other than .git/.harness are searched
 mkdir -p $W4/.github $W4/.git
 for f in .github/ci.yml .git/config .envrc plain.txt; do echo needle > $W4/$f; done

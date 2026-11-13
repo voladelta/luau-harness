@@ -812,6 +812,25 @@ mod file_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn an_effect_where_luau_cannot_yield_fails_before_it_exists() {
+        let dir = workspace("yield");
+        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
+        let log = pol.log.path.clone();
+        let vm = crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap();
+        let r = vm.session.run(r#"local ok, e = pcall(string.gsub, "a", "a", function() return sh("touch ran").stdout end)
+            assert(not ok and tostring(e):find("cannot run inside a callback that cannot yield", 1, true), tostring(e))
+            assert(not pcall(table.sort, {2, 1}, function() return write("w", "x") > 0 end))
+            assert(sh("echo again").stdout == "again\n")"#);
+        let r = tokio::time::timeout(Duration::from_secs(20), r).await.expect("a later mutation must not hang");
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert!(!dir.join("ran").exists() && !dir.join("w").exists());
+        let records = crate::eventlog::load(&log).unwrap();
+        let outcomes: std::collections::HashSet<_> = records.iter().filter_map(|r| r["of"].as_u64()).collect();
+        assert!(records.iter().filter(|r| r["kind"] == "intent").all(|r| outcomes.contains(&r["seq"].as_u64().unwrap())));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_read_never_follows_a_directory_swapped_for_a_symlink() {
         let dir = workspace("swap");
