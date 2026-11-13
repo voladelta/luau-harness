@@ -45,7 +45,7 @@ function M.init(cfg)
 	return {
 		phase = { kind = "ready", compact = "auto" }, max_turns = cfg.max_turns, task_text = cfg.task_message, messages = { { role = "user", content = cfg.task_message } },
 		report = { turns = 0, code_turns = 0, luau_errors = 0, truncated_turns = 0, ops_per_turn = {}, finished = false, final_answer = "" },
-		bad = 0, no_call = 0, recheck_asked = false, anchor = { tokens = 0, count = 0, scale = 1 }, compact_failures = 0,
+		bad = 0, no_call = 0, recheck_asked = false, anchor = { tokens = 0, count = 0, scale = 1 }, compact_failures = 0, compact_paused_until = 0,
 		retried = false, hook_state = {},
 	}
 end
@@ -53,6 +53,18 @@ end
 -- Characters of the system prompt as last sent (VM additions included); the prompt's own text before any request.
 local function system_chars(s, options)
 	return s.system_chars or #prompt.system(options)
+end
+
+-- A failed or rejected summary skips compaction for this turn; a second one in a row pauses pressure compactions for
+-- compact.retry_turns agent replies, so a summarizer that cannot cope is not asked every turn. An overflow's forced
+-- compaction and the image budget are never paused.
+local function compaction_failed(s)
+	s.compact_failures += 1
+	if s.compact_failures >= 2 then
+		s.compact_failures = 0
+		s.compact_paused_until = s.report.turns + compact.retry_turns
+	end
+	return ready(s, "skip")
 end
 
 local function save_hook_state(s)
@@ -129,8 +141,7 @@ local function step(s, event, options)
 		end
 		if s.phase.kind == "compact" then
 			if s.phase.overflow then error("compaction failed after context overflow: " .. s.phase.overflow, 0) end
-			s.compact_failures += 1
-			return ready(s, "skip")
+			return compaction_failed(s)
 		end
 		local recovery = hooks.emit("model_error", { error = event.error, messages = s.messages })
 		if recovery.retry and not s.retried then
@@ -154,8 +165,7 @@ local function step(s, event, options)
 			local first, reason = compact.accept(event.reply, s.task_text, s.messages, cut, archive_enabled)
 			if not first then
 				if s.phase.overflow then error("compaction rejected (" .. reason .. ") after: " .. s.phase.overflow, 0) end
-				s.compact_failures += 1
-				return ready(s, "skip")
+				return compaction_failed(s)
 			end
 			local kept = table.move(s.messages, cut, #s.messages, 2, { { role = "user", content = first } })
 			s.previous_summary = event.reply.text
@@ -248,9 +258,11 @@ local function step(s, event, options)
 	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, phase.bound or math.huge)
 	local max_output = assert(info.max_output, "hx.model_info() lacks max_output")
 	local force = phase.compact == "force"
-	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" then
+	local images_over = compact.images_over(s.messages)
+	-- a pause never holds back the image budget: past it the state soon outgrows the data boundary
+	local paused = s.report.turns < (s.compact_paused_until or 0) and not images_over
+	if compact.enabled and phase.compact ~= "skip" and (force or not paused) then
 		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)
-		local images_over = compact.images_over(s.messages)
 		if force or images_over or (limit > 0 and total >= limit) then
 			-- normal pressure keeps a recent tail; an overflow keeps as little as fits under its bound
 			local keep = if force then 0 else compact.keep(window, max_output)

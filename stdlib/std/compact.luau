@@ -19,6 +19,7 @@ M.context_window = 1000000 -- used only when neither --context-window nor the pr
 M.trigger_ratio = 0.8 -- compaction starts at this share of the window
 M.keep_ratio = 0.16 -- recent history kept verbatim: at most this share of the window less the reply; the newest exchange always
 M.reserve_tokens = 65536 -- most headroom kept free for the summarizer's output, reasoning included (DeepSeek harness default)
+M.retry_turns = 8 -- agent replies without pressure compaction after two failed summaries in a row
 
 -- Image budget of one request, set below the common provider limits (about 100 images, 32 MB per request). Going over
 -- it compacts like token pressure does, and the kept tail carries at most half of it, so image compactions stay rare.

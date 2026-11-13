@@ -71,7 +71,10 @@ test.case("an overflow bounds the window for its one compaction only", function(
 	s, command = loop.step(s, { kind = "next" })
 	test.eq(command.purpose, "agent") -- the retry: under the 1M window there is no further compaction
 	test.eq(s.phase.bound, nil)
-	test.eq(s.window_bound, nil) -- nothing persists: a false positive cannot shrink the window for the rest of the run
+	-- nothing persists: a false positive cannot shrink the window for the rest of the run. Under the bound these turns
+	-- (30k to 60k tokens) would pass its trigger of about 27k; under the 1M window they do not.
+	for n = 7, 10 do s, command = turn(s, 10000 * (n - 4), n, string.rep("p", 40000)) end
+	test.eq(command.purpose, "agent")
 	compact.context_window = 1000000
 end)
 
@@ -151,4 +154,49 @@ test.case("a cut-off reply is shortened on a character boundary", function()
 	test.ok(utf8.len(kept) ~= nil, "valid UTF-8")
 	test.eq(#kept, 1499)
 	test.eq(kept, text:sub(1, 1499))
+end)
+
+-- Two failed summaries in a row: a rejected one, then a model error on the summarizer call.
+local function fail_twice(s, command)
+	for n = 1, 6 do s, command = turn(s, 1000 * n, n) end
+	s, command = turn(s, 9000, 7)
+	test.eq(command.purpose, "compact")
+	s, command = loop.step(s, { kind = "model_reply", reply = { text = "x", finish = "length", calls = {} } })
+	s, command = loop.step(s, { kind = "next" })
+	test.eq(command.purpose, "agent")
+	s, command = turn(s, 9000, 8)
+	test.eq(command.purpose, "compact")
+	s, command = loop.step(s, { kind = "model_error", error = "API 500 upstream", safe_context_rejection = false })
+	s, command = loop.step(s, { kind = "next" })
+	test.eq(command.purpose, "agent")
+	return s, command
+end
+
+test.case("two failed summaries pause pressure compaction for a while, then it resumes", function()
+	local s, command = fail_twice(start())
+	local paused_at = s.report.turns
+	local n = 9
+	while s.report.turns < paused_at + compact.retry_turns - 1 do
+		s, command = turn(s, 9000, n)
+		test.eq(command.purpose, "agent") -- over the trigger, but paused
+		n += 1
+	end
+	s, command = turn(s, 9000, n)
+	test.eq(command.purpose, "compact")
+	s, command = summary(s, "SUMMARY")
+	test.eq(s.compact_failures, 0)
+end)
+
+test.case("a context overflow still compacts while compaction is paused", function()
+	local s, command = fail_twice(start())
+	for n = 9, 12 do s, command = turn(s, 9000 + 6000 * (n - 8), n, string.rep("p", 24000)) end -- paused, up to 33k
+	test.eq(command.purpose, "agent")
+	s, command = loop.step(s, { kind = "model_error", error = "API 400 maximum context length exceeded", safe_context_rejection = true })
+	test.eq(command.kind, "next")
+	s, command = loop.step(s, { kind = "next" })
+	test.eq(command.purpose, "compact")
+	s, command = summary(s, "SUMMARY")
+	s, command = loop.step(s, { kind = "next" })
+	test.eq(command.purpose, "agent")
+	test.ok(s.messages[1].content:find("SUMMARY", 1, true))
 end)
