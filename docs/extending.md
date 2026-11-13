@@ -91,7 +91,7 @@ Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose byte
 
 - HTTP errors raise with their status and a bounded response excerpt.
 - Requests have a 120-second timeout, an 8 MiB response limit, no retries and no redirects. A loopback endpoint is never reached through a proxy.
-- A failed request to a non-read-only endpoint is uncertain only when it was sent and its answer was lost (a dropped connection, a timeout, a cut-off or oversized success body, a 5xx other than 503): the server may have acted, so new mutations wait for `hx recover`. A refused connection, a 4xx or a 503 is a definite failure.
+- A failed request to a non-read-only endpoint is uncertain only when it was sent and its answer was lost (a dropped connection, a timeout, a cut-off or oversized success body, a 3xx, a 5xx other than 503): the server may have acted, so new mutations wait for `hx recover`. Redirects are not followed, and a 3xx often answers work already done (`303 See Other` after a POST). A refused connection, a 4xx or a 503 is a definite failure.
 - Endpoint declarations grant access to those URLs; the environment running hx controls network access.
 - HTTP calls use the supervisor's authorization, run deadline and journal.
 - Credentials are attached by Rust and never returned to tool code or saved in the run manifest. Literal echoes of a credential in responses are redacted before journaling; an echo in another encoding (base64, percent-encoding) is not.

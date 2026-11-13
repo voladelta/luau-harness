@@ -259,7 +259,15 @@ fn reply(resp: Value) -> std::result::Result<Reply, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::retry_after;
+    use super::{retry_after, Answered};
+
+    #[test]
+    fn only_a_4xx_or_503_answer_is_unbilled() {
+        let unbilled = |status| Answered { status, message: String::new(), retry_after: None }.unbilled();
+        assert!(unbilled(400) && unbilled(429) && unbilled(503));
+        // a redirect is not followed and may answer a generation that happened
+        assert!(!unbilled(302) && !unbilled(303) && !unbilled(500) && !unbilled(504));
+    }
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
     #[test]

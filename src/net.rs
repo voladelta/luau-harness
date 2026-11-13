@@ -12,15 +12,16 @@ pub enum Delivery {
     /// The server answered with a definite failure (a JSON-RPC error, a 4xx or a 503): it did not act.
     Answered,
     /// The request was sent and its answer lost or inconclusive (a dropped connection, a timeout, an unreadable or
-    /// oversized response, a 5xx other than 503): the server may have acted.
+    /// oversized response, a 3xx, a 5xx other than 503): the server may have acted.
     Lost,
 }
 
 impl Delivery {
-    /// The classification of an HTTP error status. A 503 refuses before processing; other 5xx can follow work the
-    /// server did (a gateway that lost its upstream's answer, say), so they settle nothing.
+    /// The classification of a status other than 2xx. Only a 4xx or a 503 refuses before processing. A 3xx is often
+    /// the answer to work done ("303 See Other" after a POST), which hx does not follow; other 5xx can follow work the
+    /// server did (a gateway that lost its upstream's answer, say). Neither settles anything.
     pub fn of_status(status: reqwest::StatusCode) -> Delivery {
-        if status.is_server_error() && status != reqwest::StatusCode::SERVICE_UNAVAILABLE { Delivery::Lost } else { Delivery::Answered }
+        if status.is_client_error() || status == reqwest::StatusCode::SERVICE_UNAVAILABLE { Delivery::Answered } else { Delivery::Lost }
     }
 
     /// The classification of a failed `send`: only a connection that was never established certainly sent nothing.
@@ -222,7 +223,8 @@ mod tests {
     fn status_classification() {
         use reqwest::StatusCode;
         for (status, delivery) in [(400, Delivery::Answered), (404, Delivery::Answered), (429, Delivery::Answered), (503, Delivery::Answered),
-            (500, Delivery::Lost), (502, Delivery::Lost), (504, Delivery::Lost)] {
+            (500, Delivery::Lost), (502, Delivery::Lost), (504, Delivery::Lost),
+            (301, Delivery::Lost), (302, Delivery::Lost), (303, Delivery::Lost), (307, Delivery::Lost), (304, Delivery::Lost)] {
             assert_eq!(Delivery::of_status(StatusCode::from_u16(status).unwrap()), delivery, "{status}");
         }
     }
