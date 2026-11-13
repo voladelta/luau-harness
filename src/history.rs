@@ -191,8 +191,7 @@ impl History {
             .latest
             .clone()
             .context("history_archive_invalid: no committed source")?;
-        let mut budget = MAX_SOURCE;
-        let saved = load(&mut index, dir, &source.blob, &mut budget, None)?;
+        let saved = load(&mut index, dir, &source.blob, &mut Budget::default(), None)?;
         ensure!(
             saved["controller"]["messages"]
                 .as_array()
@@ -228,8 +227,7 @@ impl History {
                 ordinal == 0 || (2..record.archive.cut).contains(&ordinal),
                 "history: unknown id"
             );
-            let mut budget = MAX_SOURCE;
-            let (role, text) = entry(&mut index, &record, ordinal, dir, &mut budget, deadline)?;
+            let (role, text) = entry(&mut index, &record, ordinal, dir, &mut Budget::default(), deadline)?;
             let offset = query.offset.unwrap_or(0);
             ensure!(
                 offset <= text.len() && text.is_char_boundary(offset),
@@ -278,7 +276,7 @@ impl History {
         }
         let mut entries = Vec::new();
         let mut examined = 0;
-        let mut budget = MAX_SOURCE;
+        let mut budget = Budget::default();
         while seq != 0 && entries.len() < query.limit.unwrap_or(DEFAULT_LIMIT) && examined < MAX_SCAN {
             check_deadline(deadline)?;
             let pos = index
@@ -299,7 +297,7 @@ impl History {
             };
             let cost = std::fs::metadata(dir.join("blobs").join(blob))?.len() as usize;
             ensure!(cost <= MAX_SOURCE, "history: source read limit exceeded");
-            if cost > budget {
+            if budget.charges(&index, blob) && cost > budget.left {
                 break;
             }
             let (role, text) = entry(&mut index, &record, ordinal, dir, &mut budget, deadline)?;
@@ -369,11 +367,36 @@ fn check_deadline(deadline: Option<f64>) -> Result<()> {
     Ok(())
 }
 
+/// One call's source allowance. A source is charged its size on disk the first time the call uses it, cache hit or
+/// not, and again only when it must be re-read from disk. The last source stays at hand for the call, so the messages
+/// of one checkpoint too large for the cache are read and parsed once, not once per message.
+struct Budget {
+    left: usize,
+    charged: Vec<String>,
+    last: Option<(String, Arc<Value>)>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self { left: MAX_SOURCE, charged: Vec::new(), last: None }
+    }
+}
+
+impl Budget {
+    fn held(&self, index: &Index, hash: &str) -> bool {
+        self.last.as_ref().is_some_and(|(h, _)| h == hash) || index.cache.iter().any(|(h, _, _)| h == hash)
+    }
+    /// Whether using `hash` now costs its size.
+    fn charges(&self, index: &Index, hash: &str) -> bool {
+        !(self.charged.iter().any(|h| h == hash) && self.held(index, hash))
+    }
+}
+
 fn load(
     index: &mut Index,
     dir: &Path,
     hash: &str,
-    budget: &mut usize,
+    budget: &mut Budget,
     deadline: Option<f64>,
 ) -> Result<Arc<Value>> {
     check_deadline(deadline)?;
@@ -381,17 +404,25 @@ fn load(
         hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
         "history: invalid blob hash"
     );
-    // The budget is charged per call, cache hits included, from the size on disk.
-    let size = std::fs::metadata(dir.join("blobs").join(hash))?.len() as usize;
-    ensure!(
-        size <= MAX_SOURCE && size <= *budget,
-        "history: source read limit exceeded"
-    );
-    *budget -= size;
+    if budget.charges(index, hash) {
+        let size = std::fs::metadata(dir.join("blobs").join(hash))?.len() as usize;
+        ensure!(
+            size <= MAX_SOURCE && size <= budget.left,
+            "history: source read limit exceeded"
+        );
+        budget.left -= size;
+        if !budget.charged.iter().any(|h| h == hash) {
+            budget.charged.push(hash.into());
+        }
+    }
+    if let Some((_, value)) = budget.last.as_ref().filter(|(h, _)| h == hash) {
+        return Ok(value.clone());
+    }
     if let Some(pos) = index.cache.iter().position(|(h, _, _)| h == hash) {
         let item = index.cache.remove(pos).unwrap();
         let value = item.1.clone();
         index.cache.push_back(item);
+        budget.last = Some((hash.into(), value.clone()));
         return Ok(value);
     }
     let data = crate::eventlog::read_blob_bounded(dir, hash, MAX_SOURCE, || check_deadline(deadline))
@@ -407,6 +438,7 @@ fn load(
             .cache
             .push_back((hash.into(), value.clone(), data.len()));
     }
+    budget.last = Some((hash.into(), value.clone()));
     Ok(value)
 }
 
@@ -415,7 +447,7 @@ fn entry(
     record: &Record,
     ordinal: usize,
     dir: &Path,
-    budget: &mut usize,
+    budget: &mut Budget,
     deadline: Option<f64>,
 ) -> Result<(String, String)> {
     let hash = if ordinal == 0 {
@@ -733,6 +765,24 @@ mod tests {
         }
         assert!(pages >= 3);
         assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn a_large_source_is_charged_once_per_call() {
+        // a 20 MiB checkpoint: over the cache limit, and three times over the budget would leave three entries a call
+        let mut messages = vec![message("user", "task")];
+        for i in 0..20 {
+            messages.push(message("assistant", "call"));
+            messages.push(message("tool", &format!("{i}{}", "x".repeat(1 << 20))));
+        }
+        messages.extend([message("assistant", "keep"), message("tool", "keep")]);
+        let cut = messages.len() - 1;
+        let mut f = Fixture::new(messages);
+        f.compact(cut, "summary");
+        let page = f.query(json!({"q":"absent"})).unwrap();
+        assert_eq!(page["scan_complete"], true, "{page}");
+        let page = f.query(json!({"q":"19xxx","limit":20})).unwrap();
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
     }
 
     #[test]
