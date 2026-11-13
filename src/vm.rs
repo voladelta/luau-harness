@@ -21,6 +21,12 @@ use std::time::{Duration, Instant};
 pub const CHUNK_SECS: u64 = 120;
 /// `view(path, {max = N})`: the long side images are scaled to, by default and at least / at most.
 pub const VIEW_MAX: (u32, u32, u32) = (1024, 64, 2000);
+/// Printed output kept per chunk, like a `sh` stream: the first and last half around a notice. The printer shows far
+/// less (std/printer OUTPUT_CAP); the rest stays reachable as `_cut[n]`.
+pub const PRINT_CAPTURE: usize = 1 << 20;
+/// Luau calls the interrupt at every safepoint (loop back-edge, call); the deadline check runs on every
+/// INTERRUPT_STRIDE-th one of an OS thread (see `sample_interrupt`).
+const INTERRUPT_STRIDE: u32 = 1024;
 
 pub(crate) const PRELUDE: &str = r##"
 function print(...)
@@ -98,12 +104,182 @@ mod session_budget_tests {
     }
 }
 
+/// One chunk's printed output. It lives outside the Lua memory limit, so (like `sh` output) only the first and last
+/// PRINT_CAPTURE / 2 bytes are kept, with a notice of what was dropped from the middle.
+#[derive(Default)]
+struct Printed { head: String, tail: String, total: usize }
+
+impl Printed {
+    fn push(&mut self, s: &str) {
+        let half = PRINT_CAPTURE / 2;
+        self.total += s.len();
+        // once the tail has started, everything goes to the tail, so order is kept
+        let mut take = if self.tail.is_empty() { s.len().min(half - self.head.len()) } else { 0 };
+        while !s.is_char_boundary(take) { take -= 1; }
+        self.head.push_str(&s[..take]);
+        self.tail.push_str(&s[take..]);
+        if self.tail.len() > 2 * half { self.tail.drain(..ceil_boundary(&self.tail, self.tail.len() - half)); }
+    }
+
+    fn take(&mut self) -> String {
+        let Printed { mut head, tail, total } = std::mem::take(self);
+        if total <= PRINT_CAPTURE { head.push_str(&tail); return head; }
+        let kept = &tail[ceil_boundary(&tail, tail.len().saturating_sub(PRINT_CAPTURE / 2))..];
+        head.push_str(&format!("\n…[hx: {} bytes of printed output omitted from the middle; print less]…\n", total - head.len() - kept.len()));
+        head.push_str(kept);
+        head
+    }
+}
+
+/// What `values::validate` charges for data (conservative encoded bytes, nodes), so the durable store's total can be
+/// kept per entry: the store object costs 3 bytes and 1 node, each entry its key's string plus its value.
+#[derive(Clone, Copy, Default)]
+struct DataSize { bytes: usize, nodes: usize }
+
+impl DataSize {
+    fn string(s: &str) -> usize {
+        2 + s.bytes().map(|b| if b < 32 { 6 } else if b == b'"' || b == b'\\' { 2 } else { 1 }).sum::<usize>()
+    }
+    fn value(v: &serde_json::Value, size: &mut DataSize) {
+        size.bytes += 1;
+        size.nodes += 1;
+        match v {
+            serde_json::Value::String(s) => size.bytes += Self::string(s),
+            serde_json::Value::Array(a) => { size.bytes += 2; for v in a { Self::value(v, size); } },
+            serde_json::Value::Object(o) => { size.bytes += 2; for (k, v) in o { size.bytes += Self::string(k); Self::value(v, size); } },
+            _ => size.bytes += 24,
+        }
+    }
+    fn entry(key: &str, v: &serde_json::Value) -> DataSize {
+        let mut size = DataSize { bytes: Self::string(key), nodes: 0 };
+        Self::value(v, &mut size);
+        size
+    }
+    fn entries(store: &serde_json::Map<String, serde_json::Value>) -> DataSize {
+        store.iter().map(|(k, v)| Self::entry(k, v)).fold(DataSize { bytes: 3, nodes: 1 }, |a, b| DataSize { bytes: a.bytes + b.bytes, nodes: a.nodes + b.nodes })
+    }
+}
+
+/// mlua's interrupt trampoline (one function for every VM), which `sampled_interrupt` forwards to.
+static MLUA_INTERRUPT: std::sync::OnceLock<unsafe extern "C-unwind" fn(*mut mlua::ffi::lua_State, std::ffi::c_int)> = std::sync::OnceLock::new();
+
+/// Even an interrupt that returns at once costs mlua's trampoline (an Arc clone and an error frame) per safepoint, which
+/// made `for i = 1, 1e8` 12x slower. This counts safepoints in a thread-local and enters mlua's trampoline on every
+/// INTERRUPT_STRIDE-th, so a thread runs at most that many safepoints past a deadline. A skipped call would have
+/// returned Continue, so this changes no outcome: deadlines still fire, and threads awaiting an effect still pass.
+unsafe extern "C-unwind" fn sampled_interrupt(state: *mut mlua::ffi::lua_State, gc: std::ffi::c_int) {
+    thread_local!(static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    if gc >= 0 { return; } // a GC step, which mlua ignores too
+    let n = CALLS.with(|c| { let n = c.get().wrapping_add(1); c.set(n); n });
+    if n % INTERRUPT_STRIDE == 0 && let Some(f) = MLUA_INTERRUPT.get() { unsafe { f(state, gc) } }
+}
+
+/// Put `sampled_interrupt` in front of the interrupt `set_interrupt` installed.
+fn sample_interrupt(lua: &Lua) -> mlua::Result<()> {
+    unsafe {
+        lua.exec_raw::<()>((), |state| {
+            let callbacks = mlua::ffi::lua_callbacks(state);
+            // only in front of the one trampoline it forwards to (otherwise the interrupt stays unsampled)
+            if let Some(f) = (*callbacks).interrupt
+                && f as *const () != sampled_interrupt as *const ()
+                && *MLUA_INTERRUPT.get_or_init(|| f) as *const () == f as *const () {
+                (*callbacks).interrupt = Some(sampled_interrupt);
+            }
+        })
+    }
+}
+
+fn ceil_boundary(s: &str, mut at: usize) -> usize {
+    while !s.is_char_boundary(at) { at += 1; }
+    at
+}
+
+#[cfg(test)]
+mod chunk_boundary_tests {
+    use super::*;
+
+    fn vm(name: &str, budget: Duration) -> (Vm, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hx-chunk-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        (Vm::new(policy, budget, 256 << 20, None).unwrap(), dir)
+    }
+
+    #[tokio::test]
+    async fn the_last_line_is_returned_only_when_it_is_a_statement_of_its_own() {
+        let (vm, dir) = vm("last-line", Duration::from_secs(5));
+        assert!(vm.exec_text("x = 10\n- 3").await.unwrap().starts_with("(no output)"));
+        assert!(vm.exec_text("x").await.unwrap().starts_with("=> 7"));
+        assert!(vm.exec_text("f = function(t) return #t end\ny = f\n{1, 2}").await.unwrap().starts_with("(no output)"));
+        assert!(vm.exec_text("y").await.unwrap().starts_with("=> 2"));
+        assert!(vm.exec_text("z = 1\nz + 1").await.unwrap().starts_with("=> 2"));
+        assert!(vm.exec_text("-- note\nstring.upper('a')").await.unwrap().starts_with("=> A"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn binary_values_and_errors_render_instead_of_failing_the_host() {
+        let (vm, dir) = vm("binary", Duration::from_secs(5));
+        let text = vm.exec_text("local s = '\\255\\254'\ns").await.unwrap();
+        assert!(text.contains('\u{FFFD}') && text.ends_with("error=false"), "{text}");
+        // é starts at byte 160 of the line: a byte cut would split it
+        let text = vm.exec_text(&format!("local ok = true\n_ = nil + \"{}é\"", "a".repeat(148))).await.unwrap();
+        assert!(text.contains(&format!("at line 2: _ = nil + \"{}é\n", "a".repeat(148))) && !text.contains('\u{FFFD}'), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn printed_output_keeps_its_head_and_tail_within_the_capture() {
+        let (vm, dir) = vm("print-cap", Duration::from_secs(30));
+        let r = vm.session.run("local s = string.rep('é', 1000) for i = 1, 3000 do print(i, s) end print('LAST')").await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert!(r.output.len() <= PRINT_CAPTURE + 200, "{}", r.output.len());
+        assert!(r.output.starts_with("1\t") && r.output.ends_with("LAST\n") && r.output.contains("bytes of printed output omitted"));
+        let small = vm.session.run("print('a') print('b')").await;
+        assert_eq!(small.output, "a\nb\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn durable_set_nil_deletes_and_limits_cover_the_whole_store() {
+        let (vm, dir) = vm("durable", Duration::from_secs(60));
+        let r = vm.session.run(r#"
+            durable.set("k", {1, 2}); durable.set("k", nil); assert(durable.get("k") == nil)
+            durable.set("big", string.rep("x", 9 * 1024 * 1024))
+            assert(not pcall(durable.set, "other", string.rep("y", 8 * 1024 * 1024)))
+            assert(durable.get("other") == nil and #durable.get("big") == 9 * 1024 * 1024)
+            local t = os.clock()
+            for i = 1, 500 do durable.set("n" .. i % 10, {i = i}) end
+            assert(os.clock() - t < 5, "set re-walked the store")
+            durable.set("big", nil); durable.set("other", string.rep("y", 8 * 1024 * 1024))
+            local deep = 1 for _ = 1, 64 do deep = {deep} end
+            assert(not pcall(durable.set, "deep", deep)); durable.set("deep", deep[1])
+        "#).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sampled_interrupt_still_enforces_the_chunk_budget() {
+        let (vm, dir) = vm("interrupt", Duration::from_millis(1000));
+        let t = Instant::now();
+        let r = vm.session.run("local x = 0 for i = 1, 1e5 do x += i end print(x)").await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let spun = vm.session.run("while true do end").await;
+        assert!(spun.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")));
+        let called = vm.session.run("local function f() end while true do f() end").await;
+        assert!(called.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")));
+        assert!(t.elapsed() < Duration::from_secs(20));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// The model's persistent environment plus the budgets that apply to each chunk.
 pub struct Session {
     lua: Lua,
     log: Arc<crate::eventlog::EventLog>,
     env: Table,
-    out: Arc<Mutex<String>>,
+    out: Arc<Mutex<Printed>>,
     ops: Arc<AtomicUsize>,
     deadline: Arc<Mutex<Option<Instant>>>,
     budget: Duration,
@@ -119,8 +295,12 @@ impl Session {
         if let Some(idx) = trimmed.rfind('\n') {
             let (head, last) = trimmed.split_at(idx + 1);
             // Only rewrite when `head` is a complete chunk by itself; otherwise the last line closes a block
-            // (`end`) and `return end` would silently exit the loop/if body early.
-            if self.lua.load(head).set_name("=chunk").into_function().is_ok()
+            // (`end`) and `return end` would silently exit the loop/if body early. And only when the last line is
+            // not the continuation of head's last statement (`x = 10\n- 3` is `x = 7`, `x = f\n(g)` a call): such a
+            // program compiles, but stops compiling once a statement (`do end`) separates the two lines.
+            let compiles = |src: &str| self.lua.load(src).set_name("=chunk").into_function().is_ok();
+            if compiles(head)
+                && (!compiles(trimmed) || compiles(&format!("{head}do end {last}")))
                 && let Ok(f) = load(&format!("{head}return {last}")) {
                     return Ok(f);
                 }
@@ -131,7 +311,7 @@ impl Session {
     }
 
     pub async fn run(&self, code: &str) -> RunResult {
-        self.out.lock().unwrap().clear();
+        self.out.lock().unwrap().take();
         self.ops.store(0, Ordering::Relaxed);
         self.chunks.fetch_add(1, Ordering::Relaxed);
         *self.deadline.lock().unwrap() = Some(Instant::now() + self.budget);
@@ -140,7 +320,7 @@ impl Session {
             Err(e) => Err(e),
         };
         *self.deadline.lock().unwrap() = None;
-        let output = std::mem::take(&mut *self.out.lock().unwrap());
+        let output = self.out.lock().unwrap().take();
         let (values, error) = match result {
             Ok(vals) => (vals.into_iter().filter(|v| !v.is_nil()).collect(), None),
             Err(e) => (vec![], Some(clean_error(&e))),
@@ -216,7 +396,7 @@ impl Vm {
     pub fn new(policy: Arc<Policy>, budget: Duration, mem_limit: usize, host: Option<Arc<Host>>) -> Result<Vm> {
         let root: PathBuf = policy.workspace.clone();
         let lua = Lua::new();
-        let out = Arc::new(Mutex::new(String::new()));
+        let out = Arc::new(Mutex::new(Printed::default()));
         let ops = Arc::new(AtomicUsize::new(0));
         let deadline: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let resolver = Arc::new(Resolver::new(root.clone()));
@@ -238,8 +418,8 @@ impl Vm {
         let buf = out.clone();
         g.set("__emit", lua.create_function(move |_, s: mlua::LuaString| {
             let mut b = buf.lock().unwrap();
-            b.push_str(&s.to_string_lossy());
-            b.push('\n');
+            b.push(&s.to_string_lossy());
+            b.push("\n");
             Ok(())
         })?)?;
         // Use the frozen std/printer module; fall back to tostring if it fails.
@@ -295,15 +475,15 @@ impl Vm {
                 }
             })?)?;
         }
-        let (bs, bh, bfx) = (supervisor.clone(), host.clone(), fx.clone());
+        let (bs, bh, bfx, bops) = (supervisor.clone(), host.clone(), fx.clone(), ops.clone());
         g.set("batch", lua.create_async_function(move |lua, input: Value| {
-            let (s, h, fx) = (bs.clone(), bh.clone(), bfx.clone());
+            let (s, h, fx, ops) = (bs.clone(), bh.clone(), bfx.clone(), bops.clone());
             async move {
                 s.authorize_stage(fx.stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
                 let _active = crate::workflow_runtime::EffectGuard::new(&s);
                 let operations = crate::values::copy_out(input)?;
                 let _wait = fx.awaiting(&lua);
-                let results = crate::batch::run(s.clone(), h, operations).await.map_err(mlua::Error::external)?;
+                let results = crate::batch::run(&lua, fx.clone(), h, ops, operations).await.map_err(mlua::Error::external)?;
                 crate::values::copy_in(&lua, &results)
             }
         })?)?;
@@ -379,14 +559,31 @@ impl Vm {
         })?)?;
         let stage_owner=supervisor.clone();
         let stage_epoch=supervisor.workflow_epoch();
+        // The store-wide limits are checked against a running total (measured once, then moved by each set's delta),
+        // so a set validates only its own value instead of copying and re-walking the whole store.
+        let store_size: Mutex<Option<DataSize>> = Mutex::new(None);
         durable.set("set", lua.create_function(move |_, (key, value): (String, Value)| {
             stage_owner.authorize_stage(stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
-            let value = crate::values::copy_out(value)?;
+            // set(k, nil) deletes k: a stored JSON null would come back as a truthy userdata from get.
+            let value = if value.is_nil() { None } else {
+                // validated as the store's entry, so nesting counts from the store's root
+                let entry = serde_json::Value::Object(serde_json::Map::from_iter([(key.clone(), crate::values::copy_out(value)?)]));
+                crate::values::validate(&entry)?;
+                let serde_json::Value::Object(entry) = entry else { unreachable!() };
+                entry.into_iter().next().map(|(_, v)| v)
+            };
             let mut saved = saved.lock().unwrap();
-            let mut candidate = saved.clone();
-            candidate.as_object_mut().unwrap().insert(key, value);
-            crate::values::validate(&candidate)?;
-            *saved = candidate;
+            let store = saved.as_object_mut().unwrap();
+            let mut size = store_size.lock().unwrap();
+            let total = *size.get_or_insert_with(|| DataSize::entries(store));
+            let old = store.get(&key).map_or(DataSize::default(), |v| DataSize::entry(&key, v));
+            let new = value.as_ref().map_or(DataSize::default(), |v| DataSize::entry(&key, v));
+            let next = DataSize { bytes: total.bytes - old.bytes + new.bytes, nodes: total.nodes - old.nodes + new.nodes };
+            if next.bytes > crate::values::MAX_BYTES || next.nodes > crate::values::MAX_NODES {
+                return Err(mlua::Error::runtime("durable data would exceed 16 MiB or 262144 nodes; nothing was saved"));
+            }
+            match value { Some(v) => { store.insert(key, v); }, None => { store.remove(&key); } }
+            *size = Some(next);
             Ok(())
         })?)?;
         durable.set_readonly(true);
@@ -477,6 +674,7 @@ impl Vm {
                 }
             Ok(VmState::Continue)
         });
+        sample_interrupt(&lua)?;
 
         // mlua needs its private coroutine library to build async callbacks. Neither model code nor modules receive
         // that library (or _G, which would expose it) through their environment.
@@ -694,25 +892,14 @@ impl Vm {
         Ok(())
     }
 
-    /// Run a chunk in the session and render it exactly as the loop would (std/feedback).
+    /// `hx exec`: one chunk rendered exactly as the loop shows it, plus its op count and error flag.
     pub async fn exec_text(&self, code: &str) -> Result<String> {
-        let r = self.session.run(code).await;
-        let t = self.lua.create_table()?;
-        t.set("output", r.output)?;
-        t.set("values", self.lua.create_sequence_from(r.values)?)?;
-        t.set("error", r.error.clone())?;
-        t.set("ops", r.ops)?;
-        let f = self
-            .lua
-            .load("local res, code = ...\nreturn require('std/feedback').compose(res, code)")
-            .set_name("=host")
-            .set_environment(self.modenv.clone())
-            .into_function()?;
-        let text: String = f.call_async((t, code.to_string())).await?;
-        self.session.log.check()?;
-        Ok(format!("{text}-- ops={} error={}", r.ops, r.error.is_some()))
+        let r = self.run_chunk(code).await?;
+        Ok(format!("{}-- ops={} error={}", r["feedback"].as_str().unwrap_or(""), r["ops"], !r["error"].is_null()))
     }
 
+    /// Run a chunk in the session and render it with std/feedback. The feedback comes back lossily: a chunk's value
+    /// can be any bytes (`sh("cat x.png").stdout`), which is the chunk's business, never a host error.
     pub async fn run_chunk(&self, code: &str) -> Result<serde_json::Value> {
         let result = self.session.run(code).await;
         self.session.log.check()?;
@@ -722,9 +909,9 @@ impl Vm {
         value.set("error", result.error.clone())?;
         value.set("ops", result.ops)?;
         let formatter = self.lua.load("local r, code = ...; return require('std/feedback').compose(r, code)")
-            .set_environment(self.modenv.clone()).into_function()?;
-        let feedback: String = formatter.call_async((value, code.to_string())).await?;
-        Ok(json!({"output":result.output, "error":result.error, "ops":result.ops, "feedback":feedback}))
+            .set_name("=host").set_environment(self.modenv.clone()).into_function()?;
+        let feedback: mlua::LuaString = formatter.call_async((value, code.to_string())).await?;
+        Ok(json!({"output":result.output, "error":result.error, "ops":result.ops, "feedback":feedback.to_string_lossy()}))
     }
 
     pub fn prepare_request(&self, request: &serde_json::Value) -> Result<serde_json::Value> {

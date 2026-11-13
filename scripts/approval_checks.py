@@ -243,6 +243,23 @@ class Approvals(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(self.grant_records(), [])
 
+    def test_batched_reads_await_their_permission(self):
+        # each operation drives the async read: it can wait for the prompt lock and the owner's answer
+        for i in range(32):
+            (self.outside / f"f{i}").write_text(f"v{i}")
+        code = (f'local t={{}} for i=1,32 do t[i]={{op="read",args={{"{self.outside}/f"..(i-1)}}}} end '
+                'local bad=0 for i,r in batch(t) do if not (r.ok and r.value=="v"..(i-1)) then bad+=1 print(r.error) end end print("bad",bad)')
+        result = self.headless(self.command(code, "--yes"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bad\t0", result.stdout)
+        self.assertIn("-- ops=32 ", result.stdout)
+        target = self.outside / "f0"
+        status, out = terminal(self.command(f'print(batch({{{{op="read",args={{"{target}"}}}}}})[1].value)'), ["y"])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(out.count("[approval needed]"), 1, out)
+        self.assertIn("v0", out.split("[y/N]")[-1])
+        self.assertIn("-- ops=1 ", out)
+
     def run_args(self, url, prompt="Do the scripted work", *flags):
         return ["run", prompt, "--workspace", str(self.ws), "--model", "mock",
                 "--base-url", url, "--key-env", "HX_TEST_KEY", *flags]
