@@ -33,6 +33,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 |---|---|---|
 | `--prompt-file F` | | Read the task from a file instead of a positional prompt |
 | `--ignore-config` | off | Run without this workspace's `.harness` config and `hx.lock`; without it, untrusted config makes `hx run` and `hx exec` exit with an error (see [workspace trust](configuration.md#workspace-trust)). Also accepted by `hx exec` |
+| `--approval prompt\|deny` | `policy.toml`, else `prompt` | Override the configured approval mode; cannot combine with `--yes`. Also accepted by `hx exec` and `hx test` |
 | `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run; irreversible commands still need an exact `allow` entry or a terminal answer |
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
@@ -63,7 +64,8 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | Flag | Meaning |
 |---|---|
 | `--workspace DIR` | Workspace root (default `.`) |
-| `--approval prompt\|deny` | Override the configured approval mode (default `prompt`); cannot combine with `--yes` |
+
+Flags and positional operands may come in any order; `--` ends the flags. A command refuses a flag it does not use.
 
 Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=HASH` trusts exactly the config with that hash for one launch (`HX_TRUST=1` is deprecated; see [workspace trust](configuration.md#workspace-trust)).
 

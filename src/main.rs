@@ -58,6 +58,37 @@ fn positionals(args: &[String]) -> Vec<&str> {
     cli_args(args).into_iter().filter_map(|a| match a { CliArg::Positional(p) => Some(p), _ => None }).collect()
 }
 
+/// How many positional operands `command` takes, and its usage line for a wrong count. `run` and `exec` check their
+/// own (a prompt, or any number of chunks).
+fn operand_count(command: &str) -> Option<(usize, &'static str)> {
+    Some(match command {
+        "review" => (1, "usage: hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]"),
+        "recover" => (2, "usage: hx recover LOG OP --decision complete|abandon [--yes]"),
+        "revoke" => (1, "usage: hx revoke LOG"),
+        "test" => (1, "usage: hx test PKG_DIR"),
+        "approve" => (1, "usage: hx approve PKG"),
+        "skills" => (0, "usage: hx skills"),
+        "trust" => (0, "usage: hx trust [--yes]"),
+        "staged" => (0, "usage: hx staged"),
+        "accept" => (1, "usage: hx accept NAME [--yes]"),
+        "reject" => (1, "usage: hx reject NAME"),
+        "rollback" => (1, "usage: hx rollback MODULE"),
+        "log" => (2, "usage: hx log verify FILE"),
+        _ => return None,
+    })
+}
+
+/// The positional operands of an owner command, wherever its flags stand, checked against `operand_count`.
+fn operands(args: &[String]) -> Result<Vec<&str>> {
+    let command = args.first().map(String::as_str).unwrap_or("");
+    let found = positionals(args);
+    if let Some((count, line)) = operand_count(command)
+        && (found.len() != count || (command == "log" && found.first() != Some(&"verify"))) {
+        return Err(usage(line));
+    }
+    Ok(found)
+}
+
 fn task_text(args: &[String]) -> Result<Option<String>> {
     match arg(args, "--prompt-file") {
         Some(path) => Ok(Some(std::fs::read_to_string(path)?)),
@@ -129,7 +160,7 @@ const FLAGS: &[Flag] = {
     const RUN: &[&str] = &["run"];
     &[
         flag(&[], "--workspace", Text, "DIR", "workspace root (default: .)"),
-        flag(&[], "--approval", Text, "MODE", "prompt (default) or deny: handle requests outside standing permissions"),
+        flag(&["run", "exec", "test"], "--approval", Text, "MODE", "prompt (default) or deny: handle requests outside standing permissions"),
         flag(&["run", "exec"], "--yes", Switch, "", "autopilot: approve ordinary path and tool requests for this run without asking (never irreversible commands)"),
         flag(&["run", "exec"], "--ignore-config", Switch, "", "run without this workspace's .harness config and hx.lock (instead of refusing untrusted config)"),
         flag(&["run", "exec"], "--pack", Text, "A,B", "extra packs: std/authoring (agent-written tools), std/vision (view() shows images)"),
@@ -316,8 +347,12 @@ fn validate_args(args: &[String]) -> Result<()> {
     if list_arg(args, "--pack").iter().any(|p| p == "std/rpi" || p.starts_with("std/rpi/")) {
         return Err(usage("RPI must be activated explicitly with --rpi, not --pack"));
     }
-    if command == "review" && (args.get(1).is_none_or(|s| s.starts_with("--")) || arg(args,"--gate").is_none() || arg(args,"--decision").is_none()) {
-        return Err(usage("usage: hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]"));
+    operands(args)?;
+    if command == "review" && (arg(args, "--gate").is_none() || arg(args, "--decision").is_none()) {
+        return Err(usage(operand_count("review").expect("review takes operands").1));
+    }
+    if command == "recover" && arg(args, "--decision").is_none() {
+        return Err(usage(operand_count("recover").expect("recover takes operands").1));
     }
     if let Some(mode) = arg(args, "--approval") {
         mode.parse::<policy::ApprovalMode>().map_err(|e| usage(&e.to_string()))?;
@@ -364,12 +399,15 @@ async fn real_main() -> Result<()> {
         "run" => {
             confine::note();
             // A child run of an autoresearch episode: the episode becomes part of its frozen policy.
-            cmd_run(&args, workspace.clone(), mk_policy(ar::load_episode()?)?).await
+            cmd_run(&args, mk_policy(ar::load_episode()?)?).await
         }
         "recover" => cmd_recover(&args),
-        "review" => workflow_runtime::review(Path::new(&args[1]), &arg(&args,"--gate").unwrap(), &arg(&args,"--decision").unwrap(), arg(&args,"--input-file").as_deref().map(Path::new)),
+        "review" => {
+            let (gate, decision) = (arg(&args, "--gate").expect("validated"), arg(&args, "--decision").expect("validated"));
+            workflow_runtime::review(Path::new(operands(&args)?[0]), &gate, &decision, arg(&args, "--input-file").as_deref().map(Path::new))
+        }
         "revoke" => {
-            let path = PathBuf::from(args.get(1).ok_or_else(|| usage("usage: hx revoke LOG"))?);
+            let path = PathBuf::from(operands(&args)?[0]);
             anyhow::ensure!(path.is_file(), "run log does not exist");
             std::fs::write(path.with_extension("revoked"), "revoked by owner\n")?;
             println!("revoked {}", path.display());
@@ -390,21 +428,16 @@ async fn real_main() -> Result<()> {
             Ok(())
         }
         "reject" => {
-            let n = *positionals(&args).first().ok_or_else(|| usage("usage: hx reject NAME"))?;
+            let n = operands(&args)?[0];
             modules::Resolver::new(workspace).reject(n)?;
             println!("rejected {n}");
             Ok(())
         }
         "accept" => cmd_accept(&args, &workspace),
         "rollback" => cmd_rollback(&args, &workspace),
-        "log" if args.get(1).map(String::as_str) == Some("verify") => cmd_log_verify(&args),
-        _ => Err(usage("usage: hx log verify FILE (see `hx log --help`)")),
+        "log" => cmd_log_verify(&args),
+        other => unreachable!("help_for lists {other} but nothing dispatches it"),
     }
-}
-
-/// The Luau chunks of `hx exec`: every argument after the command that is not a global flag or its value.
-fn exec_chunks(args: &[String]) -> Vec<&str> {
-    positionals(args)
 }
 
 /// hx exec --workspace DIR 'chunk1' 'chunk2' : run chunks in one session (no API key needed; used for testing)
@@ -413,7 +446,8 @@ async fn cmd_exec(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
     let mut packs = vec!["std/packages".to_string(), "std/mcp".to_string()];
     packs.extend(list_arg(args, "--pack"));
     vm.install_packs(&packs).await?;
-    for chunk in exec_chunks(args) {
+    // The chunks: every argument after the command that is not a flag or its value.
+    for chunk in positionals(args) {
         println!("{}", vm.exec_text(chunk).await?);
     }
     Ok(())
@@ -448,8 +482,7 @@ async fn with_provider_limits(mut cfg: llm::LlmCfg, args: &[String]) -> llm::Llm
 }
 
 /// hx run --workspace DIR --prompt-file F --model M [--base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
-async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy>) -> Result<()> {
-    let _ = workspace;
+async fn cmd_run(args: &[String], policy: Arc<policy::Policy>) -> Result<()> {
     let trace = arg(args, "--trace").map(PathBuf::from);
     let host = if has(args, "--resume") {
         host::Host::resume(policy, trace)?
@@ -526,9 +559,10 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
 }
 
 fn cmd_recover(args: &[String]) -> Result<()> {
-    let path = Path::new(args.get(1).ok_or_else(|| usage("usage: hx recover LOG OP --decision complete|abandon"))?);
-    let id: u64 = args.get(2).ok_or_else(|| usage("missing operation ID"))?.parse()?;
-    let decision: supervisor::Decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?.parse()?;
+    let operands = operands(args)?;
+    let path = Path::new(operands[0]);
+    let id: u64 = operands[1].parse().map_err(|_| usage(&format!("operation ID: expected a number, got {:?}", operands[1])))?;
+    let decision: supervisor::Decision = arg(args, "--decision").expect("validated").parse().map_err(|e: anyhow::Error| usage(&e.to_string()))?;
     let log = eventlog::EventLog::reconcile(path)?;
     let records = eventlog::load(path)?;
     let mut books = supervisor::Books::of(&records)?;
@@ -550,7 +584,7 @@ fn cmd_recover(args: &[String]) -> Result<()> {
 
 /// hx test PKG_DIR : run the package's tests/*.luau inside its boundary (see `modules::TestTarget`)
 async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>) -> Result<()> {
-    let dir = PathBuf::from(*positionals(args).first().ok_or_else(|| usage("usage: hx test PKG_DIR"))?).canonicalize()?;
+    let dir = PathBuf::from(operands(args)?[0]).canonicalize()?;
     let report = match modules::Resolver::new(workspace.to_path_buf()).test_target(&dir)? {
         modules::TestTarget::Harness { note } => {
             if let Some(note) = note { eprintln!("note: {note}"); }
@@ -578,7 +612,7 @@ async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>
 
 /// hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
 fn cmd_approve(args: &[String], workspace: &Path) -> Result<()> {
-    let pkg = *positionals(args).first().ok_or_else(|| usage("usage: hx approve PKG"))?;
+    let pkg = operands(args)?[0];
     let rt = trust::Retrust::before(workspace);
     println!("{}", modules::Resolver::new(workspace.to_path_buf()).approve(pkg)?);
     rt.after()
@@ -617,7 +651,7 @@ fn cmd_trust(args: &[String], workspace: &Path) -> Result<()> {
 
 /// hx rollback MODULE : undo the last accepted replacement of a harness module
 fn cmd_rollback(args: &[String], workspace: &Path) -> Result<()> {
-    let module = *positionals(args).first().ok_or_else(|| usage("usage: hx rollback MODULE"))?;
+    let module = operands(args)?[0];
     let rt = trust::Retrust::before(workspace);
     println!("{}", modules::Resolver::new(workspace.to_path_buf()).rollback(module)?);
     rt.after()
@@ -625,7 +659,7 @@ fn cmd_rollback(args: &[String], workspace: &Path) -> Result<()> {
 
 /// hx accept NAME [--yes] : review something staged, then activate exactly what the review showed
 fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
-    let n = *positionals(args).first().ok_or_else(|| usage("usage: hx accept NAME [--yes]"))?;
+    let n = operands(args)?[0];
     let r = modules::Resolver::new(workspace.to_path_buf());
     let review = r.review(n)?;
     println!("{}", review.text);
@@ -640,7 +674,7 @@ fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
 /// hx log verify FILE : check the keyed chain, the referenced blobs and the accounting, and list effects with an unknown
 /// outcome (exit 1 damaged, 3 unknown)
 fn cmd_log_verify(args: &[String]) -> Result<()> {
-    let f = PathBuf::from(args.get(2).ok_or_else(|| usage("usage: hx log verify FILE"))?);
+    let f = PathBuf::from(operands(args)?[1]);
     let r = eventlog::verify(&f)?;
     match &r.broken {
         None => println!("{} records, hash chain intact", r.records),
@@ -684,8 +718,66 @@ mod tests {
     #[test]
     fn exec_chunks_skip_global_flags_and_their_values() {
         let a = argv("exec --workspace /w print(1) --pack a,b print(2) --yes print(3)");
-        assert_eq!(exec_chunks(&a), vec!["print(1)", "print(2)", "print(3)"]);
-        assert!(exec_chunks(&argv("exec")).is_empty());
+        assert_eq!(positionals(&a), vec!["print(1)", "print(2)", "print(3)"]);
+        assert!(positionals(&argv("exec")).is_empty());
+    }
+
+    /// Every command finds its operands with global flags before, between and after them, and refuses a wrong count
+    /// or a global flag it would ignore.
+    #[test]
+    fn operands_are_found_wherever_global_flags_stand() {
+        let commands: &[(&str, &[&str], &str)] = &[
+            ("run", &["task"], "--model m"),
+            ("exec", &["print(1)", "print(2)"], ""),
+            ("review", &["LOG"], "--gate g --decision approve"),
+            ("recover", &["LOG", "7"], "--decision complete"),
+            ("revoke", &["LOG"], ""),
+            ("test", &["DIR"], ""),
+            ("approve", &["PKG"], ""),
+            ("skills", &[], ""),
+            ("trust", &[], ""),
+            ("staged", &[], ""),
+            ("accept", &["NAME"], ""),
+            ("reject", &["NAME"], ""),
+            ("rollback", &["std/printer"], ""),
+            ("log", &["verify", "FILE"], ""),
+        ];
+        for &(command, operands_, flags) in commands {
+            let mut globals = vec!["--workspace", "/w"];
+            if matches!(command, "run" | "exec" | "test") { globals.extend(["--approval", "deny"]); }
+            let flags: Vec<&str> = flags.split_whitespace().collect();
+            for split in 0..=operands_.len() {
+                // global flags at `split`, command flags at the end and then at the start
+                for flags_first in [false, true] {
+                    let mut a = vec![command.to_string()];
+                    if flags_first { a.extend(flags.iter().map(|f| f.to_string())); }
+                    a.extend(operands_[..split].iter().map(|o| o.to_string()));
+                    a.extend(globals.iter().map(|g| g.to_string()));
+                    a.extend(operands_[split..].iter().map(|o| o.to_string()));
+                    if !flags_first { a.extend(flags.iter().map(|f| f.to_string())); }
+                    validate_args(&a).unwrap_or_else(|e| panic!("{a:?}: {e}"));
+                    assert_eq!(positionals(&a), operands_, "{a:?}");
+                    if command != "run" && command != "exec" { assert_eq!(operands(&a).unwrap(), operands_, "{a:?}"); }
+                }
+            }
+            if let Some((count, _)) = operand_count(command) {
+                let mut extra = vec![command.to_string()];
+                extra.extend(operands_.iter().map(|o| o.to_string()));
+                extra.push("surplus".into());
+                extra.extend(flags.iter().map(|f| f.to_string()));
+                assert!(validate_args(&extra).unwrap_err().is::<Usage>(), "{extra:?}: {} operands only", count);
+            }
+            if !matches!(command, "run" | "exec" | "test") {
+                let mut a = vec![command.to_string(), "--approval".into(), "deny".into()];
+                a.extend(operands_.iter().map(|o| o.to_string()));
+                a.extend(flags.iter().map(|f| f.to_string()));
+                assert!(validate_args(&a).unwrap_err().is::<Usage>(), "{a:?} accepted a flag it ignores");
+            }
+        }
+        for bad in ["log check FILE", "recover LOG --decision complete", "review --gate g --decision approve"] {
+            assert!(validate_args(&argv(bad)).unwrap_err().is::<Usage>(), "{bad}");
+        }
+        assert!(cmd_recover(&argv("recover LOG abc --decision complete")).unwrap_err().is::<Usage>());
     }
 
     #[test]
@@ -699,7 +791,7 @@ mod tests {
         assert!(!has(&args, "--yes"));
         assert_eq!(task_text(&args).unwrap().as_deref(), Some("--yes"));
         assert_eq!(arg(&argv("run -- --model mock"), "--model"), None);
-        assert_eq!(exec_chunks(&argv("exec -- --yes")), vec!["--yes"]);
+        assert_eq!(positionals(&argv("exec -- --yes")), vec!["--yes"]);
     }
 
     #[test]
