@@ -264,25 +264,38 @@ mod boundary_tests {
     }
 
     #[tokio::test]
-    async fn a_value_that_raises_while_printed_falls_back_to_output_and_error() {
+    async fn a_value_with_raising_metamethods_is_summarised_without_running_them() {
         let (vm, dir) = vm("raise", Duration::from_secs(5), 64 << 20);
         let code = "print('before'); return setmetatable({}, {__index = function() error('strict table') end, __tostring = function() error('no') end})";
         let r = vm.run_chunk(code).await.unwrap();
         let feedback = r["feedback"].as_str().unwrap();
-        assert!(feedback.starts_with("before\n"), "{feedback}");
-        assert!(feedback.contains("hx could not format this result") && feedback.contains("strict table"), "{feedback}");
-        // the session survives and the next chunk renders normally
-        assert!(vm.exec_text("return 1 + 1").await.unwrap().starts_with("=> 2\n"));
+        assert!(feedback.starts_with("before\n=> {}"), "{feedback}");
+        assert!(!feedback.contains("hx could not format"), "{feedback}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn feedback_that_cannot_be_composed_falls_back_to_output_and_error() {
+        let result = RunResult { output: "before\n".into(), omitted: 7, values: vec![Value::Integer(1)], error: Some("chunk failed".into()), ops: 0 };
+        let feedback = fallback_feedback(&result, &mlua::Error::runtime("printer broke\nstack traceback: ..."));
+        assert_eq!(
+            feedback,
+            "before\nnote: 7 bytes printed in the middle of this chunk were dropped\nerror: chunk failed\n\
+             (hx could not format this result: runtime error: printer broke; the returned values are not shown)\n"
+        );
+    }
+
     #[tokio::test]
-    async fn composing_feedback_runs_under_a_deadline() {
+    async fn harness_luau_between_chunks_runs_under_a_deadline() {
         let (vm, dir) = vm("compose-deadline", Duration::from_millis(300), 64 << 20);
         let t0 = Instant::now();
-        let r = vm.run_chunk("return setmetatable({1}, {__index = function() while true do end end})").await.unwrap();
+        let spin = vm.lua.load("while true do end").set_environment(vm.modenv.clone());
+        let error = {
+            let _harness = vm.session.harness();
+            spin.exec().unwrap_err()
+        };
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
-        assert!(r["feedback"].as_str().unwrap().contains("time budget exceeded"), "{r}");
+        assert!(error.to_string().contains("time budget exceeded"), "{error}");
         // the deadline is cleared again: harness code between chunks is not left on a stale clock
         assert!(vm.session.deadline.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
