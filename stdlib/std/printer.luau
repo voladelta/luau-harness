@@ -10,10 +10,24 @@ M.DEPTH = 3
 M.ROW_CHARS = 240
 M.OUTPUT_CAP = 12000 -- total characters of printed output per turn
 
+-- Text that is not valid UTF-8 is cut by bytes, but a cut moves (at most 3 bytes) off continuation bytes, so it does
+-- not split a character that is valid. `step` is -1 to move a last kept byte back, +1 to move a first kept byte on.
+local function onchar(s: string, b: number, step: number): number
+	for _ = 1, 3 do
+		local c = s:byte(if step < 0 then b + 1 else b)
+		if c == nil or c < 0x80 or c >= 0xC0 then
+			break
+		end
+		b += step
+	end
+	return b
+end
+
 local function clip(s: string, max: number): string
 	local n = utf8.len(s)
 	if n == nil then -- not valid UTF-8: cut by bytes
-		return if #s > max then s:sub(1, max) .. "…(+" .. (#s - max) .. " bytes)" else s
+		local cut = onchar(s, max, -1)
+		return if #s > max then s:sub(1, cut) .. "…(+" .. (#s - cut) .. " bytes)" else s
 	end
 	if n <= max then
 		return s
@@ -40,8 +54,8 @@ function M.cut(s: string, max: number, what: string): string
 	local tail = max // 2
 	local head = max - tail
 	-- byte positions: the end of the head and the start of the tail
-	local hb = if unit == "chars" then utf8.offset(s, head + 1) - 1 else head
-	local tb = if unit == "chars" then utf8.offset(s, n - tail + 1) else #s - tail + 1
+	local hb = if unit == "chars" then utf8.offset(s, head + 1) - 1 else onchar(s, head, -1)
+	local tb = if unit == "chars" then utf8.offset(s, n - tail + 1) else onchar(s, #s - tail + 1, 1)
 	local name = retained(s)
 	local how = if name then string.format("the full %s is %s in your next call: search it with find/gmatch and print only the matches, instead of printing it or rerunning the command (omitted bytes: %s:sub(%d, %d))", what, name, name, hb + 1, tb - 1)
 		else "slice or filter the value, or use read(path, {offset, limit})"

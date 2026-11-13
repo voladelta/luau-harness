@@ -12,7 +12,10 @@ function M.context(code: string, msg: string): string
 		for line in (code .. "\n"):gmatch("(.-)\n") do
 			i += 1
 			if i == n then
-				out ..= "  at line " .. n .. ": " .. line:gsub("%s+$", ""):sub(1, 160) .. "\n"
+				-- 160 characters: a byte cut can split one, and the result must stay valid text
+				local text = line:gsub("%s+$", "")
+				local stop = utf8.offset(text, 161)
+				out ..= "  at line " .. n .. ": " .. (if stop then text:sub(1, stop - 1) else text) .. "\n"
 				break
 			end
 		end

@@ -40,9 +40,9 @@ findings.timeout = 99
 assert(durable.get("findings").timeout == 30)
 ```
 
-Values are copied at both boundaries. The accepted values are finite numbers, strings, booleans, null, contiguous arrays and string-keyed objects. Functions, userdata/host handles, arbitrary metatables, cycles and mixed-key tables are rejected. Native arrays carry a private inert tag so empty JSON arrays remain arrays through subsequent calls and checkpoints; a plain Luau `{}` denotes an object. A missing key returns nil. A chunk that returns a Lua error is still completed; its saved-data changes can commit with its error result. A process interrupted before checkpoint commit loses those changes. Filesystem and remote effects are not rolled back.
+Values are copied at both boundaries. The accepted values are finite numbers, strings, booleans, null, contiguous arrays and string-keyed objects. Functions, userdata/host handles, arbitrary metatables, cycles and mixed-key tables are rejected. Native arrays carry a private inert tag so empty JSON arrays remain arrays through subsequent calls and checkpoints; a plain Luau `{}` denotes an object. A missing key returns nil, and `durable.set(key, nil)` deletes the key. A chunk that returns a Lua error is still completed; its saved-data changes can commit with its error result. A process interrupted before checkpoint commit loses those changes. Filesystem and remote effects are not rolled back.
 
-Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB encoded-size bound. Shared subtrees count for every copied occurrence. The entire durable store has the same limits; rejected updates preserve its previous contents.
+Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB encoded-size bound. Shared subtrees count for every copied occurrence. The entire durable store has the same limits, checked against a running total so an update validates only its own value; rejected updates preserve its previous contents.
 
 ## Compaction history
 
@@ -59,7 +59,7 @@ print(entry.text)
 
 Search is a case-sensitive literal match over complete rendered entries. Listing defaults to five entries (maximum twenty), examines newest entries first and presents each page chronologically. Summary entries are labeled `kind="compaction"` and contain the bare summarizer output. Message entries preserve saved content and tool-call inputs; provider replay/reasoning fields and media payloads are excluded. This is the saved public transcript, so output shortened before entering the conversation cannot be recovered.
 
-Reads return at most 4096 UTF-8-safe text bytes (`bytes` can lower this). Offsets are zero-based byte offsets; offsets inside a character fail. Serialized responses are capped at 12 KiB, including escaping. List snippets are at most 200 bytes. A search examines at most 128 entries and charges at most 64 MiB of checkpoint source bytes per call, including cache hits. Follow `next` until absent; `scan_complete=false` means more candidates remain, even if the page has no matches. Cursors bind the run, query and initial archive frontier.
+Reads return at most 4096 UTF-8-safe text bytes (`bytes` can lower this). Offsets are zero-based byte offsets; offsets inside a character fail. Serialized responses are capped at 12 KiB, including escaping. List snippets are at most 200 bytes. A search examines at most 128 entries and charges at most 64 MiB of checkpoint source bytes per call: each source is charged its size once per call, including on a cache hit, and again only if it must be re-read from disk. Follow `next` until absent; `scan_complete=false` means more candidates remain, even if the page has no matches. Cursors bind the run, query and initial archive frontier.
 
 The archive covers only recorded root compactions in this run, including earlier RPI stages and before resume. It excludes live messages, un-compacted remainders of retired stages, child lanes, branch-parent journals and native operation receipts. Children and isolated package VMs have no `history` global. No supported archive records returns `status="unavailable"`; an available archive without matches returns `status="ok"` with empty entries. Legacy journals remain resumable without backfilling history or changing their frozen modules and notices.
 
@@ -137,7 +137,7 @@ for _, result in results do
 end
 ```
 
-The complete batch is validated and copied before dispatch. It accepts at most 32 independent read/search/read-only-agent operations. Results are published together in input order; search results also carry a `truncated` flag. Mutating shells, writable subagents, shared globals and arbitrary closures are excluded. `parallel{function ...}` is removed.
+The complete batch is validated and copied before dispatch. It accepts at most 32 independent read/search/read-only-agent operations. Results are published together in input order; search results also carry a `truncated` flag. Each read or search runs in its own VM under a read-only principal and may wait for an owner's path approval like its unbatched form; each counts in the chunk's `ops`. An agent operation records the same intent and receipt as `agent()`. Mutating shells, writable subagents, shared globals and arbitrary closures are excluded. `parallel{function ...}` is removed.
 
 ## Workflow customization
 
