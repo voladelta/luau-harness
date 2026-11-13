@@ -3,7 +3,9 @@ use crate::{effects::Effects, host::Host, prims, supervisor::{Principal, Supervi
 use mlua::{Lua, MultiValue, Table, Value};
 use std::{collections::HashSet, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, time::{Duration, Instant}};
 
-fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -> mlua::Result<(Lua, Table, Arc<AtomicBool>)> {
+/// A fresh VM for one package invocation: (the VM, the package's module, the principal's active flag, the package
+/// environment the module was loaded in).
+fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -> mlua::Result<(Lua, Table, Arc<AtomicBool>, Table)> {
     let registry = supervisor.registry.clone();
     let mut caps = registry.capabilities.get(package).cloned().ok_or_else(|| mlua::Error::runtime("package not in frozen registry"))?;
     if let Some(host) = &host {
@@ -101,11 +103,11 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     .install(&lua);
     lua.sandbox(true)?;
     let module: Table = require.call(package)?;
-    Ok((lua, module, active))
+    Ok((lua, module, active, env))
 }
 
 pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str, caller: Arc<Effects>) -> mlua::Result<Table> {
-    let (_worker, module, _active) = worker(supervisor.clone(), host.clone(), package)?;
+    let (_worker, module, _active, _env) = worker(supervisor.clone(), host.clone(), package)?;
     struct ExportContext<'a> {
         supervisor: Arc<Supervisor>,
         host: Option<Arc<Host>>,
@@ -137,7 +139,7 @@ pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, pa
                         let (s, h, p, route, caller) = (s.clone(), h.clone(), p.clone(), route.clone(), caller.clone());
                         async move {
                             let args = values::copy_many(args)?;
-                            let (worker, module, active) = worker(s, h, &p)?;
+                            let (worker, module, active, _env) = worker(s, h, &p)?;
                             let mut function = Value::Table(module);
                             for name in route { function = match function { Value::Table(t) => t.raw_get(name.as_str())?, _ => return Err(mlua::Error::runtime("package export changed shape")) }; }
                             let Value::Function(function) = function else { return Err(mlua::Error::runtime("package export is not callable")); };
@@ -164,4 +166,70 @@ pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, pa
     }
     let ctx = ExportContext { supervisor, host, package, caller };
     exports(lua, module, &ctx, Vec::new(), &mut HashSet::new(), &mut values::Limit::default())
+}
+
+/// What `hx test` prints: the failures, and the counts.
+#[derive(Default)]
+pub struct TestReport {
+    pub passed: usize,
+    pub failed: usize,
+    pub text: String,
+}
+
+impl TestReport {
+    /// Record one test file: its load error, or the cases `test.case` collected in `testlib.results`.
+    pub fn record(&mut self, file: &str, ran: mlua::Result<()>, testlib: &Table) -> mlua::Result<()> {
+        if let Err(e) = ran {
+            self.failed += 1;
+            self.text.push_str(&format!("FAIL {file}: load error: {e}\n"));
+            return Ok(());
+        }
+        let results: Table = testlib.get("results")?;
+        for r in results.sequence_values::<Table>() {
+            let r = r?;
+            let (case, ok): (String, bool) = (r.get("name")?, r.get("ok")?);
+            if ok {
+                self.passed += 1;
+            } else {
+                self.failed += 1;
+                self.text.push_str(&format!("FAIL {file}: {case}: {}\n", r.get::<Option<String>>("err")?.unwrap_or_default()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `hx test` of a package: each test file `(file name, source)` runs inside the package's boundary, in a package
+/// worker whose principal holds exactly the capabilities the registry grants the package. The file sees the package's
+/// environment (imports restricted to the package) plus `test`, the test library; its globals do not leak into the
+/// next file.
+pub async fn run_tests(supervisor: Arc<Supervisor>, package: &str, tests: &[(String, String)]) -> anyhow::Result<TestReport> {
+    let mut report = TestReport::default();
+    let (lua, _module, active, env) = match worker(supervisor, None, package) {
+        Ok(worker) => worker,
+        Err(e) => {
+            for (file, _) in tests {
+                report.failed += 1;
+                report.text.push_str(&format!("FAIL {file}: load error: package {package} failed to load: {e}\n"));
+            }
+            return Ok(report);
+        },
+    };
+    let testlib: Table = lua.load(crate::modules::Resolver::embedded("std", "testlib.luau").expect("std/testlib is embedded"))
+        .set_name("=std/testlib").set_environment(env.clone()).eval()?;
+    active.store(true, Ordering::Release);
+    for (file, source) in tests {
+        testlib.set("results", lua.create_table()?)?;
+        let file_env = lua.create_table()?;
+        file_env.set("test", testlib.clone())?;
+        let mt = lua.create_table()?;
+        mt.set("__index", env.clone())?;
+        file_env.set_metatable(Some(mt))?;
+        let ran = match lua.load(source).set_name(format!("={file}")).set_environment(file_env).into_function() {
+            Ok(f) => f.call_async::<()>(()).await,
+            Err(e) => Err(e),
+        };
+        report.record(file, ran, &testlib)?;
+    }
+    Ok(report)
 }

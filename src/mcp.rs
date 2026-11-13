@@ -53,10 +53,9 @@ struct File {
     server: BTreeMap<String, ServerCfg>,
 }
 
-pub fn snapshot(root: &std::path::Path) -> Result<BTreeMap<String, ServerCfg>> {
-    let path = root.join(".harness/mcp.toml");
-    if !path.exists() { return Ok(BTreeMap::new()); }
-    let file: File = toml::from_str(&std::fs::read_to_string(&path)?).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+pub fn snapshot(text: Option<&[u8]>) -> Result<BTreeMap<String, ServerCfg>> {
+    let Some(text) = text else { return Ok(BTreeMap::new()) };
+    let file: File = toml::from_str(std::str::from_utf8(text)?).map_err(|e| anyhow!(".harness/mcp.toml: {e}"))?;
     for (name, cfg) in &file.server { validate(name, cfg)?; }
     Ok(file.server)
 }

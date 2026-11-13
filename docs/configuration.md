@@ -66,7 +66,7 @@ On Linux 5.13 or newer, every shell command, local MCP server and autoresearch e
 
 | | Shell commands and MCP servers | Evaluators |
 |---|---|---|
-| Read | Read roots (workspace, private temp dir, `[fs]` roots, approved grants, toolchains, approved skills), `/usr`, `/bin`, `/sbin`, `/etc`, `/dev`, `/opt`, `/lib*`, `/proc`, `/sys` | Their scratch copy, the same system and toolchain directories, `grader` roots (and `holdout` for `select`) |
+| Read | Read roots (workspace, private temp dir, `[fs]` roots, approved grants, toolchains), `/usr`, `/bin`, `/sbin`, `/etc`, `/dev`, `/opt`, `/lib*`, `/proc`, `/sys` | Their scratch copy, the same system and toolchain directories, `grader` roots (and `holdout` for `select`) |
 | Write | Write roots (workspace, private temp dir, `[fs] write`, approved write grants), `/dev/null` and similar devices | Their scratch copy |
 | Never readable | `.harness/secrets.toml`, sealed state (`.harness/ar`, grader and held-out roots in an episode), the trust store (`~/.config/hx`) | |
 
@@ -107,10 +107,14 @@ Error: this workspace's config is not trusted (.harness/policy.toml); review it 
 - `hx run --resume` is never refused: a resumed run uses only its frozen manifest.
 - `hx approve`, `hx accept` and `hx rollback` keep an already trusted workspace trusted.
 - A workspace without such files needs nothing.
-- `HX_TRUST=HASH` in hx's environment trusts exactly that config for one launch (throwaway copies, scripts); `hx trust` prints the hash. `HX_TRUST=1`, which trusted any config, is deprecated: it still works in this release and prints a note.
+- `HX_TRUST=HASH` in hx's environment trusts exactly that config for one launch (throwaway copies, scripts); `hx trust` prints the hash.
 
 ## Approvals and `hx.lock`
 
 `hx.lock` is the single approval record: per package, the approved version and its content hash. The hash covers the package's `hx.toml`, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval.
+
+The hash is SHA-256 over every file of the package (entries starting with `.` excluded), each as its length-prefixed relative path followed by its length-prefixed content, in path order. `hx approve`, `hx skills`, `hx accept` and a run's launch read a package through the same function, so they agree on what was approved. Locks written by hx versions before this encoding no longer match: run `hx approve NAME` again for each package and skill.
+
+A run builds its extensions from the config bytes trust checked, `hx.lock` included, never from a second read of the files. `hx.lock` and the module overrides `hx accept` and `hx rollback` write are replaced atomically.
 
 Older lock files may still carry `[package.grants]` tables or a `.harness/grants.toml`; hx ignores both.

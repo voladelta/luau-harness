@@ -110,7 +110,7 @@ The branch's parent identity and inherited data are committed in its manifest, s
 
 ## Extensions and capabilities
 
-Approved package bytes and manifests are captured together at launch. A captured package's hash must match its approval, and its capabilities are the ones its approved manifest requests. Symlink-containing extension trees are refused. Skills' supporting files are copied into the protected run store. Runtime resolution does not reread mutable workspace modules.
+Approved package bytes and manifests are captured together at launch. A captured package's hash must match its approval, and its capabilities are the ones its approved manifest requests. Extension trees containing symlinks are refused (a symlinked package or skill directory is followed; its content is what was approved). Skills' supporting files are copied into the protected run store. Runtime resolution does not reread mutable workspace modules.
 
 Each package method call gets a fresh VM and a Rust principal. Native effects check that principal at dispatch. Imports are restricted to the package's own frozen files; privileged controller modules and other packages cannot be imported. Arguments/results cross as data, never function references. A read-only descendant cannot regain write authority by calling a more privileged package. `proc.sh` permits shell actions within the externally supplied process environment; it is broader than `fs.write` alone.
 

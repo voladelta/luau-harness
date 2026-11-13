@@ -447,12 +447,6 @@ impl Policy {
         if let Some(m) = approval_mode {
             p.mode = m; // the launching user's choice beats the file
         }
-        // Approved skills may live outside the workspace (~/.agents/skills); their files must be readable (read-only).
-        for pk in crate::modules::Resolver::new(workspace.clone()).list_packages() {
-            if pk.kind == "skill" && !pk.dir.is_empty() {
-                p.read_roots.push(PathBuf::from(pk.dir));
-            }
-        }
         // Automatic approval never disables the audit log.
         let log = EventLog::open(&workspace.join(".harness/log"))?;
         log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,

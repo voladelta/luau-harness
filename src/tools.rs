@@ -244,21 +244,15 @@ pub fn credentials(root: &Path, def: &Definition) -> Result<()> {
     Ok(())
 }
 
-pub fn capture(root: &Path, registry: &mut Registry) -> Result<()> {
-    let dir = root.join(".harness/tools");
-    if !dir.exists() { return Ok(()); }
-    ensure!(!std::fs::symlink_metadata(&dir)?.file_type().is_symlink(), "tools directory must not be a symlink");
-    let mut files = std::fs::read_dir(dir)?.map(|entry| entry.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?;
-    files.sort();
-    for path in files {
-        if !path.extension().is_some_and(|e| e == "lua" || e == "luau") { continue; }
-        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+pub fn capture<'a>(root: &Path, files: impl Iterator<Item = (&'a str, &'a [u8])>, registry: &mut Registry) -> Result<()> {
+    for (file, bytes) in files {
+        let Some(name) = file.strip_suffix(".lua").or_else(|| file.strip_suffix(".luau")).filter(|n| !n.contains('/')) else { continue };
+        let name = name.to_string();
         let result = (|| -> Result<(String, Definition)> {
             ensure!(identifier(&name), "invalid tool namespace {name:?}");
             ensure!(!["tools", "skills", "skill", "mcp", "deftool", "promote", "propose_module", "view", "hx", "agent"].contains(&name.as_str()), "reserved tool namespace {name}");
             ensure!(!registry.tools.contains_key(&name) && !registry.tool_errors.contains_key(&name), "duplicate tool namespace {name}");
-            ensure!(std::fs::symlink_metadata(&path)?.file_type().is_file(), "tool must be a regular file, not a symlink");
-            let text = std::fs::read_to_string(&path)?;
+            let text = std::str::from_utf8(bytes).context("tool is not UTF-8")?.to_string();
             let def = inspect(&text)?;
             credentials(root, &def)?;
             Ok((text, def))
@@ -267,7 +261,7 @@ pub fn capture(root: &Path, registry: &mut Registry) -> Result<()> {
             Ok((text, def)) => {
                 let id = format!("tool:{name}");
                 registry.capabilities.insert(id.clone(), def.capabilities.clone());
-                registry.sources.insert(id.clone(), Source { text, origin: format!(".harness/tools/{}", path.file_name().unwrap().to_string_lossy()), is_override: false, pkg: Some((id, def.capabilities.clone())) });
+                registry.sources.insert(id.clone(), Source { text, origin: format!(".harness/tools/{file}"), is_override: false, pkg: Some((id, def.capabilities.clone())) });
                 registry.tools.insert(name, def);
             },
             Err(error) => {

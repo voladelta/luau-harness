@@ -499,10 +499,6 @@ struct ToolDef {
     caps: crate::supervisor::Capabilities,
 }
 
-fn valid_name(n: &str) -> bool {
-    !n.is_empty() && n.len() <= 40 && n.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
-
 fn opt_string(o: &Option<Table>, k: &str) -> String {
     prims::opt_str(o, k).unwrap_or_default()
 }
@@ -915,7 +911,7 @@ impl Vm {
         let defs: Arc<Mutex<HashMap<String, ToolDef>>> = Arc::new(Mutex::new(HashMap::new()));
         let d_defs = defs.clone();
         let deftool = lua.create_function(move |lua, (name, source, opts): (String, String, Option<Table>)| {
-            if !valid_name(&name) {
+            if !crate::modules::valid_name(&name) {
                 return Err(mlua::Error::runtime("deftool: the name must be lowercase letters, digits and _ (starting with a letter)"));
             }
             let caps = caps_of(&opts)?;
@@ -1049,38 +1045,20 @@ impl Vm {
         Ok(request)
     }
 
-    /// Run every tests/*.luau file of a package directory; returns (passed, failed, report).
-    pub async fn run_tests(&self, pkg_dir: &std::path::Path) -> Result<(usize, usize, String)> {
+    /// Run test files `(file name, source)` in the module environment, with the agent's authority (`hx test` of the
+    /// built-in package or a directory that is not a package; packages run theirs through `packages::run_tests`).
+    pub async fn run_tests(&self, tests: &[(String, String)]) -> Result<crate::packages::TestReport> {
         let testlib: Table = self.modenv.get::<Function>("require")?.call("std/testlib")?;
         self.modenv.set("test", testlib.clone())?;
-        let mut files: Vec<_> = std::fs::read_dir(pkg_dir.join("tests"))?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "luau")).collect();
-        files.sort();
-        let (mut pass, mut fail, mut report) = (0, 0, String::new());
-        for f in files {
-            let name = f.file_name().unwrap().to_string_lossy().to_string();
-            let src = std::fs::read_to_string(&f)?;
+        let mut report = crate::packages::TestReport::default();
+        for (name, src) in tests {
             testlib.set("results", self.lua.create_table()?)?;
-            let f = self.lua.load(&src).set_name(format!("={name}")).set_environment(self.modenv.clone()).into_function();
-            let res = match f {
+            let ran = match self.lua.load(src).set_name(format!("={name}")).set_environment(self.modenv.clone()).into_function() {
                 Ok(f) => f.call_async::<()>(()).await,
                 Err(e) => Err(e),
             };
-            if let Err(e) = res {
-                fail += 1;
-                report.push_str(&format!("FAIL {name}: load error: {e}\n"));
-                continue;
-            }
-            let results: Table = testlib.get("results")?;
-            for r in results.sequence_values::<Table>().flatten() {
-                let (case, ok): (String, bool) = (r.get("name")?, r.get("ok")?);
-                if ok {
-                    pass += 1;
-                } else {
-                    fail += 1;
-                    report.push_str(&format!("FAIL {name}: {case}: {}\n", r.get::<String>("err").unwrap_or_default()));
-                }
-            }
+            report.record(name, ran, &testlib)?;
         }
-        Ok((pass, fail, report))
+        Ok(report)
     }
 }

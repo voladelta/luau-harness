@@ -191,12 +191,12 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "review" => "hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]\n\nRecords a decision only; continue with hx run --resume LOG.\n",
         "recover" => "hx recover LOG OP --decision complete|abandon [--yes]\n\nRecord an owner's reconciliation decision; never executes an operation.\nAfter abandon, the resumed agent can issue the operation again if it is still needed.\nLocal write/edit outcomes are read from the files on resume, model requests whose response was lost are charged their reserved tokens; none needs a decision.\n",
         "revoke" => "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\n",
-        "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau. Exits 1 if any test fails.\n",
-        "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no hx.toml needed; no capabilities).\n",
+        "test" => "hx test PKG_DIR\n\nRun the package's tests/*.luau inside its boundary, with only the capabilities its hx.toml requests.\nA package in .harness/pkgs must be approved; a directory without hx.toml runs with the agent's authority.\nExits 1 if any test fails.\n",
+        "approve" => "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no Luau, no capabilities; an hx.toml there is ignored).\n",
         "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
         "staged" => "hx staged\n\nList what the agent staged: packages (NAME) and harness-module replacements (std/MODULE).\n",
         "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp,ar}.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, .harness/versions/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n",
-        "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate it. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
+        "accept" => "hx accept NAME [--yes]\n\nReview something staged (every file, control characters escaped), then activate exactly that. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
         "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 corrupt chain or invalid recovery accounting, 3 unknown outcomes.\n",
@@ -371,7 +371,7 @@ async fn real_main() -> Result<()> {
         "trust" => cmd_trust(&args, &workspace),
         // hx skills : agent skills on disk and their approval state
         "skills" => {
-            print!("{}", modules::Resolver::new(workspace).skills_status());
+            print!("{}", modules::Resolver::new(workspace).skills_status()?);
             Ok(())
         }
         // hx staged | accept NAME [--yes] | reject NAME | rollback MODULE : the user's side of staging (nothing the agent can call does this)
@@ -381,7 +381,7 @@ async fn real_main() -> Result<()> {
             Ok(())
         }
         "reject" => {
-            let n = args.get(1).ok_or_else(|| usage("usage: hx reject NAME"))?;
+            let n = *positionals(&args).first().ok_or_else(|| usage("usage: hx reject NAME"))?;
             modules::Resolver::new(workspace).reject(n)?;
             println!("rejected {n}");
             Ok(())
@@ -532,24 +532,29 @@ fn cmd_recover(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// hx test PKG_DIR : run the package's tests/*.luau
+/// hx test PKG_DIR : run the package's tests/*.luau inside its boundary (see `modules::TestTarget`)
 async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>) -> Result<()> {
-    let dir = PathBuf::from(args.get(1).ok_or_else(|| usage("usage: hx test PKG_DIR"))?).canonicalize()?;
-    // Mount the package under test so `require("name")` finds it without installing or locking it, but ONLY for a
-    // directory outside .harness/pkgs (e.g. a staged tool). Installed packages keep their lock and grant checks
-    // (they resolve normally via .harness/pkgs).
-    let installed = dir.parent().is_some_and(|p| p == workspace.join(".harness/pkgs"));
-    if !installed
-        && let Ok(t) = std::fs::read_to_string(dir.join("hx.toml"))
-        && let Some(name) = t.lines().find_map(|l| l.trim().strip_prefix("name = ").map(|v| v.trim_matches('"').to_string()))
-    {
-        let _ = modules::TEST_PKG.set((name, dir.clone()));
-    }
-    let vm = vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?;
-    let (pass, fail, report) = vm.run_tests(&dir).await?;
-    print!("{report}");
-    println!("{pass} passed, {fail} failed");
-    if fail > 0 {
+    let dir = PathBuf::from(*positionals(args).first().ok_or_else(|| usage("usage: hx test PKG_DIR"))?).canonicalize()?;
+    let report = match modules::Resolver::new(workspace.to_path_buf()).test_target(&dir)? {
+        modules::TestTarget::Harness { note } => {
+            if let Some(note) = note { eprintln!("note: {note}"); }
+            let tests = modules::test_files(&dir)?;
+            vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?.run_tests(&tests).await?
+        }
+        modules::TestTarget::Package { name, mount } => {
+            let mut registry = modules::Registry::capture(workspace)?;
+            match mount {
+                Some(snapshot) => registry.mount(&name, &snapshot)?,
+                // an installed package is tested as a run would load it: approved and unchanged
+                None => { registry.resolve(&name)?; },
+            }
+            let tests = registry.tests(&name)?;
+            packages::run_tests(supervisor::Supervisor::ephemeral(policy, Arc::new(registry)), &name, &tests).await?
+        }
+    };
+    print!("{}", report.text);
+    println!("{} passed, {} failed", report.passed, report.failed);
+    if report.failed > 0 {
         std::process::exit(1);
     }
     Ok(())
@@ -557,7 +562,7 @@ async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>
 
 /// hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
 fn cmd_approve(args: &[String], workspace: &Path) -> Result<()> {
-    let pkg = args.get(1).ok_or_else(|| usage("usage: hx approve PKG"))?;
+    let pkg = *positionals(args).first().ok_or_else(|| usage("usage: hx approve PKG"))?;
     let rt = trust::Retrust::before(workspace);
     println!("{}", modules::Resolver::new(workspace.to_path_buf()).approve(pkg)?);
     rt.after()
@@ -596,22 +601,23 @@ fn cmd_trust(args: &[String], workspace: &Path) -> Result<()> {
 
 /// hx rollback MODULE : undo the last accepted replacement of a harness module
 fn cmd_rollback(args: &[String], workspace: &Path) -> Result<()> {
-    let module = args.get(1).ok_or_else(|| usage("usage: hx rollback MODULE"))?;
+    let module = *positionals(args).first().ok_or_else(|| usage("usage: hx rollback MODULE"))?;
     let rt = trust::Retrust::before(workspace);
     println!("{}", modules::Resolver::new(workspace.to_path_buf()).rollback(module)?);
     rt.after()
 }
 
-/// hx accept NAME [--yes] : review something staged, then activate it
+/// hx accept NAME [--yes] : review something staged, then activate exactly what the review showed
 fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
-    let n = args.get(1).ok_or_else(|| usage("usage: hx accept NAME [--yes]"))?;
+    let n = *positionals(args).first().ok_or_else(|| usage("usage: hx accept NAME [--yes]"))?;
     let r = modules::Resolver::new(workspace.to_path_buf());
-    println!("{}", r.review(n)?);
+    let review = r.review(n)?;
+    println!("{}", review.text);
     if !has(args, "--yes") {
-        confirm(&format!("accept {n}? {}", if n.contains('/') { "it replaces the module in force for new runs" } else { "it will be locked and granted the capabilities above" }))?;
+        confirm(&review.question())?;
     }
     let rt = trust::Retrust::before(workspace);
-    println!("{}", r.accept(n)?);
+    println!("{}", r.accept(review)?);
     rt.after()
 }
 

@@ -6,14 +6,22 @@ The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/
 
 | Kind | Where | How it becomes active |
 |---|---|---|
-| Module override | `.harness/override/std/<mod>.luau` | On a new run; `require("base:std/<mod>")` wraps the original. Invalid controller code stops the run |
+| Module override | `.harness/override/std/<file>`, replacing a file of the built-in package (`<mod>.luau`, `system.md`) | On a new run; `require("base:std/<mod>")` wraps the original. Invalid controller code stops the run. Other files under `.harness/override` are not used |
 | Local tool | `.harness/tools/NAME.lua` or `NAME.luau` | `hx trust`; loads on a new run as `NAME.method(...)` after validation and credential checks |
 | Tool package | `.harness/pkgs/NAME/` with `hx.toml`, `kind = "tool"` | `hx approve NAME`; model calls `tools.NAME.fn(...)` |
 | Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx approve NAME`; model calls `skill("NAME")` (or finds it with `skills("words")`; skills are not listed in the prompt) |
-| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (no `hx.toml`; project shadows global) | `hx approve NAME` (`hx skills` lists them); file tools gain read access to its directory |
+| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (project shadows global). It carries no Luau and no capabilities: an `hx.toml` or `.luau` file in it is an ordinary file | `hx approve NAME` (`hx skills` lists them); the run reads its files from a frozen copy at `skill("NAME").dir` |
 | MCP server | `.harness/mcp.toml` | On the next run (see [configuration](configuration.md#mcptoml)) |
-| Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Staged without execution; you review, run `hx test DIR`, accept it, and start a new run |
+| Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Staged without execution; you review, run `hx test DIR`, accept it, and start a new run. `hx accept NAME` lists every staged file and says when it replaces an installed package of the same name |
 | Agent-written module replacement | `propose_module("std/MODULE", source, {reason})` (with `--pack std/authoring`) | Staged; `hx accept std/MODULE` shows the reason, a structural check (it loads and keeps every export) and the diff, then makes it the override. `hx rollback std/MODULE` undoes it |
+
+`hx accept` shows model-written text with control characters escaped, and installs exactly the bytes it showed: if the staged content changes before you answer, accepting fails and you review it again.
+
+Package and skill names are lowercase letters, digits, `_` and `-`, starting with a letter, at most 64 bytes; `std` and `project` are reserved. A package or skill with another name is not loaded.
+
+A package is the files of its directory except entries whose name starts with `.` (so a skill's `.git` is not part of it). The directory itself may be a symlink, as skill installers create in `~/.agents/skills`: its target's content is what is approved and loaded. A symlink or special file inside it is refused by `hx approve` and by the run alike.
+
+`hx test DIR` runs a package's `tests/*.luau` inside its boundary: in a package VM with exactly the capabilities its `hx.toml` requests, with `test` (the test library) as a global and imports restricted to the package. A package in `.harness/pkgs` must be approved and unchanged; any other directory with an `hx.toml` (a staged tool) is loaded as it is, unapproved, for that test only. A directory without `hx.toml` is not a package: its tests run with the agent's authority, like `hx exec`, and `hx test` says so (refused under `.harness/`). `hx test stdlib/std` runs the built-in package's own suite that way.
 
 A package that is unapproved, or changed since approval, is invisible to a new run. Each approved package call uses a fresh VM and dispatch-time capability checks. Imports are restricted to that package; function references and host handles cannot cross its boundary. Every module accept and rollback is appended to `.harness/upgrades.jsonl`.
 

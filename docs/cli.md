@@ -13,7 +13,7 @@ Every command takes `--help`.
 | `hx recover LOG OP --decision complete\|abandon --yes` | Record an owner's decision about an uncertain mutation; never executes it |
 | `hx revoke LOG` | Stop admitting further operations for a run |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
-| `hx test PKG_DIR` | Run a package's `tests/*.luau`; exits 1 on failure |
+| `hx test PKG_DIR` | Run a package's `tests/*.luau` inside its boundary, with only the capabilities its `hx.toml` requests; exits 1 on failure |
 | `hx approve PKG` | Lock a project package's or skill's hash and grant the capabilities it requests |
 | `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and whether each is approved |
 | `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, print its hash, then trust it; runs refuse untrusted config |

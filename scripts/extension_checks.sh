@@ -122,7 +122,8 @@ out=$(xa 'local s = skill("craft") print(s.text) print(s.files[1], s.files[2], s
 check "agent skill: text without frontmatter" "$(echo "$out" | sed -n 1p)" "Read references/beats.md first."
 check "agent skill: files listed, no module" "$(echo "$out" | sed -n 3p)" "SKILL.md	references/beats.md	nil"
 check "agent skill: reference file readable via dir" "$(echo "$out" | sed -n 4p)" "beat list"
-check "agent skill: readable from sh (direct shell)" "$(xa "print(sh('cat $FH/.agents/skills/craft/references/beats.md').stdout)" | head -1)" "beat list"
+check "agent skill: readable from sh in its frozen copy" "$(xa "print(sh('cat ' .. skill('craft').dir .. '/references/beats.md').stdout)" | head -1)" "beat list"
+check "agent skill: the live directory is not a read root" "$(xa "print(pcall(read, '$FH/.agents/skills/craft/SKILL.md'))" | head -1 | grep -c 'outside the allowed roots')" "1"
 check "agent skill: global dir stays read-only" "$(xa "print(pcall(write, '$FH/.agents/skills/craft/x.md', 'x'))" | head -1 | grep -c 'outside the allowed roots')" "1"
 check "skills(query) finds by description, best first" "$(xa 'for _, h in skills("short videos") do print(h.name) end' | head -1)" "craft"
 check "skills() with no query lists approved names" "$(xa 'print(#skills())' | head -1)" "2"
@@ -130,7 +131,8 @@ check "skill(\"/name\") as the user types it" "$(xa 'print(skill("/craft").name)
 check "unknown skill suggests the closest" "$(xa 'print(pcall(skill, "crafts"))' | head -1 | grep -c 'closest: craft')" "1"
 check "project .agents/skills shadows global" "$(xa 'print(skill("vid").text)' | head -1)" "project vid"
 echo "secret" > $T/secret.txt; mkdir -p $FH/.agents/skills/linky; printf -- '---\ndescription: links out\n---\nx\n' > $FH/.agents/skills/linky/SKILL.md
-ln -s $T/secret.txt $FH/.agents/skills/linky/leak.md; HOME=$FH $H approve linky --workspace $A >/dev/null
+ln -s $T/secret.txt $FH/.agents/skills/linky/leak.md
+check "a skill containing a symlink is refused by approve" "$(HOME=$FH $H approve linky --workspace $A 2>&1 | grep -c 'may not contain symlinks')" "1"
 check "a symlink inside an approved skill is not readable (read)" "$(xa "print(pcall(read, '$FH/.agents/skills/linky/leak.md'))" | head -1 | grep -c 'outside the allowed roots')" "1"
 mkdir -p $A/.harness/pkgs/vid; printf '[package]\nversion = "1.0.0"\nkind = "skill"\ndescription = "pkg copy"\n' > $A/.harness/pkgs/vid/hx.toml; printf 'pkg vid\n' > $A/.harness/pkgs/vid/SKILL.md
 HOME=$FH $H approve vid --workspace $A >/dev/null
@@ -138,5 +140,28 @@ check ".harness/pkgs shadows an agent skill of the same name" "$(xa 'print(skill
 echo "tampered" >> $FH/.agents/skills/craft/references/beats.md
 check "a changed agent skill disappears" "$(xa 'print(pcall(skill, "craft"))' | head -1 | grep -c 'no installed skill')" "1"
 check "hx skills reports the change" "$(HOME=$FH $H skills --workspace $A | grep -c 'craft .*changed since approval')" "1"
+
+# --- an agent skill carries no Luau and no capabilities, whatever files it holds
+mkdir -p $A/.agents/skills/sneaky; printf -- '---\ndescription: sneaky\n---\nx\n' > $A/.agents/skills/sneaky/SKILL.md
+printf '[package]\nversion = "1"\nkind = "tool"\n[capabilities]\nproc = ["sh"]\n' > $A/.agents/skills/sneaky/hx.toml
+echo 'return { run = function() return sh("echo RAN").stdout end }' > $A/.agents/skills/sneaky/init.luau
+check "approving an agent skill names no capabilities" "$(HOME=$FH $H approve sneaky --workspace $A 2>&1 | grep -c 'no Luau and no capabilities')" "1"
+check "an agent skill's hx.toml grants no tool namespace" "$(xa 'print(tools.sneaky, skill("sneaky").module)' | head -1)" "nil	nil"
+
+# --- a linked skill directory approves and loads alike; its .git is not part of it
+mkdir -p $T/src/linked/.git; printf -- '---\ndescription: linked\n---\nlinked body\n' > $T/src/linked/SKILL.md; echo x > $T/src/linked/.git/HEAD
+ln -s $T/src/linked $FH/.agents/skills/linked; HOME=$FH $H approve linked --workspace $A >/dev/null
+check "a symlinked skill directory loads after approval" "$(xa 'print(skill("linked").text)' | head -1)" "linked body"
+echo y > $T/src/linked/.git/ORIG_HEAD
+check "git activity in a skill does not un-approve it" "$(HOME=$FH $H skills --workspace $A | grep -c '^linked .* approved')" "1"
+
+# --- hx test runs a package's tests inside its boundary
+S=$W/.harness/staged/sneak; mkdir -p $S/tests
+printf '[package]\nname = "sneak"\nversion = "0.1.0"\n' > $S/hx.toml; echo 'return {}' > $S/init.luau
+echo 'test.case("escape", function() sh("touch pwned") end) test.case("lib", function() test.eq(require("sneak").x, nil) end)' > $S/tests/t.luau
+out=$($H test $S --workspace $W 2>&1)
+check "hx test: a test cannot use what the package does not declare" "$(echo "$out" | grep -c 'capability_denied')$(echo "$out" | tail -1)$([ -e $W/pwned ] && echo pwned)" "11 passed, 1 failed"
+mkdir -p $W/.harness/staged/bare/tests; echo 'test.case("x", function() end)' > $W/.harness/staged/bare/tests/t.luau
+check "hx test: a staged directory without hx.toml is refused" "$($H test $W/.harness/staged/bare --workspace $W 2>&1 | grep -c 'not a package')" "1"
 
 finish
