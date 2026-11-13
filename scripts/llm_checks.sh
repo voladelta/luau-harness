@@ -36,7 +36,9 @@ check "...and the window, frozen in the manifest" "$(grep -h '"kind":"manifest"'
 models '{"data":[{"id":"any/model","context_length":40000}]}' --context-window 200000
 check "--context-window wins over the listing" "$(has '"max_output_tokens": 50000')" "yes"
 models '{"data":[]}'
-check "an unlisted model keeps the defaults, with a note" "$(has '"max_output_tokens": 65536')$(grep -c 'could not read the context window' $T/models.err)" "yes1"
+check "an unlisted model keeps the defaults, with a note" "$(has '"max_output_tokens": 65536')$(grep -c 'context window of any/model is unknown' $T/models.err)" "yes1"
+K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --base-url http://127.0.0.1:$MP --key-env K >/dev/null 2>$T/other.err
+check "another provider: hx says once that the window is unknown" "$(grep -c 'is not OpenRouter.*context window of any/model is unknown' $T/other.err)" "1"
 # --- native tool calling: the loop answers every call id; bad calls get an error result, not a crash
 mockrun() { # replies-json -> "finished|final_answer|turns|code_turns|truncated_turns"
   MOCK_REPLIES="$1" MOCK_BY_LEN=${BYLEN:-1} MOCK_LOG=$T/tool.log serve TP python3 scripts/mock_llm.py 0 || return 1; local m=$SERVED; : > $T/tool.log

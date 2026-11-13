@@ -23,7 +23,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Feature | What it does |
 |---|---|
 | Code mode | One `luau` tool; globals persist across turns; `read`, `write`, `edit`, `sh`, `search` (ripgrep engine, embedded) |
-| Process execution | On Linux, `sh`, local MCP servers and evaluators are confined by Landlock to the file policy; network isolation is up to your sandbox or container |
+| Process execution | `sh`, local MCP servers and evaluators are confined by Landlock to the file policy; network isolation is up to your sandbox or container |
 | Approvals | Workspace file tools run freely; outside paths and recognized external actions ask for approval. `--yes` approves ordinary requests automatically, never irreversible ones |
 | [RPI workflow](docs/workflows.md#rpi-research-design-implement-verify) | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds owner review gates |
 | [Autoresearch](docs/workflows.md#autoresearch) | `--ar` improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
@@ -42,6 +42,7 @@ hx exec 'hits = search("fn main", {glob = "*.rs"})' 'print(#hits, hits[1].file)'
 ```
 
 ```text
+(no output)
 -- ops=1 error=false
 1	src/main.rs
 -- ops=0 error=false
@@ -103,7 +104,7 @@ hx run "Fix the failing tests" --model MODEL
 hx run "Fix the failing tests" --model MODEL --yes
 ```
 
-Workspace and configured file-tool paths are allowed without asking. Other file-tool paths and recognized external actions ask on the controlling terminal; without one they are refused. `--yes` automatically approves ordinary requests for that run without changing `policy.toml`; irreversible commands such as a force push still need an exact `allow` entry or your answer on the terminal. Protected harness files, sealed state, credential reads and capability checks still apply. On Linux, shell commands get the same file roots as the file tools.
+Workspace and configured file-tool paths are allowed without asking. Other file-tool paths and recognized external actions ask on the controlling terminal; without one they are refused. `--yes` automatically approves ordinary requests for that run without changing `policy.toml`; irreversible commands such as a force push still need an exact `allow` entry or your answer on the terminal. Protected harness files, sealed state, credential reads and capability checks still apply. Shell commands get the same file roots as the file tools.
 
 hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens) and writes the event log to `.harness/log/`.
 
@@ -152,7 +153,7 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 ## Security model
 
 - `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools protect `.harness/`, `hx.lock`, `.git/config`, `.git/hooks` and the trust store, refuse a credential or sealed file under any name it is given, and writes refuse symlinks.
-- On Linux with Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and cannot read `.harness/secrets.toml`, sealed autoresearch state, grader and held-out roots or `~/.config/hx`. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Without Landlock hx says so once per run and children run unconfined.
+- With Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and cannot read `.harness/secrets.toml`, sealed autoresearch state, grader and held-out roots or `~/.config/hx`. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Without Landlock hx says so once per run and children run unconfined.
 - Network and GPU isolation belong to the environment running hx; configure them in your sandbox or container.
 - By default, `sh` and local MCP servers receive a minimal environment without inherited API keys. Shell commands run in their own process group, killed when the command ends. A process that detaches into its own session (`setsid`, a daemon) leaves that group and is not killed, even when hx exits.
 - `hx run` refuses workspace config until you [trust](docs/configuration.md#workspace-trust) it (or pass `--ignore-config`). Shell commands are classed read / local write / external / irreversible to decide when to ask; obvious external commands such as `git push` ask for approval unless pre-approved or launched with `--yes`, and irreversible ones always need an exact `allow` entry or your answer. The classifier is approval UX, not a guard: a command can reach the network without naming any known program.
@@ -190,7 +191,7 @@ Suites run concurrently (mock servers bind free ports); the policy suite and the
 
 ## Limitations
 
-- **Confinement covers files, on Linux only.** There is no network isolation, and without Landlock (an old kernel, or a container that filters it) children run unconfined. Shell commands can still write protected configuration inside the workspace (Landlock cannot carve a hole in a writable tree), though edited config becomes untrusted, including `.git/config` and `.git/hooks`, which run code on your next `git` command; and they can read credential files other than `.harness/secrets.toml` that sit inside a read root. Pathname Unix sockets (user D-Bus, systemd, `docker.sock`) stay reachable before Landlock ABI 9 (Linux 7.1). A credential file a command moves stays hidden for the rest of that run, not across runs.
+- **Confinement covers files only.** There is no network isolation, and without Landlock (an old kernel, or a container that filters it) children run unconfined. Shell commands can still write protected configuration inside the workspace (Landlock cannot carve a hole in a writable tree), though edited config becomes untrusted, including `.git/config` and `.git/hooks`, which run code on your next `git` command; and they can read credential files other than `.harness/secrets.toml` that sit inside a read root. Pathname Unix sockets (user D-Bus, systemd, `docker.sock`) stay reachable before Landlock ABI 9 (Linux 7.1). A credential file a command moves stays hidden for the rest of that run, not across runs.
 - **Shell commands are bounded in time only.** hx caps neither processes nor memory, and a detached process (`setsid`) outlives the command and hx. Set such limits in the environment running hx (cgroups, a container).
 - The Responses API is tested against a mock.
 - **Compaction and finish review are heuristics.** Summary and review quality depend on the model. Context size comes from `--context-window` or, on OpenRouter, the provider's model list; other providers need the flag. Resume restores it. Disabling compaction is in [configuration](docs/configuration.md#initluau-compaction-and-recheck).

@@ -1,6 +1,6 @@
 # Configuration
 
-All configuration lives in `.harness/` in the workspace. File tools can read it but refuse writes; on Linux, shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
+All configuration lives in `.harness/` in the workspace. File tools can read it but refuse writes; shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
 
 | File | Purpose |
 |---|---|
@@ -62,7 +62,7 @@ MCP tools bind as `mcp.SERVER.tool{...}`; a name that is not a Luau identifier a
 
 ## Shell confinement
 
-On Linux 5.13 or newer, every shell command, local MCP server and autoresearch evaluator starts under a Landlock ruleset built from the run's policy at that moment:
+On Linux 5.13 or newer (Landlock), every shell command, local MCP server and autoresearch evaluator starts under a Landlock ruleset built from the run's policy at that moment:
 
 | | Shell commands and MCP servers | Evaluators |
 |---|---|---|

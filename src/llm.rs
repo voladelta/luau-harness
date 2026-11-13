@@ -90,12 +90,17 @@ pub fn listed_limits(models: &Value, model: &str) -> Option<(u64, Option<u64>)> 
     Some((entry["context_length"].as_u64().filter(|n| *n > 0)?, entry["top_provider"]["max_completion_tokens"].as_u64().filter(|n| *n > 0)))
 }
 
-/// Ask an OpenRouter base URL for the model's limits, once at launch. Any failure keeps the defaults: it returns None
-/// and says so on stderr. (`HX_TEST_MODELS` treats any base URL as OpenRouter, for the check suites' mock.)
+/// Ask an OpenRouter base URL for the model's limits, once at launch. Another provider, or any failure, keeps the
+/// defaults: it returns None and says why on stderr. (`HX_TEST_MODELS` treats any base URL as OpenRouter, for the
+/// check suites' mock.)
 pub async fn provider_limits(cfg: &LlmCfg) -> Option<(u64, Option<u64>)> {
+    let unknown = |why: String| eprintln!("hx: note: {why}, so the context window of {} is unknown; compaction assumes std/compact's default, so pass --context-window if the model's is smaller", cfg.model);
     let base = cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.into());
     let openrouter = reqwest::Url::parse(&base).is_ok_and(|u| u.host_str() == Some("openrouter.ai")) || std::env::var_os("HX_TEST_MODELS").is_some();
-    if !openrouter { return None; }
+    if !openrouter {
+        unknown(format!("{base} is not OpenRouter, whose model list hx reads"));
+        return None;
+    }
     let fetched = async {
         let client = net::client(&base_url(cfg)?).timeout(Duration::from_secs(15)).build()?;
         let models: Value = client.get(format!("{}/models", base.trim_end_matches('/'))).send().await?.error_for_status()?.json().await?;
@@ -104,7 +109,7 @@ pub async fn provider_limits(cfg: &LlmCfg) -> Option<(u64, Option<u64>)> {
     match fetched {
         Ok(limits) => Some(limits),
         Err(e) => {
-            eprintln!("hx: note: could not read the context window of {} from the provider ({e}); compaction assumes std/compact's default, so pass --context-window if the model's is smaller", cfg.model);
+            unknown(format!("hx could not read the provider's model list ({e})"));
             None
         },
     }

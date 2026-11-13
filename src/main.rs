@@ -135,11 +135,12 @@ const TOP_HELP_TAIL: &str = "    -h, --help            show help (also `hx <comm
 EXAMPLES:
     hx exec --workspace . 'print(1+1)'
     hx run \"Fix the failing tests\" --yes --model claude-sonnet-5-5
-    hx log verify .harness/run.jsonl
+    hx log verify .harness/log/RUN.jsonl
 
 ENVIRONMENT:
     HX_MODEL, HX_BASE_URL   defaults for the matching `run` flags
-    HX_DEBUG=1                      print the full error chain on failure
+    HX_DEBUG=1              print the full error chain on failure
+    HX_TRUST=HASH           trust exactly the workspace config with this hash (see `hx trust`) for one launch
 ";
 
 const DEFAULT_MAX_TURNS: u64 = 200;
