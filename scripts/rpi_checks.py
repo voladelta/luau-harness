@@ -172,6 +172,8 @@ def manual_reviews():
             assert len(gates) <= 7, gates
         assert gates.count("review") == 5 and gates[-1] == "acceptance", gates
         assert "OWNER_FEEDBACK_SENTINEL" in harness.body_text(calls[-1])
+        # Resuming after an owner decision is not crash recovery.
+        assert not any("Recovered into a fresh Luau VM" in harness.body_text(body) for body in calls)
 
 
 def input_and_repair():

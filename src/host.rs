@@ -281,7 +281,7 @@ impl Host {
                     "task_message": format!("{task}\n\n[files in the working directory]\n{}", file_tree(&self.workspace))}))?,
             }
         } else {controller.init(&json!({"max_turns": max_turns, "task_message": task}))?};
-        let mut recovery = if self.depth==0 {self.supervisor.recovery.as_ref().map(|r|Event::Recover{message:serde_json::to_string_pretty(r).unwrap()}.to_json())} else {None};
+        let mut recovery = if self.depth==0 {self.supervisor.recovery.as_ref().filter(|r|recovery_due(self.supervisor.restored.as_ref(),r)).map(|r|Event::Recover{message:serde_json::to_string_pretty(r).unwrap()}.to_json())} else {None};
         let pending=if workflow {self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f|f.pending_event.clone())} else {None};
         let mut event=owner_event.or(pending).or_else(||recovery.take()).unwrap_or_else(||Event::Next.to_json());
         let mut vm:Option<Vm>=None;
@@ -407,7 +407,38 @@ pub fn file_tree(root: &std::path::Path) -> String {
     out.join("\n")
 }
 
+/// Whether a resumed root run gets the recovery turn: only when work was cut off. A run restored while running was
+/// (its controller may be waiting for a model reply or a chunk result that never comes, and the recovery turn is what
+/// returns it to a ready state); a run with no checkpoint was when receipts or uncertain operations exist. A run paused
+/// at an owner gate (or finished) stopped on purpose; its next stage starts in a fresh VM and has nothing to recover.
+fn recovery_due(restored:Option<&RunState>,recovery:&Value)->bool {
+    let listed=|key:&str|recovery[key].as_array().is_some_and(|items|!items.is_empty());
+    match restored {
+        Some(RunState::Running{..})=>true,
+        Some(RunState::AwaitingReview{..}|RunState::Finished{..})=>false,
+        None=>listed("receipts")||listed("uncertain_operations"),
+    }
+}
+
 fn ensure_object(value:&Value)->Result<()> {anyhow::ensure!(value.is_object(),"controller state must be an object");Ok(())}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::{RunState, recovery_due};
+    use serde_json::json;
+    #[test]
+    fn only_cut_off_work_is_recovered() {
+        let running = RunState::Running { controller: json!({}) };
+        let paused = RunState::AwaitingReview { controller: json!({}), report: Default::default(),
+            gate: serde_json::from_value(json!({"gate_id":"g","kind":"review","decisions":["approve"],"continuation":"next_stage"})).unwrap() };
+        let interrupted = json!({"receipts":[{"kind":"chunk_begin"}],"uncertain_operations":[]});
+        let uncertain = json!({"receipts":[],"uncertain_operations":[{"of":3}]});
+        let clean = json!({"receipts":[],"uncertain_operations":[]});
+        assert!(recovery_due(Some(&running), &interrupted) && recovery_due(Some(&running), &clean));
+        assert!(recovery_due(None, &interrupted) && recovery_due(None, &uncertain) && !recovery_due(None, &clean));
+        assert!(!recovery_due(Some(&paused), &interrupted), "an owner gate is a pause, not a crash");
+    }
+}
 
 #[cfg(test)]
 mod backoff_tests {
