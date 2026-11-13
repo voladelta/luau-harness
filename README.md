@@ -151,7 +151,7 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 
 ## Security model
 
-- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools protect `.harness/`, `hx.lock` and the trust store, and writes refuse symlinks.
+- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools protect `.harness/`, `hx.lock`, `.git/config`, `.git/hooks` and the trust store, refuse a credential or sealed file under any name it is given, and writes refuse symlinks.
 - On Linux with Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and cannot read `.harness/secrets.toml`, sealed autoresearch state, grader and held-out roots or `~/.config/hx`. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Without Landlock hx says so once per run and children run unconfined.
 - Network and GPU isolation belong to the environment running hx; configure them in your sandbox or container.
 - By default, `sh` and local MCP servers receive a minimal environment without inherited API keys. Shell commands run in their own process group, killed when the command ends. A process that detaches into its own session (`setsid`, a daemon) leaves that group and is not killed, even when hx exits.
@@ -190,7 +190,7 @@ Suites run concurrently (mock servers bind free ports); the policy suite and the
 
 ## Limitations
 
-- **Confinement covers files, on Linux only.** There is no network isolation, and without Landlock (an old kernel, or a container that filters it) children run unconfined. Shell commands can still write protected configuration inside the workspace (Landlock cannot carve a hole in a writable tree), though edited config becomes untrusted, and can read credential files other than `.harness/secrets.toml` that sit inside a read root. A credential file a command moves stays hidden for the rest of that run, not across runs.
+- **Confinement covers files, on Linux only.** There is no network isolation, and without Landlock (an old kernel, or a container that filters it) children run unconfined. Shell commands can still write protected configuration inside the workspace (Landlock cannot carve a hole in a writable tree), though edited config becomes untrusted, including `.git/config` and `.git/hooks`, which run code on your next `git` command; and they can read credential files other than `.harness/secrets.toml` that sit inside a read root. Pathname Unix sockets (user D-Bus, systemd, `docker.sock`) stay reachable before Landlock ABI 9 (Linux 7.1). A credential file a command moves stays hidden for the rest of that run, not across runs.
 - **Shell commands are bounded in time only.** hx caps neither processes nor memory, and a detached process (`setsid`) outlives the command and hx. Set such limits in the environment running hx (cgroups, a container).
 - The Responses API is tested against a mock.
 - **Compaction and finish review are heuristics.** Summary and review quality depend on the model. Context size comes from `--context-window` or, on OpenRouter, the provider's model list; other providers need the flag. Resume restores it. Disabling compaction is in [configuration](docs/configuration.md#initluau-compaction-and-recheck).

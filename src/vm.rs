@@ -772,11 +772,10 @@ impl Vm {
                 async move {
                     let args_json = crate::values::copy_out(args)?;
                     let class = if m.is_read_only(&server, &tool) { Class::Read } else { Class::External };
-                    let text = args_json.to_string();
                     let a = json!({"server": server, "tool": tool, "args": args_json});
                     let ret = fx.run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
-                        let cmd = format!("mcp {server}.{tool} {}", text.chars().take(500).collect::<String>());
-                        if let Err(why) = fx.pol.approve(&cmd, class).await {
+                        let call = crate::policy::Call::Mcp { server: &server, tool: &tool };
+                        if let Err(why) = fx.pol.approve_call(call, &args_json, class).await {
                             return Err(mlua::Error::runtime(format!("approval_required: {why}")));
                         }
                         let r = m.request(&server, "tools/call", json!({"name": tool, "arguments": args_json})).await

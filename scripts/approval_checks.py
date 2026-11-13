@@ -105,14 +105,24 @@ class Approvals(unittest.TestCase):
         self.assertNotIn("[approval needed]", out)
         self.assertEqual((self.ws / "a.txt").read_text(), "ok")
 
-    def test_outside_directory_is_approved_once(self):
+    def test_outside_file_is_approved_once_and_its_siblings_ask_again(self):
         a, b = self.outside / "a.txt", self.outside / "b.txt"
-        code, out = terminal(self.command(f'write("{a}","one"); write("{b}","two"); print(read("{a}"))'), ["y"])
+        code, out = terminal(self.command(f'write("{a}","one"); write("{a}","again"); print(pcall(write,"{b}","two")); print(read("{a}"))'), ["y", "n"])
         self.assertEqual(code, 0, out)
-        self.assertEqual(out.count("[approval needed]"), 1, out)
-        self.assertEqual(b.read_text(), "two")
+        self.assertEqual(out.count("[approval needed]"), 2, out)
+        self.assertEqual(a.read_text(), "again")
+        self.assertFalse(b.exists())
         self.assertEqual(len(self.grant_records()), 1)
         self.assertEqual(self.grant_records()[0]["source"], "prompt")
+        self.assertEqual(self.grant_records()[0]["grant"], {"path": str(a), "recursive": False, "write": True})
+
+    def test_prompt_shows_model_text_with_control_characters_escaped(self):
+        code = 'print(pcall(sh, "echo safe\\r\\27[2K; git push origin main"))'
+        status, out = terminal(self.command(code), ["n"])
+        self.assertEqual(status, 0, out)
+        self.assertIn("\\r\\u{1b}[2K; git push origin main", out)
+        self.assertNotIn("\x1b[2K", out)
+        self.assertIn("user declined", out)
 
     def test_denial_does_not_write_or_grant(self):
         target = self.outside / "no.txt"
@@ -271,7 +281,7 @@ class Approvals(unittest.TestCase):
         records = harness.records(log)
         outcome = next(r["seq"] for r in records if r["kind"] == "outcome" and r["tool"] == "write")
         boundary = next(r["seq"] for r in records if r["kind"] == "checkpoint" and r["lane"] == "root" and r["seq"] > outcome)
-        with harness.provider(lambda body, i: first if i == 0 else harness.tool(f'write("{b}","second")') if i == 1 else "done") as (url, _):
+        with harness.provider(lambda body, i: first if i == 0 else harness.tool(f'write("{a}","second")') if i == 1 else "done") as (url, _):
             status, out = terminal(self.run_args(url, "Record a checkpoint"), ["y"], env={"HX_TEST_CRASH_AFTER_RECORD": str(boundary)})
             self.assertNotEqual(status, 0, out)
             self.assertEqual(out.count("[approval needed]"), 1, out)
@@ -279,7 +289,7 @@ class Approvals(unittest.TestCase):
             status, out = terminal(["run", "--workspace", str(self.ws), "--resume", str(log)])
         self.assertEqual(status, 0, out)
         self.assertNotIn("[approval needed]", out)
-        self.assertEqual(b.read_text(), "second")
+        self.assertEqual(a.read_text(), "second")
         self.assertEqual(len(self.grant_records()), 1)
 
     def test_deadline_cancels_an_unanswered_permission_request(self):

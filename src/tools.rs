@@ -320,8 +320,8 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
             }
             let class = if spec.read_only { Class::Read } else { Class::External };
             let ret = fx.run(&lua, Tool::Http, class, json!({"namespace":namespace, "endpoint":endpoint, "arguments":args}), || async {
-                let label = format!("http {namespace}.{endpoint}");
-                fx.pol.approve(&label, class).await.map_err(|e| mlua::Error::runtime(format!("approval_required: {e}")))?;
+                let call = crate::policy::Call::Http { namespace: &namespace, endpoint: &endpoint };
+                fx.pol.approve_call(call, &args, class).await.map_err(|e| mlua::Error::runtime(format!("approval_required: {e}")))?;
                 let failed = |delivery, message: String| crate::net::effect_error(class, delivery, message);
                 let mut response = request.send().await.map_err(|e| {
                     let error = crate::net::Error::send("HTTP transport failed", e);

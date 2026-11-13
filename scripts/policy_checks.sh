@@ -84,6 +84,19 @@ else
     'print(sh("cat copied.txt d/moved.txt linked.txt 2>/dev/null").stdout == "")' | sed -n 3p)
   check "a credential file copied, moved or hard-linked stays unreadable to later commands of the run" "$out" "true"
   rm -rf $W/d $W/linked.txt $W/copied.txt
+  echo CREDENTIAL > $W/.harness/secrets.toml; mkdir -p $W/.harness/ar/run; echo SEALED-MARK > $W/.harness/ar/run/held.txt
+  out=$(run 'sh("ln .harness/secrets.toml leak.txt; mv .harness/ar/run/held.txt out.txt")
+local a, b = pcall(read, "leak.txt") local c, d = pcall(read, "out.txt")
+print(a, c, #search("CREDENTIAL", {literal = true}), #search("SEALED-MARK", {literal = true}), sh("cat leak.txt out.txt").stdout == "")' | head -1)
+  check "file tools and later commands refuse a hidden file hard-linked or moved out of sealed state" "$(echo "$out" | tr '\t' '|')" "false|false|0|0|true"
+  rm -rf $W/leak.txt $W/out.txt $W/.harness/ar
+  out=$(run 'print(pcall(read, "/dev/tty"), sh("echo x > /dev/tty; ls /dev/pts").code ~= 0, sh("head -c1 /dev/urandom >/dev/null").code)' | head -1)
+  check "no terminal access for file tools or confined commands" "$(echo "$out" | tr '\t' '|')" "false|true|0"
+  REALHOME=$(mktemp -d); mkdir -p $REALHOME/.config/hx; echo ORIG > $REALHOME/.config/hx/trust.toml
+  HOME=$REALHOME $H exec --workspace "$W" --yes "write('$REALHOME/notes.txt', 'n\\n') sh('echo PWNED > $REALHOME/.config/hx/trust.toml; echo PWNED > $REALHOME/other.txt')" >/dev/null 2>&1
+  check "--yes write grant covers the file, not its parent tree" "$(cat $REALHOME/notes.txt $REALHOME/.config/hx/trust.toml; [ -e $REALHOME/other.txt ] && echo WROTE)" "n
+ORIG"
+  rm -rf $REALHOME
   out=$(run "local r = sh('cat $S1; echo written > $ESC') print(r.code ~= 0, r.stdout == '')" | head -1)
   check "confined shell cannot read or write beyond the roots" "$(echo "$out" | tr '\t' '|')$([ -e $ESC ] && echo WROTE)" "true|true"
   out=$($H exec --workspace "$W" --yes "read(\"$S1\") print(sh('cat $S1').stdout)" 2>&1 | head -1)

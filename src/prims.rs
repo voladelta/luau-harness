@@ -185,7 +185,7 @@ pub async fn search(fx: &Effects, lua: &Lua, pattern: String, opts: SearchOption
     let (pol, workflow) = (fx.pol.clone(), fx.supervisor.workflow_epoch().is_some());
     let ret = fx.run(lua, Tool::Search, Class::Read, args, || blocking(move || {
         let root = pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-        Ok(match search_files(&pol.workspace, &root, &pattern, &opts, workflow, &pol.sealed) {
+        Ok(match search_files(&pol.workspace, &root, &pattern, &opts, workflow, &pol.unreadable()) {
             Ok(Hits { rows, truncated }) => Ret::Rows { rows, truncated },
             Err(SearchError { kind, message, hint }) => Ret::SearchErr { kind, message, hint },
         })

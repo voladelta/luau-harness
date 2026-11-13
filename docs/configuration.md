@@ -16,13 +16,13 @@ All configuration lives in `.harness/` in the workspace. File tools can read it 
 
 ```toml
 [fs]
-read = ["/extra/read/root"]     # extra read roots for file tools
-write = ["/extra/write/root"]   # extra write roots
+read = ["/extra/read/root"]     # extra read roots for file tools (relative to the workspace; ~ is your home)
+write = ["/extra/write/root"]   # extra write roots; a root that does not exist is an error
 
 [approval]
 mode = "prompt"                 # default; "deny" refuses missing permissions without asking
 ask = ["terraform apply"]       # extra command substrings that need approval
-allow = ["git push origin"]     # pre-approved (substring of each external command; irreversible ones need an exact match)
+allow = ["git push origin"]     # pre-approved (leading words of each external command; irreversible ones need an exact match)
 
 [budget]
 max_tokens = 600000
@@ -32,9 +32,9 @@ max_wall_secs = 900
 enable = []
 ```
 
-The workspace, private temp directory and `[fs]` roots are standing file-tool permissions. With `mode = "prompt"`, other file-tool paths ask on the owner's controlling terminal. A write grant covers the requested file's parent directory and its descendants, with read access; a read grant covers the requested file, or the subtree when a directory is requested. Home has no implicit grant. Refusal or a missing terminal leaves the operation unexecuted. Grants are shared by descendants and journaled for resume, and a new run starts with fresh grants.
+The workspace, private temp directory and `[fs]` roots are standing file-tool permissions. With `mode = "prompt"`, other file-tool paths ask on the owner's controlling terminal. A write grant covers the requested file only, with read access (shell commands may then change that file, not create its siblings); a read grant covers the requested file, or the subtree when a directory is requested. A directory that is `/`, contains your home directory, or contains protected configuration, credentials or sealed state is never granted, in any mode: add a narrower `[fs]` root instead. Home has no implicit grant. Refusal or a missing terminal leaves the operation unexecuted. Grants are shared by descendants and journaled for resume, and a new run starts with fresh grants.
 
-Shell commands are classed on their shell words, not substrings: each simple command of a pipeline or list (and the body of `$(...)`, backticks and `bash -c`) is classed read / local write / external / irreversible, and the command takes the highest class. A `git push` with `--force`, `--force-with-lease`, `-f`, `--delete`, `--mirror` or a `+`/`:` refspec anywhere in its arguments, `rm -r` of `/`, `~` or `$HOME`, `mkfs` and `dd` are irreversible. An `allow` entry must cover each external command in a chain, so `allow = ["git push origin"]` does not approve `git push origin main && curl -X POST ...`. The classifier decides when to ask; it is approval UX, not a guard (see [shell confinement](#shell-confinement)). The journal records who approved each shell command (`approval` on its outcome: `not-required`, `policy-allow`, `auto` or `prompt`).
+Shell commands are classed on their shell words, not substrings: each simple command of a pipeline or list (and the body of `$(...)`, backticks and `bash -c`) is classed read / local write / external / irreversible, and the command takes the highest class. A `git push` with `--force`, `--force-with-lease`, `-f`, `--delete`, `--mirror` or a `+`/`:` refspec anywhere in its arguments, `rm -r` of `/`, `~` or `$HOME`, `mkfs` and `dd` are irreversible. Shell reserved words (`if`, `then`, `do`, `{`, `!`, ...) are skipped, and after a wrapper (`sudo`, `env`, `timeout`, `nice`, `xargs`, `find -exec`, ...) or among `git`'s global options every later word is tried as the program, so `for b in a; do git push --force; done`, `timeout 5s git push --force` and `git --git-dir .git push --force` are irreversible like the bare command. An `allow` entry covers a simple command when the command's words start with the entry's words, and it must cover each external command in a chain: `allow = ["git push origin"]` approves `git push origin main` but not `sudo git push origin main`, `echo x "git push origin"; ssh host` or `git push origin main && curl -X POST ...`. The classifier decides when to ask; it is approval UX, not a guard (see [shell confinement](#shell-confinement)). The journal records who approved each shell command (`approval` on its outcome: `not-required`, `policy-allow`, `auto` or `prompt`).
 
 `hx run "TASK" --yes` automatically approves ordinary missing path permissions and external actions for one run. It never approves an irreversible command: that still needs an exact `allow` entry or the owner's answer on the terminal, and is refused without one. It overrides the configured approval mode, changes no configuration files and keeps the same scrubbed child environment. Protected configuration, sealed owner state, credential-read restrictions, symlink-write checks, capabilities and budgets still apply. Use `--approval deny` for strict refusal or `--approval prompt` to override the file; neither flag combines with `--yes`. Explicit manual workflow reviews and uncertain-operation reconciliation still need owner decisions.
 
@@ -58,7 +58,7 @@ A local server is [confined](#shell-confinement) like a shell command, to the fi
 
 An unknown key (a typo such as `bearer-env`) is an error. A server that exits is started again on the next call.
 
-MCP tools bind as `mcp.SERVER.tool{...}`; a name that is not a Luau identifier also gets an alias with `_` for each other character (`a.b` as `a_b`) unless another tool already has that name. Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`.
+MCP tools bind as `mcp.SERVER.tool{...}`; a name that is not a Luau identifier also gets an alias with `_` for each other character (`a.b` as `a_b`) unless another tool already has that name. Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`, or every tool of a server with `"mcp notes.*"` (a server whose name contains a dot cannot be pre-approved). Approval is decided on the server and tool name alone: the prompt shows the call's arguments, escaped, but they are never matched against `allow`. HTTP tool endpoints work the same way with `http NAMESPACE.ENDPOINT`.
 
 ## Shell confinement
 
@@ -66,16 +66,18 @@ On Linux 5.13 or newer, every shell command, local MCP server and autoresearch e
 
 | | Shell commands and MCP servers | Evaluators |
 |---|---|---|
-| Read | Read roots (workspace, private temp dir, `[fs]` roots, approved grants, toolchains), `/usr`, `/bin`, `/sbin`, `/etc`, `/dev`, `/opt`, `/lib*`, `/proc`, `/sys` | Their scratch copy, the same system and toolchain directories, `grader` roots (and `holdout` for `select`) |
-| Write | Write roots (workspace, private temp dir, `[fs] write`, approved write grants), `/dev/null` and similar devices | Their scratch copy |
+| Read | Read roots (workspace, private temp dir, `[fs]` roots, approved grants, toolchain directories), `/usr`, `/bin`, `/sbin`, `/etc`, `/opt`, `/lib*`, `/proc`, `/sys`, `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/shm` | Their scratch copy, the same system and toolchain directories, `grader` roots (and `holdout` for `select`) |
+| Write | Write roots (workspace, private temp dir, `[fs] write`, approved write grants), `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/shm` | Their scratch copy |
 | Never readable | `.harness/secrets.toml`, sealed state (`.harness/ar`, grader and held-out roots in an episode), the trust store (`~/.config/hx`) | |
 
-A grant approved mid-run applies to the next command. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. A credential file a command copies cannot be read; one it moves or hard-links is found by its inode and stays hidden for the rest of the run. When a hidden file sits inside a read root, the directories on the way to it (usually the workspace root and `.harness`) are granted entry by entry, so a file created directly in one of them is readable from the next command on.
+A grant approved mid-run applies to the next command. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. It has no terminal (`/dev/tty`, `/dev/pts`), so it cannot draw over an approval prompt or read your keystrokes. On Linux 6.12 or newer (Landlock ABI 6) it also cannot signal processes or connect to abstract Unix sockets outside its own command. A credential file a command copies cannot be read; one it moves or hard-links, or a file it moves out of sealed state, is known by its inode: file tools refuse it under any name, and later commands of the run cannot read it. When a hidden file sits inside a read root, the directories on the way to it (usually the workspace root and `.harness`) are granted entry by entry, so a file created directly in one of them is readable from the next command on.
 
 What stays open:
 
 - Network and GPU access: use your container or sandbox.
 - Protected configuration inside a write root (`.harness/`, `hx.lock`) is still writable by shell commands; Landlock cannot remove write access from part of a writable tree without breaking file creation in it. Edited config is no longer trusted, and the journal's hash chain shows tampering.
+- Pathname Unix sockets (the user's D-Bus or systemd socket, `docker.sock`) are reachable before Landlock ABI 9 (Linux 7.1); Landlock cannot confine them on older kernels.
+- `.git/config` and `.git/hooks` are refused to file tools but writable by shell commands, like the rest of the workspace.
 - Credential files other than `.harness/secrets.toml` (`id_rsa`, `.netrc` and the rest that file tools refuse by name) are readable by shell commands when they sit inside a read root.
 
 Without Landlock (an older kernel, or a container whose seccomp filter blocks it) hx runs children unconfined, prints one note on stderr per run and records `"confinement": "off: ..."` in the journal's session record; it never fails a command for lack of Landlock.

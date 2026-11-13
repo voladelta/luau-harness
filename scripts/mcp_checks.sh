@@ -21,8 +21,9 @@ cfg "" '[approval]
 allow = ["mcp demo.add"]'
 check "user pre-approval in policy.toml lets that tool run" "$(x 'print(mcp.demo.add{a = 2, b = 3})' | head -1)" "5"
 check "approval is per tool: delete_note is still refused" "$(x 'print(pcall(mcp.demo.delete_note, {name = "n"}))' | head -1 | grep -c approval_required)" "1"
+check "arguments never approve a call: delete_note naming the allowed tool is refused" "$(x 'print(pcall(mcp.demo.delete_note, {name = "mcp demo.add"}))' | head -1 | grep -c approval_required)" "1"
 cfg "" '[approval]
-allow = ["mcp demo."]'
+allow = ["mcp demo.*"]'
 check "a server-wide allow covers its tools" "$(x 'print(mcp.demo.delete_note{name = "n"})' | head -1)" "deleted n"
 out=$(x 'print(pcall(mcp.demo.boom, {}))' | head -1)
 check "a tool error becomes a Luau error with the server's message" "$(echo "$out" | grep -c 'mcp tool error (demo.boom): boom')" "1"
@@ -47,7 +48,7 @@ import os,socket,time
 s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(5); open('$T/port.tmp','w').write(str(s.getsockname()[1])); os.replace('$T/port.tmp','$T/port'); time.sleep(60)" & LISTEN=$!; wait_for_file $T/port || exit 1; PORT=$(cat $T/port)
 check "server connects using the outer environment's network" "$(x 'print(mcp.demo.net_probe{host = "127.0.0.1", port = '$PORT'})' | head -1)" "connected"
 cfg "" '[approval]
-allow = ["mcp demo."]'
+allow = ["mcp demo.*"]'
 out=$(x 'print(mcp.demo.env_names{})' | head -1)
 check "server env: no harness API keys" "$(echo "$out" | grep -c 'API_KEY')" "0"
 check "server env: only the variables the user listed pass through" "$(echo "$out" | grep -c 'DEMO_PASS')" "1"
@@ -73,7 +74,7 @@ check "no MCP config: nothing added to the prompt" "$(echo "$sysmsg" | grep -c '
 HL=$T/hdr.jsonl
 hcfg() { # url, extra mcp.toml lines
   printf '[server.web]\nurl = "%s"\nread_only_tools = ["read_*"]\n%s\n' "$1" "${2:-}" > $W/.harness/mcp.toml
-  printf '[approval]\nallow = ["mcp web."]\n' > $W/.harness/policy.toml
+  printf '[approval]\nallow = ["mcp web.*"]\n' > $W/.harness/policy.toml
 }
 hx() { WEB_KEY=sk-web-secret $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
 for mode in json sse; do

@@ -2,7 +2,7 @@
 //! reject credential files. Shell commands keep approval checks, a scrubbed environment and process cleanup, and on
 //! Linux the same file roots through Landlock (`confinement`, `crate::confine`). Network isolation is external.
 use crate::eventlog::EventLog;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::sync::Arc;
 use serde::Deserialize;
@@ -48,7 +48,8 @@ struct ApprovalSection {
     /// extra command substrings that count as external effects (need approval)
     #[serde(default)]
     ask: Vec<String>,
-    /// commands the USER pre-approves (substring match; an irreversible command needs an exact full-command match)
+    /// commands and calls the USER pre-approves: a shell entry covers commands that start with its words (an irreversible
+    /// command needs an exact full-command match); `mcp SERVER.TOOL` / `http NAMESPACE.ENDPOINT` name one call exactly
     #[serde(default)]
     allow: Vec<String>,
     mode: Option<ApprovalMode>,
@@ -87,9 +88,8 @@ pub struct Policy {
     cfg: Snapshot,
     pub log: Arc<EventLog>,
     grants: std::sync::Mutex<Vec<PathGrant>>,
-    /// Files and directories hidden from children, by (device, inode), with where each was last seen: a child may move
-    /// or hard-link a hidden file it cannot read, and the next command's ruleset must still hide it.
-    hidden: std::sync::Mutex<std::collections::BTreeMap<(u64, u64), PathBuf>>,
+    /// Hidden files that a child could move or hard-link, by identity (see `Hidden`).
+    hidden: std::sync::Mutex<Hidden>,
     prompt: tokio::sync::Mutex<()>,
     /// An autoresearch worker's claim and best score, when `episode` is set.
     pub ar_progress: std::sync::Mutex<crate::ar::Progress>,
@@ -154,12 +154,22 @@ const EXTERNAL: &[&[&str]] = &[&["git", "push"], &["npm", "publish"], &["cargo",
 const CURL_WRITES: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
 /// `git push` arguments that rewrite or delete remote history.
 const PUSH_DESTRUCTIVE: &[&str] = &["--force", "--force-with-lease", "--force-if-includes", "--delete", "--mirror", "--prune"];
-/// `rm -r` targets that are the whole filesystem or home directory.
-const RM_ROOTS: &[&str] = &["/", "/*", "~", "~/", "~/*", "$HOME", "$HOME/", "$HOME/*", "${HOME}", "${HOME}/", "${HOME}/*"];
-/// Programs that run the rest of their words as a command.
-const WRAPPERS: &[&str] = &["sudo", "env", "command", "exec", "nohup", "time", "nice", "xargs", "timeout", "doas"];
+/// Programs that run the rest of their words as a command. Their own options decide which word that is
+/// (`sudo -u root git`, `timeout -s KILL 5 git`), so the classifier takes the highest class any later word could give.
+const WRAPPERS: &[&str] = &["sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice", "chrt",
+    "taskset", "timeout", "xargs", "parallel", "stdbuf", "setsid", "setpriv", "unshare", "nsenter", "chroot", "busybox",
+    "flock", "strace", "ltrace", "find"];
+/// How many words after a wrapper are tried as its program. Real wrapper options are short; the bound keeps a long
+/// model-written command from making classification quadratic.
+const WRAPPED_OFFSETS: usize = 32;
+/// Shell reserved words. At the start of a simple command they open or close a compound command and run nothing
+/// themselves (`{ git push; }`, `then git push`, `do git push`), so they are skipped.
+const RESERVED: &[&str] = &["if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "in", "case", "esac",
+    "select", "function", "coproc", "{", "}", "!", "time"];
 
-const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/etc", "/dev", "/opt"];
+/// System directories file tools and children may read. No `/dev`: a file tool reading `/dev/tty` would take the
+/// owner's keystrokes, and `/dev/zero` never ends. Children get the harmless devices from `crate::confine`.
+const SYSTEM_READ: &[&str] = &["/usr", "/bin", "/sbin", "/etc", "/opt"];
 /// Credential files blocked by file tools, even inside an allowed read root.
 const SECRET_FILES: &[&str] = &["credentials", "credentials.toml", "secrets.toml", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519"];
 
@@ -239,27 +249,60 @@ fn commands(line: &str) -> Vec<Vec<String>> {
     cmds
 }
 
+/// Is `word` a shell variable assignment (`NAME=value`)?
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// A simple command's words from its first program word on: leading reserved words and assignments skipped.
+fn command_words(words: &[String]) -> &[String] {
+    let start = words.iter().position(|w| !RESERVED.contains(&w.as_str()) && !is_assignment(w)).unwrap_or(words.len());
+    &words[start..]
+}
+
+/// A simple command's words with leading reserved words skipped (`{ git push; }` is `git push`). Assignments stay:
+/// `GIT_SSH_COMMAND=x git push` is not the command an entry for `git push` approved.
+fn command_words_after_reserved(words: &[String]) -> &[String] {
+    let start = words.iter().position(|w| !RESERVED.contains(&w.as_str())).unwrap_or(words.len());
+    &words[start..]
+}
+
 /// The effect class of one simple command (its words, as `commands` splits them).
 fn class_of(words: &[String]) -> Class {
-    // Skip variable assignments and wrappers (`sudo`, `env X=1`, `timeout 5`) to the program that actually runs.
-    let mut i = 0;
-    while i < words.len() {
-        let w = words[i].as_str();
-        let assignment = w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-        if assignment || w.starts_with('-') || (i > 0 && WRAPPERS.contains(&words[i - 1].as_str()) && w.parse::<f64>().is_ok()) {
-            i += 1;
-        } else if WRAPPERS.contains(&program(w)) {
-            i += 1;
-        } else {
-            break;
-        }
+    let words = command_words(words);
+    let Some(first) = words.first() else { return Class::LocalWrite };
+    if WRAPPERS.contains(&program(first)) {
+        // Nested wrappers are covered too: every later word is tried as the program.
+        return (1..words.len().min(WRAPPED_OFFSETS + 1)).map(|k| program_class(command_words(&words[k..]))).max()
+            .unwrap_or(Class::LocalWrite);
     }
-    let Some(first) = words.get(i) else { return Class::LocalWrite };
-    let (prog, args) = (program(first), &words[i + 1..]);
+    program_class(words)
+}
+
+/// Is an `rm` argument the whole filesystem or the home directory (`/`, `//`, `/.`, `~/`, `$HOME/.`, `/*`, ...)?
+fn is_rm_root(arg: &str) -> bool {
+    let mut t = arg;
+    while let Some(shorter) = t.strip_suffix("/.").or_else(|| t.strip_suffix('/')) { t = shorter; }
+    !arg.is_empty() && matches!(t, "" | "/*" | "~" | "~/*" | "$HOME" | "$HOME/*" | "${HOME}" | "${HOME}/*")
+}
+
+/// The class of `git push ARGS`.
+fn push_class(args: &[String]) -> Class {
+    let destructive = args.iter().any(|a| PUSH_DESTRUCTIVE.iter().any(|d| a == d || a.starts_with(&format!("{d}=")))
+        || (a.starts_with('-') && !a.starts_with("--") && (a.contains('f') || a.contains('d')))
+        || ((a.starts_with('+') || a.starts_with(':')) && a.len() > 1));
+    if destructive { Class::Irreversible } else { Class::External }
+}
+
+/// The effect class of a simple command whose first word is the program.
+fn program_class(words: &[String]) -> Class {
+    let Some(first) = words.first() else { return Class::LocalWrite };
+    let (prog, args) = (program(first), &words[1..]);
     match prog {
         "bash" | "sh" | "zsh" | "dash" | "ksh" => {
-            // `bash -c 'script'` runs its script; `bash -lc` too.
-            let script = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c')).and_then(|p| args.get(p + 1));
+            // `bash -c 'script'` runs its script (`bash -lc`, `bash -c -- 'script'` too): the first operand after the flag.
+            let script = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
+                .and_then(|p| args[p + 1..].iter().find(|a| !a.starts_with('-')));
             return script.map(|s| commands(s).iter().map(|c| class_of(c)).max().unwrap_or(Class::LocalWrite)).unwrap_or(Class::LocalWrite);
         },
         "eval" => return commands(&args.join(" ")).iter().map(|c| class_of(c)).max().unwrap_or(Class::LocalWrite),
@@ -268,20 +311,18 @@ fn class_of(words: &[String]) -> Class {
         "dd" if args.iter().any(|a| a.starts_with("if=") || a.starts_with("of=")) => return Class::Irreversible,
         "rm" => {
             let recursive = args.iter().any(|a| a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && (a.contains('r') || a.contains('R'))));
-            let root = args.iter().any(|a| RM_ROOTS.contains(&a.as_str()) || a.trim_end_matches('/').is_empty() && a.starts_with('/'));
-            return if recursive && root { Class::Irreversible } else { Class::LocalWrite };
+            return if recursive && args.iter().any(|a| is_rm_root(a)) { Class::Irreversible } else { Class::LocalWrite };
         },
         "git" => {
-            // `git -C dir -c k=v push ...`: options that take a value come before the subcommand.
-            let mut j = 0;
-            while j < args.len() && args[j].starts_with('-') { j += if matches!(args[j].as_str(), "-C" | "-c") { 2 } else { 1 }; }
-            if args.get(j).map(String::as_str) == Some("push") {
-                let destructive = args[j + 1..].iter().any(|a| PUSH_DESTRUCTIVE.iter().any(|d| a == d || a.starts_with(&format!("{d}=")))
-                    || (a.starts_with('-') && !a.starts_with("--") && (a.contains('f') || a.contains('d')))
-                    || ((a.starts_with('+') || a.starts_with(':')) && a.len() > 1));
-                return if destructive { Class::Irreversible } else { Class::External };
+            // Global options come before the subcommand and some take a value (`-C dir`, `--git-dir .git`). Which word
+            // is the subcommand depends on which options take one, so each word that could be it counts.
+            let mut class = Class::LocalWrite;
+            for (j, a) in args.iter().enumerate() {
+                if a.starts_with('-') { continue; }
+                if a == "push" { class = class.max(push_class(&args[j + 1..])); }
+                if j == 0 || !args[j - 1].starts_with('-') { break; }
             }
-            return Class::LocalWrite;
+            return class;
         },
         "curl" => {
             let method = args.iter().enumerate().find_map(|(k, a)| {
@@ -343,13 +384,27 @@ impl std::fmt::Display for OutsideRoots {
 }
 impl std::error::Error for OutsideRoots {}
 
+/// Model-controlled text (a command, a path, call arguments) as it is shown to the owner: control characters (CR,
+/// ESC, ...) and invisible or reordering characters appear as escapes, so the text cannot rewrite the prompt the owner
+/// answers. Quotes stay as they are.
+pub fn shown(text: &str) -> String {
+    text.chars().map(|c| if matches!(c, '"' | '\'') { c.to_string() } else { c.escape_debug().to_string() }).collect()
+}
+
 /// Read only the owner's controlling terminal. Nonblocking IO lets cancellation/deadlines close it immediately.
+/// Input typed before the question appeared is discarded, so typeahead cannot answer it.
 async fn ask(question: &str) -> Result<bool> {
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let tty = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK)
         .open("/dev/tty").map_err(|_| anyhow::anyhow!("no controlling terminal; configure policy.toml or use --yes"))?;
     let mut tty = tty;
+    // Discard what was typed before the question is shown; an answer typed after it appears counts.
+    // SAFETY: tcflush takes an open descriptor (`tty` outlives the call) and a constant; it touches no memory.
+    if unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+        return Err(anyhow::Error::from(std::io::Error::last_os_error()).context("discarding pending terminal input"));
+    }
     writeln!(tty, "\n[approval needed] {question}\napprove? [y/N] ")?;
     let mut answer = Vec::new();
     loop {
@@ -369,6 +424,117 @@ async fn ask(question: &str) -> Result<bool> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// A named external operation whose identity hx fixes before asking: an MCP server's tool or an HTTP tool's endpoint.
+/// Approval is decided on this identity alone; the call's arguments are shown to the owner but never matched.
+#[derive(Clone, Copy, Debug)]
+pub enum Call<'a> {
+    Mcp { server: &'a str, tool: &'a str },
+    Http { namespace: &'a str, endpoint: &'a str },
+}
+
+impl Call<'_> {
+    /// (kind, owner, operation): `("mcp", server, tool)` or `("http", namespace, endpoint)`.
+    fn parts(&self) -> (&'static str, &str, &str) {
+        match *self {
+            Call::Mcp { server, tool } => ("mcp", server, tool),
+            Call::Http { namespace, endpoint } => ("http", namespace, endpoint),
+        }
+    }
+
+    /// Does the `[approval] allow` entry name this call? `mcp SERVER.TOOL` (or `http NAMESPACE.ENDPOINT`) names one
+    /// operation, `mcp SERVER.*` all of a server's. The entry splits at its first dot, so a server name that contains
+    /// one can never be pre-approved.
+    fn allowed_by(&self, entry: &str) -> bool {
+        let (kind, owner, op) = self.parts();
+        let Some(rest) = entry.trim().strip_prefix(kind).and_then(|r| r.strip_prefix(' ')) else { return false };
+        rest.split_once('.').is_some_and(|(o, name)| o == owner && (name == op || name == "*"))
+    }
+}
+
+impl std::fmt::Display for Call<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, owner, op) = self.parts();
+        write!(f, "{kind} {}.{}", shown(owner), shown(op))
+    }
+}
+
+/// How many characters of a call's arguments the approval prompt shows.
+const PROMPT_ARGS_CHARS: usize = 2000;
+
+/// Hidden files and directories a child could move or hard-link (those under a write root), by (device, inode), with
+/// every name each is known by. A child cannot rename or link a file it may not read into a place where it could read
+/// it (Landlock refuses a reparenting that gains access), but a name made in a directory it may only list becomes
+/// readable from the next ruleset on, and file tools are not confined at all. So the next ruleset hides every known
+/// name, and file tools refuse a file by its identity whatever it is called.
+#[derive(Default)]
+struct Hidden {
+    names: std::collections::BTreeMap<(u64, u64), Names>,
+    /// How many times the write roots were searched (the expensive step).
+    searches: u64,
+}
+
+#[derive(Default)]
+struct Names {
+    paths: std::collections::BTreeSet<PathBuf>,
+    dir: bool,
+    /// The inode's link count and change time when the write roots were last searched for it. A file with more links
+    /// than known names is searched for again only after that changes, so a name hx cannot reach (outside every write
+    /// root) costs one search, not one per command.
+    searched: Option<(u64, i64, i64)>,
+}
+
+impl Hidden {
+    /// Record every file and directory now under a hidden root that lies within a write root, drop names that no
+    /// longer lead to their inode, and search the write roots only when a known inode lost all its names (it was
+    /// moved) or gained a link not seen before.
+    fn refresh(&mut self, roots: &[PathBuf], write_roots: &[PathBuf]) {
+        use std::os::unix::fs::MetadataExt;
+        let state = |m: &std::fs::Metadata| (m.nlink(), m.ctime(), m.ctime_nsec());
+        for root in roots.iter().filter(|r| write_roots.iter().any(|w| r.starts_with(w) || w.starts_with(r))) {
+            walk(root, &mut |path, m| {
+                let names = self.names.entry((m.dev(), m.ino())).or_default();
+                names.dir = m.is_dir();
+                names.paths.insert(path.to_path_buf());
+            });
+        }
+        for (&key, names) in self.names.iter_mut() {
+            names.paths.retain(|p| std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == key));
+        }
+        let stale = self.names.values().any(|n| match n.paths.first().map(std::fs::symlink_metadata) {
+            None => true,
+            Some(Ok(m)) => !n.dir && m.nlink() > n.paths.len() as u64 && n.searched != Some(state(&m)),
+            Some(Err(_)) => true,
+        });
+        if !stale { return; }
+        self.searches += 1;
+        for root in write_roots {
+            walk(root, &mut |path, m| {
+                if let Some(names) = self.names.get_mut(&(m.dev(), m.ino())) { names.paths.insert(path.to_path_buf()); }
+            });
+        }
+        // An inode found nowhere was deleted (or left every write root, where no child can reach it).
+        self.names.retain(|_, n| !n.paths.is_empty());
+        for names in self.names.values_mut() {
+            names.searched = names.paths.first().and_then(|p| std::fs::symlink_metadata(p).ok()).map(|m| state(&m));
+        }
+    }
+
+    /// Every known name of every hidden file.
+    fn paths(&self) -> Vec<PathBuf> {
+        self.names.values().flat_map(|n| n.paths.iter().cloned()).collect()
+    }
+}
+
+/// Call `visit` with `path` and everything beneath it, without following symbolic links. Unreadable entries are
+/// skipped.
+fn walk(path: &Path, visit: &mut dyn FnMut(&Path, &std::fs::Metadata)) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+    visit(path, &meta);
+    if !meta.is_dir() { return; }
+    let Ok(entries) = std::fs::read_dir(path) else { return };
+    for entry in entries.flatten() { walk(&entry.path(), visit); }
 }
 
 impl Policy {
@@ -411,7 +577,8 @@ impl Policy {
         let mut p = Snapshot { autopilot, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], episode: None, ask: vec![], allow: vec![], mode: ApprovalMode::Prompt, budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
-        p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
+        // Git runs hooks and configured commands unconfined on the owner's next `git` in this workspace.
+        p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock"), workspace.join(".git/config"), workspace.join(".git/hooks")]);
         p.sealed.push(workspace.join(".harness/ar"));
         if let Some(e) = &episode { p.sealed.extend(crate::ar::sealed(e)); }
         p.episode = episode;
@@ -435,8 +602,8 @@ impl Policy {
         let trusted = crate::trust::is_trusted(&workspace);
         if let Some(t) = std::fs::read_to_string(workspace.join(".harness/policy.toml")).ok().filter(|_| trusted) {
             let f: PolicyFile = toml::from_str(&t).map_err(|e| anyhow::anyhow!("bad .harness/policy.toml: {e}"))?;
-            p.read_roots.extend(f.fs.read.iter().filter_map(canon));
-            let w: Vec<PathBuf> = f.fs.write.iter().filter_map(canon).collect();
+            p.read_roots.extend(f.fs.read.iter().map(|r| fs_root(&workspace, r)).collect::<Result<Vec<_>>>()?);
+            let w = f.fs.write.iter().map(|r| fs_root(&workspace, r)).collect::<Result<Vec<_>>>()?;
             p.read_roots.extend(w.clone());
             p.write_roots.extend(w);
             p.budget = Budget { max_tokens: f.budget.max_tokens, max_wall_secs: f.budget.max_wall_secs };
@@ -473,43 +640,38 @@ impl Policy {
             read.push(g.path.clone());
             if g.write { write.push(g.path.clone()); }
         }
-        let mut hidden = self.sealed.clone();
-        hidden.push(self.workspace.join(".harness/secrets.toml"));
-        hidden.extend(crate::trust::store_dir_canonical());
-        hidden.extend(self.track_hidden(&hidden, &write));
-        crate::confine::Rules { read, write, hidden }.with_system()
+        let roots = self.hidden_roots();
+        let mut hidden = self.hidden.lock().unwrap();
+        hidden.refresh(&roots, &write);
+        let mut paths = roots;
+        paths.extend(hidden.paths());
+        crate::confine::Rules { read, write, hidden: paths }.with_system()
     }
 
-    /// Where the hidden files seen so far are now. A file moved away from its hidden path, or given a second name by a
-    /// hard link, is found again by its inode under the write roots (the only places a child can put it).
-    fn track_hidden(&self, paths: &[PathBuf], write_roots: &[PathBuf]) -> Vec<PathBuf> {
-        use std::os::unix::fs::MetadataExt;
-        let mut seen = self.hidden.lock().unwrap();
-        let mut linked = false;
-        for p in paths {
-            if let Ok(m) = std::fs::symlink_metadata(p) {
-                seen.insert((m.dev(), m.ino()), p.clone());
-                linked |= !m.is_dir() && m.nlink() > 1;
-            }
-        }
-        let moved = seen.iter().any(|(&(dev, ino), p)| !std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (dev, ino)));
-        if !moved && !linked { return seen.values().cloned().collect(); }
-        let mut found = vec![];
-        fn walk(dir: &Path, seen: &std::collections::BTreeMap<(u64, u64), PathBuf>, found: &mut Vec<(u64, u64, PathBuf)>) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return };
-            for entry in entries.flatten() {
-                let Ok(m) = std::fs::symlink_metadata(entry.path()) else { continue };
-                if seen.contains_key(&(m.dev(), m.ino())) { found.push((m.dev(), m.ino(), entry.path())); }
-                if m.is_dir() { walk(&entry.path(), seen, found); }
-            }
-        }
-        for root in write_roots { walk(root, &seen, &mut found); }
-        let mut out: Vec<PathBuf> = found.iter().map(|(_, _, p)| p.clone()).collect();
-        // Keep one known place per inode; an inode found nowhere was deleted.
-        seen.retain(|key, _| found.iter().any(|(d, i, _)| (*d, *i) == *key) || paths.iter().any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == *key)));
-        for (dev, ino, p) in found { seen.insert((dev, ino), p); }
-        out.extend(seen.values().cloned());
+    /// What no child and no file tool may read: credentials, sealed owner state and the trust store.
+    fn hidden_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.sealed.clone();
+        roots.push(self.workspace.join(".harness/secrets.toml"));
+        roots.extend(crate::trust::store_dir_canonical());
+        roots
+    }
+
+    /// Paths file-tool search must skip: sealed state and every name a hidden file is known by now (a child that ran
+    /// since the last spawn may have given one a new name, so the names are brought up to date first).
+    pub fn unreadable(&self) -> Vec<PathBuf> {
+        let mut write = self.write_roots.clone();
+        write.extend(self.grants.lock().unwrap().iter().filter(|g| g.write).map(|g| g.path.clone()));
+        let mut hidden = self.hidden.lock().unwrap();
+        hidden.refresh(&self.hidden_roots(), &write);
+        let mut out = self.sealed.clone();
+        out.extend(hidden.paths());
         out
+    }
+
+    /// Is `path` (which must exist) one of the hidden files under another name?
+    fn is_hidden_file(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).is_ok_and(|m| self.hidden.lock().unwrap().names.contains_key(&(m.dev(), m.ino())))
     }
 
     /// Effect class of a shell command: the highest class of its simple commands.
@@ -518,19 +680,19 @@ impl Policy {
             .max(if self.ask.iter().any(|p| cmd.contains(p.as_str())) { Class::External } else { Class::LocalWrite })
     }
 
-    /// Each simple command of `cmd` (words joined by single spaces) with its effect class.
-    fn segments(&self, cmd: &str) -> Vec<(String, Class)> {
+    /// Each simple command of `cmd` (its words) with its effect class.
+    fn segments(&self, cmd: &str) -> Vec<(Vec<String>, Class)> {
         commands(cmd).into_iter().map(|words| {
             let text = words.join(" ");
             let class = class_of(&words).max(if self.ask.iter().any(|p| text.contains(p.as_str())) { Class::External } else { Class::LocalWrite });
-            (text, class)
+            (words, class)
         }).collect()
     }
 
-    /// The approval gate. Returns the approval source ("not-required", "policy-allow", "auto" or "prompt"), or the
-    /// reason it was refused. The run's approval settings are frozen in Rust; Luau code and hooks cannot change them.
-    /// `--yes` approves external requests but never an irreversible one: that needs an exact `allow` entry or the
-    /// owner's answer on the terminal.
+    /// The approval gate for a shell command. Returns the approval source ("not-required", "policy-allow", "auto" or
+    /// "prompt"), or the reason it was refused. The run's approval settings are frozen in Rust; Luau code and hooks
+    /// cannot change them. `--yes` approves external requests but never an irreversible one: that needs an exact
+    /// `allow` entry or the owner's answer on the terminal.
     pub async fn approve(&self, cmd: &str, class: Class) -> std::result::Result<&'static str, String> {
         if matches!(class, Class::Read | Class::LocalWrite) { return Ok("not-required"); }
         if class == Class::Irreversible {
@@ -540,26 +702,53 @@ impl Policy {
         } else if self.allowed(cmd) {
             return Ok("policy-allow");
         }
+        let how = if class == Class::Irreversible { "add the exact command to [approval] allow" } else { "set [approval] allow" };
+        self.ask_owner(class, &format!("{} command:\n  {}", class.name(), shown(cmd)), how).await
+    }
+
+    /// The approval gate for a named MCP or HTTP call, decided on its fixed identity. `args` is shown in the prompt
+    /// and never matched against `allow`. Returns the approval source, as `approve` does.
+    pub async fn approve_call(&self, call: Call<'_>, args: &serde_json::Value, class: Class) -> std::result::Result<&'static str, String> {
+        if matches!(class, Class::Read | Class::LocalWrite) { return Ok("not-required"); }
+        if self.autopilot && class != Class::Irreversible { return Ok("auto"); }
+        if self.allow.iter().any(|a| call.allowed_by(a)) { return Ok("policy-allow"); }
+        let text = args.to_string();
+        let mut shown_args = shown(&text.chars().take(PROMPT_ARGS_CHARS).collect::<String>());
+        if text.chars().nth(PROMPT_ARGS_CHARS).is_some() { shown_args.push_str(" ..."); }
+        let how = format!("add \"{call}\" to [approval] allow");
+        self.ask_owner(class, &format!("{} call: {call}\n  arguments: {shown_args}", class.name()), &how).await
+    }
+
+    /// Ask the owner on the terminal (prompt mode), or refuse with `how` as the remedy (deny mode).
+    async fn ask_owner(&self, class: Class, question: &str, how: &str) -> std::result::Result<&'static str, String> {
+        let irreversible = class == Class::Irreversible;
         if self.mode == ApprovalMode::Prompt {
             let _guard = self.prompt.lock().await;
-            return match ask(&format!("{} command:\n  {cmd}", class.name())).await {
+            return match ask(question).await {
                 Ok(true) => Ok("prompt"),
                 Ok(false) => Err("the user declined; it was NOT run".into()),
-                Err(_) if class == Class::Irreversible => Err("this is an irreversible effect and there is no controlling terminal to ask; it was NOT run (--yes never approves irreversible commands; add the exact command to [approval] allow)".into()),
+                Err(_) if irreversible => Err(format!("this is an irreversible effect and there is no controlling terminal to ask; it was NOT run (--yes never approves irreversible effects; {how})")),
                 Err(e) => Err(e.to_string()),
             };
         }
-        let how = if class == Class::Irreversible { "add the exact command to [approval] allow or use --approval prompt" } else { "set [approval] allow, use --approval prompt, or launch with --yes" };
-        Err(format!("this is an {} effect and needs the user's approval; it was NOT run ({how})", class.name()))
+        let other = if irreversible { "or use --approval prompt" } else { "use --approval prompt, or launch with --yes" };
+        Err(format!("this is an {} effect and needs the user's approval; it was NOT run ({how}, {other})", class.name()))
     }
 
-    /// An external request is pre-approved when an `allow` entry covers each of its external simple commands, so an
-    /// entry for one command cannot approve another chained after it. A request that is not a shell command (an MCP or
-    /// HTTP label) is matched as a whole.
+    /// An external command is pre-approved when an `allow` entry covers each of its external simple commands, so an
+    /// entry for one command cannot approve another chained after it. An entry covers a simple command when the
+    /// command's words start with the entry's words: `git push origin` covers `git push origin main` but not
+    /// `sendmail x --note "git push origin"`.
     fn allowed(&self, cmd: &str) -> bool {
-        let covered = |text: &str| self.allow.iter().any(|a| text.contains(a.as_str()));
+        let entries: Vec<Vec<String>> = self.allow.iter().filter_map(|a| {
+            let mut parsed = commands(a);
+            (parsed.len() == 1).then(|| parsed.remove(0))
+        }).collect();
         let external: Vec<_> = self.segments(cmd).into_iter().filter(|(_, c)| *c >= Class::External).collect();
-        if external.is_empty() { covered(cmd) } else { external.iter().all(|(text, _)| covered(text)) }
+        !external.is_empty() && external.iter().all(|(words, _)| {
+            let words = command_words_after_reserved(words);
+            entries.iter().any(|e| words.starts_with(e))
+        })
     }
 
     /// Request an ordinary missing path permission. Call only after principal/stage authorization.
@@ -571,14 +760,16 @@ impl Policy {
         let _guard = self.prompt.lock().await;
         let denied = match check() { Ok(_) => return Ok(()), Err(e) => e };
         let Some(outside) = denied.downcast_ref::<OutsideRoots>() else { return Err(denied) };
-        let grant = PathGrant {
-            path: if write { outside.path.parent().unwrap_or(&outside.path).to_path_buf() } else { outside.path.clone() },
-            recursive: write || outside.path.is_dir(), write,
-        };
+        // The requested file itself (children can then change it, not create its siblings), or a requested directory
+        // for reading; never a tree that holds the home directory or a protected or hidden path.
+        let grant = PathGrant { path: outside.path.clone(), recursive: !write && outside.path.is_dir(), write };
+        if grant.recursive && let Some(what) = self.covers_owner_state(&grant.path) {
+            bail!("policy: {} is a directory that contains {what}; it cannot be granted to the model (add a narrower root to [fs] in policy.toml)", shown(&grant.path.to_string_lossy()));
+        }
         let source = if self.autopilot { "auto" } else {
             if self.mode == ApprovalMode::Deny { return Err(denied); }
-            let access = if write { "read/write" } else { "read" };
-            match ask(&format!("allow {access} access to {} for this run? (requested {path})", grant.path.display())).await {
+            let (access, what) = if write { ("read/write", "the file") } else if grant.recursive { ("read", "everything under") } else { ("read", "the file") };
+            match ask(&format!("allow {access} access to {what} {} for this run? (requested {})", shown(&grant.path.to_string_lossy()), shown(path))).await {
                 Ok(true) => "prompt",
                 Ok(false) => bail!("approval_required: {denied}; the user declined"),
                 Err(e) => bail!("approval_required: {denied}; {e}"),
@@ -589,6 +780,18 @@ impl Policy {
         self.grants.lock().unwrap().push(grant);
         check()?;
         Ok(())
+    }
+
+    /// What owner state a recursive grant of `dir` would expose, if any: the home directory (and so every credential
+    /// in it), or a protected or hidden path.
+    fn covers_owner_state(&self, dir: &Path) -> Option<&'static str> {
+        if dir.parent().is_none() { return Some("the whole filesystem"); }
+        if std::env::var_os("HOME").and_then(canon).is_some_and(|home| home.starts_with(dir)) {
+            return Some("your home directory");
+        }
+        if self.protected.iter().any(|p| p.starts_with(dir)) { return Some("protected harness configuration"); }
+        if self.hidden_roots().iter().any(|p| p.starts_with(dir)) { return Some("credentials or sealed owner state"); }
+        None
     }
 
     fn granted(&self, path: &Path, write: bool) -> bool {
@@ -611,7 +814,7 @@ impl Policy {
             bail!("policy: {p} is sealed owner state and cannot be read");
         }
         let c = std::fs::canonicalize(&full).map_err(|e| anyhow::anyhow!("{p}: {e}"))?;
-        if is_secret(&c) {
+        if is_secret(&c) || self.is_hidden_file(&c) {
             bail!("policy: {p} is a credential file and cannot be read");
         }
         if !Self::within(&c, &self.read_roots) && !self.granted(&c, false) {
@@ -648,6 +851,9 @@ impl Policy {
         if Self::within(&c, &self.protected) {
             bail!("policy: {p} is protected (harness configuration cannot be modified by the model)");
         }
+        if self.is_hidden_file(&c) {
+            bail!("policy: {p} is another name for a credential file or sealed owner state and cannot be written");
+        }
         if !Self::within(&c, &self.write_roots) && !self.granted(&c, true) {
             return Err(OutsideRoots { path: c, write: true }.into());
         }
@@ -681,6 +887,18 @@ impl Policy {
 /// The system and toolchain directories every child may read (autoresearch evaluators, which have no run policy).
 pub fn system_read_roots() -> Vec<PathBuf> {
     SYSTEM_READ.iter().filter_map(canon).chain(toolchain_roots()).collect()
+}
+
+/// An `[fs]` root from `policy.toml`: `~` is the owner's home, a relative path is relative to the workspace, and a
+/// root that does not resolve to an existing path is an error rather than silently dropped.
+fn fs_root(workspace: &Path, root: &str) -> Result<PathBuf> {
+    let home = || std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| anyhow::anyhow!("bad .harness/policy.toml: [fs] root {root:?} uses ~ but HOME is not set"));
+    let path = match root.strip_prefix('~') {
+        Some("") => home()?,
+        Some(rest) if rest.starts_with('/') => home()?.join(rest.trim_start_matches('/')),
+        _ => workspace.join(root),
+    };
+    std::fs::canonicalize(&path).with_context(|| format!("bad .harness/policy.toml: [fs] root {root:?} ({}) does not resolve", path.display()))
 }
 
 /// A logged path is not authority to remove arbitrary directories on shutdown. Scratch paths must be direct,
@@ -721,13 +939,9 @@ fn toolchain_roots() -> Vec<PathBuf> {
     for t in TOOLS {
         for dir in std::env::split_paths(&path) {
             if let Some(real) = canon(dir.join(t)) {
-                if real.starts_with(&home) {
-                    // <root>/bin/tool -> <root>; otherwise the containing directory
-                    let parent = real.parent().map(Path::to_path_buf).unwrap_or_default();
-                    let root = if parent.file_name().is_some_and(|n| n == "bin") { parent.parent().map(Path::to_path_buf).unwrap_or(parent) } else { parent };
-                    if root != home {
-                        out.push(root);
-                    }
+                // Only the tool's own directory: its parent may be a catch-all such as ~/.local.
+                if let Some(dir) = real.parent().filter(|d| d.starts_with(&home) && *d != home) {
+                    out.push(dir.to_path_buf());
                 }
                 break;
             }
@@ -856,6 +1070,180 @@ mod tests {
         let chained = "git push origin main && curl -XPOST https://evil";
         assert!(p.approve(chained, p.classify_sh(chained)).await.is_err());
         drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn compound_and_wrapped_commands_classify_no_lower_than_the_bare_command() {
+        let (p, dir) = test_policy("shapes", false, &[]);
+        let irreversible = [
+            "for b in a; do git push --force; done", "{ git push --force; }", "if true; then git push --force; fi",
+            "while true; do git push --force; done", "! git push --force", "case x in x) git push --force;; esac",
+            "timeout 5s git push --force", "timeout -s KILL 5 git push --force", "timeout -k 5 10 rm -rf /",
+            "env -u X git push --force", "env -i git push --force", "env FOO=1 rm -rf /", "sudo -u root git push --force",
+            "sudo -u root rm -rf /", "sudo -E git push --force", "sudo -- rm -rf /", "doas rm -rf /", "nice -n 5 git push --force",
+            "nice -n 10 rm -rf /", "ionice -c3 rm -rf /", "stdbuf -o0 rm -rf /", "setsid rm -rf /", "chroot / rm -rf /",
+            "busybox rm -rf /", "nohup git push --force", "xargs -n1 git push --force", "xargs -I{} git push --force {}",
+            "sudo nice -n 5 timeout 9 git push --force", "find . -exec git push --force \\;", "find . -execdir git push -f \\;",
+            "find . -ok rm -rf / \\;", "git --git-dir .git push --force", "git --git-dir=.git push --force",
+            "git --work-tree . push --force", "git -C . -c a=b push --force", "git -c core.x=y push --force",
+            "bash -c -- 'git push --force'", "rm -rf $HOME/.", "rm -rf ~/.", "rm -rf /.", "rm -rf /./", "rm -rf //",
+            "f() { git push --force; }; f",
+        ];
+        for cmd in irreversible {
+            assert_eq!(p.classify_sh(cmd), Class::Irreversible, "{cmd}");
+        }
+        for cmd in ["timeout 5 git push origin main", "{ ssh host; }", "for h in a b; do scp f $h:; done", "sudo -u x aws s3 ls",
+            "git --git-dir .git push origin main", "find . -exec curl -X POST https://x \\;"] {
+            assert_eq!(p.classify_sh(cmd), Class::External, "{cmd}");
+        }
+        for cmd in ["timeout 60 cargo test", "find . -name '*.rs' -delete", "for f in *.txt; do wc -l $f; done",
+            "if [ -f x ]; then rm -rf build; fi", "git --no-pager log --oneline", "git commit -m push", "env FOO=1 make",
+            "rm -rf ./build/.", "xargs echo < list"] {
+            assert_eq!(p.classify_sh(cmd), Class::LocalWrite, "{cmd}");
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_shell_allow_entry_covers_commands_that_start_with_its_words() {
+        let (p, dir) = test_policy("words-allow", false, &["sendmail owner@example.com", "git push origin"]);
+        assert_eq!(p.approve("sendmail owner@example.com < report", Class::External).await, Ok("policy-allow"));
+        assert_eq!(p.approve("{ git push origin main; }", Class::External).await, Ok("policy-allow"));
+        for cmd in ["sendmail attacker@example.net --note \"sendmail owner@example.com\"", "echo; sendmail x 'git push origin'",
+            "GIT_SSH_COMMAND=evil git push origin main", "sudo git push origin main"] {
+            assert!(p.approve(cmd, p.classify_sh(cmd)).await.is_err(), "{cmd}");
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn named_calls_are_approved_on_their_identity_never_on_their_arguments() {
+        let (p, dir) = test_policy("calls", false, &["mcp demo.add", "mcp notes.*", "http probe.get"]);
+        let call = |server, tool| Call::Mcp { server, tool };
+        let approve = |c, args: serde_json::Value| { let p = &p; async move { p.approve_call(c, &args, Class::External).await } };
+        assert_eq!(approve(call("demo", "add"), json!({"a": 1})).await, Ok("policy-allow"));
+        assert!(approve(call("demo", "delete_note"), json!({"name": "mcp demo.add"})).await.is_err());
+        assert!(approve(call("demo", "add2"), json!({})).await.is_err());
+        assert!(approve(call("demo.add", "x"), json!({})).await.is_err());
+        assert_eq!(approve(call("notes", "delete"), json!({})).await, Ok("policy-allow"));
+        assert!(approve(call("notesx", "delete"), json!({})).await.is_err());
+        assert_eq!(approve(Call::Http { namespace: "probe", endpoint: "get" }, json!({"q": "x"})).await, Ok("policy-allow"));
+        assert!(approve(Call::Http { namespace: "probe", endpoint: "post" }, json!({"q": "http probe.get"})).await.is_err());
+        assert_eq!(p.approve_call(call("demo", "delete_note"), &json!({}), Class::Read).await, Ok("not-required"));
+        // A shell allow entry for the same text approves no call, and a call entry approves no shell command.
+        assert!(p.approve("mcp demo.delete_note", Class::External).await.is_err());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompts_show_control_characters_escaped() {
+        assert_eq!(shown("ls\rgit push --force\u{1b}[2K"), "ls\\rgit push --force\\u{1b}[2K");
+        assert_eq!(shown("a\u{202e}b \"q\" 'q'\n"), "a\\u{202e}b \"q\" 'q'\\n");
+        let call = Call::Mcp { server: "s", tool: "t\u{1b}[1A" };
+        assert_eq!(call.to_string(), "mcp s.t\\u{1b}[1A");
+    }
+
+    fn hidden_workspace(tag: &str) -> (Policy, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hx-policy-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".harness/ar/run/deep")).unwrap();
+        std::fs::write(dir.join(".harness/secrets.toml"), "TOKEN").unwrap();
+        std::fs::write(dir.join(".harness/ar/run/deep/held.txt"), "SEALED").unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        (Policy::new(&dir, false, Some(ApprovalMode::Deny), None, None).unwrap(), dir)
+    }
+
+    #[test]
+    fn file_tools_refuse_hidden_files_by_identity_after_a_link_or_move() {
+        let (p, dir) = hidden_workspace("identity");
+        p.confinement(); // a shell command starts
+        std::fs::hard_link(dir.join(".harness/secrets.toml"), dir.join("leak.txt")).unwrap();
+        std::fs::rename(dir.join(".harness/ar/run/deep/held.txt"), dir.join("out.txt")).unwrap();
+        std::fs::rename(dir.join(".harness/ar/run/deep"), dir.join("moved-dir")).unwrap();
+        for f in ["leak.txt", "out.txt"] {
+            assert!(p.check_read(f).is_err(), "read {f}");
+            assert!(p.check_write(f).is_err(), "write {f}");
+        }
+        assert!(p.unreadable().iter().any(|u| u.ends_with("leak.txt")));
+        let rules = p.confinement(); // the next command hides every name
+        for f in ["leak.txt", "out.txt", "moved-dir", ".harness/secrets.toml"] {
+            assert!(rules.hidden.contains(&dir.join(f)), "{f} not hidden from children: {:?}", rules.hidden);
+        }
+        assert!(p.check_read("README-absent").is_err());
+        std::fs::write(dir.join("README.md"), "public").unwrap();
+        assert!(p.check_read("README.md").is_ok());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hidden_file_with_an_extra_link_is_searched_for_once_not_per_command() {
+        let (p, dir) = hidden_workspace("search-once");
+        let outside = std::env::temp_dir().join(format!("hx-policy-outside-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        p.confinement();
+        // A link outside every write root (the owner's own, say) can never be found by searching the write roots.
+        std::fs::hard_link(dir.join(".harness/secrets.toml"), &outside).unwrap();
+        for _ in 0..5 { p.confinement(); }
+        assert_eq!(p.hidden.lock().unwrap().searches, 1);
+        std::fs::hard_link(dir.join(".harness/secrets.toml"), dir.join("again.txt")).unwrap();
+        for _ in 0..5 { p.confinement(); }
+        assert_eq!(p.hidden.lock().unwrap().searches, 2);
+        assert!(p.check_read("again.txt").is_err());
+        drop(p);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_automatic_write_grant_covers_the_file_not_its_parent_tree() {
+        let (p, dir) = test_policy("grant-file", true, &[]);
+        let outside = std::env::temp_dir().join(format!("hx-policy-grant-outside-{}", std::process::id()));
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        let outside = std::fs::canonicalize(outside).unwrap();
+        let note = outside.join("notes.txt");
+        p.authorize_path(&note.to_string_lossy(), true).await.unwrap();
+        assert!(p.check_write(&note.to_string_lossy()).is_ok());
+        assert!(p.check_write(&outside.join("other.txt").to_string_lossy()).is_err());
+        let rules = p.confinement();
+        assert!(rules.write.contains(&note) && !rules.write.iter().any(|w| outside.starts_with(w) && *w != note));
+        // A directory may be granted for reading, but never one holding the home directory or owner state.
+        p.authorize_path(&outside.join("sub").to_string_lossy(), false).await.unwrap();
+        for broad in ["/".to_string(), std::env::var("HOME").unwrap(), dir.parent().unwrap().to_string_lossy().into_owned()] {
+            let err = p.authorize_path(&broad, false).await.unwrap_err().to_string();
+            assert!(err.contains("cannot be granted"), "{broad}: {err}");
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_hooks_and_config_are_protected_from_file_tools() {
+        let (p, dir) = test_policy("git-protect", false, &[]);
+        for f in [".git/config", ".git/hooks/pre-commit", ".git/hooks"] {
+            assert!(p.check_write(f).unwrap_err().to_string().contains("protected"), "{f}");
+        }
+        assert!(p.check_write(".git/info/exclude").is_ok());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_roots_resolve_against_the_workspace_and_fail_loudly() {
+        let dir = std::env::temp_dir().join(format!("hx-policy-fsroot-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        assert_eq!(fs_root(&dir, "data").unwrap(), dir.join("data"));
+        assert_eq!(fs_root(&dir, "./data/../data").unwrap(), dir.join("data"));
+        assert_eq!(fs_root(&dir, "~").unwrap(), std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap());
+        let err = fs_root(&dir, "missing").unwrap_err().to_string();
+        assert!(err.contains("\"missing\"") && err.contains("does not resolve"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
