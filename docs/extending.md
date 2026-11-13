@@ -6,13 +6,13 @@ The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/
 
 | Kind | Where | How it becomes active |
 |---|---|---|
-| Module override | `.harness/override/std/<mod>.luau` | On a new run; `require("base:std/<mod>")` wraps the original. Invalid controller code stops the run |
+| Module override | `.harness/override/std/<mod>.luau` | On a new run; `require("base:std/<mod>")` wraps the original. An override also wins over an approved package module of the same name. Invalid controller code stops the run |
 | Local tool | `.harness/tools/NAME.lua` or `NAME.luau` | `hx trust`; loads on a new run as `NAME.method(...)` after validation and credential checks |
 | Tool package | `.harness/pkgs/NAME/` with `hx.toml`, `kind = "tool"` | `hx approve NAME`; model calls `tools.NAME.fn(...)` |
 | Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx approve NAME`; model calls `skill("NAME")` (or finds it with `skills("words")`; skills are not listed in the prompt) |
-| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (no `hx.toml`; project shadows global) | `hx approve NAME` (`hx skills` lists them); file tools gain read access to its directory |
+| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (project shadows global). Instructions only: an `hx.toml` or `.luau` file in it is a plain file, never a manifest or a module, so it gets no capabilities | `hx approve NAME` (`hx skills` lists them); file tools gain read access to its directory. To ship Luau, make it a package in `.harness/pkgs/NAME` |
 | MCP server | `.harness/mcp.toml` | On the next run (see [configuration](configuration.md#mcptoml)) |
-| Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Staged without execution; you review, run `hx test DIR`, accept it, and start a new run |
+| Agent-written tool | `deftool(...)` then `promote(name)` (with `--pack std/authoring`) | Staged without execution; you run `hx test DIR` and `hx accept NAME`, which lists and prints every staged file, then installs and locks exactly the bytes it printed (if the staging area changes before you answer, it refuses). Start a new run to use it |
 | Agent-written module replacement | `propose_module("std/MODULE", source, {reason})` (with `--pack std/authoring`) | Staged; `hx accept std/MODULE` shows the reason, a structural check (it loads and keeps every export) and the diff, then makes it the override. `hx rollback std/MODULE` undoes it |
 
 A package that is unapproved, or changed since approval, is invisible to a new run. Each approved package call uses a fresh VM and dispatch-time capability checks. Imports are restricted to that package; function references and host handles cannot cross its boundary. Every module accept and rollback is appended to `.harness/upgrades.jsonl`.

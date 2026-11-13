@@ -46,7 +46,11 @@ local function search_skills(query: string, limit: number)
 			end
 			if score > 0 then
 				local d = p.description or ""
-				table.insert(hits, { name = p.name, description = if #d > 240 then d:sub(1, 240) .. "…" else d, score = score })
+				if #d > 240 then
+					-- cut at the start of the character holding byte 241: a split UTF-8 sequence would fail at the Rust boundary
+					d = d:sub(1, (utf8.offset(d, 0, 241) or 241) - 1) .. "…"
+				end
+				table.insert(hits, { name = p.name, description = d, score = score })
 			end
 		end
 	end
