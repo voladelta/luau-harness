@@ -213,7 +213,7 @@ impl Effects {
         tokio::task::yield_now().await;
         self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
-        let _permit = if class != Class::Read && tool != Tool::Agent {
+        let _permit = if class != Class::Read {
             Some(self.supervisor.mutations.clone().acquire_owned().await.map_err(mlua::Error::external)?)
         } else { None };
         // State may change while queued behind another mutation.
