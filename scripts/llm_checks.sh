@@ -61,4 +61,8 @@ check "the luau tool is declared in the request" "$(grep -c '"luau"' $T/tool.log
 check "requests ask for a streamed response" "$(grep -c '"stream": true' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
 check "a dropped stream is a lost response: one new request, run finishes" "$(BYLEN=0 mockrun '[{"text":"","calls":[{"code":"print(1)"}],"drop":true},"```luau\nprint(2)\n```","all done"]')" "True|all done|2|1|0"
 check "an empty reply is resent unchanged, not nudged" "$(BYLEN=0 mockrun '["```luau\nprint(7)\n```","","all done"]')|$(grep -c 'cut off or empty' $T/tool.log | tr -d ' ')" "True|all done|3|1|1|0"
+# --- transport: a Retry-After that is not a finite delay is ignored (2 s default backoff), never a crash; a loopback
+# provider is reached directly even with a proxy configured
+check "Retry-After: NaN falls back to the default backoff" "$(BYLEN=0 mockrun '[{"status":429,"error":"slow down","retry_after":"NaN"},"```luau\nprint(7)\n```","all done"]')" "True|all done|2|1|0"
+check "a loopback base URL bypasses HTTP_PROXY" "$(HTTP_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 NO_PROXY= no_proxy= mockrun '["```luau\nprint(7)\n```","all done"]')" "True|all done|2|1|0"
 finish

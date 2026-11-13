@@ -5,7 +5,7 @@ A reply is a string or an object. A string that starts with a ```luau fence beco
 (any text after the fence is the reply text); any other string is a plain-text reply. An object is
 {"text": str, "calls": [{"code": str} | {"name": str, "arguments": str}]} for several calls or hand-made (even invalid) arguments.
 An object may also carry "prompt_tokens": N (reported as the usage input tokens, default 10) and, instead of a reply,
-"status": 400, "error": "<body>" (answer with that HTTP status and body).
+"status": 400, "error": "<body>" (answer with that HTTP status and body; "retry_after": "<value>" adds a Retry-After header).
 "reasoning": str adds a reasoning summary item that is echoed back on later turns; "finish": "length" marks the reply cut at max_output_tokens.
 A request with "stream": true is answered with server-sent events (the final response split across writes); "drop": true ends
 that stream before the response completes, like a lost connection. GET /models answers with $MOCK_MODELS."""
@@ -47,7 +47,9 @@ class H(BaseHTTPRequestHandler):
         reply = R[min(idx, len(R) - 1)]
         if isinstance(reply, dict) and "status" in reply:
             out = str(reply.get("error", "")).encode()
-            self.send_response(reply["status"]); self.send_header("content-length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            self.send_response(reply["status"]); self.send_header("content-length", str(len(out)))
+            if "retry_after" in reply: self.send_header("retry-after", reply["retry_after"])
+            self.end_headers(); self.wfile.write(out)
             return
         ptok = reply.get("prompt_tokens", 10) if isinstance(reply, dict) else 10
         text, calls = parse(reply)
