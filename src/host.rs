@@ -87,7 +87,8 @@ impl Host {
         }
         for pack in &policy.packs { if !packs.contains(pack) { packs.push(pack.clone()); } }
         llm.key()?; // Reject missing credentials before committing a new run manifest.
-        let supervisor = Supervisor::start_workflow(policy, llm, task, max_turns, packs, budget, branch, workflow)?;
+        let launch = crate::supervisor::Launch { model: llm, task, max_turns, packs, budget, branch, workflow };
+        let supervisor = Supervisor::start(policy, launch)?;
         Self::from_supervisor(supervisor, trace)
     }
 

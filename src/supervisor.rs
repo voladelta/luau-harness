@@ -553,14 +553,24 @@ pub struct Supervisor {
     pub active_effects: std::sync::atomic::AtomicUsize,
 }
 
-impl Supervisor {
-    #[cfg(test)]
-    pub fn start(policy: Arc<Policy>, model: LlmCfg, task: String, max_turns: usize, packs: Vec<String>, budget: Budget, branch: Option<Branch>) -> Result<Arc<Self>> {
-        Self::start_workflow(policy,model,task,max_turns,packs,budget,branch,None)
-    }
+/// What a new run is launched with. `Supervisor::start` freezes it into the run's manifest.
+pub struct Launch {
+    pub model: LlmCfg,
+    pub task: String,
+    pub max_turns: usize,
+    pub packs: Vec<String>,
+    pub budget: Budget,
+    pub branch: Option<Branch>,
+    pub workflow: Option<crate::workflow::WorkflowConfig>,
+}
 
-    pub fn start_workflow(policy: Arc<Policy>, model: LlmCfg, task: String, max_turns: usize, packs: Vec<String>, budget: Budget, branch: Option<Branch>, workflow: Option<crate::workflow::WorkflowConfig>) -> Result<Arc<Self>> {
-        if let Some(config)=&workflow {config.validate()?;}
+impl Supervisor {
+    /// Start a new run: capture the registry, write the manifest, and return the supervisor that owns its journal.
+    pub fn start(policy: Arc<Policy>, launch: Launch) -> Result<Arc<Self>> {
+        let Launch { model, task, max_turns, packs, budget, branch, workflow } = launch;
+        if let Some(config) = &workflow {
+            config.validate()?;
+        }
         crate::vm::check_packs(&packs)?;
         let mut registry = Registry::capture(&policy.workspace, &policy.dirs)?;
         registry.materialize_skills(&policy.log)?;
@@ -771,6 +781,10 @@ mod checkpoint_tests {
             "base_url":null,"key_env":null,"reasoning":null,"context_window":null,"cache_key":null,"provider_only":[]})).unwrap()
     }
 
+    fn launch(budget: Budget) -> Launch {
+        Launch { model: model(), task: "test".into(), max_turns: 1, packs: vec![], budget, branch: None, workflow: None }
+    }
+
     #[tokio::test]
     async fn lost_responses_are_charged_their_reserved_tokens() {
         for (tag, limit) in [("capped", Some(102)), ("uncapped", None)] {
@@ -779,8 +793,7 @@ mod checkpoint_tests {
             let dirs = crate::dirs::TestDirs::new();
             let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
             let cfg = model();
-            let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
-                Budget { max_tokens: limit, ..Budget::default() }, None).unwrap();
+            let supervisor = Supervisor::start(policy, launch(Budget { max_tokens: limit, ..Budget::default() })).unwrap();
             let op = supervisor.reserve_model(&cfg, &json!({}), 0).await.unwrap();
             assert_eq!(supervisor.books.lock().unwrap().reservations[&op], 102);
             assert!(supervisor.fail_model(op, &cfg, "lost response", None, false, 0).unwrap());
@@ -801,8 +814,7 @@ mod checkpoint_tests {
         let dirs = crate::dirs::TestDirs::new();
         let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let cfg = model();
-        let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
-            Budget { max_tokens: Some(102), max_wall_secs: Some(0.5), ..Budget::default() }, None).unwrap();
+        let supervisor = Supervisor::start(policy, launch(Budget { max_tokens: Some(102), max_wall_secs: Some(0.5) })).unwrap();
         let first = supervisor.reserve_model(&cfg, &json!({}), 0).await.unwrap();
         let queued = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor.reserve_model(&cfg, &json!({}), 1)).await
             .expect("queued admission must not wait for an unsettled request after its deadline");
@@ -851,7 +863,7 @@ mod checkpoint_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
         let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
-        (Supervisor::start(policy, model(), "test".into(), 1, vec![], Budget::default(), None).unwrap(), std::fs::canonicalize(dir).unwrap(), dirs)
+        (Supervisor::start(policy, launch(Budget::default())).unwrap(), std::fs::canonicalize(dir).unwrap(), dirs)
     }
 
     #[test]
