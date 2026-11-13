@@ -256,8 +256,20 @@ function M.request(system: string, tools, messages, cut: number, reserve: number
 	return { system = system, tools = tools, messages = prefix, max_tokens = math.floor(reserve * 4 / 5), replay = true }
 end
 
+-- How to reach the archive, shown only once it has something in it: the system prompt does not document history().
+local function history_notice(): string
+	local l = hx.limits
+	return string.format([==[
+
+The messages this and earlier compactions removed are archived; search them with the `history` function in Luau:
+- p = history({q = "literal text"}) searches case-sensitively, newest first, %d entries a page; print each p.entries[i].snippet. With no q it lists. While p.next is set, more remain: history({q = "literal text", before = p.next}).
+- e = history({id = p.entries[i].id}) reads one entry; print e.text (%d bytes a page). While e.next_offset is set, more remain: history({id = e.id, offset = e.next_offset}).
+Output cut short before it entered the conversation cannot be recovered. Live messages, other agents and un-compacted remainders of earlier workflow stages are not in the archive.
+]==], l.HISTORY_ENTRIES, l.HISTORY_BYTES)
+end
+
 function M.wrap(task, summary, history)
-	local notice = if history then '\nMessages removed by recorded compactions are available in this root lane: history({q="literal text"}), then history({id="entry-id"}). Print entry.text; follow next (resend q) or next_offset for more. Un-compacted retired RPI stages and other lanes are outside this archive.\n' else ""
+	local notice = if history then history_notice() else ""
 	return task .. "\n\n" .. SUMMARY_PREFIX .. summary .. SUMMARY_SUFFIX .. notice
 end
 

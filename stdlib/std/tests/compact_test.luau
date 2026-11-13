@@ -203,3 +203,12 @@ test.case("view limits one model reply, however many calls collect its images", 
 	hooks.clear()
 	assert(ok, err)
 end)
+
+test.case("history() is documented in the summary once the archive has entries, not before", function()
+	local with = compact.wrap("TASK", "S", true)
+	for _, needle in { 'history({q = "literal text"})', "before = p.next", "e.text", "offset = e.next_offset", "case-sensitively" } do
+		test.ok(with:find(needle, 1, true), needle)
+	end
+	test.ok(not compact.wrap("TASK", "S", false):find("history(", 1, true))
+	test.ok(not hx.asset("std/system.md"):find("history(", 1, true), "the system prompt leaves history() to the summary")
+end)

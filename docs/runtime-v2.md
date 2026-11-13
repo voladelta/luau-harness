@@ -46,7 +46,7 @@ Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB
 
 ## Compaction history
 
-Root agents can retrieve the public conversation removed by successful, recorded compactions:
+Root agents can retrieve the public conversation removed by successful, recorded compactions. The system prompt does not describe `history`; each compaction summary of a root run ends with a notice that does, so the model learns of it once the archive has entries:
 
 ```luau
 local page = history({q="earlier failure", limit=5})
