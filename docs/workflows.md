@@ -93,7 +93,7 @@ The margin is `min_delta`, or the standard error of the difference when the eval
 
 ### Isolation
 
-On Linux with Landlock, episode shell commands and evaluators are confined to their copies: the agent cannot read the grader or held-out roots, the run's records or the owner's workspace, and only the select evaluator reads `holdout`. Network isolation is up to you. Without Landlock (macOS, older kernels, containers that filter it) a spec with `select`, `grader` or `holdout` is refused unless you pass `--ar-unconfined` inside a sandbox of your own. Evaluators and episode shell commands cannot use `/dev/shm`, so Python multiprocessing locks, queues and pools fail inside them; use threads or plain subprocesses.
+On Linux with Landlock, episode shell commands and evaluators are confined to their copies: the agent cannot read the grader or held-out roots, the run's records or the owner's workspace, and only the select evaluator reads `holdout`. Network isolation is up to you. Without Landlock (macOS, older kernels, containers that filter it) a spec with `select`, `grader` or `holdout` is refused unless you pass `--ar-unconfined` inside a sandbox of your own. Evaluators and episode shell commands run in fresh namespaces: each gets a private `/proc` and `/dev/shm`, and nothing it leaves running survives it. Where the system forbids user namespaces they fall back to a cgroup each without `/dev/shm` (Python multiprocessing locks, queues and pools fail there); with neither, they refuse to run.
 
 ### Result and resume
 

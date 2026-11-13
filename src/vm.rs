@@ -532,6 +532,21 @@ impl Vm {
                     prims::json_value(&lua, result)
                 }
             })?)?;
+            // ar.verdict{pass = bool, reason = string}: an auditor's typed, final verdict.
+            if policy.episode.as_ref().is_some_and(|e| e.role == crate::ar::Role::Audit) {
+                let afx = fx.clone();
+                ar.set("verdict", lua.create_async_function(move |lua, args: mlua::Table| {
+                    let fx = afx.clone();
+                    async move {
+                        let pass: bool = args.get::<Option<bool>>("pass")?.ok_or_else(|| crate::effects::rt("ar.verdict: pass must be true or false"))?;
+                        let reason: Option<String> = args.get("reason")?;
+                        let result = fx.run(&lua, crate::supervisor::Tool::Sh, Class::LocalWrite, json!({"ar_verdict": pass, "reason": &reason}), || async {
+                            crate::ar::submit_verdict(&fx.pol, pass, reason.clone()).map(Ret::Json).map_err(|e| crate::effects::rt(format!("ar.verdict: {e}")))
+                        }).await?;
+                        prims::json_value(&lua, result)
+                    }
+                })?)?;
+            }
             ar.set_readonly(true);
             g.set("ar", ar)?;
         }

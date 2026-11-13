@@ -81,6 +81,12 @@ def report_of(result):
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def snapshot(run, snap):
+    """A stored snapshot as {path: bytes}: its manifest names each file's mode and content-addressed blob."""
+    manifest = json.loads((run / "snaps" / f"{snap}.json").read_text())
+    return {rel: (run / "snaps/blobs" / entry["blob"]).read_bytes() for rel, entry in manifest.items()}
+
+
 def ledger(path, report):
     return [json.loads(line) for line in (ar_runs(path) / report["run"] / "ledger.jsonl").read_text().splitlines()]
 
@@ -164,7 +170,7 @@ def journal_of(path, report=None):
 
 def snap_x(path, report, snap):
     """x of a snapshot of the toy task."""
-    return int(base64.b64decode(json.loads((ar_runs(path) / report["run"] / "snaps" / f"{snap}.json").read_text())["x.txt"]))
+    return int(snapshot(ar_runs(path) / report["run"], snap)["x.txt"])
 
 
 def workers(n, rounds=None, extra=""):
@@ -216,7 +222,9 @@ def scripted(body, index):
                         f'local r = ar.claim("{go(t)}")\nlocal x = {t}\nif not r.ok then r = ar.claim("{go(alt)}"); x = {alt} end\n'
                         f'print("CLAIM", r.ok, r.n)\nwrite("x.txt", tostring(x) .. "\\n")\nprint(ar.eval("go " .. x))\n'
                         f'write("x.txt", "{100 + index}\\n")\nprint(ar.eval("probe"))\nar.reset()\nreturn "RESET " .. x .. " " .. read("x.txt")'}
-    if role == "exploit":
+    # Refinements are claimed per starting state, so a moved candidate could take the same step again: only round 2
+    # refines, and round 3 finds nothing to do.
+    if role == "exploit" and label.startswith("r2-"):
         return {"code": f'local x = tonumber(read("x.txt"))\nlocal r = ar.claim("{UP}")\nlocal d = 1\n'
                         f'if not r.ok then r = ar.claim("{DOWN}"); d = -1 end\n'
                         'if r.ok then write("x.txt", tostring(x + d) .. "\\n"); print(ar.eval("step " .. d)) end\nreturn "STEP " .. d'}
@@ -402,8 +410,8 @@ def scenario_00():
 
     assert [r["n"] for r in rows] == list(range(1, len(rows) + 1)), [r["n"] for r in rows]
     for r in rows:
-        snap = json.loads((run / "snaps" / f"{r['snap']}.json").read_text())
-        assert r["score"] == -(int(base64.b64decode(snap["x.txt"])) - 7) ** 2, r
+        snap = snapshot(run, r["snap"])
+        assert r["score"] == -(int(snap["x.txt"]) - 7) ** 2, r
     resets = [o for o in outputs(requests) if o.startswith("RESET ") or "RESET " in o]
     assert len(resets) >= 8 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
     check("ledger rows stay numbered under concurrency, every score matches its snapshot, and ar.reset is per worker")
@@ -542,8 +550,8 @@ def scenario_08():
     with harness.provider(once(race)) as (url, _):
         report = report_of(ar(path, url))
     first = ledger(path, report)[0]
-    snap = json.loads((ar_runs(path) / report["run"] / "snaps" / f"{first['snap']}.json").read_text())
-    assert base64.b64decode(snap["x.txt"]) == b"0\n" and first["score"] == -49, (first, snap)
+    snap = snapshot(ar_runs(path) / report["run"], first["snap"])
+    assert snap["x.txt"] == b"0\n" and first["score"] == -49, (first, snap)
     check("snapshot and score always agree")
 
 
@@ -554,8 +562,8 @@ def scenario_09():
     junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn ar.eval("junk")'
     with harness.provider(once(junk)) as (url, _):
         report = report_of(ar(path, url))
-    snap = json.loads((ar_runs(path) / report["run"] / "snaps" / f"{ledger(path, report)[0]['snap']}.json").read_text())
-    assert base64.b64decode(snap["pkg/blob.bin"]) == b"\xff\xfe" and "pkg/link" not in snap, list(snap)
+    snap = snapshot(ar_runs(path) / report["run"], ledger(path, report)[0]["snap"])
+    assert snap["pkg/blob.bin"] == b"\xff\xfe" and "pkg/link" not in snap, list(snap)
     check("binary editable files survive and symlinks are skipped")
 
 
@@ -719,28 +727,28 @@ def scenario_17():
 
 
 def scenario_18():
-    # 14. Detached processes of agents and evaluators are reaped when their scratch copy is deleted.
-    spec = 'editable = ["x.txt", "pid.txt"]\neval = "python3 search.py; (setsid sleep 300 >/dev/null 2>&1 & echo $! > /dev/null)"\ntimeout = 30\n'
-    files = {"x.txt": "0\n", "pid.txt": "", "search.py": 'import json, subprocess, os\np = subprocess.Popen(["python3", "-c", "import os, time; os.setsid(); time.sleep(300)"], start_new_session=True)\nprint(json.dumps({"score": 0, "report": {"evaluator_daemon": p.pid}}))'}
+    # 14. Detached processes of agents and evaluators die with the command or evaluation that started them.
+    marker = f"hx-ar-reap-{os.getpid()}"
+    spec = f'editable = ["x.txt"]\neval = "python3 search.py; (setsid bash -c \'exec -a {marker}-eval sleep 300\' >/dev/null 2>&1 &)"\ntimeout = 30\n'
+    files = {"x.txt": "0\n", "search.py": f'import json, subprocess\nsubprocess.Popen(["bash", "-c", "exec -a {marker}-py sleep 300"], start_new_session=True)\nprint(json.dumps({{"score": 0}}))'}
     path = workspace("reap", files, spec)
-    daemon = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    open(\'pid.txt\', \'w\').write(str(os.getpid()))\\n    time.sleep(300)\\nos._exit(0)\\n")\n'
-              'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn ar.eval("daemon")')
+    daemon = (f'sh("(setsid bash -c \'exec -a {marker}-agent sleep 300\' >/dev/null 2>&1 &); sleep 0.5")\n'
+              f'print("SAW " .. sh("grep -l ^{marker[0]}[{marker[1]}]{marker[2:]} /proc/[0-9]*/cmdline | wc -l").stdout)\nreturn ar.eval("daemon")')
     with harness.provider(once(daemon)) as (url, requests):
-        report = report_of(ar(path, url))
-    snap = ledger(path, report)[0]["snap"]
-    pids = [int(base64.b64decode(json.loads((ar_runs(path) / report["run"] / "snaps" / f"{snap}.json").read_text())["pid.txt"]))]
-    pids += [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_daemon=(\d+)", o)]
-    assert len(pids) >= 2, (pids, outputs(requests))
+        report_of(ar(path, url))
+    # The agent's next command saw nothing its previous one left (its namespace died with it).
+    assert any("SAW 0" in o for o in outputs(requests)), outputs(requests)
     time.sleep(0.5)
-    # A killed orphan stays a zombie until init reaps it, which some container inits do lazily: zombies are dead.
-    def state(p):
-        try:
-            return Path(f"/proc/{p}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except OSError:
-            return ""
-    alive = [p for p in pids if subprocess.run(["kill", "-0", str(p)], capture_output=True).returncode == 0 and state(p) != "Z"]
-    assert not alive, f"detached processes survived: {alive}"
-    check("detached agent and evaluator processes are reaped")
+    def running():
+        out = []
+        for p in Path("/proc").iterdir():
+            try:
+                if p.name.isdigit() and (p / "cmdline").read_bytes().startswith(marker.encode()): out.append(p.name)
+            except OSError:
+                pass
+        return out
+    assert not running(), f"detached processes survived: {running()}"
+    check("detached agent and evaluator processes die with the command that started them")
 
 
 def scenario_19():
@@ -878,8 +886,8 @@ def scenario_fallback():
     six = next(c["n"] for c in claims if c["scope"] == "explore" and c["idea"] == go(6))
     assert any(r["kind"] == "audited" and r["idea"] == six and not r["pass"] for r in records), "the x = 7 state was never failed"
     kept = next(p for p in report["portfolio"] if p["idea"] == six)
-    snap = json.loads((run / "snaps" / f"{kept['snap']}.json").read_text())
-    assert base64.b64decode(snap["x.txt"]) == b"6\n" and any(r["kind"] == "audited" and r["snap"] == kept["snap"] and r["pass"] for r in records), kept
+    snap = snapshot(run, kept["snap"])
+    assert snap["x.txt"] == b"6\n" and any(r["kind"] == "audited" and r["snap"] == kept["snap"] and r["pass"] for r in records), kept
     check("a refinement that fails its audit costs only itself: the candidate keeps its best state that passed")
 
 

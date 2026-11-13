@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 mod episode;
 pub(crate) mod files;
 mod ssot;
-pub use episode::{Episode, Progress, claim, claims, eval, load_episode, reset};
+pub use episode::{Episode, Progress, claim, claims, eval, load_episode, reset, submit_verdict};
 use files::*;
 
 /// Model turns an episode may take: its whole allowance, in work rather than dollars, so it means the same on any model.
@@ -101,6 +101,10 @@ pub struct Spec {
     /// ends every run.
     #[serde(default = "Spec::max_rounds")]
     pub max_rounds: usize,
+    /// Evaluators at once across the run (default: half the CPUs, at least one), so evaluations side by side do not
+    /// skew each other's timings or time out by load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_jobs: Option<usize>,
 }
 impl Spec {
     fn timeout() -> f64 { 600.0 }
