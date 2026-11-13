@@ -104,6 +104,7 @@ def main():
             results.append(future.result())
     # ar runs four scenarios at a time on its own; beside other suites it starves them past their caps.
     results.append(run("ar", ["python3", "scripts/ar_checks.py"], cap=280))
+    results.append(run("ar_isolation", ["python3", "scripts/ar_isolation_checks.py"], cap=120))
     shutil.rmtree(states, ignore_errors=True)
     elapsed = time.monotonic() - started
     print(f"\n{sum(results)}/{len(results)} suites passed in {elapsed:.1f}s (limit: 5 minutes)", flush=True)
