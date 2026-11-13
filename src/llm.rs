@@ -1,6 +1,8 @@
 //! Responses API client with native tool calling for any compatible endpoint.
+use crate::net;
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct LlmCfg {
@@ -26,7 +28,7 @@ pub struct LlmCfg {
 pub struct Answered {
     pub status: u16,
     pub message: String,
-    /// seconds from a `Retry-After` header
+    /// seconds from a `Retry-After` header: finite and not negative
     pub retry_after: Option<f64>,
 }
 
@@ -62,6 +64,22 @@ pub struct Reply {
 /// The provider hx calls without `--base-url`.
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
+fn base_url(cfg: &LlmCfg) -> Result<reqwest::Url> {
+    let base = cfg.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+    reqwest::Url::parse(base).map_err(|e| anyhow::anyhow!("invalid model base URL {base:?}: {e}"))
+}
+
+/// The client for a run's provider. The read timeout bounds silence on the streamed reply, not the whole generation.
+pub fn client(cfg: &LlmCfg) -> Result<reqwest::Client> {
+    Ok(net::client(&base_url(cfg)?).connect_timeout(Duration::from_secs(30)).read_timeout(Duration::from_secs(300)).build()?)
+}
+
+/// Delay-seconds from a `Retry-After` header. An HTTP-date, a negative number, NaN or infinity is ignored.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    let seconds = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim().parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
+}
+
 /// A model's context window and output cap as OpenRouter's `/models` lists them: `context_length` and
 /// `top_provider.max_completion_tokens` (often null).
 pub fn listed_limits(models: &Value, model: &str) -> Option<(u64, Option<u64>)> {
@@ -76,7 +94,7 @@ pub async fn provider_limits(cfg: &LlmCfg) -> Option<(u64, Option<u64>)> {
     let openrouter = reqwest::Url::parse(&base).is_ok_and(|u| u.host_str() == Some("openrouter.ai")) || std::env::var_os("HX_TEST_MODELS").is_some();
     if !openrouter { return None; }
     let fetched = async {
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
+        let client = net::client(&base_url(cfg)?).timeout(Duration::from_secs(15)).build()?;
         let models: Value = client.get(format!("{}/models", base.trim_end_matches('/'))).send().await?.error_for_status()?.json().await?;
         listed_limits(&models, &cfg.model).ok_or_else(|| anyhow::anyhow!("{} is not in its model list", cfg.model))
     }.await;
@@ -182,9 +200,9 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     let url = format!("{base}/responses");
     // Generation can be billable even when its response is lost. The supervisor owns admission and recovery;
     // neither this adapter nor reqwest may silently dispatch a second attempt.
-    let mut response = http.post(&url).bearer_auth(key).json(&body).send().await?;
+    let mut response = http.post(&url).bearer_auth(key).json(&body).send().await.map_err(|e| net::Error::send("model request failed", e))?;
     let status = response.status();
-    let retry_after = response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()?.trim().parse::<f64>().ok());
+    let retry_after = retry_after(response.headers());
     let answered = |message: String| Answered { status: status.as_u16(), message, retry_after };
     let sse = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
     if !status.is_success() || !sse {
@@ -194,7 +212,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         let resp: Value = serde_json::from_str(&text).map_err(|e| answered(format!("API returned a malformed body: {e}")))?;
         return reply(resp).map_err(|m| answered(m).into());
     }
-    let mut events = Sse::default();
+    let mut events = net::Sse::default();
     while let Some(chunk) = response.chunk().await? {
         for data in events.push(&chunk) {
             let Ok(event) = serde_json::from_str::<Value>(&data) else { continue }; // e.g. a `[DONE]` sentinel
@@ -208,48 +226,6 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     }
     // The stream ended without a final response: like a lost connection, the generation may have been billed.
     anyhow::bail!("the response stream ended before the response completed")
-}
-
-/// Server-sent events: bytes in, the `data` of each complete event out.
-#[derive(Default)]
-struct Sse {
-    buf: Vec<u8>,
-    /// bytes of `buf` already searched for an event end
-    scanned: usize,
-}
-
-impl Sse {
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        // A line ends with \n or \r\n; JSON data never holds a raw \r, so dropping every \r leaves \n endings only.
-        self.buf.extend(bytes.iter().filter(|&&b| b != b'\r'));
-        let mut out = Vec::new();
-        // An event ends at a blank line. The final response is one large event, so resume the search where it stopped.
-        while let Some(end) = self.buf.get(self.scanned.saturating_sub(1)..).and_then(|b| b.windows(2).position(|w| w == b"\n\n")) {
-            let end = self.scanned.saturating_sub(1) + end;
-            let event = String::from_utf8_lossy(&self.buf[..end]).into_owned();
-            self.buf.drain(..end + 2);
-            self.scanned = 0;
-            let data: Vec<&str> = event.lines().filter_map(|l| l.strip_prefix("data:")).map(|d| d.strip_prefix(' ').unwrap_or(d)).collect();
-            if !data.is_empty() { out.push(data.join("\n")); }
-        }
-        self.scanned = self.buf.len();
-        out
-    }
-}
-
-#[cfg(test)]
-mod sse_tests {
-    use super::Sse;
-
-    #[test]
-    fn events_split_across_chunks_and_line_endings() {
-        let mut sse = Sse::default();
-        assert!(sse.push(b"event: response.created\ndata: {\"a\"").is_empty());
-        assert_eq!(sse.push(b":1}\n\n: comment\n\ndata: x\r\n\r\ndata: one\ndata: two\n"), vec!["{\"a\":1}", "x"]);
-        assert_eq!(sse.push(b"\n"), vec!["one\ntwo"]);
-        assert!(sse.push(b"data: partial\r\n\r").is_empty());
-        assert_eq!(sse.push(b"\n"), vec!["partial"]);
-    }
 }
 
 /// A finished Responses API response object -> Reply; Err is the message of a provider error.
@@ -271,4 +247,25 @@ fn reply(resp: Value) -> std::result::Result<Reply, String> {
     let markup = out.calls.is_empty() && TOOL_MARKUP.iter().any(|m| out.text.contains(m));
     out.finish = Some(if cut { "length" } else if markup { "tool_markup" } else { "stop" }.into());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_after;
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    #[test]
+    fn retry_after_is_a_finite_nonnegative_delay() {
+        let parse = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            retry_after(&headers)
+        };
+        assert_eq!(parse(" 7 "), Some(7.0));
+        assert_eq!(parse("0.5"), Some(0.5));
+        for bad in ["NaN", "nan", "inf", "-inf", "infinity", "1e400", "-3", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
 }

@@ -102,7 +102,7 @@ impl Host {
         Ok(Arc::new(Self { llm: m.model.clone(), workspace: m.policy.workspace.clone(), policy: supervisor.policy.clone(),
             principal: Principal::Agent { read_only: false }, durable: supervisor.durable.clone(), lane: "root".into(),
             max_turns: m.max_turns, depth: 0, max_depth: 2,
-            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).read_timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?,
+            http: llm::client(&m.model)?,
             trace: Arc::new(Mutex::new(file)), key, packs: m.packs.clone(), supervisor }))
     }
 
@@ -179,8 +179,11 @@ impl Host {
             };
             // An answer without a generation is classified. A lost response may have been billed: it is charged its
             // reserved tokens and a new request may follow. The lost operation itself is never dispatched again.
+            // A request that never reached the provider generated nothing either.
             let answered = error.downcast_ref::<llm::Answered>();
-            let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.map(|a| a.status), answered.is_some_and(|a| a.unbilled()), self.depth)?;
+            let unsent = error.downcast_ref::<crate::net::Error>().is_some_and(|e| e.delivery == crate::net::Delivery::NotSent);
+            let unbilled = unsent || answered.is_some_and(|a| a.unbilled());
+            let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.map(|a| a.status), unbilled, self.depth)?;
             let retry = match answered { Some(a) => a.retryable().then_some(a.retry_after), None => closed.then_some(None) };
             // A rate limit generated nothing, so waiting it out is free: up to RATE_LIMIT_RETRIES new requests, backing
             // off when the provider names no delay. Anything else gets one.

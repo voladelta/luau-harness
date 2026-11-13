@@ -11,6 +11,7 @@ mod history;
 mod llm;
 mod mcp;
 mod modules;
+mod net;
 mod policy;
 mod prims;
 mod trust;
