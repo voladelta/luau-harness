@@ -43,6 +43,27 @@ pub struct EventLog {
     // A separate inode survives torn-tail repair. The lock is released only when the run drops its journal.
     _writer_lock: Option<std::fs::File>,
     owner_reconciliation: bool,
+    /// Blobs this process wrote or verified, with the file's identity when it did. Checkpoints name every message of
+    /// the conversation each time, so re-hashing every existing blob would make each checkpoint cost the whole
+    /// conversation again; an unchanged identity means the file was neither replaced nor written since.
+    known: Mutex<std::collections::HashMap<String, FileId>>,
+}
+
+/// What changes whenever a file's content can have changed: a replacement gets a new inode, and any write or
+/// metadata change moves the change time, which, unlike the modification time, cannot be set back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    ino: u64,
+    len: u64,
+    ctime: (i64, i64),
+}
+
+impl FileId {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path)?;
+        Ok(Self { ino: m.ino(), len: m.len(), ctime: (m.ctime(), m.ctime_nsec()) })
+    }
 }
 
 fn lock_writer(path: &Path) -> Result<std::fs::File> {
@@ -170,7 +191,7 @@ impl EventLog {
         // The journal's name must be durable before the first intent synced into it is.
         sync_dir(dir).with_context(|| format!("journal directory {}", dir.display()))?;
         let _writer_lock = Some(lock_writer(&path)?);
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: GENESIS.into() }), failure: Mutex::new(None), session, path, key, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false }))
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: GENESIS.into() }), failure: Mutex::new(None), session, path, key, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false, known: Mutex::default() }))
     }
 
     /// Continue an existing log after a crash: verify the chain with the key, restore seq and the chain, drop a torn
@@ -202,7 +223,7 @@ impl EventLog {
         }
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
         let session = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev: chain.next }), failure: Mutex::new(None), session, path: path.to_path_buf(), key, crash_after: crash_hook(), _writer_lock, owner_reconciliation }))
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev: chain.next }), failure: Mutex::new(None), session, path: path.to_path_buf(), key, crash_after: crash_hook(), _writer_lock, owner_reconciliation, known: Mutex::default() }))
     }
 
     /// Audit failures are fatal to the run, even if Luau catches the returned error.
@@ -226,18 +247,28 @@ impl EventLog {
         self.path.parent().expect("a journal path has a parent directory")
     }
 
-    /// Store `bytes` content-addressed next to the log (write-once) and return its sha256.
+    /// Store `bytes` content-addressed next to the log (write-once, synced) and return its sha256. A blob that already
+    /// exists is reused once its content is verified; this process verifies each blob once, and again only if the
+    /// file was replaced or written since.
     pub fn blob(&self, bytes: &[u8]) -> Result<String> {
         self.check()?;
         let h = sha_bytes(bytes);
         let dir = self.dir().join("blobs");
         create_dirs(&dir).map_err(|e| self.fail(format!("event log blob: {e}")))?;
         let f = dir.join(&h);
-        if !f.exists() {
-            // atomic: a crash mid-write must not leave a truncated blob under its final name
-            write_atomic(&f, bytes).map_err(|e| self.fail(format!("event log blob: {e}")))?;
-        } else {
-            read_blob(self.dir(), &h).map_err(|e| self.fail(format!("{e:#}")))?;
+        let known = self.known.lock().unwrap().get(&h).copied();
+        match FileId::of(&f) {
+            Ok(id) if known == Some(id) => {},
+            Ok(id) => {
+                // The identity taken before the read: a change during it shows as a different identity next time.
+                read_blob(self.dir(), &h).map_err(|e| self.fail(format!("{e:#}")))?;
+                self.known.lock().unwrap().insert(h.clone(), id);
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // atomic: a crash mid-write must not leave a truncated blob under its final name
+                write_atomic(&f, bytes).map_err(|e| self.fail(format!("event log blob: {e}")))?;
+            },
+            Err(e) => return Err(self.fail(format!("event log blob {}: {e}", f.display()))),
         }
         Ok(h)
     }
@@ -370,12 +401,59 @@ pub fn verify(path: &Path) -> Result<Report> {
     let mut blob_errors = vec![];
     for (_, record) in &chain.records {
         for sha in blob_refs(record) {
-            if seen.insert(sha) && let Err(e) = read_blob(dir, sha) {
-                blob_errors.push(format!("record {}: {e:#}", record["seq"]));
+            if !seen.insert(sha.to_string()) {
+                continue;
+            }
+            let body = match read_blob(dir, sha) {
+                Ok(body) => body,
+                Err(e) => {
+                    blob_errors.push(format!("record {}: {e:#}", record["seq"]));
+                    continue;
+                },
+            };
+            if record["kind"] != "checkpoint" || record["blob"] != sha {
+                continue;
+            }
+            if let Err(e) = verify_messages(dir, &body, &mut seen) {
+                blob_errors.push(format!("record {}: checkpoint {sha}: {e:#}", record["seq"]));
             }
         }
     }
     Ok(Report { records: chain.records.len(), broken: chain.broken, blob_errors })
+}
+
+/// Hashes per chunk of a chunked hash list, such as a checkpoint's messages. Appending to the list rewrites only its
+/// last chunk, so storing a list that grew writes one hash per chunk plus at most this many, not one per item.
+pub const CHUNK: usize = 64;
+
+/// The hashes a chunk blob lists: `CHUNK` of them, or 1 to `CHUNK` for a list's `last` chunk.
+pub fn parse_chunk(bytes: &[u8], last: bool) -> Result<Vec<String>> {
+    let hashes: Vec<String> = serde_json::from_slice(bytes).context("chunk is not a list of hashes")?;
+    anyhow::ensure!(hashes.len() == CHUNK || last && (1..=CHUNK).contains(&hashes.len()), "chunk of {} hashes", hashes.len());
+    Ok(hashes)
+}
+
+/// Check the message chunks a checkpoint body names under `message_chunks`, and the message blobs they list
+/// (`supervisor::CheckpointBody`). Stops at the first bad blob, which the error names.
+fn verify_messages(dir: &Path, body: &[u8], seen: &mut std::collections::BTreeSet<String>) -> Result<()> {
+    let body: Value = serde_json::from_slice(body).context("checkpoint body is not JSON")?;
+    let chunks = match &body["message_chunks"] {
+        Value::Null => return Ok(()),
+        chunks => serde_json::from_value::<Vec<String>>(chunks.clone()).context("message chunks are not a list of hashes")?,
+    };
+    for (c, chunk) in chunks.iter().enumerate() {
+        if !seen.insert(chunk.clone()) {
+            continue;
+        }
+        let bytes = read_blob(dir, chunk)?;
+        let messages = parse_chunk(&bytes, c + 1 == chunks.len()).with_context(|| format!("message chunk {chunk}"))?;
+        for (i, message) in messages.into_iter().enumerate() {
+            if seen.insert(message.clone()) {
+                read_blob(dir, &message).with_context(|| format!("message {}", c * CHUNK + i))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The blobs a record names directly: manifest and checkpoint bodies, model replies and effect receipts.
@@ -502,7 +580,7 @@ mod open_tests {
     fn verify_reports_missing_and_corrupt_blobs() {
         let path = three_records("blob-refs");
         let log = EventLog::reopen(&path).unwrap();
-        let (kept, lost, bad) = (log.blob(b"kept").unwrap(), log.blob(b"lost").unwrap(), log.blob(b"bad").unwrap());
+        let (kept, lost, bad) = (log.blob(br#"{"durable":{}}"#).unwrap(), log.blob(b"lost").unwrap(), log.blob(b"bad").unwrap());
         log.write("checkpoint", json!({"lane": "root", "blob": kept}), false).unwrap();
         log.write("call", json!({"ret": {"t": "sh", "stdout": lost, "stderr": bad}}), false).unwrap();
         assert!(verify(&path).unwrap().blob_errors.is_empty());
@@ -620,6 +698,7 @@ mod open_tests {
             inner: Mutex::new(Inner { file: std::fs::File::open(&path).unwrap(), seq: 0, prev: "genesis".into() }),
             failure: Mutex::new(None),
             session: "read-only".into(), path: path.clone(), key: ChainKey::load().unwrap(), crash_after: None, _writer_lock: None, owner_reconciliation: false,
+            known: Mutex::default(),
         });
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
         let lua = mlua::Lua::new();
@@ -668,6 +747,22 @@ mod open_tests {
         assert!(read_blob(path.parent().unwrap(), &hash).is_err());
         assert!(log.blob(b"original").is_err(), "deduplication must not reuse a corrupted existing blob");
         assert!(read_blob(path.parent().unwrap(), "../outside").is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_verified_blob_is_reused_until_its_file_changes() {
+        let path = three_records("blob-reuse");
+        let log = EventLog::reopen(&path).unwrap();
+        let hash = log.blob(b"original").unwrap();
+        let file = path.parent().unwrap().join("blobs").join(&hash);
+        // the second store verifies the existing file; the third trusts that verification
+        assert_eq!(log.blob(b"original").unwrap(), hash);
+        assert!(log.known.lock().unwrap().contains_key(&hash));
+        assert_eq!(log.blob(b"original").unwrap(), hash);
+        // an in-place rewrite of the same length moves the change time, so the blob is verified again
+        std::fs::OpenOptions::new().write(true).open(&file).unwrap().write_all(b"0riginal").unwrap();
+        assert!(log.blob(b"original").is_err(), "deduplication must not reuse a blob changed after verification");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

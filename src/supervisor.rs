@@ -42,7 +42,24 @@ pub enum RunState {
     Finished { report: serde_json::Map<String, Value> },
 }
 
-#[derive(Serialize, Deserialize)]
+impl RunState {
+    /// The controller's private state; a finished run has none.
+    pub fn controller(&self) -> Option<&Value> {
+        match self {
+            Self::Running { controller } | Self::AwaitingReview { controller, .. } => Some(controller),
+            Self::Finished { .. } => None,
+        }
+    }
+
+    fn controller_mut(&mut self) -> Option<&mut Value> {
+        match self {
+            Self::Running { controller } | Self::AwaitingReview { controller, .. } => Some(controller),
+            Self::Finished { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     #[serde(flatten)]
     pub run: RunState,
@@ -51,20 +68,116 @@ pub struct Checkpoint {
     pub workflow: Option<crate::workflow::ExecutionFrame>,
 }
 
+/// A checkpoint as its body blob stores it. The controller state's `messages` array, the one part of that state the
+/// host reads, is stored one blob per message. The message hashes, in order, are stored in chunks of `eventlog::CHUNK`
+/// (every chunk but the last is full), one blob per chunk, and the body names the chunks. A message or chunk that is unchanged
+/// since an earlier checkpoint is never written again, so a run's blobs grow with its conversation, not with the
+/// conversation times the number of checkpoints. The rest of the controller state stays in the body as it is.
+/// `Checkpoint::write` and `Checkpoint::read` are the only split and join.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct CheckpointBody {
+    #[serde(flatten)]
+    checkpoint: Checkpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_chunks: Option<Vec<String>>,
+}
+
+impl CheckpointBody {
+    /// Parse a body blob. A body without message chunks whose controller state holds a `messages` array was written
+    /// before messages had blobs of their own and is refused, never read as something it is not.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
+        let body: Self = serde_json::from_slice(bytes).context("invalid checkpoint body")?;
+        let state = body.checkpoint.run.controller();
+        match (&body.message_chunks, state.and_then(|c| c.get("messages"))) {
+            (Some(_), _) if state.is_none_or(|c| !c.is_object()) => bail!("checkpoint body names messages but has no controller state"),
+            (Some(_), Some(_)) => bail!("checkpoint body holds messages both inline and by reference"),
+            (None, Some(Value::Array(_))) => bail!("checkpoint body holds its messages inline, as builds before message blobs wrote it; start a new run"),
+            _ => Ok(body),
+        }
+    }
+
+    /// The controller state without its `messages` array.
+    pub(crate) fn controller(&self) -> Option<&Value> {
+        self.checkpoint.run.controller()
+    }
+
+    /// Where message `index` is listed: the chunk blob's hash, whether it is the last chunk, and the message's position
+    /// in it. `None` when the controller state has no `messages` array or it is shorter.
+    pub(crate) fn message_chunk(&self, index: usize) -> Option<(&str, bool, usize)> {
+        let chunks = self.message_chunks.as_ref()?;
+        let chunk = chunks.get(index / eventlog::CHUNK)?;
+        Some((chunk, index / eventlog::CHUNK + 1 == chunks.len(), index % eventlog::CHUNK))
+    }
+}
+
 impl Checkpoint {
-    pub fn load(bytes: &[u8]) -> Result<Self> {
-        let checkpoint: Self = serde_json::from_slice(bytes)?;
-        anyhow::ensure!(checkpoint.durable.is_object(), "invalid durable checkpoint");
-        crate::values::validate(&checkpoint.durable)?;
-        match &checkpoint.run {
+    /// Store the checkpoint and return its body blob's hash. Message and chunk blobs are written and synced before the
+    /// body that names them, and the body before this returns, so a journal record written afterwards never names a
+    /// missing blob; a crash in between leaves only blobs that nothing names.
+    pub fn write(mut self, log: &EventLog) -> Result<String> {
+        let messages = match self.run.controller_mut().and_then(Value::as_object_mut) {
+            Some(state) if state.get("messages").is_some_and(Value::is_array) => state.remove("messages"),
+            _ => None,
+        };
+        let message_chunks = match messages {
+            Some(Value::Array(messages)) => {
+                let hashes = messages.iter().map(|m| log.blob(&serde_json::to_vec(m)?)).collect::<Result<Vec<_>>>()?;
+                Some(hashes.chunks(eventlog::CHUNK).map(|chunk| log.blob(&serde_json::to_vec(chunk)?)).collect::<Result<Vec<_>>>()?)
+            },
+            _ => None,
+        };
+        log.blob(&serde_json::to_vec(&CheckpointBody { checkpoint: self, message_chunks })?)
+    }
+
+    /// Read the checkpoint whose body blob is `hash`, join its messages back in order, and validate it. A missing or
+    /// corrupt blob is an error that names it.
+    pub fn read(log_dir: &Path, hash: &str) -> Result<Self> {
+        let body = CheckpointBody::parse(&eventlog::read_blob(log_dir, hash)?).with_context(|| format!("checkpoint {hash}"))?;
+        let mut checkpoint = body.checkpoint;
+        if let Some(chunks) = body.message_chunks {
+            let mut messages = vec![];
+            for (c, chunk) in chunks.iter().enumerate() {
+                let hashes = read_chunk(log_dir, chunk, c + 1 == chunks.len()).with_context(|| format!("checkpoint {hash}"))?;
+                for (i, message) in hashes.iter().enumerate() {
+                    messages.push(read_message(log_dir, message).with_context(|| format!("checkpoint {hash}: message {}", c * eventlog::CHUNK + i))?);
+                }
+            }
+            let state = checkpoint.run.controller_mut().and_then(Value::as_object_mut).expect("parse requires an object state when messages are named");
+            state.insert("messages".into(), Value::Array(messages));
+        }
+        checkpoint.validate().with_context(|| format!("checkpoint {hash}"))?;
+        Ok(checkpoint)
+    }
+
+    /// The latest root-lane checkpoint in a journal's `records`, with its record's sequence.
+    pub fn latest(log_dir: &Path, records: &[Value]) -> Result<Option<(u64, Self)>> {
+        let Some(record) = records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root") else { return Ok(None) };
+        let seq = record["seq"].as_u64().context("missing record sequence")?;
+        let hash = record["blob"].as_str().context("checkpoint record without a blob")?;
+        Ok(Some((seq, Self::read(log_dir, hash).with_context(|| format!("checkpoint at record {seq}"))?)))
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.durable.is_object(), "invalid durable checkpoint");
+        crate::values::validate(&self.durable)?;
+        match &self.run {
             RunState::Running { controller } | RunState::AwaitingReview { controller, .. } => {
                 anyhow::ensure!(controller.is_object(), "controller state must be an object");
                 crate::values::validate(controller)?;
             },
             RunState::Finished { report } => { crate::controller::command(&json!({"kind":"finish", "report":report}))?; },
         }
-        Ok(checkpoint)
+        Ok(())
     }
+}
+
+fn read_chunk(log_dir: &Path, hash: &str, last: bool) -> Result<Vec<String>> {
+    eventlog::parse_chunk(&eventlog::read_blob(log_dir, hash)?, last).with_context(|| format!("message chunk {hash}"))
+}
+
+/// One message of a checkpoint's conversation, from its blob.
+pub(crate) fn read_message(log_dir: &Path, hash: &str) -> Result<Value> {
+    serde_json::from_slice(&eventlog::read_blob(log_dir, hash)?).with_context(|| format!("message blob {hash} is not JSON"))
 }
 
 impl Manifest {
@@ -473,10 +586,8 @@ impl Supervisor {
         let (mut books, settled) = reconcile(&policy.log, &records)?;
         if settled > 0 { records = eventlog::load(path)?; }
         books.crashed();
-        let (frontier, checkpoint) = match records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root") {
-            Some(r) => (r["seq"].as_u64().context("missing record sequence")?,
-                Some(Checkpoint::load(&eventlog::read_blob(policy.log.dir(), r["blob"].as_str().context("missing checkpoint blob")?)?)
-                    .with_context(|| format!("checkpoint at record {}", r["seq"]))?)),
+        let (frontier, checkpoint) = match Checkpoint::latest(policy.log.dir(), &records)? {
+            Some((seq, checkpoint)) => (seq, Some(checkpoint)),
             None => (0, None),
         };
         let receipts: Vec<_> = records.iter().filter(|r| r["seq"].as_u64().unwrap_or(0) > frontier && matches!(r["kind"].as_str(), Some("chunk_begin" | "intent" | "outcome" | "call" | "llm" | "model_intent" | "resolution" | "uncertain" | "billing")))
@@ -525,7 +636,8 @@ impl Supervisor {
 
     pub fn checkpoint_archived(&self, lane: &str, run: RunState, durable: &Value, archive: Option<crate::history::Archive>) -> Result<()> {
         self.policy.log.check()?;
-        let blob = self.policy.log.blob(&serde_json::to_vec(&Checkpoint { run, durable: durable.clone(), workflow: if lane == "root" {self.workflow.lock().unwrap().clone()} else {None} })?)?;
+        let workflow = if lane == "root" { self.workflow.lock().unwrap().clone() } else { None };
+        let blob = Checkpoint { run, durable: durable.clone(), workflow }.write(&self.policy.log)?;
         let mut fields = json!({"lane": lane, "blob": blob});
         if let Some(archive) = &archive { fields["archive"] = serde_json::to_value(archive)?; }
         let seq = self.policy.log.write("checkpoint", fields, true)?;
@@ -806,16 +918,139 @@ mod checkpoint_tests {
 
     #[test]
     fn checkpoints_require_explicit_lifecycle_and_valid_data() {
-        let checkpoint = Checkpoint::load(br#"{"status":"running","controller":{"custom":3},"durable":{"saved":7}}"#).unwrap();
+        let (supervisor, dir) = journal("checkpoint-validation");
+        let log = &supervisor.policy.log;
+        let read = |body: &[u8]| Checkpoint::read(log.dir(), &log.blob(body).unwrap());
+        let checkpoint = read(br#"{"status":"running","controller":{"custom":3},"durable":{"saved":7}}"#).unwrap();
         assert_eq!(checkpoint.durable["saved"], 7);
         assert!(matches!(checkpoint.run, RunState::Running { controller } if controller["custom"] == 3));
+        let message = log.blob(br#"{"role":"user","content":"task"}"#).unwrap();
+        let chunk = log.blob(format!(r#"["{message}"]"#).as_bytes()).unwrap();
         for invalid in [
-            br#"{"controller":{},"durable":{}}"#.as_slice(),
-            br#"{"status":"finished","report":{"finished":true},"durable":{}}"#,
-            br#"{"status":"running","controller":[],"durable":{}}"#,
-            br#"{"status":"running","controller":{},"durable":[]}"#,
+            br#"{"controller":{},"durable":{}}"#.to_vec(),
+            br#"{"status":"finished","report":{"finished":true},"durable":{}}"#.to_vec(),
+            br#"{"status":"running","controller":[],"durable":{}}"#.to_vec(),
+            br#"{"status":"running","controller":{},"durable":[]}"#.to_vec(),
+            // the shape builds before message blobs wrote: never read as a conversation of references
+            br#"{"status":"running","controller":{"messages":[]},"durable":{}}"#.to_vec(),
+            format!(r#"{{"status":"running","controller":{{"messages":[]}},"durable":{{}},"message_chunks":["{chunk}"]}}"#).into_bytes(),
+            format!(r#"{{"status":"finished","report":{{"finished":true,"final_answer":""}},"durable":{{}},"message_chunks":["{chunk}"]}}"#).into_bytes(),
         ] {
-            assert!(Checkpoint::load(invalid).is_err());
+            assert!(read(&invalid).is_err(), "{}", String::from_utf8_lossy(&invalid));
+        }
+        drop(supervisor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn running(messages: Value) -> Checkpoint {
+        Checkpoint { run: RunState::Running { controller: json!({"messages": messages, "turns": 3, "custom": {"nested": [1, 2.5, null]}}) },
+            durable: json!({"saved": "é"}), workflow: None }
+    }
+
+    fn total_blob_bytes(dir: &Path) -> u64 {
+        std::fs::read_dir(dir.join("blobs")).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum()
+    }
+
+    #[test]
+    fn checkpoints_round_trip_with_one_blob_per_message() {
+        let (supervisor, dir) = journal("checkpoint-round-trip");
+        let log = &supervisor.policy.log;
+        let image = "iVBORw0KGgo".repeat(2000);
+        let messages = json!([
+            {"role": "user", "content": "naïve 🙂 \u{0} \"quoted\" \\ end"},
+            {"role": "assistant", "content": null, "calls": [{"id": "c1", "name": "luau", "input": {"code": "print('日本')"}}]},
+            {"role": "tool", "content": [{"type": "text", "text": "seen"}, {"type": "image", "data": image}], "images": [{"path": "a.png", "width": 2, "height": 1}]},
+            {"role": "user", "content": "naïve 🙂 \u{0} \"quoted\" \\ end"},
+        ]);
+        let mut states = vec![running(messages.clone())];
+        // A state whose `messages` is not an array is the controller's own business and stays in the body as it is.
+        states.push(Checkpoint { run: RunState::Running { controller: json!({"messages": {"not": "a list"}}) }, durable: json!({}), workflow: None });
+        states.push(Checkpoint { run: RunState::Running { controller: json!({"other": 1}) }, durable: json!({}), workflow: None });
+        states.push(Checkpoint { run: RunState::Finished { report: json!({"finished": true, "final_answer": "done"}).as_object().unwrap().clone() }, durable: json!({}), workflow: None });
+        for state in states {
+            let expected = serde_json::to_value(&state).unwrap();
+            let hash = state.write(log).unwrap();
+            assert_eq!(serde_json::to_value(Checkpoint::read(log.dir(), &hash).unwrap()).unwrap(), expected);
+        }
+        let body = CheckpointBody::parse(&eventlog::read_blob(log.dir(), &Checkpoint::write(running(messages.clone()), log).unwrap()).unwrap()).unwrap();
+        let chunk = eventlog::parse_chunk(&eventlog::read_blob(log.dir(), body.message_chunk(0).unwrap().0).unwrap(), true).unwrap();
+        // Identical messages at different positions share one blob; the chunk keeps both positions.
+        assert_eq!(chunk.len(), 4);
+        assert_eq!(chunk[0], chunk[3]);
+        assert_eq!(body.message_chunk(3).map(|(_, last, i)| (last, i)), Some((true, 3)));
+        assert!(body.message_chunk(eventlog::CHUNK).is_none());
+        assert!(body.controller().unwrap().get("messages").is_none());
+        assert_eq!(body.controller().unwrap()["turns"], 3);
+        drop(supervisor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_blobs_grow_with_the_conversation_not_with_the_number_of_checkpoints() {
+        let (supervisor, dir) = journal("checkpoint-growth");
+        let log = &supervisor.policy.log;
+        let before = total_blob_bytes(log.dir());
+        let mut messages = vec![];
+        let mut last = 0;
+        for turn in 0..100 {
+            messages.push(json!({"role": "assistant", "content": format!("turn {turn}"), "calls": [{"id": format!("c{turn}"), "name": "luau", "input": {"code": "print(1)"}}]}));
+            messages.push(json!({"role": "tool", "content": format!("{turn}:{}", "x".repeat(4000))}));
+            for _ in 0..3 {
+                let state = running(json!(messages));
+                last = serde_json::to_vec(&state).unwrap().len();
+                supervisor.checkpoint("root", state.run, &state.durable).unwrap();
+            }
+        }
+        let written = (total_blob_bytes(log.dir()) - before) as usize;
+        // 300 checkpoints of the whole state would write about 150 times the final state; message blobs, plus a body
+        // and a last chunk of hashes per checkpoint, stay under twice it.
+        assert!(written < 2 * last, "{written} bytes of blobs for a final state of {last}");
+        let (_, restored) = Checkpoint::latest(log.dir(), &eventlog::load(&log.path).unwrap()).unwrap().unwrap();
+        assert_eq!(restored.run.controller().unwrap()["messages"], json!(messages));
+        drop(supervisor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_crash_after_the_blobs_but_before_the_record_resumes_the_previous_checkpoint() {
+        let (supervisor, dir) = journal("checkpoint-crash");
+        let log = supervisor.policy.log.clone();
+        let first = running(json!([{"role": "user", "content": "task"}]));
+        supervisor.checkpoint("root", first.run.clone(), &first.durable).unwrap();
+        // The next checkpoint's message, chunk and body blobs reach the disk; the process dies before its record.
+        Checkpoint::write(running(json!([{"role": "user", "content": "task"}, {"role": "assistant", "content": "lost"}])), &log).unwrap();
+        let path = log.path.clone();
+        assert!(eventlog::verify(&path).unwrap().blob_errors.is_empty(), "unreferenced blobs are not damage");
+        drop(supervisor);
+        drop(log);
+        let policy = Arc::new(Policy::new(&dir, false, None, Some(&path), None).unwrap());
+        let resumed = Supervisor::resume(policy).unwrap();
+        assert!(matches!(&resumed.restored, Some(RunState::Running { controller }) if controller["messages"] == json!([{"role": "user", "content": "task"}])));
+        drop(resumed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_message_blob_fails_resume_and_verify_naming_the_blob() {
+        for corrupt in [false, true] {
+            let (supervisor, dir) = journal(if corrupt { "checkpoint-corrupt" } else { "checkpoint-missing" });
+            let log = supervisor.policy.log.clone();
+            let state = running(json!([{"role": "user", "content": "task"}, {"role": "assistant", "content": "unique reply"}]));
+            supervisor.checkpoint("root", state.run, &state.durable).unwrap();
+            let path = log.path.clone();
+            let hash = eventlog::sha_bytes(&serde_json::to_vec(&json!({"role": "assistant", "content": "unique reply"})).unwrap());
+            let blob = log.dir().join("blobs").join(&hash);
+            assert!(eventlog::verify(&path).unwrap().blob_errors.is_empty());
+            if corrupt { std::fs::write(&blob, "changed").unwrap(); } else { std::fs::remove_file(&blob).unwrap(); }
+            let errors = eventlog::verify(&path).unwrap().blob_errors;
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].contains(&hash) && errors[0].contains("message 1"), "{errors:?}");
+            drop(supervisor);
+            drop(log);
+            let policy = Arc::new(Policy::new(&dir, false, None, Some(&path), None).unwrap());
+            let error = format!("{:#}", Supervisor::resume(policy).err().expect("resume must fail"));
+            assert!(error.contains(&hash), "{error}");
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }

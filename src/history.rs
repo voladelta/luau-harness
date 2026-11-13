@@ -1,15 +1,13 @@
-//! Root-lane compacted context. Bodies stay in immutable checkpoints; only references are indexed.
+//! Root-lane compacted context. Bodies stay in immutable checkpoints and their message blobs; only references are
+//! indexed.
+use crate::supervisor::CheckpointBody;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::VecDeque,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, path::Path, rc::Rc, sync::Mutex};
 
+/// The journal blob bytes one call may read, and the largest single blob it reads.
 pub(crate) const MAX_SOURCE: usize = 64 << 20;
-pub(crate) const CACHE_BYTES: usize = 8 << 20;
 pub(crate) const MAX_RESPONSE: usize = 12 << 10;
 pub const MAX_TEXT: usize = 4096;
 pub(crate) const MAX_SCAN: usize = 128;
@@ -51,7 +49,6 @@ struct Record {
 struct Index {
     latest: Option<CheckpointRef>,
     records: Vec<Record>,
-    cache: VecDeque<(String, Arc<Value>, usize)>,
 }
 
 #[derive(Default)]
@@ -186,17 +183,17 @@ impl History {
                 && summary(after).is_some_and(|s| !s.trim().is_empty()),
             "history_archive_invalid: missing summary"
         );
-        let mut index = self.index.lock().unwrap();
-        let source = index
+        let source = self
+            .index
+            .lock()
+            .unwrap()
             .latest
             .clone()
             .context("history_archive_invalid: no committed source")?;
-        let saved = Loader::new(&mut index, dir, None).load(&source.blob)?;
+        let saved = crate::supervisor::Checkpoint::read(dir, &source.blob)
+            .context("history_archive_invalid: source unreadable")?;
         ensure!(
-            saved["controller"]["messages"]
-                .as_array()
-                .map(Vec::as_slice)
-                == Some(before),
+            saved.run.controller().and_then(|c| c["messages"].as_array()).map(Vec::as_slice) == Some(before),
             "history_archive_invalid: source differs"
         );
         Ok(Archive {
@@ -215,21 +212,22 @@ impl History {
         deadline: Option<f64>,
     ) -> Result<Value> {
         check_deadline(deadline)?;
-        let mut index = self.index.lock().unwrap();
-        let mut loader = Loader::new(&mut index, dir, deadline);
+        let index = self.index.lock().unwrap();
+        let mut loader = Loader::new(dir, deadline);
         if let Some(id) = &query.id {
             let (seq, ordinal) = parse_id(id)?;
-            let pos = loader
-                .index
+            let pos = index
                 .records
                 .binary_search_by_key(&seq, |r| r.seq)
                 .map_err(|_| anyhow::anyhow!("history: unknown or out-of-scope id"))?;
-            let record = loader.index.records[pos].clone();
+            let record = &index.records[pos];
             ensure!(
                 ordinal == 0 || (2..record.archive.cut).contains(&ordinal),
                 "history: unknown id"
             );
-            let (role, text) = loader.entry(&record, ordinal)?;
+            let (role, text) = loader
+                .entry(record, ordinal)?
+                .context("history: source read limit exceeded")?;
             let offset = query.offset.unwrap_or(0);
             ensure!(
                 offset <= text.len() && text.is_char_boundary(offset),
@@ -263,7 +261,7 @@ impl History {
                 );
             }
         }
-        let last = loader.index.records.last().map_or(0, |r| r.seq);
+        let last = index.records.last().map_or(0, |r| r.seq);
         let (frontier, mut seq, mut ordinal) = if let Some(cursor) = &query.before {
             decode_cursor(cursor, run, query.q.as_deref())?
         } else {
@@ -280,22 +278,20 @@ impl History {
         let mut examined = 0;
         while seq != 0 && entries.len() < query.limit.unwrap_or(DEFAULT_LIMIT) && examined < MAX_SCAN {
             check_deadline(deadline)?;
-            let pos = loader
-                .index
+            let pos = index
                 .records
                 .binary_search_by_key(&seq, |r| r.seq)
                 .map_err(|_| anyhow::anyhow!("history: invalid cursor position"))?;
             ensure!(seq <= frontier, "history: invalid cursor frontier");
-            let record = loader.index.records[pos].clone();
+            let record = &index.records[pos];
             ensure!(
                 ordinal == 0 || (2..record.archive.cut).contains(&ordinal),
                 "history: invalid cursor ordinal"
             );
-            // Never consume a candidate when its source will exceed this call's work budget.
-            if !loader.affordable(record.source(ordinal))? {
+            // Never consume a candidate whose blobs would exceed this call's read budget.
+            let Some((role, text)) = loader.entry(record, ordinal)? else {
                 break;
-            }
-            let (role, text) = loader.entry(&record, ordinal)?;
+            };
             let old_position = (seq, ordinal);
             let current = ordinal;
             if ordinal == 0 {
@@ -304,7 +300,7 @@ impl History {
                 ordinal -= 1;
             } else {
                 seq = if pos > 0 {
-                    loader.index.records[pos - 1].seq
+                    index.records[pos - 1].seq
                 } else {
                     0
                 };
@@ -363,7 +359,7 @@ fn check_deadline(deadline: Option<f64>) -> Result<()> {
 }
 
 impl Record {
-    /// The checkpoint blob holding entry `ordinal`: the summary is in the compaction's own checkpoint, the removed
+    /// The checkpoint holding entry `ordinal`: the summary is in the compaction's own checkpoint, the removed
     /// messages in the checkpoint before it.
     fn source(&self, ordinal: usize) -> &str {
         if ordinal == 0 {
@@ -374,106 +370,98 @@ impl Record {
     }
 }
 
-/// One call's access to checkpoint sources. `budget` is charged only for bytes read from disk; a source in the shared
-/// cache, or the one this call loaded last (kept even when too large for the cache), costs nothing, so the entries of
-/// one large checkpoint are read and parsed once per call.
+/// One call's reads of journal blobs. Every blob read is charged to `budget`, except that a checkpoint body or a
+/// message chunk is read once per call: the entries of one archive share them.
 struct Loader<'a> {
-    index: &'a mut Index,
     dir: &'a Path,
     deadline: Option<f64>,
     budget: usize,
-    last: Option<(String, Arc<Value>)>,
+    bodies: HashMap<String, Rc<CheckpointBody>>,
+    chunks: HashMap<String, Rc<Vec<String>>>,
 }
 
 impl<'a> Loader<'a> {
-    fn new(index: &'a mut Index, dir: &'a Path, deadline: Option<f64>) -> Self {
+    fn new(dir: &'a Path, deadline: Option<f64>) -> Self {
         Self {
-            index,
             dir,
             deadline,
             budget: MAX_SOURCE,
-            last: None,
+            bodies: HashMap::new(),
+            chunks: HashMap::new(),
         }
     }
 
-    /// The parsed source if this call can have it without reading the disk.
-    fn loaded(&mut self, hash: &str) -> Option<Arc<Value>> {
-        if let Some((h, value)) = &self.last
-            && h == hash
-        {
-            return Some(value.clone());
-        }
-        let pos = self.index.cache.iter().position(|(h, _, _)| h == hash)?;
-        let item = self.index.cache.remove(pos).expect("position is in range");
-        let value = item.1.clone();
-        self.index.cache.push_back(item);
-        Some(value)
-    }
-
-    fn size(&self, hash: &str) -> Result<usize> {
+    /// The verified blob `hash`, or `None` when it does not fit what is left of this call's budget. A blob over the
+    /// per-blob limit is an error.
+    fn read(&mut self, hash: &str) -> Result<Option<Vec<u8>>> {
+        check_deadline(self.deadline)?;
         ensure!(
             hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
             "history: invalid blob hash"
         );
-        let size = std::fs::metadata(self.dir.join("blobs").join(hash))?.len() as usize;
+        let path = self.dir.join("blobs").join(hash);
+        let size = std::fs::metadata(&path)
+            .with_context(|| format!("history: journal blob {}", path.display()))?
+            .len() as usize;
         ensure!(size <= MAX_SOURCE, "history: source read limit exceeded");
-        Ok(size)
-    }
-
-    /// Whether loading `hash` fits what is left of this call's budget; an oversized source is an error.
-    fn affordable(&mut self, hash: &str) -> Result<bool> {
-        if self.loaded(hash).is_some() {
-            return Ok(true);
+        if size > self.budget {
+            return Ok(None);
         }
-        Ok(self.size(hash)? <= self.budget)
-    }
-
-    fn load(&mut self, hash: &str) -> Result<Arc<Value>> {
-        check_deadline(self.deadline)?;
-        if let Some(value) = self.loaded(hash) {
-            return Ok(value);
-        }
-        let size = self.size(hash)?;
-        ensure!(size <= self.budget, "history: source read limit exceeded");
         self.budget -= size;
         let deadline = self.deadline;
         let data = crate::eventlog::read_blob_bounded(self.dir, hash, MAX_SOURCE, || check_deadline(deadline))
-            .map_err(|e| if e.to_string().starts_with("history:") { e } else { anyhow::anyhow!("history: {e}") })?;
-        let value: Arc<Value> =
-            Arc::new(serde_json::from_slice(&data).context("history: invalid checkpoint JSON")?);
+            .map_err(|e| if e.to_string().starts_with("history:") { e } else { anyhow::anyhow!("history: {e:#}") })?;
         check_deadline(self.deadline)?;
-        if data.len() <= CACHE_BYTES {
-            let cache = &mut self.index.cache;
-            while cache.iter().map(|(_, _, n)| n).sum::<usize>() + data.len() > CACHE_BYTES {
-                cache.pop_front();
-            }
-            cache.push_back((hash.into(), value.clone(), data.len()));
-        }
-        self.last = Some((hash.into(), value.clone()));
-        Ok(value)
+        Ok(Some(data))
     }
 
-    /// The role and rendered text of entry `ordinal` of `record`.
-    fn entry(&mut self, record: &Record, ordinal: usize) -> Result<(String, String)> {
-        let saved = self.load(record.source(ordinal))?;
-        if ordinal == 0 {
-            return Ok((
-                "summary".into(),
-                summary(&saved["controller"])
-                    .context("history: missing summary")?
-                    .into(),
-            ));
+    fn body(&mut self, hash: &str) -> Result<Option<Rc<CheckpointBody>>> {
+        if let Some(body) = self.bodies.get(hash) {
+            return Ok(Some(body.clone()));
         }
-        let message = saved["controller"]["messages"]
-            .get(ordinal - 1)
+        let Some(data) = self.read(hash)? else {
+            return Ok(None);
+        };
+        let body = Rc::new(CheckpointBody::parse(&data).map_err(|e| anyhow::anyhow!("history: checkpoint {hash}: {e:#}"))?);
+        self.bodies.insert(hash.into(), body.clone());
+        Ok(Some(body))
+    }
+
+    fn chunk(&mut self, hash: &str, last: bool) -> Result<Option<Rc<Vec<String>>>> {
+        if let Some(chunk) = self.chunks.get(hash) {
+            return Ok(Some(chunk.clone()));
+        }
+        let Some(data) = self.read(hash)? else {
+            return Ok(None);
+        };
+        let chunk = Rc::new(crate::eventlog::parse_chunk(&data, last).map_err(|e| anyhow::anyhow!("history: message chunk {hash}: {e:#}"))?);
+        self.chunks.insert(hash.into(), chunk.clone());
+        Ok(Some(chunk))
+    }
+
+    /// The role and rendered text of entry `ordinal` of `record`, or `None` when its blobs do not fit the budget.
+    fn entry(&mut self, record: &Record, ordinal: usize) -> Result<Option<(String, String)>> {
+        let Some(body) = self.body(record.source(ordinal))? else {
+            return Ok(None);
+        };
+        let controller = body.controller().context("history: source has no controller state")?;
+        if ordinal == 0 {
+            let summary = summary(controller).context("history: missing summary")?;
+            return Ok(Some(("summary".into(), summary.into())));
+        }
+        let (chunk, last, position) = body
+            .message_chunk(ordinal - 1)
             .context("history: missing archived message")?;
-        Ok((
-            message["role"]
-                .as_str()
-                .context("history: invalid message role")?
-                .into(),
-            render(message)?,
-        ))
+        let Some(hashes) = self.chunk(chunk, last)? else {
+            return Ok(None);
+        };
+        let hash = hashes.get(position).context("history: missing archived message")?;
+        let Some(data) = self.read(hash)? else {
+            return Ok(None);
+        };
+        let message: Value = serde_json::from_slice(&data).context("history: invalid message JSON")?;
+        let role = message["role"].as_str().context("history: invalid message role")?;
+        Ok(Some((role.into(), render(&message)?)))
     }
 }
 
@@ -569,6 +557,7 @@ fn decode_cursor(cursor: &str, run: &str, q: Option<&str>) -> Result<(u64, u64, 
 mod tests {
     use super::*;
     use crate::eventlog::EventLog;
+    use std::sync::Arc;
     struct Fixture {
         dir: std::path::PathBuf,
         log: Arc<EventLog>,
@@ -594,10 +583,13 @@ mod tests {
             f
         }
         fn save(&self, controller: Value, archive: Option<Archive>) {
-            let blob = self
-                .log
-                .blob(&serde_json::to_vec(&json!({"controller":controller})).unwrap())
-                .unwrap();
+            let blob = crate::supervisor::Checkpoint {
+                run: crate::supervisor::RunState::Running { controller },
+                durable: json!({}),
+                workflow: None,
+            }
+            .write(&self.log)
+            .unwrap();
             let mut fields = json!({"lane":"root","blob":blob});
             if let Some(a) = &archive {
                 fields["archive"] = json!(a);
@@ -626,6 +618,16 @@ mod tests {
                 .unwrap();
             self.save(state, Some(archive));
             self.messages = next;
+        }
+        fn archive_seq(&self) -> u64 {
+            crate::eventlog::load(&self.log.path)
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|r| r.get("archive").is_some())
+                .unwrap()["seq"]
+                .as_u64()
+                .unwrap()
         }
         fn query(&self, q: Value) -> Result<Value> {
             self.history.query(&self.dir, "run", Query::parse(q)?, None)
@@ -769,24 +771,63 @@ mod tests {
     }
 
     #[test]
-    fn a_search_reads_a_source_too_large_for_the_cache_once() {
+    fn a_search_charges_message_blobs_and_continues_where_the_budget_ran_out() {
+        // Five compactions each archive the same 15 MiB message: one blob, but every read of it is charged, so the
+        // fifth does not fit one call's 64 MiB.
+        let big = "x".repeat(15 << 20);
+        let mut f = Fixture::new(vec![
+            message("user", "task"),
+            message("assistant", "call"),
+            message("tool", &big),
+            message("assistant", "keep"),
+            message("tool", "keep"),
+        ]);
+        f.compact(4, "summary 0");
+        for round in 1..5 {
+            f.messages.extend([
+                message("assistant", "call"),
+                message("tool", &big),
+                message("assistant", "keep"),
+                message("tool", "keep"),
+            ]);
+            f.save(json!({"messages":f.messages,"previous_summary":"summary"}), None);
+            f.compact(f.messages.len() - 1, &format!("summary {round}"));
+        }
+        let first = f.query(json!({"q":"absent","limit":20})).unwrap();
+        assert_eq!(first["scan_complete"], false);
+        let rest = f
+            .query(json!({"q":"absent","limit":20,"before":first["next"]}))
+            .unwrap();
+        assert_eq!(rest["scan_complete"], true);
+    }
+
+    #[test]
+    fn identical_messages_in_one_archive_keep_distinct_ids() {
         let mut messages = vec![message("user", "task")];
-        for i in 0..10 {
-            messages.push(message("assistant", "call"));
-            let big = "x".repeat(CACHE_BYTES + 1);
-            messages.push(message("tool", if i == 0 { &big } else { "ordinary" }));
+        for _ in 0..80 {
+            messages.push(message("assistant", "same call"));
+            messages.push(message("tool", "same result"));
         }
         messages.extend([message("assistant", "keep"), message("tool", "keep")]);
         let cut = messages.len() - 1;
         let mut f = Fixture::new(messages);
         f.compact(cut, "summary");
-        // Twenty entries share one source over the cache's size; each charged it in full, and the budget
-        // ran out after seven.
-        let page = f.query(json!({"q":"absent","limit":20})).unwrap();
-        assert_eq!(page["scan_complete"], true);
-        assert!(page.get("next").is_none());
-        let all = f.query(json!({"limit":20})).unwrap();
-        assert_eq!(all["entries"].as_array().unwrap().len(), 20);
+        let mut ids = std::collections::BTreeSet::new();
+        let mut q = json!({"q":"same result","limit":20});
+        loop {
+            let page = f.query(q.clone()).unwrap();
+            for entry in page["entries"].as_array().unwrap() {
+                assert!(ids.insert(entry["id"].as_str().unwrap().to_string()));
+                assert_eq!(f.query(json!({"id":entry["id"]})).unwrap()["text"], "same result");
+            }
+            match page["next"].as_str() {
+                Some(next) => q["before"] = json!(next),
+                None => break,
+            }
+        }
+        // 80 occurrences across two chunks of the source's message list, each with its own position.
+        assert_eq!(ids.len(), 80);
+        assert!(ids.contains(&format!("h:{}:m:3", f.archive_seq())));
     }
 
     #[test]

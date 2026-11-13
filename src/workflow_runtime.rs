@@ -567,15 +567,7 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
     let manifest = crate::supervisor::Manifest::inspect(path)?;
     ensure!(manifest.workflow.is_some(), "run has no review workflow");
     let records = eventlog::load(path)?;
-    let latest = records
-        .iter()
-        .rev()
-        .find(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
-        .context("run has no checkpoint")?;
-    let checkpoint = Checkpoint::load(&eventlog::read_blob(
-        log.dir(),
-        latest["blob"].as_str().context("checkpoint blob missing")?,
-    )?)?;
+    let (_, checkpoint) = Checkpoint::latest(log.dir(), &records)?.context("run has no checkpoint")?;
     let RunState::AwaitingReview { gate: request, .. } = checkpoint.run else {
         anyhow::bail!("run is not awaiting review");
     };

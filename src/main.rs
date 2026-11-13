@@ -463,11 +463,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             let records = eventlog::load(path)?;
             let (books, _) = supervisor::reconcile(&journal, &records)?;
             anyhow::ensure!(books.open.is_empty() && books.reservations.is_empty(), "reconcile uncertain operations and model billing before branching");
-            let state = records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
-                .map(|r| -> Result<_> {
-                    let blob = r["blob"].as_str().ok_or_else(|| anyhow::anyhow!("checkpoint record without a blob"))?;
-                    supervisor::Checkpoint::load(&eventlog::read_blob(journal.dir(), blob)?)
-                }).transpose()?;
+            let state = supervisor::Checkpoint::latest(journal.dir(), &records)?.map(|(_, checkpoint)| checkpoint);
             Ok((journal, manifest, state))
         }).transpose()?;
         let task = task_text(args)?.or_else(|| inherited.as_ref().map(|(_, m, _)| m.task.clone()))
@@ -787,7 +783,6 @@ mod tests {
             ("docs/runtime-v2.md", runtime, format!("Reads return at most {} UTF-8-safe text bytes", history::MAX_TEXT)),
             ("docs/runtime-v2.md", runtime, format!("Serialized responses are capped at {} KiB", history::MAX_RESPONSE >> 10)),
             ("docs/runtime-v2.md", runtime, format!("A search examines at most {} entries and charges at most {} of checkpoint source bytes", history::MAX_SCAN, mib(history::MAX_SOURCE))),
-            ("docs/runtime-v2.md", runtime, format!("a cache holds at most {} of encoded source bodies", mib(history::CACHE_BYTES))),
             ("docs/runtime-v2.md", runtime, format!("under a {}-second CPU deadline and a {} memory limit", word(tools::REGISTER_SECS as usize), mib(tools::REGISTER_MEMORY))),
             ("docs/extending.md", extending, format!("limited to {} second and {}", word(tools::REGISTER_SECS as usize), mib(tools::REGISTER_MEMORY))),
             ("docs/extending.md", extending, format!("Requests have a {}-second timeout, an {} response limit", tools::HTTP_TIMEOUT_SECS, mib(tools::HTTP_MAX_BODY))),
