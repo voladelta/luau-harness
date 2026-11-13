@@ -29,7 +29,7 @@ fn install_pkg(root: &Path, name: &str) -> PathBuf {
 
 /// The registry a run would capture once the owner trusts the workspace config as it is now.
 fn trusted_registry(root: &Path) -> Registry {
-    Registry::build(root, Some(crate::trust::Config::read(root).unwrap())).unwrap()
+    Registry::build(root, Some(crate::trust::Config::read(root).unwrap()), &crate::dirs::TestDirs::new()).unwrap()
 }
 
 /// The lock's verdict on a package directory.
@@ -201,7 +201,7 @@ fn frozen_registry_resolves_overrides_packages_and_builtins() {
     write(root.join(".harness/override/std/printer.luau"), "return {changed=true}\n");
     assert_eq!(registry.resolve("std/printer").unwrap().text, "return {}\n");
     // untrusted config: only the built-in package
-    let untrusted = Registry::build(&root, None).unwrap();
+    let untrusted = Registry::build(&root, None, &crate::dirs::TestDirs::new()).unwrap();
     assert!(!untrusted.resolve("std/printer").unwrap().is_override && untrusted.resolve("foo").is_err());
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -231,7 +231,7 @@ fn the_registry_is_built_from_the_bytes_trust_read() {
     let config = crate::trust::Config::read(&root).unwrap();
     // hx.lock changes after trust read it: the registry still follows the bytes that were judged
     std::fs::write(root.join("hx.lock"), "").unwrap();
-    let registry = Registry::build(&root, Some(config)).unwrap();
+    let registry = Registry::build(&root, Some(config), &crate::dirs::TestDirs::new()).unwrap();
     assert!(registry.resolve("foo").is_ok());
     assert!(trusted_registry(&root).resolve("foo").is_err());
     let _ = std::fs::remove_dir_all(&root);
@@ -303,7 +303,7 @@ fn one_walker_skips_dot_entries_follows_a_linked_root_and_refuses_inner_links() 
     // what approve locked is what a run loads
     let registry = trusted_registry(&root);
     assert_eq!(registry.packages.iter().find(|p| p.name == "g").unwrap().files, ["SKILL.md"]);
-    assert!(r.skills_status().unwrap().lines().any(|l| l.split_whitespace().take(2).eq(["g", "approved"])));
+    assert!(r.skills_status(&crate::dirs::TestDirs::new()).unwrap().lines().any(|l| l.split_whitespace().take(2).eq(["g", "approved"])));
     // .git churn (git gc) does not un-approve it
     write(real.join(".git/objects/pack/p1"), "pack");
     assert!(trusted_registry(&root).packages.iter().any(|p| p.name == "g"));

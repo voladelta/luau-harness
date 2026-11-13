@@ -412,7 +412,10 @@ impl Mcp {
 
     /// Start the server (or open the HTTP session) and complete the handshake.
     async fn connect(&self, server: &str, cfg: &ServerCfg) -> Result<Conn> {
-        let mut conn = if cfg.url.is_some() { Self::connect_http(server, cfg)? } else { self.spawn_stdio(server, cfg)? };
+        let mut conn = if cfg.url.is_some() { Self::connect_http(server, cfg)? } else {
+            let ruleset = self.pol.ruleset().await.map_err(|e| anyhow!("MCP server {server}: cannot prepare confinement: {e}"))?;
+            self.spawn_stdio(server, cfg, ruleset)?
+        };
         let version = if matches!(conn, Conn::Http(_)) { "2025-06-18" } else { "2024-11-05" };
         let init = conn.request("initialize", json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "hx", "version": env!("CARGO_PKG_VERSION")}})).await?;
         if let Conn::Http(h) = &mut conn {
@@ -422,7 +425,7 @@ impl Mcp {
         Ok(conn)
     }
 
-    fn spawn_stdio(&self, server: &str, cfg: &ServerCfg) -> Result<Conn> {
+    fn spawn_stdio(&self, server: &str, cfg: &ServerCfg, ruleset: Option<Arc<crate::confine::Ruleset>>) -> Result<Conn> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args);
         cmd.env_clear().envs(self.pol.env());
@@ -434,8 +437,7 @@ impl Mcp {
         cmd.current_dir(&self.pol.workspace).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
         // The server gets the run's file policy as it stands at its start, like a shell command, and its own process
         // group, so a wrapper (`npx`, `uvx`) cannot leave the real server running when the connection is dropped.
-        let ruleset = self.pol.confinement().prepare().map_err(|e| anyhow!("MCP server {server}: cannot prepare confinement: {e}"))?;
-        crate::prims::confine_command(&mut cmd, ruleset.map(Arc::new));
+        crate::prims::confine_command(&mut cmd, ruleset);
         let mut child = cmd.spawn().map_err(|e| anyhow!("cannot start MCP server {server}: {e}"))?;
         let group = GroupKill::new(&child);
         let stdin = child.stdin.take().expect("stdin is piped");

@@ -339,7 +339,7 @@ impl Resolver {
     }
 
     /// `hx skills`: every agent skill and whether the model can see it.
-    pub fn skills_status(&self) -> Result<String> {
+    pub fn skills_status(&self, dirs: &crate::dirs::Dirs) -> Result<String> {
         let lock = Lockfile::read(&self.root.join("hx.lock"))?;
         let mut s = String::new();
         for (name, dir) in self.agent_skills() {
@@ -359,7 +359,7 @@ impl Resolver {
             };
             s.push_str(&format!("{name:<28} {state:<24} {}\n", dir.display()));
         }
-        if !crate::trust::is_trusted(&self.root) {
+        if !crate::trust::is_trusted(&self.root, dirs) {
             s.insert_str(0, "workspace config not trusted: no skill is visible until you run `hx trust`\n");
         }
         Ok(if s.is_empty() { "no skills in .agents/skills or ~/.agents/skills\n".into() } else { s })

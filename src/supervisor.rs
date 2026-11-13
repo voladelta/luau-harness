@@ -562,7 +562,7 @@ impl Supervisor {
     pub fn start_workflow(policy: Arc<Policy>, model: LlmCfg, task: String, max_turns: usize, packs: Vec<String>, budget: Budget, branch: Option<Branch>, workflow: Option<crate::workflow::WorkflowConfig>) -> Result<Arc<Self>> {
         if let Some(config)=&workflow {config.validate()?;}
         crate::vm::check_packs(&packs)?;
-        let mut registry = Registry::capture(&policy.workspace)?;
+        let mut registry = Registry::capture(&policy.workspace, &policy.dirs)?;
         registry.materialize_skills(&policy.log)?;
         let manifest = Manifest { format: FORMAT, runtime: env!("CARGO_PKG_VERSION").into(), binary_sha: binary_sha()?,
             task, model, max_turns, packs, deadline: budget.max_wall_secs.map(|s| now() + s), budget,
@@ -776,7 +776,8 @@ mod checkpoint_tests {
         for (tag, limit) in [("capped", Some(102)), ("uncapped", None)] {
             let dir = std::env::temp_dir().join(format!("hx-billing-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+            let dirs = crate::dirs::TestDirs::new();
+            let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
             let cfg = model();
             let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
                 Budget { max_tokens: limit, ..Budget::default() }, None).unwrap();
@@ -797,7 +798,8 @@ mod checkpoint_tests {
     async fn queued_model_admission_expires_without_a_settlement() {
         let dir = std::env::temp_dir().join(format!("hx-admission-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let cfg = model();
         let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
             Budget { max_tokens: Some(102), max_wall_secs: Some(0.5), ..Budget::default() }, None).unwrap();
@@ -843,17 +845,18 @@ mod checkpoint_tests {
         assert!(books.apply(4, "resolution", &json!({"of": 1})).is_err(), "an intent settles once");
     }
 
-    fn journal(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
+    fn journal(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf, crate::dirs::TestDirs) {
         let dir = std::env::temp_dir().join(format!("hx-ledger-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
-        (Supervisor::start(policy, model(), "test".into(), 1, vec![], Budget::default(), None).unwrap(), std::fs::canonicalize(dir).unwrap())
+        let dirs = crate::dirs::TestDirs::new();
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        (Supervisor::start(policy, model(), "test".into(), 1, vec![], Budget::default(), None).unwrap(), std::fs::canonicalize(dir).unwrap(), dirs)
     }
 
     #[test]
     fn invalid_accounting_is_rejected_before_append_and_stops_admission() {
-        let (supervisor, dir) = journal("invalid-append");
+        let (supervisor, dir, _dirs) = journal("invalid-append");
         let path = supervisor.policy.log.path.clone();
         let before = std::fs::read(&path).unwrap();
         assert!(supervisor.record(LedgerKind::Billing, json!({"of": 1}), true).is_err());
@@ -867,7 +870,7 @@ mod checkpoint_tests {
     /// A write intent whose file was replaced (or not) before a crash: `before` and `after` are the content the
     /// `expect` record names, `on_disk` what the file holds at recovery.
     fn settle(tag: &str, before: Option<&str>, on_disk: Option<&str>) -> (Option<String>, bool) {
-        let (supervisor, dir) = journal(tag);
+        let (supervisor, dir, _dirs) = journal(tag);
         let file = dir.join("note.txt");
         if let Some(text) = before { std::fs::write(&file, text).unwrap(); }
         let id = supervisor.intent(Tool::Write, Class::LocalWrite, &json!({"path": "note.txt"}), "sha", 0, &Principal::Agent { read_only: false }, None).unwrap();
@@ -907,7 +910,7 @@ mod checkpoint_tests {
 
     #[test]
     fn owner_reconciliation_can_bill_a_revoked_run() {
-        let (supervisor, dir) = journal("revoked-billing");
+        let (supervisor, dir, _dirs) = journal("revoked-billing");
         let cfg = model();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let op = rt.block_on(supervisor.reserve_model(&cfg, &json!({}), 0)).unwrap();
@@ -923,7 +926,7 @@ mod checkpoint_tests {
 
     #[test]
     fn checkpoints_require_explicit_lifecycle_and_valid_data() {
-        let (supervisor, dir) = journal("checkpoint-validation");
+        let (supervisor, dir, _dirs) = journal("checkpoint-validation");
         let log = &supervisor.policy.log;
         let read = |body: &[u8]| Checkpoint::read(log.dir(), &log.blob(body).unwrap());
         let checkpoint = read(br#"{"status":"running","controller":{"custom":3},"durable":{"saved":7}}"#).unwrap();
@@ -958,7 +961,7 @@ mod checkpoint_tests {
 
     #[test]
     fn checkpoints_round_trip_with_one_blob_per_message() {
-        let (supervisor, dir) = journal("checkpoint-round-trip");
+        let (supervisor, dir, _dirs) = journal("checkpoint-round-trip");
         let log = &supervisor.policy.log;
         let image = "iVBORw0KGgo".repeat(2000);
         let messages = json!([
@@ -992,7 +995,7 @@ mod checkpoint_tests {
 
     #[test]
     fn checkpoint_blobs_grow_with_the_conversation_not_with_the_number_of_checkpoints() {
-        let (supervisor, dir) = journal("checkpoint-growth");
+        let (supervisor, dir, _dirs) = journal("checkpoint-growth");
         let log = &supervisor.policy.log;
         let before = total_blob_bytes(log.dir());
         let mut messages = vec![];
@@ -1018,7 +1021,7 @@ mod checkpoint_tests {
 
     #[test]
     fn a_crash_after_the_blobs_but_before_the_record_resumes_the_previous_checkpoint() {
-        let (supervisor, dir) = journal("checkpoint-crash");
+        let (supervisor, dir, _dirs) = journal("checkpoint-crash");
         let log = supervisor.policy.log.clone();
         let first = running(json!([{"role": "user", "content": "task"}]));
         supervisor.checkpoint("root", first.run.clone(), &first.durable).unwrap();
@@ -1028,7 +1031,7 @@ mod checkpoint_tests {
         assert!(eventlog::verify(&path).unwrap().blob_errors.is_empty(), "unreferenced blobs are not damage");
         drop(supervisor);
         drop(log);
-        let policy = Arc::new(Policy::new(&dir, false, None, Some(&path), None).unwrap());
+        let policy = Arc::new(Policy::new(&_dirs, &dir, false, None, Some(&path), None).unwrap());
         let resumed = Supervisor::resume(policy).unwrap();
         assert!(matches!(&resumed.restored, Some(RunState::Running { controller }) if controller["messages"] == json!([{"role": "user", "content": "task"}])));
         drop(resumed);
@@ -1038,7 +1041,7 @@ mod checkpoint_tests {
     #[test]
     fn a_missing_or_corrupt_message_blob_fails_resume_and_verify_naming_the_blob() {
         for corrupt in [false, true] {
-            let (supervisor, dir) = journal(if corrupt { "checkpoint-corrupt" } else { "checkpoint-missing" });
+            let (supervisor, dir, _dirs) = journal(if corrupt { "checkpoint-corrupt" } else { "checkpoint-missing" });
             let log = supervisor.policy.log.clone();
             let state = running(json!([{"role": "user", "content": "task"}, {"role": "assistant", "content": "unique reply"}]));
             supervisor.checkpoint("root", state.run, &state.durable).unwrap();
@@ -1052,7 +1055,7 @@ mod checkpoint_tests {
             assert!(errors[0].contains(&hash) && errors[0].contains("message 1"), "{errors:?}");
             drop(supervisor);
             drop(log);
-            let policy = Arc::new(Policy::new(&dir, false, None, Some(&path), None).unwrap());
+            let policy = Arc::new(Policy::new(&_dirs, &dir, false, None, Some(&path), None).unwrap());
             let error = format!("{:#}", Supervisor::resume(policy).err().expect("resume must fail"));
             assert!(error.contains(&hash), "{error}");
             let _ = std::fs::remove_dir_all(dir);

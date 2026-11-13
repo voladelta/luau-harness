@@ -78,27 +78,34 @@ An intent without an outcome is uncertain. Local `write` and `edit` settle thems
 Shell commands and MCP calls can act outside the workspace. If interrupted, resume allows inspection but blocks new mutations until the owner reconciles them:
 
 ```bash
-hx log verify .harness/log/RUN.jsonl
-hx recover .harness/log/RUN.jsonl OP --decision complete --yes
-hx recover .harness/log/RUN.jsonl OP --decision abandon --yes
+hx log verify RUN
+hx recover RUN OP --decision complete --yes
+hx recover RUN OP --decision abandon --yes
 ```
 
 Record a decision based on the actual external state; it dispatches nothing and is final. After `abandon`, the resumed agent sees the receipts and can issue the operation again if it is still needed.
 
 Journal or blob failure is fatal to effect admission, including when Luau catches the returned error. A separate OS lock allows only one writer/resumer.
 
-Each record's `prev` is an HMAC-SHA256 of the previous line under a per-user journal key: 32 random bytes in `journal.key` beside the trust store (`$XDG_CONFIG_HOME/hx/` or `~/.config/hx/`), created with mode 0600 on first use. File tools cannot read or write the key, `search` skips it, and Landlock hides the whole directory from shell commands. The journal itself stays inside the workspace, where shell commands can write it; the key is what makes a forged or edited record detectable. `hx log verify` and every reopen (resume, branch, `hx recover`) verify the chain with the key, and a log that fails is refused; `hx log verify` also checks that every blob a record names, and every message blob a checkpoint names, exists and has the content its name hashes. What the key does not protect against:
+The journal lives outside the workspace, in the workspace's log directory under hx's state directory (`$XDG_STATE_HOME/hx/workspaces/NAME-ID/log/`, see `hx paths`), with its blobs, its writer lock and its revocation marker. No root of the model's contains that directory: file tools refuse it and, with Landlock, shell commands and MCP servers can neither read nor write it. That, not the chain, is what keeps the model from truncating, editing or replacing its own journal, deleting a lock or a `.revoked` marker, or putting another run's journal in its place. `RUN` above is the run's name (its journal's file name without `.jsonl`), or a path to the journal.
 
-- Without Landlock, shell commands run unconfined and can read the key, so they can forge records.
-- Removing records from the end of a journal leaves a valid chain and is not detected. Removing a blob is detected by `hx log verify` and by the read that needs it.
-- Anyone who can read the key, such as the owner or another process of the same user outside hx, can rewrite a journal.
+Each record's `prev` is the SHA-256 of the previous line, and each record names its session, which is also the journal's file name. `hx log verify` and every reopen (resume, branch, `hx review`, `hx recover`) check both, and a log that fails is refused; `hx log verify` also checks that every blob a record names, and every message blob a checkpoint names, exists and has the content its name hashes. A resumed run must be in the workspace's log directory. What the chain detects:
 
-Journals of earlier formats have an unkeyed chain and cannot be resumed or branched; a journal whose key was deleted or replaced cannot be verified.
+- A record edited, inserted or deleted anywhere but at the end, and a gap in the sequence numbers, by anyone who did not recompute the chain after it: a damaged disk, a stray edit.
+- One run's journal standing in for another's: copied over it, or renamed to its name. Its records name another session.
+- A missing or altered blob.
+
+What it does not detect:
+
+- A rewrite by someone who recomputes the hashes: the chain has no secret. Only the journal's location keeps the model from writing it, so without Landlock, where shell commands run unconfined and can write anywhere the user can, a journal can be rewritten undetectably; so can the owner, or another process of the same user outside hx.
+- Records removed from the end of a journal: what remains is a valid chain.
+
+Journals that an earlier version chained with a per-user key, or kept in `.harness/log`, are not read; start a new run.
 
 ## Resume and branch
 
 ```bash
-hx run --workspace PROJECT --resume PROJECT/.harness/log/RUN.jsonl
+hx run --workspace PROJECT --resume RUN
 ```
 
 The manifest restores provider/model settings, context/output limits, extra packs, budgets, policy (including autopilot and approval mode) and exact module/package bytes, including the standard library and system prompt. Repeating these flags on resume is an error. Credential values are never stored; the named environment variables must still be available. A rebuilt binary can resume a run of the same journal format (it prints a note): the workflow's Luau comes from the manifest, and old chunks are never re-executed. Workspace configuration edits do not alter an existing run. Temporary file-tool path grants are recorded as `path_grant` journal entries and restored on resume. They are shared by the run's descendants and never copied to a new branch.
@@ -108,7 +115,7 @@ The latest committed controller checkpoint and durable data are restored into fr
 To choose current approved extensions, new policy, a new binary or other settings, explicitly branch:
 
 ```bash
-hx run --workspace PROJECT --branch PROJECT/.harness/log/RUN.jsonl \
+hx run --workspace PROJECT --branch RUN \
   --model MODEL --key-env OPENROUTER_API_KEY
 ```
 
@@ -124,7 +131,7 @@ Each package method call gets a fresh VM and a Rust principal. Native effects ch
 
 Single-file tools in `.harness/tools/NAME.{lua,luau}` use the same invocation boundary. Workspace trust covers their source and grants their declared capabilities; no package manifest or lock entry is needed. Registration evaluates definitions without effects under a one-second CPU deadline and a 16 MiB memory limit. A namespace is exposed only after every method, signature, endpoint and required credential validates. Invalid files produce diagnostics without activating partial namespaces. Source, method metadata and fixed HTTP endpoint grants are frozen in the registry; successful registrations contribute signatures to the model prompt.
 
-Local HTTP endpoints carry an explicit read-only classification (default: external). Requests use the supervisor's authorization, journal, deadline and mutation gate. Endpoint declarations grant network access to their fixed URLs subject to the environment's network access; redirects and automatic retries are disabled. Rust resolves named credentials from the environment, workspace secrets, then user secrets, and attaches them to headers. Secrets are not part of the frozen registry and may rotate; resume checks them again. File tools cannot read `secrets.toml`; Landlock keeps shell commands and MCP servers from reading `.harness/secrets.toml` and `~/.config/hx/`. Literal echoes of a credential (and its JSON-escaped form in error excerpts) in responses and HTTP error excerpts are redacted before receipts are written; other encodings of it are not detected.
+Local HTTP endpoints carry an explicit read-only classification (default: external). Requests use the supervisor's authorization, journal, deadline and mutation gate. Endpoint declarations grant network access to their fixed URLs subject to the environment's network access; redirects and automatic retries are disabled. Rust resolves named credentials from the environment, workspace secrets, then user secrets, and attaches them to headers. Secrets are not part of the frozen registry and may rotate; resume checks them again. Both secrets files are in hx's configuration directory, outside every root: file tools refuse them, and Landlock keeps shell commands and MCP servers from reading or writing them. Literal echoes of a credential (and its JSON-escaped form in error excerpts) in responses and HTTP error excerpts are redacted before receipts are written; other encodings of it are not detected.
 
 Package initializers must be pure. Put file/process work inside exported methods. Pass invocation state as explicit data and save results in the agent's `durable` store when needed.
 
@@ -193,11 +200,11 @@ An `inspect` stage ceiling applies during research and design, transitively to c
 Manual mode gates research questions, research, system design, program design and final acceptance. Automatic mode omits those routine reviews but still creates real input gates for essential missing information or mandatory human validation. Pauses report `finished:false`; resuming an unanswered gate makes no provider call. Review decisions are owner CLI actions:
 
 ```bash
-hx review .harness/log/RUN.jsonl --gate GATE_ID --decision approve
-hx review .harness/log/RUN.jsonl --gate GATE_ID --decision revise --input-file feedback.md
-hx review .harness/log/RUN.jsonl --gate GATE_ID --decision answer --input-file answers.md
-hx review .harness/log/RUN.jsonl --gate GATE_ID --decision waive --input-file reason.md
-hx run --resume .harness/log/RUN.jsonl
+hx review RUN --gate GATE_ID --decision approve
+hx review RUN --gate GATE_ID --decision revise --input-file feedback.md
+hx review RUN --gate GATE_ID --decision answer --input-file answers.md
+hx review RUN --gate GATE_ID --decision waive --input-file reason.md
+hx run --resume RUN
 ```
 
 Each gate declares its allowed decisions and exact artifact/check scope. Review and acceptance reports carry the frozen `check_plan` (ID, command, cwd, timeout, requirements, inputs). Revision creates a new artifact version and invalidates downstream dependencies. An input answer resumes the relevant work; an arbitrary answer does not establish a passing check. Explicit waivers remain separate from passing evidence. Final acceptance commits without another model call, including after the execution deadline, subject to the host's source freshness and revocation checks. Resuming executable work still requires the run's existing budgets and deadline. Review decisions are recorded and consumed durably, each exactly once; recording one never dispatches work, and a gate accepts one unconsumed decision. An acceptance approval that is stale on resume (the project changed after `hx review` recorded it) is consumed without effect: the resume reports `decision_rejected` and the gate stays open for a new decision, normally `revise`.
@@ -212,7 +219,7 @@ Adapted phase instructions and the upstream MIT notice are embedded with the bin
 
 ## Autoresearch workflow
 
-`hx run --ar --prompt-file PROGRAM` searches for a better score under `.harness/ar.toml` (covered by `hx trust`). It requires Git and a committed workspace apart from the editable paths. `--rpi`, `--branch`, `--trace`, `--max-tokens`, `--max-wall` and `--max-turns` are refused: episodes are limited in model turns, and the run ends by its own progress rule. All other run flags pass through to the episodes. `hx run --ar --resume .harness/ar/RUN` continues an interrupted search with its frozen launch settings.
+`hx run --ar --prompt-file PROGRAM` searches for a better score under `.harness/ar.toml` (covered by `hx trust`). It requires Git and a committed workspace apart from the editable paths. `--rpi`, `--branch`, `--trace`, `--max-tokens`, `--max-wall` and `--max-turns` are refused: episodes are limited in model turns, and the run ends by its own progress rule. All other run flags pass through to the episodes. `hx run --ar --resume RUN` continues an interrupted search with its frozen launch settings; `RUN` is the run's name in the workspace's autoresearch directory (`hx paths` prints it), or its path.
 
 ```toml
 editable = ["ar/strategy.pine"]                  # files or directories; the only thing that leaves an episode
@@ -231,7 +238,7 @@ min_delta = 0.05
 - `ar.eval(note)` snapshots the editable files (binary-safe, executable bits kept; symlinks, special files and editable paths below a symlinked directory skipped; every directory and file is opened relative to its already opened parent without following a symlink, so swapping one in while the snapshot is taken reaches nothing outside; UTF-8 names; at most 16 MiB, 10,000 files and 32 levels, or that eval is refused), stores the snapshot content-addressed, and runs the `eval` command in a second throwaway copy of `base` holding exactly those bytes and modes. A process the agent leaves running cannot change what is scored. It appends a ledger row and returns `{n, score, valid, se, improved, best, report}`. Explore and exploit workers score only after their claim is accepted. A state's search score is the mean of all valid evaluations of its snapshot (and of the host's baseline evaluation, for the seed), with the standard error of that mean, `sqrt(sum of se²) / n`, when the evaluator reports `se`. Evaluating the same files again adds a sample to their mean; it is not a new state and never improves. A new state improves the worker's best when its score beats the best state's by more than their combined standard error, `sqrt(se_a² + se_b²)` (by anything for a deterministic evaluator), so small steps add up across rounds; `min_delta` is the bar a candidate must clear against the seed. Evaluations of one snapshot run one at a time. `ar.claims()` lists the claims in the worker's scope (every explore idea, or the refinements of its candidate) as plain text. An evaluator that has reported no `se` in the run (the host's baseline evaluation included) is treated as deterministic (once it reports one, every later evaluation runs the evaluator): an eval of a state it already scored validly returns the stored result with `cached: true`, adding no ledger row when it is a probe or the same candidate scored it, and a row for this candidate (judged against the worker's best, without running the evaluator) when only another candidate did. `ar.reset()` puts the worker's best scored state (the state it started from when it has not improved) back into the editable paths, through the same path checks as `write`, so it cannot change anything outside the workspace.
 - Evaluators are owner commands run with a scrubbed environment (no inherited credentials). With Landlock each one reads only its scratch copy, the system and toolchain directories and its `grader` roots (the `select` evaluator also its `holdout` roots), and writes only its scratch copy, so the search evaluator cannot read held-out data. A `holdout` root inside a `grader` root, or inside a system or toolchain directory every evaluator reads, would be readable by the search evaluator: such an `ar.toml` is refused. Network access must be configured externally, and without Landlock evaluators run unconfined. The `grader` and `holdout` declarations also seal those roots from agent file tools and shell commands. When editable code runs inside the evaluator (a Python module it imports, for example), that code can print its own result line; such an evaluator must run candidates in a subprocess and parse their output itself.
 - A child reads its episode (role, spec, run directory, starting state) once at launch and records it in its frozen policy, so its manifest says which episode it served.
-- The run directory is sealed from file tools: in every mode, including `--yes`, `read`, `search` and `view` cannot read `.harness/ar`, and `write`/`edit` cannot modify it. Each child's policy also seals the owner's `.harness/ar`, `grader` and `holdout` roots. Shell commands are confined to the child's file policy, which does not include any of these. All episode shell commands receive the same minimal environment, including under `--yes`.
+- The run directory is in hx's state directory, outside every root: in every mode, including `--yes`, file tools refuse it and shell commands cannot reach it. Each child's policy also seals the `grader` and `holdout` roots from file tools, and `ar.toml` may not put them inside a directory the agent's shell commands read (the system and toolchain directories). Shell commands are confined to the child's file policy, which includes none of these. All episode shell commands receive the same minimal environment, including under `--yes`.
 - When an episode attempt or an evaluation ends, every process that still has its working directory, its executable or an open file in its throwaway copy is killed (found under `/proc`, repeated until none is left) before the copy is deleted. Throwaway copies live in one directory per process in the system temp directory, locked while that process lives; one left by a process that was stopped or killed is removed by the next `hx run --ar`.
 
 **Manager loop.** A run is research, then rounds until progress stops, and returns a portfolio of distinct good candidates rather than one best state: the single best score is the state most likely to be an overfit or an evaluator hole. Before any episode the host scores the seed with the search evaluator (`seed.json`, outside the ledger) and, with `select`, checks that the held-out evaluator scores the seed validly (otherwise the run stops before spending).
@@ -248,7 +255,7 @@ min_delta = 0.05
 
 **Limits.** Every episode is limited to 40 model turns, so a run means the same on any model. Stopping the orchestrator (SIGINT, SIGTERM or SIGHUP) stops its episode children, which kill the commands and evaluators they started; a child whose orchestrator dies outright sees its stdin close and stops the same way. An episode that dies before any eval is retried up to twice; when every episode of a batch crashed, the next try waits 2, then 4 minutes. When every attempt of every episode of a batch crashed (a provider outage, or misconfiguration), the run stops there with the child's error and exits nonzero without a report; `hx run --ar --resume` then gives that batch's unfinished episodes fresh attempts. A run that ends with no evals exits nonzero.
 
-**State and recovery.** `.harness/ar/RUN/` holds `launch.json` (spec, program, child flags, frozen commit), `base/`, `seed`, `seed.json`, `journal.jsonl` (planned batches, episodes, held-out scores, audits and gates), `ledger.jsonl` (each row names its candidate), `claims.jsonl`, `snaps/`, `portfolio/`, `episodes/` (task, stderr, report and journals per child) and `report.json`. Each batch is journaled whole before any of it starts, and each episode as started (with its scratch directory) before its child runs and finished after. Resume uses the spec frozen in `launch.json` (approved at launch), so later edits to `ar.toml` neither change nor block it. It first closes an episode that never finished: as finished when its child had ended and its report was saved, otherwise as interrupted, with the rate limits the killed child's journals in its leftover scratch directory recorded. Then it runs what was planned but not finished, retrying interrupted workers that had not scored anything and interrupted research and audits (judged by a final answer a killed child never gave) without counting them as crashes, and continues; a retried worker keeps the claim its earlier attempt made, and held-out scores, audit verdicts and gates already journaled are reused. A torn final line in the ledger or journal (a writer killed mid-append) is ignored when read and dropped before the next append. Kill the orchestrator's process group, not only the orchestrator, so no child keeps running.
+**State and recovery.** The run directory (`RUN` in the workspace's autoresearch directory, `$XDG_STATE_HOME/hx/workspaces/NAME-ID/ar/`) holds `launch.json` (spec, program, child flags, frozen commit), `base/`, `seed`, `seed.json`, `journal.jsonl` (planned batches, episodes, held-out scores, audits and gates), `ledger.jsonl` (each row names its candidate), `claims.jsonl`, `snaps/`, `portfolio/`, `episodes/` (task, stderr, report and journals per child; each child is an `hx run` that journals in hx's state directory like any run, and its journals are moved here when it ends) and `report.json`. Each batch is journaled whole before any of it starts, and each episode as started (with its scratch directory) before its child runs and finished after. Resume uses the spec frozen in `launch.json` (approved at launch), so later edits to `ar.toml` neither change nor block it. It first closes an episode that never finished: as finished when its child had ended and its report was saved, otherwise as interrupted, with the rate limits the killed child's journals recorded. Then it runs what was planned but not finished, retrying interrupted workers that had not scored anything and interrupted research and audits (judged by a final answer a killed child never gave) without counting them as crashes, and continues; a retried worker keeps the claim its earlier attempt made, and held-out scores, audit verdicts and gates already journaled are reused. A torn final line in the ledger or journal (a writer killed mid-append) is ignored when read and dropped before the next append. Kill the orchestrator's process group, not only the orchestrator, so no child keeps running.
 
 ## Budgets and validation
 

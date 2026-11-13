@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-turn prompt-cache hit ratio from an hx event log: cache_stats.py .harness/log/<session>.jsonl
+"""Per-turn prompt-cache hit ratio from an hx event log: cache_stats.py LOG/<session>.jsonl (LOG from `hx paths`)
 Turn 1 should be ~0%; later turns should be high. A flat 0% means the prefix is not cacheable (too short, or it changes).
 Summarizer calls (std/compact) are listed as turns too; they replay the previous request's prefix, so they should hit as well."""
 import json, sys

@@ -102,7 +102,7 @@ class Tools(unittest.TestCase):
         self.dir = self.ws / ".harness/tools"
         self.dir.mkdir(parents=True)
         self.env = {k: v for k, v in os.environ.items() if k not in ("TINYFISH_API_KEY", "HX_TRUST")}
-        self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"))
+        self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"), XDG_STATE_HOME=str(self.root / "state"))
         CALLS.clear()
         RAW.clear()
 
@@ -111,6 +111,11 @@ class Tools(unittest.TestCase):
                                 env=self.env if env is None else env, text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result.stdout + result.stderr
+
+    def path(self, name):
+        """One of hx's locations for the workspace (`log`, `secrets`, ...), from `hx paths`."""
+        out = self.command("paths")
+        return Path(next(line.split(": ", 1)[1] for line in out.splitlines() if line.startswith(f"{name}: ")))
 
     def run_code(self, *code, env=None):
         return self.command("exec", *code, env=env)
@@ -149,22 +154,29 @@ class Tools(unittest.TestCase):
         code = 'local r=probe.get{query="space & café",page=0}; print(r.echo,r.query.query[1])'
         self.assertIn("[redacted]\tspace & café", self.run_code(code))
         self.assertEqual(CALLS[-1][-1], "user-test-key")
-        project = self.ws / ".harness/secrets.toml"
+        project = self.path("secrets")
+        project.parent.mkdir(parents=True)
         project.write_text('TINYFISH_API_KEY="project-test-key"\n')
         self.run_code(code)
         self.assertEqual(CALLS[-1][-1], "project-test-key")
+        # A secrets file left in the workspace by an earlier version is not read; hx says where the file goes now.
+        (self.ws / ".harness/secrets.toml").write_text('TINYFISH_API_KEY="leftover-test-key"\n')
+        out = self.run_code(code)
+        self.assertEqual(CALLS[-1][-1], "project-test-key")
+        self.assertIn(f".harness/secrets.toml is left from an earlier version of hx and is not read; hx keeps it in {project}", out)
+        (self.ws / ".harness/secrets.toml").unlink()
         env = dict(self.env, TINYFISH_API_KEY="environment-test-key")
         out = self.run_code(code, env=env)
         self.assertNotIn("environment-test-key", out)
         self.assertEqual(CALLS[-1][-1], "environment-test-key")
-        for path in (self.ws / ".harness/log").rglob("*"):
+        for path in self.path("log").rglob("*"):
             if path.is_file():
                 content = path.read_bytes()
                 for key in (b"environment-test-key", b"project-test-key", b"user-test-key"):
                     self.assertNotIn(key, content, str(path))
-        out = self.run_code('print(pcall(read,".harness/secrets.toml")); print(#search("project-test-key"))')
+        out = self.run_code(f'print(pcall(read,"{project}")); print(#search("project-test-key"))')
         self.assertNotIn("project-test-key", out)
-        self.assertIn("credential file", out)
+        self.assertIn("hx's own configuration or state", out)
 
     def test_tinyfish_search_and_fetch_wire_contract(self):
         source = (ROOT / "examples/tools/tinyfish.lua").read_text()

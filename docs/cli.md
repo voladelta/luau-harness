@@ -19,13 +19,16 @@ Every command takes `--help`.
 | `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, print its hash, then trust it; runs refuse untrusted config |
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
 | `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
-| `hx log verify FILE` | Check a log's keyed hash chain, the blobs it references and its recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
+| `hx log verify LOG` | Check a log's hash chain and the session its records name, the blobs it references and its recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
+| `hx paths` | Print where hx keeps this workspace's files, one `name: path` per line: `log`, `ar` (autoresearch runs), `secrets`, and the `trust` store |
+
+`LOG` is a run name, such as `1794591703-21202`, for that run's journal in the workspace's log directory, or a path to a journal (`./NAME.jsonl` for one in the current directory). `hx run --ar --resume RUN` takes a run name in the workspace's autoresearch directory, or a path.
 
 ## `hx run` flags
 
 Supply one quoted positional prompt or `--prompt-file`, with flags before or after the prompt. Use `--` before a literal prompt starting with `--`. `--branch` inherits its task unless a new prompt is supplied; `--resume` restores its saved task, approval mode, autopilot setting and path grants, without repeated launch flags. `--yes` is also accepted by `hx exec`.
 
-The workspace, private temp directory and configured file-tool roots need no confirmation. Other paths ask for a temporary grant; recognized external commands, HTTP actions and MCP tools ask unless pre-approved. No controlling terminal means refusal. `--yes` grants ordinary requests automatically, never an irreversible command (force push, `rm -rf ~`, `mkfs`, `dd`), while retaining protected paths, credential-read restrictions, capabilities, budgets and the scrubbed environment. It does not answer manual workflow review gates or reconcile uncertain operations. Shell commands are [confined](configuration.md#shell-confinement) to the file-tool roots. The former `--yolo` option has been removed.
+The workspace, private temp directory and configured file-tool roots need no confirmation. Other paths ask for a temporary grant; recognized external commands, HTTP actions and MCP tools ask unless pre-approved. No controlling terminal means refusal. `--yes` grants ordinary requests automatically: commands, and single files outside the roots. It never grants a directory (that needs your answer on the terminal) nor an irreversible command (force push, `rm -rf ~`, `mkfs`, `dd`), while retaining protected paths, credential-read restrictions, capabilities, budgets and the scrubbed environment. It does not answer manual workflow review gates or reconcile uncertain operations. Shell commands are [confined](configuration.md#shell-confinement) to the file-tool roots. The former `--yolo` option has been removed.
 
 hx always uses the Responses API. Requests go to `/responses` under the configured base URL.
 
@@ -82,13 +85,13 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 ## Report and logs
 
-`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer` and tokens. The event log is written to `.harness/log/`. The log stores file contents and command output as blobs in `.harness/log/blobs/`, so treat it as sensitive.
+`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer`, tokens and `log`, the path of the run's event log. Event logs live outside the workspace, in hx's state directory: `$XDG_STATE_HOME/hx/workspaces/NAME-ID/log/` (default `~/.local/state/hx/...`; `NAME` is the workspace directory's name, `ID` 16 hex digits of the SHA-256 of its canonical path). `hx paths` prints the directory. The log stores file contents and command output as blobs in its `blobs/` directory, so treat it as sensitive. A `.harness/log`, `.harness/ar` or `.harness/secrets.toml` left in a workspace by an earlier version is not read; hx says so once and names the new location.
 
 ## Checkpoints and resume
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Runs created before per-run approvals, before shell outcomes recorded their approval source, or before journals were keyed (`~/.config/hx/journal.key`) use an older journal format; start a new run with this version.
+Runs created before per-run approvals or before shell outcomes recorded their approval source use an older journal format, and journals an earlier version chained with a per-user key do not verify; start a new run with this version. A run resumes only from the workspace's log directory.
 
 Interrupted local `write`/`edit` settle themselves from the evidence when the file holds its content from before or after the write. Interrupted shell commands require owner reconciliation. An interrupted subagent leaves nothing to reconcile beyond its own effects. Model requests whose response was lost are charged their reserved tokens on resume or branch, including a revoked run's; they are not operations for `hx recover`. Other uncertain effects wait for `hx recover`.
 

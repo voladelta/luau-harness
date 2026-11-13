@@ -1,15 +1,17 @@
 # Shared setup for the bash check suites: `cd "$(dirname "$0")/.." && source scripts/check_helpers.sh` at the top.
-# It gives each suite a fresh trust store and scratch directory $T (removed on exit, after the suite's own `cleanup`),
+# It gives each suite fresh hx configuration and state directories (trust store, journals; beside $T, since a
+# workspace may not contain them) and a scratch directory $T (all removed on exit, after the suite's own `cleanup`),
 # $H (hx; scripts/hx_trusted trusts the config a suite writes, per launch, under HX_TRUST=current), $R (the repository
 # root), and check/finish for the pass/fail tally. Build first: scripts/all_checks.py builds once for every suite.
 set -u
 R=$PWD
 T=$(mktemp -d); T=$(cd "$T" && pwd -P)
-export HX_TRUST=current XDG_CONFIG_HOME=$T/config  # suites write .harness config on purpose; trust_checks.sh tests trust
+HXDIRS=$(mktemp -d); HXDIRS=$(cd "$HXDIRS" && pwd -P)
+export HX_TRUST=current XDG_CONFIG_HOME=$HXDIRS/config XDG_STATE_HOME=$HXDIRS/state  # suites write .harness config on purpose; trust_checks.sh tests trust
 H=$R/scripts/hx_trusted
 pass=0; fail=0
 cleanup() { :; }  # a suite redefines it to stop its mock servers and processes
-trap 'cleanup; rm -rf "$T"' EXIT
+trap 'cleanup; rm -rf "$T" "$HXDIRS"' EXIT
 
 # check NAME GOT WANT
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
@@ -39,7 +41,10 @@ sys.exit("test synchronization file did not appear within 5s: " + sys.argv[1])
 PY
 }
 
+# logdir DIR: the log directory of workspace DIR (journals, blobs), from `hx paths`.
+logdir() { "$R/target/release/hx" paths --workspace "$1" | sed -n 's/^log: //p'; }
+
 # unconfined DIR: did hx runs in workspace DIR record that Landlock is unavailable (children run unconfined)?
 unconfined() {
-  grep -qh '"confinement":"off' "$1"/.harness/log/*.jsonl 2>/dev/null
+  grep -qh '"confinement":"off' "$(logdir "$1")"/*.jsonl 2>/dev/null
 }

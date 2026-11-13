@@ -1,6 +1,6 @@
 # Configuration
 
-All configuration lives in `.harness/` in the workspace. File tools can read it but refuse writes; shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
+Workspace configuration lives in `.harness/` in the workspace. File tools can read it but refuse writes; shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
 
 | File | Purpose |
 |---|---|
@@ -9,8 +9,16 @@ All configuration lives in `.harness/` in the workspace. File tools can read it 
 | `.harness/init.luau` | Toggles for `std` modules such as compaction and recheck |
 | `.harness/ar.toml` | Autoresearch setup (see [workflows](workflows.md#harnessartoml)) |
 | `.harness/override/`, `.harness/tools/`, `.harness/pkgs/` | Extensions (see [Extending](extending.md)) |
-| `.harness/secrets.toml` | Credentials for tools (see [credentials](extending.md#credentials)) |
 | `hx.lock` | Approved packages and their content hashes |
+
+What hx treats as authority or as a secret is kept outside the workspace, in its own directories, which no root of the model's may contain:
+
+| Location | Holds |
+|---|---|
+| `$XDG_CONFIG_HOME/hx/` (default `~/.config/hx/`) | `trust.toml` (the trust store), `secrets.toml` (your credentials for tools), and per workspace `workspaces/NAME-ID/secrets.toml` (that workspace's credentials, see [credentials](extending.md#credentials)) |
+| `$XDG_STATE_HOME/hx/` (default `~/.local/state/hx/`) | Per workspace `workspaces/NAME-ID/log/` (event logs, blobs, lock files, revocation markers, each run's materialized skills) and `workspaces/NAME-ID/ar/` (autoresearch runs) |
+
+`NAME` is the workspace directory's name with unusual characters replaced, `ID` the first 16 hex digits of the SHA-256 of its canonical path. `hx paths` prints the four that matter (`log`, `ar`, `secrets`, `trust`). hx refuses a workspace, an `[fs]` root or a path grant that contains either directory or lies inside one (`[fs] write = ["~"]` with the default locations, for example): Landlock grants whole trees, so such a root would hand the model the trust store, your credentials and the journals. A `.harness/secrets.toml`, `.harness/log` or `.harness/ar` left by an earlier version is not read; hx says so once on stderr with the new location, and moving the file is up to you.
 
 ## `policy.toml`
 
@@ -68,17 +76,17 @@ On Linux 5.13 or newer (Landlock), every shell command, local MCP server and aut
 |---|---|---|
 | Read | Read roots (workspace, private temp dir, `[fs]` roots, approved grants, toolchain directories), `/usr`, `/bin`, `/sbin`, `/etc`, `/opt`, `/lib*`, `/proc`, `/sys`, `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/shm` | Their scratch copy, the same system and toolchain directories, `grader` roots (and `holdout` for `select`) |
 | Write | Write roots (workspace, private temp dir, `[fs] write`, approved write grants), `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/shm` | Their scratch copy |
-| Never readable | `.harness/secrets.toml`, sealed state (`.harness/ar`, grader and held-out roots in an episode), the trust store (`~/.config/hx`) | |
+| Also readable | The run's materialized skills (in its log directory), so a skill's supporting files are there | |
 
-A grant approved mid-run applies to the next command. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. It has no terminal (`/dev/tty`, `/dev/pts`), so it cannot draw over an approval prompt or read your keystrokes. On Linux 6.12 or newer (Landlock ABI 6) it also cannot signal processes or connect to abstract Unix sockets outside its own command. A credential file a command copies cannot be read; one it moves or hard-links, or a file it moves out of sealed state, is known by its inode: file tools refuse it under any name, and later commands of the run cannot read it. When a hidden file sits inside a read root, the directories on the way to it (usually the workspace root and `.harness`) are granted entry by entry, so a file created directly in one of them is readable from the next command on.
+Nothing else is reachable: in particular not hx's configuration and state directories (trust store, credentials, journals, autoresearch runs), which lie outside every root, nor an autoresearch episode's `grader` and `holdout` roots, which may not lie inside one. A grant approved mid-run applies to the next command. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. It has no terminal (`/dev/tty`, `/dev/pts`), so it cannot draw over an approval prompt or read your keystrokes. On Linux 6.12 or newer (Landlock ABI 6) it also cannot signal processes or connect to abstract Unix sockets outside its own command.
 
 What stays open:
 
 - Network and GPU access: use your container or sandbox.
-- Protected configuration inside a write root (`.harness/`, `hx.lock`) is still writable by shell commands; Landlock cannot remove write access from part of a writable tree without breaking file creation in it. Edited config is no longer trusted, and the journal's hash chain shows tampering.
+- Protected configuration inside a write root (`.harness/`, `hx.lock`) is still writable by shell commands; Landlock cannot remove write access from part of a writable tree without breaking file creation in it. Edited config is no longer trusted.
 - Pathname Unix sockets (the user's D-Bus or systemd socket, `docker.sock`) are reachable before Landlock ABI 9 (Linux 7.1); Landlock cannot confine them on older kernels.
 - `.git/config` and `.git/hooks` are refused to file tools but writable by shell commands, like the rest of the workspace.
-- Credential files other than `.harness/secrets.toml` (`id_rsa`, `.netrc` and the rest that file tools refuse by name) are readable by shell commands when they sit inside a read root.
+- Credential files that sit inside a read root (`id_rsa`, `.netrc` and the rest that file tools refuse by name) are readable by shell commands. `--yes` never grants a directory, so it cannot put one such as `~/.ssh` in a command's reach; only your answer on the terminal can.
 
 Without Landlock (an older kernel, or a container whose seccomp filter blocks it) hx runs children unconfined, prints one note on stderr per run and records `"confinement": "off: ..."` in the journal's session record; it never fails a command for lack of Landlock.
 
@@ -98,7 +106,7 @@ require("std/recheck").enabled = true
 
 ## Workspace trust
 
-`.harness/{policy,mcp,ar}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/`, `.harness/versions/` (what `hx rollback` restores) and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in `~/.config/hx/trust.toml` (outside the repo, protected from the model), `hx run` and `hx exec` refuse to start:
+`.harness/{policy,mcp,ar}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/`, `.harness/versions/` (what `hx rollback` restores) and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in the trust store (`trust.toml` in hx's configuration directory, outside the repo and every root of the model's), `hx run` and `hx exec` refuse to start:
 
 ```text
 Error: this workspace's config is not trusted (.harness/policy.toml); review it and run `hx trust`, or pass --ignore-config to run without it

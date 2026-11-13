@@ -101,12 +101,12 @@ Tool code also gets `json.encode`, `json.decode` and `base64.decode`, whose byte
 Credential lookup checks, in order:
 
 1. A nonblank environment variable.
-2. `.harness/secrets.toml` in the workspace.
-3. `$XDG_CONFIG_HOME/hx/secrets.toml`, or `~/.config/hx/secrets.toml`.
+2. The workspace's `secrets.toml`, in hx's configuration directory: `$XDG_CONFIG_HOME/hx/workspaces/NAME-ID/secrets.toml` (default under `~/.config/hx/`); `hx paths` prints it.
+3. Your own `$XDG_CONFIG_HOME/hx/secrets.toml`, or `~/.config/hx/secrets.toml`.
 
 Secrets files contain top-level string assignments, for example `TINYFISH_API_KEY = "your-key"`. Blank values fall through to the next source. Without a usable key, the tool's whole registration fails and its methods stay unavailable.
 
-Secrets files are blocked from file-tool reads and searches, and shell commands and MCP servers cannot read them either ([shell confinement](configuration.md#shell-confinement)); without Landlock, your sandbox must restrict shell access. Keep them out of version control. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
+Both secrets files live outside every workspace and every root the model can reach: file tools refuse them, and shell commands and MCP servers cannot read or write them ([shell confinement](configuration.md#shell-confinement)); without Landlock, your sandbox must restrict shell access. A `.harness/secrets.toml` left in a workspace by an earlier version is not read. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
 
 ## Included example tools
 

@@ -1,18 +1,18 @@
-//! Append-only event log with a keyed hash chain: the source of truth for what the model did.
+//! Append-only event log with a hash chain: the source of truth for what the model did.
 //!
-//! One JSON object per line: { seq, ts_ms, session, kind, prev, ... }. `prev` is the HMAC-SHA256 of the previous line
-//! under a per-user key (`KEY_FILE`, beside the trust store, outside every workspace), so a process that can write the
-//! journal but cannot read the key cannot edit, insert or delete a record, or append a forged one, without `hx log
-//! verify` and every reopen noticing. Removing records from the end leaves a valid chain and is not detected. Effects that
-//! change the world are written write-ahead: an `intent` record (flushed and synced) BEFORE the effect, an `outcome`
+//! One JSON object per line: { seq, ts_ms, session, kind, prev, ... }. `prev` is the SHA-256 of the previous line, and
+//! every record names the journal's session, which is also its file name (`SESSION.jsonl`). The chain and the session
+//! detect damage and mix-ups (a record edited, inserted or deleted in place, a sequence gap, another run's journal under
+//! this name); they do not stop a writer that recomputes the chain, nor see records removed from the end. What keeps
+//! the model from writing a journal at all is where it lives: in hx's state directory (`crate::dirs`), outside every
+//! root a file tool or a confined child can reach. Effects that change the world are written write-ahead: an `intent` record (flushed and synced) BEFORE the effect, an `outcome`
 //! record (`of` = the intent's seq) after. An intent with no outcome is an UNKNOWN outcome: the process died mid-effect,
 //! and a human decides.
 use anyhow::{Context, Result};
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -52,10 +52,6 @@ impl LedgerKind {
     }
 }
 
-/// The journal key's file name in hx's configuration directory (`trust::store_dir`), which confined children cannot see
-/// and file tools refuse.
-pub const KEY_FILE: &str = "journal.key";
-
 const GENESIS: &str = "genesis";
 
 struct Inner {
@@ -69,7 +65,6 @@ pub struct EventLog {
     failure: Mutex<Option<String>>,
     pub session: String,
     pub path: PathBuf,
-    key: ChainKey,
     /// test hook: SIGKILL this process right after the Nth record is on disk (HX_TEST_CRASH_AFTER_RECORD)
     crash_after: Option<u64>,
     // A separate inode survives torn-tail repair. The lock is released only when the run drops its journal.
@@ -137,78 +132,13 @@ fn create_dirs(dir: &Path) -> std::io::Result<()> {
     sync_dir(parent)
 }
 
-/// The per-user secret that keys every journal's chain.
-#[derive(Clone)]
-struct ChainKey([u8; 32]);
-
-impl ChainKey {
-    fn path() -> Result<PathBuf> {
-        crate::trust::store_dir().map(|d| d.join(KEY_FILE)).context("no HOME or XDG_CONFIG_HOME for the journal key")
-    }
-
-    /// The key that verifies existing journals. It is never created here: a new key could verify nothing.
-    fn load() -> Result<Self> {
-        let path = Self::path()?;
-        Self::read(&path).with_context(|| format!("journal key {}", path.display()))
-    }
-
-    /// The key new journals are written with, created on first use.
-    fn load_or_create() -> Result<Self> {
-        let path = Self::path()?;
-        match Self::read(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::create(&path),
-            other => other,
-        }
-        .with_context(|| format!("journal key {}", path.display()))
-    }
-
-    fn read(path: &Path) -> std::io::Result<Self> {
-        let mut bytes = Vec::with_capacity(33);
-        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?.take(33).read_to_end(&mut bytes)?;
-        let key = bytes.try_into().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a 32-byte key"))?;
-        Ok(Self(key))
-    }
-
-    /// 32 random bytes, mode 0600. They are written under a private temporary name and hard-linked into place, which
-    /// fails if the key exists (like `O_EXCL`), so the key appears whole or not at all and concurrent first uses agree.
-    fn create(path: &Path) -> std::io::Result<Self> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = path.parent().expect("the key path has a parent directory");
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        let mut key = [0u8; 32];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
-        let (tmp, mut file) = loop {
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = dir.join(format!(".{KEY_FILE}.{}-{n}", std::process::id()));
-            match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp) {
-                Ok(file) => break (tmp, file),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        };
-        let linked = file.write_all(&key).and_then(|()| file.sync_all()).and_then(|()| std::fs::hard_link(&tmp, path));
-        std::fs::remove_file(&tmp)?;
-        match linked {
-            Ok(()) => {
-                sync_dir(dir)?;
-                Ok(Self(key))
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Self::read(path),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// The link to `line`: what the `prev` of the record after it must be.
-    fn link(&self, line: &str) -> String {
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC takes a key of any length");
-        mac.update(line.as_bytes());
-        hex(&mac.finalize().into_bytes())
-    }
+/// The link to `line`: what the `prev` of the record after it must be.
+fn link(line: &str) -> String {
+    sha_bytes(line.as_bytes())
 }
 
 impl EventLog {
     pub fn open(dir: &Path) -> Result<Arc<EventLog>> {
-        let key = ChainKey::load_or_create()?;
         create_dirs(dir).with_context(|| format!("journal directory {}", dir.display()))?;
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
         // `{secs}-{pid}`, plus `-N` when another session of this process opened one in the same second
@@ -226,10 +156,10 @@ impl EventLog {
         // The journal's name must be durable before the first intent synced into it is.
         sync_dir(dir).with_context(|| format!("journal directory {}", dir.display()))?;
         let _writer_lock = Some(lock_writer(&path)?);
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: GENESIS.into() }), failure: Mutex::new(None), session, path, key, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false, known: Mutex::default() }))
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: GENESIS.into() }), failure: Mutex::new(None), session, path, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false, known: Mutex::default() }))
     }
 
-    /// Continue an existing log after a crash: verify the chain with the key, restore seq and the chain, drop a torn
+    /// Continue an existing log after a crash: verify the chain and the session, restore seq and the chain, drop a torn
     /// final line. A malformed line before the end is not a crash: the log is refused, never truncated (the records after
     /// it are evidence).
     pub fn reopen(path: &Path) -> Result<Arc<EventLog>> {
@@ -244,9 +174,9 @@ impl EventLog {
 
     fn reopen_mode(path: &Path, owner_reconciliation: bool) -> Result<Arc<EventLog>> {
         let _writer_lock = Some(lock_writer(path)?);
-        let key = ChainKey::load()?;
         let text = read_text(path)?;
-        let chain = Chain::check(&text, &key).map_err(|e| anyhow::anyhow!("{}: {e}; not resuming a damaged log", path.display()))?;
+        let session = session_of(path)?;
+        let chain = Chain::check(&text, &session).map_err(|e| anyhow::anyhow!("{}: {e}; not resuming a damaged log", path.display()))?;
         if let Some((line, why)) = &chain.broken {
             anyhow::bail!("{}: {why} at line {line}; not resuming a damaged log", path.display());
         }
@@ -257,8 +187,7 @@ impl EventLog {
             write_atomic(path, keep.as_bytes())?;
         }
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
-        let session = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev: chain.next }), failure: Mutex::new(None), session, path: path.to_path_buf(), key, crash_after: crash_hook(), _writer_lock, owner_reconciliation, known: Mutex::default() }))
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev: chain.next }), failure: Mutex::new(None), session, path: path.to_path_buf(), crash_after: crash_hook(), _writer_lock, owner_reconciliation, known: Mutex::default() }))
     }
 
     /// Audit failures are fatal to the run, even if Luau catches the returned error.
@@ -344,7 +273,7 @@ impl EventLog {
         if sync {
             g.file.sync_data().map_err(|e| self.fail(format!("event log sync: {e}")))?;
         }
-        g.prev = self.key.link(&line);
+        g.prev = link(&line);
         if self.crash_after == Some(seq) {
             let _ = g.file.sync_data();
             // SAFETY: kill takes only integers and touches no memory of this process before it ends it.
@@ -391,48 +320,53 @@ fn parse(text: &str) -> std::result::Result<(Vec<Record<'_>>, bool), usize> {
     Ok((out, false))
 }
 
-/// A log's records checked against the key.
+/// The session a journal belongs to: its file name without `.jsonl`.
+fn session_of(path: &Path) -> Result<String> {
+    path.file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).map(String::from)
+        .with_context(|| format!("{}: not a journal file name", path.display()))
+}
+
+/// A log's records checked against their chain and the journal's session.
 struct Chain<'a> {
     records: Vec<Record<'a>>,
     torn: bool,
-    /// The first line whose `prev`, `seq` or `kind` is wrong, and what is wrong with it.
+    /// The first line whose `prev`, `seq`, `session` or `kind` is wrong, and what is wrong with it.
     broken: Option<(usize, String)>,
     /// The `prev` the next appended record carries.
     next: String,
 }
 
 impl<'a> Chain<'a> {
-    fn check(text: &'a str, key: &ChainKey) -> Result<Self> {
+    fn check(text: &'a str, session: &str) -> Result<Self> {
         let (records, torn) = parse(text).map_err(|n| anyhow::anyhow!("line {n} is not valid JSON"))?;
         let (mut next, mut broken) = (GENESIS.to_string(), None);
         for (i, (line, v)) in records.iter().enumerate() {
             let n = i + 1;
             let problem = if v["prev"].as_str() != Some(next.as_str()) {
-                // Journals of earlier formats chained plain SHA-256: say so rather than call them damaged.
-                let unkeyed = n == 2 && v["prev"].as_str() == Some(sha_bytes(records[0].0.as_bytes()).as_str());
-                Some(if unkeyed { "hash chain is not keyed (an earlier journal format; start a new run)" } else { "hash chain broken" })
+                Some("hash chain broken".to_string())
+            } else if v["session"].as_str() != Some(session) {
+                Some(format!("record belongs to session {}, not to this journal's {session}", v["session"]))
             } else if v["seq"].as_u64() != Some(n as u64) {
-                Some("record sequence is not consecutive")
+                Some("record sequence is not consecutive".to_string())
             } else if !v["kind"].is_string() {
-                Some("record has no kind")
+                Some("record has no kind".to_string())
             } else {
                 None
             };
             if let Some(problem) = problem {
-                broken = Some((n, problem.to_string()));
+                broken = Some((n, problem));
                 break;
             }
-            next = key.link(line);
+            next = link(line);
         }
         Ok(Self { records, torn, broken, next })
     }
 }
 
-/// Verify the chain and the record sequence with the journal key, and every blob a record references.
+/// Verify the chain, the record sequence and the session, and every blob a record references.
 pub fn verify(path: &Path) -> Result<Report> {
-    let key = ChainKey::load()?;
     let text = read_text(path)?;
-    let chain = Chain::check(&text, &key).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let chain = Chain::check(&text, &session_of(path)?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     let dir = path.parent().context("a journal path has a parent directory")?;
     let mut seen = std::collections::BTreeSet::new();
     let mut blob_errors = vec![];
@@ -532,12 +466,11 @@ pub fn read_blob_bounded(log_dir: &Path, sha: &str, max: usize, mut check: impl 
     Ok(bytes)
 }
 
-/// All complete records of a log, after verifying the chain with the journal key (a torn final line from a crash is
-/// ignored; a malformed line before it, a broken chain or a sequence gap is an error).
+/// All complete records of a log, after verifying the chain and the session (a torn final line from a crash is
+/// ignored; a malformed line before it, a broken chain, a sequence gap or another session's record is an error).
 pub fn load(path: &Path) -> Result<Vec<Value>> {
-    let key = ChainKey::load()?;
     let text = read_text(path)?;
-    let chain = Chain::check(&text, &key).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let chain = Chain::check(&text, &session_of(path)?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     if let Some((line, why)) = chain.broken {
         anyhow::bail!("{}: {why} at line {line}", path.display());
     }
@@ -553,7 +486,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 mod open_tests {
     use super::*;
 
-    /// Append `record` to the log at `path` with a valid link under `key`, the way a forger holding the key would.
+    /// Append `record` to the log at `path`, its `prev` made by `link` from the last line.
     fn append_linked(path: &Path, mut record: Value, link: impl Fn(&str) -> String) -> String {
         let mut text = std::fs::read_to_string(path).unwrap();
         record["prev"] = json!(link(text.lines().last().unwrap()));
@@ -563,36 +496,46 @@ mod open_tests {
     }
 
     #[test]
-    fn a_record_appended_without_the_key_breaks_the_chain() {
-        let path = three_records("forged");
-        let grant = json!({"seq": 4, "kind": "path_grant", "session": "x", "ts_ms": 0, "grant": {"path": "/", "write": true}});
-        let text = append_linked(&path, grant, |line| sha_bytes(line.as_bytes()));
+    fn a_record_edited_in_place_breaks_the_chain() {
+        let path = three_records("edited");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let edited = text.replacen("\"i\":1", "\"i\":7", 1);
+        assert_ne!(edited, text);
+        std::fs::write(&path, &edited).unwrap();
         let report = verify(&path).unwrap();
-        assert_eq!(report.broken.as_ref().map(|b| b.0), Some(4));
+        assert_eq!(report.broken.as_ref().map(|b| b.0), Some(3), "the line after the edited one no longer links");
         assert!(EventLog::reopen(&path).is_err());
         assert!(load(&path).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "a refused log is left as it is");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "a refused log is left as it is");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn an_unkeyed_journal_is_named_as_an_earlier_format() {
-        let path = three_records("unkeyed");
-        let text = std::fs::read_to_string(&path).unwrap();
-        let first = text.lines().next().unwrap().to_string();
-        let mut second: Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
-        second["prev"] = json!(sha_bytes(first.as_bytes()));
-        std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
-        let error = format!("{:#}", load(&path).unwrap_err());
-        assert!(error.contains("not keyed") && error.contains("line 2"), "{error}");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    fn another_runs_journal_cannot_stand_in_for_this_one() {
+        let mine = three_records("identity");
+        let other = EventLog::open(mine.parent().unwrap()).unwrap();
+        other.write("path_grant", json!({"grant": {"path": "/", "recursive": true, "write": true}}), true).unwrap();
+        assert_ne!(other.session, mine.file_stem().unwrap().to_str().unwrap());
+        // Every record names its session, and the session is the file name: a copy under another run's name fails.
+        std::fs::copy(&other.path, &mine).unwrap();
+        let report = verify(&mine).unwrap();
+        let (line, why) = report.broken.expect("a substituted journal is refused");
+        assert!(line == 1 && why.contains("belongs to session"), "{line}: {why}");
+        assert!(EventLog::reopen(&mine).is_err());
+        assert!(load(&mine).is_err());
+        // A single record of another session spliced in is refused the same way, chain or no chain.
+        let path = three_records("identity-splice");
+        let forged = json!({"seq": 4, "kind": "path_grant", "session": "elsewhere", "ts_ms": 0, "grant": {"path": "/", "write": true}});
+        append_linked(&path, forged, link);
+        assert!(verify(&path).unwrap().broken.is_some_and(|(n, why)| n == 4 && why.contains("belongs to session")));
+        for p in [mine, path] { let _ = std::fs::remove_dir_all(p.parent().unwrap()); }
     }
 
     #[test]
-    fn a_keyed_chain_does_not_hide_a_sequence_gap() {
+    fn a_linked_chain_does_not_hide_a_sequence_gap() {
         let path = three_records("invalid-sequence");
-        let key = ChainKey::load().unwrap();
-        let text = append_linked(&path, json!({"seq": 5, "kind": "note"}), |line| key.link(line));
+        let session = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let text = append_linked(&path, json!({"seq": 5, "kind": "note", "session": session}), link);
         let report = verify(&path).unwrap();
         assert_eq!(report.broken, Some((4, "record sequence is not consecutive".into())));
         assert!(EventLog::reopen(&path).is_err());
@@ -642,15 +585,6 @@ mod open_tests {
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].contains(&lost) && errors[1].contains("hash mismatch"), "{errors:?}");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn the_key_is_private_and_stable() {
-        use std::os::unix::fs::PermissionsExt;
-        let path = ChainKey::path().unwrap();
-        let key = ChainKey::load_or_create().unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
-        assert_eq!(ChainKey::load().unwrap().0, key.0);
     }
 
     #[test]
@@ -744,11 +678,12 @@ mod open_tests {
     #[tokio::test]
     async fn failed_intent_write_prevents_the_effect_even_if_the_error_is_caught() {
         let path = three_records("write-failure");
-        let mut pol = crate::policy::Policy::new(path.parent().unwrap(), false, None, None, None).unwrap();
+        let dirs = crate::dirs::TestDirs::new();
+        let mut pol = crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None).unwrap();
         pol.log = Arc::new(EventLog {
             inner: Mutex::new(Inner { file: std::fs::File::open(&path).unwrap(), seq: 0, prev: "genesis".into() }),
             failure: Mutex::new(None),
-            session: "read-only".into(), path: path.clone(), key: ChainKey::load().unwrap(), crash_after: None, _writer_lock: None, owner_reconciliation: false,
+            session: "read-only".into(), path: path.clone(), crash_after: None, _writer_lock: None, owner_reconciliation: false,
             known: Mutex::default(),
         });
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
@@ -768,7 +703,8 @@ mod open_tests {
     #[tokio::test]
     async fn failed_outcome_blob_keeps_an_unknown_intent_and_blocks_later_effects() {
         let path = three_records("blob-failure");
-        let pol = crate::policy::Policy::new(path.parent().unwrap(), false, None, None, None).unwrap();
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None).unwrap();
         let log_path = pol.log.path.clone();
         std::fs::write(log_path.parent().unwrap().join("blobs"), "not a directory").unwrap();
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());

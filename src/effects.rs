@@ -309,17 +309,18 @@ impl Drop for WaitGuard {
 mod tests {
     use super::*;
 
-    fn effects(tag: &str) -> (Arc<Effects>, std::path::PathBuf) {
+    fn effects(tag: &str) -> (Arc<Effects>, std::path::PathBuf, crate::dirs::TestDirs) {
         let dir = std::env::temp_dir().join(format!("hx-effects-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let pol = Policy::new(&dir, false, None, None, None).unwrap();
-        (Effects::new(Arc::new(pol), 0, Arc::default()), dir)
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = Policy::new(&dirs, &dir, false, None, None, None).unwrap();
+        (Effects::new(Arc::new(pol), 0, Arc::default()), dir, dirs)
     }
 
     #[tokio::test]
     async fn queued_mutation_rechecks_uncertain_state_before_dispatch() {
-        let (fx, dir) = effects("queued");
+        let (fx, dir, _dirs) = effects("queued");
         let lua = Lua::new();
         let permit = fx.supervisor.mutations.clone().acquire_owned().await.unwrap();
         let id = fx.supervisor.intent(Tool::McpCall, Class::External, &json!({}), "hash", 0, &fx.principal, None).unwrap();
@@ -347,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn uncertainty_uses_error_type_instead_of_message_text() {
-        let (fx, dir) = effects("typed");
+        let (fx, dir, _dirs) = effects("typed");
         let lua = Lua::new();
         let result = fx.run(&lua, Tool::Write, Class::LocalWrite, json!({}), || async { Err(rt("unknown_outcome: ordinary error text")) }).await;
         assert!(result.is_err());

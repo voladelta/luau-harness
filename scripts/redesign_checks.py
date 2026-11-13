@@ -3,12 +3,13 @@
 
 Artifacts are retained when HX_CHECK_ARTIFACTS is set. Run after cargo build --release.
 """
+import atexit
 import contextlib
 import hashlib
-import hmac
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -20,15 +21,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = Path(__file__).resolve().parents[1]
 # hx_trusted runs HX_BIN (default target/release/hx); with HX_TRUST=current it trusts the config written for each launch.
 HX = ROOT / "scripts/hx_trusted"
+HX_BIN = Path(os.environ.get("HX_BIN", ROOT / "target/release/hx"))
 if os.environ.get("HX_CHECK_ARTIFACTS"):
     _artifact_root = Path(os.environ["HX_CHECK_ARTIFACTS"])
     _artifact_root.mkdir(parents=True, exist_ok=True)
     BASE = Path(tempfile.mkdtemp(prefix="redesign-", dir=_artifact_root))
 else:
     BASE = Path(tempfile.mkdtemp(prefix="hx-redesign-"))
+    atexit.register(shutil.rmtree, BASE, ignore_errors=True)  # suites that import this one share BASE and its cleanup
 BASE.mkdir(parents=True, exist_ok=True)
 ENV = {**os.environ, "HX_TRUST": "current", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1",  # backoff: host.rs unit test
-       "XDG_CONFIG_HOME": str(BASE / "config")}  # this suite's own journal key
+       # this suite's own trust store and journals (workspaces are BASE/NAME, so neither is inside one)
+       "XDG_CONFIG_HOME": str(BASE / "config"), "XDG_STATE_HOME": str(BASE / "state")}
 for key in ("HX_MODEL", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
     ENV.pop(key, None)
 passed = 0
@@ -57,16 +61,27 @@ def records(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def hx_path(workspace, name, env=None):
+    """One of hx's own locations for `workspace` (`log`, `ar`, `secrets`, `trust`), from `hx paths`."""
+    out = subprocess.run([str(HX_BIN), "paths", "--workspace", str(workspace)], env={**ENV, **(env or {})},
+                         capture_output=True, text=True, check=True).stdout
+    return Path(next(line.split(": ", 1)[1] for line in out.splitlines() if line.startswith(f"{name}: ")))
+
+
+def logdir(workspace):
+    """The workspace's log directory (journals, blobs) in this suite's state directory."""
+    return hx_path(workspace, "log")
+
+
 def journal(path):
-    files = list((path / ".harness/log").glob("*.jsonl"))
+    files = list(logdir(path).glob("*.jsonl"))
     assert len(files) == 1, files
     return files[0]
 
 
 def chain_link(line):
-    """The `prev` of the record after `line`: its HMAC-SHA256 under the suite's journal key, as only the owner can compute."""
-    key = (Path(ENV["XDG_CONFIG_HOME"]) / "hx/journal.key").read_bytes()
-    return hmac.new(key, line.encode(), hashlib.sha256).hexdigest()
+    """The `prev` of the record after `line`: its SHA-256."""
+    return hashlib.sha256(line.encode()).hexdigest()
 
 
 def tool(code):
@@ -723,11 +738,11 @@ def review_branch_and_revocation():
     parent = journal(path)
     for boundary in (2, 3):
         with provider(lambda body, i: tool('assert(durable.get("keep").n==4); print("SEED_OK")') if i == 0 else "done") as (url, calls):
-            previous = set((path / ".harness/log").glob("*.jsonl"))
+            previous = set(logdir(path).glob("*.jsonl"))
             result = run(path, "run", "--branch", str(parent), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY",
                          env={"HX_TEST_CRASH_AFTER_RECORD": str(boundary)}, ok=False)
             assert result.returncode and not calls
-            child, = set((path / ".harness/log").glob("*.jsonl")) - previous
+            child, = set(logdir(path).glob("*.jsonl")) - previous
             report = json.loads(run(path, "run", "--resume", str(child)).stdout)
             assert report["finished"] and report["luau_errors"] == 0, report
 
@@ -744,7 +759,7 @@ def review_branch_and_revocation():
         count = len(calls)
         result = run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY", ok=False)
         assert result.returncode and "reconcile uncertain" in result.stderr
-        assert sum(any(r["kind"] == "manifest" for r in records(p)) for p in (path / ".harness/log").glob("*.jsonl")) == 1
+        assert sum(any(r["kind"] == "manifest" for r in records(p)) for p in logdir(path).glob("*.jsonl")) == 1
         run(path, "revoke", str(log))
         run(path, "recover", str(log), str(op), "--decision", "abandon", "--yes")
         assert run(path, "run", "--resume", str(log), ok=False).returncode and len(calls) == count
@@ -891,7 +906,7 @@ def cli_preflight():
         result = subprocess.run([str(HX), "run", "--workspace", str(path), *flags], env=ENV,
                                 capture_output=True, text=True, timeout=10)
         assert result.returncode == 2, (flags, result.returncode, result.stderr)
-        assert not (path / ".harness/log").exists(), (flags, "invalid invocation opened a journal")
+        assert not logdir(path).exists(), (flags, "invalid invocation opened a journal")
     assert not Path("absent.lock").exists()
 
 
@@ -990,4 +1005,4 @@ if __name__ == "__main__":
     check("unsupported run formats fail before resume or branch dispatch", unsupported_run_format)
     check("session, package and batch agents reject invalid options before dispatch", agent_option_validation)
     check("corrupt artifacts fail before dispatch", corrupt_artifacts)
-    print(f"{passed} passed; artifacts: {BASE}")
+    print(f"{passed} passed" + (f"; artifacts: {BASE}" if os.environ.get("HX_CHECK_ARTIFACTS") else ""))

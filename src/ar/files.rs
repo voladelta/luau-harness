@@ -444,7 +444,7 @@ pub(super) struct Scored {
 pub(super) fn search_read_roots(spec: &Spec) -> Result<Vec<PathBuf>> {
     let mut read = crate::policy::system_read_roots();
     read.extend(spec.roots(false)?);
-    let read = crate::confine::Rules { read, write: vec![], hidden: vec![] }.with_system().read;
+    let read = crate::confine::Rules { read, write: vec![] }.with_system().read;
     for h in spec.holdout_roots()? {
         if let Some(r) = read.iter().find(|r| h.starts_with(r)) {
             bail!("ar.toml: holdout root {} lies inside {}, which the search evaluator may read", h.display(), r.display());
@@ -471,7 +471,7 @@ pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, 
         place(&scratch.0.join("tree"), &spec_, &files_)?;
         std::fs::create_dir(scratch.0.join("tmp"))?;
         read.push(scratch.0.clone());
-        let rules = crate::confine::Rules { read, write: vec![scratch.0.clone()], hidden: vec![] }.with_system();
+        let rules = crate::confine::Rules { read, write: vec![scratch.0.clone()] }.with_system();
         Ok((scratch, rules.prepare()?.map(std::sync::Arc::new)))
     }).await??;
     let env = crate::prims::ShellEnv { env: Some(evaluator_env(&scratch.0.join("tmp"))), confine: rules };
@@ -584,12 +584,19 @@ pub(super) fn freeze(workspace: &Path, run: &Path) -> Result<String> {
     Ok(commit)
 }
 
-/// Copy an episode workspace's journals into the run as `episodes/LABEL.log`; returns that directory.
-pub(super) fn keep_logs(ws: &Path, episodes: &Path, label: &str) -> Result<PathBuf> {
+/// Move an episode's journals (`log`, its workspace's log directory in hx's state directory) into the run as
+/// `episodes/LABEL.log`, and remove what is left of that workspace's state; returns the new directory.
+pub(super) fn keep_logs(log: &Path, episodes: &Path, label: &str) -> Result<PathBuf> {
     let logs = episodes.join(format!("{label}.log"));
-    if ws.join(".harness/log").is_dir() && !logs.exists() {
+    if log.is_dir() && !logs.exists() {
         std::fs::create_dir_all(episodes)?;
-        copy_tree(&ws.join(".harness/log"), &logs)?;
+        // Both are in hx's state directory, normally one filesystem; a rename across two fails and is a copy instead.
+        if std::fs::rename(log, &logs).is_err() {
+            copy_tree(log, &logs)?;
+        }
+    }
+    if let Some(state) = log.parent().filter(|s| s.is_dir()) {
+        std::fs::remove_dir_all(state).with_context(|| format!("episode state {}", state.display()))?;
     }
     Ok(logs)
 }

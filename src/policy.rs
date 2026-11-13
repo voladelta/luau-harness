@@ -1,6 +1,8 @@
 //! Capability policy for model-reachable effects. File tools check canonical paths, protect harness configuration, and
 //! reject credential files. Shell commands keep approval checks, a scrubbed environment and process cleanup, and on
-//! Linux the same file roots through Landlock (`confinement`, `crate::confine`). Network isolation is external.
+//! Linux the same file roots through Landlock (`confinement`, `crate::confine`). Network isolation is external. hx's
+//! own configuration and state (`crate::dirs`) lie outside every root, so neither can reach them.
+use crate::dirs::Dirs;
 use crate::eventlog::EventLog;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -99,8 +101,8 @@ pub struct Policy {
     cfg: Snapshot,
     pub log: Arc<EventLog>,
     grants: std::sync::Mutex<Vec<PathGrant>>,
-    /// Hidden files that a child could move or hard-link, by identity (see `Hidden`).
-    hidden: std::sync::Mutex<Hidden>,
+    /// hx's own directories: never inside a root, refused to file tools.
+    pub dirs: Dirs,
     prompt: tokio::sync::Mutex<()>,
     /// An autoresearch worker's claim and best score, when `episode` is set.
     pub ar_progress: std::sync::Mutex<crate::ar::Progress>,
@@ -120,7 +122,8 @@ pub struct Snapshot {
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
     pub protected: Vec<PathBuf>,
-    /// Owner state the model may neither read nor write (autoresearch held-out results and snapshots), in any mode.
+    /// Owner files under a read root that the model may neither read nor write in any mode: an autoresearch episode's
+    /// grader and holdout roots.
     #[serde(default)]
     pub sealed: Vec<PathBuf>,
     /// The autoresearch episode this run serves (`ar.*`), recorded with the rest of the frozen policy.
@@ -620,112 +623,36 @@ impl std::fmt::Display for Call<'_> {
 /// How many characters of a call's arguments the approval prompt shows.
 const PROMPT_ARGS_CHARS: usize = 2000;
 
-/// Hidden files and directories a child could move or hard-link (those under a write root), by (device, inode), with
-/// every name each is known by. A child cannot rename or link a file it may not read into a place where it could read
-/// it (Landlock refuses a reparenting that gains access), but a name made in a directory it may only list becomes
-/// readable from the next ruleset on, and file tools are not confined at all. So the next ruleset hides every known
-/// name, and file tools refuse a file by its identity whatever it is called.
-#[derive(Default)]
-struct Hidden {
-    names: std::collections::BTreeMap<(u64, u64), Names>,
-    /// How many times the write roots were searched (the expensive step).
-    searches: u64,
-}
-
-#[derive(Default)]
-struct Names {
-    paths: std::collections::BTreeSet<PathBuf>,
-    dir: bool,
-    /// The inode's link count and change time when the write roots were last searched for it. A file with more links
-    /// than known names is searched for again only after that changes, so a name hx cannot reach (outside every write
-    /// root) costs one search, not one per command.
-    searched: Option<(u64, i64, i64)>,
-}
-
-impl Hidden {
-    /// Record every file and directory now under a hidden root that lies within a write root, drop names that no
-    /// longer lead to their inode, and search the write roots only when a known inode lost all its names (it was
-    /// moved) or gained a link not seen before.
-    fn refresh(&mut self, roots: &[PathBuf], write_roots: &[PathBuf]) {
-        use std::os::unix::fs::MetadataExt;
-        let state = |m: &std::fs::Metadata| (m.nlink(), m.ctime(), m.ctime_nsec());
-        for root in roots.iter().filter(|r| write_roots.iter().any(|w| r.starts_with(w) || w.starts_with(r))) {
-            walk(root, &mut |path, m| {
-                let names = self.names.entry((m.dev(), m.ino())).or_default();
-                names.dir = m.is_dir();
-                names.paths.insert(path.to_path_buf());
-            });
-        }
-        for (&key, names) in self.names.iter_mut() {
-            names.paths.retain(|p| std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == key));
-        }
-        let stale = self.names.values().any(|n| match n.paths.first().map(std::fs::symlink_metadata) {
-            None => true,
-            Some(Ok(m)) => !n.dir && m.nlink() > n.paths.len() as u64 && n.searched != Some(state(&m)),
-            Some(Err(_)) => true,
-        });
-        if !stale { return; }
-        self.searches += 1;
-        for root in write_roots {
-            walk(root, &mut |path, m| {
-                if let Some(names) = self.names.get_mut(&(m.dev(), m.ino())) { names.paths.insert(path.to_path_buf()); }
-            });
-        }
-        // An inode found nowhere was deleted (or left every write root, where no child can reach it).
-        self.names.retain(|_, n| !n.paths.is_empty());
-        for names in self.names.values_mut() {
-            names.searched = names.paths.first().and_then(|p| std::fs::symlink_metadata(p).ok()).map(|m| state(&m));
-        }
-    }
-
-    /// Every known name of every hidden file.
-    fn paths(&self) -> Vec<PathBuf> {
-        self.names.values().flat_map(|n| n.paths.iter().cloned()).collect()
-    }
-}
-
-/// Call `visit` with `path` and everything beneath it, without following symbolic links. Unreadable entries are
-/// skipped.
-fn walk(path: &Path, visit: &mut dyn FnMut(&Path, &std::fs::Metadata)) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
-    visit(path, &meta);
-    if !meta.is_dir() { return; }
-    let Ok(entries) = std::fs::read_dir(path) else { return };
-    for entry in entries.flatten() { walk(&entry.path(), visit); }
-}
-
 impl Policy {
     /// `autopilot` is the launching user's `--yes`: automatically approve ordinary requests.
-    /// Canonical paths, credentials, sealed state and protected configuration are checked in every mode.
-    pub fn new(workspace: &Path, autopilot: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, episode: Option<crate::ar::Episode>) -> Result<Policy> {
+    /// Canonical paths, credentials, sealed state, hx's own directories and protected configuration are checked in
+    /// every mode. `resume` is the journal of the run to continue, which must be in this workspace's log directory.
+    pub fn new(dirs: &Dirs, workspace: &Path, autopilot: bool, approval_mode: Option<ApprovalMode>, resume: Option<&Path>, episode: Option<crate::ar::Episode>) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
+        let own = dirs.workspace(&workspace);
         if let Some(path) = resume {
+            let actual = std::fs::canonicalize(path).with_context(|| format!("run log {}", path.display()))?;
+            anyhow::ensure!(actual.parent() == Some(own.log.as_path()),
+                "{} is not in this workspace's log directory {}; a run resumes only from there", path.display(), own.log.display());
             // Lock before reading any recovery state or repairing the log. Mutable workspace configuration is never
             // consulted for a resumed run: the exact authority approved at launch is part of its manifest.
-            let log = EventLog::reopen(path)?;
-            let manifest = crate::supervisor::Manifest::load(path)?;
+            let log = EventLog::reopen(&actual)?;
+            let manifest = crate::supervisor::Manifest::load(&actual)?;
             anyhow::ensure!(manifest.policy.workspace == workspace, "resume workspace differs from the saved run");
-            let mut p = manifest.policy;
+            let p = manifest.policy;
             validate_scratch(&p.tmp)?;
             std::fs::create_dir_all(&p.tmp)?;
-            // A journal may have been moved since launch. Its actual files and artifacts remain read-only to file tools.
-            let actual = std::fs::canonicalize(path)?;
-            p.protected.extend([actual.clone(), actual.with_extension("lock"), actual.with_extension("revoked"),
-                actual.parent().unwrap().join("blobs"), actual.parent().unwrap().join("registry")]);
-            // The key that authenticates this journal is sealed wherever this launch finds it.
-            p.sealed.extend(journal_key());
-            // Newly introduced aliases must not turn frozen protected paths into writable paths.
-            let aliases: Vec<_> = p.protected.iter().filter_map(canon).collect();
-            p.protected.extend(aliases);
             // The orchestrator retries an episode as a new child and never resumes one; a stale episode must not get `ar`.
-            anyhow::ensure!(p.episode.is_none(), "this run was an autoresearch episode; continue the search with `hx run --ar --resume .harness/ar/RUN`");
+            anyhow::ensure!(p.episode.is_none(), "this run was an autoresearch episode; continue the search with `hx run --ar --resume RUN`");
             log.check()?;
             if crate::confine::status().is_err() {
                 log.write("confinement", json!({"confinement": crate::confine::describe()}), true)?;
             }
-            let grants = crate::eventlog::load(path)?.iter().filter(|r| r["kind"] == "path_grant")
+            let grants = crate::eventlog::load(&actual)?.iter().filter(|r| r["kind"] == "path_grant")
                 .map(|r| serde_json::from_value(r["grant"].clone())).collect::<std::result::Result<Vec<PathGrant>, _>>()?;
-            return Ok(Policy { cfg: p, log, grants: grants.into(), hidden: Default::default(), prompt: Default::default(), ar_progress: Default::default() }.live());
+            // hx's directories may have moved since launch (another XDG_STATE_HOME): the frozen roots must still miss them.
+            check_roots(dirs, p.read_roots.iter().chain(&p.write_roots).chain(grants.iter().map(|g| &g.path)))?;
+            return Ok(Policy { cfg: p, log, grants: grants.into(), dirs: dirs.clone(), prompt: Default::default(), ar_progress: Default::default() }.live());
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
@@ -733,10 +660,9 @@ impl Policy {
         let tmp = std::fs::canonicalize(tmp)?;
         let mut p = Snapshot { autopilot, workspace: workspace.clone(), tmp: tmp.clone(), read_roots: vec![], write_roots: vec![], protected: vec![], sealed: vec![], episode: None, ask: vec![], allow: vec![], mode: ApprovalMode::Prompt, budget: Budget::default(), packs: vec![] };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
-        p.write_roots.extend([workspace.clone(), tmp]);
+        p.write_roots.extend([workspace.clone(), tmp.clone()]);
         // Git runs hooks and configured commands unconfined on the owner's next `git` in this workspace.
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock"), workspace.join(".git/config"), workspace.join(".git/hooks")]);
-        p.sealed.push(workspace.join(".harness/ar"));
         if let Some(e) = &episode { p.sealed.extend(crate::ar::sealed(e)); }
         p.episode = episode;
         for r in SYSTEM_READ {
@@ -745,20 +671,17 @@ impl Policy {
             }
         }
         p.read_roots.extend(toolchain_roots());
-        // the trust store must never be writable by the model, even if the user's write roots cover ~/.config
-        if let Some(d) = crate::trust::store_dir_canonical() {
-            p.protected.push(d);
-        }
-        p.sealed.extend(journal_key());
         // check_write resolves aliases before comparing. Protect the resolved configuration too, including an
-        // untrusted workspace's symlinked .harness or hx.lock including automatically approved path requests.
+        // untrusted workspace's symlinked .harness or hx.lock.
         let canonical_protected: Vec<_> = p.protected.iter().filter_map(canon).collect();
         p.protected.extend(canonical_protected);
         let canonical_sealed: Vec<_> = p.sealed.iter().filter_map(canon).collect();
         p.sealed.extend(canonical_sealed);
-        let trusted = crate::trust::is_trusted(&workspace);
-        if let Some(t) = std::fs::read_to_string(workspace.join(".harness/policy.toml")).ok().filter(|_| trusted) {
-            let f: PolicyFile = toml::from_str(&t).map_err(|e| anyhow::anyhow!("bad .harness/policy.toml: {e}"))?;
+        // The policy is parsed from the bytes the trust decision covered, never from a second read of the file.
+        let config = crate::trust::trusted(&workspace, dirs)?;
+        if let Some(text) = config.as_ref().and_then(|c| c.file(".harness/policy.toml")) {
+            let f: PolicyFile = std::str::from_utf8(text).map_err(anyhow::Error::from)
+                .and_then(|t| toml::from_str(t).map_err(anyhow::Error::from)).map_err(|e| anyhow::anyhow!("bad .harness/policy.toml: {e}"))?;
             p.read_roots.extend(f.fs.read.iter().map(|r| fs_root(&workspace, r)).collect::<Result<Vec<_>>>()?);
             let w = f.fs.write.iter().map(|r| fs_root(&workspace, r)).collect::<Result<Vec<_>>>()?;
             p.read_roots.extend(w.clone());
@@ -775,61 +698,50 @@ impl Policy {
         if let Some(m) = approval_mode {
             p.mode = m; // the launching user's choice beats the file
         }
-        // Automatic approval never disables the audit log.
-        let log = EventLog::open(&workspace.join(".harness/log"))?;
-        log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,
-            "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha,
-            "confinement": crate::confine::describe()}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
+        check_roots(dirs, p.read_roots.iter().chain(&p.write_roots))?;
+        // Landlock only adds access: a sealed root under a read root would be readable by every shell command.
+        if let Some((s, r)) = p.sealed.iter().find_map(|s| p.read_roots.iter().find(|r| s.starts_with(r)).map(|r| (s, r))) {
+            bail!("autoresearch: {} lies inside {}, which the agent's shell commands may read; move it outside", s.display(), r.display());
+        }
+        // Automatic approval never disables the audit log.
+        let log = EventLog::open(&own.log)?;
+        let config_sha = match &config { Some(c) => c.hash(), None => crate::trust::config_hash(&workspace) };
+        log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,
+            "approval_mode": p.mode, "config_sha": config_sha, "trusted": config.is_some(), "modules_sha": modules_sha,
+            "confinement": crate::confine::describe()}), true)?;
         let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
-        Ok(Policy { cfg: p, log, grants: Default::default(), hidden: Default::default(), prompt: Default::default(), ar_progress }.live())
+        Ok(Policy { cfg: p, log, grants: Default::default(), dirs: dirs.clone(), prompt: Default::default(), ar_progress }.live())
     }
 
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
 
     /// What a child process (`sh`, a local MCP server) may touch, from the current policy and the grants approved so
-    /// far: the read roots minus credentials, sealed owner state and the trust store; the write roots. Built per spawn,
-    /// so a grant approved mid-run applies to later commands. Protected configuration inside a write root stays
-    /// writable by children: Landlock cannot carve a hole in a writable tree without breaking file creation in it.
+    /// far: the read roots and this run's materialized skills (read), the write roots (write). Built per spawn, so a
+    /// grant approved mid-run applies to later commands. Protected configuration inside a write root stays writable by
+    /// children: Landlock cannot carve a hole in a writable tree without breaking file creation in it.
     pub fn confinement(&self) -> crate::confine::Rules {
         let (mut read, mut write) = (self.read_roots.clone(), self.write_roots.clone());
+        read.push(self.registry());
         for g in self.grants.lock().unwrap().iter() {
             read.push(g.path.clone());
             if g.write { write.push(g.path.clone()); }
         }
-        let roots = self.hidden_roots();
-        let mut hidden = self.hidden.lock().unwrap();
-        hidden.refresh(&roots, &write);
-        let mut paths = roots;
-        paths.extend(hidden.paths());
-        crate::confine::Rules { read, write, hidden: paths }.with_system()
+        crate::confine::Rules { read, write }.with_system()
     }
 
-    /// What no child and no file tool may read: credentials, sealed owner state and the trust store.
-    fn hidden_roots(&self) -> Vec<PathBuf> {
-        let mut roots = self.sealed.clone();
-        roots.push(self.workspace.join(".harness/secrets.toml"));
-        roots.extend(crate::trust::store_dir_canonical());
-        roots
+    /// The Landlock ruleset for a child started now (`confinement`), built on a blocking thread: it opens every root.
+    pub async fn ruleset(self: &Arc<Self>) -> std::io::Result<Option<Arc<crate::confine::Ruleset>>> {
+        let pol = self.clone();
+        let ruleset = tokio::task::spawn_blocking(move || pol.confinement().prepare()).await.map_err(std::io::Error::other)??;
+        Ok(ruleset.map(Arc::new))
     }
 
-    /// Paths file-tool search must skip: sealed state and every name a hidden file is known by now (a child that ran
-    /// since the last spawn may have given one a new name, so the names are brought up to date first).
-    pub fn unreadable(&self) -> Vec<PathBuf> {
-        let mut write = self.write_roots.clone();
-        write.extend(self.grants.lock().unwrap().iter().filter(|g| g.write).map(|g| g.path.clone()));
-        let mut hidden = self.hidden.lock().unwrap();
-        hidden.refresh(&self.hidden_roots(), &write);
-        let mut out = self.sealed.clone();
-        out.extend(hidden.paths());
-        out
-    }
-
-    /// Is `path` (which must exist) one of the hidden files under another name?
-    fn is_hidden_file(&self, path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path).is_ok_and(|m| self.hidden.lock().unwrap().names.contains_key(&(m.dev(), m.ino())))
+    /// This run's materialized skills (`Registry::materialize_skills`): the one part of hx's state the model may
+    /// read, so that a skill's supporting files are there for it.
+    fn registry(&self) -> PathBuf {
+        self.log.dir().join("registry").join(&self.log.session)
     }
 
     /// Effect class of a shell command: the highest class of its simple commands.
@@ -918,12 +830,14 @@ impl Policy {
         let denied = match check() { Ok(_) => return Ok(()), Err(e) => e };
         let Some(outside) = denied.downcast_ref::<OutsideRoots>() else { return Err(denied) };
         // The requested file itself (children can then change it, not create its siblings), or a requested directory
-        // for reading; never a tree that holds the home directory or a protected or hidden path.
+        // for reading; never a tree that holds the home directory, protected configuration or hx's own files.
         let grant = PathGrant { path: outside.path.clone(), recursive: !write && outside.path.is_dir(), write };
         if grant.recursive && let Some(what) = self.covers_owner_state(&grant.path) {
             bail!("policy: {} is a directory that contains {what}; it cannot be granted to the model (add a narrower root to [fs] in policy.toml)", shown(&grant.path.to_string_lossy()));
         }
-        let source = if self.autopilot { ApprovalSource::Auto } else {
+        // Autopilot grants single files. A directory exposes everything in it, including credential files that file
+        // tools refuse by name but shell commands can read, so only the owner can grant one.
+        let source = if self.autopilot && !grant.recursive { ApprovalSource::Auto } else {
             if self.mode == ApprovalMode::Deny { return Err(denied); }
             let (access, what) = if write { ("read/write", "the file") } else if grant.recursive { ("read", "everything under") } else { ("read", "the file") };
             match ask(&format!("allow {access} access to {what} {} for this run? (requested {})", shown(&grant.path.to_string_lossy()), shown(path))).await {
@@ -940,14 +854,15 @@ impl Policy {
     }
 
     /// What owner state a recursive grant of `dir` would expose, if any: the home directory (and so every credential
-    /// in it), or a protected or hidden path.
+    /// in it), protected configuration, sealed state or hx's own files.
     fn covers_owner_state(&self, dir: &Path) -> Option<&'static str> {
         if dir.parent().is_none() { return Some("the whole filesystem"); }
         if std::env::var_os("HOME").and_then(canon).is_some_and(|home| home.starts_with(dir)) {
             return Some("your home directory");
         }
         if self.protected.iter().any(|p| p.starts_with(dir)) { return Some("protected harness configuration"); }
-        if self.hidden_roots().iter().any(|p| p.starts_with(dir)) { return Some("credentials or sealed owner state"); }
+        if self.sealed.iter().any(|p| p.starts_with(dir)) { return Some("sealed owner state"); }
+        if self.dirs.overlap(dir).is_some() { return Some("hx's own configuration or state"); }
         None
     }
 
@@ -964,17 +879,27 @@ impl Policy {
         roots.iter().any(|r| path.starts_with(r))
     }
 
-    /// Resolve `p` (relative to the workspace) for reading; the canonical path must be inside a read root.
+    /// Is `path` hx's own configuration or state? This run's materialized skills are not: the model reads them.
+    fn is_own(&self, path: &Path) -> bool {
+        self.dirs.owns(path) && !path.starts_with(self.registry())
+    }
+
+    /// Resolve `p` (relative to the workspace) for reading; the canonical path must be inside a read root (or this
+    /// run's materialized skills).
     pub fn check_read(&self, p: &str) -> Result<PathBuf> {
-        let full = self.abs(p);
-        if self.is_sealed(&normalize(&full)) || std::fs::canonicalize(&full).is_ok_and(|c| self.is_sealed(&c)) {
+        let full = normalize(&self.abs(p));
+        let canonical = std::fs::canonicalize(self.abs(p));
+        if self.is_sealed(&full) || canonical.as_ref().is_ok_and(|c| self.is_sealed(c)) {
             bail!("policy: {p} is sealed owner state and cannot be read");
         }
-        let c = std::fs::canonicalize(&full).map_err(|e| anyhow::anyhow!("{p}: {e}"))?;
-        if is_secret(&c) || self.is_hidden_file(&c) {
+        if self.is_own(&full) || canonical.as_ref().is_ok_and(|c| self.is_own(c)) {
+            bail!("policy: {p} is hx's own configuration or state and cannot be read");
+        }
+        let c = canonical.map_err(|e| anyhow::anyhow!("{p}: {e}"))?;
+        if is_secret(&c) {
             bail!("policy: {p} is a credential file and cannot be read");
         }
-        if !Self::within(&c, &self.read_roots) && !self.granted(&c, false) {
+        if !Self::within(&c, &self.read_roots) && !c.starts_with(self.registry()) && !self.granted(&c, false) {
             return Err(OutsideRoots { path: c, write: false }.into());
         }
         Ok(c)
@@ -1005,11 +930,8 @@ impl Policy {
         if self.is_sealed(&full) || self.is_sealed(&c) {
             bail!("policy: {p} is sealed owner state and cannot be written");
         }
-        if Self::within(&c, &self.protected) {
-            bail!("policy: {p} is protected (harness configuration cannot be modified by the model)");
-        }
-        if self.is_hidden_file(&c) {
-            bail!("policy: {p} is another name for a credential file or sealed owner state and cannot be written");
+        if Self::within(&c, &self.protected) || self.dirs.owns(&full) || self.dirs.owns(&c) {
+            bail!("policy: {p} is protected (harness configuration and hx's own state cannot be modified by the model)");
         }
         if !Self::within(&c, &self.write_roots) && !self.granted(&c, true) {
             return Err(OutsideRoots { path: c, write: true }.into());
@@ -1044,6 +966,18 @@ impl Policy {
 /// The system and toolchain directories every child may read (autoresearch evaluators, which have no run policy).
 pub fn system_read_roots() -> Vec<PathBuf> {
     SYSTEM_READ.iter().filter_map(canon).chain(toolchain_roots()).collect()
+}
+
+/// Refuse roots that would put hx's own configuration or state within the model's reach: Landlock grants a whole
+/// tree, so a root that contains either directory (or lies inside one) would expose the trust store, secrets or journals.
+fn check_roots<'a>(dirs: &Dirs, roots: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    for root in roots {
+        if let Some((what, dir)) = dirs.overlap(root) {
+            bail!("policy: {} cannot be a root of the model's: it overlaps hx's {what} directory {} (narrow [fs] in .harness/policy.toml, \
+                use another workspace, or move hx's directories with XDG_CONFIG_HOME / XDG_STATE_HOME)", root.display(), dir.display());
+        }
+    }
+    Ok(())
 }
 
 /// An `[fs]` root from `policy.toml`: `~` is the owner's home, a relative path is relative to the workspace, and a
@@ -1104,12 +1038,6 @@ impl Drop for Policy {
     }
 }
 
-/// The journal key (`eventlog::KEY_FILE`): sealed, so file tools can neither read nor write it, search skips it and
-/// confined children cannot see it, even when a root covers the configuration directory.
-fn journal_key() -> Option<PathBuf> {
-    crate::trust::store_dir_canonical().map(|d| d.join(crate::eventlog::KEY_FILE))
-}
-
 /// Directories under $HOME that hold the user's toolchains (so `python3`, `git`, `cargo` are readable by file tools).
 fn toolchain_roots() -> Vec<PathBuf> {
     let home = std::env::var("HOME").ok().and_then(canon);
@@ -1140,16 +1068,20 @@ fn toolchain_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dirs::TestDirs;
 
     #[test]
     fn resume_cannot_adopt_and_delete_an_unrelated_scratch_directory() {
+        let dirs = TestDirs::new();
         let dir = std::env::temp_dir().join(format!("hx-policy-scratch-test-{}", std::process::id()));
         let victim = dir.join("unrelated");
         std::fs::create_dir_all(&victim).unwrap();
         std::fs::write(victim.join("sentinel"), "KEEP").unwrap();
-        let log = EventLog::open(&dir.join("log")).unwrap();
+        let log = EventLog::open(&dirs.workspace(&dir).log).unwrap();
         log.write("session", json!({"workspace": dir, "tmp": victim}), true).unwrap();
-        let result = Policy::new(&dir, false, None, Some(&log.path), None);
+        let path = log.path.clone();
+        drop(log);
+        let result = Policy::new(&dirs, &dir, false, None, Some(&path), None);
         let accepted = result.is_ok();
         drop(result);
         assert!(victim.join("sentinel").exists(), "Policy::drop deleted unrelated data");
@@ -1180,9 +1112,10 @@ mod tests {
 
     #[test]
     fn classify_sh_orders_irreversible_before_external() {
+        let dirs = TestDirs::new();
         let dir = std::env::temp_dir().join(format!("hx-policy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = Policy::new(&dir, false, None, None, None).unwrap();
+        let p = Policy::new(&dirs, &dir, false, None, None, None).unwrap();
         assert_eq!(p.classify_sh("git push --force origin main"), Class::Irreversible);
         assert_eq!(p.classify_sh("git push origin main"), Class::External);
         assert_eq!(p.classify_sh("ls -la"), Class::LocalWrite);
@@ -1195,17 +1128,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn test_policy(tag: &str, autopilot: bool, allow: &[&str]) -> (Policy, PathBuf) {
+    /// A policy over a fresh workspace, in deny mode (nothing ever asks the terminal), with `allow` pre-approved, and
+    /// hx's directories (removed when dropped).
+    fn test_policy(tag: &str, autopilot: bool, allow: &[&str]) -> (Policy, PathBuf, TestDirs) {
+        let dirs = TestDirs::new();
         let dir = std::env::temp_dir().join(format!("hx-policy-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut p = Policy::new(&dir, autopilot, Some(ApprovalMode::Deny), None, None).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let mut p = Policy::new(&dirs, &dir, autopilot, Some(ApprovalMode::Deny), None, None).unwrap();
         p.cfg.allow = allow.iter().map(|s| s.to_string()).collect();
-        (p, dir)
+        (p, dir, dirs)
     }
 
     #[test]
     fn classification_is_on_shell_words() {
-        let (p, dir) = test_policy("words", false, &[]);
+        let (p, dir, _dirs) = test_policy("words", false, &[]);
         for cmd in ["git push origin main --force", "git push --force-with-lease", "git  push -f", "git push origin --delete old",
             "git push origin +main", "git -C repo push --force", "cd x && git push -fu origin main", "rm -rf ~", "rm -fr /", "rm -r -f $HOME",
             "sudo rm -rf /", "echo $(git push --force)", "bash -c 'git push --force'", "mkfs.ext4 /dev/sda", "dd if=/dev/zero of=/dev/sda"] {
@@ -1225,7 +1163,7 @@ mod tests {
 
     #[tokio::test]
     async fn autopilot_never_approves_an_irreversible_command() {
-        let (p, dir) = test_policy("autopilot", true, &[]);
+        let (p, dir, _dirs) = test_policy("autopilot", true, &[]);
         assert_eq!(p.approve("git push origin main", Class::External).await.ok(), Some(ApprovalSource::Auto));
         assert_eq!(p.approve("ls", Class::LocalWrite).await.ok(), Some(ApprovalSource::NotRequired));
         for cmd in ["git push origin main --force", "rm -rf ~"] {
@@ -1233,7 +1171,7 @@ mod tests {
             assert!(p.approve(cmd, Class::Irreversible).await.is_err(), "{cmd}");
         }
         drop(p);
-        let (p, dir2) = test_policy("autopilot-allow", true, &["rm -rf ~"]);
+        let (p, dir2, _dirs2) = test_policy("autopilot-allow", true, &["rm -rf ~"]);
         assert_eq!(p.approve("rm -rf ~", Class::Irreversible).await.ok(), Some(ApprovalSource::PolicyAllow));
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1242,7 +1180,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_substring_allow_cannot_approve_a_reordered_force_push_or_a_chained_command() {
-        let (p, dir) = test_policy("reorder", false, &["git push origin"]);
+        let (p, dir, _dirs) = test_policy("reorder", false, &["git push origin"]);
         let forced = "git push origin main --force";
         assert_eq!(p.classify_sh(forced), Class::Irreversible);
         assert!(p.approve(forced, p.classify_sh(forced)).await.is_err());
@@ -1256,7 +1194,7 @@ mod tests {
 
     #[test]
     fn compound_and_wrapped_commands_classify_no_lower_than_the_bare_command() {
-        let (p, dir) = test_policy("shapes", false, &[]);
+        let (p, dir, _dirs) = test_policy("shapes", false, &[]);
         let irreversible = [
             "for b in a; do git push --force; done", "{ git push --force; }", "if true; then git push --force; fi",
             "while true; do git push --force; done", "! git push --force", "case x in x) git push --force;; esac",
@@ -1289,7 +1227,7 @@ mod tests {
 
     #[test]
     fn unknown_programs_need_approval_and_everyday_commands_do_not() {
-        let (p, dir) = test_policy("unknown", false, &[]);
+        let (p, dir, _dirs) = test_policy("unknown", false, &[]);
         let padded = |wrapper: &str, pad: &str, n: usize| format!("{wrapper} {} git push --force origin main", vec![pad; n].join(" "));
         let must_ask = vec![
             "g$'i't push origin main".to_string(), "$x push origin main".into(), "\"$(echo git)\" push origin main".into(),
@@ -1332,7 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_shell_allow_entry_covers_commands_that_start_with_its_words() {
-        let (p, dir) = test_policy("words-allow", false, &["sendmail owner@example.com", "git push origin"]);
+        let (p, dir, _dirs) = test_policy("words-allow", false, &["sendmail owner@example.com", "git push origin"]);
         assert_eq!(p.approve("sendmail owner@example.com < report", Class::External).await.ok(), Some(ApprovalSource::PolicyAllow));
         assert_eq!(p.approve("{ git push origin main; }", Class::External).await.ok(), Some(ApprovalSource::PolicyAllow));
         for cmd in ["sendmail attacker@example.net --note \"sendmail owner@example.com\"", "echo; sendmail x 'git push origin'",
@@ -1345,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_calls_are_approved_on_their_identity_never_on_their_arguments() {
-        let (p, dir) = test_policy("calls", false, &["mcp demo.add", "mcp notes.*", "http probe.get"]);
+        let (p, dir, _dirs) = test_policy("calls", false, &["mcp demo.add", "mcp notes.*", "http probe.get"]);
         let call = |server, tool| Call::Mcp { server, tool };
         let approve = |c, args: serde_json::Value| { let p = &p; async move { p.approve_call(c, &args, Class::External).await } };
         assert_eq!(approve(call("demo", "add"), json!({"a": 1})).await.ok(), Some(ApprovalSource::PolicyAllow));
@@ -1377,61 +1315,100 @@ mod tests {
         assert_eq!(call.to_string(), "mcp s.t\\u{1b}[1A");
     }
 
-    fn hidden_workspace(tag: &str) -> (Policy, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("hx-policy-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".harness/ar/run/deep")).unwrap();
-        std::fs::write(dir.join(".harness/secrets.toml"), "TOKEN").unwrap();
-        std::fs::write(dir.join(".harness/ar/run/deep/held.txt"), "SEALED").unwrap();
-        let dir = std::fs::canonicalize(dir).unwrap();
-        (Policy::new(&dir, false, Some(ApprovalMode::Deny), None, None).unwrap(), dir)
+    #[test]
+    fn hx_own_directories_are_never_a_root_and_file_tools_refuse_them() {
+        let dirs = TestDirs::new();
+        let base = dirs.config().parent().unwrap().parent().unwrap().to_path_buf();
+        // A workspace that holds hx's directories, or lies inside one, is refused.
+        for ws in [base.clone(), dirs.state().join("ws")] {
+            std::fs::create_dir_all(&ws).unwrap();
+            let err = Policy::new(&dirs, &ws, false, None, None, None).err().expect("refused").to_string();
+            assert!(err.contains("overlaps hx's"), "{err}");
+        }
+        // So is an [fs] root that does (`write = ["~"]` with hx's directories under the home directory).
+        let ws = base.join("project");
+        std::fs::create_dir_all(ws.join(".harness")).unwrap();
+        for root in [base.to_string_lossy().into_owned(), dirs.config().to_string_lossy().into_owned()] {
+            std::fs::create_dir_all(dirs.config()).unwrap();
+            std::fs::write(ws.join(".harness/policy.toml"), format!("[fs]\nwrite = [{root:?}]\n")).unwrap();
+            crate::trust::record(&ws, &dirs).unwrap();
+            let err = Policy::new(&dirs, &ws, false, None, None, None).err().expect("refused").to_string();
+            assert!(err.contains("overlaps hx's configuration directory"), "{err}");
+        }
+        std::fs::remove_file(ws.join(".harness/policy.toml")).unwrap();
+        let p = Policy::new(&dirs, &ws, true, Some(ApprovalMode::Deny), None, None).unwrap();
+        let rules = p.confinement();
+        assert!(rules.read.iter().chain(&rules.write).all(|r| dirs.overlap(r).is_none() || r.starts_with(p.registry())), "{rules:?}");
+        // File tools refuse the trust store, the secrets, the journal and its directory, whatever the spelling.
+        let own = dirs.workspace(&ws);
+        std::fs::create_dir_all(&own.ar).unwrap();
+        let journal = p.log.path.to_string_lossy().into_owned();
+        for path in [dirs.trust_store(), own.secrets.clone(), own.log.clone(), own.ar.clone(), p.log.path.clone(), own.log.join("x/../y")] {
+            let path = path.to_string_lossy().into_owned();
+            assert!(p.check_read(&path).unwrap_err().to_string().contains("hx's own"), "read {path}");
+            assert!(p.check_write(&path).unwrap_err().to_string().contains("protected"), "write {path}");
+        }
+        std::os::unix::fs::symlink(&own.log, ws.join("logs")).unwrap();
+        assert!(p.check_read("logs").is_err() && p.check_write("logs/x").is_err());
+        assert!(futures::executor::block_on(p.authorize_path(&journal, false)).is_err(), "autopilot cannot grant a journal");
+        // This run's materialized skills are the exception: readable, never writable.
+        std::fs::create_dir_all(p.registry().join("skill")).unwrap();
+        std::fs::write(p.registry().join("skill/notes.md"), "notes").unwrap();
+        let skill = p.registry().join("skill/notes.md").to_string_lossy().into_owned();
+        assert!(p.check_read(&skill).is_ok());
+        assert!(p.check_write(&skill).is_err());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
-    fn file_tools_refuse_hidden_files_by_identity_after_a_link_or_move() {
-        let (p, dir) = hidden_workspace("identity");
-        p.confinement(); // a shell command starts
-        std::fs::hard_link(dir.join(".harness/secrets.toml"), dir.join("leak.txt")).unwrap();
-        std::fs::rename(dir.join(".harness/ar/run/deep/held.txt"), dir.join("out.txt")).unwrap();
-        std::fs::rename(dir.join(".harness/ar/run/deep"), dir.join("moved-dir")).unwrap();
-        for f in ["leak.txt", "out.txt"] {
-            assert!(p.check_read(f).is_err(), "read {f}");
-            assert!(p.check_write(f).is_err(), "write {f}");
-        }
-        assert!(p.unreadable().iter().any(|u| u.ends_with("leak.txt")));
-        let rules = p.confinement(); // the next command hides every name
-        for f in ["leak.txt", "out.txt", "moved-dir", ".harness/secrets.toml"] {
-            assert!(rules.hidden.contains(&dir.join(f)), "{f} not hidden from children: {:?}", rules.hidden);
-        }
-        assert!(p.check_read("README-absent").is_err());
-        std::fs::write(dir.join("README.md"), "public").unwrap();
-        assert!(p.check_read("README.md").is_ok());
+    fn a_run_resumes_only_from_its_workspace_log_directory() {
+        let dirs = TestDirs::new();
+        let ws = std::env::temp_dir().join(format!("hx-policy-resume-elsewhere-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let p = Policy::new(&dirs, &ws, false, None, None, None).unwrap();
+        let (journal, copy) = (p.log.path.clone(), ws.join(p.log.path.file_name().unwrap()));
         drop(p);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::copy(&journal, &copy).unwrap();
+        let err = Policy::new(&dirs, &ws, false, None, Some(&copy), None).err().expect("refused").to_string();
+        assert!(err.contains("not in this workspace's log directory"), "{err}");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
-    fn a_hidden_file_with_an_extra_link_is_searched_for_once_not_per_command() {
-        let (p, dir) = hidden_workspace("search-once");
-        let outside = std::env::temp_dir().join(format!("hx-policy-outside-link-{}", std::process::id()));
-        let _ = std::fs::remove_file(&outside);
-        p.confinement();
-        // A link outside every write root (the owner's own, say) can never be found by searching the write roots.
-        std::fs::hard_link(dir.join(".harness/secrets.toml"), &outside).unwrap();
-        for _ in 0..5 { p.confinement(); }
-        assert_eq!(p.hidden.lock().unwrap().searches, 1);
-        std::fs::hard_link(dir.join(".harness/secrets.toml"), dir.join("again.txt")).unwrap();
-        for _ in 0..5 { p.confinement(); }
-        assert_eq!(p.hidden.lock().unwrap().searches, 2);
-        assert!(p.check_read("again.txt").is_err());
+    fn the_policy_comes_from_the_trusted_bytes() {
+        let dirs = TestDirs::new();
+        let ws = std::env::temp_dir().join(format!("hx-policy-trusted-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(ws.join(".harness")).unwrap();
+        std::fs::write(ws.join(".harness/policy.toml"), "[budget]\nmax_tokens = 7\n").unwrap();
+        crate::trust::record(&ws, &dirs).unwrap();
+        assert_eq!(Policy::new(&dirs, &ws, false, None, None, None).unwrap().budget.max_tokens, Some(7));
+        // Changed after trust: not used at all (neither the new bytes nor, of course, the old ones).
+        std::fs::write(ws.join(".harness/policy.toml"), "[budget]\nmax_tokens = 9\n").unwrap();
+        assert_eq!(Policy::new(&dirs, &ws, false, None, None, None).unwrap().budget.max_tokens, None);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn autopilot_grants_a_file_but_never_a_directory() {
+        let (p, dir, _dirs) = test_policy("autopilot-dir", true, &[]);
+        let outside = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("hx-policy-autopilot-dir-out-{}", std::process::id()));
+        std::fs::create_dir_all(outside.join(".ssh")).unwrap();
+        std::fs::write(outside.join(".ssh/id_rsa"), "KEY").unwrap();
+        std::fs::write(outside.join(".ssh/known_hosts"), "hosts").unwrap();
+        let err = p.authorize_path(&outside.join(".ssh").to_string_lossy(), false).await.unwrap_err();
+        assert!(err.is::<OutsideRoots>() || err.is::<ApprovalRequired>(), "{err}");
+        assert!(!p.confinement().read.iter().any(|r| r.starts_with(&outside)), "a directory was granted without the owner");
+        p.authorize_path(&outside.join(".ssh/known_hosts").to_string_lossy(), false).await.unwrap();
+        assert!(p.authorize_path(&outside.join(".ssh/id_rsa").to_string_lossy(), false).await.is_err(), "a credential file is never granted");
         drop(p);
-        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn an_automatic_write_grant_covers_the_file_not_its_parent_tree() {
-        let (p, dir) = test_policy("grant-file", true, &[]);
+        let (p, dir, _dirs) = test_policy("grant-file", true, &[]);
         let outside = std::env::temp_dir().join(format!("hx-policy-grant-outside-{}", std::process::id()));
         std::fs::create_dir_all(outside.join("sub")).unwrap();
         let outside = std::fs::canonicalize(outside).unwrap();
@@ -1441,8 +1418,7 @@ mod tests {
         assert!(p.check_write(&outside.join("other.txt").to_string_lossy()).is_err());
         let rules = p.confinement();
         assert!(rules.write.contains(&note) && !rules.write.iter().any(|w| outside.starts_with(w) && *w != note));
-        // A directory may be granted for reading, but never one holding the home directory or owner state.
-        p.authorize_path(&outside.join("sub").to_string_lossy(), false).await.unwrap();
+        // Never a directory holding the home directory or owner state, whoever is asked.
         for broad in ["/".to_string(), std::env::var("HOME").unwrap(), dir.parent().unwrap().to_string_lossy().into_owned()] {
             let err = p.authorize_path(&broad, false).await.unwrap_err().to_string();
             assert!(err.contains("cannot be granted"), "{broad}: {err}");
@@ -1454,7 +1430,7 @@ mod tests {
 
     #[test]
     fn git_hooks_and_config_are_protected_from_file_tools() {
-        let (p, dir) = test_policy("git-protect", false, &[]);
+        let (p, dir, _dirs) = test_policy("git-protect", false, &[]);
         for f in [".git/config", ".git/hooks/pre-commit", ".git/hooks"] {
             assert!(p.check_write(f).unwrap_err().to_string().contains("protected"), "{f}");
         }

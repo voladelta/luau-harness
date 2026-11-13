@@ -28,13 +28,13 @@ check "the prompt documents view()" "$(tail -1 $T/req.jsonl | grep -c 'view(path
 : > $T/req.jsonl; run $W >/dev/null
 check "without the pack: no view, no prompt line" "$(tail -1 $T/req.jsonl | grep -c 'view(path')" "0"
 check "without the pack: no images sent" "$(img_parts)" "0"
-check "event log has no pixels anywhere" "$(cat $W/.harness/log/*.jsonl | grep -c 'iVBORw0KGgo')" "0"
+check "event log has no pixels anywhere" "$(cat "$(logdir $W)"/*.jsonl | grep -c 'iVBORw0KGgo')" "0"
 ffmpeg -v error -f rawvideo -pix_fmt rgb24 -s 2000x2000 -i /dev/urandom -frames:v 1 $W/noise.png  # ~16 MB of base64
 check "one turn takes at most half the image byte budget" "$($H exec --workspace $W --pack std/vision 'print(pcall(view, "noise.png", {max = 2000}))' 2>&1 | grep -c 'over the 2.7 MB')" "1"
 check "at most 4 images per turn across calls" "$($H exec --workspace $W --pack std/vision 'view({"frame.png","frame.png","frame.png"})' 'print(pcall(view, {"frame.png","frame.png"}))' 2>&1 | grep -c 'per turn')" "1"
 
 # Completed recovery returns the saved report and captured conversation; it does not reread old images.
-LOG=$(grep -l '"tool":"view"' $W/.harness/log/*.jsonl | head -1)
+LOG=$(grep -l '"tool":"view"' "$(logdir $W)"/*.jsonl | head -1)
 resume() { OPENROUTER_API_KEY=x $H run --workspace $W --resume $LOG --trace $T/$1 >$T/$1.out 2>$T/$1.err; }
 before=$(wc -l < $T/req.jsonl | tr -d ' ')
 resume tr2.txt; rc=$?

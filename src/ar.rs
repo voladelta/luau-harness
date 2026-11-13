@@ -11,8 +11,8 @@
 //!   evaluator sees exactly the recorded bytes and nothing else the agent did.
 //! - Evaluators run with a scrubbed environment in a throwaway copy, confined (Landlock) to that copy, the system and
 //!   their grader roots; only the select evaluator may read the holdout roots.
-//! - The run directory (`.harness/ar/RUN`, with `base`, snapshots, ledger, claims, journal and held-out scores) is
-//!   sealed from file tools and from confined shell commands in every mode.
+//! - The run directory (`RUN` in the workspace's autoresearch directory, `crate::dirs`, with `base`, snapshots, ledger,
+//!   claims, journal and held-out scores) is in hx's state directory, outside every root of every episode.
 //!
 //! A run is research, then rounds. A research episode studies the task and writes the brief every worker gets. Round 1
 //! runs explore workers side by side; each derives its own idea from a host seed and claims it with `ar.claim`. Claims
@@ -91,10 +91,12 @@ pub struct Spec {
 impl Spec {
     fn max() -> String { "max".into() }
     fn timeout() -> f64 { 600.0 }
-    pub fn load(workspace: &Path) -> Result<Spec> {
+    /// The spec in `config`, the workspace config the trust decision covered (never a second read of the file).
+    pub fn load(workspace: &Path, config: &crate::trust::Config) -> Result<Spec> {
         let path = workspace.join(".harness/ar.toml");
-        let text = std::fs::read_to_string(&path).with_context(|| format!("--ar needs {}", path.display()))?;
-        let spec: Spec = toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        let text = config.file(".harness/ar.toml").with_context(|| format!("--ar needs {}", path.display()))?;
+        let spec: Spec = std::str::from_utf8(text).map_err(anyhow::Error::from)
+            .and_then(|t| toml::from_str(t).map_err(anyhow::Error::from)).with_context(|| format!("invalid {}", path.display()))?;
         ensure!(!spec.editable.is_empty(), "ar.toml: editable must name at least one path");
         for p in &spec.editable {
             let parts: Vec<&str> = p.trim_end_matches('/').split('/').collect();
@@ -103,9 +105,14 @@ impl Spec {
                 && !matches!(parts[0], ".harness" | ".git"),
                 "ar.toml: editable path {p:?} must be a relative path inside the workspace, outside .harness and .git");
         }
+        let agent_reads = crate::policy::system_read_roots();
         for g in spec.roots(true)? {
             ensure!(!g.starts_with(workspace) && !workspace.starts_with(&g),
                 "ar.toml: grader and holdout root {} must not overlap the workspace", g.display());
+            // Landlock only adds access, so no root of an episode's shell commands may hold one.
+            if let Some(r) = agent_reads.iter().find(|r| g.starts_with(r)) {
+                bail!("ar.toml: grader and holdout root {} lies inside {}, which the agent's shell commands may read", g.display(), r.display());
+            }
         }
         search_read_roots(&spec)?;
         ensure!(matches!(spec.direction.as_str(), "max" | "min"), "ar.toml: direction must be max or min");
@@ -207,12 +214,10 @@ fn baseline(dir: &Path) -> Option<Baseline> {
 #[serde(rename_all = "snake_case")]
 pub enum Role { Research, Explore, Exploit, Audit }
 
-/// Paths a child's policy must seal, so that even with --yes its agent cannot read or change them: every
-/// autoresearch run of the owner's workspace (this run included) and the evaluators' roots.
+/// Paths a child's policy must seal, so that even with --yes its agent cannot read or change them: the evaluators'
+/// roots. (The runs themselves are in hx's state directory, which no policy lets the model reach.)
 pub fn sealed(e: &Episode) -> Vec<PathBuf> {
-    let mut out = vec![e.dir.parent().unwrap_or(&e.dir).to_path_buf()];
-    out.extend(e.spec.roots(true).unwrap_or_default());
-    out
+    e.spec.roots(true).unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -356,6 +361,8 @@ struct Outcome {
 }
 
 struct Orchestrator {
+    /// hx's directories; episode children share them, so their journals land in this state directory.
+    dirs: crate::dirs::Dirs,
     workspace: PathBuf,
     dir: PathBuf,
     launch: Launch,
@@ -522,7 +529,7 @@ impl Orchestrator {
         let report = String::from_utf8_lossy(&out.stdout).lines().rev()
             .find_map(|l| serde_json::from_str::<Value>(l).ok()).unwrap_or(Value::Null);
         std::fs::write(ep_dir.join(format!("{label}.report.json")), serde_json::to_vec_pretty(&report)?)?;
-        let logs = keep_logs(&ws, &ep_dir, label)?;
+        let logs = keep_logs(&self.dirs.workspace(&ws).log, &ep_dir, label)?;
         drop(scratch);
         // Without a report the child's journals say how often it was rate-limited.
         let rate_limits = report["rate_limits"].as_u64().unwrap_or_else(|| rate_limited(&logs));
@@ -772,7 +779,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
     /// Close the episodes a stopped orchestrator left open. A child whose report the orchestrator saved had ended:
     /// it finished as it would have. Any other was interrupted: a worker that scored nothing, research and audits
     /// (judged by a final answer a killed child never gave) are retried, without counting as a crash. The child's
-    /// journals, in its leftover scratch copy, say how often it was rate-limited.
+    /// journals, left in hx's state directory, say how often it was rate-limited.
     fn close_open(&self, records: &mut Vec<Record>) -> Result<()> {
         let rows = ledger(&self.dir)?;
         let episodes = self.dir.join("episodes");
@@ -790,8 +797,8 @@ comes from a hole or a rule violation). Without that line the audit counts for n
                 Some(report) => Record::Finished { crashed: evals == 0 && report.is_null(), interrupted: false,
                     rate_limits: report["rate_limits"].as_u64().unwrap_or(0), label },
                 None => {
-                    let rate_limits = match scratch.map(|s| s.join("ws")).filter(|ws| ws.is_dir()) {
-                        Some(ws) => rate_limited(&keep_logs(&ws, &episodes, &label)?),
+                    let rate_limits = match scratch {
+                        Some(scratch) => rate_limited(&keep_logs(&self.dirs.workspace(&scratch.join("ws")).log, &episodes, &label)?),
                         None => 0,
                     };
                     let answer_only = label.starts_with("r0-") || label.starts_with('a');
@@ -980,12 +987,13 @@ fn show(v: Option<f64>) -> String {
 }
 
 /// `hx run --ar`: search until two rounds in a row make no progress, or continue the run in `resume` (a run directory).
-pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>, resume: Option<PathBuf>) -> Result<()> {
+pub async fn orchestrate(workspace: &Path, dirs: &crate::dirs::Dirs, start: Option<(Vec<String>, String)>, resume: Option<PathBuf>) -> Result<()> {
+    let runs = dirs.workspace(workspace).ar;
     // A resumed run uses the spec frozen in its sealed launch.json, approved when it started; only a launch reads ar.toml.
     let (dir, launch, records) = match (start, resume) {
         (_, Some(dir)) => {
             let dir = dir.canonicalize().with_context(|| format!("autoresearch run {}", dir.display()))?;
-            ensure!(dir.parent() == Some(&workspace.join(".harness/ar").canonicalize()?), "--resume for --ar takes a run directory under .harness/ar");
+            ensure!(dir.parent() == Some(runs.as_path()), "--resume for --ar takes a run of this workspace, in {}", runs.display());
             let launch: Launch = serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?)?;
             ensure!(!dir.join("report.json").exists(), "autoresearch run {} already finished", dir.display());
             ensure!(dir.join("seed.json").exists() || !dir.join("ledger.jsonl").exists(),
@@ -994,13 +1002,14 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>,
             (dir, launch, records)
         }
         (Some((child_args, program)), None) => {
-            ensure!(crate::trust::is_trusted(workspace), "--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first");
+            let config = crate::trust::trusted(workspace, dirs)?
+                .context("--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first")?;
             ensure!(crate::workflow::git_inventory(workspace)?.is_some(), "--ar requires a Git repository at the workspace root");
-            let spec = Spec::load(workspace)?;
+            let spec = Spec::load(workspace, &config)?;
             let bad = uncommitted(workspace, &spec)?;
             ensure!(bad.is_empty(), "--ar freezes the committed tree: commit or remove changes outside the editable paths: {}", bad.join(", "));
             let id = format!("{}-{}", chrono_stamp(), std::process::id());
-            let dir = workspace.join(".harness/ar").join(&id);
+            let dir = runs.join(&id);
             std::fs::create_dir_all(&dir)?;
             let commit = freeze(workspace, &dir)?;
             std::fs::write(dir.join("seed"), save_snap(&dir, &capture(workspace, &spec)?)?)?;
@@ -1010,7 +1019,7 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>,
         }
         (None, None) => bail!("--ar needs a program, or --resume RUN_DIR"),
     };
-    let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, launch };
+    let mut o = Orchestrator { dirs: dirs.clone(), workspace: workspace.to_path_buf(), dir, launch };
     eprintln!("hx ar: run {}{}", o.dir.display(), if records.is_empty() { "" } else { ", resumed" });
     let report = o.run(records).await?;
     outln!("{}", serde_json::to_string(&report)?)?;
@@ -1114,7 +1123,7 @@ mod tests {
             std::fs::write(dir.join("seed"), "seed").unwrap();
             std::fs::write(dir.join("seed.json"), r#"{"score": 0.0, "report": null}"#).unwrap();
             let spec: Spec = toml::from_str("editable = [\"x\"]\neval = \"true\"\n").unwrap();
-            let o = Orchestrator { workspace: dir.clone(), dir: dir.clone(),
+            let o = Orchestrator { dirs: crate::dirs::Dirs::at(&dir.join("config"), &dir.join("state")), workspace: dir.clone(), dir: dir.clone(),
                 launch: Launch { spec, program: String::new(), child_args: vec![], commit: String::new() } };
             let ideas: std::collections::BTreeSet<u32> = rows.iter().map(|r| r.0).collect();
             for idea in ideas {
@@ -1203,10 +1212,10 @@ mod tests {
         let load = |holdout: &Path| {
             std::fs::write(ws.join(".harness/ar.toml"), format!("editable = [\"x\"]\neval = \"true\"\ngrader = [\"{}\"]\n\
                 holdout = [\"{}\"]\n", grader.display(), holdout.display())).unwrap();
-            Spec::load(&ws).map(drop).map_err(|e| e.to_string())
+            Spec::load(&ws, &crate::trust::Config::read(&ws).unwrap()).map(drop).map_err(|e| e.to_string())
         };
         assert!(load(&grader.join("select")).unwrap_err().contains("which the search evaluator may read"));
-        assert!(load(Path::new("/etc")).unwrap_err().contains("which the search evaluator may read"));
+        assert!(load(Path::new("/etc")).unwrap_err().contains("which the agent's shell commands may read"));
         std::fs::create_dir_all(base.join("held")).unwrap();
         assert_eq!(load(&base.join("held")), Ok(()));
         let _ = std::fs::remove_dir_all(&base);

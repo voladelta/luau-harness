@@ -77,19 +77,23 @@ if unconfined "$W"; then
   out=$(run "print(sh('cat $S1; echo written > $ESC').stdout)" | head -1)
   check "unconfined shell reads and writes beyond file-tool roots" "$out$(cat "$ESC")" "SECRETwritten"
 else
-  echo CREDENTIAL > $W/.harness/secrets.toml; echo PUBLIC > $W/README.md
-  out=$(run 'local s, r = sh("cat .harness/secrets.toml"), sh("cat README.md") print(s.code ~= 0, s.stdout == "", r.stdout)' | head -1)
-  check "confined shell cannot read .harness/secrets.toml but reads README.md" "$(echo "$out" | tr '\t' '|')" "true|true|PUBLIC"
-  out=$(run 'sh("cp .harness/secrets.toml copied.txt; mkdir -p d; mv .harness/secrets.toml d/moved.txt; ln d/moved.txt linked.txt")' \
-    'print(sh("cat copied.txt d/moved.txt linked.txt 2>/dev/null").stdout == "")' | sed -n 3p)
-  check "a credential file copied, moved or hard-linked stays unreadable to later commands of the run" "$out" "true"
-  rm -rf $W/d $W/linked.txt $W/copied.txt
-  echo CREDENTIAL > $W/.harness/secrets.toml; mkdir -p $W/.harness/ar/run; echo SEALED-MARK > $W/.harness/ar/run/held.txt
-  out=$(run 'sh("ln .harness/secrets.toml leak.txt; mv .harness/ar/run/held.txt out.txt")
-local a, b = pcall(read, "leak.txt") local c, d = pcall(read, "out.txt")
-print(a, c, #search("CREDENTIAL", {literal = true}), #search("SEALED-MARK", {literal = true}), sh("cat leak.txt out.txt").stdout == "")' | head -1)
-  check "file tools and later commands refuse a hidden file hard-linked or moved out of sealed state" "$(echo "$out" | tr '\t' '|')" "false|false|0|0|true"
-  rm -rf $W/leak.txt $W/out.txt $W/.harness/ar
+  # hx's own files (the workspace's secrets, its journals and autoresearch runs) are outside the workspace and every root.
+  SEC=$($H paths --workspace "$W" | sed -n 's/^secrets: //p'); AR=$($H paths --workspace "$W" | sed -n 's/^ar: //p')
+  mkdir -p "$(dirname "$SEC")" "$AR/run"; echo 'K = "CREDENTIAL"' > "$SEC"; echo SEALED-MARK > "$AR/run/held.txt"; echo PUBLIC > $W/README.md
+  out=$(run "local s, r = sh('cat $SEC'), sh('cat README.md') print(s.code ~= 0, s.stdout == '', r.stdout)" | head -1)
+  check "confined shell cannot read the workspace secrets but reads README.md" "$(echo "$out" | tr '\t' '|')" "true|true|PUBLIC"
+  out=$(run 'local r = sh("echo hi > new.txt; cat new.txt; mkdir -p venv/bin && echo ok > venv/bin/x && cat venv/bin/x; git init -q fresh && echo git-ok") print(r.stdout:gsub("\n", " "))' | head -1)
+  check "a command reads the files it creates in a workspace that has secrets" "$out" "hi ok git-ok 	3"
+  out=$(run "print(sh('mv $SEC leak.txt').code ~= 0, sh('echo forged > $SEC').code ~= 0, sh('echo x > $AR/run/held.txt; mv $AR/run/held.txt out.txt').code ~= 0)" | head -1)
+  check "confined shell cannot move or overwrite the secrets or autoresearch state" "$(echo "$out" | tr '\t' '|')$(cat "$SEC" "$AR/run/held.txt" | tr '\n' '|')" "true|true|true"'K = "CREDENTIAL"|SEALED-MARK|'
+  out=$(run 'local a = pcall(read, "leak.txt") local b = pcall(read, "out.txt") print(a, b, #search("CREDENTIAL", {literal = true}), sh("cat leak.txt out.txt 2>/dev/null").stdout == "")' | head -1)
+  check "nothing of it is reachable in the next run" "$(echo "$out" | tr '\t' '|')" "false|false|0|true"
+  out=$($H exec --workspace "$W" --yes "print(pcall(read, '$SEC'), pcall(read, '$AR/run/held.txt'), pcall(write, '$AR/run/held.txt', 'x'))" 2>&1 | head -1)
+  check "file tools refuse hx's own files, even with --yes" "$(echo "$out" | cut -f1-3 | tr '\t' '|')" "false|false|false"
+  rm -rf "$W/leak.txt" "$W/out.txt" "$W/new.txt" "$W/venv" "$W/fresh" "$AR"
+  KEYS=$OUT/home/.ssh; mkdir -p $KEYS; echo PRIVATE-KEY > $KEYS/id_rsa
+  out=$($H exec --workspace "$W" --yes "print(pcall(sh, 'cat id_rsa', {cwd = '$KEYS'}))" 2>&1 </dev/null | head -1)
+  check "--yes never grants a directory: no shell command in ~/.ssh" "$(echo "$out" | grep -c PRIVATE-KEY)$(echo "$out" | grep -c 'approval_required')" "01"
   out=$(run 'print(pcall(read, "/dev/tty"), sh("echo x > /dev/tty; ls /dev/pts").code ~= 0, sh("head -c1 /dev/urandom >/dev/null").code)' | head -1)
   check "no terminal access for file tools or confined commands" "$(echo "$out" | tr '\t' '|')" "false|true|0"
   REALHOME=$(mktemp -d); mkdir -p $REALHOME/.config/hx; echo ORIG > $REALHOME/.config/hx/trust.toml
@@ -101,7 +105,7 @@ ORIG"
   check "confined shell cannot read or write beyond the roots" "$(echo "$out" | tr '\t' '|')$([ -e $ESC ] && echo WROTE)" "true|true"
   out=$($H exec --workspace "$W" --yes "read(\"$S1\") print(sh('cat $S1').stdout)" 2>&1 | head -1)
   check "a path grant approved mid-run applies to later shell commands" "$out" "SECRET"
-  rm -f $W/.harness/secrets.toml
+  rm -f "$SEC"
 fi
 
 # --- approval classes: a program the classifier cannot read needs approval; everyday commands do not

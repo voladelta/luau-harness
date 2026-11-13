@@ -5,12 +5,12 @@
 //! unconfined, and the run says so once.
 use std::path::{Path, PathBuf};
 
-/// What a child may touch. `hidden` paths are carved out of the read roots that contain them.
+/// What a child may touch: everything beneath each read root (read-only) and each write root (write only; a path a
+/// child should read and write is in both lists).
 #[derive(Debug, Default)]
 pub struct Rules {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
-    pub hidden: Vec<PathBuf>,
 }
 
 /// Read-only for every child, in addition to the policy's read roots: shared libraries, process and system
@@ -74,12 +74,6 @@ impl Rules {
         // older kernel lacks.
         let abi = ABI::from(version);
         let (read, write) = (AccessFs::from_read(abi), AccessFs::from_write(abi));
-        let mut full = vec![];
-        let mut list = vec![];
-        let hidden: Vec<PathBuf> = self.hidden.iter().filter_map(|h| std::fs::canonicalize(h).ok()).collect();
-        for root in self.read.iter().filter_map(|r| std::fs::canonicalize(r).ok()) {
-            carve(&root, &hidden, &mut full, &mut list);
-        }
         let err = |e: landlock::RulesetError| std::io::Error::other(e.to_string());
         let mut builder = Builder::default().handle_access(AccessFs::from_all(abi)).map_err(err)?;
         let scopes = Scope::from_all(abi);
@@ -90,30 +84,10 @@ impl Rules {
             if let Ok(fd) = PathFd::new(path) { ruleset.as_mut().add_rule(PathBeneath::new(fd, access)).map_err(err)?; }
             Ok(())
         };
-        for p in &full { add(p, read)?; }
-        for p in &list { add(p, AccessFs::ReadDir.into())?; }
-        // Write rules add no read access: a hidden file inside a write root stays unreadable. (Moving it to a readable
-        // place is refused too: Landlock never lets a rename or link gain access.)
+        for p in &self.read { add(p, read)?; }
         for p in &self.write { add(p, write)?; }
         let fd: Option<std::os::fd::OwnedFd> = ruleset.into();
         Ok(fd.map(Ruleset))
-    }
-}
-
-/// Grant `root` for reading, except `hidden` paths beneath it. Landlock only adds access, so a directory on the way
-/// to a hidden path gets listing access only and each of its other entries is granted separately; an entry created in
-/// such a directory after the ruleset was built is readable from the next command on. Symlinked entries are skipped:
-/// granting one would grant its target.
-fn carve(root: &Path, hidden: &[PathBuf], full: &mut Vec<PathBuf>, list: &mut Vec<PathBuf>) {
-    if hidden.iter().any(|h| root.starts_with(h)) { return; }
-    if !hidden.iter().any(|h| h.starts_with(root)) {
-        full.push(root.to_path_buf());
-        return;
-    }
-    list.push(root.to_path_buf());
-    let Ok(entries) = std::fs::read_dir(root) else { return };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|t| !t.is_symlink()) { carve(&entry.path(), hidden, full, list); }
     }
 }
 
@@ -134,49 +108,6 @@ impl Ruleset {
 mod tests {
     use super::*;
 
-    #[test]
-    fn carving_grants_siblings_and_lists_ancestors() {
-        let dir = std::env::temp_dir().join(format!("hx-carve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".harness/log")).unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join(".harness/secrets.toml"), "k").unwrap();
-        std::fs::write(dir.join("README.md"), "r").unwrap();
-        std::os::unix::fs::symlink("/etc", dir.join("link")).unwrap();
-        let (mut full, mut list) = (vec![], vec![]);
-        carve(&dir, &[dir.join(".harness/secrets.toml")], &mut full, &mut list);
-        full.sort();
-        assert_eq!(full, vec![dir.join(".harness/log"), dir.join("README.md"), dir.join("src")]);
-        list.sort();
-        assert_eq!(list, vec![dir.clone(), dir.join(".harness")]);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_confined_child_cannot_read_a_hidden_file() {
-        if status().is_err() { eprintln!("skipped: Landlock unavailable"); return; }
-        let dir = std::env::temp_dir().join(format!("hx-confine-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".harness")).unwrap();
-        std::fs::write(dir.join(".harness/secrets.toml"), "SECRET").unwrap();
-        std::fs::write(dir.join("README.md"), "PUBLIC").unwrap();
-        let rules = Rules { read: vec![dir.clone(), "/usr".into(), "/bin".into(), "/etc".into()], write: vec![], hidden: vec![dir.join(".harness/secrets.toml")] }.with_system();
-        let ruleset = std::sync::Arc::new(rules.prepare().unwrap().unwrap());
-        let run = |file: &str| {
-            let r = ruleset.clone();
-            let mut cmd = std::process::Command::new("cat");
-            cmd.arg(dir.join(file));
-            use std::os::unix::process::CommandExt;
-            // SAFETY: `apply` is async-signal-safe (two syscalls on an fd prepared before the fork).
-            unsafe { cmd.pre_exec(move || r.apply()); }
-            cmd.output().unwrap()
-        };
-        assert_eq!(run("README.md").stdout, b"PUBLIC");
-        let secret = run(".harness/secrets.toml");
-        assert!(!secret.status.success() && secret.stdout.is_empty());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// Run `script` with bash under `rules`; returns (exit code, stdout, stderr).
     fn confined(rules: Rules, script: &str) -> (Option<i32>, String, String) {
         use std::os::unix::process::CommandExt;
@@ -189,8 +120,26 @@ mod tests {
         (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
     }
 
+    #[test]
+    fn a_confined_child_reads_what_it_creates_and_nothing_outside_its_roots() {
+        if status().is_err() { eprintln!("skipped: Landlock unavailable"); return; }
+        let dir = std::env::temp_dir().join(format!("hx-confine-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        std::fs::create_dir_all(dir.join("owner")).unwrap();
+        std::fs::write(dir.join("owner/secrets.toml"), "SECRET").unwrap();
+        let ws = dir.join("ws");
+        let rules = Rules { read: vec![ws.clone(), "/usr".into(), "/bin".into(), "/etc".into()], write: vec![ws.clone()] }.with_system();
+        let script = format!("cd {} && echo hi > new.txt && cat new.txt && mkdir -p d/e && echo x > d/e/f && cat d/e/f && cat ../owner/secrets.toml",
+            ws.display());
+        let (code, out, err) = confined(rules, &script);
+        assert_eq!(out, "hi\nx\n", "{err}");
+        assert!(code != Some(0) && err.contains("Permission denied"), "{code:?} {err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn system() -> Rules {
-        Rules { read: vec!["/usr".into(), "/bin".into(), "/etc".into()], write: vec![], hidden: vec![] }.with_system()
+        Rules { read: vec!["/usr".into(), "/bin".into(), "/etc".into()], write: vec![] }.with_system()
     }
 
     #[test]

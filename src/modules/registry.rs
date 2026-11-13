@@ -47,12 +47,12 @@ impl Registry {
     /// Freeze everything a run may load: the built-in package, and, when the workspace config is trusted, the
     /// overrides, project init, MCP servers and local tools from the bytes trust covered, plus every package and agent
     /// skill whose snapshot the lock in those bytes approves.
-    pub fn capture(root: &Path) -> Result<Self> {
-        Self::build(root, crate::trust::trusted(root)?)
+    pub fn capture(root: &Path, dirs: &crate::dirs::Dirs) -> Result<Self> {
+        Self::build(root, crate::trust::trusted(root, dirs)?, dirs)
     }
 
     /// `capture` from config already read and judged: `config` is None when it may not be used.
-    pub(super) fn build(root: &Path, config: Option<crate::trust::Config>) -> Result<Self> {
+    pub(super) fn build(root: &Path, config: Option<crate::trust::Config>, dirs: &crate::dirs::Dirs) -> Result<Self> {
         let mut registry = Registry::default();
         for (pkg, file, text) in EMBEDDED {
             let key = format!("{pkg}/{file}");
@@ -95,7 +95,7 @@ impl Registry {
             }
         }
         registry.mcp = crate::mcp::snapshot(config.file(".harness/mcp.toml"))?;
-        crate::tools::capture(root, config.tree(".harness/tools"), &mut registry)?;
+        crate::tools::capture(dirs, root, config.tree(".harness/tools"), &mut registry)?;
         Ok(registry)
     }
 

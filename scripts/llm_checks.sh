@@ -32,7 +32,7 @@ models() { # MOCK_MODELS json, then runq args -> request log and stderr in $T/mo
 }
 models '{"data":[{"id":"any/model","context_length":40000,"top_provider":{"max_completion_tokens":3000}}]}'
 check "the provider's listing sets the output cap" "$(has '"max_output_tokens": 3000')" "yes"
-check "...and the window, frozen in the manifest" "$(grep -h '"kind":"manifest"' $W/.harness/log/*.jsonl | head -1 | python3 -c "import json,sys,pathlib;r=json.loads(sys.stdin.read());print(json.loads(pathlib.Path('$W/.harness/log/blobs/'+r['blob']).read_text())['model']['context_window'])")" "40000"
+check "...and the window, frozen in the manifest" "$(grep -h '"kind":"manifest"' "$(logdir $W)"/*.jsonl | head -1 | python3 -c "import json,sys,pathlib;r=json.loads(sys.stdin.read());print(json.loads(pathlib.Path('$(logdir $W)/blobs/'+r['blob']).read_text())['model']['context_window'])")" "40000"
 models '{"data":[{"id":"any/model","context_length":40000}]}' --context-window 200000
 check "--context-window wins over the listing" "$(has '"max_output_tokens": 50000')" "yes"
 models '{"data":[]}'

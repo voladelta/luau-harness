@@ -70,8 +70,13 @@ def report_of(result):
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def ardir(path):
+    """The workspace's autoresearch directory (its runs), in the suite's state directory."""
+    return harness.hx_path(path, "ar")
+
+
 def ledger(path, report):
-    return [json.loads(line) for line in (path / ".harness/ar" / report["run"] / "ledger.jsonl").read_text().splitlines()]
+    return [json.loads(line) for line in (ardir(path) / report["run"] / "ledger.jsonl").read_text().splitlines()]
 
 
 def answered(body):
@@ -274,7 +279,7 @@ def scenario_00():
     with harness.provider(scripted) as (url, requests):
         result = ar(path, url)
     report = report_of(result)
-    run = path / ".harness/ar" / report["run"]
+    run = ardir(path) / report["run"]
     rows = ledger(path, report)
     claims = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines()]
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
@@ -371,7 +376,7 @@ def scenario_01():
     assert report["search"] == 12, report["search"]
     check("small refinement steps add up to progress; a run that keeps progressing goes on until progress stops")
 
-    records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
+    records = [json.loads(l) for l in (ardir(path) / report["run"] / "journal.jsonl").read_text().splitlines()]
     widths = [len(r["episodes"]) for r in records if r["kind"] == "planned" and r["batch"].startswith("round")]
     assert widths[0] == 8 and widths[1] == 6 and max(widths[1:]) == 6, widths
     limited = [r for r in records if r["kind"] == "finished" and r.get("rate_limits")]
@@ -386,7 +391,7 @@ def scenario_02():
     with harness.provider(hopeless) as (url, _):
         result = ar(path, url)
     report = report_of(result)
-    run = path / ".harness/ar" / report["run"]
+    run = ardir(path) / report["run"]
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
     gates = [r for r in records if r["kind"] == "gate"]
     assert len(gates[0]["chosen"]) == 3 and not any(c["good"] for c in gates[0]["candidates"]), gates[0]
@@ -414,7 +419,7 @@ def scenario_03():
     path = workspace("noverdict")
     with harness.provider(lambda body, index: "Checked the state." if role_of(body)[0] == "audit" else scripted(body, index)) as (url, _):
         report = report_of(ar(path, url))
-    records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
+    records = [json.loads(l) for l in (ardir(path) / report["run"] / "journal.jsonl").read_text().splitlines()]
     assert any(r["kind"] == "planned" and r["batch"].startswith("audit") for r in records), "no audit ran"
     assert not any(r["kind"] == "audited" for r in records) and report["portfolio"] == [], report["portfolio"]
     assert (path / "x.txt").read_text() == "0\n" and "no verdict; it stays unaudited" in (BASE / "noverdict.stderr").read_text()
@@ -464,20 +469,25 @@ def scenario_06():
 
 
 def scenario_07():
-    # File tools cannot read owner state in either policy mode; each episode gets its own journal.
+    # Neither file tools nor shell commands reach the runs in either policy mode; each episode gets its own journal,
+    # kept in the run.
     for mode in ("default", "autopilot"):
         path = workspace(f"sealed-{mode}")
-        look = ('local r = sh("ls .harness/log/*.jsonl | wc -l")\n'
-                f'local ok, e = pcall(read, "{path}/.harness/ar")\n'
+        runs = ardir(path)
+        look = (f'local r = sh("ls {runs} >/dev/null 2>&1; echo $?; ls -a .harness 2>/dev/null | grep -c log")\n'
+                f'local ok, e = pcall(read, "{runs}")\n'
                 'print(ar.eval("baseline"))\n'
-                'return "OUT " .. r.stdout .. " READ " .. tostring(e)')
+                'return "OUT " .. r.stdout:gsub("\\n", " ") .. " READ " .. tostring(e)')
         with harness.provider(once(look, ("research", "r1-w1"))) as (url, requests):
-            ar(path, url, extra=["--yes"] if mode == "autopilot" else [])
+            result = ar(path, url, extra=["--yes"] if mode == "autopilot" else [])
         outs = [o for o in outputs(requests) if "OUT " in o]
         assert len(outs) >= 2, outs
-        assert all("sealed owner state" in o for o in outs), outs
-        assert all(o.split("OUT ")[1].split("READ")[0].strip().endswith("1") for o in outs), outs
-    check("file tools cannot read autoresearch state; episodes have separate journals")
+        assert all("hx's own configuration or state" in o for o in outs), outs
+        assert all(o.split("OUT ")[1].split("READ")[0].split() == ["2", "0"] for o in outs), outs
+        episodes = runs / report_of(result)["run"] / "episodes"
+        logs = {p.parent.name: len(list(p.parent.glob("*.jsonl"))) for p in episodes.glob("*.log/*.jsonl")}
+        assert {"r0-research.log", "r1-w1.log"} <= set(logs) and set(logs.values()) == {1}, logs
+    check("neither file tools nor commands reach autoresearch state; episodes have separate journals, kept in the run")
 
 
 def scenario_08():
@@ -488,7 +498,7 @@ def scenario_08():
     with harness.provider(once(race)) as (url, _):
         report = report_of(ar(path, url))
     first = ledger(path, report)[0]
-    snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{first['snap']}.json").read_text())
+    snap = json.loads((ardir(path) / report["run"] / "snaps" / f"{first['snap']}.json").read_text())
     assert base64.b64decode(snap["x.txt"]) == b"0\n" and first["score"] == -49, (first, snap)
     check("snapshot and score always agree")
 
@@ -500,7 +510,7 @@ def scenario_09():
     junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn ar.eval("junk")'
     with harness.provider(once(junk)) as (url, _):
         report = report_of(ar(path, url))
-    snap = json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{ledger(path, report)[0]['snap']}.json").read_text())
+    snap = json.loads((ardir(path) / report["run"] / "snaps" / f"{ledger(path, report)[0]['snap']}.json").read_text())
     assert base64.b64decode(snap["pkg/blob.bin"]) == b"\xff\xfe" and "pkg/link" not in snap, list(snap)
     check("binary editable files survive and symlinks are skipped")
 
@@ -514,7 +524,7 @@ def scenario_10():
                                    start_new_session=True)
         deadline, journal = time.time() + 180, None
         while time.time() < deadline:
-            journals = list((path / ".harness/ar").glob("*/journal.jsonl"))
+            journals = list(ardir(path).glob("*/journal.jsonl"))
             if journals:
                 lines = [json.loads(l) for l in journals[0].read_text().splitlines() if l.endswith("}")]
                 done = {r["label"] for r in lines if r["kind"] == "finished"}
@@ -558,7 +568,7 @@ def scenario_11():
                                    start_new_session=True)
         deadline, journal = time.time() + 180, None
         while time.time() < deadline:
-            journals = list((path / ".harness/ar").glob("*/journal.jsonl"))
+            journals = list(ardir(path).glob("*/journal.jsonl"))
             if journals and AUDIT_GATE.exists():
                 lines = [json.loads(l) for l in journals[0].read_text().splitlines() if l.endswith("}")]
                 if any(r["kind"] == "started" and r["label"].startswith("a1-") for r in lines):
@@ -605,7 +615,7 @@ def scenario_13():
     path = workspace("idle")
     with harness.provider(lambda body, index: "Answer: 0" if role_of(body)[0] == "judge" else "nothing to do") as (url, _):
         result = ar(path, url, ok=False)
-    episodes = list((path / ".harness/ar").glob("*/episodes/*.md"))
+    episodes = list(ardir(path).glob("*/episodes/*.md"))
     assert result.returncode != 0 and "made no evaluations" in result.stderr and len(episodes) == 9, (len(episodes), result.stderr[-800:])
     check("idle agents end the run after round 1; a run without evals fails")
 
@@ -617,7 +627,7 @@ def scenario_14():
         result = ar(path, url, env={"HX_AR_RETRY_SECS": "0"})
     report = report_of(result)
     assert "retrying" in result.stderr and report["evals"] > 0, result.stderr[-1500:]
-    records = [json.loads(l) for l in (path / ".harness/ar" / report["run"] / "journal.jsonl").read_text().splitlines()]
+    records = [json.loads(l) for l in (ardir(path) / report["run"] / "journal.jsonl").read_text().splitlines()]
     crashed = next(r for r in records if r["kind"] == "finished" and r.get("crashed"))
     assert any(r["kind"] == "started" and r["label"] == "r0-research.2" for r in records), records
     path = workspace("misconfigured")
@@ -645,17 +655,17 @@ def scenario_17():
     grader, holdout = held_out_roots()
     spec = f'editable = ["x.txt"]\neval = "python3 search.py"\ngrader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n'
     path = workspace("autopilot-seal", spec=spec)
-    (path / ".harness/ar/old-run").mkdir(parents=True)
-    (path / ".harness/ar/old-run/ledger.jsonl").write_text("secret ledger")
+    (ardir(path) / "old-run").mkdir(parents=True)
+    (ardir(path) / "old-run/ledger.jsonl").write_text("secret ledger")
     look = ('local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'")\n'
-            f'local a, ae = pcall(read, "{path}/.harness/ar/old-run/ledger.jsonl")\n'
+            f'local a, ae = pcall(read, "{ardir(path)}/old-run/ledger.jsonl")\n'
             f'local b, be = pcall(read, "{holdout}/secret.txt")\n'
             f'local c, ce = pcall(write, "{grader}/score.sh", "x")\n'
             'print(ar.eval("b"))\nreturn "OUT " .. r.stdout .. tostring(ae) .. tostring(be) .. tostring(ce)')
     with harness.provider(once(look)) as (url, requests):
         ar(path, url, extra=["--yes"])
     outs = [o for o in outputs(requests) if "OUT " in o]
-    assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and o.count("sealed owner state") == 3 for o in outs), outs
+    assert outs and all(o.split("OUT ")[1].lstrip().startswith("0") and o.count("sealed owner state") == 2 and "hx's own" in o for o in outs), outs
     assert (grader / "score.sh").read_text().count("\n") == 1, "grader root was modified"
     check("--yes episodes scrub credentials and file tools seal owner and grader data")
 
@@ -670,7 +680,7 @@ def scenario_18():
     with harness.provider(once(daemon)) as (url, requests):
         report = report_of(ar(path, url))
     snap = ledger(path, report)[0]["snap"]
-    pids = [int(base64.b64decode(json.loads((path / ".harness/ar" / report["run"] / "snaps" / f"{snap}.json").read_text())["pid.txt"]))]
+    pids = [int(base64.b64decode(json.loads((ardir(path) / report["run"] / "snaps" / f"{snap}.json").read_text())["pid.txt"]))]
     pids += [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_daemon=(\d+)", o)]
     assert len(pids) >= 2, (pids, outputs(requests))
     time.sleep(0.5)
@@ -771,7 +781,7 @@ def scenario_fallback():
     path = workspace("fallback")
     with harness.provider(strict) as (url, _):
         report = report_of(ar(path, url))
-    run = path / ".harness/ar" / report["run"]
+    run = ardir(path) / report["run"]
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
     claims = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines()]
     six = next(c["n"] for c in claims if c["scope"] == "explore" and c["idea"] == go(6))
@@ -793,7 +803,7 @@ def scenario_stall():
     path = workspace("stall")
     with harness.provider(outage) as (url, _):
         result = ar(path, url, ok=False, env={"HX_AR_RETRY_SECS": "0"})
-        run = next((path / ".harness/ar").iterdir())
+        run = next(ardir(path).iterdir())
         records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
         assert result.returncode != 0 and "keep failing" in result.stderr and not (run / "report.json").exists(), result.stderr[-1500:]
         assert [r["batch"] for r in records if r["kind"] == "stalled"] == ["round2"], records[-3:]

@@ -2,11 +2,12 @@
 //! `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/{override,tools}/` and `hx.lock`. The model cannot
 //! write them, but whoever wrote the repo can, so a cloned repo could widen file-tool access, start MCP commands or
 //! pre-approve its own packages and skills. hx therefore uses that config only when the user has trusted its exact
-//! content: `hx trust` records a hash per workspace in `~/.config/hx/trust.toml` (outside every repo, protected from
-//! the model). `hx run` and `hx exec` refuse untrusted config unless `--ignore-config` asks to run without it; other
+//! content: `hx trust` records a hash per workspace in the trust store (`Dirs::trust_store`, outside every repo and
+//! every root the model can reach). `hx run` and `hx exec` refuse untrusted config unless `--ignore-config` asks to run without it; other
 //! commands ignore it as if absent. A workspace with none of these files needs no trust. `HX_TRUST=<hash>` in hx's own
 //! environment trusts that exact config for one launch (throwaway copies).
-use anyhow::{anyhow, Context, Result};
+use crate::dirs::Dirs;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -15,35 +16,6 @@ use std::path::{Path, PathBuf};
 /// asks, and the agent stages there itself.)
 const FILES: [&str; 5] = [".harness/policy.toml", ".harness/mcp.toml", ".harness/init.luau", ".harness/ar.toml", "hx.lock"];
 const TREES: [&str; 3] = [".harness/override", ".harness/versions", ".harness/tools"];
-
-/// `$XDG_CONFIG_HOME/hx` or `~/.config/hx`.
-pub fn store_dir() -> Option<PathBuf> {
-    match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        Some(x) => Some(PathBuf::from(x).join("hx")),
-        None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/hx")),
-    }
-}
-
-/// The store dir with its deepest existing ancestor canonicalized (symlinks resolved), for the protected-path list:
-/// the policy compares canonical paths, so `~/.config -> dotfiles/config` must not slip past the protection.
-pub fn store_dir_canonical() -> Option<PathBuf> {
-    let d = store_dir()?;
-    let mut base = d.clone();
-    let mut rest = Vec::new();
-    while !base.exists() {
-        rest.push(base.file_name()?.to_os_string());
-        base = base.parent()?.to_path_buf();
-    }
-    let mut c = std::fs::canonicalize(&base).ok()?;
-    for r in rest.into_iter().rev() {
-        c.push(r);
-    }
-    Some(c)
-}
-
-fn store_file() -> Result<PathBuf> {
-    store_dir().map(|d| d.join("trust.toml")).ok_or_else(|| anyhow!("no HOME or XDG_CONFIG_HOME for the trust store"))
-}
 
 fn key(ws: &Path) -> String {
     std::fs::canonicalize(ws).unwrap_or_else(|_| ws.to_path_buf()).to_string_lossy().to_string()
@@ -175,10 +147,9 @@ pub fn config_hash(ws: &Path) -> Option<String> {
     Config::read(ws).ok()?.hash()
 }
 
-fn read_store() -> BTreeMap<String, String> {
-    store_file()
+fn read_store(dirs: &Dirs) -> BTreeMap<String, String> {
+    std::fs::read_to_string(dirs.trust_store())
         .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| toml::from_str::<BTreeMap<String, BTreeMap<String, String>>>(&t).ok())
         .and_then(|mut m| m.remove("workspaces"))
         .unwrap_or_default()
@@ -194,25 +165,25 @@ pub fn ignore_config() {
 /// The workspace config, when hx may use it: when there is none, when `HX_TRUST` in hx's own environment names its
 /// hash, or when its hash was trusted; never with `--ignore-config` or with symlinks in it. The returned bytes are the
 /// ones the decision covered: build from them, never from a second read.
-pub fn trusted(ws: &Path) -> Result<Option<Config>> {
+pub fn trusted(ws: &Path, dirs: &Dirs) -> Result<Option<Config>> {
     if IGNORE_CONFIG.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(None);
     }
     let config = Config::read(ws)?;
     let Some(h) = config.hash() else { return Ok(Some(config)) };
-    let consented = std::env::var("HX_TRUST").is_ok_and(|v| v == h) || read_store().get(&key(ws)) == Some(&h);
+    let consented = std::env::var("HX_TRUST").is_ok_and(|v| v == h) || read_store(dirs).get(&key(ws)) == Some(&h);
     Ok((consented && config.symlinks().is_empty()).then_some(config))
 }
 
 /// May hx use this workspace's config? See `trusted`; a config that cannot be read is not trusted.
-pub fn is_trusted(ws: &Path) -> bool {
-    matches!(trusted(ws), Ok(Some(_)))
+pub fn is_trusted(ws: &Path, dirs: &Dirs) -> bool {
+    matches!(trusted(ws, dirs), Ok(Some(_)))
 }
 
 /// `hx run` and `hx exec` refuse to start over workspace config the user has not trusted, rather than silently
 /// running without it.
-pub fn require_trusted(ws: &Path) -> Result<()> {
-    if IGNORE_CONFIG.load(std::sync::atomic::Ordering::Relaxed) || is_trusted(ws) {
+pub fn require_trusted(ws: &Path, dirs: &Dirs) -> Result<()> {
+    if IGNORE_CONFIG.load(std::sync::atomic::Ordering::Relaxed) || is_trusted(ws, dirs) {
         return Ok(());
     }
     anyhow::bail!(
@@ -222,22 +193,22 @@ pub fn require_trusted(ws: &Path) -> Result<()> {
 }
 
 /// Record the workspace's current config as trusted. Returns the hash (None: nothing to trust).
-pub fn record(ws: &Path) -> Result<Option<String>> {
+pub fn record(ws: &Path, dirs: &Dirs) -> Result<Option<String>> {
     let config = Config::read(ws)?;
     let links = config.symlinks();
     if !links.is_empty() {
         anyhow::bail!("cannot trust a config with symlinks (their targets are not covered): {}; replace them with real files", links.join(", "));
     }
     let Some(h) = config.hash() else { return Ok(None) };
-    let path = store_file()?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let path = dirs.trust_store();
+    std::fs::create_dir_all(dirs.config())?;
     // Concurrent `hx trust` runs would otherwise lose each other's entries: read-modify-write under an exclusive lock,
     // replacing the file atomically.
     use std::os::unix::fs::OpenOptionsExt;
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
         .custom_flags(libc::O_NOFOLLOW).open(path.with_extension("lock"))?;
     lock.lock().context("cannot lock the trust store")?;
-    let mut all = read_store();
+    let mut all = read_store(dirs);
     all.insert(key(ws), h.clone());
     let body = toml::to_string(&BTreeMap::from([("workspaces", all)]))?;
     crate::atomic_file::replace_trusted(&path,
@@ -247,26 +218,27 @@ pub fn record(ws: &Path) -> Result<Option<String>> {
 
 /// For commands the user runs that change the config themselves (`hx approve`, `accept`, `rollback`):
 /// keep a trusted workspace trusted, but never let them bless config the user has not trusted yet.
-pub struct Retrust {
+pub struct Retrust<'a> {
     ws: PathBuf,
+    dirs: &'a Dirs,
     was: bool,
 }
 
-impl Retrust {
-    pub fn before(ws: &Path) -> Retrust {
+impl<'a> Retrust<'a> {
+    pub fn before(ws: &Path, dirs: &'a Dirs) -> Self {
         // HX_TRUST is consent for one launch only: it must not make the trust permanent here
         let hash = Config::read(ws).ok().filter(|c| c.symlinks().is_empty()).map(|c| c.hash());
         let was = match hash {
             Some(None) => true,
-            Some(Some(h)) => read_store().get(&key(ws)) == Some(&h),
+            Some(Some(h)) => read_store(dirs).get(&key(ws)) == Some(&h),
             None => false,
         };
-        Retrust { ws: ws.to_path_buf(), was }
+        Retrust { ws: ws.to_path_buf(), dirs, was }
     }
 
     pub fn after(self) -> Result<()> {
         if self.was {
-            record(&self.ws)?;
+            record(&self.ws, self.dirs)?;
         } else {
             eprintln!("note: this workspace's .harness config is not trusted, so `hx run` refuses it; review it and run `hx trust`");
         }

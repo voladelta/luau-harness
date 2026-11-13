@@ -5,14 +5,16 @@ source scripts/check_helpers.sh
 cleanup() { pkill -f "sleep 4242" 2>/dev/null; kill $MOCK 2>/dev/null; }
 MOCK=
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf '#!/bin/bash\necho deployed > deployed.txt\n' > $W/deploy.sh; chmod +x $W/deploy.sh; }
-lastlog() { ls -t $W/.harness/log/*.jsonl | head -1; }
+lastlog() { ls -t "$(logdir $W)"/*.jsonl | head -1; }
 
 # --- 0. the log is independent of the policy flag, and admin commands do not open a session
 newws n
 $H exec --workspace $W --yes 'write("a.txt", "hi")' >/dev/null 2>&1
-check "--yes still writes a log" "$(ls $W/.harness/log/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
+check "--yes still writes a log" "$(ls "$(logdir $W)"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
 $H staged --workspace $W >/dev/null
-check "admin commands open no log session" "$(ls $W/.harness/log/*.jsonl | wc -l | tr -d ' ')" "1"
+check "admin commands open no log session" "$(ls "$(logdir $W)"/*.jsonl | wc -l | tr -d ' ')" "1"
+check "the log lives in hx's state directory, not the workspace" "$(logdir $W | grep -c "^$XDG_STATE_HOME/hx/workspaces/n-[0-9a-f]\{16\}/log$")$([ -e $W/.harness/log ] && echo IN-TREE)" "1"
+check "hx paths names the log, ar, secrets and trust locations" "$($H paths --workspace $W | cut -d: -f1 | tr '\n' ' ')" "log ar secrets trust "
 
 # --- 0b. --yes automatically grants ordinary paths and commands, but .harness/ and hx.lock stay read-only (through file tools)
 newws y
@@ -49,8 +51,9 @@ print("yes" if any(r["kind"]=="call" and r["tool"]=="read" for r in rs) and "zeb
 PY
 )" "yes"
 
-# --- 2. tampering is detected
-python3 - "$L" "$T/tampered.jsonl" <<'PY'
+# --- 2. tampering is detected (copies keep the journal's name: the name is its session)
+N=$(basename $L); mkdir -p $T/tampered $T/deleted $T/substituted
+python3 - "$L" "$T/tampered/$N" <<'PY'
 import json,sys
 lines=open(sys.argv[1]).read().splitlines()
 for i,line in enumerate(lines):
@@ -64,29 +67,28 @@ else:
     raise AssertionError("no write intent to tamper with")
 open(sys.argv[2],"w").write("\n".join(lines)+"\n")
 PY
-$H log verify $T/tampered.jsonl >/dev/null 2>&1; check "edited record breaks the chain (exit 1)" "$?" "1"
-python3 - "$L" "$T/deleted.jsonl" <<'PY'
+$H log verify $T/tampered/$N >/dev/null 2>&1; check "edited record breaks the chain (exit 1)" "$?" "1"
+python3 - "$L" "$T/deleted/$N" <<'PY'
 import sys
 l=open(sys.argv[1]).read().splitlines(); del l[2]; open(sys.argv[2],"w").write("\n".join(l)+"\n")
 PY
-$H log verify $T/deleted.jsonl >/dev/null 2>&1; check "deleted record breaks the chain (exit 1)" "$?" "1"
-KEY=$XDG_CONFIG_HOME/hx/journal.key
-check "the journal key is private and outside the workspace" "$(stat -c %a $KEY)" "600"
-# A shell command can write the journal but cannot read the key: a record forged with a plain hash does not verify.
-python3 - "$L" "$T/forged.jsonl" <<'PY'
-import hashlib,json,sys
-lines=open(sys.argv[1]).read().splitlines()
-last=json.loads(lines[-1])
-grant={"seq":last["seq"]+1,"ts_ms":last["ts_ms"],"session":last["session"],"kind":"path_grant","prev":hashlib.sha256(lines[-1].encode()).hexdigest(),"grant":{"path":"/","write":True}}
-open(sys.argv[2],"w").write("\n".join(lines+[json.dumps(grant,separators=(",",":"))])+"\n")
-PY
-out=$($H log verify $T/forged.jsonl 2>&1); rc=$?
-check "a forged path_grant breaks the keyed chain (exit 1)" "$rc$(echo "$out" | grep -c 'BROKEN at line')" "11"
-printf '[fs]\nread = ["%s"]\n' "$XDG_CONFIG_HOME" > $W/.harness/policy.toml
-check "file tools cannot read the journal key, even inside a read root" "$($H exec --workspace $W "print(pcall(read, '$KEY'))" 2>/dev/null | head -1 | grep -c 'false.*sealed')" "1"
+$H log verify $T/deleted/$N >/dev/null 2>&1; check "deleted record breaks the chain (exit 1)" "$?" "1"
+cp $L $T/substituted/$N; check "an intact journal verifies under its own name" "$($H log verify $T/substituted/$N | head -1 | grep -c intact)" "1"
+cp $L $T/substituted/other-run.jsonl; out=$($H log verify $T/substituted/other-run.jsonl 2>&1); rc=$?
+check "a journal under another run's name is refused (exit 1)" "$rc$(echo "$out" | grep -c 'belongs to session')" "11"
+check "hx log verify takes a bare run name" "$($H log verify --workspace $W ${N%.jsonl} | head -1 | grep -c intact)" "1"
+# The journal is outside every root: a shell command can neither truncate it, nor put another run's journal in its place.
 if ! unconfined $W; then
-  check "confined shell commands cannot read the journal key" "$($H exec --workspace $W "print(sh('cat $KEY >/dev/null 2>&1; echo \$?').stdout)" 2>/dev/null | head -1)" "1"
+  OTHER=$(ls "$(logdir $W)"/*.jsonl | grep -v "$N" | head -1)
+  [ -n "$OTHER" ] || { $H exec --workspace $W 'print(1)' >/dev/null; OTHER=$(ls -t "$(logdir $W)"/*.jsonl | head -1); }
+  before=$(wc -l < $L)
+  out=$($H exec --workspace $W "local a = sh('head -n 1 $L > t && mv t $L'); local b = sh('cp $OTHER $L'); local c = sh('rm -f ${L%.jsonl}.lock; touch ${L%.jsonl}.revoked'); print(a.code ~= 0, b.code ~= 0, c.code ~= 0)" 2>/dev/null | head -1)
+  check "confined shell cannot truncate, replace or unlock a journal" "$(echo "$out" | tr '\t' ' ')" "true true true"
+  check "...and the journal is whole and still its own" "$(wc -l < $L)$($H log verify $L | head -1 | grep -c intact)$([ -e ${L%.jsonl}.revoked ] && echo REVOKED)" "${before}1"
+  check "file tools cannot read or write the journal" "$($H exec --workspace $W --yes "print(pcall(read, '$L'), pcall(write, '$L', 'x'))" 2>/dev/null | head -1 | cut -f1,2 | tr '\t' ' ')" "false false"
 fi
+printf '[fs]\nread = ["%s"]\n' "$XDG_STATE_HOME" > $W/.harness/policy.toml
+check "a read root that holds hx's state is refused" "$($H exec --workspace $W 'print(1)' 2>&1 | grep -c "overlaps hx's state directory")" "1"
 rm $W/.harness/policy.toml
 
 # --- 3. approval gate: external effects are refused without the user's approval, and do not run
@@ -135,15 +137,18 @@ print("yes" if c[("llm",None)]==2 and c[("chunk_begin",None)]==1 and c[("checkpo
 PY
 )$($H log verify $L | head -1 | grep -c intact)" "yes1"
 
-# --- 6. resume refuses a journal that fails verification
+# --- 6. resume refuses a journal that fails verification, and one from outside the workspace's log directory
+cp $L $T/elsewhere.jsonl
+out=$(OPENROUTER_API_KEY=x $H run --workspace $W --resume $T/elsewhere.jsonl 2>&1); rc=$?
+check "resume refuses a journal outside the log directory" "$([ $rc -ne 0 ] && echo refused)$(echo "$out" | grep -c "not in this workspace's log directory")" "refused1"
 python3 - "$L" <<'PY'
-import hashlib,json,sys
+import json,sys
 lines=open(sys.argv[1]).read().splitlines()
 last=json.loads(lines[-1])
-grant={"seq":last["seq"]+1,"ts_ms":last["ts_ms"],"session":last["session"],"kind":"path_grant","prev":hashlib.sha256(lines[-1].encode()).hexdigest(),"grant":{"path":"/","write":True}}
+grant={"seq":last["seq"]+1,"ts_ms":last["ts_ms"],"session":last["session"],"kind":"path_grant","prev":"0"*64,"grant":{"path":"/","write":True}}
 open(sys.argv[1],"a").write(json.dumps(grant,separators=(",",":"))+"\n")
 PY
-out=$(OPENROUTER_API_KEY=x $H run --workspace $W --resume $L 2>&1); rc=$?
-check "resume refuses a forged record" "$([ $rc -ne 0 ] && echo refused)$(echo "$out" | grep -c 'hash chain broken')" "refused1"
+out=$(OPENROUTER_API_KEY=x $H run --workspace $W --resume $(basename $L .jsonl) 2>&1); rc=$?
+check "resume (by run name) refuses a forged record" "$([ $rc -ne 0 ] && echo refused)$(echo "$out" | grep -c 'hash chain broken')" "refused1"
 
 finish

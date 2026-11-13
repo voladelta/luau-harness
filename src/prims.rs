@@ -206,7 +206,7 @@ pub async fn search(fx: &Effects, lua: &Lua, pattern: String, opts: SearchOption
     let (pol, workflow) = (fx.pol.clone(), fx.supervisor.workflow_epoch().is_some());
     let ret = fx.run(lua, Tool::Search, Class::Read, args, || blocking(move || {
         let root = pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-        Ok(match search_files(&pol.workspace, &root, &pattern, &opts, cap, workflow, &pol.unreadable()) {
+        Ok(match search_files(&pol.workspace, &root, &pattern, &opts, cap, workflow, &pol.sealed) {
             Ok(Hits { rows, truncated }) => Ret::Rows { rows, truncated },
             Err(SearchError { kind, message, hint }) => Ret::SearchErr { kind, message, hint },
         })
@@ -355,7 +355,7 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
                     Some(c) => pol.check_read(c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
-                let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol)?, &cmd, cwd, opts.secs()).await?;
+                let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol).await?, &cmd, cwd, opts.secs()).await?;
                 Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None, approval })
             }).await?;
             match ret {
@@ -465,7 +465,7 @@ fn search_files(root: &Path, base: &Path, pat: &str, opts: &SearchOptions, cap: 
         }
         // In a workflow, run artifacts are searched only when asked for by path.
         let relative = entry.path().strip_prefix(&project).unwrap_or(entry.path());
-        !workflow || [".harness/log", ".agents/artifacts"].iter().all(|runtime| explicit.starts_with(runtime) || !relative.starts_with(runtime))
+        !workflow || explicit.starts_with(".agents/artifacts") || !relative.starts_with(".agents/artifacts")
     });
     if let Some(glob) = &opts.glob {
         let hint = "use gitignore-style globs like *.rs or src/**/*.ts";
@@ -532,9 +532,9 @@ pub struct ShellEnv {
 impl ShellEnv {
     /// The agent's `sh`: scrub credentials by default and in every autoresearch episode, and confine it to the run's
     /// current file policy (grants approved so far included).
-    pub fn agent(pol: &crate::policy::Policy) -> mlua::Result<ShellEnv> {
-        let confine = pol.confinement().prepare().map_err(|e| rt(format!("sh: cannot prepare confinement: {e}")))?;
-        Ok(ShellEnv { env: Some(pol.env()), confine: confine.map(Arc::new) })
+    pub async fn agent(pol: &Arc<crate::policy::Policy>) -> mlua::Result<ShellEnv> {
+        let confine = pol.ruleset().await.map_err(|e| rt(format!("sh: cannot prepare confinement: {e}")))?;
+        Ok(ShellEnv { env: Some(pol.env()), confine })
     }
 }
 
@@ -787,7 +787,8 @@ mod receipt_tests {
     async fn shell_receipt_identity_includes_the_command_after_character_2000() {
         let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let path = pol.log.path.clone();
         let prefix = format!(": #{}\n", "x".repeat(2100));
         let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));
@@ -819,9 +820,10 @@ mod file_tests {
         dir
     }
 
-    fn vm(dir: &Path) -> crate::vm::Vm {
-        let pol = Arc::new(crate::policy::Policy::new(dir, false, None, None, None).unwrap());
-        crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap()
+    fn vm(dir: &Path) -> (crate::vm::Vm, crate::dirs::TestDirs) {
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, dir, false, None, None, None).unwrap());
+        (crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap(), dirs)
     }
 
     #[test]
@@ -839,7 +841,7 @@ mod file_tests {
     async fn read_write_and_edit_are_byte_exact() {
         let dir = workspace("bytes");
         std::fs::write(dir.join("f"), b"a\xffb\nend\n").unwrap();
-        let vm = vm(&dir);
+        let (vm, _dirs) = vm(&dir);
         let r = vm.session.run(r#"local s = read("f"); assert(#s == 8 and s:byte(2) == 255)
             assert(read("f", {offset = 2}) == "end\n")
             edit("f", "\255", "\128"); write("g", "\254\n")"#).await;
@@ -853,7 +855,7 @@ mod file_tests {
     async fn read_refuses_what_is_not_a_regular_file() {
         let dir = workspace("fifo");
         assert!(std::process::Command::new("mkfifo").arg(dir.join("pipe")).status().unwrap().success());
-        let vm = vm(&dir);
+        let (vm, _dirs) = vm(&dir);
         let r = vm.session.run(r#"local ok, e = pcall(read, "pipe"); assert(not ok and tostring(e):find("not a regular file", 1, true), tostring(e))
             local ok2, e2 = pcall(read, "."); assert(not ok2 and tostring(e2):find("is a directory", 1, true), tostring(e2))"#).await;
         assert!(r.error.is_none(), "{:?}", r.error);
@@ -864,7 +866,7 @@ mod file_tests {
     async fn options_are_plain_data_read_once() {
         let dir = workspace("options");
         std::fs::write(dir.join("f"), "x\n").unwrap();
-        let vm = vm(&dir);
+        let (vm, _dirs) = vm(&dir);
         let r = vm.session.run(r#"local trap = setmetatable({}, {__index = function() error("metamethod ran") end})
             local ok, e = pcall(read, "f", trap); assert(not ok and not tostring(e):find("metamethod ran", 1, true), tostring(e))
             assert(not pcall(read, "f", {offest = 2}))
@@ -914,7 +916,8 @@ mod file_tests {
     #[tokio::test]
     async fn an_effect_where_luau_cannot_yield_fails_before_it_exists() {
         let dir = workspace("yield");
-        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let log = pol.log.path.clone();
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap();
         let r = vm.session.run(r#"local yield = "attempt to yield across metamethod/C-call boundary"
@@ -946,7 +949,8 @@ mod file_tests {
         std::fs::write(dir.join("d/f"), "inside").unwrap();
         std::fs::write(outside.join("f"), "OUTSIDE").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("l")).unwrap();
-        let pol = crate::policy::Policy::new(&dir, false, None, None, None).unwrap();
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = {
             let (d, l, stop) = (std::ffi::CString::new(dir.join("d").into_os_string().into_encoded_bytes()).unwrap(),
@@ -1004,7 +1008,8 @@ mod shell_tests {
             assert!(shell(&env(), "touch ran", dir.clone(), secs).await.is_err());
         }
         assert!(!dir.join("ran").exists(), "the command must not run");
-        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(5), 32 << 20, None).unwrap();
         let r = vm.session.run("print(pcall(sh, 'touch ran', {timeout = 0/0}))").await;
         assert!(r.error.is_none() && r.output.starts_with("false"), "{:?} {}", r.error, r.output);
@@ -1015,7 +1020,8 @@ mod shell_tests {
     #[tokio::test]
     async fn options_with_a_metatable_are_refused_without_running_it() {
         let dir = scratch("index");
-        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(5), 32 << 20, None).unwrap();
         let code = "sh('touch ran', setmetatable({}, {__index = function() while true do end end, __pairs = function() while true do end end}))";
         let t0 = std::time::Instant::now();

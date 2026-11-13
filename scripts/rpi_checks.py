@@ -120,7 +120,7 @@ class Script:
             prefix = 'assert(leaked_global==nil); '
         if self.guards and name == "research_questions":
             prefix += 'leaked_global=41; '
-            prefix += 'local rows=search("Create result.txt",{glob="**/*",literal=true,max=20}); assert(#rows>0); for _,row in rows do assert(not row.file:find(".harness/log",1,true) and not row.file:find(".agents/artifacts",1,true)) end; assert(#search("Create result.txt",{path=".agents/artifacts",glob="**/*",literal=true,max=10})>0); assert(#search("Create result.txt",{path=".harness/log",glob="**/*",literal=true,max=10})>0); '
+            prefix += 'local rows=search("Create result.txt",{glob="**/*",literal=true,max=20}); assert(#rows>0); for _,row in rows do assert(not row.file:find(".agents/artifacts",1,true)) end; assert(#search("Create result.txt",{path=".agents/artifacts",glob="**/*",literal=true,max=10})>0); '
 
         return harness.tool(prefix + submit(name))
 
@@ -264,7 +264,7 @@ def opt_in_and_preflight():
     for index, flags in enumerate((("--manual",), ("--pack", "std/rpi"), ("--rpi", "--rpi"))):
         path = workspace("preflight-" + str(index))
         value = run(path, "run", *flags, ok=False)
-        assert value.returncode == 2 and not (path / ".harness/log").exists(), value.stderr
+        assert value.returncode == 2 and not harness.logdir(path).exists(), value.stderr
     non_git = BASE / "non-git"
     non_git.mkdir(parents=True, exist_ok=True)
     (non_git / "task.md").write_text("task")
@@ -630,4 +630,4 @@ if __name__ == "__main__":
     check("a project that cannot be observed is refused at launch", unobservable_project_fails_at_launch)
     check("verification shell commands run while the project cannot be observed", verification_shell_runs_while_unobservable)
     check("a verification over an unobservable project is sealed failed and goes to repair", unobservable_verification_goes_to_repair)
-    print(f"{passed} passed; artifacts: {BASE}")
+    print(f"{passed} passed" + (f"; artifacts: {BASE}" if os.environ.get("HX_CHECK_ARTIFACTS") else ""))

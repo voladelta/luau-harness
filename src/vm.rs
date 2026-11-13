@@ -266,7 +266,8 @@ mod session_budget_tests {
     async fn awaiting_an_effect_does_not_spend_the_luau_cpu_allowance() {
         let dir = std::env::temp_dir().join(format!("hx-chunk-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let vm = Vm::new(policy, Duration::from_millis(30), 32 << 20, None).unwrap();
         let waited = vm.session.run("local r=sh('sleep 0.1; echo waited'); assert(r.code==0); print(r.stdout)").await;
         assert!(waited.error.is_none(), "{:?}", waited.error);
@@ -280,7 +281,8 @@ mod session_budget_tests {
     async fn a_loop_of_slow_native_calls_stops_at_its_budget() {
         let dir = std::env::temp_dir().join(format!("hx-slow-native-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let vm = Vm::new(policy, Duration::from_millis(300), 64 << 20, None).unwrap();
         // Each iteration is one interrupt and a sort of tens of milliseconds.
         let code = "local t = table.create(1e6, 0); for i = 1, 1e6 do t[i] = i end; while true do table.sort(t) end";
@@ -309,9 +311,10 @@ mod session_budget_tests {
     async fn isolated_package_wait_preserves_the_callers_cpu_allowance() {
         let dir = std::env::temp_dir().join(format!("hx-package-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let dirs = crate::dirs::TestDirs::new();
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let vm = Vm::new(policy.clone(), Duration::from_millis(30), 32 << 20, None).unwrap();
-        let mut registry = crate::modules::Registry::capture(&dir).unwrap();
+        let mut registry = crate::modules::Registry::capture(&dir, &dirs).unwrap();
         let caps = crate::supervisor::Capabilities::from([crate::supervisor::Capability::ProcSh]);
         registry.capabilities.insert("probe".into(), caps.clone());
         registry.sources.insert("probe".into(), crate::modules::Source {
@@ -339,16 +342,17 @@ mod boundary_tests {
     use super::*;
     use std::time::Instant;
 
-    fn vm(name: &str, budget: Duration, mem_limit: usize) -> (Vm, PathBuf) {
+    fn vm(name: &str, budget: Duration, mem_limit: usize) -> (Vm, PathBuf, crate::dirs::TestDirs) {
         let dir = std::env::temp_dir().join(format!("hx-boundary-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
-        (Vm::new(policy, budget, mem_limit, None).unwrap(), dir)
+        let dirs = crate::dirs::TestDirs::new();
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        (Vm::new(policy, budget, mem_limit, None).unwrap(), dir, dirs)
     }
 
     #[tokio::test]
     async fn a_result_that_is_not_utf8_still_reaches_the_model() {
-        let (vm, dir) = vm("utf8", Duration::from_secs(5), 64 << 20);
+        let (vm, dir, _dirs) = vm("utf8", Duration::from_secs(5), 64 << 20);
         let r = vm.run_chunk("local s = 'café au lait'; print(s:sub(1, 4)); return s:sub(1, 4)").await.unwrap();
         let feedback = r["feedback"].as_str().unwrap();
         assert!(feedback.contains("=> caf\u{FFFD}"), "{feedback}");
@@ -358,7 +362,7 @@ mod boundary_tests {
 
     #[tokio::test]
     async fn a_value_with_raising_metamethods_is_summarised_without_running_them() {
-        let (vm, dir) = vm("raise", Duration::from_secs(5), 64 << 20);
+        let (vm, dir, _dirs) = vm("raise", Duration::from_secs(5), 64 << 20);
         let code = "print('before'); return setmetatable({}, {__index = function() error('strict table') end, __tostring = function() error('no') end})";
         let r = vm.run_chunk(code).await.unwrap();
         assert_eq!(r["feedback"], "before\n=> {}\n", "{r}");
@@ -397,7 +401,7 @@ mod boundary_tests {
 
     #[tokio::test]
     async fn harness_luau_between_chunks_runs_under_a_deadline() {
-        let (vm, dir) = vm("compose-deadline", Duration::from_millis(300), 64 << 20);
+        let (vm, dir, _dirs) = vm("compose-deadline", Duration::from_millis(300), 64 << 20);
         let t0 = Instant::now();
         let spin = vm.lua.load("while true do end").set_environment(vm.modenv.clone());
         let error = {
@@ -413,7 +417,7 @@ mod boundary_tests {
 
     #[tokio::test]
     async fn a_chunk_that_fills_memory_still_gets_feedback() {
-        let (vm, dir) = vm("memory", Duration::from_secs(10), 32 << 20);
+        let (vm, dir, _dirs) = vm("memory", Duration::from_secs(10), 32 << 20);
         let r = vm.run_chunk("keep = {}; for i = 1, 1e8 do keep[i] = string.rep('x', 64) .. i end").await.unwrap();
         let feedback = r["feedback"].as_str().unwrap();
         assert!(feedback.contains("error:") && feedback.contains("memory"), "{feedback}");
@@ -429,7 +433,7 @@ mod boundary_tests {
 
     #[tokio::test]
     async fn harness_code_cannot_raise_the_memory_ceiling_and_the_model_is_told_when_it_is_over() {
-        let (vm, dir) = vm("ceiling", Duration::from_secs(10), 32 << 20);
+        let (vm, dir, _dirs) = vm("ceiling", Duration::from_secs(10), 32 << 20);
         let hoard = "kept = kept or {}; table.insert(kept, string.rep(string.char(65 + #kept), 24 * 1024 * 1024))";
         for _ in 0..6 {
             let _harness = vm.session.harness();
@@ -447,7 +451,7 @@ mod boundary_tests {
 
     #[tokio::test]
     async fn print_output_is_bounded_and_the_feedback_says_so() {
-        let (vm, dir) = vm("print", Duration::from_secs(30), 64 << 20);
+        let (vm, dir, _dirs) = vm("print", Duration::from_secs(30), 64 << 20);
         let r = vm.session.run("for i = 1, 30000 do print(string.rep('é', 50)) end").await;
         let printed = 30000 * 101;
         assert!(r.output.len() < PRINT_CAP + 200 && r.omitted > printed - PRINT_CAP - 8, "{} {}", r.output.len(), r.omitted);
@@ -478,7 +482,7 @@ mod boundary_tests {
     #[test]
     fn a_failed_durable_set_keeps_the_previous_value() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let (vm, dir) = vm("durable", Duration::from_secs(10), 128 << 20);
+        let (vm, dir, _dirs) = vm("durable", Duration::from_secs(10), 128 << 20);
         let code = "durable.set('k', {n = 1})
             local big = string.rep('x', 17 * 1024 * 1024)
             assert(not pcall(durable.set, 'k', big))
@@ -491,7 +495,7 @@ mod boundary_tests {
 
     #[tokio::test]
     async fn the_session_sandbox_holds() {
-        let (vm, dir) = vm("sandbox", Duration::from_secs(5), 64 << 20);
+        let (vm, dir, _dirs) = vm("sandbox", Duration::from_secs(5), 64 << 20);
         let probes = [
             "_G == nil and coroutine == nil and getfenv == nil and setfenv == nil",
             "loadstring == nil and require == nil and hx == nil",
@@ -739,7 +743,7 @@ impl Vm {
         let supervisor = match &host {
             Some(h) => h.supervisor.clone(),
             None => {
-                let mut registry = crate::modules::Registry::capture(&root)?;
+                let mut registry = crate::modules::Registry::capture(&root, &policy.dirs)?;
                 registry.materialize_skills(&policy.log)?;
                 crate::supervisor::Supervisor::ephemeral(policy.clone(), Arc::new(registry))
             },
@@ -800,7 +804,6 @@ impl Vm {
                     let query = crate::history::Query::parse(args.clone()).map_err(mlua::Error::external)?;
                     ops.fetch_add(1, Ordering::Relaxed);
                     let result = fx.run(&lua, crate::supervisor::Tool::History, Class::Read, args, || async move {
-                        h.policy.check_read(&h.policy.log.path.to_string_lossy()).map_err(mlua::Error::external)?;
                         let deadline = h.supervisor.manifest.as_ref().and_then(|m| m.deadline);
                         let value = tokio::task::spawn_blocking(move || h.supervisor.history.query(
                             h.policy.log.dir(), &h.policy.log.session, query, deadline)).await

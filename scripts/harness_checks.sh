@@ -50,8 +50,8 @@ check "effect in a gsub callback does not run" "$([ -e $W4/ran ] && echo ran || 
 check "a later mutation still runs" "$(echo "$out" | grep -cF 'stdout="again\n"')" "1"
 check "no intent is left without an outcome" "$(python3 -c '
 import json, sys, glob
-seen = [json.loads(l) for f in glob.glob(sys.argv[1] + "/.harness/log/*.jsonl") for l in open(f)]
-print(len({r["seq"] for r in seen if r["kind"] == "intent"} - {r.get("of") for r in seen}))' $W4)" "0"
+seen = [json.loads(l) for f in glob.glob(sys.argv[1] + "/*.jsonl") for l in open(f)]
+print(len({r["seq"] for r in seen if r["kind"] == "intent"} - {r.get("of") for r in seen}))' "$(logdir $W4)")" "0"
 
 # 3c. search returns plain data: capped rows cross the data boundary, and hidden files other than .git/.harness are searched
 mkdir -p $W4/.github $W4/.git
@@ -69,13 +69,13 @@ check "sh keeps the end of a stream over 1 MiB" "$($H exec --workspace $W 'local
 # 4c. sh forks for an unprivileged user who already owns many threads (a desktop session: browsers, editors). The
 # suites run as root, which the kernel's per-user process limit exempts, so this runs as nobody when it can.
 as_user=(); [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null && as_user=(setpriv --reuid=65534 --regid=65534 --clear-groups)
-U=$(mktemp -d); chmod 755 "$U"; mkdir "$U/ws" "$U/config"; [ ${#as_user[@]} -gt 0 ] && chown 65534:65534 "$U/ws" "$U/config"
+U=$(mktemp -d); chmod 755 "$U"; mkdir "$U/ws" "$U/config" "$U/state"; [ ${#as_user[@]} -gt 0 ] && chown 65534:65534 "$U/ws" "$U/config" "$U/state"
 "${as_user[@]}" python3 -c '
 import threading, time
 for _ in range(400): threading.Thread(target=time.sleep, args=(60,), daemon=True).start()
 print("ready", flush=True); time.sleep(60)' > "$U/ready" & THREADS=$!
 for _ in $(seq 100); do grep -q ready "$U/ready" 2>/dev/null && break; sleep 0.05; done
-check "sh forks for a user who owns hundreds of threads" "$(HOME=$U/config XDG_CONFIG_HOME=$U/config "${as_user[@]}" timeout 60 $H exec --workspace "$U/ws" 'local r = sh("echo a | cat"); print(r.stdout == "a\n", r.code)' 2>&1 | head -1)" "true	0"
+check "sh forks for a user who owns hundreds of threads" "$(HOME=$U/config XDG_CONFIG_HOME=$U/config XDG_STATE_HOME=$U/state "${as_user[@]}" timeout 60 $H exec --workspace "$U/ws" 'local r = sh("echo a | cat"); print(r.stdout == "a\n", r.code)' 2>&1 | head -1)" "true	0"
 kill $THREADS; rm -rf "$U"
 
 # 5. package lock gate
@@ -174,7 +174,7 @@ check "frozen printer refuses hot reload" "$($H test $W3/pk --workspace $W3 2>/d
 W5=$T/ws5; mkdir -p $W5/pkg/tests $T/tmp5; echo 'assert(false, "nope")' > $W5/pkg/tests/fail_test.luau
 ended() { python3 -c '
 import json, sys, glob
-print(all(json.loads(open(f).readlines()[-1])["kind"] == "session_end" for f in glob.glob(sys.argv[1] + "/.harness/log/*.jsonl")))' "$1"; }
+print(all(json.loads(open(f).readlines()[-1])["kind"] == "session_end" for f in glob.glob(sys.argv[1] + "/*.jsonl")))' "$(logdir $1)"; }
 (cd $W5 && TMPDIR=$T/tmp5 $H test pkg >/dev/null 2>&1); status=$?
 check "a failing hx test exits 1 and ends its session" "$status $(ended $W5) $(ls $T/tmp5 | wc -l)" "1 True 0"
 rm -rf $W5/.harness

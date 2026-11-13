@@ -978,8 +978,8 @@ mod tests {
         let root = repository("observation");
         std::fs::write(root.join("app.js"), "one").unwrap();
         let a = observe_project(&root, &[]).unwrap();
-        std::fs::create_dir_all(root.join(".harness/log")).unwrap();
-        std::fs::write(root.join(".harness/log/run"), "log").unwrap();
+        std::fs::create_dir_all(root.join(".harness/staged")).unwrap();
+        std::fs::write(root.join(".harness/staged/run"), "staged").unwrap();
         std::fs::create_dir_all(root.join(".agents/artifacts/rpi-run")).unwrap();
         std::fs::write(root.join(".agents/artifacts/rpi-run/one.md"), "doc").unwrap();
         assert_eq!(a.digest, observe_project(&root, &[]).unwrap().digest);
@@ -1094,7 +1094,7 @@ mod tests {
     #[test]
     fn projection_refuses_unowned_files_and_regenerates_owned_views() {
         let root = workspace("projection");
-        let log = crate::eventlog::EventLog::open(&root.join(".harness/log")).unwrap();
+        let log = crate::eventlog::EventLog::open(&root.join("journal")).unwrap();
         let blob = log.blob(b"# Canonical").unwrap();
         let artifact = ArtifactRef {
             id: "request".into(),

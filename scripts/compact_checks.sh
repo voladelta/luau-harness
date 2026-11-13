@@ -40,7 +40,7 @@ run() { # workspace port trace extra-flags...   (stdout/stderr in $T/out, $T/err
     --context-window 40000 --max-output 1000 --trace $3 "${@:4}" > $T/out 2> $T/err
 }
 field() { python3 -c "import sys,json;r=json.loads(open('$T/out').read().strip().splitlines()[-1]);print(r.get('$1'))" 2>/dev/null; }
-lastlog() { ls -t $1/.harness/log/*.jsonl | head -1; }
+lastlog() { ls -t "$(logdir $1)"/*.jsonl | head -1; }
 
 # ---- 1. A1: with the pack off, and with it on below the threshold, requests are identical ----
 THREE=$(R 'dump(C("a=1"), C("b=2"), S("done"))')

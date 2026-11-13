@@ -1,5 +1,5 @@
 //! Single-file, workspace-trusted tools. Definitions and endpoint grants are frozen; secrets never are.
-use crate::{effects::{Effects, Ret}, modules::{Registry, Source}, policy::Class, supervisor::{Capabilities, Capability, Tool}, values};
+use crate::{dirs::Dirs, effects::{Effects, Ret}, modules::{Registry, Source}, policy::Class, supervisor::{Capabilities, Capability, Tool}, values};
 use anyhow::{Context, Result, ensure};
 use mlua::{Function, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
@@ -210,12 +210,11 @@ fn inspect(text: &str) -> Result<Definition> {
     definition(&lua.load(text).set_name("=tool registration").eval::<Table>()?)
 }
 
-/// Environment > workspace > user config. No recursive scans or shell evaluation of credential files.
-fn secret(root: &Path, name: &str) -> Result<String> {
+/// Environment > the workspace's secrets > the user's (both in hx's configuration directory, `crate::dirs`). No
+/// recursive scans or shell evaluation of credential files.
+fn secret(dirs: &Dirs, root: &Path, name: &str) -> Result<String> {
     if let Ok(value) = std::env::var(name) && !value.trim().is_empty() { return Ok(value); }
-    let mut paths = vec![root.join(".harness/secrets.toml")];
-    if let Some(dir) = crate::trust::store_dir() { paths.push(dir.join("secrets.toml")); }
-    for path in paths {
+    for path in [dirs.workspace(root).secrets, dirs.user_secrets()] {
         match std::fs::symlink_metadata(&path) {
             Ok(meta) => ensure!(meta.file_type().is_file(), "secrets file must be a regular file: {}", path.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -230,13 +229,13 @@ fn secret(root: &Path, name: &str) -> Result<String> {
         let secrets: BTreeMap<String, String> = toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid secrets file {} (expected NAME = \"value\")", path.display()))?;
         if let Some(value) = secrets.get(name).filter(|v| !v.trim().is_empty()) { return Ok(value.clone()); }
     }
-    anyhow::bail!("missing credential {name}; set it in the environment, .harness/secrets.toml, or the hx user secrets.toml")
+    anyhow::bail!("missing credential {name}; set it in the environment, the workspace's secrets.toml or your own (see `hx paths`)")
 }
 
-pub fn credentials(root: &Path, def: &Definition) -> Result<()> {
+pub fn credentials(dirs: &Dirs, root: &Path, def: &Definition) -> Result<()> {
     for endpoint in def.http.values() {
         if let Some(name) = &endpoint.secret {
-            let value = secret(root, name)?;
+            let value = secret(dirs, root, name)?;
             reqwest::header::HeaderValue::from_str(&value).map_err(|_| anyhow::anyhow!("credential {name} is not a valid HTTP header value"))?;
             ensure!(!endpoint.bearer || !value.starts_with("Bearer "), "credential {name} must be the bare token: bearer = true adds the \"Bearer \" prefix");
         }
@@ -244,7 +243,7 @@ pub fn credentials(root: &Path, def: &Definition) -> Result<()> {
     Ok(())
 }
 
-pub fn capture<'a>(root: &Path, files: impl Iterator<Item = (&'a str, &'a [u8])>, registry: &mut Registry) -> Result<()> {
+pub fn capture<'a>(dirs: &Dirs, root: &Path, files: impl Iterator<Item = (&'a str, &'a [u8])>, registry: &mut Registry) -> Result<()> {
     for (file, bytes) in files {
         let Some(name) = file.strip_suffix(".lua").or_else(|| file.strip_suffix(".luau")).filter(|n| !n.contains('/')) else { continue };
         let name = name.to_string();
@@ -254,7 +253,7 @@ pub fn capture<'a>(root: &Path, files: impl Iterator<Item = (&'a str, &'a [u8])>
             ensure!(!registry.tools.contains_key(&name) && !registry.tool_errors.contains_key(&name), "duplicate tool namespace {name}");
             let text = std::str::from_utf8(bytes).context("tool is not UTF-8")?.to_string();
             let def = inspect(&text)?;
-            credentials(root, &def)?;
+            credentials(dirs, root, &def)?;
             Ok((text, def))
         })();
         match result {
@@ -299,7 +298,7 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
             let (Some(spec), Some(client)) = (def.http.get(&endpoint), clients.get(&endpoint)) else { return Err(mlua::Error::runtime("undeclared HTTP endpoint")) };
             let args = values::copy_out(args)?;
             let serde_json::Value::Object(mut fields) = args.clone() else { return Err(mlua::Error::runtime("http arguments must be an object")) };
-            let key = spec.secret.as_ref().map(|name| secret(&fx.pol.workspace, name)).transpose().map_err(mlua::Error::external)?;
+            let key = spec.secret.as_ref().map(|name| secret(&fx.pol.dirs, &fx.pol.workspace, name)).transpose().map_err(mlua::Error::external)?;
             let mut url = template(&spec.url).map_err(mlua::Error::external)?.url(&mut fields)?;
             // GET and DELETE carry no body: their remaining arguments are the query. The others send them as JSON.
             let bodiless = matches!(spec.method.as_str(), "GET" | "DELETE");
@@ -387,7 +386,7 @@ pub fn install(lua: &Lua, env: &Table, supervisor: Arc<crate::supervisor::Superv
     for (name, def) in &supervisor.registry.tools {
         let result = (|| -> Result<Table> {
             ensure!(env.get::<Value>(name.as_str())?.is_nil(), "namespace {name} is already in use");
-            credentials(&supervisor.policy.workspace, def)?;
+            credentials(&supervisor.policy.dirs, &supervisor.policy.workspace, def)?;
             Ok(crate::packages::proxy(lua, supervisor.clone(), host.clone(), &format!("tool:{name}"), caller.clone())?)
         })();
         match result {
