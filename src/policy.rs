@@ -490,7 +490,8 @@ impl Policy {
         hidden.push(self.workspace.join(".harness/secrets.toml"));
         hidden.extend(crate::trust::store_dir_canonical());
         hidden.extend(self.track_hidden(&hidden, &write));
-        crate::confine::Rules { read, write, hidden }.with_system()
+        let rules = crate::confine::Rules { read, write, hidden }.with_system();
+        if self.episode.is_some() { rules.without_shm() } else { rules }
     }
 
     /// Where the hidden files seen so far are now. A file moved away from its hidden path, or given a second name by a

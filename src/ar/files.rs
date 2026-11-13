@@ -223,7 +223,7 @@ pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, 
     let mut read = crate::policy::system_read_roots();
     read.extend(spec.roots(holdout)?);
     read.push(scratch.0.clone());
-    let rules = crate::confine::Rules { read, write: vec![scratch.0.clone()], hidden: vec![] }.with_system();
+    let rules = crate::confine::Rules { read, write: vec![scratch.0.clone()], hidden: vec![] }.with_system().without_shm();
     let env = crate::prims::ShellEnv { env: Some(evaluator_env(&tmp)), confine: rules.prepare()?.map(std::sync::Arc::new) };
     let (stdout, stderr, code, timed_out, _) = crate::prims::shell(&env, cmd, tree, spec.timeout).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
