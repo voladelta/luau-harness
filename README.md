@@ -175,13 +175,13 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 Every check uses `target/release/hx`, and none needs an API key (model runs use a scripted mock).
 
 ```bash
-scripts/all_checks.sh            # builds, then runs every offline suite; five-minute deadline
+scripts/all_checks.sh            # builds, then runs rustfmt, clippy and every offline suite; five-minute deadline
 scripts/all_checks.sh --jobs 2   # fewer concurrent suites (default: 4)
 hx test stdlib/std               # Luau unit tests
 cargo test --release
 ```
 
-Suites run concurrently (mock servers bind free ports); the policy suite and the autoresearch suite run alone. Stalled suites fail with a diagnostic, and reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
+The code is formatted with `cargo fmt` and kept free of clippy warnings (`cargo clippy --release --all-targets -- -D warnings`); the runner fails on either. Suites run concurrently (mock servers bind free ports); the policy suite and the autoresearch suite run alone. Stalled suites fail with a diagnostic, and reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
 
 | Path | Contents |
 |---|---|

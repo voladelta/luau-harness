@@ -87,7 +87,9 @@ def main():
         return 1
     results = [run("policy_checks", ["bash", "scripts/policy_checks.sh"], cap=60)]
     # Mock servers bind free ports and every suite uses its own workspaces, so the rest run independently.
-    suites = [("Rust tests", ["cargo", "test", "--release", "--quiet"]),
+    suites = [("format", ["cargo", "fmt", "--check"]),
+              ("clippy", ["cargo", "clippy", "--release", "--all-targets", "--quiet", "--", "-D", "warnings"]),
+              ("Rust tests", ["cargo", "test", "--release", "--quiet"]),
               ("std unit tests", ["target/release/hx", "test", "stdlib/std"])]
     for name in ("extension", "llm", "mcp", "vision", "compact", "harness", "journal", "budget", "caps", "upgrade", "trust"):
         suites.append((name + "_checks", ["bash", f"scripts/{name}_checks.sh"]))
