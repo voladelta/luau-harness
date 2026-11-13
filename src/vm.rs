@@ -221,8 +221,13 @@ impl Budget {
             if now < self.deadline.0.load(Ordering::Relaxed).min(run_end) {
                 return Ok(VmState::Continue);
             }
-            if now >= run_end {
+            // The run deadline is judged on its own clock, as the supervisor judges it: the budget clock may be a
+            // tick ahead of it.
+            if self.run_deadline.is_some_and(|end| crate::supervisor::now() >= end) {
                 return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached"));
+            }
+            if now < self.deadline.0.load(Ordering::Relaxed) {
+                return Ok(VmState::Continue);
             }
             if let Some(waiting) = &self.waiting
                 && waiting.lock().unwrap().contains_key(&(lua.current_thread().to_pointer() as usize))
@@ -284,6 +289,20 @@ mod session_budget_tests {
         assert!(r.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")), "{:?}", r.error);
         assert!(t0.elapsed() < Duration::from_secs(2), "a 300 ms budget took {:?}", t0.elapsed());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_run_deadline_stops_luau_only_once_it_has_passed_on_its_own_clock() {
+        // The supervisor judges the run deadline on the wall clock; an interrupt that fired before that would be an
+        // error the run cannot recognise as its budget.
+        for _ in 0..20 {
+            let lua = Lua::new();
+            let end = crate::supervisor::now() + 0.02;
+            Budget { run_deadline: Some(end), deadline: Arc::default(), waiting: None, exceeded: "chunk budget" }.install(&lua);
+            let error = lua.load("while true do end").exec().unwrap_err().to_string();
+            assert!(error.contains("absolute run deadline reached"), "{error}");
+            assert!(crate::supervisor::now() >= end);
+        }
     }
 
     #[tokio::test]
