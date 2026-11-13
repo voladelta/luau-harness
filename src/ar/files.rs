@@ -264,8 +264,8 @@ pub(crate) fn remove_scratch() {
     for dir in live { remove(&dir); }
 }
 
-/// Remove the evaluation copies in the system temp dir whose process is gone (killed with SIGKILL, so it removed
-/// nothing). Once per process, at its first evaluation.
+/// Remove the episode and evaluation copies in the system temp dir whose process is gone (killed with SIGKILL, so it
+/// removed nothing; a resume would clean only its own run's). Once per process, at its first evaluation.
 fn sweep() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| if let Ok(base) = std::fs::canonicalize(std::env::temp_dir()) { sweep_dead(&base) });
@@ -274,7 +274,8 @@ fn sweep() {
 fn sweep_dead(base: &Path) {
     for entry in std::fs::read_dir(base).into_iter().flatten().flatten() {
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("hx-ar-eval-")).and_then(|n| n.split('-').next())
+        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("hx-ar-eval-").or_else(|| n.strip_prefix("hx-ar-ws-")))
+            .filter(|n| n.ends_with(".noindex")).and_then(|n| n.split('-').next())
             .and_then(|p| p.parse::<i32>().ok()).filter(|p| *p > 0) else { continue };
         let gone = unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
         if gone && entry.file_type().is_ok_and(|t| t.is_dir()) { remove(&entry.path()); }
@@ -714,10 +715,12 @@ h=$(grep -l '^[h]{}' /proc/[0-9]*/cmdline | wc -l)\necho \"{{\\\"score\\\": $n, 
         let dead = child.id();
         child.wait().unwrap();
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let orphan = base.join(format!("hx-ar-eval-{dead}-1-1.noindex"));
-        std::fs::create_dir_all(orphan.join("tree")).unwrap();
+        let orphans = [base.join(format!("hx-ar-eval-{dead}-1-1.noindex")), base.join(format!("hx-ar-ws-{dead}-1-1.noindex"))];
+        let mine = base.join(format!("hx-ar-ws-{}-1-1.noindex", std::process::id()));
+        for dir in orphans.iter().chain([&mine]) { std::fs::create_dir_all(dir.join("tree")).unwrap(); }
         sweep_dead(&base);
-        assert!(!orphan.exists());
+        assert!(orphans.iter().all(|o| !o.exists()) && mine.exists(), "only copies of a process that is gone are removed");
+        let _ = std::fs::remove_dir_all(mine);
     }
 
     #[test]
