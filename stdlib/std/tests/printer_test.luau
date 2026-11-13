@@ -23,9 +23,12 @@ test.case("record tables print as a summary plus first rows", function()
 	test.ok(out:find("…+25 more rows", 1, true), out)
 end)
 
-test.case("capped marker comes from the truncated flag", function()
-	local rows = setmetatable({ { a = 1 } }, { __index = { truncated = true } })
-	test.eq(printer.top(rows):match("^[^\n]+"), "<table: 1 rows {a}, capped>")
+test.case("summaries read tables raw, so a raising or looping __index cannot break them", function()
+	local raising = setmetatable({ { a = 1 } }, { __index = function() error("boom") end })
+	test.eq(printer.top(raising):match("^[^\n]+"), "<table: 1 rows {a}>")
+	local looping = setmetatable({ 1, 2 }, {})
+	getmetatable(looping).__index = looping
+	test.eq(printer.top(looping), "<array: 2 items> [1, 2]")
 end)
 
 test.case("arrays and maps", function()

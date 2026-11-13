@@ -280,15 +280,17 @@ def readonly_descendants_and_budget():
     (directory / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nfs=["write"]\n')
     (directory / "init.luau").write_text('return {run=function() return write("escape.txt","bad") end}')
     run(path, "approve", "writer")
+    # A batch agent's value is agent()'s {answer, finished, turns}; the child answers "child done" only when its
+    # read-only assertions all held.
     parent_code = '''local r=batch({{op="agent",args={"CHILD ONE"}},{op="agent",args={"CHILD TWO"}}})
-for _, c in r do assert(c.ok and c.value.finished and c.value.luau_errors==0) end
+for _, c in r do assert(c.ok and c.value.finished and c.value.answer=="child done", c.error or c.value.answer) end
 print("CHILDREN_OK")'''
     child_code = '''assert(not pcall(write,"escape.txt","bad")); assert(not pcall(sh,"echo bad > escape.txt"))
-assert(not pcall(tools.writer.run)); print("READONLY_OK")'''
+assert(not pcall(tools.writer.run)); print("READONLY" .. "_HELD")'''
     def answer(body, index):
         first = not has_assistant(body)
         if task_text(body).startswith("CHILD"):
-            return tool(child_code) if first else "child done"
+            return tool(child_code) if first else ("child done" if "READONLY_HELD" in json.dumps(body) else "child failed")
         return tool(parent_code) if first else "parent done"
     with provider(answer) as (url, calls):
         report = json.loads(start(path, url).stdout)

@@ -2,11 +2,13 @@
 //! `Effects` and every path through `Policy`; shell commands are confined to the policy's roots where Landlock exists.
 use crate::effects::{rt, Effects, Ret};
 use crate::policy::Class;
+use crate::supervisor::Tool;
 use anyhow::Result;
 use grep::regex::RegexMatcherBuilder;
 use grep::searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
 use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use mlua::{Lua, Table, Value};
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -32,9 +34,9 @@ pub fn prompt_limits() -> serde_json::Value {
 }
 
 
-fn resolve(root: &Path, p: &str) -> PathBuf {
-    let p = Path::new(p);
-    if p.is_absolute() { p.to_path_buf() } else { root.join(p) }
+/// Run blocking file work off the async worker threads.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> mlua::Result<T> + Send + 'static) -> mlua::Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(mlua::Error::external)?
 }
 
 /// Replace a file's content all at once (temp file, fsync, rename), after journaling the content's hash. A crash leaves
@@ -44,17 +46,30 @@ fn replace_file(sup: &crate::supervisor::Supervisor, intent: Option<u64>, p: &Pa
     target.replace(bytes)
 }
 
+/// Open a policy-checked canonical path for reading: every directory from `/` down is opened without following a
+/// link, so a directory swapped for a symlink after the check fails the read instead of redirecting it.
+fn read_checked(p: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    crate::atomic_file::Target::open(p, false)?.read(max)
+}
+
 pub fn opt_str(o: &Option<Table>, k: &str) -> Option<String> {
     o.as_ref().and_then(|t| t.get::<Option<String>>(k).ok().flatten())
 }
 fn opt_num(o: &Option<Table>, k: &str) -> Option<f64> {
     o.as_ref().and_then(|t| t.get::<Option<f64>>(k).ok().flatten())
 }
-fn opt_bool(o: &Option<Table>, k: &str) -> bool {
-    o.as_ref().and_then(|t| t.get::<Option<bool>>(k).ok().flatten()).unwrap_or(false)
-}
 pub fn bad(r: Ret) -> mlua::Error {
     rt(format!("unexpected native result {r:?}"))
+}
+
+/// Parse a primitive's options (`nil` for the defaults) into `T`. The table is copied out as plain data first (raw
+/// access, no metamethods), so options are read once, before the effect starts, and an invalid one is an error.
+pub fn options<T: DeserializeOwned + Default>(name: &str, value: Value) -> mlua::Result<T> {
+    if value.is_nil() {
+        return Ok(T::default());
+    }
+    let json = crate::values::copy_out(value).map_err(|e| rt(format!("{name}: options: {e}")))?;
+    serde_json::from_value(json).map_err(|e| rt(format!("{name}: options: {e}")))
 }
 
 /// Copy a structured native result into Lua data.
@@ -65,22 +80,170 @@ pub fn json_value(lua: &Lua, r: Ret) -> mlua::Result<Value> {
     }
 }
 
-pub fn rows_table(lua: &Lua, rows: &[(String, i64, String)], truncated: bool) -> mlua::Result<Table> {
-    let t = lua.create_table()?;
+/// `read(path, opts)` options: `offset` and `limit` count lines, `offset` from 1.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReadOptions {
+    pub offset: Option<f64>,
+    pub limit: Option<f64>,
+}
+
+/// Read a file's bytes exactly as stored (or the requested lines of it), under the read policy.
+pub async fn read(fx: &Effects, lua: &Lua, path: String, opts: ReadOptions) -> mlua::Result<Vec<u8>> {
+    let args = json!({"path": &path, "offset": opts.offset, "limit": opts.limit});
+    let pol = fx.pol.clone();
+    match fx.run(lua, Tool::Read, Class::Read, args, || blocking(move || read_file(&pol, &path, &opts).map(Ret::Bytes))).await? {
+        Ret::Bytes(bytes) => Ok(bytes),
+        r => Err(bad(r)),
+    }
+}
+
+fn read_file(pol: &crate::policy::Policy, path: &str, opts: &ReadOptions) -> mlua::Result<Vec<u8>> {
+    let p = pol.check_read(path).map_err(|e| rt(format!("read {path}: {e}")))?;
+    let bytes = read_checked(&p, MAX_READ).map_err(|e| match e.kind() {
+        std::io::ErrorKind::IsADirectory => rt(format!("read {path}: is a directory (use sh('ls') or search)")),
+        _ => rt(format!("read {path}: {e}")),
+    })?;
+    if bytes.iter().take(8192).any(|b| *b == 0) {
+        return Err(rt(format!("read {path}: binary file")));
+    }
+    if opts.offset.is_none() && opts.limit.is_none() {
+        return Ok(bytes);
+    }
+    let start = opts.offset.unwrap_or(1.0).max(1.0) as usize - 1;
+    let take = opts.limit.map(|l| l.max(0.0) as usize).unwrap_or(usize::MAX);
+    Ok(bytes.split_inclusive(|b| *b == b'\n').skip(start).take(take).flatten().copied().collect())
+}
+
+/// `edit(path, old, new, opts)` options.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct EditOptions {
+    all: bool,
+}
+
+/// Lines in `text` as `str::lines` counts them: a final line without a newline counts, an empty tail does not.
+fn line_count(text: &[u8]) -> usize {
+    text.split(|b| *b == b'\n').count() - usize::from(text.is_empty() || text.ends_with(b"\n"))
+}
+
+/// Replace `old` with `new` in `text`, byte for byte. Unless `all`, `old` must occur exactly once, counting
+/// overlapping occurrences: in `"aaa"`, `"aa"` occurs twice. -> (new text, replacements)
+fn replace_bytes(path: &str, text: &[u8], old: &[u8], new: &[u8], all: bool) -> mlua::Result<(Vec<u8>, usize)> {
+    let finder = memchr::memmem::Finder::new(old);
+    let hits: Vec<usize> = finder.find_iter(text).collect();
+    let Some(&first) = hits.first() else {
+        return Err(rt(format!("edit_not_found: text not found in {path}; read the file and copy the exact text (whitespace matters)")));
+    };
+    if !all && (hits.len() > 1 || finder.find(&text[first + 1..]).is_some()) {
+        let times = if hits.len() > 1 { format!("{} times", hits.len()) } else { "twice (overlapping)".into() };
+        return Err(rt(format!("edit_not_unique: text matches {times} in {path}; include more surrounding lines or pass {{all=true}}")));
+    }
+    let mut out = Vec::with_capacity(text.len() + hits.len() * new.len());
+    let mut from = 0;
+    for &at in &hits {
+        out.extend_from_slice(&text[from..at]);
+        out.extend_from_slice(new);
+        from = at + old.len();
+    }
+    out.extend_from_slice(&text[from..]);
+    Ok((out, hits.len()))
+}
+
+/// The search options of `search(pattern, opts)`.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchOptions {
+    pub path: Option<String>,
+    pub glob: Option<String>,
+    pub max: Option<f64>,
+    pub ignore_case: bool,
+    pub literal: bool,
+}
+
+pub type Rows = Vec<(String, i64, String)>;
+
+/// A search the pattern or glob made impossible; the prelude raises it as a `{kind, message, hint}` table.
+pub struct SearchError {
+    pub kind: String,
+    pub message: String,
+    pub hint: String,
+}
+
+impl SearchError {
+    fn new(kind: &str, message: impl Into<String>, hint: &str) -> Self {
+        Self { kind: kind.into(), message: message.into(), hint: hint.into() }
+    }
+}
+
+/// The matching lines; `truncated` when a match beyond `max` exists and was left out.
+pub struct Hits {
+    pub rows: Rows,
+    pub truncated: bool,
+}
+
+/// Search files under the read policy (`search(pattern, opts)`).
+pub async fn search(fx: &Effects, lua: &Lua, pattern: String, opts: SearchOptions) -> mlua::Result<Result<Hits, SearchError>> {
+    let base = opts.path.clone().unwrap_or_else(|| ".".into());
+    let args = json!({"pattern": &pattern, "path": &base, "glob": opts.glob, "max": opts.max, "ignore_case": opts.ignore_case, "literal": opts.literal});
+    let (pol, workflow) = (fx.pol.clone(), fx.supervisor.workflow_epoch().is_some());
+    let ret = fx.run(lua, Tool::Search, Class::Read, args, || blocking(move || {
+        let root = pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
+        Ok(match search_files(&pol.workspace, &root, &pattern, &opts, workflow, &pol.sealed) {
+            Ok(Hits { rows, truncated }) => Ret::Rows { rows, truncated },
+            Err(SearchError { kind, message, hint }) => Ret::SearchErr { kind, message, hint },
+        })
+    })).await?;
+    match ret {
+        Ret::Rows { rows, truncated } => Ok(Ok(Hits { rows, truncated })),
+        Ret::SearchErr { kind, message, hint } => Ok(Err(SearchError { kind, message, hint })),
+        r => Err(bad(r)),
+    }
+}
+
+/// Search rows as a Lua array of `{file, line, text}`.
+pub fn rows_table(lua: &Lua, rows: &[(String, i64, String)]) -> mlua::Result<Table> {
+    let t = lua.create_table_with_capacity(rows.len(), 0)?;
     for (file, line, text) in rows {
-        let row = lua.create_table()?;
-        row.set("file", file.as_str())?;
-        row.set("line", *line)?;
-        row.set("text", text.as_str())?;
+        let row = lua.create_table_with_capacity(0, 3)?;
+        row.raw_set("file", file.as_str())?;
+        row.raw_set("line", *line)?;
+        row.raw_set("text", text.as_str())?;
         t.raw_push(row)?;
     }
-    if truncated {
-        let (mt, idx) = (lua.create_table()?, lua.create_table()?);
-        idx.set("truncated", true)?;
-        mt.set("__index", idx)?;
-        t.set_metatable(Some(mt))?;
-    }
     Ok(t)
+}
+
+/// What a subagent returned: `agent(...)` and a batch `agent` operation give the model this as `{answer, finished, turns}`.
+pub struct AgentReply {
+    pub answer: String,
+    pub finished: bool,
+    pub turns: u64,
+}
+
+impl AgentReply {
+    pub fn into_lua(self, lua: &Lua) -> mlua::Result<Table> {
+        let t = lua.create_table_with_capacity(0, 3)?;
+        t.raw_set("answer", self.answer)?;
+        t.raw_set("finished", self.finished)?;
+        t.raw_set("turns", self.turns)?;
+        Ok(t)
+    }
+}
+
+/// Run `task` in `child` (made by `Host::child` with the principal it may have) as one effect: a subagent records an
+/// intent and a receipt, and recovery never redispatches it.
+pub async fn agent(fx: &Effects, lua: &Lua, child: Arc<crate::host::Host>, task: String, options: &crate::host::AgentOptions) -> mlua::Result<AgentReply> {
+    let args = json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": options.max_turns, "model": options.model, "effort": options.effort});
+    let ret = fx.run(lua, Tool::Agent, Class::LocalWrite, args, || async {
+        child.log(&format!("### SUBAGENT (depth {}, model {}, effort {})\n{task}", child.depth, child.llm.model, child.llm.reasoning.as_deref().unwrap_or("default")));
+        let rep = child.clone().run_task(task.clone(), options.max_turns).await.map_err(|e| rt(e.to_string()))?;
+        Ok(Ret::Agent { answer: rep["final_answer"].as_str().unwrap_or("").to_string(), finished: rep["finished"].as_bool().unwrap_or(false), turns: rep["turns"].as_u64().unwrap_or(0) })
+    }).await?;
+    match ret {
+        Ret::Agent { answer, finished, turns } => Ok(AgentReply { answer, finished, turns }),
+        r => Err(bad(r)),
+    }
 }
 
 pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()> {
@@ -93,37 +256,12 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
 
     // read(path, {offset=1, limit=n}) -> string. offset/limit are in lines.
     let (f, o) = (fx.clone(), ops.clone());
-    g.set("read", lua.create_async_function(move |lua, (path, opts): (String, Option<Table>)| {
+    g.set("read", lua.create_async_function(move |lua, (path, opts): (String, Value)| {
         let (f, o) = (f.clone(), o.clone());
+        let opts = options::<ReadOptions>("read", opts);
         async move {
             o.fetch_add(1, Ordering::Relaxed);
-            let (offset, limit) = (opt_num(&opts, "offset"), opt_num(&opts, "limit"));
-            let args = json!({"path": &path, "offset": offset, "limit": limit});
-            let pol = f.pol.clone();
-            match f.run_sync(&lua, crate::supervisor::Tool::Read, Class::Read, args, |_| {
-                let p = pol.check_read(&path).map_err(|e| rt(format!("read {path}: {e}")))?;
-                let meta = std::fs::metadata(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
-                if meta.is_dir() {
-                    return Err(rt(format!("read {path}: is a directory (use sh('ls') or search)")));
-                }
-                if meta.len() > MAX_READ {
-                    return Err(rt(format!("read {path}: file is {} bytes, over the 10MB limit", meta.len())));
-                }
-                let bytes = std::fs::read(&p).map_err(|e| rt(format!("read {path}: {e}")))?;
-                if bytes.iter().take(8192).any(|b| *b == 0) {
-                    return Err(rt(format!("read {path}: binary file")));
-                }
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                if offset.is_none() && limit.is_none() {
-                    return Ok(Ret::Str(text));
-                }
-                let start = offset.unwrap_or(1.0).max(1.0) as usize - 1;
-                let take = limit.map(|l| l.max(0.0) as usize).unwrap_or(usize::MAX);
-                Ok(Ret::Str(text.split_inclusive('\n').skip(start).take(take).collect::<String>()))
-            }).await? {
-                Ret::Str(s) => Ok(s),
-                r => Err(bad(r)),
-            }
+            lua.create_string(read(&f, &lua, path, opts?).await?)
         }
     })?)?;
 
@@ -131,18 +269,18 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
     let (f, o) = (fx.clone(), ops.clone());
     g.set("write", lua.create_async_function(move |lua, (path, content): (String, mlua::LuaString)| {
         let (f, o) = (f.clone(), o.clone());
+        let bytes = content.as_bytes().to_vec();
         async move {
             o.fetch_add(1, Ordering::Relaxed);
-            let bytes = content.as_bytes().to_vec();
             let args = json!({"path": &path, "bytes": bytes.len(), "sha256": crate::eventlog::sha_bytes(&bytes)});
-            let pol = f.pol.clone();
-            let sup = f.supervisor.clone();
-            match f.run_sync(&lua, crate::supervisor::Tool::Write, Class::LocalWrite, args, |intent| {
+            let (pol, sup) = (f.pol.clone(), f.supervisor.clone());
+            let len = bytes.len();
+            match f.run_with_intent(&lua, Tool::Write, Class::LocalWrite, args, |intent| blocking(move || {
                 let p = pol.check_write(&path).map_err(|e| rt(format!("write {path}: {e}")))?;
                 let target = crate::atomic_file::Target::open(&p, true).map_err(mlua::Error::external)?;
                 replace_file(&sup, intent, &p, &target, &bytes).map_err(crate::effects::effect_error)?;
-                Ok(Ret::Num(bytes.len() as f64))
-            }).await? {
+                Ok(Ret::Num(len as f64))
+            })).await? {
                 Ret::Num(n) => Ok(n as i64),
                 r => Err(bad(r)),
             }
@@ -151,37 +289,31 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
 
     // edit(path, old, new, {all=false}) -> "ok: N replacement(s), +A/-B lines". `old` must match exactly once unless all=true.
     let (f, o) = (fx.clone(), ops.clone());
-    g.set("edit", lua.create_async_function(move |lua, (path, old, new, opts): (String, mlua::LuaString, mlua::LuaString, Option<Table>)| {
+    g.set("edit", lua.create_async_function(move |lua, (path, old, new, opts): (String, mlua::LuaString, mlua::LuaString, Value)| {
         let (f, o) = (f.clone(), o.clone());
+        let (old, new) = (old.as_bytes().to_vec(), new.as_bytes().to_vec());
+        let opts = options::<EditOptions>("edit", opts);
         async move {
             o.fetch_add(1, Ordering::Relaxed);
-            let (old, new) = (old.to_string_lossy().to_string(), new.to_string_lossy().to_string());
-            let all = opt_bool(&opts, "all");
-            let args = json!({"path": &path, "old_sha": crate::eventlog::sha_bytes(old.as_bytes()), "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "old_bytes": old.len(), "new_bytes": new.len(), "all": all});
-            let pol = f.pol.clone();
-            let sup = f.supervisor.clone();
-            match f.run_sync(&lua, crate::supervisor::Tool::Edit, Class::LocalWrite, args, |intent| {
+            let all = opts?.all;
+            if old.is_empty() {
+                return Err(rt(format!("edit {path}: `old` is empty")));
+            }
+            let args = json!({"path": &path, "old_sha": crate::eventlog::sha_bytes(&old), "new_sha": crate::eventlog::sha_bytes(&new), "old_bytes": old.len(), "new_bytes": new.len(), "all": all});
+            let (pol, sup) = (f.pol.clone(), f.supervisor.clone());
+            match f.run_with_intent(&lua, Tool::Edit, Class::LocalWrite, args, |intent| blocking(move || {
                 let p = pol.check_write(&path).map_err(|e| rt(format!("edit {path}: {e}")))?;
                 // edit reads the file, and whether `old` matched would reveal its content
                 if crate::policy::is_secret(&p) {
                     return Err(rt(format!("edit {path}: policy: a credential file cannot be read")));
                 }
-                let target = crate::atomic_file::Target::open(&p, false).map_err(mlua::Error::external)?;
-                let text = target.read_to_string().map_err(|e| rt(format!("edit {path}: {e}")))?;
-                if old.is_empty() {
-                    return Err(rt(format!("edit {path}: `old` is empty")));
-                }
-                let n = text.matches(&old).count();
-                if n == 0 {
-                    return Err(rt(format!("edit_not_found: text not found in {path}; read the file and copy the exact text (whitespace matters)")));
-                }
-                if n > 1 && !all {
-                    return Err(rt(format!("edit_not_unique: text matches {n} times in {path}; include more surrounding lines or pass {{all=true}}")));
-                }
-                replace_file(&sup, intent, &p, &target, text.replace(&old, &new).as_bytes()).map_err(crate::effects::effect_error)?;
-                let (a, b) = (new.lines().count() * n, old.lines().count() * n);
+                let target = crate::atomic_file::Target::open(&p, false).map_err(|e| rt(format!("edit {path}: {e}")))?;
+                let text = target.read(MAX_READ).map_err(|e| rt(format!("edit {path}: {e}")))?;
+                let (edited, n) = replace_bytes(&path, &text, &old, &new, all)?;
+                replace_file(&sup, intent, &p, &target, &edited).map_err(crate::effects::effect_error)?;
+                let (a, b) = (line_count(&new) * n, line_count(&old) * n);
                 Ok(Ret::Str(format!("ok: {n} replacement{}, +{a}/-{b} lines", if n == 1 { "" } else { "s" })))
-            }).await? {
+            })).await? {
                 Ret::Str(s) => Ok(s),
                 r => Err(bad(r)),
             }
@@ -223,69 +355,64 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         }
     })?)?;
 
-    // __search_raw(pattern, opts) -> rows | nil, {kind, message, hint}; wrapped by the prelude so errors are tables.
+    // __search_raw(pattern, opts) -> rows, truncated | nil, nil, {kind, message, hint}; the prelude's `search` raises the
+    // error table.
     let (f, o) = (fx.clone(), ops);
-    g.set("__search_raw", lua.create_async_function(move |lua, (pat, opts): (String, Option<Table>)| {
+    g.set("__search_raw", lua.create_async_function(move |lua, (pattern, opts): (String, Value)| {
         let (f, o) = (f.clone(), o.clone());
+        let opts = options::<SearchOptions>("search", opts);
         async move {
             o.fetch_add(1, Ordering::Relaxed);
-            let base = opt_str(&opts, "path").unwrap_or_else(|| ".".into());
-            let args = json!({"pattern": &pat, "path": &base, "glob": opt_str(&opts, "glob"), "max": opt_num(&opts, "max"), "ignore_case": opt_bool(&opts, "ignore_case"), "literal": opt_bool(&opts, "literal")});
-            let pol = f.pol.clone();
-            match f.run_sync(&lua, crate::supervisor::Tool::Search, Class::Read, args, |_| {
-                pol.check_read(&base).map_err(|e| rt(format!("search {base}: {e}")))?;
-                Ok(match search(&pol.workspace, &pat, &opts, true, f.supervisor.workflow_epoch().is_some(), &pol.sealed)? {
-                    Ok((rows, truncated)) => Ret::Rows { rows, truncated },
-                    Err((kind, message, hint)) => Ret::SearchErr { kind: kind.into(), message, hint: hint.into() },
-                })
-            }).await? {
-                Ret::Rows { rows, truncated } => Ok((Value::Table(rows_table(&lua, &rows, truncated)?), Value::Nil)),
-                Ret::SearchErr { kind, message, hint } => {
-                    let e = lua.create_table()?;
-                    e.set("kind", kind)?;
-                    e.set("message", message)?;
-                    e.set("hint", hint)?;
-                    Ok((Value::Nil, Value::Table(e)))
+            match search(&f, &lua, pattern, opts?).await? {
+                Ok(Hits { rows, truncated }) => Ok((Value::Table(rows_table(&lua, &rows)?), Value::Boolean(truncated), Value::Nil)),
+                Err(SearchError { kind, message, hint }) => {
+                    let e = lua.create_table_with_capacity(0, 3)?;
+                    e.raw_set("kind", kind)?;
+                    e.raw_set("message", message)?;
+                    e.raw_set("hint", hint)?;
+                    Ok((Value::Nil, Value::Nil, Value::Table(e)))
                 }
-                r => Err(bad(r)),
             }
         }
     })?)?;
     Ok(())
 }
 
-type SearchErr = (&'static str, String, &'static str);
-type Rows = Vec<(String, i64, String)>;
+/// Directories no search descends into unless the search starts inside them: Git's object store and the harness's
+/// own state.
+const INTERNAL_DIRS: [&str; 2] = [".git", ".harness"];
 
 struct Collect<'a> {
     rows: &'a mut Rows,
     file: String,
     cap: usize,
+    /// A match past `cap` was seen (and not collected).
+    over: bool,
 }
 
 impl Sink for Collect<'_> {
     type Error = std::io::Error;
     fn matched(&mut self, _s: &grep::searcher::Searcher, m: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         if self.rows.len() >= self.cap {
+            self.over = true;
             return Ok(false);
         }
         let text = String::from_utf8_lossy(m.bytes()).trim_end().to_string();
         let text: String = if text.chars().count() > 300 { text.chars().take(300).collect::<String>() + "…" } else { text };
         self.rows.push((self.file.clone(), m.line_number().unwrap_or(0) as i64, text));
-        Ok(self.rows.len() < self.cap)
+        Ok(true)
     }
 }
 
-// search(pattern, {path=".", glob="*.rs", max=200, ignore_case=false, literal=false}). With `skip_secrets` (the policy is on),
-// credential files are not searched, as `read` refuses them.
-fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, workflow: bool, sealed: &[PathBuf]) -> mlua::Result<Result<(Rows, bool), SearchErr>> {
-    let literal = opt_bool(opts, "literal");
-    if !literal {
+/// Search the files under `base` (canonical and policy-checked) for `pattern`, gitignore-aware, skipping binary
+/// files, credential files, sealed paths and `INTERNAL_DIRS`. Rows name files relative to `root`.
+fn search_files(root: &Path, base: &Path, pat: &str, opts: &SearchOptions, workflow: bool, sealed: &[PathBuf]) -> Result<Hits, SearchError> {
+    if !opts.literal {
         for tok in ["(?=", "(?!", "(?<=", "(?<!"] {
             if pat.contains(tok) {
-                return Ok(Err(("unsupported_regex",
+                return Err(SearchError::new("unsupported_regex",
                     format!("lookaround `{tok}` is not supported (Rust regex engine)"),
-                    "search for the fixed part and filter the rows in Luau, or use two searches")));
+                    "search for the fixed part and filter the rows in Luau, or use two searches"));
             }
         }
         let b = pat.as_bytes();
@@ -293,8 +420,8 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
         while i + 1 < b.len() {
             if b[i] == b'\\' {
                 if (b'1'..=b'9').contains(&b[i + 1]) {
-                    return Ok(Err(("unsupported_regex", "backreferences are not supported".into(),
-                        "match each part separately and compare in Luau")));
+                    return Err(SearchError::new("unsupported_regex", "backreferences are not supported",
+                        "match each part separately and compare in Luau"));
                 }
                 i += 2;
             } else {
@@ -302,62 +429,54 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
             }
         }
     }
-    let matcher = match RegexMatcherBuilder::new()
-        .case_insensitive(opt_bool(opts, "ignore_case"))
-        .fixed_strings(literal)
+    let matcher = RegexMatcherBuilder::new()
+        .case_insensitive(opts.ignore_case)
+        .fixed_strings(opts.literal)
         .build(pat)
-    {
-        Ok(m) => m,
-        Err(e) => return Ok(Err(("invalid_regex", e.to_string(), "escape special characters or pass literal=true"))),
-    };
-    // Walk the authorized canonical root so a root alias cannot hide sealed descendants.
-    let base = std::fs::canonicalize(resolve(root, &opt_str(opts, "path").unwrap_or_else(|| ".".into())))
-        .map_err(mlua::Error::external)?;
-    let cap = opt_num(opts, "max").map(|m| m.max(1.0) as usize).unwrap_or(DEFAULT_HITS);
-    let mut wb = WalkBuilder::new(&base);
-    wb.follow_links(false).require_git(false).sort_by_file_path(|a, b| a.cmp(b));
+        .map_err(|e| SearchError::new("invalid_regex", e.to_string(), "escape special characters or pass literal=true"))?;
+    let cap = opts.max.map(|m| m.max(1.0) as usize).unwrap_or(DEFAULT_HITS);
+    let mut wb = WalkBuilder::new(base);
+    wb.hidden(false).follow_links(false).require_git(false).sort_by_file_path(|a, b| a.cmp(b));
     if workflow {
         wb.parents(false);
-        let project=root.to_path_buf();
-        let explicit=base.strip_prefix(root).unwrap_or(&base).to_path_buf();
-        wb.filter_entry(move |entry| {
-            let relative=entry.path().strip_prefix(&project).unwrap_or(entry.path());
-            [".harness/log", ".agents/artifacts"].iter().all(|runtime|explicit.starts_with(runtime) || !relative.starts_with(runtime))
-        });
     }
-    if let Some(glob) = opt_str(opts, "glob") {
-        let mut ob = OverrideBuilder::new(&base);
-        if let Err(e) = ob.add(&glob) {
-            return Ok(Err(("invalid_glob", e.to_string(), "use gitignore-style globs like *.rs or src/**/*.ts")));
+    let (project, explicit) = (root.to_path_buf(), base.strip_prefix(root).unwrap_or(base).to_path_buf());
+    wb.filter_entry(move |entry| {
+        if entry.depth() > 0 && INTERNAL_DIRS.iter().any(|d| entry.file_name() == *d) {
+            return false;
         }
-        match ob.build() {
-            Ok(o) => { wb.overrides(o); }
-            Err(e) => return Ok(Err(("invalid_glob", e.to_string(), "use gitignore-style globs"))),
-        }
+        // In a workflow, run artifacts are searched only when asked for by path.
+        let relative = entry.path().strip_prefix(&project).unwrap_or(entry.path());
+        !workflow || [".harness/log", ".agents/artifacts"].iter().all(|runtime| explicit.starts_with(runtime) || !relative.starts_with(runtime))
+    });
+    if let Some(glob) = &opts.glob {
+        let hint = "use gitignore-style globs like *.rs or src/**/*.ts";
+        let mut ob = OverrideBuilder::new(base);
+        ob.add(glob).map_err(|e| SearchError::new("invalid_glob", e.to_string(), hint))?;
+        wb.overrides(ob.build().map_err(|e| SearchError::new("invalid_glob", e.to_string(), hint))?);
     }
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(0))
         .build();
     let mut rows: Rows = Vec::new();
-    let mut capped = false;
     for entry in wb.build().flatten() {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path();
-        if (skip_secrets && crate::policy::is_secret(path)) || sealed.iter().any(|s| path.starts_with(s)) {
+        if crate::policy::is_secret(path) || sealed.iter().any(|s| path.starts_with(s)) {
             continue;
         }
         let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-        let mut sink = Collect { rows: &mut rows, file: rel, cap };
+        let mut sink = Collect { rows: &mut rows, file: rel, cap, over: false };
+        // An unreadable file is skipped like a binary one.
         let _ = searcher.search_path(&matcher, path, &mut sink);
-        if rows.len() >= cap {
-            capped = true;
-            break;
+        if sink.over {
+            return Ok(Hits { rows, truncated: true });
         }
     }
-    Ok(Ok((rows, capped)))
+    Ok(Hits { rows, truncated: false })
 }
 
 /// A shell command's environment (None: inherited) and its kernel confinement (None: unconfined).
@@ -522,11 +641,7 @@ pub fn load_view_image(pol: &crate::policy::Policy, path: &str, max: u32) -> std
     use base64::Engine;
     use image::{GenericImageView, ImageFormat};
     let p = pol.check_read(path).map_err(|e| format!("view {path}: {e}"))?;
-    let len = std::fs::metadata(&p).map_err(|e| format!("view {path}: {e}"))?.len();
-    if len > MAX_IMAGE_FILE {
-        return Err(format!("view {path}: file is {len} bytes, over the 20MB limit"));
-    }
-    let bytes = std::fs::read(&p).map_err(|e| format!("view {path}: {e}"))?;
+    let bytes = read_checked(&p, MAX_IMAGE_FILE).map_err(|e| format!("view {path}: {e}"))?;
     let fmt = image::guess_format(&bytes).map_err(|_| format!("view {path}: not an image (PNG, JPEG, WebP or GIF)"))?;
     if !matches!(fmt, ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif) {
         return Err(format!("view {path}: unsupported format {fmt:?} (PNG, JPEG, WebP or GIF)"));
@@ -596,5 +711,129 @@ mod receipt_tests {
         let outcomes: Vec<_> = records.iter().filter(|r| r["kind"] == "outcome" && r["ret"]["t"] == "sh").collect();
         assert!(outcomes.len() == 2 && outcomes.iter().all(|r| r["approval"] == "not-required"), "each shell outcome records who approved it");
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    fn workspace(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hx-prims-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn vm(dir: &Path) -> crate::vm::Vm {
+        let pol = Arc::new(crate::policy::Policy::new(dir, false, None, None, None).unwrap());
+        crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap()
+    }
+
+    #[test]
+    fn edit_uniqueness_counts_overlapping_occurrences() {
+        let text = b"end\nend\nend\n";
+        assert!(replace_bytes("f", text, b"end\nend", b"X", false).is_err_and(|e| e.to_string().contains("edit_not_unique")));
+        assert!(replace_bytes("f", b"aaa", b"aa", b"b", false).is_err());
+        assert_eq!(replace_bytes("f", b"aaa", b"aa", b"b", true).unwrap(), (b"ba".to_vec(), 1));
+        assert_eq!(replace_bytes("f", b"a\xffb", b"\xff", b"\x80", false).unwrap(), (b"a\x80b".to_vec(), 1));
+        assert!(replace_bytes("f", b"abc", b"x", b"y", false).is_err_and(|e| e.to_string().contains("edit_not_found")));
+        assert_eq!((line_count(b""), line_count(b"a"), line_count(b"a\n"), line_count(b"a\nb")), (0, 1, 1, 2));
+    }
+
+    #[tokio::test]
+    async fn read_write_and_edit_are_byte_exact() {
+        let dir = workspace("bytes");
+        std::fs::write(dir.join("f"), b"a\xffb\nend\n").unwrap();
+        let vm = vm(&dir);
+        let r = vm.session.run(r#"local s = read("f"); assert(#s == 8 and s:byte(2) == 255)
+            assert(read("f", {offset = 2}) == "end\n")
+            edit("f", "\255", "\128"); write("g", "\254\n")"#).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"a\x80b\nend\n");
+        assert_eq!(std::fs::read(dir.join("g")).unwrap(), b"\xfe\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn read_refuses_what_is_not_a_regular_file() {
+        let dir = workspace("fifo");
+        assert!(std::process::Command::new("mkfifo").arg(dir.join("pipe")).status().unwrap().success());
+        let vm = vm(&dir);
+        let r = vm.session.run(r#"local ok, e = pcall(read, "pipe"); assert(not ok and tostring(e):find("not a regular file", 1, true), tostring(e))
+            local ok2, e2 = pcall(read, "."); assert(not ok2 and tostring(e2):find("is a directory", 1, true), tostring(e2))"#).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn options_are_plain_data_read_once() {
+        let dir = workspace("options");
+        std::fs::write(dir.join("f"), "x\n").unwrap();
+        let vm = vm(&dir);
+        let r = vm.session.run(r#"local trap = setmetatable({}, {__index = function() error("metamethod ran") end})
+            local ok, e = pcall(read, "f", trap); assert(not ok and not tostring(e):find("metamethod ran", 1, true), tostring(e))
+            assert(not pcall(read, "f", {offest = 2}))
+            assert(not pcall(search, "x", {ignore_case = "yes"}))
+            assert(not pcall(edit, "f", "x", "y", {al = true}))"#).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_is_truncated_only_when_a_match_was_left_out() {
+        let dir = workspace("cap");
+        std::fs::write(dir.join("a"), "hit\nhit\n").unwrap();
+        std::fs::write(dir.join("b"), "hit\n").unwrap();
+        let search = |max: f64| {
+            let opts = SearchOptions { max: Some(max), ..Default::default() };
+            search_files(&dir, &dir, "hit", &opts, false, &[]).ok().unwrap()
+        };
+        let exact = search(3.0);
+        assert_eq!((exact.rows.len(), exact.truncated), (3, false));
+        let capped = search(2.0);
+        assert_eq!((capped.rows.len(), capped.truncated), (2, true));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_covers_hidden_paths_except_git_and_harness() {
+        let dir = workspace("hidden");
+        for f in [".github/ci.yml", ".git/config", ".harness/x", ".envrc", "src/.keep", "credentials"] {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "needle\n").unwrap();
+        }
+        let opts = SearchOptions { literal: true, ..Default::default() };
+        let files: Vec<String> = search_files(&dir, &dir, "needle", &opts, false, &[]).ok().unwrap().rows.into_iter().map(|r| r.0).collect();
+        assert_eq!(files, [".envrc", ".github/ci.yml", "src/.keep"]);
+        let inside = search_files(&dir, &dir.join(".harness"), "needle", &opts, false, &[]).ok().unwrap();
+        assert_eq!(inside.rows.len(), 1, "a search that starts inside .harness covers it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_read_never_follows_a_directory_swapped_for_a_symlink() {
+        let dir = workspace("swap");
+        let outside = workspace("swap-outside");
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d/f"), "inside").unwrap();
+        std::fs::write(outside.join("f"), "OUTSIDE").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("l")).unwrap();
+        let pol = crate::policy::Policy::new(&dir, false, None, None, None).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let (d, l, stop) = (std::ffi::CString::new(dir.join("d").into_os_string().into_encoded_bytes()).unwrap(),
+                std::ffi::CString::new(dir.join("l").into_os_string().into_encoded_bytes()).unwrap(), stop.clone());
+            std::thread::spawn(move || while !stop.load(Ordering::Relaxed) {
+                // SAFETY: both arguments are NUL-terminated paths that outlive the call.
+                unsafe { libc::renameat2(libc::AT_FDCWD, d.as_ptr(), libc::AT_FDCWD, l.as_ptr(), libc::RENAME_EXCHANGE) };
+            })
+        };
+        let leaked = (0..3000).filter(|_| read_file(&pol, "d/f", &ReadOptions::default()).is_ok_and(|b| b == b"OUTSIDE")).count();
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert_eq!(leaked, 0);
+        let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(outside));
     }
 }

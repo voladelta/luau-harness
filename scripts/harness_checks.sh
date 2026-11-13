@@ -40,6 +40,13 @@ rm $W/.harness/override/std/printer.luau
 check "parallel API absent" "$($H exec --workspace $W 'print(parallel == nil)' 2>&1 | head -1)" "true"
 echo batch-data > $W/batch.txt
 check "sealed read batch" "$($H exec --workspace $W 'print(batch({{op="read",args={"batch.txt"}}})[1].value)' | head -1)" "batch-data"
+check "batch operations count as ops and carry search truncation" "$($H exec --workspace $W 'local r=batch({{op="read",args={"batch.txt"}},{op="search",args={"batch",{path="batch.txt",max=1}}}}); print(r[2].ok, #r[2].value, r[2].truncated)' | head -2 | tr '\n' ' ')" "true	1	false -- ops=2 error=false "
+
+# 3c. search returns plain data: capped rows cross the data boundary, and hidden files other than .git/.harness are searched
+mkdir -p $W4/.github $W4/.git
+for f in .github/ci.yml .git/config .envrc plain.txt; do echo needle > $W4/$f; done
+check "search covers hidden files but not .git" "$($H exec --workspace $W4 'local rows = search("needle", {literal=true}); local files = {}; for _, r in rows do table.insert(files, r.file) end; table.sort(files); print(table.concat(files, ","))' | sed -n 1p)" ".envrc,.github/ci.yml,plain.txt"
+check "capped search rows are data" "$($H exec --workspace $W4 'local rows, more = search("needle", {max=1}); durable.set("rows", rows); print(#rows, more)' | sed -n 1p)" "1	true"
 
 # 4. vars() lists session variables
 check "vars" "$($H exec --workspace $W $'x = 41\nvars()' | head -1)" "=> <table: 1 keys> {x=41}"

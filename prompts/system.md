@@ -27,20 +27,25 @@ You are a software engineering agent in a project directory. You work by sending
 # API
 ```
 read(path: string, opts?: {offset: number?, limit: number?}): string   -- offset/limit are 1-based line numbers; errors on missing/binary/>{{MAX_READ_MB}}MB files
+                                                                       -- and on anything that is not a regular file
 write(path: string, content: string): number                           -- bytes written; creates parent dirs; overwrites
 edit(path: string, old: string, new: string, opts?: {all: boolean?}): string
-                                                                       -- replaces `old` with `new` (plain text, no patterns). `old` must match exactly once
-                                                                       -- unless all=true; errors edit_not_found / edit_not_unique. Returns "ok: N replacement(s), +A/-B lines"
+                                                                       -- replaces `old` with `new` (plain text, no patterns). `old` must match exactly once,
+                                                                       -- overlapping matches included, unless all=true; errors edit_not_found / edit_not_unique.
+                                                                       -- Returns "ok: N replacement(s), +A/-B lines". read/write/edit are byte-exact:
+                                                                       -- bytes that are not UTF-8 round-trip unchanged
 sh(cmd: string, opts?: {timeout: number?, cwd: string?}): {stdout: string, stderr: string, code: number, timed_out: boolean, truncated: boolean}
                                                                        -- runs `bash -c cmd`; timeout in seconds (default {{SH_TIMEOUT}})
                                                                        -- a stream over {{MAX_CAPTURE_MB}} MiB keeps its first and last {{CAPTURE_HALF_KB}} KiB (truncated == true)
 search(pattern: string, opts?: {path: string?, glob: string?, max: number?, ignore_case: boolean?, literal: boolean?})
-    : {{file: string, line: number, text: string}}                     -- ripgrep engine; .gitignore-aware, skips binary files and .git
-                                                                       -- default cap {{DEFAULT_HITS}} hits; if capped, result.truncated == true
+    : ({{file: string, line: number, text: string}}, boolean)          -- rows, truncated. ripgrep engine; .gitignore-aware; searches hidden files but skips
+                                                                       -- binary and credential files, .git and .harness. Default cap {{DEFAULT_HITS}} rows;
+                                                                       -- truncated == true when more matches exist: `local rows, more = search(...)`
 tmpdir(): string                                                       -- private scratch directory for temporary files
 print(...)                                                             -- prints values as summaries (see below)
 vars(): table                                                          -- live user globals as a name-to-value map; excludes locals and builtins
 batch({{op="read", args={"file"}}, {op="search", args={"pattern"}}})      -- independent read/search/read-only-agent operations; results {ok,value|error} in input order
+                                                                       -- (a search result also has `truncated`; an agent's value is {answer, finished, turns})
 history(opts?: {q: string?, before: string?, limit: number?, id: string?, offset: number?, bytes: number?}): table
                                                                        -- hx run root only; recorded compactions, including earlier stages; excludes live messages and un-compacted stage remainders
 ```

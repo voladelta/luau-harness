@@ -45,6 +45,8 @@ fn is_unknown(error: &mlua::Error) -> bool {
 pub enum Ret {
     Num(f64),
     Str(String),
+    /// File content, byte-exact (journaled like `Str`).
+    Bytes(Vec<u8>),
     /// `approval` is who approved the command (`Policy::approve`); the outcome record carries it.
     Sh { stdout: Vec<u8>, stderr: Vec<u8>, code: Option<i64>, timed_out: bool, truncated: bool, operation_id: Option<u64>, approval: &'static str },
     Rows { rows: Vec<(String, i64, String)>, truncated: bool },
@@ -60,6 +62,7 @@ impl Ret {
         Ok(match self {
             Ret::Num(v) => json!({"t": "num", "v": v}),
             Ret::Str(s) => json!({"t": "str", "blob": log.blob(s.as_bytes())?}),
+            Ret::Bytes(b) => json!({"t": "str", "blob": log.blob(b)?}),
             Ret::Sh { stdout, stderr, code, timed_out, truncated, .. } => json!({"t": "sh", "stdout": log.blob(stdout)?, "stderr": log.blob(stderr)?, "code": code, "timed_out": timed_out, "truncated": truncated}),
             Ret::Rows { rows, truncated } => json!({"t": "rows", "blob": log.blob(serde_json::to_string(rows).unwrap_or_default().as_bytes())?, "n": rows.len(), "truncated": truncated}),
             Ret::SearchErr { kind, message, hint } => json!({"t": "searcherr", "kind": kind, "message": message, "hint": hint}),
@@ -173,41 +176,20 @@ impl Effects {
         Ok(())
     }
 
-    /// Authorize and record one synchronous effect.
-    /// `f` receives the durable intent's ID (None for reads).
-    #[cfg(test)]
-    pub fn sync(&self, _lua: &Lua, tool: Tool, class: Class, args: Value, f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
-        self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
-        self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
-        let _permit = if class != Class::Read && tool != Tool::Agent {
-            Some(self.supervisor.mutations.clone().try_acquire_owned().map_err(|_| rt("another mutation is in progress"))?)
-        } else { None };
-        self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
-        self.supervisor.authorize(&self.principal, tool, class).map_err(mlua::Error::external)?;
-        let sha = args_sha(&args);
-        let t0 = std::time::Instant::now();
-        let call = Call { tool, class, args: &args, sha: &sha };
-        let intent = self.begin(&call)?;
-        let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
-        let res = f(intent);
-        self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
-        res
-    }
-
     /// Async authorization around a synchronous file executor. The intent ID still reaches atomic writes.
     pub async fn run_sync(&self, lua: &Lua, tool: Tool, class: Class, args: Value,
         f: impl FnOnce(Option<u64>) -> mlua::Result<Ret>) -> mlua::Result<Ret> {
-        self.run_inner(lua, tool, class, args, |intent| async move { f(intent) }).await
+        self.run_with_intent(lua, tool, class, args, |intent| async move { f(intent) }).await
     }
 
     /// Authorize and record one asynchronous effect (sh, agent).
     pub async fn run<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where F: FnOnce() -> Fut, Fut: Future<Output = mlua::Result<Ret>> {
-        self.run_inner(lua, tool, class, args, |_| f()).await
+        self.run_with_intent(lua, tool, class, args, |_| f()).await
     }
 
-    /// Authorize and record one asynchronous effect (sh, agent).
-    async fn run_inner<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
+    /// Authorize and record one asynchronous effect; `f` receives the durable intent's ID (None for reads).
+    pub async fn run_with_intent<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where
         F: FnOnce(Option<u64>) -> Fut,
         Fut: Future<Output = mlua::Result<Ret>>,
@@ -233,9 +215,6 @@ impl Effects {
                 _ => None,
             };
             if let Some(path) = path {
-                if tool == Tool::Edit && crate::policy::is_secret(std::path::Path::new(path)) {
-                    return Err(rt("edit: policy: a credential file cannot be read"));
-                }
                 self.pol.authorize_path(path, matches!(tool, Tool::Write | Tool::Edit)).await.map_err(mlua::Error::external)?;
             }
             Ok(())
@@ -342,18 +321,18 @@ mod tests {
         drop(permit);
         assert!(queued.await.is_err());
         assert!(!executed.get());
-        assert!(fx.sync(&lua, Tool::Read, Class::Read, json!({}), |_| Ok(Ret::Num(0.0))).is_ok());
+        assert!(fx.run(&lua, Tool::Read, Class::Read, json!({}), || async { Ok(Ret::Num(0.0)) }).await.is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn uncertainty_uses_error_type_instead_of_message_text() {
+    #[tokio::test]
+    async fn uncertainty_uses_error_type_instead_of_message_text() {
         let (fx, dir) = effects("typed");
         let lua = Lua::new();
-        let result = fx.sync(&lua, Tool::Write, Class::LocalWrite, json!({}), |_| Err(rt("unknown_outcome: ordinary error text")));
+        let result = fx.run(&lua, Tool::Write, Class::LocalWrite, json!({}), || async { Err(rt("unknown_outcome: ordinary error text")) }).await;
         assert!(result.is_err());
         assert!(fx.supervisor.uncertain_operations().is_empty());
-        let result = fx.sync(&lua, Tool::Write, Class::LocalWrite, json!({}), |_| Err(unknown("response lost")));
+        let result = fx.run(&lua, Tool::Write, Class::LocalWrite, json!({}), || async { Err(unknown("response lost")) }).await;
         assert!(result.is_err());
         assert_eq!(fx.supervisor.uncertain_operations().len(), 1);
         assert_eq!(crate::eventlog::verify(&fx.log().path).unwrap().unknown.len(), 1);

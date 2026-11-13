@@ -137,7 +137,7 @@ for _, result in results do
 end
 ```
 
-The complete batch is validated and copied before dispatch. It accepts at most 32 independent read/search/read-only-agent operations. Results are published together in input order; search results also carry a `truncated` flag. Mutating shells, writable subagents, shared globals and arbitrary closures are excluded. `parallel{function ...}` is removed.
+The complete batch is validated and copied before dispatch. It accepts at most 32 independent read/search/read-only-agent operations. Each operation goes through the same authorization, journal records and operation count as the single primitive, and agents run read-only. Results are published together in input order: a read's value is the file's bytes, a search's value is its rows and the entry also carries `truncated`, and an agent's value is `{answer, finished, turns}`, as `agent()` returns. Mutating shells, writable subagents, shared globals and arbitrary closures are excluded. `parallel{function ...}` is removed.
 
 ## Workflow customization
 

@@ -673,6 +673,7 @@ dependencies = [
  "image",
  "landlock",
  "libc",
+ "memchr",
  "mlua",
  "reqwest",
  "serde",

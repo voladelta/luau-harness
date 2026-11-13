@@ -109,6 +109,32 @@ impl Target {
         Ok(text)
     }
 
+    /// The target's whole content, opened through the pinned directory without following a link. Refuses a directory
+    /// (`IsADirectory`), anything else that is not a regular file (a FIFO would block, a device may never end;
+    /// `InvalidInput`) and content over `max` bytes (`FileTooLarge`), reading at most `max + 1` bytes either way.
+    pub fn read(&self, max: u64) -> io::Result<Vec<u8>> {
+        let file = self.existing()?;
+        let meta = file.metadata()?;
+        if meta.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+        }
+        if !meta.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        let too_large = |len: u64| {
+            io::Error::new(io::ErrorKind::FileTooLarge, format!("file is {len} bytes, over the {max}-byte limit"))
+        };
+        if meta.len() > max {
+            return Err(too_large(meta.len()));
+        }
+        let mut bytes = Vec::new();
+        file.take(max + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max {
+            return Err(too_large(bytes.len() as u64));
+        }
+        Ok(bytes)
+    }
+
     /// Unlink the target name itself (a link is removed, never followed).
     pub fn remove(&self) -> io::Result<()> {
         if unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) } < 0 {

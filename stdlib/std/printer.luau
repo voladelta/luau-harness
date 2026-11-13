@@ -157,9 +157,8 @@ end
 
 local function toptable(t): string
 	local arr, rest = split(t)
-	local cap = if t.truncated == true then ", capped" else ""
 	if isrecords(arr) then
-		local out = { "<table: " .. #arr .. " rows {" .. table.concat(keyed(arr[1]) :: any, ",") .. "}" .. cap .. ">" }
+		local out = { "<table: " .. #arr .. " rows {" .. table.concat(keyed(arr[1]) :: any, ",") .. "}>" }
 		for i = 1, math.min(#arr, M.ROWS) do
 			table.insert(out, "  [" .. i .. "] " .. clip(fmt(arr[i], 1), M.ROW_CHARS))
 		end
@@ -170,7 +169,7 @@ local function toptable(t): string
 		return table.concat(out, "\n")
 	end
 	if #arr > 0 and #rest == 0 then
-		return "<array: " .. #arr .. " items" .. cap .. "> " .. fmttable(t, 0)
+		return "<array: " .. #arr .. " items> " .. fmttable(t, 0)
 	end
 	if #arr == 0 and #rest > 0 then
 		return "<table: " .. #rest .. " keys> " .. fmttable(t, 0)

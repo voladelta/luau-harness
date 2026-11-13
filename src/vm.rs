@@ -39,12 +39,12 @@ loadstring = nil
 require = nil
 
 function search(pattern, opts)
-	local rows, err = __search_raw(pattern, opts)
+	local rows, truncated, err = __search_raw(pattern, opts)
 	if err then
 		setmetatable(err, { __tostring = function(e) return e.kind .. ": " .. e.message .. " (hint: " .. e.hint .. ")" end })
 		error(err, 2)
 	end
-	return rows
+	return rows, truncated
 end
 "##;
 
@@ -295,16 +295,15 @@ impl Vm {
                 }
             })?)?;
         }
-        let (bs, bh, bfx) = (supervisor.clone(), host.clone(), fx.clone());
+        let (bs, bh, bfx, bops) = (supervisor.clone(), host.clone(), fx.clone(), ops.clone());
         g.set("batch", lua.create_async_function(move |lua, input: Value| {
-            let (s, h, fx) = (bs.clone(), bh.clone(), bfx.clone());
+            let (s, h, fx, ops) = (bs.clone(), bh.clone(), bfx.clone(), bops.clone());
             async move {
                 s.authorize_stage(fx.stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
                 let _active = crate::workflow_runtime::EffectGuard::new(&s);
                 let operations = crate::values::copy_out(input)?;
                 let _wait = fx.awaiting(&lua);
-                let results = crate::batch::run(s.clone(), h, operations).await.map_err(mlua::Error::external)?;
-                crate::values::copy_in(&lua, &results)
+                crate::batch::run(&fx, &lua, h, &ops, operations).await
             }
         })?)?;
         if host.as_ref().is_some_and(|h|h.is_workflow_root()) {
@@ -398,23 +397,7 @@ impl Vm {
                 async move {
                     let options = crate::host::AgentOptions::from_lua(opts)?;
                     let child = h.child(&options, afx.principal.clone()).map_err(mlua::Error::external)?;
-                    let args = serde_json::json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": options.max_turns, "model": options.model, "effort": options.effort});
-                    // A subagent records an intent and receipt; recovery never redispatches it.
-                    let ret = afx.run(&lua, crate::supervisor::Tool::Agent, Class::LocalWrite, args, || async {
-                        child.log(&format!("### SUBAGENT (depth {}, model {}, effort {})\n{task}", child.depth, child.llm.model, child.llm.reasoning.as_deref().unwrap_or("default")));
-                        let rep = child.run_task(task.clone(), options.max_turns).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
-                        Ok(Ret::Agent { answer: rep["final_answer"].as_str().unwrap_or("").to_string(), finished: rep["finished"].as_bool().unwrap_or(false), turns: rep["turns"].as_u64().unwrap_or(0) })
-                    }).await?;
-                    match ret {
-                        Ret::Agent { answer, finished, turns } => {
-                            let t = lua.create_table()?;
-                            t.set("answer", answer)?;
-                            t.set("finished", finished)?;
-                            t.set("turns", turns)?;
-                            Ok(t)
-                        }
-                        r => Err(prims::bad(r)),
-                    }
+                    prims::agent(&afx, &lua, child, task, &options).await?.into_lua(&lua)
                 }
             })?)?;
         }

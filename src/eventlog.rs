@@ -504,8 +504,8 @@ mod open_tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    #[test]
-    fn failed_intent_write_prevents_the_effect_even_if_the_error_is_caught() {
+    #[tokio::test]
+    async fn failed_intent_write_prevents_the_effect_even_if_the_error_is_caught() {
         let path = three_records("write-failure");
         let mut pol = crate::policy::Policy::new(path.parent().unwrap(), false, None, None, None).unwrap();
         pol.log = Arc::new(EventLog {
@@ -517,18 +517,18 @@ mod open_tests {
         let lua = mlua::Lua::new();
         let mut executed = false;
         for _ in 0..2 {
-            let result = fx.sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
+            let result = fx.run_sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
                 executed = true;
                 Ok(crate::effects::Ret::Num(0.0))
-            });
+            }).await;
             assert!(result.is_err(), "a failed WAL must be fatal before executing the effect");
         }
         assert!(!executed);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    #[test]
-    fn failed_outcome_blob_keeps_an_unknown_intent_and_blocks_later_effects() {
+    #[tokio::test]
+    async fn failed_outcome_blob_keeps_an_unknown_intent_and_blocks_later_effects() {
         let path = three_records("blob-failure");
         let pol = crate::policy::Policy::new(path.parent().unwrap(), false, None, None, None).unwrap();
         let log_path = pol.log.path.clone();
@@ -537,10 +537,10 @@ mod open_tests {
         let lua = mlua::Lua::new();
         let mut executions = 0;
         for _ in 0..2 {
-            let result = fx.sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
+            let result = fx.run_sync(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), |_| {
                 executions += 1;
                 Ok(crate::effects::Ret::Str("result".into()))
-            });
+            }).await;
             assert!(result.is_err());
         }
         assert_eq!(executions, 1, "the first effect precedes the outcome failure; the second must not execute");
