@@ -16,20 +16,22 @@ pub struct Episode {
     pub role: Role,
     /// The candidate an exploit worker improves (0 for every other role).
     pub idea: u32,
-    /// The snapshot the workspace starts from, and the score an improvement must beat (none: any valid score).
+    /// The snapshot the workspace starts from: an exploit worker's candidate's best state, which an improvement must
+    /// beat, or the seed.
     pub start: String,
-    pub best: Option<f64>,
 }
 
-/// A worker's progress inside its child run: its claim and its best score so far. Held by the run's `Policy`.
+/// A worker's progress inside its child run: its claim and its best state so far. Held by the run's `Policy`.
 #[derive(Default)]
 pub struct Progress {
     claim: Option<u32>,
-    best: Option<f64>,
+    /// The snapshot of the best state: an exploit worker starts at its candidate's; an explore worker's first valid
+    /// state sets it, even below the seed.
+    best: Option<String>,
 }
 impl Progress {
     pub fn start(episode: Option<&Episode>) -> Progress {
-        Progress { claim: None, best: episode.and_then(|e| e.best) }
+        Progress { claim: None, best: episode.filter(|e| e.role == Role::Exploit).map(|e| e.start.clone()) }
     }
 }
 
@@ -56,50 +58,67 @@ fn served<'a>(pol: &'a Policy, what: &str) -> Result<(&'a Episode, &'a Mutex<Pro
 pub async fn eval(pol: &Policy, note: String) -> Result<Value> {
     let (episode, progress) = served(pol, "ar.eval")?;
     let spec = &episode.spec;
-    let claim = progress.lock().unwrap().claim;
+    let claim = progress.lock().expect("ar progress lock poisoned").claim;
     let idea = match (episode.role, claim) {
         (Role::Explore | Role::Exploit, None) => bail!("claim your idea with ar.claim(\"...\") before scoring it"),
         (Role::Explore, Some(n)) => n,
         (Role::Exploit, Some(_)) => episode.idea,
         (Role::Research | Role::Audit, _) => 0,
     };
-    let files = capture(&pol.workspace, spec)?;
-    let snap = save_snap(&episode.dir, &files)?;
+    let (workspace, dir, spec_) = (pol.workspace.clone(), episode.dir.clone(), spec.clone());
+    let (files, snap, held) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let files = capture(&workspace, &spec_)?;
+        let snap = save_snap(&dir, &files)?;
+        // Evaluations of one state are serialized, so a deterministic evaluator's stored result is seen by the next.
+        let held = lock_file(&dir.join("snaps").join(format!("{snap}.lock")))?;
+        Ok((files, snap, held))
+    }).await??;
     // An evaluator that reports no `se` is deterministic: a state it already scored validly keeps its stored result. A
     // probe, or a state its candidate already has, gets that result and no new ledger row; a state only another
     // candidate scored is recorded for this one, judged against its best, without running the evaluator again.
     let rows = ledger(&episode.dir)?;
     let stored = rows.iter().find(|r| r.snap == snap && r.valid && r.se.is_none());
     if let Some(r) = stored.filter(|_| idea == 0 || rows.iter().any(|o| o.snap == snap && o.idea == idea && o.valid && o.se.is_none())) {
-        let best = progress.lock().unwrap().best;
+        let best = best_score(episode, progress, &rows);
         return Ok(json!({"n": r.n, "score": r.score, "valid": true, "se": null, "improved": false, "best": best,
             "report": r.report, "cached": true}));
     }
-    let (score, valid, se, report) = match stored {
-        Some(r) => (r.score, true, None, r.report.clone()),
+    let scored = match stored {
+        Some(r) => files::Scored { score: r.score, valid: true, se: None, report: r.report.clone() },
         None => evaluate(spec, &episode.dir, &files, &spec.eval, false).await?,
     };
-    // A worker's step counts when it beats its best by more than the evaluator's noise, so small steps add up across
-    // rounds; `min_delta` is the bar against the seed, applied at the gate.
-    let margin = se.unwrap_or(0.0);
-    let (improved, best) = {
-        let mut p = progress.lock().unwrap();
-        // The state a worker starts from never improves it, so an explore worker's bar is set by the first state it builds.
-        let improved = idea != 0 && valid && snap != episode.start
-            && spec.better(score.unwrap(), p.best, if p.best.is_some() { margin } else { 0.0 });
-        if improved { p.best = score; }
-        (improved, p.best)
-    };
-    let n = {
+    let files::Scored { score, valid, se, report } = scored;
+    let (n, improved, best) = {
         let _lock = lock_file(&episode.dir.join("ledger.lock"))?;
-        let n = ledger(&episode.dir)?.len() + 1;
-        append_line(&episode.dir.join("ledger.jsonl"), &Row { n, episode: episode.label.clone(), idea,
-            note: note.chars().take(300).collect(), snap, score, valid, se, improved, report: report.clone() })?;
-        n
+        let mut rows = ledger(&episode.dir)?;
+        let n = rows.len() + 1;
+        let mut p = progress.lock().expect("ar progress lock poisoned");
+        let mut row = Row { n, episode: episode.label.clone(), idea, note: note.chars().take(300).collect(), snap: snap.clone(),
+            score, valid, se, improved: false, report: report.clone() };
+        rows.push(row.clone());
+        // A state counts when it is new to this worker (evaluating the same bytes again refines their score, it is
+        // not a step) and beats the worker's best by more than their combined standard error, so small steps add up
+        // across rounds; `min_delta` is the bar against the seed, applied at the gate. The state a worker starts
+        // from never improves it, so an explore worker's bar is set by the first state it builds.
+        let new = estimate(&episode.dir, &rows, &snap);
+        let best = p.best.as_deref().and_then(|b| estimate(&episode.dir, &rows, b));
+        row.improved = idea != 0 && valid && snap != episode.start && p.best.as_deref() != Some(&snap)
+            && new.is_some_and(|e| spec.beats(e, best, 0.0));
+        if row.improved { p.best = Some(snap.clone()); }
+        append_line(&episode.dir.join("ledger.jsonl"), &row)?;
+        let best = p.best.as_deref().and_then(|b| estimate(&episode.dir, &rows, b)).map(|e| e.mean);
+        (n, row.improved, best)
     };
+    drop(held);
     let mut out = json!({"n": n, "score": score, "valid": valid, "se": se, "improved": improved, "best": best, "report": report});
     if stored.is_some() { out["cached"] = json!(true); }
     Ok(out)
+}
+
+/// The search score of this worker's best state so far.
+fn best_score(episode: &Episode, progress: &Mutex<Progress>, rows: &[Row]) -> Option<f64> {
+    let best = progress.lock().expect("ar progress lock poisoned").best.clone()?;
+    estimate(&episode.dir, rows, &best).map(|e| e.mean)
 }
 
 /// `ar.claim(idea)`: claim the idea an explore worker will test, or the refinement an exploit worker will try. Claims
@@ -227,21 +246,12 @@ pub(super) fn lock_file(path: &Path) -> Result<std::fs::File> {
 pub fn reset(pol: &Policy) -> Result<Value> {
     let (episode, progress) = served(pol, "ar.reset")?;
     let rows = ledger(&episode.dir)?;
-    let snap = rows.iter().rev().find(|r| r.improved && r.episode == episode.label)
-        .map_or_else(|| episode.start.clone(), |r| r.snap.clone());
+    let snap = progress.lock().expect("ar progress lock poisoned").best.clone().unwrap_or_else(|| episode.start.clone());
     let files = load_snap(&episode.dir, &snap)?;
-    // The agent controls this workspace, so every change goes the way its own `write` would: a policy-resolved path,
-    // and directories opened without following links.
-    let target = |rel: &str, create| -> Result<crate::atomic_file::Target> {
-        Ok(crate::atomic_file::Target::open(&pol.check_write(rel)?, create)?)
-    };
-    for rel in capture(&pol.workspace, &episode.spec)?.keys().filter(|rel| !files.contains_key(*rel)) {
-        target(rel, false)?.remove()?;
-    }
-    for (rel, bytes) in &files {
-        target(rel, true)?.replace(bytes)?;
-    }
-    Ok(json!({"best": progress.lock().unwrap().best}))
+    // The agent controls this workspace, so every change passes its own `write` check, and every directory is opened
+    // without following links.
+    restore(&pol.workspace, &episode.spec, &files, |rel| pol.check_write(rel).map(drop))?;
+    Ok(json!({"best": best_score(episode, progress, &rows)}))
 }
 
 #[cfg(test)]

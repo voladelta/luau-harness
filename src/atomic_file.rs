@@ -135,14 +135,6 @@ impl Target {
         Ok(bytes)
     }
 
-    /// Unlink the target name itself (a link is removed, never followed).
-    pub fn remove(&self) -> io::Result<()> {
-        if unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
     pub fn replace(&self, bytes: &[u8]) -> anyhow::Result<()> {
         let permissions = match self.existing() {
             Ok(file) => {

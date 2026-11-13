@@ -390,15 +390,16 @@ def scenario_02():
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
     gates = [r for r in records if r["kind"] == "gate"]
     assert len(gates[0]["chosen"]) == 3 and not any(c["good"] for c in gates[0]["candidates"]), gates[0]
+    # Worker 1 rebuilt the seed's score in other bytes: a different state, so it goes on like any other.
     copy = next(c for c in gates[0]["candidates"] if c["search"] == -49)
-    first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["search"]) if c is not copy][:3]
-    assert copy["idea"] not in gates[0]["chosen"], gates[0]
+    first = [c["idea"] for c in sorted(gates[0]["candidates"], key=lambda c: -c["search"])][:3]
+    assert copy["idea"] == first[0] and not copy["good"], gates[0]
     assert gates[0]["chosen"] == first, (gates[0]["chosen"], first)
     round2 = next(r for r in records if r["kind"] == "planned" and r["batch"] == "round2")
     assert {p["role"] for p in round2["episodes"]} == {"exploit"} and {p["idea"] for p in round2["episodes"]} == set(first), round2
     assert report["portfolio"] == [] and (path / "x.txt").read_text() == "0\n" and "no candidate beat the seed" in result.stderr, report
     assert not any(p.name.startswith("a") for p in (run / "episodes").iterdir()), "a candidate below the seed was audited"
-    check("ideas below the seed go on to refinement unaudited, a copy of the seed never; the workspace keeps the seed")
+    check("ideas below or tying the seed go on to refinement unaudited; the workspace keeps the seed")
 
     path = workspace("invalid")
     with harness.provider(lambda body, index: hopeless(body, index, "nope")) as (url, _):
@@ -779,6 +780,62 @@ def scenario_fallback():
     snap = json.loads((run / "snaps" / f"{kept['snap']}.json").read_text())
     assert base64.b64decode(snap["x.txt"]) == b"6\n" and kept["audit"] is True, kept
     check("a refinement that fails its audit costs only itself: the candidate keeps its best state that passed")
+
+
+def scenario_stall():
+    # A provider outage that crashes every attempt of a batch stops the run without a report; --resume continues it.
+    down = [True]
+    def outage(body, index):
+        if down[0] and role_of(body)[0] == "exploit":
+            return {"status": 503, "error": "provider down"}
+        return scripted(body, index)
+
+    path = workspace("stall")
+    with harness.provider(outage) as (url, _):
+        result = ar(path, url, ok=False, env={"HX_AR_RETRY_SECS": "0"})
+        run = next((path / ".harness/ar").iterdir())
+        records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
+        assert result.returncode != 0 and "keep failing" in result.stderr and not (run / "report.json").exists(), result.stderr[-1500:]
+        assert [r["batch"] for r in records if r["kind"] == "stalled"] == ["round2"], records[-3:]
+        assert not any(r["kind"] == "gate" and r["round"] == 2 for r in records)
+        down[0] = False
+        resumed = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)],
+                                 env=harness.ENV, capture_output=True, text=True, timeout=600)
+    assert resumed.returncode == 0 and (run / "report.json").exists(), resumed.stderr[-3000:]
+    records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
+    assert any(r["kind"] == "started" and r["label"] == "r2-w1.4" for r in records), [r.get("label") for r in records]
+    assert sum(r["kind"] == "planned" and r["batch"] == "round2" for r in records) == 1
+    check("a batch whose every attempt crashed stops the run without a report; --resume retries it")
+
+
+def scenario_modes():
+    # An executable editable evaluator keeps its mode in every copy; with no result the owner's editable files, modes
+    # and untracked entries are untouched.
+    files = {"x.txt": "0\n", "tool/run.sh": "#!/bin/sh\necho '{\"score\": 1}'\n"}
+    path = workspace("modes", files, 'editable = ["tool"]\neval = "./tool/run.sh"\ntimeout = 30\n')
+    os.chmod(path / "tool/run.sh", 0o750)
+    subprocess.run(["git", "commit", "-qam", "exec"], cwd=path, check=True)
+    os.symlink("run.sh", path / "tool/link.sh")
+    with harness.provider(once('return ar.eval("probe")')) as (url, _):
+        report = report_of(ar(path, url))
+    assert all(r["valid"] and r["score"] == 1 for r in ledger(path, report)), ledger(path, report)
+    assert os.stat(path / "tool/run.sh").st_mode & 0o777 == 0o750 and (path / "tool/link.sh").is_symlink()
+    check("executable editable files keep their mode; the owner's editable paths are left alone without a result")
+
+
+def scenario_noisy():
+    # With a noisy evaluator, scoring the same files again refines their mean; it is never a new improvement.
+    noisy = 'import json, random; x = int(open("x.txt").read()); print(json.dumps({"score": x + random.gauss(0, 0.5), "se": 0.5}))'
+    path = workspace("noisy", {"x.txt": "0\n", "search.py": noisy}, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
+    code = 'write("x.txt", "1\\n")\nlocal n = 0\nfor i = 1, 20 do if ar.eval("same").improved then n = n + 1 end end\nreturn "IMPROVED " .. n'
+    with harness.provider(once(code, ("r1-w1",))) as (url, requests):
+        report = report_of(ar(path, url))
+    mine = [r for r in ledger(path, report) if r["episode"] == "r1-w1"]
+    assert len(mine) == 20 and sum(r["improved"] for r in mine) == 1, [(r["score"], r["improved"]) for r in mine]
+    candidate = next(c for c in report["candidates"] if c["snap"] == mine[0]["snap"])
+    mean = sum(r["score"] for r in mine) / len(mine)
+    assert abs(candidate["search"] - mean) < 1e-9 and abs(candidate["se"] - 0.5 / len(mine) ** 0.5) < 1e-9, (candidate, mean)
+    check("a noisy state's score is the mean of its evaluations; re-scoring the same files never counts as improved")
 
 
 # Scenarios are independent (own workspace, own mock provider), so a few run side by side; more would load the machine.
