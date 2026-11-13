@@ -22,7 +22,7 @@ write = ["/extra/write/root"]   # extra write roots
 [approval]
 mode = "prompt"                 # default; "deny" refuses missing permissions without asking
 ask = ["terraform apply"]       # extra command substrings that need approval
-allow = ["git push origin"]     # pre-approved (substring of each external command; irreversible ones need an exact match)
+allow = ["git push origin"]     # pre-approved: leading words of each external command; irreversible ones need an exact match
 
 [budget]
 max_tokens = 600000
@@ -34,7 +34,7 @@ enable = []
 
 The workspace, private temp directory and `[fs]` roots are standing file-tool permissions. With `mode = "prompt"`, other file-tool paths ask on the owner's controlling terminal. A write grant covers the requested file's parent directory and its descendants, with read access; a read grant covers the requested file, or the subtree when a directory is requested. Home has no implicit grant. Refusal or a missing terminal leaves the operation unexecuted. Grants are shared by descendants and journaled for resume, and a new run starts with fresh grants.
 
-Shell commands are classed on their shell words, not substrings: each simple command of a pipeline or list (and the body of `$(...)`, backticks and `bash -c`) is classed read / local write / external / irreversible, and the command takes the highest class. A `git push` with `--force`, `--force-with-lease`, `-f`, `--delete`, `--mirror` or a `+`/`:` refspec anywhere in its arguments, `rm -r` of `/`, `~` or `$HOME`, `mkfs` and `dd` are irreversible. An `allow` entry must cover each external command in a chain, so `allow = ["git push origin"]` does not approve `git push origin main && curl -X POST ...`. The classifier decides when to ask; it is approval UX, not a guard (see [shell confinement](#shell-confinement)). The journal records who approved each shell command (`approval` on its outcome: `not-required`, `policy-allow`, `auto` or `prompt`).
+Shell commands are classed on their shell words, not substrings: each simple command of a pipeline or list (and the body of `$(...)`, backticks and `bash -c`) is classed read / local write / external / irreversible, and the command takes the highest class. A `git push` with `--force`, `--force-with-lease`, `-f`, `--delete`, `--mirror` or a `+`/`:` refspec anywhere in its arguments, `rm -r` of `/`, `~` or `$HOME`, `mkfs` and `dd` are irreversible. An `allow` entry covers a command when its words are the command's first words, and it must cover each external command in a chain: `allow = ["git push origin"]` approves `git push origin main` but not `git push originx`, `git push -o "git push origin" x` or `git push origin main && curl -X POST ...`. The classifier decides when to ask; it is approval UX, not a guard (see [shell confinement](#shell-confinement)). Approval is asked before the operation's intent is journaled, and the intent records who approved it (`approval`: `not-required`, `policy-allow`, `auto` or `prompt`).
 
 `hx run "TASK" --yes` automatically approves ordinary missing path permissions and external actions for one run. It never approves an irreversible command: that still needs an exact `allow` entry or the owner's answer on the terminal, and is refused without one. It overrides the configured approval mode, changes no configuration files and keeps the same scrubbed child environment. Protected configuration, sealed owner state, credential-read restrictions, symlink-write checks, capabilities and budgets still apply. Use `--approval deny` for strict refusal or `--approval prompt` to override the file; neither flag combines with `--yes`. Explicit manual workflow reviews and uncertain-operation reconciliation still need owner decisions.
 
@@ -56,7 +56,7 @@ bearer_env = "REMOTE_TOKEN"     # or headers_env = {"x-api-key" = "VAR"}
 
 A local server is [confined](#shell-confinement) like a shell command, to the file policy at its start. Network and GPU access are controlled by the environment running hx; hx has no network switches.
 
-MCP tools bind as `mcp.SERVER.tool{...}`. Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`.
+MCP tools bind as `mcp.SERVER.tool{...}` (a name that is not an identifier, or whose safe form collides with another tool's, as `mcp.SERVER["name"]`). Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`, or every tool of a server with `"mcp notes.*"`; entries match the tool's identity exactly, never its arguments. A remote server's header credentials are scrubbed from its errors and results before they are journaled; a local server's output is not filtered, so pass it only the variables it needs. A local server that exits is started again on the next call.
 
 ## Shell confinement
 

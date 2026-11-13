@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-// Approval policy and temporary grants are frozen under this format; shell outcomes carry their approval source.
-pub const FORMAT: u64 = 9;
+// Approval policy and temporary grants are frozen under this format; every mutating intent carries its approval
+// source, asked before the intent is written.
+pub const FORMAT: u64 = 10;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -368,9 +369,10 @@ impl Supervisor {
         Ok(())
     }
 
-    pub fn intent(&self, tool: Tool, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal) -> Result<u64> {
+    /// `approval` is who approved the operation (`Policy::approve`); it was asked before this record is written.
+    pub fn intent(&self, tool: Tool, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal, approval: &str) -> Result<u64> {
         let mut fields = json!({"tool":tool.name(), "class":class.name(), "args":args,
-            "args_sha":args_sha, "depth":depth, "principal":principal.name(),
+            "args_sha":args_sha, "depth":depth, "principal":principal.name(), "approval":approval,
             "summary":args.to_string().chars().take(300).collect::<String>()});
         self.workflow_effect_metadata(tool, &mut fields)?;
         self.record("intent", fields, true)

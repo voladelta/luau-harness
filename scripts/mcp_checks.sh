@@ -21,9 +21,22 @@ cfg "" '[approval]
 allow = ["mcp demo.add"]'
 check "user pre-approval in policy.toml lets that tool run" "$(x 'print(mcp.demo.add{a = 2, b = 3})' | head -1)" "5"
 check "approval is per tool: delete_note is still refused" "$(x 'print(pcall(mcp.demo.delete_note, {name = "n"}))' | head -1 | grep -c approval_required)" "1"
+check "an allowed tool's name in another tool's arguments approves nothing" "$(x 'print(pcall(mcp.demo.delete_note, {name = "n", why = "mcp demo.add"}))' | head -1 | grep -c approval_required)" "1"
+check "...and the refusal journals no intent" "$(python3 -c "
+import json,glob,os
+log=max(glob.glob('$W/.harness/log/*.jsonl'), key=os.path.getmtime)
+print(sum(1 for r in map(json.loads, open(log)) if r['kind']=='intent'))")" "0"
 cfg "" '[approval]
 allow = ["mcp demo."]'
+check "a substring of a tool's identity approves nothing" "$(x 'print(pcall(mcp.demo.delete_note, {name = "n"}))' | head -1 | grep -c approval_required)" "1"
+cfg "" '[approval]
+allow = ["mcp demo.*"]'
 check "a server-wide allow covers its tools" "$(x 'print(mcp.demo.delete_note{name = "n"})' | head -1)" "deleted n"
+out=$(x 'print(pcall(__mcp_call, "demo", "no_such_tool", {})); print(mcp.demo.add{a = 1, b = 1})' | tr '\n' ' ')
+check "a JSON-RPC error is a definite failure: the next mutation runs" "$(echo "$out" | grep -c 'MCP error -32602: unknown tool: no_such_tool.* 2 $')$($H log verify $(ls -t $W/.harness/log/*.jsonl | head -1) >/dev/null; echo $?)" "10"
+touch $W/demo_extra
+check "a server that exited is started again on the next call" "$(x 'print(mcp.demo.quit{}); sh("sleep 0.5"); print(mcp.demo.add{a = 2, b = 2})' | grep -v "^mcp tool" | tr '\n' ' ')" "quit 4 "
+rm $W/demo_extra
 out=$(x 'print(pcall(mcp.demo.boom, {}))' | head -1)
 check "a tool error becomes a Luau error with the server's message" "$(echo "$out" | grep -c 'mcp tool error (demo.boom): boom')" "1"
 check "tool names are also reachable with a safe alias" "$(x 'print(mcp.demo["read_note"] == mcp.demo.read_note)' | head -1)" "true"
@@ -41,7 +54,7 @@ import os,socket,time
 s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(5); open('$T/port.tmp','w').write(str(s.getsockname()[1])); os.replace('$T/port.tmp','$T/port'); time.sleep(60)" & LISTEN=$!; wait_for_file $T/port || exit 1; PORT=$(cat $T/port)
 check "server connects using the outer environment's network" "$(x 'print(mcp.demo.net_probe{host = "127.0.0.1", port = '$PORT'})' | head -1)" "connected"
 cfg "" '[approval]
-allow = ["mcp demo."]'
+allow = ["mcp demo.*"]'
 out=$(x 'print(mcp.demo.env_names{})' | head -1)
 check "server env: no harness API keys" "$(echo "$out" | grep -c 'API_KEY')" "0"
 check "server env: only the variables the user listed pass through" "$(echo "$out" | grep -c 'DEMO_PASS')" "1"
@@ -56,6 +69,14 @@ import json
 l=[json.loads(x) for x in open('$T/req.jsonl')][-1]; print(l['instructions'])")
 check "prompt lists MCP tools with schema-derived signatures" "$(echo "$sysmsg" | grep -c 'mcp.demo.add{a: number, b: number}  -- Add two numbers')" "1"
 check "optional/none: a tool with no arguments is mcp.demo.boom{}" "$(echo "$sysmsg" | grep -c 'mcp.demo.boom{}')" "1"
+touch $W/demo_extra $W/demo_pages
+OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null 2>&1
+check "paged tools/list, a colliding safe name and a long non-ASCII description reach the prompt intact" "$(python3 -c "
+import json
+s=[json.loads(x) for x in open('$T/req.jsonl')][-1]['instructions']
+print(chr(233) * 121 not in s and all(t in s for t in ['mcp.demo.boom{}', 'mcp.demo.long_desc{}  -- ' + chr(233) * 120, 'mcp.demo[\"x-y\"]{}', 'mcp.demo.x_y{}']))")" "True"
+check "...and the collision is reported" "$(x 'print(mcp.demo["x-y"]{}, mcp.demo.x_y{})' 2>&1 | grep -c 'x-y is reachable only as\|x-y	x_y')" "2"
+rm $W/demo_extra $W/demo_pages
 rm $W/.harness/mcp.toml
 OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null 2>&1
 sysmsg=$(python3 -c "
@@ -67,7 +88,7 @@ check "no MCP config: nothing added to the prompt" "$(echo "$sysmsg" | grep -c '
 HL=$T/hdr.jsonl
 hcfg() { # url, extra mcp.toml lines
   printf '[server.web]\nurl = "%s"\nread_only_tools = ["read_*"]\n%s\n' "$1" "${2:-}" > $W/.harness/mcp.toml
-  printf '[approval]\nallow = ["mcp web."]\n' > $W/.harness/policy.toml
+  printf '[approval]\nallow = ["mcp web.*"]\n' > $W/.harness/policy.toml
 }
 hx() { WEB_KEY=sk-web-secret $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
 for mode in json sse; do
@@ -105,11 +126,15 @@ hcfg "https://example.com/mcp" 'env = ["WEB_KEY"]'
 check "http: stdio-only keys are refused on a url server" "$(hx 'print(1)' | grep -c 'do not apply')" "1"
 
 # --- HTTP edge cases: split SSE stream, server request id collision, echoed secret, session expiry
-SESSION=1 EXPIRE=$T/expire HDR_LOG=$HL serve HP env -C $T python3 $R/scripts/mcp_http_server.py 0 sse-split || exit 1; SRV=$SERVED; : > $HL
+SESSION=1 EXPIRE=$T/expire DROP=$T/drop ECHO_RESULT=1 HDR_LOG=$HL serve HP env -C $T python3 $R/scripts/mcp_http_server.py 0 sse-split || exit 1; SRV=$SERVED; : > $HL
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
 check "http/sse-split: 3-byte chunks, server request with our id, no final blank line" "$(hx 'print(mcp.web.add{a = 6, b = 7})' | head -1)" "13"
+out=$(hx 'print(mcp.web.add{a = 6, b = 7})')
+check "http: a secret the server echoes in a result is scrubbed, in the result and the journal" "$(echo "$out" | grep -c 'seen Bearer \*\*\*')$(grep -rl sk-web-secret $W/.harness/log 2>/dev/null | wc -l | tr -d ' ')" "10"
 touch $T/expire
-check "http: lost mutation response stays uncertain and blocks another mutation" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'session expired.*unknown_outcome.*unresolved mutations')" "1"
+check "http: an expired session rejected the call unhandled, so it is sent again on a new session" "$(hx 'print(mcp.web.add{a=1,b=1})' | head -1)" "2"
+touch $T/drop
+check "http: lost mutation response stays uncertain and blocks another mutation" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ' | grep -c 'unknown_outcome.*unresolved mutations')" "1"
 kill $SRV; wait $SRV 2>/dev/null
 NEED_HEADER="authorization:Bearer other-key" ECHO_KEY=1 serve HP env -C $T python3 $R/scripts/mcp_http_server.py 0 json || exit 1; SRV=$SERVED
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'  # each server gets a fresh port

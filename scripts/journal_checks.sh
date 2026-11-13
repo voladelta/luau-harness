@@ -76,16 +76,22 @@ newws b; printf '[approval]\nask = ["./deploy.sh"]\n' > $W/.harness/policy.toml
 out=$($H exec --workspace $W 'print(pcall(sh, "./deploy.sh"))' 2>&1 | head -1)
 check "external command refused" "$(echo "$out" | grep -c 'approval_required')" "1"
 check "refused command did not run" "$([ -e $W/deployed.txt ] && echo RAN || echo not-run)" "not-run"
-L=$(lastlog); check "refusal is logged (intent + denied outcome)" "$(python3 - "$L" <<'PY'
+L=$(lastlog); check "refusal is logged as a denied call, with no intent (approval comes first)" "$(python3 - "$L" <<'PY'
 import json,sys
 rs=[json.loads(l) for l in open(sys.argv[1])]
-i=[r for r in rs if r["kind"]=="intent" and r["tool"]=="sh"]; o=[r for r in rs if r["kind"]=="outcome" and r.get("denied")]
-print("yes" if i and o and i[0]["class"]=="external" and o[0]["of"]==i[0]["seq"] else "no")
+i=[r for r in rs if r["kind"]=="intent" and r["tool"]=="sh"]; c=[r for r in rs if r["kind"]=="call" and r.get("denied")]
+print("yes" if not i and c and c[0]["class"]=="external" and c[0]["tool"]=="sh" else "no")
 PY
-)" "yes"
+)$($H log verify $L >/dev/null; echo $?)" "yes0"
 newws c; printf '[approval]\nask = ["./deploy.sh"]\nallow = ["./deploy.sh"]\n' > $W/.harness/policy.toml
 $H exec --workspace $W 'sh("./deploy.sh")' >/dev/null 2>&1
 check "user pre-approval in policy.toml lets it run" "$([ -e $W/deployed.txt ] && echo ran || echo not-run)" "ran"
+check "the intent records who approved it" "$(python3 -c "
+import json,sys
+print([r.get('approval') for r in map(json.loads, open('$(lastlog)')) if r['kind']=='intent' and r['tool']=='sh'])")" "['policy-allow']"
+newws c2; printf '[approval]\nallow = ["git push origin"]\n' > $W/.harness/policy.toml
+out=$($H exec --workspace $W 'print(pcall(sh, "git push -o \"git push origin\" nowhere main"))' 2>&1 | head -1)
+check "an allow entry inside a quoted argument approves nothing" "$(echo "$out" | grep -c 'approval_required')" "1"
 newws d; printf '[approval]\nask = ["./deploy.sh"]\n' > $W/.harness/policy.toml
 out=$($H exec --workspace $W 'print(pcall(sh, "./deploy.sh"))' --approval prompt 2>&1 </dev/null | head -1)
 check "prompt mode with no terminal refuses" "$(echo "$out" | grep -c 'approval_required')$([ -e $W/deployed.txt ] && echo RAN)" "1"

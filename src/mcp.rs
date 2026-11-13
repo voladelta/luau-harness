@@ -57,19 +57,30 @@ pub fn snapshot(root: &std::path::Path) -> Result<BTreeMap<String, ServerCfg>> {
     Ok(file.server)
 }
 
-/// The server process is gone or stopped answering: the cached connection must be dropped.
+/// The server process is gone or stopped answering: the cached connection must be dropped. `sent` says whether the
+/// request may have reached the server: a lost answer after sending is uncertain, a failure to send is not.
 #[derive(Debug)]
-struct ConnLost(String);
+struct ConnLost { message: String, sent: bool }
 impl std::fmt::Display for ConnLost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for ConnLost {}
 
+/// The request may have reached the server, which then gave no definite answer.
+fn lost(message: impl Into<String>) -> anyhow::Error { anyhow::Error::new(ConnLost { message: message.into(), sent: true }) }
+/// The connection failed before the request could reach the server.
+fn unsent(message: impl Into<String>) -> anyhow::Error { anyhow::Error::new(ConnLost { message: message.into(), sent: false }) }
+
+/// Did a failed request possibly act? Only when it may have reached the server without a definite answer; a JSON-RPC
+/// error, an HTTP 4xx and every failure before sending are definite.
+pub fn may_have_acted(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ConnLost>().is_some_and(|c| c.sent)
+}
+
 struct Stdio {
-    #[allow(dead_code)] // kept alive; killed when dropped
-    child: Child,
+    child: Child, // killed when dropped
     stdin: ChildStdin,
     out: BufReader<ChildStdout>,
     next_id: u64,
@@ -120,23 +131,39 @@ fn validate(name: &str, c: &ServerCfg) -> Result<()> {
 pub struct Mcp {
     pub servers: BTreeMap<String, ServerCfg>,
     pol: Arc<Policy>,
-    conns: Mutex<HashMap<String, Arc<Mutex<Conn>>>>,
+    /// One slot per server, locked across its spawn and handshake, so a slow server stalls only its own callers.
+    /// None: not connected (never, or the connection was lost); the next call connects afresh.
+    conns: std::sync::Mutex<HashMap<String, Arc<Mutex<Option<Conn>>>>>,
 }
 
-/// Index just past the first complete SSE event (terminated by a blank line), if any.
-fn sse_event_end(buf: &[u8]) -> Option<usize> {
-    (0..buf.len()).find_map(|i| {
-        if buf[i..].starts_with(b"\n\n") {
-            Some(i + 2)
-        } else if buf[i..].starts_with(b"\r\n\r\n") {
-            Some(i + 4)
-        } else {
-            None
+/// Splits an SSE byte stream into events (each terminated by a blank line). The scan for a boundary resumes where the
+/// last one stopped, so a large event arriving in small chunks costs linear time, not a rescan per chunk.
+#[derive(Default)]
+struct SseEvents { buf: Vec<u8>, scanned: usize }
+
+impl SseEvents {
+    fn next_event(&mut self) -> Option<Vec<u8>> {
+        // A boundary may straddle the previous scan's end: back up by its longest form's length minus one.
+        let from = self.scanned.saturating_sub(3);
+        let end = (from..self.buf.len()).find_map(|i| {
+            if self.buf[i..].starts_with(b"\n\n") {
+                Some(i + 2)
+            } else if self.buf[i..].starts_with(b"\r\n\r\n") {
+                Some(i + 4)
+            } else {
+                None
+            }
+        });
+        match end {
+            Some(end) => { self.scanned = 0; Some(self.buf.drain(..end).collect()) },
+            None => { self.scanned = self.buf.len(); None },
         }
-    })
+    }
 }
 
 const MAX_BODY: usize = 16 << 20;
+/// `tools/list` pages followed per server before the listing is reported as truncated.
+pub const MAX_LIST_PAGES: usize = 20;
 
 /// One byte allowance for the whole response, including ignored notifications and HTTP error bodies.
 /// Check before appending; neither a missing Content-Length nor draining SSE events resets the allowance.
@@ -147,7 +174,7 @@ impl ResponseBudget {
 
     fn consume(&mut self, bytes: usize) -> Result<()> {
         self.remaining = self.remaining.checked_sub(bytes)
-            .ok_or_else(|| anyhow::Error::new(ConnLost("MCP response too large".into())))?;
+            .ok_or_else(|| lost("MCP response too large"))?;
         Ok(())
     }
 
@@ -161,18 +188,18 @@ impl ResponseBudget {
         let mut bytes = Vec::new();
         // One sentinel byte distinguishes an exact-sized frame from an oversized, newline-free stream.
         reader.take(self.remaining as u64 + 1).read_until(b'\n', &mut bytes).await
-            .map_err(|e| anyhow::Error::new(ConnLost(format!("MCP stdio read failed: {e}"))))?;
+            .map_err(|e| lost(format!("MCP stdio read failed: {e}")))?;
         self.consume(bytes.len())?;
         Ok(bytes)
     }
 
     async fn body(&mut self, response: &mut reqwest::Response) -> Result<Vec<u8>> {
         if response.content_length().is_some_and(|n| n > self.remaining as u64) {
-            return Err(anyhow::Error::new(ConnLost("MCP response too large".into())));
+            return Err(lost("MCP response too large"));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await
-            .map_err(|e| anyhow::Error::new(ConnLost(format!("MCP response read failed: {}", e.without_url()))))? {
+            .map_err(|e| lost(format!("MCP response read failed: {}", e.without_url())))? {
             self.append(&mut bytes, &chunk)?;
         }
         Ok(bytes)
@@ -220,32 +247,22 @@ pub fn glob(pat: &str, s: &str) -> bool {
 impl Mcp {
     pub fn frozen(pol: Arc<Policy>, servers: BTreeMap<String, ServerCfg>) -> Result<Option<Arc<Mcp>>> {
         for (name, cfg) in &servers { validate(name, cfg)?; }
-        Ok((!servers.is_empty()).then(|| Arc::new(Mcp { servers, pol, conns: Mutex::new(HashMap::new()) })))
+        Ok((!servers.is_empty()).then(|| Arc::new(Mcp { servers, pol, conns: Default::default() })))
     }
     pub fn is_read_only(&self, server: &str, tool: &str) -> bool {
         self.servers.get(server).is_some_and(|c| c.read_only_tools.iter().any(|p| glob(p, tool)))
     }
 
-    async fn conn(&self, server: &str) -> Result<Arc<Mutex<Conn>>> {
-        let mut conns = self.conns.lock().await;
-        if let Some(c) = conns.get(server) {
-            return Ok(c.clone());
+    /// Start a server (or open an HTTP client) and complete the handshake.
+    async fn connect(&self, server: &str, cfg: &ServerCfg) -> Result<Conn> {
+        let mut c = if cfg.url.is_some() { Self::connect_http(server, cfg)? } else { self.spawn_stdio(server, cfg)? };
+        let version = if matches!(c, Conn::Http(_)) { "2025-06-18" } else { "2024-11-05" };
+        let init = Self::request_on(&mut c, "initialize", json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "hx", "version": "0.1"}})).await?;
+        if let Conn::Http(h) = &mut c {
+            h.version = Some(init["protocolVersion"].as_str().unwrap_or(version).to_string());
         }
-        let cfg = self.servers.get(server).ok_or_else(|| anyhow!("no MCP server named {server:?} in .harness/mcp.toml"))?;
-        let conn = if cfg.url.is_some() { Self::connect_http(server, cfg)? } else { self.spawn_stdio(server, cfg)? };
-        let conn = Arc::new(Mutex::new(conn));
-        // handshake
-        {
-            let mut c = conn.lock().await;
-            let version = if matches!(*c, Conn::Http(_)) { "2025-06-18" } else { "2024-11-05" };
-            let init = Self::request_on(&mut c, "initialize", json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "hx", "version": "0.1"}})).await?;
-            if let Conn::Http(h) = &mut *c {
-                h.version = Some(init["protocolVersion"].as_str().unwrap_or(version).to_string());
-            }
-            Self::notify_on(&mut c, "notifications/initialized").await?;
-        }
-        conns.insert(server.to_string(), conn.clone());
-        Ok(conn)
+        Self::notify_on(&mut c, "notifications/initialized").await?;
+        Ok(c)
     }
 
     fn spawn_stdio(&self, server: &str, cfg: &ServerCfg) -> Result<Conn> {
@@ -306,13 +323,19 @@ impl Mcp {
     async fn notify_on(c: &mut Conn, method: &str) -> Result<()> {
         let msg = json!({"jsonrpc": "2.0", "method": method});
         match c {
-            Conn::Stdio(s) => {
-                s.stdin.write_all((msg.to_string() + "\n").as_bytes()).await?;
-                s.stdin.flush().await?;
-                Ok(())
-            }
+            Conn::Stdio(s) => Self::stdio_send(s, &(msg.to_string() + "\n")).await,
             Conn::Http(h) => Self::http_post(h, &msg, None).await.map(|_| ()),
         }
+    }
+
+    /// Write one message. A server that has exited, or whose stdin is closed (EPIPE), never received it: the connection
+    /// is lost, but nothing was sent.
+    async fn stdio_send(c: &mut Stdio, line: &str) -> Result<()> {
+        if let Ok(Some(status)) = c.child.try_wait() {
+            return Err(unsent(format!("MCP server exited ({status})")));
+        }
+        c.stdin.write_all(line.as_bytes()).await.map_err(|e| unsent(format!("MCP stdio write failed: {e}")))?;
+        c.stdin.flush().await.map_err(|e| unsent(format!("MCP stdio write failed: {e}")))
     }
 
     async fn stdio_request(c: &mut Stdio, method: &str, params: Value) -> Result<Value> {
@@ -320,37 +343,39 @@ impl Mcp {
         c.next_id += 1;
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string() + "\n";
         let work = async {
-            c.stdin.write_all(line.as_bytes()).await?;
-            c.stdin.flush().await?;
+            Self::stdio_send(c, &line).await?;
             let mut budget = ResponseBudget::new();
             loop {
                 let buf = budget.line(&mut c.out).await?;
                 if buf.is_empty() {
-                    return Err(anyhow::Error::new(ConnLost(format!("MCP server exited while handling {method}"))));
+                    return Err(lost(format!("MCP server exited while handling {method}")));
                 }
                 let Ok(v) = serde_json::from_slice::<Value>(&buf) else { continue };
                 if v["id"].as_u64() != Some(id) {
                     continue; // notifications and server->client requests are ignored
                 }
                 if let Some(e) = v.get("error") {
-                    bail!("MCP error: {}", e["message"].as_str().unwrap_or("unknown"));
+                    bail!("MCP error {}: {}", e["code"], e["message"].as_str().unwrap_or("unknown"));
                 }
                 return Ok(v["result"].clone());
             }
         };
         tokio::time::timeout(Duration::from_secs(60), work).await
-            .map_err(|_| anyhow::Error::new(ConnLost(format!("MCP server did not answer {method} within 60s"))))?
+            .map_err(|_| lost(format!("MCP server did not answer {method} within 60s")))?
     }
 
     async fn http_request(h: &mut Http, method: &str, params: Value) -> Result<Value> {
         let id = h.next_id;
         h.next_id += 1;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let v = Self::http_post(h, &msg, Some(id)).await?.ok_or_else(|| anyhow::Error::new(ConnLost(format!("MCP server sent no response to {method}"))))?;
+        let v = Self::http_post(h, &msg, Some(id)).await?.ok_or_else(|| lost(format!("MCP server sent no response to {method}")))?;
         if let Some(e) = v.get("error") {
-            bail!("MCP error: {}", Self::scrub(h, e["message"].as_str().unwrap_or("unknown").to_string()));
+            bail!("MCP error {}: {}", e["code"], Self::scrub(h, e["message"].as_str().unwrap_or("unknown").to_string()));
         }
-        Ok(v["result"].clone())
+        // A server can echo the auth header it was sent; results are journaled and shown to the model.
+        let mut result = v["result"].clone();
+        Self::scrub_value(h, &mut result);
+        Ok(result)
     }
 
     fn scrub(h: &Http, mut t: String) -> String {
@@ -360,10 +385,22 @@ impl Mcp {
         t
     }
 
+    fn scrub_value(h: &Http, value: &mut Value) {
+        match value {
+            Value::String(s) => *s = Self::scrub(h, std::mem::take(s)),
+            Value::Array(items) => items.iter_mut().for_each(|v| Self::scrub_value(h, v)),
+            Value::Object(fields) => {
+                *fields = std::mem::take(fields).into_iter().map(|(k, mut v)| { Self::scrub_value(h, &mut v); (Self::scrub(h, k), v) }).collect();
+            },
+            _ => {},
+        }
+    }
+
     /// POST one JSON-RPC message. With `want` = the request id, returns the matching response (from a JSON body or an
     /// SSE stream); without it (a notification) returns None.
     async fn http_post(h: &mut Http, msg: &Value, want: Option<u64>) -> Result<Option<Value>> {
-        let lost = |h: &Http, t: String| anyhow::Error::new(ConnLost(Self::scrub(h, t)));
+        let gone = |h: &Http, t: String, sent: bool| anyhow::Error::new(ConnLost { message: Self::scrub(h, t), sent });
+        let lost = |h: &Http, t: String| gone(h, t, true);
         let mut req = h.client.post(&h.url).headers(h.headers.clone()).header("accept", "application/json, text/event-stream").json(msg);
         if let Some(s) = &h.session {
             req = req.header("mcp-session-id", s);
@@ -372,37 +409,41 @@ impl Mcp {
             req = req.header("mcp-protocol-version", v);
         }
         let work = async {
-            let mut resp = req.send().await.map_err(|e| lost(h, format!("MCP http request failed: {}", e.without_url())))?;
+            // A connection that was never made carried no request.
+            let mut resp = req.send().await.map_err(|e| { let sent = !e.is_connect(); gone(h, format!("MCP http request failed: {}", e.without_url()), sent) })?;
             let mut budget = ResponseBudget::new();
             let status = resp.status();
             if let Some(s) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
                 h.session = Some(s.to_string());
             }
             if status == reqwest::StatusCode::NOT_FOUND && h.session.is_some() {
-                return Err(lost(h, "MCP session expired (HTTP 404)".into()));
+                // The server rejected the session before handling the request; a new session can send it again.
+                return Err(gone(h, "MCP session expired (HTTP 404)".into(), false));
             }
             if !status.is_success() {
                 let bytes = budget.body(&mut resp).await?;
                 let body: String = Self::scrub(h, String::from_utf8_lossy(&bytes).into_owned()).chars().take(200).collect();
                 let hint = if status.is_redirection() { " (redirects are not followed)" } else if status.as_u16() == 401 || status.as_u16() == 403 { " (check the credentials)" } else { "" };
-                bail!("{}", Self::scrub(h, format!("MCP server returned HTTP {}{hint}: {body}", status.as_u16())));
+                let message = Self::scrub(h, format!("MCP server returned HTTP {}{hint}: {body}", status.as_u16()));
+                // A refusal (3xx/4xx) is definite; a 5xx, often a gateway giving up, may follow the action.
+                if status.is_server_error() { return Err(lost(h, message)); }
+                bail!("{message}");
             }
             let Some(id) = want else { return Ok(None) };
             let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
             if ctype.starts_with("text/event-stream") {
-                let mut buf: Vec<u8> = vec![];
+                let mut events = SseEvents::default();
                 loop {
                     let Some(chunk) = resp.chunk().await.map_err(|e| lost(h, format!("MCP stream failed: {}", e.without_url())))? else {
                         // the stream may end without the final blank line: try what is left
-                        buf.extend_from_slice(b"\n\n");
-                        if let Some(v) = sse_response(&buf, id) {
+                        events.buf.extend_from_slice(b"\n\n");
+                        if let Some(v) = sse_response(&events.buf, id) {
                             return Ok(Some(v));
                         }
                         return Err(lost(h, "MCP stream ended without a response".into()));
                     };
-                    budget.append(&mut buf, &chunk)?;
-                    while let Some(end) = sse_event_end(&buf) {
-                        let ev: Vec<u8> = buf.drain(..end).collect();
+                    budget.append(&mut events.buf, &chunk)?;
+                    while let Some(ev) = events.next_event() {
                         if let Some(v) = sse_response(&ev, id) {
                             return Ok(Some(v));
                         }
@@ -417,21 +458,29 @@ impl Mcp {
             }
             Ok(Some(v))
         };
-        tokio::time::timeout(Duration::from_secs(60), work).await.map_err(|_| anyhow::Error::new(ConnLost("MCP server did not answer within 60s".into())))?
+        tokio::time::timeout(Duration::from_secs(60), work).await.map_err(|_| self::lost("MCP server did not answer within 60s"))?
     }
 
+    /// One request on the server's connection, connecting first if there is none. A lost connection is dropped, so
+    /// the next call starts a fresh server (or session). A cached connection found dead before the request was sent
+    /// (the server exited, its session expired) is replaced at once and the request sent once on the new one.
     pub async fn request(&self, server: &str, method: &str, params: Value) -> Result<Value> {
-        let conn = self.conn(server).await?;
-        let mut c = conn.lock().await;
-        match Self::request_on(&mut c, method, params).await {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                if e.is::<ConnLost>() {
-                    drop(c);
-                    self.conns.lock().await.remove(server); // the next call starts a fresh server
-                }
-                Err(e)
+        let cfg = self.servers.get(server).ok_or_else(|| anyhow!("no MCP server named {server:?} in .harness/mcp.toml"))?;
+        let slot = self.conns.lock().unwrap().entry(server.to_string()).or_default().clone();
+        let mut conn = slot.lock().await;
+        let mut retried = false;
+        loop {
+            let fresh = conn.is_none();
+            if fresh {
+                // The handshake is not this request: whatever happened to it, this request was never sent.
+                *conn = Some(self.connect(server, cfg).await.map_err(|e| anyhow!("{e:#}"))?);
             }
+            let result = Self::request_on(conn.as_mut().unwrap(), method, params.clone()).await;
+            if let Err(e) = &result && let Some(gone) = e.downcast_ref::<ConnLost>() {
+                *conn = None;
+                if !gone.sent && !fresh && !retried { retried = true; continue; }
+            }
+            return result;
         }
     }
 }
@@ -505,6 +554,100 @@ mod tests {
         body.extend_from_slice(b"data: {\"id\":1,\"result\":{}}\n\n");
         let error = chunked_http(200, "text/event-stream", body).await.unwrap_err();
         assert!(error.is::<ConnLost>() && error.to_string().contains("too large"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn only_an_unanswered_sent_request_may_have_acted() {
+        let rpc = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad arguments"}}"#.to_vec();
+        let error = chunked_http(200, "application/json", rpc).await.unwrap_err();
+        assert!(!may_have_acted(&error) && error.to_string().contains("-32602"), "{error}");
+        assert!(!may_have_acted(&chunked_http(400, "application/json", b"{}".to_vec()).await.unwrap_err()));
+        assert!(may_have_acted(&chunked_http(502, "text/plain", b"gateway".to_vec()).await.unwrap_err()));
+        assert!(may_have_acted(&chunked_http(200, "application/json", b"{\"id\":1".to_vec()).await.unwrap_err()));
+        // Nothing listens on this port: the request never left.
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut http = Http { client: reqwest::Client::builder().no_proxy().build().unwrap(), url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: Default::default(), secrets: vec![], session: None, version: None, next_id: 1 };
+        let error = Mcp::http_request(&mut http, "tools/call", json!({})).await.unwrap_err();
+        assert!(error.is::<ConnLost>() && !may_have_acted(&error), "{error}");
+    }
+
+    #[test]
+    fn sse_boundaries_are_found_across_chunks_without_rescanning() {
+        let mut events = SseEvents::default();
+        let mut found = vec![];
+        for chunk in b"data: a\r\n\r\ndata: b\n\ndata: c".chunks(3) {
+            events.buf.extend_from_slice(chunk);
+            while let Some(ev) = events.next_event() { found.push(ev); }
+        }
+        assert_eq!(found, [b"data: a\r\n\r\n".to_vec(), b"data: b\n\n".to_vec()]);
+        assert_eq!(events.buf, b"data: c");
+        // One 8 MiB event in 4 KiB chunks: a rescan per chunk is quadratic (minutes in a debug build).
+        let started = std::time::Instant::now();
+        let mut events = SseEvents::default();
+        let body = [b"data: ".as_slice(), &vec![b'x'; 8 << 20], b"\n\n"].concat();
+        let mut n = 0;
+        for chunk in body.chunks(4096) {
+            events.buf.extend_from_slice(chunk);
+            while events.next_event().is_some() { n += 1; }
+        }
+        assert_eq!(n, 1);
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    /// A stdio server: answers `quit` and exits, answers `bad` with a JSON-RPC error, waits SLOW seconds before its
+    /// handshake, and otherwise returns its pid.
+    const SERVER: &str = r#"
+import json, os, sys, time
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m: continue
+    if m["method"] == "initialize": time.sleep(float(os.environ.get("SLOW", "0")))
+    name = m.get("params", {}).get("name")
+    if name == "bad":
+        print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32602, "message": "bad arguments"}}), flush=True); continue
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"pid": os.getpid()}}), flush=True)
+    if name == "quit": sys.exit(0)
+"#;
+
+    fn servers(tag: &str, slow: &[&str]) -> (Arc<Mcp>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hx-mcp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        let cfg = |slow: bool| ServerCfg { command: "python3".into(), args: vec!["-c".into(), if slow { SERVER.replace("\"0\"", "\"2\"") } else { SERVER.into() }], ..Default::default() };
+        let servers = ["a", "b"].iter().map(|s| (s.to_string(), cfg(slow.contains(s)))).collect();
+        (Mcp::frozen(pol, servers).unwrap().unwrap(), dir)
+    }
+
+    #[tokio::test]
+    async fn an_exited_stdio_server_is_respawned_and_errors_keep_the_connection() {
+        let (mcp, dir) = servers("respawn", &[]);
+        let call = |name: &str| mcp.request("a", "tools/call", json!({"name": name, "arguments": {}}));
+        let first = call("quit").await.unwrap()["pid"].as_u64();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let second = call("x").await.unwrap()["pid"].as_u64();
+        assert!(first.is_some() && second.is_some() && first != second);
+        let error = call("bad").await.unwrap_err();
+        assert!(!may_have_acted(&error) && error.to_string().contains("bad arguments"), "{error}");
+        assert_eq!(call("x").await.unwrap()["pid"].as_u64(), second, "a JSON-RPC error keeps the connection");
+        drop(mcp);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_slow_handshake_does_not_stall_other_servers() {
+        let (mcp, dir) = servers("slow", &["a"]);
+        let started = std::time::Instant::now();
+        let (slow, fast) = (mcp.request("a", "tools/list", json!({})), async {
+            let r = mcp.request("b", "tools/list", json!({})).await;
+            (r, started.elapsed())
+        });
+        let (slow, (fast, fast_took)) = tokio::join!(slow, fast);
+        assert!(slow.is_ok() && fast.is_ok());
+        assert!(fast_took < Duration::from_millis(1500) && started.elapsed() >= Duration::from_secs(2), "{fast_took:?}");
+        drop(mcp);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
