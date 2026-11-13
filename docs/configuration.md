@@ -109,6 +109,8 @@ Error: this workspace's config is not trusted (.harness/policy.toml); review it 
 
 ## Approvals and `hx.lock`
 
-`hx.lock` is the single approval record: per package, the approved version and its content hash. The hash covers the package's `hx.toml`, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval.
+`hx.lock` is the single approval record: per package, the approved version and its content hash. The hash covers every file of the package, `hx.toml` included, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval. A package or skill containing a symlink cannot be approved.
+
+Content hashes start with `v2:` and frame every path and file content with its length. Earlier versions of hx wrote unframed hashes, under which one file's bytes could be split into several files without changing the hash; hx no longer accepts them. A package locked with an old hash is not loaded (requiring it reports that it was approved by an older hx), and `hx skills` shows `re-approve (old hash)`: review it and run `hx approve NAME` again. Re-approving rewrites `hx.lock`, which keeps an already trusted workspace trusted.
 
 Older lock files may still carry `[package.grants]` tables or a `.harness/grants.toml`; hx ignores both.

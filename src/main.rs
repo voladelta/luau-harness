@@ -54,6 +54,14 @@ fn positionals(args: &[String]) -> Vec<&str> {
     cli_args(args).into_iter().filter_map(|a| match a { CliArg::Positional(p) => Some(p), _ => None }).collect()
 }
 
+/// An admin command's operands: exactly `n` positionals, read through the same parser as every flag (so
+/// `hx approve --workspace W PKG` works and a flag is never taken for an operand). Otherwise a usage error.
+fn operands<'a>(args: &'a [String], n: usize, usage_line: &str) -> Result<Vec<&'a str>> {
+    let found = positionals(args);
+    if found.len() != n { return Err(usage(&format!("usage: {usage_line}"))); }
+    Ok(found)
+}
+
 fn task_text(args: &[String]) -> Result<Option<String>> {
     match arg(args, "--prompt-file") {
         Some(path) => Ok(Some(std::fs::read_to_string(path)?)),
@@ -192,7 +200,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "skills" => "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n",
         "staged" => "hx staged\n\nList what the agent staged: packages (NAME) and harness-module replacements (std/MODULE).\n",
         "trust" => "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp,ar}.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, .harness/versions/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in ~/.config/hx/trust.toml.\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n",
-        "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate it. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
+        "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate exactly what was shown (refused if it changes meanwhile). A package\n(every file is printed) is locked in hx.lock and granted the capabilities it requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
         "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 corrupt chain or invalid recovery accounting, 3 unknown outcomes.\n",
@@ -303,7 +311,7 @@ fn validate_args(args: &[String]) -> Result<()> {
     if list_arg(args, "--pack").iter().any(|p| p == "std/rpi" || p.starts_with("std/rpi/")) {
         return Err(usage("RPI must be activated explicitly with --rpi, not --pack"));
     }
-    if command == "review" && (args.get(1).is_none_or(|s| s.starts_with("--")) || arg(args,"--gate").is_none() || arg(args,"--decision").is_none()) {
+    if command == "review" && (positionals(args).len() != 1 || arg(args,"--gate").is_none() || arg(args,"--decision").is_none()) {
         return Err(usage("usage: hx review LOG --gate ID --decision approve|revise|answer|waive [--input-file F]"));
     }
     if let Some(mode) = arg(args, "--approval") {
@@ -354,10 +362,15 @@ async fn real_main() -> Result<()> {
             cmd_run(&args, workspace.clone(), mk_policy(ar::load_episode()?)?).await
         }
         "recover" => cmd_recover(&args),
-        "review" => workflow_runtime::review(Path::new(&args[1]), &arg(&args,"--gate").unwrap(), &arg(&args,"--decision").unwrap(), arg(&args,"--input-file").as_deref().map(Path::new)),
+        "review" => workflow_runtime::review(Path::new(positionals(&args)[0]), &arg(&args,"--gate").unwrap(), &arg(&args,"--decision").unwrap(), arg(&args,"--input-file").as_deref().map(Path::new)),
         "revoke" => {
-            let path = PathBuf::from(args.get(1).ok_or_else(|| usage("usage: hx revoke LOG"))?);
+            let path = PathBuf::from(operands(&args, 1, "hx revoke LOG")?[0]);
             anyhow::ensure!(path.is_file(), "run log does not exist");
+            // Only a run journal: the marker is written beside the given file, so any other path would just litter. The
+            // chain is not verified here: revoking a damaged or live journal must still work.
+            let text = std::fs::read(&path)?;
+            let journal = text.split(|b| *b == b'\n').any(|l| serde_json::from_slice::<serde_json::Value>(l).is_ok_and(|r| r["kind"] == "manifest"));
+            anyhow::ensure!(journal, "{} is not a run journal (it has no manifest record)", path.display());
             std::fs::write(path.with_extension("revoked"), "revoked by owner\n")?;
             println!("revoked {}", path.display());
             Ok(())
@@ -367,24 +380,26 @@ async fn real_main() -> Result<()> {
         "trust" => cmd_trust(&args, &workspace),
         // hx skills : agent skills on disk and their approval state
         "skills" => {
+            operands(&args, 0, "hx skills")?;
             print!("{}", modules::Resolver::new(workspace).skills_status());
             Ok(())
         }
         // hx staged | accept NAME [--yes] | reject NAME | rollback MODULE : the user's side of staging (nothing the agent can call does this)
         "staged" => {
+            operands(&args, 0, "hx staged")?;
             let l = modules::Resolver::new(workspace).list_staged();
             println!("{}", if l.is_empty() { "nothing staged".to_string() } else { l.join("\n") });
             Ok(())
         }
         "reject" => {
-            let n = args.get(1).ok_or_else(|| usage("usage: hx reject NAME"))?;
+            let n = operands(&args, 1, "hx reject NAME")?[0];
             modules::Resolver::new(workspace).reject(n)?;
             println!("rejected {n}");
             Ok(())
         }
         "accept" => cmd_accept(&args, &workspace),
         "rollback" => cmd_rollback(&args, &workspace),
-        "log" if args.get(1).map(String::as_str) == Some("verify") => cmd_log_verify(&args),
+        "log" if positionals(&args).first() == Some(&"verify") => cmd_log_verify(&args),
         _ => Err(usage("usage: hx log verify FILE (see `hx log --help`)")),
     }
 }
@@ -511,8 +526,9 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
 }
 
 fn cmd_recover(args: &[String]) -> Result<()> {
-    let path = Path::new(args.get(1).ok_or_else(|| usage("usage: hx recover LOG OP --decision complete|abandon"))?);
-    let id: u64 = args.get(2).ok_or_else(|| usage("missing operation ID"))?.parse()?;
+    let operands = operands(args, 2, "hx recover LOG OP --decision complete|abandon")?;
+    let path = Path::new(operands[0]);
+    let id: u64 = operands[1].parse().map_err(|_| usage(&format!("operation ID must be a number, got {:?}", operands[1])))?;
     let decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?;
     anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon"), "decision must be complete or abandon");
     let log = eventlog::EventLog::reconcile(path)?;
@@ -528,15 +544,13 @@ fn cmd_recover(args: &[String]) -> Result<()> {
 
 /// hx test PKG_DIR : run the package's tests/*.luau
 async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>) -> Result<()> {
-    let dir = PathBuf::from(args.get(1).ok_or_else(|| usage("usage: hx test PKG_DIR"))?).canonicalize()?;
+    let given = operands(args, 1, "hx test PKG_DIR")?[0];
+    let dir = PathBuf::from(given).canonicalize().map_err(|e| anyhow::anyhow!("package directory {given}: {e}"))?;
     // Mount the package under test so `require("name")` finds it without installing or locking it, but ONLY for a
     // directory outside .harness/pkgs (e.g. a staged tool). Installed packages keep their lock and grant checks
     // (they resolve normally via .harness/pkgs).
     let installed = dir.parent().is_some_and(|p| p == workspace.join(".harness/pkgs"));
-    if !installed
-        && let Ok(t) = std::fs::read_to_string(dir.join("hx.toml"))
-        && let Some(name) = t.lines().find_map(|l| l.trim().strip_prefix("name = ").map(|v| v.trim_matches('"').to_string()))
-    {
+    if !installed && let Some(name) = modules::Resolver::test_name(&dir)? {
         let _ = modules::TEST_PKG.set((name, dir.clone()));
     }
     let vm = vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?;
@@ -551,7 +565,7 @@ async fn cmd_test(args: &[String], workspace: &Path, policy: Arc<policy::Policy>
 
 /// hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
 fn cmd_approve(args: &[String], workspace: &Path) -> Result<()> {
-    let pkg = args.get(1).ok_or_else(|| usage("usage: hx approve PKG"))?;
+    let pkg = operands(args, 1, "hx approve PKG")?[0];
     let rt = trust::Retrust::before(workspace);
     println!("{}", modules::Resolver::new(workspace.to_path_buf()).approve(pkg)?);
     rt.after()
@@ -590,7 +604,7 @@ fn cmd_trust(args: &[String], workspace: &Path) -> Result<()> {
 
 /// hx rollback MODULE : undo the last accepted replacement of a harness module
 fn cmd_rollback(args: &[String], workspace: &Path) -> Result<()> {
-    let module = args.get(1).ok_or_else(|| usage("usage: hx rollback MODULE"))?;
+    let module = operands(args, 1, "hx rollback MODULE")?[0];
     let rt = trust::Retrust::before(workspace);
     println!("{}", modules::Resolver::new(workspace.to_path_buf()).rollback(module)?);
     rt.after()
@@ -598,20 +612,22 @@ fn cmd_rollback(args: &[String], workspace: &Path) -> Result<()> {
 
 /// hx accept NAME [--yes] : review something staged, then activate it
 fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
-    let n = args.get(1).ok_or_else(|| usage("usage: hx accept NAME [--yes]"))?;
+    let n = operands(args, 1, "hx accept NAME [--yes]")?[0];
     let r = modules::Resolver::new(workspace.to_path_buf());
-    println!("{}", r.review(n)?);
+    // Accept installs exactly the bytes printed here; if the staging area changes before the answer, it refuses.
+    let reviewed = r.review(n)?;
+    println!("{}", reviewed.text);
     if !has(args, "--yes") {
-        confirm(&format!("accept {n}? {}", if n.contains('/') { "it replaces the module in force for new runs" } else { "it will be locked and granted the capabilities above" }))?;
+        confirm(&format!("accept {n}? {}", if n.contains('/') { "it replaces the module in force for new runs" } else { "every file above will be installed, locked and granted the capabilities in its hx.toml" }))?;
     }
     let rt = trust::Retrust::before(workspace);
-    println!("{}", r.accept(n)?);
+    println!("{}", r.accept(&reviewed)?);
     rt.after()
 }
 
 /// hx log verify FILE : check the hash chain and list effects with an unknown outcome (exit 1 tampered, 3 unknown)
 fn cmd_log_verify(args: &[String]) -> Result<()> {
-    let f = PathBuf::from(args.get(2).ok_or_else(|| usage("usage: hx log verify FILE"))?);
+    let f = PathBuf::from(operands(args, 2, "hx log verify FILE")?[1]);
     let r = eventlog::verify(&f)?;
     println!("{} records, hash chain {}", r.records, if r.chain_ok { "intact".to_string() } else { format!("BROKEN at line {}", r.bad_line.unwrap_or(0)) });
     for (seq, tool, summary) in &r.unknown {
@@ -655,6 +671,20 @@ mod tests {
         assert_eq!(task_text(&args).unwrap().as_deref(), Some("--yes"));
         assert_eq!(arg(&argv("run -- --model mock"), "--model"), None);
         assert_eq!(exec_chunks(&argv("exec -- --yes")), vec!["--yes"]);
+    }
+
+    #[test]
+    fn admin_operands_skip_flags_and_their_values() {
+        assert_eq!(operands(&argv("test --workspace /w pkgdir"), 1, "x").unwrap(), vec!["pkgdir"]);
+        assert_eq!(operands(&argv("approve --workspace /w pkg"), 1, "x").unwrap(), vec!["pkg"]);
+        assert_eq!(operands(&argv("recover --decision abandon log 3 --yes"), 2, "x").unwrap(), vec!["log", "3"]);
+        assert_eq!(operands(&argv("log --workspace /w verify f.jsonl"), 2, "x").unwrap(), vec!["verify", "f.jsonl"]);
+        for bad in ["approve --workspace /w", "approve a b", "skills extra"] {
+            let n = if bad.starts_with("skills") { 0 } else { 1 };
+            assert!(operands(&argv(bad), n, "x").unwrap_err().is::<Usage>(), "{bad}");
+        }
+        validate_args(&argv("review --workspace /w log --gate g --decision approve")).unwrap();
+        assert!(validate_args(&argv("review --gate g --decision approve")).unwrap_err().is::<Usage>());
     }
 
     #[test]

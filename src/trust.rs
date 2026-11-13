@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Config files whose content trust covers (paths relative to the workspace), plus whole trees: module overrides and
-/// the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
-/// asks, and the agent stages there itself.)
+/// the saved versions `hx rollback` restores. (`.harness/staged` is not covered: the agent stages there itself, and
+/// `hx accept` shows every staged file, asks, and installs exactly the bytes it showed.)
 const FILES: [&str; 5] = [".harness/policy.toml", ".harness/mcp.toml", ".harness/init.luau", ".harness/ar.toml", "hx.lock"];
 const TREES: [&str; 3] = [".harness/override", ".harness/versions", ".harness/tools"];
 
@@ -95,22 +95,29 @@ pub fn symlinks(ws: &Path) -> Vec<String> {
     config_files(ws).into_iter().filter_map(|f| f.strip_prefix("symlink:").map(String::from)).collect()
 }
 
+/// The one hash of a file tree, for trust and package approval alike: SHA-256 over (path, content) pairs in the given
+/// order, each part prefixed with its length. Without the framing, bytes could move between a path and a neighbouring
+/// file's content (a blob holding `\0hx.toml\0...` hashed like a real hx.toml), so two different trees could match.
+pub fn tree_hash<'a>(entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (path, body) in entries {
+        h.update((path.len() as u64).to_le_bytes());
+        h.update(path);
+        h.update((body.len() as u64).to_le_bytes());
+        h.update(body);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Hash of the config (length-framed path + content of every file), or None when there is none.
 pub fn config_hash(ws: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let files = config_files(ws);
     if files.is_empty() {
         return None;
     }
-    let mut h = Sha256::new();
-    for f in files {
-        let body = if f.starts_with("symlink:") { Vec::new() } else { std::fs::read(ws.join(&f)).unwrap_or_default() };
-        h.update((f.len() as u64).to_le_bytes());
-        h.update(f.as_bytes());
-        h.update((body.len() as u64).to_le_bytes());
-        h.update(&body);
-    }
-    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    let bodies: Vec<Vec<u8>> = files.iter().map(|f| if f.starts_with("symlink:") { Vec::new() } else { std::fs::read(ws.join(f)).unwrap_or_default() }).collect();
+    Some(tree_hash(files.iter().zip(&bodies).map(|(f, b)| (f.as_bytes(), b.as_slice()))))
 }
 
 fn read_store() -> BTreeMap<String, String> {
@@ -204,5 +211,38 @@ impl Retrust {
             eprintln!("note: this workspace's .harness config is not trusted, so `hx run` refuses it; review it and run `hx trust`");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_hash_frames_lengths() {
+        // Unframed `path\0content\0` hashing made these two trees equal: one file whose content spells a second file.
+        let one = tree_hash([(&b"assets/a.bin"[..], &b"x\0hx.toml\0kind = \"tool\""[..])]);
+        let two = tree_hash([(&b"assets/a.bin"[..], &b"x"[..]), (&b"hx.toml"[..], &b"kind = \"tool\""[..])]);
+        assert_ne!(one, two);
+        assert_ne!(tree_hash([(&b"ab"[..], &b"c"[..])]), tree_hash([(&b"a"[..], &b"bc"[..])]));
+    }
+
+    #[test]
+    fn config_hash_is_stable_across_the_shared_helper() {
+        // Trust records written before the helper existed must stay valid: same framing, same bytes.
+        let ws = std::env::temp_dir().join(format!("hx-trust-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".harness")).unwrap();
+        std::fs::write(ws.join(".harness/policy.toml"), "[budget]\nmax_tokens = 1\n").unwrap();
+        std::fs::write(ws.join("hx.lock"), "").unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for (f, body) in [(".harness/policy.toml", &b"[budget]\nmax_tokens = 1\n"[..]), ("hx.lock", &b""[..])] {
+            h.update((f.len() as u64).to_le_bytes()); h.update(f.as_bytes());
+            h.update((body.len() as u64).to_le_bytes()); h.update(body);
+        }
+        let expected: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(config_hash(&ws), Some(expected));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

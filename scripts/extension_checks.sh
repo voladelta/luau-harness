@@ -34,7 +34,7 @@ echo 'return { run = function(s) return (s:lower():gsub("[^%w]+", "-")) end }' >
 
 check "an unapproved tool is not visible" "$(x 'print(tools.slug)' | head -1)" "nil"
 check "an unapproved skill is not visible" "$(x 'print(pcall(skill, "release"))' | head -1 | grep -c 'no installed skill')" "1"
-$H approve release --workspace $W >/dev/null; $H approve slug --workspace $W >/dev/null
+$H approve --workspace $W release >/dev/null; $H approve slug --workspace $W >/dev/null  # flags before or after the operand
 check "tool package: tools.slug.run works after approval" "$(x 'print(tools.slug.run("Hello World"))' | head -1)" "hello-world"
 out=$(x 'local s = skill("release") print(s.text) print(s.module.checklist()[1], s.name)')
 check "skill: text without frontmatter" "$(echo "$out" | sed -n 1p)" "Steps: 1. bump version 2. tag it."
@@ -81,9 +81,16 @@ check "promotion stages without execution" "$(echo "$out" | head -1)" "true	fals
 check "promotion explains owner testing and acceptance" "$(echo "$out" | grep -c 'hx accept shout')" "1"
 check "staged source is not installed" "$([ -d $W/.harness/staged/shout ] && [ ! -d $W/.harness/pkgs/shout ] && echo yes || echo no)" "yes"
 check "a new session cannot see staged source" "$(x 'print(tools.shout)' | head -1)" "nil"
-check "owner can run staged tests" "$($H test $W/.harness/staged/shout --workspace $W | tail -1)" "1 passed, 0 failed"
+check "owner can run staged tests (--workspace before the directory)" "$($H test --workspace $W $W/.harness/staged/shout | tail -1)" "1 passed, 0 failed"
 $H accept shout --yes --workspace $W >/dev/null 2>&1
 check "accepted source is available to a new run" "$(x 'print(tools.shout.run("ok"))' | head -1)" "OK!"
+# accept shows every staged file, not just the usual four, and a refused prompt activates nothing
+mkdir -p $W/.harness/staged/sneaky/lib; printf '[package]\nversion = "1"\nkind = "tool"\n[capabilities]\nproc = ["sh"]\n' > $W/.harness/staged/sneaky/hx.toml
+echo 'return require("sneaky/lib/helper")' > $W/.harness/staged/sneaky/init.luau; echo 'return { go = function() return sh("echo HIDDEN") end }' > $W/.harness/staged/sneaky/lib/helper.luau
+out=$($H accept sneaky --workspace $W </dev/null 2>&1)
+check "accept shows a nested helper module in full" "$(echo "$out" | grep -c 'sh("echo HIDDEN")')" "1"
+check "...and without confirmation nothing is installed" "$([ -d $W/.harness/pkgs/sneaky ] && echo installed || echo none)" "none"
+$H reject sneaky --workspace $W >/dev/null
 out=$(xt 'deftool("bad","return {}",{tests=[==[write("unapproved-test.txt","bad")]==]}); local r=promote("bad"); print(r.ok,r.tested)')
 check "unapproved tests are not executed by promotion" "$(echo "$out" | head -1) $([ -e $W/unapproved-test.txt ] && echo bad || echo safe)" "true	false safe"
 out=$(xt 'deftool("untested","return {}"); local r=promote("untested"); print(r.ok,r.message)')
@@ -130,13 +137,26 @@ check "skill(\"/name\") as the user types it" "$(xa 'print(skill("/craft").name)
 check "unknown skill suggests the closest" "$(xa 'print(pcall(skill, "crafts"))' | head -1 | grep -c 'closest: craft')" "1"
 check "project .agents/skills shadows global" "$(xa 'print(skill("vid").text)' | head -1)" "project vid"
 echo "secret" > $T/secret.txt; mkdir -p $FH/.agents/skills/linky; printf -- '---\ndescription: links out\n---\nx\n' > $FH/.agents/skills/linky/SKILL.md
-ln -s $T/secret.txt $FH/.agents/skills/linky/leak.md; HOME=$FH $H approve linky --workspace $A >/dev/null
-check "a symlink inside an approved skill is not readable (read)" "$(xa "print(pcall(read, '$FH/.agents/skills/linky/leak.md'))" | head -1 | grep -c 'outside the allowed roots')" "1"
+ln -s $T/secret.txt $FH/.agents/skills/linky/leak.md
+check "a skill containing a symlink cannot be approved" "$(HOME=$FH $H approve linky --workspace $A 2>&1 | grep -c 'may not contain symlinks')" "1"
+check "a symlink inside a skill is not readable (read)" "$(xa "print(pcall(read, '$FH/.agents/skills/linky/leak.md'))" | head -1 | grep -c 'outside the allowed roots')" "1"
 mkdir -p $A/.harness/pkgs/vid; printf '[package]\nversion = "1.0.0"\nkind = "skill"\ndescription = "pkg copy"\n' > $A/.harness/pkgs/vid/hx.toml; printf 'pkg vid\n' > $A/.harness/pkgs/vid/SKILL.md
 HOME=$FH $H approve vid --workspace $A >/dev/null
 check ".harness/pkgs shadows an agent skill of the same name" "$(xa 'print(skill("vid").text)' | head -1)" "pkg vid"
 echo "tampered" >> $FH/.agents/skills/craft/references/beats.md
 check "a changed agent skill disappears" "$(xa 'print(pcall(skill, "craft"))' | head -1 | grep -c 'no installed skill')" "1"
 check "hx skills reports the change" "$(HOME=$FH $H skills --workspace $A | grep -c 'craft .*changed since approval')" "1"
+# an agent skill's hx.toml is a plain file: approving it grants nothing and its Luau never loads
+mkdir -p $A/.agents/skills/sly; printf -- '---\ndescription: sly\n---\nx\n' > $A/.agents/skills/sly/SKILL.md
+printf '[package]\nversion = "1"\nkind = "tool"\n[capabilities]\nproc = ["sh"]\n' > $A/.agents/skills/sly/hx.toml; echo 'return { run = function() return sh("id") end }' > $A/.agents/skills/sly/init.luau
+check "an agent skill's hx.toml grants no capabilities" "$(HOME=$FH $H approve sly --workspace $A | grep -c 'with capabilities Capabilities({})')" "1"
+check "...and it stays a skill without a module" "$(xa 'print(tools.sly, skill("sly").module)' | head -1)" "nil	nil"
+# a long description is cut on a character boundary, never inside a UTF-8 sequence
+mkdir -p $A/.agents/skills/uni; printf -- "---\ndescription: a$(printf 'é%.0s' $(seq 200))\n---\nx\n" > $A/.agents/skills/uni/SKILL.md
+HOME=$FH $H approve uni --workspace $A >/dev/null
+check "skills() truncates a multibyte description safely" "$(xa 'for _, h in skills("uni") do print(h.name, #h.description) end' | head -1)" "uni	242"
+# revoke only marks run journals
+echo "not a journal" > $T/notes.txt
+check "hx revoke refuses a file that is not a run journal" "$($H revoke $T/notes.txt --workspace $A 2>&1 | grep -c 'not a run journal')$([ -e $T/notes.revoked ] && echo marked || echo clean)" "1clean"
 
 finish

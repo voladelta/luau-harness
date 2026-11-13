@@ -1,22 +1,26 @@
 //! Module resolution, package manifests, the lockfile (approvals) and staging.
 //!
-//! `require("pkg")` loads `init.luau`; `require("pkg/mod")` loads `mod.luau`. Lookup order:
-//!   1. `<ws>/.harness/override/<pkg>/<mod>.luau`   user override of any module (e.g. the printer), no rebuild needed
+//! `require("pkg")` loads `init.luau`; `require("pkg/mod")` loads `mod.luau`. Lookup order (the first wins):
+//!   1. `<ws>/.harness/override/<pkg>/<mod>.luau`   user override of any module (e.g. the printer), no rebuild needed;
+//!                                                  the owner's explicit choice, so it also beats an approved package
 //!   2. `<ws>/.harness/pkgs/<pkg>/<mod>.luau`       project package (needs a lockfile entry for its exact content)
 //!   3. the built-in `std` package embedded in the binary
 //!
 //! Agent skills (the `.agents/skills` convention): `<ws>/.agents/skills/<name>/SKILL.md`, then `~/.agents/skills/<name>/SKILL.md`.
-//! They need no hx.toml (the manifest comes from SKILL.md frontmatter), carry no Luau and no capabilities, and are locked
-//! by `hx approve NAME` like any package. `.harness/pkgs/<name>` shadows them.
+//! Their manifest always comes from SKILL.md frontmatter: they carry no Luau and no capabilities, so an `hx.toml` or
+//! `.luau` file inside one is an ordinary file, never a manifest and never loaded. They are locked by `hx approve NAME`
+//! like any package. `.harness/pkgs/<name>` shadows them.
+//!
+//! Approval, verification and capture all read a package once into a `Snapshot` (files, hash, manifest from those same
+//! bytes), so what `hx approve` shows, what hx.lock records and what a run loads cannot differ.
 //!
 //! Everything under (1), (2), `project/init` and the agent skills is used only when the workspace config is trusted
 //! (see trust.rs); otherwise only the built-in package resolves.
 //!
 //! `require("base:std/printer")` skips (1), so an override can wrap the module it replaces.
 //! `require("project/init")` is `<ws>/.harness/init.luau`, run before the loop starts (hook registration etc.).
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use crate::supervisor::Capabilities;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,6 +74,8 @@ pub struct Manifest {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct PackageInfo {
+    /// The package's name (the `hx test` mount; installed packages are named by their directory).
+    pub name: Option<String>,
     pub version: String,
     /// "tool" (functions the model calls as tools.NAME), "skill" (SKILL.md + optional Luau), or empty (plain module)
     pub kind: Option<String>,
@@ -112,6 +118,55 @@ struct LockEntry {
     name: String,
     version: String,
     hash: String,
+}
+
+/// Lock hashes carry this scheme prefix. Hashes written before it (unframed `path\0content\0`) let two different trees
+/// hash alike, so they no longer verify: such a package is reported as needing `hx approve` again, never matched.
+const HASH_SCHEME: &str = "v2:";
+
+/// A package's files, relative path to bytes, read once.
+type Files = BTreeMap<PathBuf, Vec<u8>>;
+
+fn files_hash(files: &Files) -> String {
+    format!("{HASH_SCHEME}{}", crate::trust::tree_hash(files.iter().map(|(p, b)| (p.as_os_str().as_encoded_bytes(), b.as_slice()))))
+}
+
+/// The hex digits of a lock hash, shortened for display.
+fn short(hash: &str) -> &str {
+    let h = hash.strip_prefix(HASH_SCHEME).unwrap_or(hash);
+    &h[..8.min(h.len())]
+}
+
+/// A package or agent skill read once: what is hashed, approved, shown and loaded are these same bytes.
+#[derive(Debug)]
+struct Snapshot {
+    name: String,
+    dir: PathBuf,
+    agent_skill: bool,
+    files: Files,
+    hash: String,
+    man: Manifest,
+}
+
+/// Whether hx.lock approves a package as it is now.
+#[derive(Debug)]
+enum Approval {
+    Approved(Snapshot),
+    NotLocked,
+    /// Locked under the old unframed hash: valid once, unverifiable now.
+    Outdated,
+    Changed { locked: String, now: String },
+}
+
+impl Approval {
+    fn refusal(&self, pkg: &str) -> String {
+        match self {
+            Approval::Approved(_) => String::new(),
+            Approval::NotLocked => format!("package {pkg} is not locked; review it, then run `hx approve {pkg}`"),
+            Approval::Outdated => format!("package {pkg} was approved by an older hx whose content hash this version no longer accepts; review it and run `hx approve {pkg}` again"),
+            Approval::Changed { locked, now } => format!("package {pkg} changed since it was approved (locked {}…, now {}…); review it and run `hx approve {pkg}` again", short(locked), short(now)),
+        }
+    }
 }
 
 pub struct Resolver {
@@ -171,72 +226,49 @@ impl Registry {
             }
         }
         if trusted {
+            // One pass: each package is read, hashed and checked against hx.lock once, and loaded from those bytes.
+            let (approved, rejected) = resolver.approved()?;
+            registry.rejected = rejected;
+            'packages: for snap in approved {
+                let name = snap.name.clone();
+                let caps = snap.man.capabilities.clone();
+                let mut sources = Vec::new();
+                // agent skills carry no Luau: their .luau files are plain assets (see the module header)
+                for (relative, bytes) in snap.files.iter().filter(|_| !snap.agent_skill) {
+                    let file = relative.to_string_lossy().replace('\\', "/");
+                    let Some(module) = file.strip_suffix(".luau") else { continue };
+                    let Ok(text) = String::from_utf8(bytes.clone()) else {
+                        registry.rejected.insert(name.clone(), format!("package {name}: {file} is not UTF-8 text"));
+                        continue 'packages;
+                    };
+                    let module = if module == "init" { name.clone() } else { format!("{name}/{module}") };
+                    sources.push((module, Source { text, origin: format!("{name}/{file}"), is_override: false, pkg: Some((name.clone(), caps.clone())) }));
+                }
+                registry.sources.extend(sources);
+                registry.capabilities.insert(name.clone(), caps);
+                registry.packages.push(Resolver::info(&snap));
+                for (relative, bytes) in snap.files {
+                    registry.assets.insert(format!("{name}/{}", relative.to_string_lossy().replace('\\', "/")), bytes);
+                }
+            }
+            // After packages: an override is the owner's explicit choice and wins over a package module of the same name.
             let overrides = root.join(".harness/override");
             if overrides.is_dir() {
                 for (relative, bytes) in frozen_files(&overrides)? {
                     let key = relative.to_string_lossy().replace('\\', "/");
-                    let text = String::from_utf8(bytes.clone())?;
-                    registry.assets.insert(key.clone(), bytes);
+                    // Only modules are decoded here; other files (e.g. std/system.md) stay bytes until used.
                     if let Some(name) = key.strip_suffix(".luau") {
+                        let text = String::from_utf8(bytes.clone()).map_err(|_| anyhow!("module override .harness/override/{key} is not UTF-8 text"))?;
                         let name = name.strip_suffix("/init").unwrap_or(name).to_string();
-                        registry.sources.insert(name, Source { text, origin: key, is_override: true, pkg: None });
+                        registry.sources.insert(name, Source { text, origin: key.clone(), is_override: true, pkg: None });
                     }
+                    registry.assets.insert(key, bytes);
                 }
             }
             let init = root.join(".harness/init.luau");
             if init.is_file() {
                 anyhow::ensure!(!std::fs::symlink_metadata(&init)?.file_type().is_symlink(), "project init must not be a symlink");
                 registry.sources.insert("project/init".into(), Source { text: std::fs::read_to_string(init)?, origin: "project/init".into(), is_override: false, pkg: None });
-            }
-            for entry in std::fs::read_dir(root.join(".harness/pkgs")).into_iter().flatten().flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let Ok(man) = Resolver::read_manifest(&name, &entry.path())
-                    && let Err(error) = resolver.verify(&name, &entry.path(), &man) {
-                    registry.rejected.insert(name, error.to_string());
-                }
-            }
-            for info in resolver.list_packages() {
-                let lock: Lockfile = read_toml(&root.join("hx.lock"))?;
-                let (dir, _) = resolver.locate(&info.name)?;
-                let files = match frozen_files(&dir) {
-                    Ok(files) => files,
-                    Err(error) => { registry.rejected.insert(info.name.clone(), error.to_string()); continue; },
-                };
-                // Capabilities and metadata must come from the same bytes whose approval hash we validate.
-                let man: Manifest = match files.get(Path::new("hx.toml")) {
-                    Some(bytes) => toml::from_str(std::str::from_utf8(bytes)?)?,
-                    None => {
-                        let text = files.get(Path::new("SKILL.md")).context("skill has no frozen SKILL.md")?;
-                        let mut man = Manifest::default();
-                        man.package.version = "agent-skill".into(); man.package.kind = Some("skill".into());
-                        man.package.description = Some(frontmatter_description(std::str::from_utf8(text)?)); man
-                    },
-                };
-                // Hash the bytes actually captured, not a second filesystem read.
-                let mut hash = Sha256::new();
-                for (relative, bytes) in &files {
-                    hash.update(relative.to_string_lossy().as_bytes()); hash.update([0]);
-                    hash.update(bytes); hash.update([0]);
-                }
-                let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-                lock.package.iter().find(|p| p.name == info.name && p.hash == digest && p.version == man.package.version)
-                    .with_context(|| format!("package {} changed while its approved snapshot was captured", info.name))?;
-                registry.capabilities.insert(info.name.clone(), man.capabilities.clone());
-                let mut info = info;
-                info.version = man.package.version.clone(); info.kind = man.package.kind.clone().unwrap_or_default();
-                info.description = man.package.description.clone().unwrap_or_default();
-                info.signature = man.tool.signature.clone().unwrap_or_default(); info.doc = man.tool.doc.clone().unwrap_or_default();
-                if info.kind == "skill" { info.files = files.keys().map(|p| p.to_string_lossy().to_string()).collect(); }
-                for (relative, bytes) in files {
-                    let file = relative.to_string_lossy().replace('\\', "/");
-                    let key = format!("{}/{file}", info.name);
-                    registry.assets.insert(key.clone(), bytes.clone());
-                    if let Some(module) = file.strip_suffix(".luau") {
-                        let name = if module == "init" { info.name.clone() } else { format!("{}/{module}", info.name) };
-                        registry.sources.insert(name, Source { text: String::from_utf8(bytes)?, origin: key, is_override: false, pkg: Some((info.name.clone(), man.capabilities.clone())) });
-                    }
-                }
-                registry.packages.push(info);
             }
             registry.mcp = crate::mcp::snapshot(root)?;
             crate::tools::capture(root, &mut registry)?;
@@ -307,38 +339,6 @@ fn split_name(name: &str) -> (&str, &str) {
     name.split_once('/').unwrap_or((name, ""))
 }
 
-/// Hash of every file in a package directory (relative path + content, sorted), tests included.
-pub fn hash_dir(dir: &Path) -> Result<String> {
-    let mut files = Vec::new();
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for e in std::fs::read_dir(dir)? {
-            let p = e?.path();
-            // symlink_metadata: a symlinked directory is not walked (a link to / would hash the disk); see below
-            if std::fs::symlink_metadata(&p)?.is_dir() {
-                walk(&p, base, out)?;
-            } else if p.file_name().is_some_and(|n| n != ".DS_Store") {
-                out.push(p.strip_prefix(base).unwrap().to_path_buf());
-            }
-        }
-        Ok(())
-    }
-    walk(dir, dir, &mut files)?;
-    files.sort();
-    let mut h = Sha256::new();
-    for f in files {
-        h.update(f.to_string_lossy().as_bytes());
-        h.update([0]);
-        let full = dir.join(&f);
-        // a symlink contributes its target path, not the target's content (reads through it are refused anyway)
-        match std::fs::read_link(&full) {
-            Ok(t) => h.update(format!("symlink:{}", t.display()).as_bytes()),
-            Err(_) => h.update(std::fs::read(&full)?),
-        }
-        h.update([0]);
-    }
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}
-
 /// The value of `description:` in SKILL.md frontmatter (plain, quoted, or a `>`/`|` block).
 fn frontmatter_description(text: &str) -> String {
     let Some(fm) = text.strip_prefix("---\n").and_then(|t| t.split_once("\n---").map(|(f, _)| f)) else { return String::new() };
@@ -355,26 +355,10 @@ fn frontmatter_description(text: &str) -> String {
     String::new()
 }
 
-/// Files under `dir`, relative and sorted (skips dotfiles).
-fn list_files(dir: &Path) -> Vec<String> {
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if e.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            if p.is_dir() {
-                walk(&p, base, out);
-            } else {
-                out.push(p.strip_prefix(base).unwrap().to_string_lossy().to_string());
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(dir, dir, &mut out);
-    out.sort();
-    out
+/// Text for the owner's terminal: control characters other than newline and tab are shown escaped, so staged content
+/// cannot hide lines from the review (`\r`, cursor movement, clear-line sequences).
+fn printable(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { c.escape_unicode().to_string() } else { c.to_string() }).collect()
 }
 
 impl Resolver {
@@ -406,26 +390,91 @@ impl Resolver {
         self.agent_skill_roots().into_iter().map(|r| r.join(name)).find(|d| d.join("SKILL.md").is_file())
     }
 
-    /// A skill without hx.toml: kind "skill", no capabilities, description from SKILL.md frontmatter.
-    fn agent_skill_manifest(dir: &Path) -> Manifest {
-        let text = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+    /// The manifest, parsed from the snapshot's own bytes. A `.harness/pkgs` package declares it in hx.toml. An agent
+    /// skill never does: kind "skill", no capabilities, description from SKILL.md frontmatter, whatever else it ships.
+    fn manifest(name: &str, agent_skill: bool, files: &Files) -> Result<Manifest> {
+        let text = |file: &str| -> Result<&str> {
+            let bytes = files.get(Path::new(file)).ok_or_else(|| anyhow!("package {name}: missing {file}"))?;
+            std::str::from_utf8(bytes).map_err(|_| anyhow!("package {name}: {file} is not UTF-8 text"))
+        };
+        if !agent_skill {
+            return toml::from_str(text("hx.toml")?).map_err(|e| anyhow!("package {name}: bad hx.toml: {e}"));
+        }
         let mut m = Manifest::default();
         m.package.version = "agent-skill".into();
         m.package.kind = Some("skill".into());
-        m.package.description = Some(frontmatter_description(&text));
-        m
+        m.package.description = Some(frontmatter_description(text("SKILL.md")?));
+        Ok(m)
     }
 
-    /// Where package `name` lives and its manifest: `.harness/pkgs/<name>`, else an agent skill.
-    fn locate(&self, name: &str) -> Result<(PathBuf, Manifest)> {
+    /// Where package `name` lives: `.harness/pkgs/<name>`, else an agent skill (true).
+    fn locate(&self, name: &str) -> Result<(PathBuf, bool)> {
+        // a package named std would replace built-in modules; that is what overrides are for
+        anyhow::ensure!(name != "std", "std is the built-in package; replace one of its modules with an override instead");
         let pdir = self.harness().join("pkgs").join(name);
-        if pdir.is_dir() {
-            return Ok((pdir.clone(), Self::read_manifest(name, &pdir)?));
+        if pdir.is_dir() && !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\']) {
+            return Ok((pdir, false));
         }
         if let Some(d) = self.agent_skill_dir(name) {
-            return Ok((d.clone(), Self::agent_skill_manifest(&d)));
+            return Ok((d, true));
         }
         bail!("no package or skill named {name} (looked in .harness/pkgs, .agents/skills, ~/.agents/skills)")
+    }
+
+    /// Read package `name` once: its files, their hash and its manifest.
+    fn snapshot(&self, name: &str) -> Result<Snapshot> {
+        let (dir, agent_skill) = self.locate(name)?;
+        let files = frozen_files(&dir).map_err(|e| anyhow!("package {name}: {e}"))?;
+        let man = Self::manifest(name, agent_skill, &files)?;
+        Ok(Snapshot { name: name.to_string(), hash: files_hash(&files), dir, agent_skill, files, man })
+    }
+
+    /// Does `lock` approve package `name` as it is on disk now? Its files are read only when hx.lock has an entry for it
+    /// (~/.agents/skills can be large).
+    fn approval(&self, lock: &Lockfile, name: &str) -> Result<Approval> {
+        let Some(entry) = lock.package.iter().find(|e| e.name == name) else { return Ok(Approval::NotLocked) };
+        if !entry.hash.starts_with(HASH_SCHEME) {
+            return Ok(Approval::Outdated);
+        }
+        let snap = self.snapshot(name)?;
+        Ok(if entry.hash != snap.hash || entry.version != snap.man.package.version {
+            Approval::Changed { locked: entry.hash.clone(), now: snap.hash }
+        } else {
+            Approval::Approved(snap)
+        })
+    }
+
+    /// Every package and agent skill hx.lock approves as it is now (what the model may use), and why each other
+    /// `.harness/pkgs` package is refused (the error `require` reports for it). Unapproved agent skills are just absent.
+    fn approved(&self) -> Result<(Vec<Snapshot>, BTreeMap<String, String>)> {
+        let (mut out, mut rejected) = (Vec::new(), BTreeMap::new());
+        if !crate::trust::is_trusted(&self.root) {
+            return Ok((out, rejected)); // hx.lock is untrusted, so nothing it approves is visible
+        }
+        let mut names: Vec<String> = std::fs::read_dir(self.harness().join("pkgs")).into_iter().flatten().flatten()
+            .filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        names.sort();
+        // A malformed hx.lock approves nothing; it does not stop runs that use no package.
+        let lock: Lockfile = match read_toml(&self.root.join("hx.lock")) {
+            Ok(lock) => lock,
+            Err(e) => {
+                rejected.extend(names.into_iter().map(|n| (n, format!("hx.lock is not valid TOML, so nothing is approved: {e}"))));
+                return Ok((out, rejected));
+            },
+        };
+        for name in names {
+            match self.approval(&lock, &name) {
+                Ok(Approval::Approved(snap)) => out.push(snap),
+                Ok(refused) => { rejected.insert(name.clone(), refused.refusal(&name)); },
+                Err(e) => { rejected.insert(name, e.to_string()); },
+            }
+        }
+        for (name, _) in self.agent_skills() {
+            if !self.harness().join("pkgs").join(&name).is_dir() && let Ok(Approval::Approved(snap)) = self.approval(&lock, &name) {
+                out.push(snap);
+            }
+        }
+        Ok((out, rejected))
     }
 
     /// Every skill found under the `.agents/skills` roots: (name, dir), first root wins.
@@ -447,14 +496,16 @@ impl Resolver {
     /// `hx skills`: every agent skill and whether the model can see it.
     pub fn skills_status(&self) -> String {
         let mut s = String::new();
+        let lock = read_toml::<Lockfile>(&self.root.join("hx.lock"));
         for (name, dir) in self.agent_skills() {
             let state = if self.harness().join("pkgs").join(&name).is_dir() {
                 "shadowed by .harness/pkgs".to_string()
             } else {
-                match self.verify(&name, &dir, &Self::agent_skill_manifest(&dir)) {
-                    Ok(()) => "approved".into(),
-                    Err(e) if e.to_string().contains("not locked") => "not approved".into(),
-                    Err(e) if e.to_string().contains("changed since it was approved") => "changed since approval".into(),
+                match lock.as_ref().map_err(|e| anyhow!("hx.lock: {e}")).and_then(|lock| self.approval(lock, &name)) {
+                    Ok(Approval::Approved(_)) => "approved".into(),
+                    Ok(Approval::NotLocked) => "not approved".into(),
+                    Ok(Approval::Outdated) => "re-approve (old hash)".into(),
+                    Ok(Approval::Changed { .. }) => "changed since approval".into(),
                     Err(e) => format!("error: {}", e.to_string().lines().next().unwrap_or("")),
                 }
             };
@@ -471,61 +522,42 @@ impl Resolver {
             .map_err(|e| anyhow!("package {pkg}: bad hx.toml: {e}"))
     }
 
-    fn verify(&self, pkg: &str, dir: &Path, man: &Manifest) -> Result<()> {
-        let lock: Lockfile = read_toml(&self.root.join("hx.lock"))?;
-        let Some(entry) = lock.package.iter().find(|e| e.name == pkg) else {
-            bail!("package {pkg} is not locked; review it, then run `hx approve {pkg}`")
-        };
-        let hash = hash_dir(dir)?; // only for locked packages: ~/.agents/skills can be large
-        if entry.hash != hash || entry.version != man.package.version {
-            bail!(
-                "package {pkg} changed since it was approved (locked {}…, now {}…); review it and run `hx approve {pkg}` again",
-                &entry.hash[..8.min(entry.hash.len())],
-                &hash[..8]
-            );
+    /// Is package `name` approved as it is now? The error says why not.
+    #[cfg(test)]
+    fn verify(&self, name: &str) -> Result<()> {
+        match self.approval(&read_toml(&self.root.join("hx.lock"))?, name)? {
+            Approval::Approved(_) => Ok(()),
+            refused => bail!("{}", refused.refusal(name)),
         }
-        Ok(())
+    }
+
+    /// The name `hx test DIR` mounts a package under: `[package] name` in its hx.toml (parsed, not pattern-matched),
+    /// else the directory's name; None without an hx.toml (nothing to mount).
+    pub fn test_name(dir: &Path) -> Result<Option<String>> {
+        let dirname = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if !dir.join("hx.toml").is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self::read_manifest(&dirname, dir)?.package.name.unwrap_or(dirname)))
     }
 
     /// Every installed package that is locked and unchanged: what the model may use. Others are skipped.
     pub fn list_packages(&self) -> Vec<PkgInfo> {
-        let mut out = Vec::new();
-        if !crate::trust::is_trusted(&self.root) {
-            return out; // hx.lock is untrusted, so nothing it approves is visible
-        }
-        let mut dirs: Vec<_> = std::fs::read_dir(self.harness().join("pkgs")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        dirs.sort();
-        for dir in dirs {
-            let name = dir.file_name().unwrap().to_string_lossy().to_string();
-            let Ok(man) = Self::read_manifest(&name, &dir) else { continue };
-            if self.verify(&name, &dir, &man).is_err() {
-                continue;
-            }
-            out.push(Self::info(name, &dir, &man));
-        }
-        for (name, dir) in self.agent_skills() {
-            if out.iter().any(|p| p.name == name) || self.harness().join("pkgs").join(&name).is_dir() {
-                continue;
-            }
-            let man = Self::agent_skill_manifest(&dir);
-            if self.verify(&name, &dir, &man).is_ok() {
-                out.push(Self::info(name, &dir, &man));
-            }
-        }
-        out
+        self.approved().map(|(snaps, _)| snaps.iter().map(Self::info).collect()).unwrap_or_default()
     }
 
-    fn info(name: String, dir: &Path, man: &Manifest) -> PkgInfo {
+    fn info(snap: &Snapshot) -> PkgInfo {
+        let man = &snap.man;
         let kind = man.package.kind.clone().unwrap_or_default();
         let skill = kind == "skill";
         PkgInfo {
-            name,
+            name: snap.name.clone(),
             version: man.package.version.clone(),
             description: man.package.description.clone().unwrap_or_default(),
             signature: man.tool.signature.clone().unwrap_or_default(),
             doc: man.tool.doc.clone().unwrap_or_default(),
-            dir: if skill { std::fs::canonicalize(dir).unwrap_or(dir.into()).display().to_string() } else { String::new() },
-            files: if skill { list_files(dir) } else { vec![] },
+            dir: if skill { std::fs::canonicalize(&snap.dir).unwrap_or(snap.dir.clone()).display().to_string() } else { String::new() },
+            files: if skill { snap.files.keys().map(|p| p.to_string_lossy().to_string()).collect() } else { vec![] },
             kind,
         }
     }
@@ -595,47 +627,67 @@ impl Resolver {
         name.contains('/')
     }
 
-    /// What the user reviews before accepting: a package's manifest, source and tests; or a module replacement's
-    /// reason, structural check and diff against the module in force.
-    pub fn review(&self, name: &str) -> Result<String> {
+    /// What the user reviews before accepting, with the exact bytes it shows: every file of a package (text in full,
+    /// anything else by size), or a module replacement's reason, structural check and diff against the module in force.
+    pub fn review(&self, name: &str) -> Result<Reviewed> {
         let dir = self.staged(name)?;
+        let files = frozen_files(&dir)?;
+        let hash = files_hash(&files);
+        let text = |file: &str| -> Result<String> {
+            String::from_utf8(files.get(Path::new(file)).ok_or_else(|| anyhow!("staged {name} has no {file}"))?.clone()).map_err(|_| anyhow!("staged {name}: {file} is not UTF-8 text"))
+        };
         if Self::is_module(name) {
-            let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)?;
-            let new = std::fs::read_to_string(dir.join("new.luau"))?;
+            let meta: serde_json::Value = serde_json::from_str(&text("meta.json")?)?;
+            let new = text("new.luau")?;
             let check = self.check_module(name, &new).unwrap_or_else(|e| format!("FAILS: {e}"));
-            let current = self.effective_source(name)?;
-            let mut diff = std::process::Command::new("diff").args(["-u", "--label", "current", "--label", "staged", "-"]).arg(dir.join("new.luau"))
+            // diff the reviewed bytes (stdin) against the module in force (a private temporary copy)
+            let current = tempfile_with(&self.effective_source(name)?)?;
+            let mut diff = std::process::Command::new("diff").args(["-u", "--label", "current", "--label", "staged"]).arg(current.path()).arg("-")
                 .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn()?;
-            std::io::Write::write_all(&mut diff.stdin.take().unwrap(), current.as_bytes())?;
+            std::io::Write::write_all(&mut diff.stdin.take().unwrap(), new.as_bytes())?;
             let diff = diff.wait_with_output()?;
-            return Ok(format!("== staged module {name} ==\nreason: {}\ncheck: {check}\n\n{}", meta["reason"].as_str().unwrap_or(""), String::from_utf8_lossy(&diff.stdout)));
+            let text = format!("== staged module {name} ==\nreason: {}\ncheck: {check}\n\n{}", printable(meta["reason"].as_str().unwrap_or("")), printable(&String::from_utf8_lossy(&diff.stdout)));
+            return Ok(Reviewed { name: name.into(), text, files, hash });
         }
-        let mut out = format!("== staged package {name} ==\n");
-        for rel in ["hx.toml", "init.luau", "types.d.luau"] {
-            if let Ok(t) = std::fs::read_to_string(dir.join(rel)) {
-                out.push_str(&format!("\n--- {rel} ---\n{t}\n"));
+        let mut out = format!("== staged package {name}: {} files, review {}… ==\n", files.len(), short(&hash));
+        for (rel, bytes) in &files {
+            out.push_str(&format!("  {} ({} bytes)\n", printable(&rel.to_string_lossy()), bytes.len()));
+        }
+        for (rel, bytes) in &files {
+            let rel = printable(&rel.to_string_lossy());
+            match std::str::from_utf8(bytes) {
+                Ok(t) => out.push_str(&format!("\n--- {rel} ---\n{}{}", printable(t), if t.ends_with('\n') { "" } else { "\n" })),
+                Err(_) => out.push_str(&format!("\n--- {rel} --- ({} bytes, not text; never loaded as Luau)\n", bytes.len())),
             }
         }
-        if let Ok(rd) = std::fs::read_dir(dir.join("tests")) {
-            for e in rd.flatten() {
-                out.push_str(&format!("\n--- tests/{} ---\n{}\n", e.file_name().to_string_lossy(), std::fs::read_to_string(e.path()).unwrap_or_default()));
-            }
-        }
-        Ok(out)
+        Ok(Reviewed { name: name.into(), text: out, files, hash })
     }
 
-    /// `hx accept NAME`: activate what is staged as NAME. A package moves into pkgs/ and is locked and granted the
-    /// capabilities it requests; a module replacement becomes the override. Only the user's CLI reaches this.
-    pub fn accept(&self, name: &str) -> Result<String> {
+    /// `hx accept NAME`: activate what `review` showed. A package is installed into pkgs/ from the reviewed bytes and
+    /// locked, granting the capabilities its reviewed manifest requests; a module replacement becomes the override.
+    /// The staging area is writable by the agent's shell, so if it no longer holds exactly what was shown, nothing is
+    /// activated. Only the user's CLI reaches this.
+    pub fn accept(&self, reviewed: &Reviewed) -> Result<String> {
+        let name = reviewed.name.as_str();
         let from = self.staged(name)?;
-        if Self::is_module(name) {
-            return self.accept_module(name, &from);
+        if frozen_files(&from).map(|f| files_hash(&f)).ok().as_deref() != Some(reviewed.hash.as_str()) {
+            bail!("staged {name} changed after it was shown for review; nothing was activated. Run `hx accept {name}` again to review what is staged now");
         }
+        if Self::is_module(name) {
+            let utf8 = |file: &str| reviewed.files.get(Path::new(file)).and_then(|b| String::from_utf8(b.clone()).ok()).ok_or_else(|| anyhow!("staged {name} has no {file}"));
+            return self.accept_module(name, &from, &serde_json::from_str(&utf8("meta.json")?)?, &utf8("new.luau")?);
+        }
+        let man = Self::manifest(name, false, &reviewed.files)?;
         let to = self.harness().join("pkgs").join(name);
-        std::fs::create_dir_all(self.harness().join("pkgs"))?;
         let _ = std::fs::remove_dir_all(&to);
-        std::fs::rename(&from, &to)?;
-        self.approve(name)
+        for (rel, bytes) in &reviewed.files {
+            let path = to.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, bytes)?;
+        }
+        self.lock(name, &man.package.version, &reviewed.hash)?;
+        std::fs::remove_dir_all(&from)?;
+        Ok(format!("approved {name} {} ({}…) from {} with capabilities {:?}", man.package.version, short(&reviewed.hash), to.display(), man.capabilities))
     }
 
     pub fn reject(&self, name: &str) -> Result<()> {
@@ -731,16 +783,14 @@ impl Resolver {
         Ok(())
     }
 
-    fn accept_module(&self, module: &str, dir: &Path) -> Result<String> {
-        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)?;
-        let new = std::fs::read_to_string(dir.join("new.luau"))?;
+    fn accept_module(&self, module: &str, dir: &Path, meta: &serde_json::Value, new: &str) -> Result<String> {
         // The replacement covers the whole module and was written against the module in force when it was staged: if
         // that module has changed since (another accept, a rollback), accepting would silently drop the change.
         let current = crate::eventlog::sha_bytes(self.effective_source(module)?.as_bytes());
         if Some(current.as_str()) != meta["base_sha"].as_str() {
             bail!("{module} has changed since this replacement was staged; stage it again against the current module");
         }
-        self.check_module(module, &new)?;
+        self.check_module(module, new)?;
         let target = self.override_path(module)?;
         let vdir = self.versions_dir(module);
         std::fs::create_dir_all(&vdir)?;
@@ -751,7 +801,7 @@ impl Resolver {
             Err(_) => std::fs::write(vdir.join(format!("{n:04}.none")), "")?,
         }
         std::fs::create_dir_all(target.parent().unwrap())?;
-        std::fs::write(&target, &new)?;
+        std::fs::write(&target, new)?;
         std::fs::remove_dir_all(dir)?;
         self.log_upgrade(serde_json::json!({"action": "accept", "module": module, "reason": meta["reason"], "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "version": n}))?;
         Ok(format!("activated {module} (version {n}); undo with `hx rollback {module}`"))
@@ -776,17 +826,45 @@ impl Resolver {
     }
 
     /// `hx approve <pkg>`: lock the package's exact content, which grants exactly the capabilities its manifest requests.
+    /// The manifest shown is the one verification and capture use (for an agent skill: never its hx.toml).
     pub fn approve(&self, pkg: &str) -> Result<String> {
-        let (dir, man) = self.locate(pkg)?;
-        let hash = hash_dir(&dir)?;
+        let snap = self.snapshot(pkg)?;
+        self.lock(pkg, &snap.man.package.version, &snap.hash)?;
+        let inert = snap.agent_skill && snap.files.keys().any(|p| p == Path::new("hx.toml") || p.extension().is_some_and(|e| e == "luau"));
+        Ok(format!("approved {pkg} {} ({}…) from {} with capabilities {:?}{}", snap.man.package.version, short(&snap.hash), snap.dir.display(), snap.man.capabilities,
+            if inert { "\nnote: agent skills carry no Luau or capabilities: its hx.toml and .luau files are plain files, never loaded (move it to .harness/pkgs to make it a package)" } else { "" }))
+    }
+
+    /// Record `name` at `version` with content `hash` in hx.lock, replacing its previous entry.
+    fn lock(&self, name: &str, version: &str, hash: &str) -> Result<()> {
         let lock_path = self.root.join("hx.lock");
         let mut entries = read_toml::<Lockfile>(&lock_path)?.package;
-        entries.retain(|e| e.name != pkg);
-        entries.push(LockEntry { name: pkg.into(), version: man.package.version.clone(), hash: hash.clone() });
+        entries.retain(|e| e.name != name);
+        entries.push(LockEntry { name: name.into(), version: version.into(), hash: hash.into() });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         std::fs::write(&lock_path, toml::to_string(&Lockfile { package: entries })?)?;
-        Ok(format!("approved {pkg} {} ({}…) from {} with capabilities {:?}", man.package.version, &hash[..8], dir.display(), man.capabilities))
+        Ok(())
     }
+}
+
+/// What `hx accept` showed for a staged NAME and the exact bytes behind it (see `Resolver::review`).
+pub struct Reviewed {
+    pub name: String,
+    pub text: String,
+    files: Files,
+    hash: String,
+}
+
+/// A private temporary file holding `text`, removed on drop.
+struct TempFile(PathBuf);
+impl TempFile { fn path(&self) -> &Path { &self.0 } }
+impl Drop for TempFile { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+fn tempfile_with(text: &str) -> Result<TempFile> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let nonce: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
+    let path = std::env::temp_dir().join(format!("hx-review-{}-{nonce:x}.luau", std::process::id()));
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?.write_all(text.as_bytes())?;
+    Ok(TempFile(path))
 }
 
 #[cfg(test)]
@@ -815,6 +893,11 @@ mod tests {
         dir
     }
 
+    /// Review, then accept what was shown (the `hx accept` sequence without the prompt).
+    fn acc(r: &Resolver, name: &str) -> Result<String> {
+        r.accept(&r.review(name)?)
+    }
+
     fn err(r: Result<impl Sized>) -> String {
         match r {
             Ok(_) => panic!("expected an error"),
@@ -836,23 +919,22 @@ mod tests {
         let root = ws("lock");
         let dir = install_pkg(&root, "foo");
         let r = Resolver::new(root.clone());
-        assert!(err(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap())).contains("not locked"));
+        assert!(err(r.verify("foo")).contains("not locked"));
         // Approval records the exact content, manifest (and so capabilities) included.
         let msg = r.approve("foo").unwrap();
         assert!(msg.starts_with("approved foo 1.0"), "{msg}");
         let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
         assert!(lock.contains("name = \"foo\"") && lock.contains("version = \"1.0\""), "{lock}");
         assert!(!lock.contains("grants"), "{lock}");
-        assert!(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap()).is_ok());
+        assert!(r.verify("foo").is_ok());
         // any content change invalidates the lock
         std::fs::write(dir.join("init.luau"), "return { x = 2 }\n").unwrap();
-        assert!(err(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap())).contains("changed since it was approved"));
+        assert!(err(r.verify("foo")).contains("changed since it was approved"));
         // so does a version that differs from the locked one
         std::fs::write(dir.join("hx.toml"), "[package]\nversion = \"2.0\"\n\n[capabilities]\nfs = [\"read\"]\n").unwrap();
-        let man = Resolver::read_manifest("foo", &dir).unwrap();
         // lock the new content under the old version: only the version differs
-        std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"1.0\"\nhash = {:?}\n", hash_dir(&dir).unwrap())).unwrap();
-        assert!(err(Resolver::new(root.clone()).verify("foo", &dir, &man)).contains("changed since it was approved"));
+        std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"1.0\"\nhash = {:?}\n", files_hash(&frozen_files(&dir).unwrap()))).unwrap();
+        assert!(err(Resolver::new(root.clone()).verify("foo")).contains("changed since it was approved"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -865,10 +947,10 @@ mod tests {
         // A lock written before grants were dropped still parses; its extra table is ignored.
         let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
         std::fs::write(root.join("hx.lock"), format!("{lock}\n[package.grants]\nfs = [\"read\"]\n")).unwrap();
-        assert!(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap()).is_ok());
+        assert!(r.verify("foo").is_ok());
         // Requesting more is a manifest edit, so it changes the hash and needs a new approval.
         std::fs::write(dir.join("hx.toml"), "[package]\nversion = \"1.0\"\n\n[capabilities]\nfs = [\"read\", \"write\"]\n").unwrap();
-        assert!(err(r.verify("foo", &dir, &Resolver::read_manifest("foo", &dir).unwrap())).contains("changed since it was approved"));
+        assert!(err(r.verify("foo")).contains("changed since it was approved"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -896,19 +978,20 @@ mod tests {
         assert_eq!(lock.matches("[[package]]").count(), 2);
         assert!(lock.find("\"bar\"").unwrap() < lock.find("\"foo\"").unwrap(), "sorted by name: {lock}");
         assert!(err(r.approve("nope")).contains("no package or skill named nope"));
+        install_pkg(&root, "std");
+        assert!(err(r.approve("std")).contains("built-in package"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn approve_writes_valid_toml_for_any_name() {
         let root = ws("dotted");
-        let dir = install_pkg(&root, "my.pkg");
+        install_pkg(&root, "my.pkg");
         install_pkg(&root, "other");
         let r = Resolver::new(root.clone());
         r.approve("my.pkg").unwrap();
         r.approve("other").unwrap();
-        let man = Resolver::read_manifest("my.pkg", &dir).unwrap();
-        assert!(r.verify("my.pkg", &dir, &man).is_ok());
+        assert!(r.verify("my.pkg").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -949,16 +1032,21 @@ mod tests {
         r.stage("foo", &files("1.0")).unwrap();
         r.stage("bar", &files("1.0")).unwrap();
         assert_eq!(r.list_staged(), vec!["bar", "foo"]);
-        let review = r.review("foo").unwrap();
+        let review = r.review("foo").unwrap().text;
         assert!(review.contains("--- hx.toml ---") && review.contains("--- tests/a.luau ---\n-- t"), "{review}");
         assert!(err(r.review("nope")).contains("nothing staged"));
-        assert!(r.accept("foo").unwrap().starts_with("approved foo 1.0"));
+        assert!(acc(&r, "foo").unwrap().starts_with("approved foo 1.0"));
+        // a malformed hx.lock approves nothing but does not fail capture (runs without packages still start)
+        unsafe { std::env::set_var("HX_TRUST", "1") };
+        std::fs::write(root.join("hx.lock"), "lock\n").unwrap();
+        assert!(err(Registry::capture(&root).unwrap().resolve("foo")).contains("hx.lock is not valid TOML"));
+        std::fs::remove_file(root.join("hx.lock")).unwrap();
         assert!(root.join(".harness/pkgs/foo/init.luau").is_file());
         assert_eq!(r.list_staged(), vec!["bar"]);
         // re-staging and accepting replaces the installed copy
         r.stage("foo", &files("1.1")).unwrap();
-        assert!(r.accept("foo").unwrap().starts_with("approved foo 1.1"));
-        assert!(err(r.accept("foo")).contains("nothing staged"));
+        assert!(acc(&r, "foo").unwrap().starts_with("approved foo 1.1"));
+        assert!(err(acc(&r, "foo")).contains("nothing staged"));
         r.reject("bar").unwrap();
         assert!(r.list_staged().is_empty());
         assert!(r.reject("bar").is_err());
@@ -995,8 +1083,8 @@ mod tests {
         let check = |src: &str| {
             r.stage_module("std/printer", src, "").unwrap();
             assert_eq!(r.list_staged(), vec!["std/printer"]);
-            let review = r.review("std/printer").unwrap();
-            let accepted = r.accept("std/printer");
+            let review = r.review("std/printer").unwrap().text;
+            let accepted = acc(&r, "std/printer");
             if accepted.is_ok() { r.rollback("std/printer").unwrap(); }
             (review, accepted)
         };
@@ -1020,11 +1108,11 @@ mod tests {
         let r = Resolver::new(root.clone());
         let builtin = r.effective_source("std/printer").unwrap();
         r.stage_module("std/printer", &format!("{builtin}\n-- A\n"), "").unwrap();
-        r.accept("std/printer").unwrap();
+        acc(&r, "std/printer").unwrap();
         // staged against A, then A is rolled back: accepting now would silently drop the rollback
         r.stage_module("std/printer", &format!("{builtin}\n-- A\n-- B\n"), "").unwrap();
         r.rollback("std/printer").unwrap();
-        assert!(err(r.accept("std/printer")).contains("changed since this replacement was staged"));
+        assert!(err(acc(&r, "std/printer")).contains("changed since this replacement was staged"));
         assert_eq!(r.effective_source("std/printer").unwrap(), builtin);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1038,19 +1126,19 @@ mod tests {
         r.stage_module("std/printer", &new, "test").unwrap();
         r.stage("tool", &[("hx.toml".into(), "[package]\nversion = \"1\"\n".into())]).unwrap();
         assert_eq!(r.list_staged(), vec!["tool", "std/printer"]);
-        assert!(r.review("std/printer").unwrap().contains("reason: test"));
-        assert!(r.accept("std/printer").unwrap().contains("version 1"));
+        assert!(r.review("std/printer").unwrap().text.contains("reason: test"));
+        assert!(acc(&r, "std/printer").unwrap().contains("version 1"));
         assert_eq!(r.effective_source("std/printer").unwrap(), new);
         assert_eq!(r.list_staged(), vec!["tool"]);
         // a second replacement stacks on the first
         let newer = format!("{new}-- v3\n");
         r.stage_module("std/printer", &newer, "").unwrap();
-        assert!(r.accept("std/printer").unwrap().contains("version 2"));
+        assert!(acc(&r, "std/printer").unwrap().contains("version 2"));
         assert_eq!(r.effective_source("std/printer").unwrap(), newer);
         // rejecting a staged replacement leaves the module in force alone
         r.stage_module("std/printer", "return {}", "").unwrap();
         r.reject("std/printer").unwrap();
-        assert!(err(r.accept("std/printer")).contains("nothing staged"));
+        assert!(err(acc(&r, "std/printer")).contains("nothing staged"));
         let log = std::fs::read_to_string(root.join(".harness/upgrades.jsonl")).unwrap();
         assert_eq!(log.matches("\"accept\"").count(), 2);
         assert!(r.rollback("std/printer").unwrap().ends_with("the previous version"));
@@ -1059,6 +1147,121 @@ mod tests {
         assert_eq!(r.effective_source("std/printer").unwrap(), builtin);
         assert!(!root.join(".harness/override/std/printer.luau").exists());
         assert!(err(r.rollback("std/printer")).contains("nothing to roll back"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_blob_cannot_be_split_into_other_files_under_the_same_approval() {
+        let root = ws("split");
+        let skill = root.join(".agents/skills/s");
+        write(skill.join("SKILL.md"), "---\ndescription: s\n---\nx\n");
+        // With unframed `path\0content\0` hashing, this one file hashed exactly like the three files below.
+        let manifest = "[package]\nversion = \"agent-skill\"\nkind = \"tool\"\n[capabilities]\nproc = [\"sh\"]\n";
+        write(skill.join("assets/a.bin"), &format!("x\0hx.toml\0{manifest}\0init.luau\0return {{}}"));
+        let r = Resolver::new(root.clone());
+        r.approve("s").unwrap();
+        assert!(r.verify("s").is_ok());
+        write(skill.join("assets/a.bin"), "x");
+        write(skill.join("hx.toml"), manifest);
+        write(skill.join("init.luau"), "return {}");
+        assert!(err(r.verify("s")).contains("changed since it was approved"));
+        assert!(r.skills_status().contains("changed since approval"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lock_entry_with_the_old_hash_asks_for_reapproval() {
+        let root = ws("legacy");
+        install_pkg(&root, "foo");
+        write(root.join(".agents/skills/s/SKILL.md"), "---\ndescription: s\n---\nx\n");
+        let old = "0".repeat(64);
+        write(root.join("hx.lock"), &format!("[[package]]\nname = \"foo\"\nversion = \"1.0\"\nhash = \"{old}\"\n\n[[package]]\nname = \"s\"\nversion = \"agent-skill\"\nhash = \"{old}\"\n"));
+        let r = Resolver::new(root.clone());
+        assert!(err(r.verify("foo")).contains("approved by an older hx") && err(r.verify("foo")).contains("hx approve foo"));
+        assert!(r.skills_status().contains("re-approve (old hash)"), "{}", r.skills_status());
+        r.approve("foo").unwrap();
+        assert!(r.verify("foo").is_ok());
+        assert!(std::fs::read_to_string(root.join("hx.lock")).unwrap().contains("hash = \"v2:"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_agent_skill_never_takes_a_manifest_or_luau_from_its_files() {
+        let root = ws("skillman");
+        unsafe { std::env::set_var("HX_TRUST", "1") };
+        let skill = root.join(".agents/skills/s");
+        write(skill.join("SKILL.md"), "---\ndescription: helpful\n---\nx\n");
+        write(skill.join("hx.toml"), "[package]\nversion = \"9\"\nkind = \"tool\"\n[capabilities]\nproc = [\"sh\"]\n");
+        write(skill.join("init.luau"), "return { run = function() return sh('id') end }\n");
+        let r = Resolver::new(root.clone());
+        // approve shows what verification and capture use: kind skill, no capabilities
+        let msg = r.approve("s").unwrap();
+        assert!(msg.starts_with("approved s agent-skill") && msg.contains("Capabilities({})") && msg.contains("never loaded"), "{msg}");
+        assert!(r.verify("s").is_ok());
+        let registry = Registry::capture(&root).unwrap();
+        let info = registry.packages.iter().find(|p| p.name == "s").unwrap();
+        assert_eq!((info.kind.as_str(), info.description.as_str()), ("skill", "helpful"));
+        assert!(registry.capabilities["s"].0.is_empty());
+        assert!(err(registry.resolve("s")).contains("module not found"));
+        assert!(registry.assets.contains_key("s/init.luau"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accept_shows_every_file_and_installs_only_the_reviewed_bytes() {
+        let root = ws("review");
+        let r = Resolver::new(root.clone());
+        r.stage("t", &[("hx.toml".into(), "[package]\nversion = \"1\"\nkind = \"tool\"\n[capabilities]\nproc = [\"sh\"]\n".into()),
+            ("init.luau".into(), "return require('t/helper')\n".into()), ("lib/helper.luau".into(), "return { go = function() return sh('evil') end }\n".into()),
+            ("notes.txt".into(), "hidden\u{1b}[2Kline\rcover\n".into())]).unwrap();
+        let reviewed = r.review("t").unwrap();
+        assert!(reviewed.text.contains("--- lib/helper.luau ---\nreturn { go = function() return sh('evil') end }"), "{}", reviewed.text);
+        // terminal control sequences are shown, not obeyed
+        assert!(reviewed.text.contains("hidden\\u{1b}[2Kline\\u{d}cover"), "{}", reviewed.text);
+        // the agent's shell rewrites the staging area between the printout and the answer: nothing is activated
+        write(root.join(".harness/staged/t/lib/helper.luau"), "return { go = function() return sh('worse') end }\n");
+        assert!(err(r.accept(&reviewed)).contains("changed after it was shown for review"));
+        assert!(!root.join(".harness/pkgs/t").exists());
+        let reviewed = r.review("t").unwrap();
+        assert!(r.accept(&reviewed).unwrap().starts_with("approved t 1"));
+        assert_eq!(std::fs::read_to_string(root.join(".harness/pkgs/t/lib/helper.luau")).unwrap(), "return { go = function() return sh('worse') end }\n");
+        assert!(r.verify("t").is_ok());
+        // a module replacement is bound the same way
+        let builtin = r.effective_source("std/printer").unwrap();
+        r.stage_module("std/printer", &format!("{builtin}\n-- shown\n"), "").unwrap();
+        let reviewed = r.review("std/printer").unwrap();
+        write(root.join(".harness/staged/std/printer/new.luau"), &format!("{builtin}\n-- swapped\n"));
+        assert!(err(r.accept(&reviewed)).contains("changed after it was shown for review"));
+        assert_eq!(r.effective_source("std/printer").unwrap(), builtin);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_override_beats_a_package_and_non_text_override_files_are_kept_as_bytes() {
+        let root = ws("precedence");
+        unsafe { std::env::set_var("HX_TRUST", "1") };
+        install_pkg(&root, "foo");
+        Resolver::new(root.clone()).approve("foo").unwrap();
+        write(root.join(".harness/override/foo/init.luau"), "return { owner = true }\n");
+        std::fs::create_dir_all(root.join(".harness/override/std")).unwrap();
+        std::fs::write(root.join(".harness/override/std/logo.png"), [0x89, 0xff, 0xfe]).unwrap();
+        let registry = Registry::capture(&root).unwrap();
+        let foo = registry.resolve("foo").unwrap();
+        assert!(foo.is_override && foo.text.contains("owner"));
+        assert_eq!(registry.assets["std/logo.png"], vec![0x89, 0xff, 0xfe]);
+        std::fs::write(root.join(".harness/override/std/printer.luau"), [0xff]).unwrap();
+        assert!(err(Registry::capture(&root)).contains(".harness/override/std/printer.luau is not UTF-8"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_name_reads_the_manifest() {
+        let root = ws("testname");
+        write(root.join("p/hx.toml"), "[package]\n name   =   \"real\"\nversion = \"1\"\n");
+        assert_eq!(Resolver::test_name(&root.join("p")).unwrap().as_deref(), Some("real"));
+        write(root.join("q/hx.toml"), "[package]\nversion = \"1\"\n");
+        assert_eq!(Resolver::test_name(&root.join("q")).unwrap().as_deref(), Some("q"));
+        assert_eq!(Resolver::test_name(&root.join("none")).unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
