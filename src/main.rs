@@ -897,6 +897,7 @@ mod tests {
         let trigger = format!("{}%", (luau_number(&compact, "M.trigger_ratio = ") * 100.0).round());
         let reserve_max = luau_number(&compact, "M.reserve_tokens = ") as usize;
         let reserve_min = luau_number(&compact, "math.max(") as usize;
+        let retry_turns = luau_number(&compact, "M.retry_turns = ") as usize;
         let reserve_share = match luau_number(&compact, "math.floor(window / ") as usize { 8 => "an eighth", 4 => "a quarter", d => panic!("1/{d}") };
         let (readme, cli, config) = (include_str!("../README.md"), include_str!("../docs/cli.md"), include_str!("../docs/configuration.md"));
         let (runtime, extending, workflows) = (include_str!("../docs/runtime-v2.md"), include_str!("../docs/extending.md"), include_str!("../docs/workflows.md"));
@@ -906,6 +907,7 @@ mod tests {
             ("docs/cli.md", cli, format!("compaction starts at {trigger} of it")),
             ("docs/configuration.md", config, format!("At {trigger} of the context window ({}M is assumed", window / 1_000_000)),
             ("docs/configuration.md", config, format!("{reserve_share} of the window, from {}k tokens up to {}k", reserve_min / 1024, reserve_max / 1024)),
+            ("docs/configuration.md", config, format!("pauses for the next {} agent replies (`retry_turns`)", word(retry_turns))),
             ("docs/runtime-v2.md", runtime, format!("Copies stop during traversal at {} levels, {} nodes or a conservative {} encoded-size bound",
                 values::MAX_DEPTH, values::MAX_NODES, mib(values::MAX_BYTES))),
             ("docs/runtime-v2.md", runtime, format!("Listing defaults to {} entries (maximum {})", word(history::DEFAULT_LIMIT), word(history::MAX_LIMIT))),
