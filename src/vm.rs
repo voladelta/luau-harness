@@ -37,6 +37,8 @@ getfenv = nil
 setfenv = nil
 loadstring = nil
 require = nil
+-- The only way Luau code makes userdata with a metatable of its own; every userdata left is the host's.
+newproxy = nil
 
 function search(pattern, opts)
 	local rows, truncated, err = __search_raw(pattern, opts)
@@ -336,10 +338,27 @@ mod boundary_tests {
         let (vm, dir) = vm("raise", Duration::from_secs(5), 64 << 20);
         let code = "print('before'); return setmetatable({}, {__index = function() error('strict table') end, __tostring = function() error('no') end})";
         let r = vm.run_chunk(code).await.unwrap();
+        assert_eq!(r["feedback"], "before\n=> {}\n", "{r}");
+        // userdata: the session cannot make any with a metatable of its own; hx's errors show their message
+        assert_eq!(vm.exec_text("return newproxy == nil").await.unwrap(), "=> true\n-- ops=0 error=false");
+        let r = vm.run_chunk("return select(2, pcall(read, 'missing'))").await.unwrap();
         let feedback = r["feedback"].as_str().unwrap();
-        assert!(feedback.starts_with("before\n=> {}"), "{feedback}");
-        assert!(!feedback.contains("hx could not format"), "{feedback}");
+        assert!(feedback.starts_with("=> missing: No such file"), "{feedback}");
+        assert!(!feedback.contains("traceback") && !feedback.contains("runtime error"), "{feedback}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_printer_names_userdata_without_running_its_metamethods() {
+        // A plain Luau state still has newproxy: the printer must not need the session's sandbox to be safe.
+        let lua = Lua::new();
+        let printer: Table = lua.load(crate::modules::Resolver::embedded("std", "printer.luau").expect("std/printer is embedded")).eval().unwrap();
+        let u: Value = lua.load("local u = newproxy(true); getmetatable(u).__tostring = function() ran = true; return 'mine' end; return u").eval().unwrap();
+        let shown: String = printer.get::<Function>("top").unwrap().call(u.clone()).unwrap();
+        assert_eq!(shown, "<userdata>");
+        let nested: String = printer.get::<Function>("top").unwrap().call(lua.create_sequence_from([u]).unwrap()).unwrap();
+        assert_eq!(nested, "<array: 1 items> [<userdata>]");
+        assert_eq!(lua.globals().get::<Value>("ran").unwrap(), Value::Nil);
     }
 
     #[test]
@@ -376,11 +395,30 @@ mod boundary_tests {
         let feedback = r["feedback"].as_str().unwrap();
         assert!(feedback.contains("error:") && feedback.contains("memory"), "{feedback}");
         assert!(!feedback.contains("hx could not format"), "{feedback}");
-        // the model's data still fills the allowance; the next chunk's feedback and the request hooks still work
-        let next = vm.exec_text("return #keep > 0").await.unwrap();
-        assert!(next.starts_with("=> true\n") || next.contains("memory"), "{next}");
+        // the model's data still fills the allowance: a chunk that allocates fails, and its feedback and the request
+        // hooks still work
+        let next = vm.exec_text("return string.rep('y', 16 * 1024 * 1024)").await.unwrap();
+        assert!(next.starts_with("error: memory error: not enough memory\n"), "{next}");
         let request = json!({"system": "s", "messages": [{"role": "user", "content": "hi"}], "tools": []});
         assert_eq!(vm.prepare_request(&request).unwrap()["messages"], request["messages"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn harness_code_cannot_raise_the_memory_ceiling_and_the_model_is_told_when_it_is_over() {
+        let (vm, dir) = vm("ceiling", Duration::from_secs(10), 32 << 20);
+        let hoard = "kept = kept or {}; table.insert(kept, string.rep(string.char(65 + #kept), 24 * 1024 * 1024))";
+        for _ in 0..6 {
+            let _harness = vm.session.harness();
+            let _ = vm.lua.load(hoard).set_environment(vm.modenv.clone()).exec();
+        }
+        let ceiling = (32 << 20) + HARNESS_HEADROOM;
+        assert!(vm.lua.used_memory() <= ceiling, "{} MiB", vm.lua.used_memory() >> 20);
+        // what harness code kept puts the session over its limit: the model is told, and can still run a chunk
+        let over = vm.exec_text("return 1").await.unwrap();
+        assert!(over.starts_with("=> 1\nnote: the session now holds ") && over.contains("over its 32 MiB memory limit"), "{over}");
+        vm.modenv.raw_set("kept", Value::Nil).unwrap();
+        assert_eq!(vm.exec_text("return 2").await.unwrap(), "=> 2\n-- ops=0 error=false");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -490,8 +528,13 @@ impl Session {
         self.out.lock().unwrap().take();
         self.ops.store(0, Ordering::Relaxed);
         self.chunks.fetch_add(1, Ordering::Relaxed);
+        // Compiling runs none of the model's code, so it gets the harness ceiling: a session over its limit can still
+        // run the chunk that frees memory.
+        self.lua.set_memory_limit(self.harness_ceiling()).expect(MEMORY_CONTROL);
+        let compiled = self.compile(code);
+        self.lua.set_memory_limit(self.mem_limit).expect(MEMORY_CONTROL);
         self.deadline.start(self.budget);
-        let result = match self.compile(code) {
+        let result = match compiled {
             Ok(f) => f.call_async::<MultiValue>(()).await,
             Err(e) => Err(e),
         };
@@ -504,14 +547,33 @@ impl Session {
         RunResult { output, omitted, values, error, ops: self.ops.load(Ordering::Relaxed) }
     }
 
-    /// Time and memory for harness Luau that runs between chunks (feedback, request hooks). It can run the model's
-    /// metamethods, so it gets a deadline of its own; and the model may have filled its memory allowance, so it gets
-    /// `HARNESS_HEADROOM` above what is in use. Both are restored when the guard drops.
+    /// Time and memory for harness Luau that runs between chunks (feedback, request hooks). It runs no code of the
+    /// model's, but the printer and the hooks can be the user's own (an override, a pack), so it gets a deadline of
+    /// its own. The model may have filled its memory allowance, so it may use `HARNESS_HEADROOM` above the limit: a
+    /// fixed ceiling, so nothing the harness keeps can raise the next one. Both are restored when the guard drops;
+    /// a session left over its limit is collected then.
     fn harness(&self) -> HarnessGuard<'_> {
-        let used = self.lua.used_memory();
-        self.lua.set_memory_limit(used.max(self.mem_limit).saturating_add(HARNESS_HEADROOM)).expect(MEMORY_CONTROL);
+        self.lua.set_memory_limit(self.harness_ceiling()).expect(MEMORY_CONTROL);
         self.deadline.start(self.budget.min(HARNESS_TIME));
         HarnessGuard { session: self }
+    }
+
+    fn harness_ceiling(&self) -> usize {
+        self.mem_limit.saturating_add(HARNESS_HEADROOM)
+    }
+
+    /// A note for the model when the session holds more than its memory limit after harness code ran (a module it
+    /// loaded, data a hook kept): code that allocates fails until the model frees memory.
+    fn over_limit_note(&self) -> Option<String> {
+        let used = self.lua.used_memory();
+        (used > self.mem_limit).then(|| {
+            format!(
+                "note: the session now holds {} MiB, over its {} MiB memory limit, so code that allocates fails with \
+                 \"not enough memory\"; free memory first (set large variables to nil)\n",
+                used >> 20,
+                self.mem_limit >> 20
+            )
+        })
     }
 }
 
@@ -526,8 +588,12 @@ struct HarnessGuard<'a> {
 
 impl Drop for HarnessGuard<'_> {
     fn drop(&mut self) {
-        self.session.deadline.clear();
-        self.session.lua.set_memory_limit(self.session.mem_limit).expect(MEMORY_CONTROL);
+        let session = self.session;
+        session.deadline.clear();
+        if session.lua.used_memory() > session.mem_limit {
+            session.lua.gc_collect().expect("Luau runs no finalizer that can fail a collection");
+        }
+        session.lua.set_memory_limit(session.mem_limit).expect(MEMORY_CONTROL);
     }
 }
 
@@ -1116,12 +1182,15 @@ impl Vm {
             let _harness = self.session.harness();
             self.compose(code, &result).await
         };
-        let feedback = feedback.unwrap_or_else(|e| fallback_feedback(&result, &e));
+        let mut feedback = feedback.unwrap_or_else(|e| fallback_feedback(&result, &e));
+        if let Some(note) = self.session.over_limit_note() {
+            feedback.push_str(&note);
+        }
         Ok((result, feedback))
     }
 
-    /// std/feedback's rendering of a chunk's result. It runs the model's metamethods (`__index`, `__tostring`), so it
-    /// runs under `Session::harness`, and its text may hold any bytes.
+    /// std/feedback's rendering of a chunk's result, under `Session::harness`. It reads the model's values raw and runs
+    /// none of their metamethods; its text may hold any bytes.
     async fn compose(&self, code: &str, result: &RunResult) -> mlua::Result<String> {
         let value = self.lua.create_table()?;
         value.set("output", result.output.as_str())?;

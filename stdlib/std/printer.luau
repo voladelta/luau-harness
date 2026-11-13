@@ -147,11 +147,14 @@ fmt = function(v: any, depth: number): string
 		return fmttable(v, depth)
 	elseif ty == "function" then
 		return "<function>"
-	elseif ty == "error" or ty == "userdata" then
-		-- error objects raised by native primitives (caught with pcall): show the message, not the Rust traceback
+	elseif ty == "error" then
+		-- an error raised by a native primitive (caught with pcall): show the message, not the Rust traceback. Only
+		-- hx makes these, and their metatable is locked, so tostring runs hx's code and never the model's.
 		local msg = tostring(v):gsub("^runtime error: ", ""):gsub("\nstack traceback:.*$", "")
 		return msg
 	end
+	-- Any other value is named by its type: the printer reads values raw and never runs a metamethod, which could
+	-- be the model's code.
 	return "<" .. ty .. ">"
 end
 
