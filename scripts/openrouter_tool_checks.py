@@ -253,6 +253,7 @@ class OpenRouterToolTests(unittest.TestCase):
         )
         self.assertIn("1\tfalse\tqwen/qwen-image-2.1-turbo", out1)
         self.assertEqual(len(CALLS), 1)
+        self.assertIsNone(CALLS[0][4])  # the public model list never receives the API key
 
         # Second call: hits cache, cached=true, NO additional HTTP request
         out2 = self.run_code(
@@ -351,6 +352,8 @@ class OpenRouterToolTests(unittest.TestCase):
         )
         self.assertIn("false\t# Documentation Index", out3)
         self.assertEqual(len(CALLS), 2)
+        # Public documentation never receives the API key
+        self.assertEqual([c[4] for c in CALLS], [None, None])
 
     def test_json_single_pass_escape_preservation(self):
         """Single-pass JSON string decoder preserves literal escaped backslashes without turning \\n into newline."""

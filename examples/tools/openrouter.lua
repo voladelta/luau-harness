@@ -15,12 +15,19 @@
 
 local ORIGIN = "https://openrouter.ai"
 
--- Every endpoint shares the origin and the bearer key; only path, method and flags differ.
-local function endpoint(path, method, flags)
-	local spec = { url = ORIGIN .. path, method = method, secret = "OPENROUTER_API_KEY", bearer = true }
+-- Every endpoint shares the origin; only path, method and flags differ. The key goes only to endpoints that need it.
+local function public(path, method, flags)
+	local spec = { url = ORIGIN .. path, method = method }
 	for k, v in pairs(flags or {}) do
 		spec[k] = v
 	end
+	return spec
+end
+
+local function endpoint(path, method, flags)
+	local spec = public(path, method, flags)
+	spec.secret = "OPENROUTER_API_KEY"
+	spec.bearer = true
 	return spec
 end
 
@@ -58,9 +65,9 @@ return {
 	},
 	http = {
 		credits = endpoint("/api/v1/credits", "GET", { read_only = true }),
-		models = endpoint("/api/v1/models", "GET", { read_only = true }),
-		model_help = endpoint("/{provider}/{model_id}/llms.txt", "GET", { raw = true, read_only = true }),
-		docs_index = endpoint("/docs/llms.txt", "GET", { raw = true, read_only = true }),
+		models = public("/api/v1/models", "GET", { read_only = true }),
+		model_help = public("/{provider}/{model_id}/llms.txt", "GET", { raw = true, read_only = true }),
+		docs_index = public("/docs/llms.txt", "GET", { raw = true, read_only = true }),
 		responses = endpoint("/api/v1/responses", "POST"),
 		images = endpoint("/api/v1/images", "POST"),
 		speech = endpoint("/api/v1/audio/speech", "POST", { raw = true }),
