@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("hx supports Linux only");
+
 mod ar;
 mod atomic_file;
 mod confine;

@@ -5,7 +5,8 @@
 # hx
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
+![Rust 1.100+](https://img.shields.io/badge/rust-1.100%2B-orange.svg)
+![Linux only](https://img.shields.io/badge/platform-linux-lightgrey.svg)
 
 A headless coding-agent harness in which the model writes Luau instead of calling tools one at a time. Rust owns effects and recovery; Luau supplies composition and workflow decisions.
 
@@ -61,7 +62,7 @@ print(sh("python -m pytest -q 2>&1 | tail -15").stdout)
 
 ## Installation
 
-Requires Rust 1.85 or newer (edition 2024), Bash and Unix process support. Run hx on Linux 5.13 or newer for kernel file confinement of shell commands (Landlock), and inside your own sandbox or container to isolate network access.
+hx runs on Linux only. It requires Rust 1.100 or newer (edition 2024; the toolchain is pinned in `rust-toolchain.toml`) and Bash. Run it on Linux 5.13 or newer for kernel file confinement of shell commands (Landlock), and inside your own sandbox or container to isolate network access.
 
 ```bash
 cargo install --git https://github.com/voladelta/luau-harness
