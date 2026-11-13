@@ -60,14 +60,7 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     lua.load(crate::vm::PRELUDE).exec()?;
     // Package imports can reach only this package's frozen source files. The cache dies with this invocation.
     let env = lua.create_table()?;
-    let view = lua.create_table()?;
-    for pair in g.pairs::<Value, Value>() {
-        let (key, value) = pair?;
-        if matches!(&key, Value::String(s) if matches!(s.to_str()?.as_ref(), "_G" | "coroutine")) { continue; }
-        view.raw_set(key, value)?;
-    }
-    view.set_readonly(true);
-    let mt = lua.create_table()?; mt.set("__index", view)?; mt.set("__metatable", "locked")?; env.set_metatable(Some(mt))?;
+    env.set_metatable(Some(crate::vm::locked_env(&lua, &g)?))?;
     let loaded = lua.create_table()?;
     let loading = Arc::new(Mutex::new(HashSet::new()));
     let package = package.to_string();
@@ -99,14 +92,13 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
     })?;
     env.set("require", require.clone())?;
     lua.set_memory_limit(128 << 20)?;
-    let d = deadline;
-    let waiting = fx.waiting.clone();
-    lua.set_interrupt(move |lua| {
-        if supervisor.remaining().is_some_and(|remaining| remaining.is_zero()) { return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached")); }
-        if waiting.lock().unwrap().contains_key(&(lua.current_thread().to_pointer() as usize)) { return Ok(mlua::VmState::Continue); }
-        if d.lock().unwrap().is_some_and(|deadline| Instant::now() >= deadline) { return Err(mlua::Error::runtime("package time budget exceeded")); }
-        Ok(mlua::VmState::Continue)
-    });
+    crate::vm::Budget {
+        run_deadline: supervisor.manifest.as_ref().and_then(|m| m.deadline),
+        deadline,
+        waiting: Some(fx.waiting.clone()),
+        exceeded: "package time budget exceeded",
+    }
+    .install(&lua);
     lua.sandbox(true)?;
     let module: Table = require.call(package)?;
     Ok((lua, module, active))

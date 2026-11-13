@@ -29,6 +29,10 @@ function M.compose(res, code: string): string
 	if res.error then
 		err = printer.cut("error: " .. res.error .. "\n" .. M.context(code, res.error), printer.OUTPUT_CAP // 3, "error")
 	end
+	if (res.omitted or 0) > 0 then
+		-- hx keeps only the start and end of a chunk's print output; the printer's own cut hides that marker
+		err = "note: " .. res.omitted .. " bytes printed in the middle of this chunk were dropped\n" .. err
+	end
 	local text = res.output
 	if #res.values > 0 then
 		local shown = {}

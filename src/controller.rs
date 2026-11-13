@@ -3,7 +3,7 @@ use crate::{modules::Registry, values};
 use anyhow::Result;
 use mlua::{Function, Lua, MultiValue, Table, Value};
 use serde_json::Value as Json;
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -89,7 +89,15 @@ pub fn command(value: &Json) -> Result<Command> {
     Ok(command)
 }
 
-pub struct Controller { lua: Lua, module: Table }
+pub struct Controller {
+    lua: Lua,
+    module: Table,
+    /// Deadline of the transition running now; each `init` and `step` gets `STEP_TIME`.
+    deadline: Arc<Mutex<Option<Instant>>>,
+}
+
+/// CPU allowance of one controller transition: no controller can hang effect admission.
+const STEP_TIME: Duration = Duration::from_secs(10);
 
 impl Controller {
     pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, packs: &[String], run_deadline: Option<f64>, entrypoint: &str) -> Result<Self> {
@@ -99,18 +107,11 @@ impl Controller {
         for name in ["_G", "os", "coroutine", "getfenv", "setfenv", "loadstring", "require"] { g.set(name, Value::Nil)?; }
         let math: Table = g.get("math")?;
         math.set("random", Value::Nil)?; math.set("randomseed", Value::Nil)?;
-        let deadline = Arc::new(std::sync::Mutex::new(Instant::now() + Duration::from_secs(10)));
-        let d = deadline.clone();
-        lua.set_interrupt(move |_| {
-            if run_deadline.is_some_and(|d| crate::supervisor::now() >= d) {
-                return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached during controller execution"));
-            }
-            if Instant::now() >= *d.lock().unwrap() { return Err(mlua::Error::runtime("controller time budget exceeded")); }
-            Ok(mlua::VmState::Continue)
-        });
+        let deadline = Arc::new(Mutex::new(Some(Instant::now() + STEP_TIME)));
+        crate::vm::Budget { run_deadline, deadline: deadline.clone(), waiting: None, exceeded: "controller time budget exceeded" }.install(&lua);
         lua.set_memory_limit(128 << 20)?;
         let env = lua.create_table()?;
-        let mt = lua.create_table()?; mt.set("__index", g.clone())?; env.set_metatable(Some(mt))?;
+        env.set_metatable(Some(crate::vm::locked_env(&lua, &g)?))?;
         let loaded = lua.create_table()?;
         let (r, e, l) = (registry.clone(), env.clone(), loaded);
         let require = lua.create_function(move |lua, name: String| {
@@ -148,13 +149,15 @@ impl Controller {
             }
         }
         let module: Table = require.call(entrypoint)?;
-        // Each transition gets a fresh interrupt deadline; no controller can hang effect admission.
-        module.set("__deadline", lua.create_function(move |_, ()| { *deadline.lock().unwrap() = Instant::now() + Duration::from_secs(10); Ok(()) })?)?;
-        Ok(Self { lua, module })
+        Ok(Self { lua, module, deadline })
+    }
+
+    fn start_transition(&self) {
+        *self.deadline.lock().unwrap() = Some(Instant::now() + STEP_TIME);
     }
 
     pub fn init(&self, cfg: &Json) -> Result<Json> {
-        self.module.get::<Function>("__deadline")?.call::<()>(())?;
+        self.start_transition();
         let result: Value = self.module.get::<Function>("init")?.call(values::copy_in(&self.lua, cfg)?)?;
         let state = values::copy_out(result)?;
         anyhow::ensure!(state.is_object(), "controller state must be an object");
@@ -162,10 +165,40 @@ impl Controller {
     }
 
     pub fn step(&self, state: &Json, event: &Json) -> Result<(Json, Json)> {
-        self.module.get::<Function>("__deadline")?.call::<()>(())?;
+        self.start_transition();
         let result: MultiValue = self.module.get::<Function>("step")?.call((values::copy_in(&self.lua, state)?, values::copy_in(&self.lua, event)?))?;
         anyhow::ensure!(result.len() == 2, "controller step must return state and one command");
         let mut result = result.into_iter();
         Ok((values::copy_out(result.next().unwrap())?, values::copy_out(result.next().unwrap())?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn controller(step: &str) -> Controller {
+        let mut registry = Registry::default();
+        let text = format!("return {{init = function(cfg) return {{}} end, step = function(state, event) {step} end}}");
+        registry.sources.insert("t".into(), crate::modules::Source { text, origin: "t.luau".into(), is_override: false, pkg: None });
+        Controller::new(Arc::new(registry), json!({}), String::new(), &[], None, "t").unwrap()
+    }
+
+    #[test]
+    fn every_transition_gets_its_own_deadline_and_a_sandboxed_env() {
+        let probe = controller("return state, {kind = 'next', \
+            sealed = _G == nil and coroutine == nil and os == nil and getfenv == nil and math.random == nil \
+                and not pcall(function() string.lower = nil end)}");
+        let (_, command) = probe.step(&json!({}), &json!({})).unwrap();
+        assert_eq!(command["sealed"], true);
+        let spin = controller("if event.spin then while true do end end return state, {kind = 'next'}");
+        assert!(spin.step(&json!({}), &json!({"spin": false})).is_ok());
+        let t0 = Instant::now();
+        let err = spin.step(&json!({}), &json!({"spin": true})).unwrap_err();
+        assert!(err.to_string().contains("controller time budget exceeded"), "{err}");
+        assert!(t0.elapsed() < STEP_TIME + Duration::from_secs(5));
+        // the next transition starts on a fresh allowance
+        assert!(spin.step(&json!({}), &json!({"spin": false})).is_ok());
     }
 }

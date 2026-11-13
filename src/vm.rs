@@ -6,7 +6,7 @@ use crate::host::Host;
 use crate::modules::Resolver;
 use crate::policy::{Class, Policy};
 use crate::prims;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic, VmState};
 use std::collections::{BTreeMap, HashMap};
@@ -50,9 +50,153 @@ end
 
 pub struct RunResult {
     pub output: String,
+    /// Bytes `print` wrote that `output` does not hold (see `Printed`).
+    pub omitted: usize,
     pub values: Vec<Value>,
     pub error: Option<String>,
     pub ops: usize,
+}
+
+/// Bytes of `print` output one chunk keeps: the first and the last half. The buffer lives outside the Lua memory
+/// limit, so it must be bounded by itself.
+const PRINT_CAP: usize = 1 << 20;
+
+/// What `print` wrote during one chunk: the first and last `PRINT_CAP / 2` bytes, and how many bytes there were.
+#[derive(Default)]
+struct Printed {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl Printed {
+    fn push(&mut self, bytes: &[u8]) {
+        let half = PRINT_CAP / 2;
+        self.total = self.total.saturating_add(bytes.len());
+        let take = bytes.len().min(half - self.head.len());
+        self.head.extend_from_slice(&bytes[..take]);
+        let rest = &bytes[take..];
+        if rest.len() >= half {
+            self.tail.clear();
+            self.tail.extend_from_slice(&rest[rest.len() - half..]);
+        } else {
+            self.tail.extend_from_slice(rest);
+            // Trim only once the tail doubles, so appending stays amortized O(1).
+            if self.tail.len() > 2 * half {
+                self.tail.drain(..self.tail.len() - half);
+            }
+        }
+    }
+
+    /// The captured text (invalid UTF-8 replaced) and the number of bytes left out of its middle; empties the buffer.
+    fn take(&mut self) -> (String, usize) {
+        let Printed { mut head, tail, total } = std::mem::take(self);
+        if total <= PRINT_CAP {
+            head.extend_from_slice(&tail);
+            return (String::from_utf8_lossy(&head).into_owned(), 0);
+        }
+        // Over the cap the head is full and the tail holds at least half; cut both on character boundaries.
+        let tail = &tail[tail.len() - PRINT_CAP / 2..];
+        let head = &head[..whole_prefix(&head)];
+        let tail = &tail[tail.iter().take(3).take_while(|&&b| is_continuation(b)).count()..];
+        let omitted = total - head.len() - tail.len();
+        let text = format!(
+            "{}\n…[hx: {omitted} bytes omitted from the middle of the printed output]…\n{}",
+            String::from_utf8_lossy(head),
+            String::from_utf8_lossy(tail)
+        );
+        (text, omitted)
+    }
+}
+
+fn is_continuation(b: u8) -> bool {
+    b & 0xC0 == 0x80
+}
+
+/// Length of `b` without a UTF-8 sequence cut off at its end.
+fn whole_prefix(b: &[u8]) -> usize {
+    for back in 1..=b.len().min(4) {
+        let lead = b[b.len() - back];
+        if !is_continuation(lead) {
+            let width = match lead {
+                0xF0.. => 4,
+                0xE0.. => 3,
+                0xC0.. => 2,
+                _ => 1,
+            };
+            return if width > back { b.len() - back } else { b.len() };
+        }
+    }
+    b.len()
+}
+
+/// Threads awaiting an effect, as `Effects::waiting` holds them.
+type Waiting = Arc<Mutex<HashMap<usize, (usize, mlua::Thread)>>>;
+
+/// Interrupts between two budget checks. Luau interrupts on every loop backedge and call, so most interrupts must
+/// cost no more than a counter; a deadline is noticed at most this many interrupts late.
+const INTERRUPT_STRIDE: u32 = 1024;
+
+/// The time budgets one Lua state's interrupt enforces.
+pub(crate) struct Budget {
+    /// The run's absolute deadline on the `supervisor::now()` clock.
+    pub run_deadline: Option<f64>,
+    /// Deadline of the code running now (a chunk, a package call, a controller step); `None` while nothing is timed.
+    pub deadline: Arc<Mutex<Option<Instant>>>,
+    /// Threads awaiting an effect do not spend the allowance (see `Effects::awaiting`).
+    pub waiting: Option<Waiting>,
+    /// The error raised when `deadline` has passed.
+    pub exceeded: &'static str,
+}
+
+impl Budget {
+    fn check(&self, lua: &Lua) -> mlua::Result<VmState> {
+        if self.run_deadline.is_some_and(|d| crate::supervisor::now() >= d) {
+            return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached"));
+        }
+        let deadline = *self.deadline.lock().unwrap();
+        if deadline.is_none_or(|d| Instant::now() < d) {
+            return Ok(VmState::Continue);
+        }
+        if let Some(waiting) = &self.waiting
+            && waiting.lock().unwrap().contains_key(&(lua.current_thread().to_pointer() as usize))
+        {
+            return Ok(VmState::Continue);
+        }
+        Err(mlua::Error::runtime(self.exceeded))
+    }
+
+    /// Make this the interrupt of `lua`.
+    pub(crate) fn install(self, lua: &Lua) {
+        let ticks = std::cell::Cell::new(0u32);
+        lua.set_interrupt(move |lua| {
+            let tick = ticks.get().wrapping_add(1);
+            ticks.set(tick);
+            if !tick.is_multiple_of(INTERRUPT_STRIDE) {
+                return Ok(VmState::Continue);
+            }
+            self.check(lua)
+        });
+    }
+}
+
+/// The metatable of every environment model, module and package code runs in. Reads fall through to a read-only
+/// copy of `globals` that leaves out `_G` (the real globals) and `coroutine` (mlua's async callbacks need the
+/// library, code must not get it), and `getmetatable` returns only "locked".
+pub(crate) fn locked_env(lua: &Lua, globals: &Table) -> mlua::Result<Table> {
+    let view = lua.create_table()?;
+    for pair in globals.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        if matches!(&key, Value::String(s) if matches!(s.as_bytes().as_ref(), b"_G" | b"coroutine")) {
+            continue;
+        }
+        view.raw_set(key, value)?;
+    }
+    view.set_readonly(true);
+    let metatable = lua.create_table()?;
+    metatable.raw_set("__index", view)?;
+    metatable.raw_set("__metatable", "locked")?;
+    Ok(metatable)
 }
 
 #[cfg(test)]
@@ -98,15 +242,146 @@ mod session_budget_tests {
     }
 }
 
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    fn vm(name: &str, budget: Duration, mem_limit: usize) -> (Vm, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hx-boundary-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        (Vm::new(policy, budget, mem_limit, None).unwrap(), dir)
+    }
+
+    #[tokio::test]
+    async fn a_result_that_is_not_utf8_still_reaches_the_model() {
+        let (vm, dir) = vm("utf8", Duration::from_secs(5), 64 << 20);
+        let r = vm.run_chunk("local s = 'café au lait'; print(s:sub(1, 4)); return s:sub(1, 4)").await.unwrap();
+        let feedback = r["feedback"].as_str().unwrap();
+        assert!(feedback.contains("=> caf\u{FFFD}"), "{feedback}");
+        assert!(r["output"].as_str().unwrap().starts_with("caf\u{FFFD}"), "{r}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_value_that_raises_while_printed_falls_back_to_output_and_error() {
+        let (vm, dir) = vm("raise", Duration::from_secs(5), 64 << 20);
+        let code = "print('before'); return setmetatable({}, {__index = function() error('strict table') end, __tostring = function() error('no') end})";
+        let r = vm.run_chunk(code).await.unwrap();
+        let feedback = r["feedback"].as_str().unwrap();
+        assert!(feedback.starts_with("before\n"), "{feedback}");
+        assert!(feedback.contains("hx could not format this result") && feedback.contains("strict table"), "{feedback}");
+        // the session survives and the next chunk renders normally
+        assert!(vm.exec_text("return 1 + 1").await.unwrap().starts_with("=> 2\n"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn composing_feedback_runs_under_a_deadline() {
+        let (vm, dir) = vm("compose-deadline", Duration::from_millis(300), 64 << 20);
+        let t0 = Instant::now();
+        let r = vm.run_chunk("return setmetatable({1}, {__index = function() while true do end end})").await.unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert!(r["feedback"].as_str().unwrap().contains("time budget exceeded"), "{r}");
+        // the deadline is cleared again: harness code between chunks is not left on a stale clock
+        assert!(vm.session.deadline.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_that_fills_memory_still_gets_feedback() {
+        let (vm, dir) = vm("memory", Duration::from_secs(10), 32 << 20);
+        let r = vm.run_chunk("keep = {}; for i = 1, 1e8 do keep[i] = string.rep('x', 64) .. i end").await.unwrap();
+        let feedback = r["feedback"].as_str().unwrap();
+        assert!(feedback.contains("error:") && feedback.contains("memory"), "{feedback}");
+        assert!(!feedback.contains("hx could not format"), "{feedback}");
+        // the model's data still fills the allowance; the next chunk's feedback and the request hooks still work
+        let next = vm.exec_text("return #keep > 0").await.unwrap();
+        assert!(next.starts_with("=> true\n") || next.contains("memory"), "{next}");
+        let request = json!({"system": "s", "messages": [{"role": "user", "content": "hi"}], "tools": []});
+        assert_eq!(vm.prepare_request(&request).unwrap()["messages"], request["messages"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn print_output_is_bounded_and_the_feedback_says_so() {
+        let (vm, dir) = vm("print", Duration::from_secs(30), 64 << 20);
+        let r = vm.session.run("for i = 1, 30000 do print(string.rep('é', 50)) end").await;
+        let printed = 30000 * 101;
+        assert!(r.output.len() < PRINT_CAP + 200 && r.omitted > printed - PRINT_CAP - 8, "{} {}", r.output.len(), r.omitted);
+        assert!(!r.output.contains('\u{FFFD}'), "cut inside a character");
+        assert!(r.output.contains(&format!("[hx: {} bytes omitted", r.omitted)));
+        let text = vm.exec_text("for i = 1, 30000 do print(string.rep('é', 50)) end").await.unwrap();
+        assert!(text.contains(&format!("note: {} bytes printed in the middle of this chunk were dropped", r.omitted)), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn printed_keeps_head_and_tail_on_character_boundaries() {
+        let mut p = Printed::default();
+        p.push(b"ab");
+        p.push(b"\n");
+        assert_eq!(p.take(), ("ab\n".to_string(), 0));
+        let line = "€".repeat(1000); // 3 bytes per character, so the halves fall inside one
+        for _ in 0..1000 {
+            p.push(line.as_bytes());
+        }
+        let (text, omitted) = p.take();
+        assert!(!text.contains('\u{FFFD}'));
+        let kept: usize = text.split('\n').filter(|s| !s.contains("omitted")).map(str::len).sum();
+        assert_eq!(kept + omitted, 3_000_000);
+        assert_eq!(p.take(), (String::new(), 0));
+    }
+
+    #[test]
+    fn a_failed_durable_set_keeps_the_previous_value() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (vm, dir) = vm("durable", Duration::from_secs(10), 128 << 20);
+        let code = "durable.set('k', {n = 1})
+            local big = string.rep('x', 17 * 1024 * 1024)
+            assert(not pcall(durable.set, 'k', big))
+            assert(not pcall(durable.set, 'fresh', big))
+            assert(durable.get('k').n == 1 and durable.get('fresh') == nil)";
+        let r = rt.block_on(vm.session.run(code));
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_session_sandbox_holds() {
+        let (vm, dir) = vm("sandbox", Duration::from_secs(5), 64 << 20);
+        let probes = [
+            "_G == nil and coroutine == nil and getfenv == nil and setfenv == nil",
+            "loadstring == nil and require == nil and hx == nil",
+            "not pcall(function() string.lower = nil end) and string.lower('A') == 'a'",
+            "not pcall(function() getmetatable('').__index = {} end)",
+            "not pcall(function() math.floor = nil end)",
+            "not pcall(function() durable.get = nil end)",
+        ];
+        for probe in probes {
+            let r = vm.session.run(&format!("return {probe}")).await;
+            assert!(r.error.is_none() && matches!(r.values.as_slice(), [Value::Boolean(true)]), "{probe}: {:?}", r.error);
+        }
+        // a copied array's tag cannot be read, removed or reproduced
+        crate::values::copy_in(&vm.lua, &json!([1, 2])).and_then(|a| vm.session.env.raw_set("arr", a)).unwrap();
+        let r = vm.session.run("return getmetatable(arr) == 'native array' and not pcall(setmetatable, arr, nil)").await;
+        assert!(matches!(r.values.as_slice(), [Value::Boolean(true)]), "{:?}", r.error);
+        let forged = vm.session.run("durable.set('x', setmetatable({}, {__hx_array = true}))").await;
+        assert!(forged.error.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// The model's persistent environment plus the budgets that apply to each chunk.
 pub struct Session {
     lua: Lua,
     log: Arc<crate::eventlog::EventLog>,
     env: Table,
-    out: Arc<Mutex<String>>,
+    out: Arc<Mutex<Printed>>,
     ops: Arc<AtomicUsize>,
     deadline: Arc<Mutex<Option<Instant>>>,
     budget: Duration,
+    mem_limit: usize,
     /// chunks run so far (see `hx.retain`)
     chunks: Arc<AtomicU64>,
 }
@@ -131,7 +406,7 @@ impl Session {
     }
 
     pub async fn run(&self, code: &str) -> RunResult {
-        self.out.lock().unwrap().clear();
+        self.out.lock().unwrap().take();
         self.ops.store(0, Ordering::Relaxed);
         self.chunks.fetch_add(1, Ordering::Relaxed);
         *self.deadline.lock().unwrap() = Some(Instant::now() + self.budget);
@@ -140,13 +415,71 @@ impl Session {
             Err(e) => Err(e),
         };
         *self.deadline.lock().unwrap() = None;
-        let output = std::mem::take(&mut *self.out.lock().unwrap());
+        let (output, omitted) = self.out.lock().unwrap().take();
         let (values, error) = match result {
             Ok(vals) => (vals.into_iter().filter(|v| !v.is_nil()).collect(), None),
             Err(e) => (vec![], Some(clean_error(&e))),
         };
-        RunResult { output, values, error, ops: self.ops.load(Ordering::Relaxed) }
+        RunResult { output, omitted, values, error, ops: self.ops.load(Ordering::Relaxed) }
     }
+
+    /// Time and memory for harness Luau that runs between chunks (feedback, request hooks). It can run the model's
+    /// metamethods, so it gets a deadline of its own; and the model may have filled its memory allowance, so it gets
+    /// `HARNESS_HEADROOM` above what is in use. Both are restored when the guard drops.
+    fn harness(&self) -> HarnessGuard<'_> {
+        let used = self.lua.used_memory();
+        self.lua.set_memory_limit(used.max(self.mem_limit).saturating_add(HARNESS_HEADROOM)).expect(MEMORY_CONTROL);
+        *self.deadline.lock().unwrap() = Some(Instant::now() + self.budget.min(HARNESS_TIME));
+        HarnessGuard { session: self }
+    }
+}
+
+/// CPU allowance and memory headroom of the harness Luau around a chunk (see `Session::harness`).
+const HARNESS_TIME: Duration = Duration::from_secs(10);
+const HARNESS_HEADROOM: usize = 64 << 20;
+const MEMORY_CONTROL: &str = "Vm::new set a memory limit, so the allocator tracks memory";
+
+struct HarnessGuard<'a> {
+    session: &'a Session,
+}
+
+impl Drop for HarnessGuard<'_> {
+    fn drop(&mut self) {
+        *self.session.deadline.lock().unwrap() = None;
+        self.session.lua.set_memory_limit(self.session.mem_limit).expect(MEMORY_CONTROL);
+    }
+}
+
+/// Characters of a chunk's output and error that `fallback_feedback` shows: std/printer's `OUTPUT_CAP`.
+const FALLBACK_CHARS: usize = 12_000;
+
+/// The feedback of a chunk whose std/feedback rendering failed: its output and error, cut in Rust, and why the
+/// values are missing.
+fn fallback_feedback(result: &RunResult, why: &mlua::Error) -> String {
+    let mut text = clip(&result.output, FALLBACK_CHARS * 2 / 3);
+    if result.omitted > 0 {
+        text.push_str(&format!("note: {} bytes printed in the middle of this chunk were dropped\n", result.omitted));
+    }
+    if let Some(error) = &result.error {
+        text.push_str(&format!("error: {}\n", clip(error, FALLBACK_CHARS / 3)));
+    }
+    let why = clean_error(why);
+    let why = clip(why.lines().next().unwrap_or(""), 300);
+    let lost = if result.values.is_empty() { "" } else { "; the returned values are not shown" };
+    text.push_str(&format!("(hx could not format this result: {why}{lost})\n"));
+    text
+}
+
+/// `s` cut to at most `max` characters: its start and end around a marker.
+fn clip(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let half = max / 2;
+    let head: String = s.chars().take(half).collect();
+    let tail: String = s.chars().skip(n - half).collect();
+    format!("{head}\n…[{} characters omitted]…\n{tail}", n - 2 * half)
 }
 
 fn clean_error(e: &mlua::Error) -> String {
@@ -216,7 +549,7 @@ impl Vm {
     pub fn new(policy: Arc<Policy>, budget: Duration, mem_limit: usize, host: Option<Arc<Host>>) -> Result<Vm> {
         let root: PathBuf = policy.workspace.clone();
         let lua = Lua::new();
-        let out = Arc::new(Mutex::new(String::new()));
+        let out = Arc::new(Mutex::new(Printed::default()));
         let ops = Arc::new(AtomicUsize::new(0));
         let deadline: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let resolver = Arc::new(Resolver::new(root.clone()));
@@ -238,8 +571,8 @@ impl Vm {
         let buf = out.clone();
         g.set("__emit", lua.create_function(move |_, s: mlua::LuaString| {
             let mut b = buf.lock().unwrap();
-            b.push_str(&s.to_string_lossy());
-            b.push('\n');
+            b.push(&s.as_bytes());
+            b.push(b"\n");
             Ok(())
         })?)?;
         // Use the frozen std/printer module; fall back to tostring if it fails.
@@ -257,8 +590,8 @@ impl Vm {
             }
             let f = pf.lock().unwrap().clone();
             if let Some(f) = f
-                && let Ok(s) = f.call::<String>(v.clone()) {
-                    return Ok(s);
+                && let Ok(s) = f.call::<mlua::LuaString>(v.clone()) {
+                    return Ok(s.to_string_lossy());
                 }
             Ok(lua.coerce_string(v.clone())?.map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| format!("<{}>", v.type_name())))
         })?)?;
@@ -382,10 +715,17 @@ impl Vm {
             stage_owner.authorize_stage(stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
             let value = crate::values::copy_out(value)?;
             let mut saved = saved.lock().unwrap();
-            let mut candidate = saved.clone();
-            candidate.as_object_mut().unwrap().insert(key, value);
-            crate::values::validate(&candidate)?;
-            *saved = candidate;
+            fn store(saved: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+                saved.as_object_mut().expect("the durable store is validated as an object when loaded")
+            }
+            let previous = store(&mut saved).insert(key.clone(), value);
+            if let Err(e) = crate::values::validate(&saved) {
+                match previous {
+                    Some(previous) => store(&mut saved).insert(key, previous),
+                    None => store(&mut saved).remove(&key),
+                };
+                return Err(e);
+            }
             Ok(())
         })?)?;
         durable.set_readonly(true);
@@ -443,36 +783,14 @@ impl Vm {
 
         lua.sandbox(true)?;
         lua.set_memory_limit(mem_limit)?;
-        let (dl, waiting, run_supervisor) = (deadline.clone(), fx.waiting.clone(), supervisor.clone());
-        lua.set_interrupt(move |lua| {
-            if run_supervisor.remaining().is_some_and(|d| d.is_zero()) {
-                return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached"));
-            }
-            {
-                let w = waiting.lock().unwrap();
-                if !w.is_empty() && w.contains_key(&(lua.current_thread().to_pointer() as usize)) {
-                    return Ok(VmState::Continue); // this thread awaits sh/agent/mcp: their own timeouts apply
-                }
-            }
-            if let Some(t) = *dl.lock().unwrap()
-                && Instant::now() > t {
-                    return Err(mlua::Error::runtime("time budget exceeded (infinite loop?)"));
-                }
-            Ok(VmState::Continue)
-        });
-
-        // mlua needs its private coroutine library to build async callbacks. Neither model code nor modules receive
-        // that library (or _G, which would expose it) through their environment.
-        let view = lua.create_table()?;
-        for pair in g.pairs::<Value, Value>() {
-            let (key, value) = pair?;
-            if matches!(&key, Value::String(s) if matches!(s.to_str()?.as_ref(), "_G" | "coroutine")) { continue; }
-            view.raw_set(key, value)?;
+        Budget {
+            run_deadline: supervisor.manifest.as_ref().and_then(|m| m.deadline),
+            deadline: deadline.clone(),
+            waiting: Some(fx.waiting.clone()),
+            exceeded: "time budget exceeded (infinite loop?)",
         }
-        view.set_readonly(true);
-        let gmt = lua.create_table()?;
-        gmt.set("__index", view)?;
-        gmt.set("__metatable", "locked")?;
+        .install(&lua);
+        let gmt = locked_env(&lua, &g)?;
         session_env.set_metatable(Some(gmt.clone()))?;
 
         // --- module env: require + hx API (not visible to the model's session) ---
@@ -539,7 +857,7 @@ impl Vm {
             list.raw_push(v)?;
             Ok(list.raw_len())
         })?)?;
-        let session = Session { lua: lua.clone(), log: policy.log.clone(), env: session_env, out, ops, deadline, budget, chunks };
+        let session = Session { lua: lua.clone(), log: policy.log.clone(), env: session_env, out, ops, deadline, budget, mem_limit, chunks };
         // hx.view_image(path, max) -> { path, width, height, orig_width, orig_height, mime, data } for the vision pack.
         // Record the live image identity once and return the same loaded bytes.
         let vfx = fx.clone();
@@ -679,42 +997,54 @@ impl Vm {
 
     /// Run a chunk in the session and render it exactly as the loop would (std/feedback).
     pub async fn exec_text(&self, code: &str) -> Result<String> {
-        let r = self.session.run(code).await;
-        let t = self.lua.create_table()?;
-        t.set("output", r.output)?;
-        t.set("values", self.lua.create_sequence_from(r.values)?)?;
-        t.set("error", r.error.clone())?;
-        t.set("ops", r.ops)?;
-        let f = self
-            .lua
-            .load("local res, code = ...\nreturn require('std/feedback').compose(res, code)")
-            .set_name("=host")
-            .set_environment(self.modenv.clone())
-            .into_function()?;
-        let text: String = f.call_async((t, code.to_string())).await?;
-        self.session.log.check()?;
-        Ok(format!("{text}-- ops={} error={}", r.ops, r.error.is_some()))
+        let (result, feedback) = self.run_with_feedback(code).await?;
+        Ok(format!("{feedback}-- ops={} error={}", result.ops, result.error.is_some()))
     }
 
+    /// Run a chunk in the session: its output, error, effect count and the feedback the model sees.
     pub async fn run_chunk(&self, code: &str) -> Result<serde_json::Value> {
-        let result = self.session.run(code).await;
-        self.session.log.check()?;
-        let value = self.lua.create_table()?;
-        value.set("output", result.output.clone())?;
-        value.set("values", self.lua.create_sequence_from(result.values)?)?;
-        value.set("error", result.error.clone())?;
-        value.set("ops", result.ops)?;
-        let formatter = self.lua.load("local r, code = ...; return require('std/feedback').compose(r, code)")
-            .set_environment(self.modenv.clone()).into_function()?;
-        let feedback: String = formatter.call_async((value, code.to_string())).await?;
+        let (result, feedback) = self.run_with_feedback(code).await?;
         Ok(json!({"output":result.output, "error":result.error, "ops":result.ops, "feedback":feedback}))
     }
 
+    /// Run a chunk and compose its feedback. Only a journal failure is an error: whatever the chunk returned, its
+    /// result reaches the model as text.
+    async fn run_with_feedback(&self, code: &str) -> Result<(RunResult, String)> {
+        let result = self.session.run(code).await;
+        self.session.log.check()?;
+        let feedback = {
+            let _harness = self.session.harness();
+            self.compose(code, &result).await
+        };
+        let feedback = feedback.unwrap_or_else(|e| fallback_feedback(&result, &e));
+        Ok((result, feedback))
+    }
+
+    /// std/feedback's rendering of a chunk's result. It runs the model's metamethods (`__index`, `__tostring`), so it
+    /// runs under `Session::harness`, and its text may hold any bytes.
+    async fn compose(&self, code: &str, result: &RunResult) -> mlua::Result<String> {
+        let value = self.lua.create_table()?;
+        value.set("output", result.output.as_str())?;
+        value.set("omitted", result.omitted)?;
+        value.set("values", self.lua.create_sequence_from(result.values.iter().cloned())?)?;
+        value.set("error", result.error.as_deref())?;
+        value.set("ops", result.ops)?;
+        let compose = self.lua.load("local r, code = ...; return require('std/feedback').compose(r, code)")
+            .set_name("=feedback").set_environment(self.modenv.clone()).into_function()?;
+        let text: mlua::LuaString = compose.call_async((value, code)).await?;
+        Ok(text.to_string_lossy())
+    }
+
+    /// Run the `before_model` hooks over a request and append the local tools to its system prompt.
     pub fn prepare_request(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
-        let req = crate::values::copy_in(&self.lua, request)?;
-        let prepare = self.lua.load("local request = ...; return require('std/hooks').emit('before_model', request)")
-            .set_environment(self.modenv.clone()).into_function()?;
-        let mut request = crate::values::copy_out(prepare.call(req)?)?;
+        let prepared = {
+            let _harness = self.session.harness();
+            let req = crate::values::copy_in(&self.lua, request)?;
+            let prepare = self.lua.load("local request = ...; return require('std/hooks').emit('before_model', request)")
+                .set_name("=before_model").set_environment(self.modenv.clone()).into_function()?;
+            prepare.call(req)?
+        };
+        let mut request = crate::values::copy_out(prepared).context("before_model hooks returned a request that is not data")?;
         if let Some(system) = request["system"].as_str() { request["system"] = json!(format!("{system}{}", self.tool_prompt)); }
         Ok(request)
     }
