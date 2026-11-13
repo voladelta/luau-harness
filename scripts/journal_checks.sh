@@ -5,14 +5,14 @@ source scripts/check_helpers.sh
 cleanup() { pkill -f "sleep 4242" 2>/dev/null; kill $MOCK 2>/dev/null; }
 MOCK=
 newws() { W=$T/$1; rm -rf $W; mkdir -p $W/.harness; printf '#!/bin/bash\necho deployed > deployed.txt\n' > $W/deploy.sh; chmod +x $W/deploy.sh; }
-lastlog() { ls -t $W/.harness/log/*.jsonl | head -1; }
+lastlog() { ls -t "$(logs $W)"/*.jsonl | head -1; }
 
 # --- 0. the log is independent of the policy flag, and admin commands do not open a session
 newws n
 $H exec --workspace $W --yes 'write("a.txt", "hi")' >/dev/null 2>&1
-check "--yes still writes a log" "$(ls $W/.harness/log/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
+check "--yes still writes a log" "$(ls "$(logs $W)"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
 $H staged --workspace $W >/dev/null
-check "admin commands open no log session" "$(ls $W/.harness/log/*.jsonl | wc -l | tr -d ' ')" "1"
+check "admin commands open no log session" "$(ls "$(logs $W)"/*.jsonl | wc -l | tr -d ' ')" "1"
 
 # --- 0b. --yes automatically grants ordinary paths and commands, but .harness/ and hx.lock stay read-only (through file tools)
 newws y
@@ -115,12 +115,28 @@ newws h
 echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
 MOCK_REPLIES='["```luau\nwrite(\"x.txt\",\"1\")\n```","done"]' serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
 echo go > $T/p.txt
-OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY >/dev/null
+report=$(OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY)
 L=$(lastlog); check "run log has llm + chunk + write records, chain intact" "$(python3 - "$L" <<'PY'
 import json,sys,collections
 rs=[json.loads(l) for l in open(sys.argv[1])]; c=collections.Counter((r["kind"],r.get("tool")) for r in rs)
 print("yes" if c[("llm",None)]==2 and c[("chunk_begin",None)]==1 and c[("checkpoint",None)]>=3 and c[("intent","write")]==1 and c[("session",None)]==1 else str(dict(c)))
 PY
 )$($H log verify $L | head -1 | grep -c intact)" "yes1"
+
+# --- 6. run state lives outside the workspace: listed by `hx runs`, out of reach of shell commands, old journals still work
+check "the report names the journal in the state directory, none in the workspace" "$(echo "$report" | python3 -c "import json,sys;print(json.load(sys.stdin)['log'])")$([ -e $W/.harness/log ] && echo IN-WORKSPACE)" "$L"
+ID=$(basename $L .jsonl)
+check "hx runs lists the run with its path" "$($H runs --workspace $W | grep -c "^$L  run  go")" "1"
+check "a run id works where LOG is expected" "$($H log verify --workspace $W $ID | head -1 | grep -c intact)" "1"
+if unconfined $W; then echo "skip shell confinement of the journal (Landlock unavailable)"; else
+  before=$(cksum < $L)
+  out=$($H exec --workspace $W --yes "print(sh('cat $L | wc -c; echo forged >> $L; ls $(dirname $L)/blobs').code)" 2>&1)
+  check "a shell command can neither read nor append to the journal" "$(echo "$out" | head -1)$(cksum < $L | grep -c "$before")" "21"
+  check "...nor can file tools read it" "$($H exec --workspace $W --yes "print((pcall(read, '$L')))" 2>&1 | head -1)" "false"
+fi
+mkdir -p $W/.harness/log; cp -R "$(logs $W)"/. $W/.harness/log/; OLD=$W/.harness/log/$ID.jsonl
+out=$($H log verify $OLD 2>&1); check "an old in-workspace journal still verifies, with a note" "$(echo "$out" | grep -c 'intact')$(echo "$out" | grep -c 'lives in the workspace and is not protected from shell commands')" "11"
+out=$(OPENROUTER_API_KEY=x $H run --workspace $W --resume $OLD 2>&1)
+check "...and resumes, with the note" "$(echo "$out" | grep -c 'not protected from shell commands')$(echo "$out" | tail -1 | python3 -c "import json,sys;print(json.load(sys.stdin)['log'] == sys.argv[1])" $OLD)" "1True"
 
 finish

@@ -93,7 +93,8 @@ class Tools(unittest.TestCase):
         self.dir = self.ws / ".harness/tools"
         self.dir.mkdir(parents=True)
         self.env = {k: v for k, v in os.environ.items() if k not in ("TINYFISH_API_KEY", "HX_TRUST")}
-        self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"))
+        self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"),
+                        XDG_STATE_HOME=str(self.root / "state"))
         CALLS.clear()
 
     def command(self, *args, env=None):
@@ -149,7 +150,8 @@ class Tools(unittest.TestCase):
         out = self.run_code(code, env=env)
         self.assertNotIn("environment-test-key", out)
         self.assertEqual(CALLS[-1][-1], "environment-test-key")
-        for path in (self.ws / ".harness/log").rglob("*"):
+        self.assertTrue(list((self.root / "state").rglob("*.jsonl")), "the runs journaled outside the workspace")
+        for path in (self.root / "state").rglob("*"):  # every journal and blob of this test
             if path.is_file():
                 content = path.read_bytes()
                 for key in (b"environment-test-key", b"project-test-key", b"user-test-key"):
@@ -316,7 +318,7 @@ class Tools(unittest.TestCase):
         media_type, encoded = out.splitlines()[0].split("\t")
         self.assertEqual(media_type, "application/json")
         self.assertIn(b"[redacted]", base64.b64decode(encoded))
-        for path in (self.ws / ".harness/log").rglob("*"):
+        for path in (self.root / "state").rglob("*"):  # every journal and blob of this test
             if path.is_file():
                 self.assertNotIn(b"binary-echo-key", path.read_bytes(), str(path))
 

@@ -395,21 +395,25 @@ impl Policy {
             let mut p = manifest.policy;
             validate_scratch(&p.tmp)?;
             std::fs::create_dir_all(&p.tmp)?;
-            // A journal may have been moved since launch. Its actual files and artifacts remain read-only to file tools.
+            // A journal may have been moved since launch (or predate the state directory, in `.harness/log`). Its actual
+            // files are sealed from file tools and hidden from children, wherever it is, and so is today's state root.
             let actual = std::fs::canonicalize(path)?;
-            p.protected.extend([actual.clone(), actual.with_extension("lock"), actual.with_extension("revoked"),
+            p.sealed.extend([actual.clone(), actual.with_extension("lock"), actual.with_extension("revoked"),
                 actual.parent().unwrap().join("blobs"), actual.parent().unwrap().join("registry")]);
+            p.sealed.extend(crate::state::root());
+            p.protected.extend(crate::state::root());
             // Newly introduced aliases must not turn frozen protected paths into writable paths.
             let aliases: Vec<_> = p.protected.iter().filter_map(canon).collect();
             p.protected.extend(aliases);
             // The orchestrator retries an episode as a new child and never resumes one; a stale episode must not get `ar`.
-            anyhow::ensure!(p.episode.is_none(), "this run was an autoresearch episode; continue the search with `hx run --ar --resume .harness/ar/RUN`");
+            anyhow::ensure!(p.episode.is_none(), "this run was an autoresearch episode; continue the search with `hx run --ar --resume RUN`");
             log.check()?;
             if crate::confine::status().is_err() {
                 log.write("confinement", json!({"confinement": crate::confine::describe()}), true)?;
             }
             let grants = crate::eventlog::load(path)?.iter().filter(|r| r["kind"] == "path_grant")
                 .map(|r| serde_json::from_value(r["grant"].clone())).collect::<std::result::Result<Vec<PathGrant>, _>>()?;
+            unguarded(p.write_roots.iter().chain(grants.iter().filter(|g| g.write).map(|g| &g.path)))?;
             return Ok(Policy { cfg: p, log, grants: grants.into(), hidden: Default::default(), prompt: Default::default(), ar_progress: Default::default() });
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
@@ -420,7 +424,10 @@ impl Policy {
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp]);
         p.protected.extend([workspace.join(".harness"), workspace.join("hx.lock")]);
-        p.sealed.push(workspace.join(".harness/ar"));
+        // Run state (every workspace's journals and autoresearch runs) lives outside the workspace, in the state root:
+        // never readable or writable by file tools, like the trust store below.
+        p.sealed.extend(crate::state::root());
+        p.protected.extend(crate::state::root());
         if let Some(e) = &episode { p.sealed.extend(crate::ar::sealed(e)); }
         p.episode = episode;
         for r in SYSTEM_READ {
@@ -457,14 +464,23 @@ impl Policy {
         if let Some(m) = approval_mode {
             p.mode = m; // the launching user's choice beats the file
         }
+        if let Err(e) = unguarded(&p.write_roots) {
+            let _ = std::fs::remove_dir_all(&p.tmp);
+            return Err(e);
+        }
         // Approved skills may live outside the workspace (~/.agents/skills); their files must be readable (read-only).
         for pk in crate::modules::Resolver::new(workspace.clone()).list_packages() {
             if pk.kind == "skill" && !pk.dir.is_empty() {
                 p.read_roots.push(PathBuf::from(pk.dir));
             }
         }
-        // Automatic approval never disables the audit log.
-        let log = EventLog::open(&workspace.join(".harness/log"))?;
+        // Automatic approval never disables the audit log. An episode's child journals straight into its autoresearch
+        // run, so no part of the run store is ever inside a directory a shell command can write.
+        let dir = match &p.episode {
+            Some(e) => e.dir.join("episodes").join(format!("{}.log", e.label)),
+            None => crate::state::log_dir(&workspace)?,
+        };
+        let log = EventLog::open(&dir)?;
         log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,
             "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha,
             "confinement": crate::confine::describe()}), true)?;
@@ -477,20 +493,23 @@ impl Policy {
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }
 
     /// What a child process (`sh`, a local MCP server) may touch, from the current policy and the grants approved so
-    /// far: the read roots minus credentials, sealed owner state and the trust store; the write roots. Built per spawn,
-    /// so a grant approved mid-run applies to later commands. Protected configuration inside a write root stays
-    /// writable by children: Landlock cannot carve a hole in a writable tree without breaking file creation in it.
+    /// far: the read roots minus credentials, sealed owner state, the run state and the trust store; the write roots.
+    /// Built per spawn, so a grant approved mid-run applies to later commands. Protected configuration inside a write
+    /// root stays writable by children: Landlock cannot carve a hole in a writable tree without breaking file creation
+    /// in it. That is why run state lives outside the workspace and no write root may overlap it (`unguarded`); one
+    /// that does anyway is left out here rather than handed to the child.
     pub fn confinement(&self) -> crate::confine::Rules {
         let (mut read, mut write) = (self.read_roots.clone(), self.write_roots.clone());
         for g in self.grants.lock().unwrap().iter() {
             read.push(g.path.clone());
             if g.write { write.push(g.path.clone()); }
         }
+        write.retain(|w| crate::state::overlap(w).is_none());
         let mut hidden = self.sealed.clone();
         hidden.push(self.workspace.join(".harness/secrets.toml"));
-        hidden.extend(crate::trust::store_dir_canonical());
+        hidden.extend(crate::state::guarded());
         hidden.extend(self.track_hidden(&hidden, &write));
-        let rules = crate::confine::Rules { read, write, hidden }.with_system();
+        let rules = crate::confine::Rules { read, write, hidden, exposed: vec![self.skills()] }.with_system();
         if self.episode.is_some() { rules.without_shm() } else { rules }
     }
 
@@ -598,9 +617,14 @@ impl Policy {
         let _guard = self.prompt.lock().await;
         let denied = match check() { Ok(_) => return Ok(()), Err(e) => e };
         let Some(outside) = denied.downcast_ref::<OutsideRoots>() else { return Err(denied) };
+        // A write grant covers the file's directory, so siblings can be created too. Where that directory overlaps the
+        // run state or the trust store (`~` itself, for `~/notes.txt`), the grant is that one file instead: a recursive
+        // write grant there would let later shell commands write them, as hiding removes reads only.
+        let parent = outside.path.parent().unwrap_or(&outside.path).to_path_buf();
+        let narrow = write && crate::state::overlap(&parent).is_some();
         let grant = PathGrant {
-            path: if write { outside.path.parent().unwrap_or(&outside.path).to_path_buf() } else { outside.path.clone() },
-            recursive: write || outside.path.is_dir(), write,
+            path: if write && !narrow { parent } else { outside.path.clone() },
+            recursive: !narrow && (write || outside.path.is_dir()), write,
         };
         let source = if self.autopilot { "auto" } else {
             if self.mode == ApprovalMode::Deny { return Err(denied); }
@@ -627,6 +651,13 @@ impl Policy {
         Self::within(path, &self.sealed)
     }
 
+    /// This run's copy of its approved skills' files (`Registry::materialize_skills`): inside the sealed run store, yet
+    /// readable (never writable) by file tools and children, since a skill's text points the model at them.
+    fn skills(&self) -> PathBuf {
+        let dir = self.log.dir().join("registry").join(&self.log.session);
+        std::fs::canonicalize(&dir).unwrap_or(dir)
+    }
+
     fn within(path: &Path, roots: &[PathBuf]) -> bool {
         roots.iter().any(|r| path.starts_with(r))
     }
@@ -634,14 +665,15 @@ impl Policy {
     /// Resolve `p` (relative to the workspace) for reading; the canonical path must be inside a read root.
     pub fn check_read(&self, p: &str) -> Result<PathBuf> {
         let full = self.abs(p);
-        if self.is_sealed(&normalize(&full)) || std::fs::canonicalize(&full).is_ok_and(|c| self.is_sealed(&c)) {
+        let skill = std::fs::canonicalize(&full).is_ok_and(|c| c.starts_with(self.skills()));
+        if !skill && (self.is_sealed(&normalize(&full)) || std::fs::canonicalize(&full).is_ok_and(|c| self.is_sealed(&c))) {
             bail!("policy: {p} is sealed owner state and cannot be read");
         }
         let c = std::fs::canonicalize(&full).map_err(|e| anyhow::anyhow!("{p}: {e}"))?;
         if is_secret(&c) {
             bail!("policy: {p} is a credential file and cannot be read");
         }
-        if !Self::within(&c, &self.read_roots) && !self.granted(&c, false) {
+        if !skill && !Self::within(&c, &self.read_roots) && !self.granted(&c, false) {
             return Err(OutsideRoots { path: c, write: false }.into());
         }
         Ok(c)
@@ -703,6 +735,19 @@ impl Policy {
         v
     }
 
+}
+
+/// Refuse write roots that overlap the state root or the trust store (`crate::state::guarded`): hiding removes only
+/// reads, so a shell command could write the journals or trust records under such a root. Refused rather than carved:
+/// carving a write root takes file creation away from every directory on the way down (`~` itself, for `write = ["~"]`).
+fn unguarded<'a>(roots: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    for root in roots {
+        if let Some(g) = crate::state::overlap(root) {
+            bail!("policy: the write root {} overlaps {} (hx's run state or trust store), which shell commands must not write; \
+narrow the root in .harness/policy.toml [fs] write, or move the workspace or XDG_STATE_HOME so they do not overlap", root.display(), g.display());
+        }
+    }
+    Ok(())
 }
 
 /// The system and toolchain directories every child may read (autoresearch evaluators, which have no run policy).
@@ -900,4 +945,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_run_store_is_outside_the_workspace_and_sealed_from_file_tools() {
+        let (p, dir) = test_policy("store", false, &[]);
+        let journal = p.log.path.clone();
+        assert!(journal.starts_with(crate::state::log_dir(&dir).unwrap()) && !journal.starts_with(std::fs::canonicalize(&dir).unwrap()));
+        assert!(!dir.join(".harness/log").exists(), "nothing of the run store is in the workspace");
+        let blobs = journal.parent().unwrap().join("blobs/x");
+        for path in [journal.clone(), blobs, crate::state::ar_dir(&dir).unwrap().join("run/launch.json")] {
+            let path = path.to_string_lossy();
+            assert!(p.check_read(&path).unwrap_err().to_string().contains("sealed"), "{path}");
+            assert!(p.check_write(&path).unwrap_err().to_string().contains("sealed"), "{path}");
+        }
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_write_root_or_grant_may_overlap_the_run_store() {
+        let root = crate::state::root().unwrap();
+        for bad in [root.parent().unwrap().to_path_buf(), root.join("projects/x")] {
+            assert!(unguarded(&[bad.clone()]).unwrap_err().to_string().contains("overlaps"), "{}", bad.display());
+        }
+        assert!(unguarded(&[std::env::temp_dir().join("hx-elsewhere")]).is_ok());
+        let (p, dir) = test_policy("grant", true, &[]);
+        // Writing a file beside the state root grants that file, not the directory that holds the state root.
+        let beside = root.parent().unwrap().join("beside.txt");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(p.authorize_path(&beside.to_string_lossy(), true)).unwrap();
+        assert!(p.check_write(&beside.to_string_lossy()).is_ok());
+        assert!(p.check_write(&root.parent().unwrap().join("sibling.txt").to_string_lossy()).is_err());
+        assert!(p.confinement().write.iter().all(|w| crate::state::overlap(w).is_none()));
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_confined_shell_can_neither_read_nor_write_the_journal() {
+        if crate::confine::status().is_err() { eprintln!("skipped: Landlock unavailable"); return; }
+        let (mut p, dir) = test_policy("confined-store", false, &[]);
+        // Even under read and write roots that cover the state root: hiding carves reads, and the write root is left out.
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        p.cfg.read_roots.push(temp.clone());
+        p.cfg.write_roots.push(temp);
+        let journal = p.log.path.clone();
+        let before = std::fs::read(&journal).unwrap();
+        let ruleset = std::sync::Arc::new(p.confinement().prepare().unwrap().unwrap());
+        let run = |script: &str| {
+            let r = ruleset.clone();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(script).arg("sh").arg(&journal);
+            use std::os::unix::process::CommandExt;
+            unsafe { cmd.pre_exec(move || r.apply()); }
+            cmd.output().unwrap()
+        };
+        let read = run("cat \"$1\"");
+        assert!(!read.status.success() && read.stdout.is_empty());
+        assert!(!run("echo forged >> \"$1\"").status.success());
+        // No new files beside it either (a planted journal or blob). Directory listing is not carved: Landlock grants
+        // listing beneath an ancestor of a hidden path, so names may show, never contents.
+        assert!(!run("echo x > \"$(dirname \"$1\")/planted.jsonl\"").status.success());
+        assert!(!run("mkdir -p \"$(dirname \"$1\")/blobs\" && echo x > \"$(dirname \"$1\")/blobs/y\"").status.success());
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        assert!(run(&format!("echo inside > {}/made", dir.display())).status.success(), "the workspace stays writable");
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

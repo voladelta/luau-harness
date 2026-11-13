@@ -19,7 +19,7 @@ ws a; out=$(run $P1 $W --max-tokens 40)
 check "token budget stops the run after 3 calls" "$(echo "$out" | field llm_calls)" "3"
 check "stopped reason names the token limit" "$(echo "$out" | field stopped | grep -c 'token admission threshold')" "1"
 check "run is reported unfinished (not a crash)" "$(echo "$out" | field finished)" "False"
-check "budget stop is logged" "$(grep -h -c '"kind":"budget"' $W/.harness/log/*.jsonl)" "1"
+check "budget stop is logged" "$(grep -h -c '"kind":"budget"' "$(logs $W)"/*.jsonl)" "1"
 
 ws b; printf '[budget]\nmax_cost = 1\n' > $W/.harness/policy.toml
 check "policy.toml max_cost is refused, not ignored" "$(OPENROUTER_API_KEY=x $H run --workspace $W --prompt-file $T/p.txt --model m 2>&1 | grep -c 'unknown field `max_cost`')" "1"

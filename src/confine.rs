@@ -4,12 +4,14 @@
 //! before, and the run says so once.
 use std::path::{Path, PathBuf};
 
-/// What a child may touch. `hidden` paths are carved out of the read roots that contain them.
+/// What a child may touch. `hidden` paths are carved out of the read roots that contain them; `exposed` paths are
+/// readable all the same (a run's own frozen skill files, which live in the hidden run store).
 #[derive(Debug, Default)]
 pub struct Rules {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
     pub hidden: Vec<PathBuf>,
+    pub exposed: Vec<PathBuf>,
 }
 
 /// Read-only for every child, in addition to the policy's read roots: shared libraries, process and device
@@ -98,7 +100,7 @@ impl Rules {
             if let Ok(fd) = PathFd::new(path) { ruleset.as_mut().add_rule(PathBeneath::new(fd, access)).map_err(err)?; }
             Ok(())
         };
-        for p in &full { add(p, read)?; }
+        for p in full.iter().chain(&self.exposed) { add(p, read)?; }
         for p in &list { add(p, AccessFs::ReadDir.into())?; }
         // Write rules add no read access: a hidden file inside a write root stays unreadable. (Moving it to a readable
         // place is refused too: Landlock never lets a rename or link gain access.)
@@ -152,7 +154,7 @@ mod tests {
     fn carving_grants_siblings_and_lists_ancestors() {
         let dir = std::env::temp_dir().join(format!("hx-carve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".harness/log")).unwrap();
+        std::fs::create_dir_all(dir.join(".harness/pkgs")).unwrap();
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join(".harness/secrets.toml"), "k").unwrap();
         std::fs::write(dir.join("README.md"), "r").unwrap();
@@ -160,7 +162,7 @@ mod tests {
         let (mut full, mut list) = (vec![], vec![]);
         carve(&dir, &[dir.join(".harness/secrets.toml")], &mut full, &mut list);
         full.sort();
-        assert_eq!(full, vec![dir.join(".harness/log"), dir.join("README.md"), dir.join("src")]);
+        assert_eq!(full, vec![dir.join(".harness/pkgs"), dir.join("README.md"), dir.join("src")]);
         list.sort();
         assert_eq!(list, vec![dir.clone(), dir.join(".harness")]);
         let _ = std::fs::remove_dir_all(dir);
@@ -175,7 +177,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".harness")).unwrap();
         std::fs::write(dir.join(".harness/secrets.toml"), "SECRET").unwrap();
         std::fs::write(dir.join("README.md"), "PUBLIC").unwrap();
-        let rules = Rules { read: vec![dir.clone(), "/usr".into(), "/bin".into(), "/etc".into()], write: vec![], hidden: vec![dir.join(".harness/secrets.toml")] }.with_system();
+        let rules = Rules { read: vec![dir.clone(), "/usr".into(), "/bin".into(), "/etc".into()], write: vec![], hidden: vec![dir.join(".harness/secrets.toml")], exposed: vec![] }.with_system();
         let ruleset = std::sync::Arc::new(rules.prepare().unwrap().unwrap());
         let run = |file: &str| {
             let r = ruleset.clone();
@@ -197,7 +199,7 @@ mod tests {
         if status().is_err() || !Path::new("/dev/shm").is_dir() { eprintln!("skipped: Landlock or /dev/shm unavailable"); return; }
         let planted = PathBuf::from(format!("/dev/shm/hx-confine-planted-{}", std::process::id()));
         std::fs::write(&planted, "LEFT").unwrap();
-        let rules = Rules { read: vec!["/usr".into(), "/bin".into(), "/etc".into(), "/dev".into()], write: vec![], hidden: vec![] }.with_system().without_shm();
+        let rules = Rules { read: vec!["/usr".into(), "/bin".into(), "/etc".into(), "/dev".into()], write: vec![], hidden: vec![], exposed: vec![] }.with_system().without_shm();
         let ruleset = std::sync::Arc::new(rules.prepare().unwrap().unwrap());
         let script = format!("echo x > /dev/shm/hx-confine-{}; cat {}; echo ok > /dev/null && echo NULL", std::process::id(), planted.display());
         let mut cmd = std::process::Command::new("/bin/sh");

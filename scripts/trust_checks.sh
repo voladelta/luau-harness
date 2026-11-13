@@ -55,8 +55,11 @@ echo '-- x' >> $W/.harness/override/std/printer.luau
 check "an edited override counts too" "$($H skills --workspace $W | grep -c 'not trusted')" "1"
 $H trust --workspace $W --yes >/dev/null
 
-# --- the model cannot write the trust store, even when the user's write roots cover it
+# --- the model cannot write the trust store: a write root covering it is refused (shell commands could write it), and
+# file tools refuse it under a read root
 printf '[fs]\nwrite = ["%s"]\n' "$XDG_CONFIG_HOME" > $W/.harness/policy.toml; $H trust --workspace $W --yes >/dev/null
+check "a write root covering the trust store is refused at launch" "$($H exec --workspace $W 'print(1)' 2>&1 | grep -c 'overlaps')" "1"
+printf '[fs]\nread = ["%s"]\n' "$XDG_CONFIG_HOME" > $W/.harness/policy.toml; $H trust --workspace $W --yes >/dev/null
 check "model cannot write the trust store (write)" "$(x "print(pcall(write, '$XDG_CONFIG_HOME/hx/trust.toml', 'x'))" | head -1 | grep -c protected)" "1"
 
 # --- HX_TRUST=HASH is the launcher's consent to that exact config for one run; a workspace without config needs nothing
@@ -83,6 +86,8 @@ check "a symlinked .harness is never trusted" "$($H trust --workspace $W --yes 2
 # the store is protected by its canonical path (XDG_CONFIG_HOME through a symlink)
 fresh store; mkdir -p $T/realcfg; ln -s $T/realcfg $T/linkcfg; printf '[fs]\nwrite = ["%s"]\n' "$T/realcfg" > $W/.harness/policy.toml
 XDG_CONFIG_HOME=$T/linkcfg $H trust --workspace $W --yes >/dev/null
+check "store reached through a symlinked path is still guarded" "$(XDG_CONFIG_HOME=$T/linkcfg $H exec --workspace $W 'print(1)' 2>&1 | grep -c 'overlaps')" "1"
+printf '[fs]\nread = ["%s"]\n' "$T/realcfg" > $W/.harness/policy.toml; XDG_CONFIG_HOME=$T/linkcfg $H trust --workspace $W --yes >/dev/null
 check "store reached through a symlinked path is still protected" "$(XDG_CONFIG_HOME=$T/linkcfg $H exec --workspace $W "print(pcall(write, '$T/linkcfg/hx/trust.toml', 'forged'))" 2>/dev/null | head -1 | grep -c protected)" "1"
 # saved versions are covered: a planted rollback target makes the workspace untrusted, and rollback cannot bless it
 fresh roll; printf '[budget]\nmax_tokens = 1000000\n' > $W/.harness/policy.toml; $H trust --workspace $W --yes >/dev/null

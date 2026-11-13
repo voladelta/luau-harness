@@ -96,7 +96,7 @@ class Approvals(unittest.TestCase):
                               text=True, timeout=10, start_new_session=True)
 
     def grant_records(self):
-        log, = (self.ws / ".harness/log").glob("*.jsonl")
+        log, = harness.logs(self.ws).glob("*.jsonl")
         return [r for r in harness.records(log) if r["kind"] == "path_grant"]
 
     def test_workspace_does_not_ask(self):
@@ -208,11 +208,11 @@ class Approvals(unittest.TestCase):
         self.assertEqual(self.grant_records(), [])
 
     def test_search_through_an_alias_cannot_expose_sealed_state(self):
-        sealed = self.ws / ".harness/ar/run"
+        sealed = harness.state_dir(self.ws) / "ar/run"
         sealed.mkdir(parents=True)
         (sealed / "ledger.txt").write_text("sealed-result-marker")
-        (self.ws / "harness-alias").symlink_to(self.ws / ".harness", target_is_directory=True)
-        code = 'print(#search("sealed-result-marker",{path="harness-alias",literal=true}))'
+        (self.ws / "state-alias").symlink_to(harness.state_dir(self.ws), target_is_directory=True)
+        code = 'local ok, rows = pcall(search, "sealed-result-marker", {path="state-alias", literal=true}); print(ok and #rows or 0)'
         result = self.headless(self.command(code, "--yes"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[0], "0", result.stdout)
@@ -228,7 +228,7 @@ class Approvals(unittest.TestCase):
         self.assertIn("approved", out)
 
     def verify_no_uncertainty(self):
-        log, = (self.ws / ".harness/log").glob("*.jsonl")
+        log, = harness.logs(self.ws).glob("*.jsonl")
         result = self.headless(["log", "verify", str(log)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse([r for r in harness.records(log) if r["kind"] == "intent" and r["tool"] == "sh"])
@@ -304,7 +304,7 @@ class Approvals(unittest.TestCase):
             args[args.index(str(self.ws))] = str(control)
             result = self.headless(args)
             self.assertEqual(result.returncode, 0, result.stderr)
-        log, = (control / ".harness/log").glob("*.jsonl")
+        log, = harness.logs(control).glob("*.jsonl")
         records = harness.records(log)
         outcome = next(r["seq"] for r in records if r["kind"] == "outcome" and r["tool"] == "write")
         boundary = next(r["seq"] for r in records if r["kind"] == "checkpoint" and r["lane"] == "root" and r["seq"] > outcome)
@@ -312,7 +312,7 @@ class Approvals(unittest.TestCase):
             status, out = terminal(self.run_args(url, "Record a checkpoint"), ["y"], env={"HX_TEST_CRASH_AFTER_RECORD": str(boundary)})
             self.assertNotEqual(status, 0, out)
             self.assertEqual(out.count("[approval needed]"), 1, out)
-            log, = (self.ws / ".harness/log").glob("*.jsonl")
+            log, = harness.logs(self.ws).glob("*.jsonl")
             status, out = terminal(["run", "--workspace", str(self.ws), "--resume", str(log)])
         self.assertEqual(status, 0, out)
         self.assertNotIn("[approval needed]", out)
@@ -334,7 +334,7 @@ class Approvals(unittest.TestCase):
                       ["one", "--yolo"], ["one", "--yes", "--approval", "deny"]):
             result = self.headless(["run", "--workspace", str(self.ws), *flags])
             self.assertEqual(result.returncode, 2, (flags, result.stderr))
-            self.assertFalse((self.ws / ".harness/log").exists(), flags)
+            self.assertFalse(harness.logs(self.ws).exists(), flags)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ source scripts/check_helpers.sh
 cleanup() { kill $MOCK 2>/dev/null; }
 
 # 1. std package tests (printer, hooks, mcp)
-out=$($H test stdlib/std --workspace "$T"); status=$?
+mkdir -p "$T/std"; out=$($H test stdlib/std --workspace "$T/std"); status=$?
 if [ "$status" -eq 0 ] && [[ "$out" =~ ^[1-9][0-9]*\ passed,\ 0\ failed$ ]]; then
   check "std tests" "passed" "passed"
 else

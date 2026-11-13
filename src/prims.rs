@@ -321,7 +321,8 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
         let explicit=base.strip_prefix(root).unwrap_or(&base).to_path_buf();
         wb.filter_entry(move |entry| {
             let relative=entry.path().strip_prefix(&project).unwrap_or(entry.path());
-            [".harness/log", ".agents/artifacts"].iter().all(|runtime|explicit.starts_with(runtime) || !relative.starts_with(runtime))
+            // Readable artifact projections stay in the project but are not project inventory (journals live outside it).
+            explicit.starts_with(".agents/artifacts") || !relative.starts_with(".agents/artifacts")
         });
     }
     if let Some(glob) = opt_str(opts, "glob") {

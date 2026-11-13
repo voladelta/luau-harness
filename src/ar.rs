@@ -11,8 +11,9 @@
 //!   evaluator sees exactly the recorded bytes and nothing else the agent did.
 //! - Evaluators run with a scrubbed environment in a throwaway copy, confined (Landlock) to that copy, the system and
 //!   their grader roots; only the select evaluator may read the holdout roots.
-//! - The run directory (`.harness/ar/RUN`, with `base`, snapshots, ledger, claims, journal and held-out scores) is
-//!   sealed from file tools and from confined shell commands in every mode.
+//! - The run directory (`ar/RUN` in the workspace's state directory outside it, `crate::state`, with `base`, snapshots,
+//!   ledger, claims, journal, held-out scores and the episodes' own journals) is sealed from file tools and hidden from
+//!   confined shell commands in every mode, and no write root may overlap it.
 //!
 //! A run is research, then rounds. A research episode studies the task and writes the brief every worker gets. Round 1
 //! runs explore workers side by side; each derives its own idea from a host seed and claims it with `ar.claim`. Claims
@@ -476,7 +477,8 @@ impl Orchestrator {
         let report = String::from_utf8_lossy(&out.stdout).lines().rev()
             .find_map(|l| serde_json::from_str::<Value>(l).ok()).unwrap_or(Value::Null);
         std::fs::write(ep_dir.join(format!("{label}.report.json")), serde_json::to_vec_pretty(&report)?)?;
-        let logs = keep_logs(&ws, &ep_dir, label)?;
+        // The child journaled straight into `episodes/LABEL.log` (its policy puts it there), never into its copy.
+        let logs = ep_dir.join(format!("{label}.log"));
         drop(scratch);
         // Without a report the child's journals say how often it was rate-limited.
         let rate_limits = report["rate_limits"].as_u64().unwrap_or_else(|| rate_limited(&logs));
@@ -736,22 +738,16 @@ comes from a hole or a rule violation). Without that line the audit counts for n
         }).collect();
         for (label, scratch) in open {
             let evals = rows.iter().filter(|r| r.episode == label).count();
-            // The killed child's scratch copy survives a killed orchestrator: keep its journals.
-            // The journal names the directory, but only one shaped like an episode's scratch copy is cleaned up: a
+            // The killed child's scratch copy survives a killed orchestrator; its journals are already in the run. The
+            // journal names the directory, but only one shaped like an episode's scratch copy is cleaned up: a
             // recorded path is not authority to kill processes and delete files anywhere else.
             let scratch = scratch.filter(|s| {
                 let ok = valid_scratch(s);
                 if !ok { eprintln!("hx ar: ignoring invalid recorded scratch directory {}", s.display()); }
                 ok && s.is_dir()
             });
-            let rate_limits = match scratch {
-                Some(dir) => {
-                    let logs = keep_logs(&dir.join("ws"), &self.dir.join("episodes"), &label)?;
-                    drop(Scratch(dir));
-                    rate_limited(&logs)
-                }
-                None => 0,
-            };
+            if let Some(dir) = scratch { drop(Scratch(dir)); }
+            let rate_limits = if valid_label(&label) { rate_limited(&self.dir.join("episodes").join(format!("{label}.log"))) } else { 0 };
             // Research and audits are judged by their final answer, which a killed child never gave: they are retried
             // like a worker that scored nothing.
             let answer_only = label.starts_with("r0-") || label.starts_with('a');
@@ -925,18 +921,18 @@ fn show(v: Option<f64>) -> String {
 /// `hx run --ar`: search until two rounds in a row make no progress, or continue the run in `resume` (a run directory).
 pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>, resume: Option<PathBuf>) -> Result<()> {
     // A resumed run uses the spec frozen in its sealed launch.json, approved when it started; only a launch reads ar.toml.
-    // Agents of ordinary runs of this workspace can write `.harness/ar` from their shell, so a resume trusts launch.json
-    // only as hashed into the launch record kept in the trust store, and an orchestrator holds its run's lock while it runs.
+    // The run directory is in the state root, which no agent can reach (file tools are sealed from it, shell commands
+    // neither see nor write it), as safe as the trust store, so launch.json needs no second record there. A directory
+    // elsewhere (a run from before the state root, in `.harness/ar`) is refused: shell commands could have rewritten it.
+    // An orchestrator holds its run's lock while it runs.
     let (dir, launch, records, _lock) = match (start, resume) {
         (_, Some(dir)) => {
             let dir = dir.canonicalize().with_context(|| format!("autoresearch run {}", dir.display()))?;
-            ensure!(dir.parent() == Some(&workspace.join(".harness/ar").canonicalize()?), "--resume for --ar takes a run directory under .harness/ar");
+            let runs = crate::state::ar_dir(workspace)?;
+            ensure!(dir.parent() == Some(runs.as_path()), "--resume for --ar takes one of this workspace's runs in {} (see `hx runs`); \
+a run kept in the workspace's .harness/ar predates that and cannot be resumed", runs.display());
             let lock = lock_run(&dir)?;
-            let bytes = std::fs::read(dir.join("launch.json"))?;
-            let recorded = std::fs::read_to_string(launch_record(&dir)?).unwrap_or_default();
-            ensure!(recorded.trim() == crate::eventlog::sha_bytes(&bytes), "autoresearch run {}: launch.json does not match the \
-launch record hx kept when the run started (it was changed, or the run predates the record); start a new run", dir.display());
-            let launch: Launch = serde_json::from_slice(&bytes)?;
+            let launch: Launch = serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?)?;
             launch.spec.check(workspace)?;
             ensure!(!dir.join("report.json").exists(), "autoresearch run {} already finished", dir.display());
             ensure!(dir.join("seed.json").exists() || !dir.join("ledger.jsonl").exists(),
@@ -952,18 +948,14 @@ launch record hx kept when the run started (it was changed, or the run predates 
             ensure!(bad.is_empty(), "--ar freezes the committed tree: commit or remove changes outside the editable paths: {}", bad.join(", "));
             // `.noindex`: Spotlight skips the run's snapshots, logs and copies.
             let id = format!("{}-{}.noindex", chrono_stamp(), std::process::id());
-            let dir = workspace.join(".harness/ar").join(&id);
+            let dir = crate::state::ar_dir(workspace)?.join(&id);
             std::fs::create_dir_all(&dir)?;
             let dir = dir.canonicalize()?;
             let lock = lock_run(&dir)?;
             let commit = freeze(workspace, &dir)?;
             crate::atomic_file::replace_trusted(&dir.join("seed"), save_snap(&dir, &capture(workspace, &spec)?)?.as_bytes())?;
             let launch = Launch { spec, program, child_args, commit };
-            let bytes = serde_json::to_vec_pretty(&launch)?;
-            let record = launch_record(&dir)?;
-            std::fs::create_dir_all(record.parent().unwrap())?;
-            crate::atomic_file::replace_trusted(&record, crate::eventlog::sha_bytes(&bytes).as_bytes())?;
-            crate::atomic_file::replace_trusted(&dir.join("launch.json"), &bytes)?;
+            crate::atomic_file::replace_trusted(&dir.join("launch.json"), &serde_json::to_vec_pretty(&launch)?)?;
             (dir, launch, vec![], lock)
         }
         (None, None) => bail!("--ar needs a program, or --resume RUN_DIR"),
@@ -973,14 +965,6 @@ launch record hx kept when the run started (it was changed, or the run predates 
     let report = o.run(records).await?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
-}
-
-/// Where hx keeps the hash of a run's launch.json: the trust store, which neither agent file tools nor confined shell
-/// commands can write. One small file per run, named by the run directory.
-fn launch_record(dir: &Path) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let store = crate::trust::store_dir().context("no HOME or XDG_CONFIG_HOME for the autoresearch launch record")?;
-    Ok(store.join("ar-launch").join(&crate::eventlog::sha_bytes(dir.as_os_str().as_bytes())[..32]))
 }
 
 /// The run's lock, held while an orchestrator works on it: a second `--resume` would take the live run's episodes for
@@ -1096,7 +1080,7 @@ mod tests {
         let (grader, holdout) = (dir.join("grader"), dir.join("holdout"));
         std::fs::create_dir_all(&grader).unwrap();
         std::fs::create_dir_all(&holdout).unwrap();
-        let run = dir.join("ws/.harness/ar/run");
+        let run = dir.join("state/ar/run");
         std::fs::create_dir_all(&run).unwrap();
         let spec = spec(&format!("select = \"python3 secret_select.py\"\ngrader = [\"{}\"]\nholdout = [\"{}\"]\n", grader.display(), holdout.display()));
         let launch = Launch { spec, program: String::new(), child_args: vec![], commit: String::new() };
@@ -1105,7 +1089,7 @@ mod tests {
         let episode = o.child_episode(&plan, "r1-w1").unwrap();
         let text = serde_json::to_string(&episode.spec).unwrap();
         assert!(!text.contains("secret_select") && !text.contains("holdout\":[\"") && episode.spec.grader.len() == 1, "{text}");
-        assert_eq!(sealed(&episode), vec![dir.join("ws/.harness/ar"), grader.clone(), holdout.clone()]);
+        assert_eq!(sealed(&episode), vec![dir.join("state/ar"), grader.clone(), holdout.clone()]);
         std::fs::remove_dir_all(&holdout).unwrap();
         assert!(o.child_episode(&plan, "r1-w1").is_err(), "an unresolved holdout root must not go unsealed");
         let _ = std::fs::remove_dir_all(dir);

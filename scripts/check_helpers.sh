@@ -1,11 +1,12 @@
 # Shared setup for the bash check suites: `cd "$(dirname "$0")/.." && source scripts/check_helpers.sh` at the top.
-# It gives each suite a fresh trust store and scratch directory $T (removed on exit, after the suite's own `cleanup`),
+# It gives each suite a fresh trust store, run-state directory and scratch directory $T (removed on exit, after the suite's own `cleanup`),
 # $H (hx; scripts/hx_trusted trusts the config a suite writes, per launch, under HX_TRUST=current), $R (the repository
 # root), and check/finish for the pass/fail tally. Build first: scripts/all_checks.py builds once for every suite.
 set -u
 R=$PWD
 T=$(mktemp -d); T=$(cd "$T" && pwd -P)
 export HX_TRUST=current XDG_CONFIG_HOME=$T/config  # suites write .harness config on purpose; trust_checks.sh tests trust
+export XDG_STATE_HOME=$T/xdg-state  # journals and autoresearch runs, outside every workspace; one per suite, so suites run side by side
 H=$R/scripts/hx_trusted
 pass=0; fail=0
 cleanup() { :; }  # a suite redefines it to stop its mock servers and processes
@@ -39,7 +40,14 @@ sys.exit("test synchronization file did not appear within 5s: " + sys.argv[1])
 PY
 }
 
+# logs DIR: the journal directory of workspace DIR (hx keeps it in $XDG_STATE_HOME/hx, keyed by the canonical path).
+logs() {
+  python3 -c 'import hashlib, os, re, sys
+p = os.path.realpath(sys.argv[1]); name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(p))[:40] or "root"
+print(os.path.join(os.environ["XDG_STATE_HOME"], "hx/projects", name + "-" + hashlib.sha256(p.encode()).hexdigest()[:12], "log"))' "$1"
+}
+
 # unconfined DIR: did hx runs in workspace DIR record that Landlock is unavailable (children run unconfined)?
 unconfined() {
-  grep -qh '"confinement":"off' "$1"/.harness/log/*.jsonl 2>/dev/null
+  grep -qh '"confinement":"off' "$(logs "$1")"/*.jsonl 2>/dev/null
 }

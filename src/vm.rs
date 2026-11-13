@@ -464,7 +464,7 @@ impl Vm {
                     let query = crate::history::Query::parse(args.clone()).map_err(mlua::Error::external)?;
                     ops.fetch_add(1, Ordering::Relaxed);
                     let result = fx.run(&lua, crate::supervisor::Tool::History, Class::Read, args, || async move {
-                        h.policy.check_read(&h.policy.log.path.to_string_lossy()).map_err(mlua::Error::external)?;
+                        // No file-tool check on the journal: it is sealed run state; hx serves this run's own archive.
                         let deadline = h.supervisor.manifest.as_ref().and_then(|m| m.deadline);
                         let value = tokio::task::spawn_blocking(move || h.supervisor.history.query(
                             h.policy.log.dir(), &h.policy.log.session, query, deadline)).await

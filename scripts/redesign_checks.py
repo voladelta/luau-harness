@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import subprocess
@@ -26,7 +27,9 @@ if os.environ.get("HX_CHECK_ARTIFACTS"):
 else:
     BASE = Path(tempfile.mkdtemp(prefix="hx-redesign-"))
 BASE.mkdir(parents=True, exist_ok=True)
-ENV = {**os.environ, "HX_TRUST": "current", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1"}  # backoff: host.rs unit test
+# Run state (journals, autoresearch runs) goes to XDG_STATE_HOME/hx, one directory per suite so suites run side by side.
+ENV = {**os.environ, "HX_TRUST": "current", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1",  # backoff: host.rs unit test
+       "XDG_STATE_HOME": str(BASE / "xdg-state")}
 for key in ("HX_MODEL", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
     ENV.pop(key, None)
 passed = 0
@@ -55,8 +58,20 @@ def records(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def state_dir(path):
+    """Where hx keeps a workspace's run state: XDG_STATE_HOME/hx/projects/<name>-<sha256(canonical path)[:12]>."""
+    real = os.path.realpath(path)
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(real))[:40] or "root"
+    return Path(ENV["XDG_STATE_HOME"]) / "hx/projects" / f"{name}-{hashlib.sha256(real.encode()).hexdigest()[:12]}"
+
+
+def logs(path):
+    """A workspace's journal directory."""
+    return state_dir(path) / "log"
+
+
 def journal(path):
-    files = list((path / ".harness/log").glob("*.jsonl"))
+    files = list(logs(path).glob("*.jsonl"))
     assert len(files) == 1, files
     return files[0]
 
@@ -703,11 +718,11 @@ def review_branch_and_revocation():
     parent = journal(path)
     for boundary in (2, 3):
         with provider(lambda body, i: tool('assert(durable.get("keep").n==4); print("SEED_OK")') if i == 0 else "done") as (url, calls):
-            previous = set((path / ".harness/log").glob("*.jsonl"))
+            previous = set(logs(path).glob("*.jsonl"))
             result = run(path, "run", "--branch", str(parent), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY",
                          env={"HX_TEST_CRASH_AFTER_RECORD": str(boundary)}, ok=False)
             assert result.returncode and not calls
-            child, = set((path / ".harness/log").glob("*.jsonl")) - previous
+            child, = set(logs(path).glob("*.jsonl")) - previous
             report = json.loads(run(path, "run", "--resume", str(child)).stdout)
             assert report["finished"] and report["luau_errors"] == 0, report
 
@@ -724,7 +739,7 @@ def review_branch_and_revocation():
         count = len(calls)
         result = run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY", ok=False)
         assert result.returncode and "reconcile uncertain" in result.stderr
-        assert sum(any(r["kind"] == "manifest" for r in records(p)) for p in (path / ".harness/log").glob("*.jsonl")) == 1
+        assert sum(any(r["kind"] == "manifest" for r in records(p)) for p in logs(path).glob("*.jsonl")) == 1
         run(path, "revoke", str(log))
         run(path, "recover", str(log), str(op), "--decision", "abandon", "--yes")
         assert run(path, "run", "--resume", str(log), ok=False).returncode and len(calls) == count
@@ -854,7 +869,7 @@ def cli_preflight():
         result = subprocess.run([str(HX), "run", "--workspace", str(path), *flags], env=ENV,
                                 capture_output=True, text=True, timeout=10)
         assert result.returncode == 2, (flags, result.returncode, result.stderr)
-        assert not (path / ".harness/log").exists(), (flags, "invalid invocation opened a journal")
+        assert not logs(path).exists(), (flags, "invalid invocation opened a journal")
     assert not Path("absent.lock").exists()
 
 
