@@ -1,6 +1,7 @@
 //! MCP client: stdio and Streamable HTTP. Stdio servers are user-configured third-party processes, started directly
-//! under the run's Landlock file policy, like shell commands. HTTP servers are remote; the `url` in the user-owned
-//! mcp.toml is the consent to reach them.
+//! under the run's Landlock file policy in their own process group, like shell commands; the group is killed when the
+//! connection is dropped or hx is stopped. HTTP servers are remote; the `url` in the user-owned mcp.toml is the
+//! consent to reach them.
 //!
 //! `.harness/mcp.toml` (user-owned; file tools cannot write `.harness/`; an unknown key is an error):
 //!   [server.NAME]
@@ -17,6 +18,7 @@
 //!   For remote servers, the approval gate and recorded effects are the controls. No OAuth.
 use crate::net::{self, BodyError, Delivery, ResponseBudget, Sse};
 use crate::policy::Policy;
+use crate::prims::GroupKill;
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -134,7 +136,10 @@ fn result(v: Value, scrub: impl Fn(String) -> String) -> McpResult<Value> {
 }
 
 struct Stdio {
-    /// Killed when dropped.
+    /// Kills the server's whole process group when dropped (a lost connection, a timeout, hx stopping). Declared
+    /// before `child` so it drops first, while the group leader is not yet reaped and the group id cannot be reused.
+    _group: Option<GroupKill>,
+    /// Killed and reaped when dropped.
     child: Child,
     stdin: ChildStdin,
     out: BufReader<ChildStdout>,
@@ -415,16 +420,15 @@ impl Mcp {
             }
         }
         cmd.current_dir(&self.pol.workspace).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
-        // The server gets the run's file policy as it stands at its start, like a shell command.
-        if let Some(ruleset) = self.pol.confinement().prepare().map_err(|e| anyhow!("MCP server {server}: cannot prepare confinement: {e}"))? {
-            // SAFETY: the hook runs in the forked child before exec; `Ruleset::apply` only makes the prctl and
-            // landlock_restrict_self syscalls on a ruleset fd prepared in the parent, and allocates nothing.
-            unsafe { cmd.pre_exec(move || ruleset.apply()); }
-        }
+        // The server gets the run's file policy as it stands at its start, like a shell command, and its own process
+        // group, so a wrapper (`npx`, `uvx`) cannot leave the real server running when the connection is dropped.
+        let ruleset = self.pol.confinement().prepare().map_err(|e| anyhow!("MCP server {server}: cannot prepare confinement: {e}"))?;
+        crate::prims::confine_command(&mut cmd, ruleset.map(Arc::new));
         let mut child = cmd.spawn().map_err(|e| anyhow!("cannot start MCP server {server}: {e}"))?;
+        let group = GroupKill::new(&child);
         let stdin = child.stdin.take().expect("stdin is piped");
         let out = BufReader::new(child.stdout.take().expect("stdout is piped"));
-        Ok(Conn::Stdio(Stdio { child, stdin, out, next_id: 1 }))
+        Ok(Conn::Stdio(Stdio { _group: group, child, stdin, out, next_id: 1 }))
     }
 
     /// Auth headers are resolved from the environment here, in Rust: the model and Luau never see them.

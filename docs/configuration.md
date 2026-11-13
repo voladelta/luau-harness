@@ -54,7 +54,7 @@ url = "https://mcp.example.com/mcp"
 bearer_env = "REMOTE_TOKEN"     # or headers_env = {"x-api-key" = "VAR"}
 ```
 
-A local server is [confined](#shell-confinement) like a shell command, to the file policy at its start. Network and GPU access are controlled by the environment running hx; hx has no network switches.
+A local server is [confined](#shell-confinement) like a shell command, to the file policy at its start, and runs in its own process group: when hx drops the connection (the server stopped answering, the run ended, hx was stopped by a signal) it kills the whole group, so the real server behind a wrapper such as `npx` or `uvx` ends too. A process that detaches into its own session is not killed. Network and GPU access are controlled by the environment running hx; hx has no network switches.
 
 An unknown key (a typo such as `bearer-env`) is an error. A server that exits is started again on the next call.
 

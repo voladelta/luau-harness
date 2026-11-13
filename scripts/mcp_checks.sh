@@ -34,6 +34,15 @@ out=$(x 'print(pcall(mcp.demo.rpc_error, {})); print(mcp.demo.add{a = 1, b = 2})
 check "a JSON-RPC error is a definite failure: the next mutation runs" "$(echo "$out" | grep -c 'false.*Invalid params: missing key.* 3 $')$(echo "$out" | grep -c unknown_outcome)" "10"
 out=$(x 'print(mcp.demo.exit{}); local t = os.clock(); while os.clock() - t < 0.5 do end; print(mcp.demo.add{a = 2, b = 2}); print(mcp.demo.add{a = 3, b = 3})' | tr '\n' ' ')
 check "a server that exits between calls is restarted for the next one" "$out" "bye 4 6 "
+# alive: is the process in spawned.pid running? (a zombie is not: this container's init may not reap orphans)
+alive() { [ -s $W/spawned.pid ] || { echo "no pid"; return; }; case "$(ps -o stat= -p "$(cat $W/spawned.pid 2>/dev/null)" 2>/dev/null)" in ""|Z*) echo gone;; *) echo alive;; esac; }
+rm -f $W/spawned.pid; x 'print(mcp.demo.read_spawn{})' >/dev/null
+check "a server's own children end with the run" "$(alive)" "gone"
+rm -f $W/spawned.pid
+DEMO_PASS=1 $H exec --workspace $W 'print(mcp.demo.read_spawn{}); local t = os.clock(); while os.clock() - t < 20 do end' >/dev/null 2>&1 & HX=$!
+for _ in $(seq 100); do [ -s $W/spawned.pid ] && break; sleep 0.1; done
+kill -TERM $HX; wait $HX 2>/dev/null
+check "...and when hx is stopped by a signal" "$(alive)" "gone"
 
 # --- local servers get the run's file policy through Landlock when the kernel offers it, else run unconfined
 if unconfined "$W"; then

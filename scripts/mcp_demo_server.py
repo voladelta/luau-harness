@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """A tiny MCP server (stdio, JSON-RPC 2.0) for testing hx's MCP client. Every tools/call is appended to calls.log.
 Over stdio, tools/list answers in pages of three (nextCursor); `exit` answers and then exits; `ask_ping` sends the
-client a ping request and answers only once the client has replied to it. `rpc_error` answers with a JSON-RPC error."""
-import json, os, socket, sys
+client a ping request and answers only once the client has replied to it. `rpc_error` answers with a JSON-RPC error.
+`read_spawn` starts a long-lived child (as a wrapper like npx would) and writes its pid to spawned.pid."""
+import json, os, socket, subprocess, sys
 
 def schema(**props):
     return {"type": "object", "properties": {k: {"type": v} for k, v in props.items()}, "required": list(props)}
@@ -18,6 +19,7 @@ TOOLS = [
     {"name": "rpc_error", "description": "Answers with a JSON-RPC error", "inputSchema": {"type": "object"}},
     {"name": "exit", "description": "Answers, then the server exits", "inputSchema": {"type": "object"}},
     {"name": "ask_ping", "description": "Pings the client before answering", "inputSchema": {"type": "object"}},
+    {"name": "read_spawn", "description": "Starts a long-lived child process", "inputSchema": {"type": "object"}},
 ]
 PAGE = 3
 
@@ -56,6 +58,11 @@ def call(name, a):
         return text("boom", True)
     if name == "exit":
         return text("bye")
+    if name == "read_spawn":
+        child = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open("spawned.pid", "w") as f:
+            f.write(str(child.pid))
+        return text("spawned")
     if name == "rpc_error":
         raise RpcError("Invalid params: missing key")
     return text("unknown tool", True)
