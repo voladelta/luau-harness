@@ -469,7 +469,7 @@ impl Reader<'_> {
 fn expand(value: &Value, open: &mut dyn FnMut(&Value) -> Result<Arc<Value>>) -> Result<Value> {
     let node = open(value)?;
     Ok(match &*node {
-        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| Ok((k.clone(), expand(v, open)?))).collect::<Result<_>>()?),
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| Ok((crate::cas::unescape(k)?.to_string(), expand(v, open)?))).collect::<Result<_>>()?),
         Value::Array(items) => Value::Array(items.iter().map(|v| expand(v, open)).collect::<Result<_>>()?),
         other => other.clone(),
     })

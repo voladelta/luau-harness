@@ -69,9 +69,6 @@ pub(crate) fn charge(key: Option<&str>, value: &serde_json::Value) -> (usize, us
     total
 }
 
-/// The stored-state reference key (`cas::MARKER`) is reserved: data that could name a blob could, once checkpointed,
-/// be expanded into another blob of the run store on resume.
-fn reserved() -> mlua::Error { mlua::Error::runtime(format!("the key {:?} is reserved for stored state", crate::cas::MARKER)) }
 
 pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
     fn visit(value: Value, stack: &mut HashSet<usize>, depth: usize, limit: &mut Limit) -> mlua::Result<serde_json::Value> {
@@ -117,7 +114,6 @@ pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
                         let (key, value) = pair?;
                         let Value::String(key) = key else { return Err(bad()); };
                         let key = key.to_str()?;
-                        if *key == *crate::cas::MARKER { return Err(reserved()); }
                         limit.string(&key)?;
                         fields.insert(key.to_string(), visit(value, stack, depth + 1, limit)?);
                     }
@@ -138,7 +134,6 @@ fn validate_with_limit(value: &serde_json::Value, depth: usize, limit: &mut Limi
         match value {
             serde_json::Value::Array(v) => { for v in v { validate_with_limit(v, depth + 1, limit)?; } },
             serde_json::Value::Object(v) => {
-                if v.contains_key(crate::cas::MARKER) { return Err(reserved()); }
                 for v in v.values() { validate_with_limit(v, depth + 1, limit)?; }
             },
             _ => {},
@@ -213,15 +208,15 @@ mod tests {
         assert!(validate(&serde_json::json!({"large":"x".repeat(MAX_BYTES)})).is_err());
     }
     #[test]
-    fn stored_state_references_cannot_be_forged_from_data() {
+    fn marker_shaped_keys_are_ordinary_data() {
+        // Stored state escapes `$` keys (`cas::escape`), so the boundary needs no reserved key: a model's tool-call
+        // input or a Luau table may hold `$hx.blob` and it stays data.
         let lua = Lua::new();
         let sha = "0".repeat(64);
-        let forged = lua.load(format!("return {{ messages = {{ {{ ['$hx.blob'] = '{sha}' }} }} }}")).eval().unwrap();
-        assert!(copy_out(forged).unwrap_err().to_string().contains("reserved"));
-        let nested = serde_json::json!({"a":[{"b":{crate::cas::MARKER: sha}}]});
-        assert!(validate(&nested).unwrap_err().to_string().contains("reserved"));
-        assert!(copy_in(&lua, &nested).is_err());
-        assert!(validate(&serde_json::json!({"$hx.blob2": 1, "hx.blob": 2})).is_ok());
+        let table = lua.load(format!("return {{ messages = {{ {{ ['$hx.blob'] = '{sha}' }} }} }}")).eval().unwrap();
+        let data = copy_out(table).unwrap();
+        assert_eq!(data["messages"][0][crate::cas::MARKER], sha);
+        assert!(validate(&data).is_ok() && copy_in(&lua, &data).is_ok());
     }
     #[test]
     fn charge_is_what_validate_counts() {

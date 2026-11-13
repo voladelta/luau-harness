@@ -78,7 +78,8 @@ def stored(log, sha):
         if isinstance(v, dict):
             if list(v) == ["$hx.blob"]:
                 return stored(log, v["$hx.blob"])
-            return {k: expand(x) for k, x in v.items()}
+            # stored keys starting with "$" carry one more "$" (cas::escape)
+            return {(k[1:] if k.startswith("$") else k): expand(x) for k, x in v.items()}
         return [expand(x) for x in v] if isinstance(v, list) else v
     return expand(json.loads(data))
 

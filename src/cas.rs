@@ -7,9 +7,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value};
 use std::{collections::{HashMap, HashSet}, path::Path};
 
-/// The key of a reference object `{"$hx.blob": SHA}`. Data crossing the Luau boundary cannot hold it
-/// (`values::validate`, `values::copy_out`) and `store` refuses it anywhere else, so every reference in a stored tree
-/// was made by `store` and loading can never be steered to another blob of the run store.
+/// The key of a reference object `{"$hx.blob": SHA}`. Stored object keys that start with `$` get one more `$`
+/// (`escape`, undone by `unescape`), so data, including a model's own tool-call input, round-trips whatever its keys
+/// are, and every reference in a stored tree was made by `store`: loading can never be steered to another blob.
 pub const MARKER: &str = "$hx.blob";
 /// A subtree whose encoding, with its own large subtrees already replaced, is over this many bytes is stored as a blob.
 /// A reference costs about 80 bytes, so smaller subtrees stay inline.
@@ -72,13 +72,13 @@ fn split_items(log: Option<&EventLog>, items: &[Value], root: bool) -> Result<(V
 fn split(log: Option<&EventLog>, value: &Value, root: bool) -> Result<(Value, usize)> {
     let (node, len) = match value {
         Value::Object(map) => {
-            ensure!(!map.contains_key(MARKER), "stored state cannot hold the reserved key {MARKER:?}");
             let mut out = Map::new();
             let mut len = 1 + map.len().max(1);
             for (key, item) in map {
                 let (item, n) = split(log, item, false)?;
-                len += encoded(key) + 1 + n;
-                out.insert(key.clone(), item);
+                let key = escape(key);
+                len += encoded(&key) + 1 + n;
+                out.insert(key.into_owned(), item);
             }
             (Value::Object(out), len)
         },
@@ -92,6 +92,20 @@ fn split(log: Option<&EventLog>, value: &Value, root: bool) -> Result<(Value, us
         _ => { let len = encoded(value); (value.clone(), len) },
     };
     if root || len > SPLIT { Ok((link(put(log, &serde_json::to_vec(&node)?)?), REF_LEN)) } else { Ok((node, len)) }
+}
+
+/// A data key as stored: `$k` becomes `$$k`, so no stored data key equals `MARKER`.
+fn escape(key: &str) -> std::borrow::Cow<'_, str> {
+    if key.starts_with('$') { format!("${key}").into() } else { key.into() }
+}
+
+/// A stored key as data. A single-`$` key that is not a reference is damage.
+pub fn unescape(key: &str) -> Result<&str> {
+    match key.strip_prefix('$') {
+        Some(rest) if rest.starts_with('$') => Ok(rest),
+        Some(_) => bail!("malformed stored key {key:?}"),
+        None => Ok(key),
+    }
 }
 
 fn link(sha: String) -> Value { Value::Object(Map::from_iter([(MARKER.to_string(), Value::String(sha))])) }
@@ -129,7 +143,7 @@ fn expand(dir: &Path, value: Value, seen: &mut HashMap<String, Value>, depth: us
     ensure!(depth <= MAX_DEPTH, "stored state nests deeper than {MAX_DEPTH} levels");
     if let Some(sha) = reference(&value)? { return expand_blob(dir, sha, seen, depth + 1); }
     Ok(match value {
-        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| Ok((k, expand(dir, v, seen, depth + 1)?))).collect::<Result<_>>()?),
+        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| Ok((unescape(&k)?.to_string(), expand(dir, v, seen, depth + 1)?))).collect::<Result<_>>()?),
         Value::Array(items) => Value::Array(items.into_iter().map(|v| expand(dir, v, seen, depth + 1)).collect::<Result<_>>()?),
         value => value,
     })
@@ -192,11 +206,15 @@ mod tests {
     }
 
     #[test]
-    fn markers_are_refused_and_damage_is_detected() {
+    fn dollar_keys_round_trip_and_damage_is_detected() {
         let log = log("markers");
-        for forged in [json!({"a":{MARKER:"0".repeat(64)}}), json!([{MARKER:"x","other":1}])] {
-            assert!(store(&log, &forged).is_err(), "{forged}");
+        // A model can put the marker in its own tool-call input: stored as data, never followed as a reference.
+        for data in [json!({"a":{MARKER:"0".repeat(64)}}), json!([{MARKER:"x","other":1}]), json!({"$$k":{"$schema":"y".repeat(3000)}})] {
+            let sha = store(&log, &data).unwrap();
+            assert_eq!(load(log.dir(), &sha).unwrap(), data);
+            assert!(verify(log.dir(), &sha, &mut HashSet::new()).is_ok());
         }
+        assert!(unescape("$schema").is_err() && unescape("$$schema").unwrap() == "$schema" && unescape("k").unwrap() == "k");
         let state = json!({"messages":["m".repeat(5000), "n".repeat(5000)]});
         let sha = store(&log, &state).unwrap();
         let blobs = log.dir().join("blobs");
