@@ -69,6 +69,21 @@ local function save_hook_state(s)
 	hooks.state = s.hook_state
 end
 
+-- One notice, appended to a tool result, when the run is about to stop the model: two turns before max_turns, or with
+-- the last fifth of a wall-clock allowance left (at least a minute). Without it a capped run ends mid-work and returns
+-- no final answer. A workflow stage ends by submission, not by prose, so it gets none.
+local function wrap_up(s, event, options): string
+	if s.wrapped or options.submissions then return "" end
+	local time = event.time
+	local turns_left = s.max_turns - s.report.turns
+	local secs_left = if type(time) == "table" and type(time.remaining) == "number" and type(time.total) == "number"
+		and time.remaining <= math.max(60, time.total / 5) then time.remaining else nil
+	if turns_left > 2 and not secs_left then return "" end
+	s.wrapped = true
+	local left = if secs_left then string.format("about %d seconds", math.floor(secs_left)) else string.format("%d model turns", turns_left)
+	return "\n\n[hx] The run stops in " .. left .. ". Stop starting new work: give your final answer in your next reply."
+end
+
 local function next_call(s)
 	local cur = s.phase
 	local c = cur.calls[cur.index]
@@ -119,7 +134,7 @@ local function step(s, event, options)
 		s.notifications = s.notifications or {}
 		for _, message in event.notifications or {} do table.insert(s.notifications, message) end
 		table.insert(s.report.ops_per_turn, res.ops)
-		table.insert(s.messages, { role = "tool", id = s.phase.calls[s.phase.index].id, content = res.feedback })
+		table.insert(s.messages, { role = "tool", id = s.phase.calls[s.phase.index].id, content = res.feedback .. wrap_up(s, event, options) })
 		s.phase.index += 1
 		if native_submission then
 			-- Native control data is captured before hooks; never execute trailing calls.

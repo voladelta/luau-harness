@@ -191,3 +191,28 @@ test.case("a large fixed part (system prompt + task) does not make compaction re
 	test.ok(compactions >= 1 and compactions <= 3, "compacts only once the summarizable span is worth it: " .. compactions)
 	compact.context_window = 1000000
 end)
+
+test.case("a run about to stop asks for the final answer once: by time or by turns", function()
+	local function reply(s, n, time)
+		s = loop.step(s, { kind = "model_reply", system_chars = SYSTEM,
+			reply = { text = "", finish = "stop", input = 100, output = 10, calls = { { id = "w" .. n, name = "luau", input = { code = "x = 1" } } } } })
+		s = loop.step(s, { kind = "run_result", result = { ops = 1, feedback = "ok" }, time = time })
+		local tool = s.messages[#s.messages].content
+		return loop.step(s, { kind = "next" }), tool
+	end
+	local s = start()
+	local tool
+	s, tool = reply(s, 1, { remaining = 200, total = 240 })
+	test.eq(tool, "ok")
+	s, tool = reply(s, 2, { remaining = 55, total = 240 })
+	test.ok(tool:find("about 55 seconds", 1, true) and tool:find("final answer", 1, true), tool)
+	s, tool = reply(s, 3, { remaining = 20, total = 240 })
+	test.eq(tool, "ok") -- once
+	hooks.clear()
+	hx.model_info = function() return { max_output = 16384 } end
+	s = loop.step(loop.init({ task_message = "TASK", max_turns = 4 }), { kind = "next" })
+	s, tool = reply(s, 1)
+	test.eq(tool, "ok")
+	s, tool = reply(s, 2)
+	test.ok(tool:find("2 model turns", 1, true), tool)
+end)

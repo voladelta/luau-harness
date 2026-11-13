@@ -29,7 +29,9 @@ pub enum Event {
     /// `error` is for display; controllers branch on `error_kind`. `safe_context_rejection` is for controllers frozen in
     /// older run manifests, which matched `error` against overflow wording when it was set.
     ModelError { error: String, error_kind: ErrorKind, safe_context_rejection: bool },
-    RunResult { result: Json, notifications: Json },
+    /// `time`: `{remaining, total}` seconds of the run's wall-clock allowance, when it has one, so a controller can
+    /// ask for a final answer before the deadline stops the run (controllers are pure: time arrives as data).
+    RunResult { result: Json, notifications: Json, #[serde(skip_serializing_if = "Option::is_none")] time: Option<Json> },
     /// An owner's review decision; `document` holds the workflow's artifacts and owner inputs.
     OwnerDecision { #[serde(flatten)] document: serde_json::Map<String, Json>, decision: Json, text: String, request: Json },
     /// A workflow stage is ready to start.

@@ -408,7 +408,9 @@ impl Host {
                     }
                     // Images view() queued go to the controller with the result, so it budgets them before the next request.
                     let notifications=vm.as_ref().unwrap().drain_notifications()?;
-                    event=Event::RunResult{result,notifications}.to_json();
+                    let time=self.supervisor.manifest.as_ref().and_then(|m|m.budget.max_wall_secs).zip(self.supervisor.remaining())
+                        .map(|(total,left)|json!({"remaining":left.as_secs_f64(),"total":total}));
+                    event=Event::RunResult{result,notifications,time}.to_json();
                 },
                 Command::Finish{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
                 Command::Boundary{..}=>unreachable!(),
