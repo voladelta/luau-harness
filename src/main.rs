@@ -369,9 +369,11 @@ async fn real_main() -> Result<()> {
             cmd_ar(&args, &workspace).await
         }
         "run" => {
+            // A child run of an autoresearch episode: the episode becomes part of its frozen policy. Loaded before
+            // anything is spawned, so its channel never reaches another process.
+            let episode = ar::load_episode()?;
             confine::note();
-            // A child run of an autoresearch episode: the episode becomes part of its frozen policy.
-            cmd_run(&args, workspace.clone(), mk_policy(ar::load_episode()?)?).await
+            cmd_run(&args, workspace.clone(), mk_policy(episode)?).await
         }
         "recover" => cmd_recover(&args, &workspace),
         "runs" => {

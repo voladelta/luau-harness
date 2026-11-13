@@ -92,8 +92,6 @@ pub struct Policy {
     /// or hard-link a hidden file it cannot read, and the next command's ruleset must still hide it.
     hidden: std::sync::Mutex<std::collections::BTreeMap<(u64, u64), PathBuf>>,
     prompt: tokio::sync::Mutex<()>,
-    /// An autoresearch worker's claim and best score, when `episode` is set.
-    pub ar_progress: std::sync::Mutex<crate::ar::Progress>,
 }
 
 impl std::ops::Deref for Policy {
@@ -414,7 +412,7 @@ impl Policy {
             let grants = crate::eventlog::load(path)?.iter().filter(|r| r["kind"] == "path_grant")
                 .map(|r| serde_json::from_value(r["grant"].clone())).collect::<std::result::Result<Vec<PathGrant>, _>>()?;
             unguarded(p.write_roots.iter().chain(grants.iter().filter(|g| g.write).map(|g| &g.path)))?;
-            return Ok(Policy { cfg: p, log, grants: grants.into(), hidden: Default::default(), prompt: Default::default(), ar_progress: Default::default() });
+            return Ok(Policy { cfg: p, log, grants: grants.into(), hidden: Default::default(), prompt: Default::default() });
         }
         let modules_sha = crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!("hx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos()));
@@ -474,10 +472,10 @@ impl Policy {
                 p.read_roots.push(PathBuf::from(pk.dir));
             }
         }
-        // Automatic approval never disables the audit log. An episode's child journals straight into its autoresearch
-        // run, so no part of the run store is ever inside a directory a shell command can write.
+        // Automatic approval never disables the audit log. An episode's child journals beside its workspace in its copy,
+        // sealed like the run store; it never writes its autoresearch run, whose orchestrator keeps the journal after it.
         let dir = match &p.episode {
-            Some(e) => e.dir.join("episodes").join(format!("{}.log", e.label)),
+            Some(e) => e.log.clone(),
             None => crate::state::log_dir(&workspace)?,
         };
         let log = EventLog::open(&dir)?;
@@ -487,8 +485,15 @@ impl Policy {
             "isolation": p.episode.as_ref().map(|_| crate::confine::describe_isolation())}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
-        let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
-        Ok(Policy { cfg: p, log, grants: Default::default(), hidden: Default::default(), prompt: Default::default(), ar_progress })
+        Ok(Policy { cfg: p, log, grants: Default::default(), hidden: Default::default(), prompt: Default::default() })
+    }
+
+    /// A policy that grants nothing and journals into `log`: the autoresearch orchestrator's own model calls, admitted and
+    /// recorded in its run's journal.
+    pub fn journal_only(workspace: &Path, log: Arc<EventLog>) -> Policy {
+        let cfg = Snapshot { autopilot: false, workspace: workspace.to_path_buf(), tmp: PathBuf::new(), read_roots: vec![], write_roots: vec![],
+            protected: vec![], sealed: vec![], episode: None, ask: vec![], allow: vec![], mode: ApprovalMode::Prompt, budget: Budget::default(), packs: vec![] };
+        Policy { cfg, log, grants: Default::default(), hidden: Default::default(), prompt: Default::default() }
     }
 
     pub fn snapshot(&self) -> Snapshot { self.cfg.clone() }

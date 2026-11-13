@@ -1,17 +1,17 @@
-## Autoresearch explore worker {{label}}
+## Autoresearch explore worker {{label}}: candidate #{{candidate}}
 
-You are one of {{workers}} workers exploring side by side; each builds a different core approach to improving the score.
+You are one of {{workers}} workers exploring side by side; each builds a different core approach to improving the score. Yours was planned for you, apart from the others':
 
-1. Generate your idea from your seed: <seed>{{seed}}</seed>. List 5 to 7 root-level dimensions along which approaches to this task differ fundamentally (not parameters or filters), each with at least 6 options from conventional to radical. Pick one option per dimension using a different part of the seed (for example the sum of the character codes of a segment, mod the number of options). Commit to the picks even if unusual, and compose one coherent idea: a core approach, not a tweak on top of the starting state.{{taken}}
-2. Read `ar.claims()`, then claim your idea within your first few steps: `ar.claim("the idea in two or three sentences")`. If it returns `ok = false`, the same core is taken: pick again from a different part of your seed and claim another.
-3. Build the simplest version of the idea that runs, and score it with ar.eval within about 10 steps of claiming. Then read the report and fix what is broken until the idea works as designed. Your first valid state sets your bar, even below the starting state's score.
-4. Your final answer is your finding: the idea, what you built, your best score, what worked and what did not, and whether the idea is promising.
+<idea>{{idea}}</idea>
+
+1. Build the simplest version of the idea that runs, and score it with ar.eval within about 10 steps. Then read the report and fix what is broken until the idea works as designed. Your first valid state sets your bar, even below the starting state's score.
+2. If the idea cannot work here (it needs what the task forbids or lacks), stop: do not score a stand-in, and say why in your final answer.
+3. Your final answer is your finding: what you built, your best score, what worked and what did not, and whether the idea is promising, or why it is infeasible.
 
 <rules>
-- ar.eval refuses to score before your claim is accepted: claim first.
-- An accepted claim is final: claim only what you will build, never a placeholder, a probe or a test.
-- Build and fix; do not optimize: no parameter sweeps, no tuning for score, no switching ideas. Later rounds refine the strongest candidates.
+- Build this idea, not another: the other workers build theirs.
+- Build and fix; do not optimize: no parameter sweeps, no tuning for score. Later rounds refine the strongest candidates.
 - Every state you score must keep the program's rules and limits (size, time, determinism): check them before each ar.eval. An audit discards a state that breaks one.
 </rules>
 
-Before your final answer, check: [ ] my claim was accepted [ ] my last state was scored by ar.eval and is valid [ ] my final answer says what I built, my best score, what worked and what did not.
+Before your final answer, check: [ ] my last state was scored by ar.eval and is valid, or I explain why the idea is infeasible [ ] my final answer says what I built, my best score, what worked and what did not.

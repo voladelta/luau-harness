@@ -2,6 +2,7 @@
 //! run in, the evaluator itself, and the committed tree frozen at launch.
 use super::*;
 use base64::Engine as _;
+use crate::eventlog::{EventLog, read_blob};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -55,7 +56,7 @@ fn open_nofollow(path: &Path) -> Result<Option<File>> {
 /// exactly. Every entry is opened relative to its parent's descriptor without following a link and judged by what was
 /// opened (fstat), so a process that swaps a path for a symlink to grader or held-out data between the listing and the
 /// read gets nothing through.
-pub(super) fn capture(root: &Path, spec: &Spec) -> Result<Files> {
+pub(super) fn capture(root: &Path, editable: &[String]) -> Result<Files> {
     /// The names in an open directory.
     fn list(dir: &File) -> Result<Vec<String>> {
         let fd = unsafe { libc::dup(dir.as_raw_fd()) };
@@ -100,7 +101,7 @@ pub(super) fn capture(root: &Path, spec: &Spec) -> Result<Files> {
     }
     let (mut out, mut total) = (BTreeMap::new(), 0);
     let top = File::open(root)?;
-    'paths: for e in &spec.editable {
+    'paths: for e in editable {
         let e = e.trim_end_matches('/');
         let parts: Vec<&str> = e.split('/').collect();
         // A symlinked parent directory is skipped like any symlink: nothing is read through it.
@@ -121,16 +122,16 @@ pub(super) fn capture(root: &Path, spec: &Spec) -> Result<Files> {
 /// stay, and so do directories. Nothing is reached through a symlink: directories on the way are opened (or created)
 /// without following links, and a snapshot path that runs into a symlink or a directory is refused. A missing `root` is
 /// created (a portfolio directory).
-pub(super) fn place(root: &Path, spec: &Spec, files: &Files) -> Result<()> {
+pub(super) fn place(root: &Path, editable: &[String], files: &Files) -> Result<()> {
     std::fs::create_dir_all(root)?;
     let root = std::fs::canonicalize(root)?;
-    place_checked(&root, spec, files, &|rel| Ok(root.join(rel)))
+    place_checked(&root, editable, files, &|rel| Ok(root.join(rel)))
 }
 
 /// `place` into a canonical `root`, with each editable path resolved by `resolve` (an agent's workspace: the policy's
 /// write check, so a reset goes where the agent's own `write` would).
-pub(super) fn place_checked(root: &Path, spec: &Spec, files: &Files, resolve: &dyn Fn(&str) -> Result<PathBuf>) -> Result<()> {
-    let current = capture(root, spec)?;
+pub(super) fn place_checked(root: &Path, editable: &[String], files: &Files, resolve: &dyn Fn(&str) -> Result<PathBuf>) -> Result<()> {
+    let current = capture(root, editable)?;
     for rel in current.keys().filter(|rel| !files.contains_key(*rel)) {
         crate::atomic_file::Target::open(&resolve(rel)?, false)?.remove()?;
     }
@@ -153,51 +154,44 @@ struct Stored {
     blob: String,
 }
 
-/// A snapshot's manifest (`{path: {mode, blob}}`) and its id, the start of the manifest's hash.
-fn manifest(files: &Files) -> Result<(Vec<u8>, String)> {
-    let stored: BTreeMap<&String, Stored> = files.iter()
-        .map(|(k, e)| (k, Stored { mode: e.mode & 0o777, blob: crate::eventlog::sha_bytes(&e.bytes) })).collect();
-    let bytes = serde_json::to_vec(&stored)?;
-    let id = crate::eventlog::sha_bytes(&bytes)[..16].to_string();
-    Ok((bytes, id))
+/// Store a snapshot in the run's blob store, through the orchestrator's journal (only it writes the run): each file's
+/// bytes once, content-addressed, however many snapshots hold them, then the manifest `{path: {mode, blob}}`, whose own
+/// hash is the snapshot's id. Each blob is durable before the next is written, so a manifest names only blobs that are.
+pub(super) fn save_snap(log: &EventLog, files: &Files) -> Result<String> {
+    let mut stored = BTreeMap::new();
+    for (rel, e) in files { stored.insert(rel, Stored { mode: e.mode & 0o777, blob: log.blob(&e.bytes)? }); }
+    log.blob(&serde_json::to_vec(&stored)?)
 }
 
-/// Store a snapshot under `dir/snaps`; returns its id. Each file's bytes are stored once, content-addressed, in
-/// `snaps/blobs/SHA` however many snapshots hold them; `snaps/ID.json` is the manifest.
-pub(super) fn save_snap(dir: &Path, files: &Files) -> Result<String> {
-    let blobs = dir.join("snaps").join("blobs");
-    std::fs::create_dir_all(&blobs)?;
-    for entry in files.values() {
-        store_whole(&blobs.join(crate::eventlog::sha_bytes(&entry.bytes)), &entry.bytes)?;
-    }
-    // The manifest last, so one that exists names only blobs that do.
-    let (bytes, id) = manifest(files)?;
-    store_whole(&dir.join("snaps").join(format!("{id}.json")), &bytes)?;
-    Ok(id)
-}
-
-/// Write a content-addressed file whole or not at all (a temporary name, then a rename). One of the right length is
-/// complete and kept; one torn by an older hx is shorter and rewritten.
-fn store_whole(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::metadata(path).map_or(true, |m| m.len() != bytes.len() as u64) {
-        crate::atomic_file::replace_trusted(path, bytes)?;
-    }
-    Ok(())
-}
-
+/// A stored snapshot; a damaged manifest or blob is an error, never other bytes.
 pub(super) fn load_snap(dir: &Path, id: &str) -> Result<Files> {
-    let raw: BTreeMap<String, Value> = serde_json::from_slice(&std::fs::read(dir.join("snaps").join(format!("{id}.json")))?)?;
-    raw.into_iter().map(|(rel, v)| {
-        // A snapshot from before modes and blobs: base64 bytes, read as an ordinary file.
-        if let Some(text) = v.as_str() {
-            return Ok((rel, Entry { mode: 0o644, bytes: base64::engine::general_purpose::STANDARD.decode(text)? }));
-        }
-        let stored: Stored = serde_json::from_value(v)?;
-        ensure!(stored.blob.len() == 64 && stored.blob.bytes().all(|b| b.is_ascii_hexdigit()), "snapshot {id}: malformed blob name");
-        let bytes = std::fs::read(dir.join("snaps").join("blobs").join(&stored.blob))?;
-        ensure!(crate::eventlog::sha_bytes(&bytes) == stored.blob, "snapshot {id}: {rel} is damaged");
-        Ok((rel, Entry { mode: stored.mode & 0o777, bytes }))
-    }).collect()
+    let stored: BTreeMap<String, Stored> = serde_json::from_slice(&read_blob(dir, id)?).with_context(|| format!("snapshot {id}"))?;
+    stored.into_iter().map(|(rel, s)| Ok((rel, Entry { mode: s.mode & 0o777, bytes: read_blob(dir, &s.blob)? }))).collect()
+}
+
+/// Files as they cross an episode's channel: `{path: {mode, data}}`, the bytes in base64.
+pub(super) fn to_wire(files: &Files) -> Value {
+    Value::Object(files.iter().map(|(rel, e)| (rel.clone(),
+        json!({"mode": e.mode & 0o777, "data": base64::engine::general_purpose::STANDARD.encode(&e.bytes)}))).collect())
+}
+
+/// Files from an episode's channel, held to what `capture` could have produced: paths inside the editable paths without
+/// `.`, `..` or empty components, and the snapshot limits.
+pub(super) fn from_wire(editable: &[String], wire: &Value) -> Result<Files> {
+    let map = wire.as_object().context("files must be an object")?;
+    ensure!(map.len() <= MAX_FILES, "editable paths hold more than {MAX_FILES} files");
+    let (mut out, mut total) = (Files::new(), 0);
+    for (rel, v) in map {
+        let parts: Vec<&str> = rel.split('/').collect();
+        ensure!(parts.len() <= MAX_DEPTH + 8 && parts.iter().all(|c| !c.is_empty() && *c != "." && *c != "..")
+            && editable.iter().any(|e| { let e = e.trim_end_matches('/'); rel == e || rel.starts_with(&format!("{e}/")) }),
+            "{rel:?} is not an editable file");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().context("file data")?)?;
+        total += bytes.len();
+        ensure!(total <= MAX_SNAPSHOT, "editable files exceed {} MiB", MAX_SNAPSHOT >> 20);
+        out.insert(rel.clone(), Entry { mode: v["mode"].as_u64().context("file mode")? as u32 & 0o777, bytes });
+    }
+    Ok(out)
 }
 
 /// A fresh private directory in the system temp dir; removed on drop. Nothing a process started in it can still be
@@ -205,17 +199,18 @@ pub(super) fn load_snap(dir: &Path, id: &str) -> Result<Files> {
 /// died with them.
 pub(super) struct Scratch(pub(super) PathBuf);
 
-/// A recorded scratch path is not authority to delete files: only a direct, non-symlink child of the system temp
-/// directory with the name `Scratch::new("ws")` gives an episode's copy.
-pub(super) fn valid_scratch(path: &Path) -> bool {
-    let Ok(base) = std::fs::canonicalize(std::env::temp_dir()) else { return false };
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let shaped = name.strip_prefix("hx-ar-ws-").and_then(|n| n.strip_suffix(".noindex")).is_some_and(|n| {
-        let parts: Vec<&str> = n.split('-').collect();
-        parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 20 && p.bytes().all(|b| b.is_ascii_digit()))
-    });
-    shaped && path.parent() == Some(base.as_path())
-        && std::fs::symlink_metadata(path).map_or(true, |m| m.is_dir() && !m.file_type().is_symlink())
+/// The copies an earlier orchestrator left for attempt `label` of the run `run` (its directory name): direct,
+/// non-symlink directories in the system temp dir named as `Scratch::episode` names them. Only these are removed on
+/// resume; nothing in the journal names a path to delete.
+pub(super) fn left_copies(run: &str, label: &str) -> Vec<PathBuf> {
+    let Ok(base) = std::fs::canonicalize(std::env::temp_dir()) else { return vec![] };
+    let tail = format!("-{}-{label}.noindex", run.trim_end_matches(".noindex"));
+    std::fs::read_dir(&base).into_iter().flatten().flatten().filter(|e| {
+        let name = e.file_name();
+        let pid = name.to_str().and_then(|n| n.strip_prefix("hx-ar-ws-")).and_then(|n| n.strip_suffix(tail.as_str()));
+        pid.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            && e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink())
+    }).map(|e| e.path()).collect()
 }
 /// The scratch directories this process holds, removed by `remove_scratch` when it is told to stop (it then runs no
 /// destructors).
@@ -227,14 +222,23 @@ impl Scratch {
         Scratch::new_in(&std::fs::canonicalize(std::env::temp_dir())?, kind)
     }
 
-    /// A new scratch directory in `parent`: an episode's evaluations go inside its own scratch copy, which the
-    /// orchestrator removes however the episode ended (a kill included).
-    pub(super) fn new_in(parent: &Path, kind: &str) -> Result<Scratch> {
+    fn new_in(parent: &Path, kind: &str) -> Result<Scratch> {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Scratch::named(parent.join(format!("hx-ar-{kind}-{}-{nanos}-{seq}.noindex", std::process::id())))
+    }
+
+    /// An episode attempt's copy, `hx-ar-ws-PID-RUN-LABEL.noindex`: named from its run and label, so a resumed
+    /// orchestrator finds what its predecessor left (`left_copies`), and from this process, so any later process
+    /// removes it once this one is gone (`sweep_dead`).
+    pub(super) fn episode(run: &str, label: &str) -> Result<Scratch> {
+        let base = std::fs::canonicalize(std::env::temp_dir())?;
+        Scratch::named(base.join(format!("hx-ar-ws-{}-{}-{label}.noindex", std::process::id(), run.trim_end_matches(".noindex"))))
+    }
+
+    fn named(path: PathBuf) -> Result<Scratch> {
         // `.noindex`: Spotlight skips it, so the copies a run churns through are never indexed.
-        let path = parent.join(format!("hx-ar-{kind}-{}-{nanos}-{seq}.noindex", std::process::id()));
         std::fs::create_dir(&path)?;
         LIVE.lock().unwrap().insert(path.clone());
         Ok(Scratch(path))
@@ -320,24 +324,11 @@ pub(super) fn cap_report(report: Value) -> Value {
     Value::Object(out)
 }
 
-/// Evaluator runs a run may have at once, across all its episodes (separate processes): the spec's `eval_jobs`, or half
-/// the CPUs and at least one, so search evaluations side by side neither starve each other nor time out by load.
+/// Evaluator runs a run may have at once (the orchestrator runs them all): the spec's `eval_jobs`, or half the CPUs and
+/// at least one, so search evaluations side by side neither starve each other nor time out by load.
 pub(super) fn eval_jobs(spec: &Spec) -> usize {
     spec.eval_jobs.filter(|n| *n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)))
-}
-
-/// One of the run's `jobs` evaluator slots, `run/slots/N`, held (`flock`) until the file is dropped.
-async fn eval_slot(run: &Path, jobs: usize) -> Result<File> {
-    let dir = run.join("slots");
-    std::fs::create_dir_all(&dir)?;
-    loop {
-        for n in 0..jobs.max(1) {
-            let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(n.to_string()))?;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { return Ok(file); }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
 }
 
 /// Mounting an evaluator's tree as an overlay failed once here: copy from then on.
@@ -348,7 +339,7 @@ fn base_files(base: &Path, spec: &Spec) -> Result<Vec<String>> {
     static CACHE: std::sync::Mutex<Option<(PathBuf, Vec<String>)>> = std::sync::Mutex::new(None);
     let mut cache = CACHE.lock().unwrap();
     if let Some((at, files)) = cache.as_ref().filter(|(at, _)| at == base) { let _ = at; return Ok(files.clone()); }
-    let files: Vec<String> = capture(base, spec)?.into_keys().collect();
+    let files: Vec<String> = capture(base, &spec.editable)?.into_keys().collect();
     *cache = Some((base.to_path_buf(), files.clone()));
     Ok(files)
 }
@@ -367,7 +358,7 @@ fn overlay(spec: &Spec, run: &Path, files: &Files, scratch: &Scratch) -> Result<
     let paths: Vec<&Path> = overlay.lower.iter().chain([&overlay.upper, &overlay.work, &overlay.target]).map(PathBuf::as_path).collect();
     if !crate::confine::Overlay::expressible(&paths) { return Ok(None); }
     for dir in [&overlay.lower[0], &overlay.upper, &overlay.work, &overlay.target] { std::fs::create_dir(dir)?; }
-    place(&overlay.lower[0], spec, files)?;
+    place(&overlay.lower[0], &spec.editable, files)?;
     Ok(Some(overlay))
 }
 
@@ -378,15 +369,9 @@ fn overlay(spec: &Spec, run: &Path, files: &Files, scratch: &Scratch) -> Result<
 /// for the select evaluator), and write only its scratch directory. Candidate code running inside it can read what it
 /// reads, so a failed evaluator's output is never returned (that would carry grader or held-out files to the agent):
 /// the result says only how it failed, and the output is kept for the owner in the run's `failures/SNAP.txt`.
-pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, holdout: bool) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
-    evaluate_in(None, spec, run, files, cmd, holdout).await
-}
-
-/// `evaluate` with its copy in `home` (an episode's scratch copy) instead of the system temp dir.
-pub(super) async fn evaluate_in(home: Option<&Path>, spec: &Spec, run: &Path, files: &Files, cmd: &str, holdout: bool) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
-    let _slot = eval_slot(run, eval_jobs(spec)).await?;
+pub(super) async fn evaluate(spec: &Spec, run: &Path, snap: &str, files: &Files, cmd: &str, holdout: bool) -> Result<(Option<f64>, bool, Option<f64>, Value)> {
     sweep();
-    let scratch = match home { Some(home) => Scratch::new_in(home, "eval")?, None => Scratch::new("eval")? };
+    let scratch = Scratch::new("eval")?;
     let tree = scratch.0.join("tree");
     let tmp = scratch.0.join("tmp");
     std::fs::create_dir(&tmp)?;
@@ -400,7 +385,7 @@ pub(super) async fn evaluate_in(home: Option<&Path>, spec: &Spec, run: &Path, fi
         if layers.is_none() {
             let _ = std::fs::remove_dir(&tree);
             copy_tree(&run.join("base"), &tree)?;
-            place(&tree, spec, files)?;
+            place(&tree, &spec.editable, files)?;
         }
         let env = crate::prims::ShellEnv { env: Some(evaluator_env(&tmp)), confine: confine.clone(),
             isolate: Some(crate::confine::Isolate { net: true, overlay: layers.clone() }) };
@@ -424,7 +409,7 @@ pub(super) async fn evaluate_in(home: Option<&Path>, spec: &Spec, run: &Path, fi
             None => "the evaluator was killed by a signal".to_string(),
         };
         let tail = |s: &str| s.chars().rev().take(FAILURE_CHARS).collect::<Vec<_>>().into_iter().rev().collect::<String>();
-        let (kept, snap) = (run.join("failures"), manifest(files)?.1);
+        let kept = run.join("failures");
         let _ = std::fs::create_dir_all(&kept).and_then(|_| std::fs::write(kept.join(format!("{snap}.txt")),
             format!("{why}\n--- stdout (end)\n{}\n--- stderr (end)\n{}\n", tail(&stdout), tail(&String::from_utf8_lossy(&stderr)))));
         return Ok((None, false, None, json!({"error": format!("{why}; its output is kept for the owner, not shown to agents")})));
@@ -551,7 +536,7 @@ mod tests {
         std::os::unix::fs::symlink(&secret, ws.join("pkg/linkdir")).unwrap();
         std::os::unix::fs::symlink(&secret, ws.join("linked")).unwrap();
         let spec: Spec = toml::from_str("editable = [\"pkg/\", \"linked/answers.txt\", \"missing/x\", \"other/none\"]\neval = \"true\"").unwrap();
-        let files = capture(&ws, &spec).unwrap();
+        let files = capture(&ws, &spec.editable).unwrap();
         assert_eq!(files.keys().collect::<Vec<_>>(), vec!["pkg/a.txt", "pkg/sub/b.bin"]);
         assert_eq!(files["pkg/sub/b.bin"].bytes, vec![0u8, 255]);
         let _ = std::fs::remove_dir_all(dir);
@@ -560,34 +545,34 @@ mod tests {
     fn entry(mode: u32, bytes: &str) -> Entry { Entry { mode, bytes: bytes.as_bytes().to_vec() } }
 
     #[test]
-    fn snapshots_are_written_whole_and_share_blobs() {
+    fn snapshots_share_blobs_and_cross_the_channel_checked() {
         let dir = temp("snaps");
+        std::fs::write(dir.join("journal.jsonl"), "").unwrap();
+        let log = EventLog::reopen(&dir.join("journal.jsonl")).unwrap();
         let files = Files::from([("x.txt".to_string(), entry(0o644, "7\n")), ("run.sh".to_string(), entry(0o755, "#!/bin/sh\n"))]);
-        let id = save_snap(&dir, &files).unwrap();
-        // A snapshot or blob torn by a killed writer is rewritten, not taken as stored.
-        let path = dir.join("snaps").join(format!("{id}.json"));
-        let whole = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
-        let blob = dir.join("snaps/blobs").join(crate::eventlog::sha_bytes(b"7\n"));
-        std::fs::write(&blob, "7").unwrap();
-        assert_eq!(save_snap(&dir, &files).unwrap(), id);
+        let id = save_snap(&log, &files).unwrap();
+        assert_eq!(save_snap(&log, &files).unwrap(), id);
         assert_eq!(load_snap(&dir, &id).unwrap(), files, "bytes and modes come back");
         // The manifest names modes and blobs; no file is stored as base64 in it.
-        let manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let manifest: Value = serde_json::from_slice(&read_blob(&dir, &id).unwrap()).unwrap();
         assert_eq!(manifest["run.sh"]["mode"], json!(0o755));
-        // A second snapshot that changes one file stores one more blob, and a mode change none.
+        // A second snapshot that changes one file stores one more blob (and its manifest), and a mode change only a manifest.
         let mut next = files.clone();
         next.insert("x.txt".into(), entry(0o644, "8\n"));
         next.insert("run.sh".into(), entry(0o644, "#!/bin/sh\n"));
-        let other = save_snap(&dir, &next).unwrap();
+        let other = save_snap(&log, &next).unwrap();
         assert_ne!(other, id, "a mode is part of the snapshot");
-        assert_eq!(std::fs::read_dir(dir.join("snaps/blobs")).unwrap().count(), 3);
-        assert_eq!(std::fs::read_dir(dir.join("snaps")).unwrap().count(), 3, "a temporary file was left behind");
-        // A damaged blob is an error, never other bytes; a snapshot from before blobs still loads.
-        std::fs::write(&blob, "9\n").unwrap();
-        assert!(load_snap(&dir, &id).unwrap_err().to_string().contains("damaged"));
-        std::fs::write(dir.join("snaps/old.json"), r#"{"x.txt":"Nwo="}"#).unwrap();
-        assert_eq!(load_snap(&dir, "old").unwrap(), Files::from([("x.txt".to_string(), entry(0o644, "7\n"))]));
+        assert_eq!(std::fs::read_dir(dir.join("blobs")).unwrap().count(), 5);
+        // A damaged blob is an error, never other bytes.
+        std::fs::write(dir.join("blobs").join(crate::eventlog::sha_bytes(b"7\n")), "9\n").unwrap();
+        assert!(load_snap(&dir, &id).unwrap_err().to_string().contains("mismatch"));
+        // What crosses the channel comes back exactly, and only editable files within the limits do.
+        let editable = vec!["x.txt".to_string(), "pkg/".to_string()];
+        let sent = Files::from([("x.txt".to_string(), entry(0o755, "1")), ("pkg/a/b".to_string(), entry(0o600, "\u{0}"))]);
+        assert_eq!(from_wire(&editable, &to_wire(&sent)).unwrap(), sent);
+        for bad in ["y.txt", "pkg/../y", "pkg//a", "pkg/./a", "/x.txt", "x.txt/"] {
+            assert!(from_wire(&editable, &json!({bad: {"mode": 420, "data": ""}})).is_err(), "{bad}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -606,14 +591,14 @@ mod tests {
         let before = std::fs::metadata(ws.join("pkg/same.txt")).unwrap().modified().unwrap();
         let files = Files::from([("pkg/run.sh".to_string(), entry(0o755, "new")), ("pkg/same.txt".to_string(), entry(0o644, "same")),
             ("pkg/sub/deep/n.txt".to_string(), entry(0o600, "n"))]);
-        place(&ws, &spec, &files).unwrap();
-        assert_eq!(capture(&ws, &spec).unwrap(), files, "exactly the snapshot, modes included");
+        place(&ws, &spec.editable, &files).unwrap();
+        assert_eq!(capture(&ws, &spec.editable).unwrap(), files, "exactly the snapshot, modes included");
         assert!(std::fs::symlink_metadata(ws.join("pkg/link")).unwrap().file_type().is_symlink(), "a skipped symlink stays");
         assert!(std::fs::symlink_metadata(ws.join("pkg/linkdir")).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::metadata(ws.join("pkg/same.txt")).unwrap().modified().unwrap(), before, "an unchanged file is not rewritten");
         // A snapshot path through a symlinked directory is refused, and nothing is written through it.
         let through = Files::from([("pkg/linkdir/planted.txt".to_string(), entry(0o644, "p"))]);
-        assert!(place(&ws, &spec, &through).is_err());
+        assert!(place(&ws, &spec.editable, &through).is_err());
         assert!(!dir.join("elsewhere/planted.txt").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -647,7 +632,7 @@ h=$(grep -l '^[h]{}' /proc/[0-9]*/cmdline | wc -l)\necho \"{{\\\"score\\\": $n, 
         for keep in [true, false] {
             let mut files = Files::from([("pkg/run.sh".to_string(), Entry { mode: 0o755, bytes: script.clone().into_bytes() })]);
             if keep { files.insert("pkg/gone.txt".into(), entry(0o644, "g")); }
-            let (score, valid, _, report) = evaluate(&spec, &run, &files, "./pkg/run.sh", false).await.unwrap();
+            let (score, valid, _, report) = evaluate(&spec, &run, "s", &files, "./pkg/run.sh", false).await.unwrap();
             assert!(valid, "{report}");
             assert!(score.unwrap() <= 6.0 && report["held"] == 1, "the evaluator sees only its own processes, its leftover among them: {score:?} {report}");
             assert_eq!((report["gone"].clone(), report["data"].clone()), (json!(keep as u8), json!("d")), "{report}");
@@ -665,28 +650,13 @@ h=$(grep -l '^[h]{}' /proc/[0-9]*/cmdline | wc -l)\necho \"{{\\\"score\\\": $n, 
         if !isolated() { return; }
         let (run, spec) = run_with_base("eval-fail", &[("pkg/a.txt", "a", 0o644)]);
         let files = Files::from([("pkg/a.txt".to_string(), entry(0o644, "a"))]);
-        let (score, valid, _, report) = evaluate(&spec, &run, &files, "echo GRADER-SECRET-OUT; echo GRADER-SECRET-ERR >&2; exit 3", false).await.unwrap();
+        let (score, valid, _, report) = evaluate(&spec, &run, "s", &files, "echo GRADER-SECRET-OUT; echo GRADER-SECRET-ERR >&2; exit 3", false).await.unwrap();
         assert_eq!((score, valid), (None, false));
         assert!(!report.to_string().contains("GRADER-SECRET") && report["error"].as_str().unwrap().contains("status 3"), "{report}");
-        let kept = std::fs::read_to_string(run.join("failures").join(format!("{}.txt", manifest(&files).unwrap().1))).unwrap();
+        let kept = std::fs::read_to_string(run.join("failures/s.txt")).unwrap();
         assert!(kept.contains("GRADER-SECRET-OUT") && kept.contains("GRADER-SECRET-ERR"), "the owner keeps the output: {kept}");
-        let (_, valid, _, report) = evaluate(&spec, &run, &files, "echo '{\"score\": 1, \"report\": {\"ok\": true}}' ; exit 1", false).await.unwrap();
+        let (_, valid, _, report) = evaluate(&spec, &run, "s", &files, "echo '{\"score\": 1, \"report\": {\"ok\": true}}' ; exit 1", false).await.unwrap();
         assert!(!valid && report.get("ok").is_none(), "{report}");
-        let _ = std::fs::remove_dir_all(run);
-    }
-
-    #[tokio::test]
-    async fn evaluator_slots_limit_concurrent_runs() {
-        let run = temp("slots");
-        let first = eval_slot(&run, 1).await.unwrap();
-        let waiting = tokio::time::timeout(std::time::Duration::from_millis(300), eval_slot(&run, 1)).await;
-        assert!(waiting.is_err(), "a second evaluation started while the only slot was held");
-        drop(first);
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), eval_slot(&run, 1)).await.is_ok());
-        let two = (eval_slot(&run, 2).await.unwrap(), eval_slot(&run, 2).await.unwrap());
-        drop(two);
-        let spec: Spec = toml::from_str("editable = [\"x\"]\neval = \"true\"").unwrap();
-        assert!(eval_jobs(&spec) >= 1);
         let _ = std::fs::remove_dir_all(run);
     }
 
@@ -715,19 +685,23 @@ h=$(grep -l '^[h]{}' /proc/[0-9]*/cmdline | wc -l)\necho \"{{\\\"score\\\": $n, 
     }
 
     #[test]
-    fn only_episode_scratch_copies_are_cleaned_up() {
-        let scratch = Scratch::new("ws").unwrap();
-        assert!(valid_scratch(&scratch.0));
+    fn a_resumed_run_finds_only_its_own_episode_copies() {
+        let (run, other) = (format!("1-{}.noindex", std::process::id()), format!("2-{}.noindex", std::process::id()));
+        let mine = Scratch::episode(&run, "r1-w3.2").unwrap();
+        let theirs = Scratch::episode(&other, "r1-w3.2").unwrap();
+        let sibling = Scratch::episode(&run, "r1-w3").unwrap();
+        assert_eq!(left_copies(&run, "r1-w3.2"), vec![mine.0.clone()]);
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let link = base.join(format!("hx-ar-ws-{}-1-999.noindex", std::process::id()));
-        std::os::unix::fs::symlink(&scratch.0, &link).unwrap();
-        assert!(!valid_scratch(&link), "a symlinked scratch path");
+        let link = base.join(format!("hx-ar-ws-1-{}-r1-w4.noindex", run.trim_end_matches(".noindex")));
+        std::os::unix::fs::symlink(&mine.0, &link).unwrap();
+        assert!(left_copies(&run, "r1-w4").is_empty(), "a symlinked copy is not removed through");
         let _ = std::fs::remove_file(&link);
-        for bad in ["/home", "/", "/tmp/../home/hx-ar-ws-1-2-3.noindex"] { assert!(!valid_scratch(Path::new(bad)), "{bad}"); }
-        assert!(!valid_scratch(&base.join("hx-ar-eval-1-2-3.noindex")));
-        assert!(!valid_scratch(&base.join("hx-ar-ws-1-2.noindex")));
-        assert!(!valid_scratch(&base.join("x").join("hx-ar-ws-1-2-3.noindex")));
-        assert!(valid_scratch(&base.join("hx-ar-ws-1-2-3.noindex")), "a scratch copy that is already gone");
+        drop((theirs, sibling));
+        let gone = mine.0.clone();
+        drop(mine);
+        assert!(!gone.exists() && left_copies(&run, "r1-w3.2").is_empty());
+        let spec: Spec = toml::from_str("editable = [\"x\"]\neval = \"true\"").unwrap();
+        assert!(eval_jobs(&spec) >= 1);
     }
 
     #[test]

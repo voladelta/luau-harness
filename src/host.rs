@@ -93,6 +93,10 @@ impl AgentOptions {
     }
 }
 
+fn http() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).read_timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?)
+}
+
 impl Host {
     pub fn start(llm: LlmCfg, policy: Arc<Policy>, options: StartOptions) -> Result<Arc<Self>> {
         let StartOptions { task, max_turns, trace, budget: flags, mut packs, branch, workflow } = options;
@@ -111,6 +115,16 @@ impl Host {
         Self::from_supervisor(Supervisor::resume(policy)?, trace)
     }
 
+    /// A host that only makes model calls (`complete`), admitted and journaled under `policy`: the autoresearch
+    /// orchestrator plans ideas through it.
+    pub fn calls_only(llm: LlmCfg, policy: Arc<Policy>) -> Result<Arc<Self>> {
+        let key = llm.key()?;
+        let supervisor = Supervisor::ephemeral(policy.clone(), Arc::new(crate::modules::Registry::default()));
+        Ok(Arc::new(Self { llm, workspace: policy.workspace.clone(), policy, principal: Principal::Agent { read_only: true },
+            durable: Arc::new(Mutex::new(json!({}))), lane: "root".into(), max_turns: 0, depth: 0, max_depth: 0, http: http()?,
+            trace: Arc::new(Mutex::new(None)), key, packs: vec![], supervisor }))
+    }
+
     fn from_supervisor(supervisor: Arc<Supervisor>, trace: Option<PathBuf>) -> Result<Arc<Self>> {
         let m = supervisor.manifest.as_ref().context("missing run manifest")?;
         let key = if matches!(&supervisor.restored,Some(RunState::Finished{..}|RunState::AwaitingReview{..})) {m.model.key().unwrap_or_default()} else {m.model.key()?};
@@ -118,8 +132,7 @@ impl Host {
         Ok(Arc::new(Self { llm: m.model.clone(), workspace: m.policy.workspace.clone(), policy: supervisor.policy.clone(),
             principal: Principal::Agent { read_only: false }, durable: supervisor.durable.clone(), lane: "root".into(),
             max_turns: m.max_turns, depth: 0, max_depth: 2,
-            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).read_timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?,
-            trace: Arc::new(Mutex::new(file)), key, packs: m.packs.clone(), supervisor }))
+            http: http()?, trace: Arc::new(Mutex::new(file)), key, packs: m.packs.clone(), supervisor }))
     }
 
     pub fn child(&self, options: &AgentOptions, principal: Principal) -> Result<Arc<Self>> {

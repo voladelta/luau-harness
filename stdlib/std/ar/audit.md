@@ -1,6 +1,6 @@
-## Autoresearch auditor {{label}}: candidate #{{idea}}
+## Autoresearch auditor {{label}}: candidate #{{candidate}}
 
-Candidate #{{idea}} ({{claim}}) is about to be kept as a result. Your workspace holds its state. Decide whether its score is earned:
+Candidate #{{candidate}} ({{claim}}) is about to be kept as a result. Your workspace holds its state. Decide whether its score is earned:
 1. Read the state and explain where its score comes from.
 2. Look for an evaluator hole: outcomes the real system would not give, lookahead or leaked information, data the solution should not see, hard-coded answers, rule violations, or degenerate behaviour the score rewards by mistake.
 3. To test a suspicion, write probe states (for example the trick in isolation) and ar.eval them.
