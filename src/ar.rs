@@ -870,7 +870,7 @@ impl Orchestrator {
     fn vars(&self, plan: &Plan, label: &str, book: &Book) -> Vec<(&'static str, String)> {
         let spec = self.spec();
         vec![("label", label.to_string()), ("workers", spec.workers.to_string()), ("editable", spec.editable.join(", ")),
-            ("candidate", plan.candidate.to_string()), ("claim", book.idea(plan.candidate)), ("idea", plan.idea.clone().unwrap_or_default()),
+            ("candidate", plan.candidate.to_string()), ("candidate_idea", book.idea(plan.candidate)), ("idea", plan.idea.clone().unwrap_or_default()),
             ("best", show(plan.best))]
     }
 
