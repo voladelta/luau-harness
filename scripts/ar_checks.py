@@ -134,14 +134,17 @@ def outputs(requests):
     return [item.get("output", "") for body in requests for item in body.get("input", []) if item.get("type") == "function_call_output"]
 
 
+def verdict_code(passed, reason=""):
+    return {"code": f'if ar.verdict then ar.verdict{{pass = {str(passed).lower()}, reason = {json.dumps(reason)}}}; return "RECORDED" end\n'
+                    'return "PWD " .. sh("pwd").stdout'}
+
+
 def audit(body, passed, reason=""):
     """An auditor's reply: its verdict through `ar.verdict{pass, reason}` (passed=None: it gives none). An hx whose
     episodes do not have `ar.verdict` yet gets the verdict file `ar.verdict` writes from the check itself, found through
     the auditor's working directory (its scratch copy, journaled when the episode started)."""
     if passed is None: return "Checked the state; ran out of steps before deciding."
-    if not answered(body):
-        return {"code": f'if ar.verdict then ar.verdict{{pass = {str(passed).lower()}, reason = {json.dumps(reason)}}}; return "RECORDED" end\n'
-                        'return "PWD " .. sh("pwd").stdout'}
+    if not answered(body): return verdict_code(passed, reason)
     pwd = next((o.split("PWD ", 1)[1].split()[0] for o in outputs([body]) if "PWD " in o), None)
     if pwd:
         label = role_of(body)[1]
@@ -338,7 +341,7 @@ def scenario_00():
     check("claims are served first come, first served: a duplicate idea is turned away and its worker claims another; a placeholder claim is refused")
 
     assert (run / "episodes/r0-research.report.json").exists() and "BRIEF:" in (run / "episodes/r1-w1.md").read_text()
-    gates = [r for r in records if r["kind"] == "gate"]
+    gates = [r for r in records if r["kind"] == "gate" and not r["last"]]
     assert [g["round"] for g in gates] == [1, 2, 3, 4], gates
     three = next(c["n"] for c in explore if c["idea"] == go(3))
     six = next(c["n"] for c in explore if c["idea"] == go(6))
@@ -970,8 +973,11 @@ def scenario_interrupt():
     # Finding 2: stopping the orchestrator three times before round 1's workers score uses up nothing; once the provider
     # works, the run finishes. Each killed child's temp directory was inside its scratch copy and went with it (15).
     path = workspace("interrupt", spec=workers(2, 1))
+    working = lanes({"r1-w1": [3], "r1-w2": [2]})
+    fixed = []  # the provider works once the owner has fixed it; the run keeps the provider it was launched with
     def sleepy(body, index):
         role = role_of(body)[0]
+        if fixed: return working(body, index)
         if role == "explore" and not answered(body): return {"code": 'sh("sleep 120")\nreturn "late"'}
         return "Answer: 0" if role == "judge" else "BRIEF" if role == "research" else "done"
     def started(n):
@@ -993,9 +999,9 @@ def scenario_interrupt():
             p.wait()
             if n < 6:
                 p = subprocess.Popen(resume(run), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    with harness.provider(lanes({"r1-w1": [3], "r1-w2": [2]})) as (url, requests):
+        fixed.append(True)
         result = subprocess.run(resume(run), env=harness.ENV, capture_output=True, text=True, timeout=300)
-    assert result.returncode == 0 and requests, result.stderr[-2000:]
+    assert result.returncode == 0, result.stderr[-2000:]
     records = journal_of(path)
     assert [r["label"] for r in records if r["kind"] == "started" and r["label"].startswith("r1-w1")] == ["r1-w1", "r1-w1.2", "r1-w1.3", "r1-w1.4"]
     killed = [r for r in records if r["kind"] == "finished" and r["outcome"] == "interrupted"]
@@ -1101,6 +1107,26 @@ def scenario_rebuild():
     tmp = next(o for o in outputs(requests) if "TMP " in o).split("TMP ")[1].split()[0]
     assert re.search(r"/hx-ar-ws-[^/]+/tmp/hx-\d+-\d+$", tmp), tmp
     check("episodes keep running the orchestrator's own binary after it is replaced, with temp directories in their copies (finding 15)")
+
+
+def scenario_late_verdict():
+    # An auditor that works until the turn-cap notice and records its verdict in the turn after it (the last one with
+    # tools) is audited; its tool-less last reply is prose, which never counts.
+    path = workspace("late-verdict", {"x.txt": "0\n", "search.py": LINEAR % "x"}, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\nworkers = 1\nmax_rounds = 1\n')
+    turns = []
+    def reply(body, index):
+        if role_of(body)[0] != "audit": return lanes({"r1-w1": [3]})(body, index)
+        outs = outputs([body])
+        turns.append(len(outs))
+        if any("PWD " in o or "RECORDED" in o for o in outs): return audit(body, True)
+        if outs and "[hx] The run stops" in outs[-1]: return verdict_code(True)
+        return {"code": 'return "still looking"'}
+    with harness.provider(reply) as (url, _):
+        report = report_of(ar(path, url))
+    records = journal_of(path)
+    assert max(turns) >= 30 and [r["pass"] for r in records if r["kind"] == "audited"] == [True], (max(turns), records[-3:])
+    assert [snap_x(path, report, p["snap"]) for p in report["portfolio"]] == [3], report
+    check("an auditor that records its verdict right after the turn-cap notice is audited")
 
 
 # Scenarios are independent (own workspace, own mock provider), so a few run side by side; more would load the machine.

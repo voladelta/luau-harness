@@ -1131,14 +1131,18 @@ grader and held-out data and rewrite the run's records. Run hx in a sandbox of y
     Ok(())
 }
 
-/// The hx binary episodes run, resolved once at launch. On Linux it is `/proc/self/exe`, which names this process's
-/// own executable even after the file at its path is replaced or deleted, so rebuilding hx during a run can neither
-/// change nor break later episodes (a copy into the run directory would do the same at the cost of a binary per run).
-/// Elsewhere it is the path this process started from.
-fn hx_exe() -> Result<PathBuf> {
+/// The hx binary episodes run: a copy of this process's own executable in the run directory, made when the orchestrator
+/// starts. Rebuilding hx replaces the file at its path (the old one is unlinked), so spawning that path would change
+/// later episodes mid-run, and spawning `/proc/self/exe` would start children whose own executable is deleted (a child
+/// reads it to record its hash). On Linux the copy is read from `/proc/self/exe`, so even a rebuild that lands during
+/// the copy cannot change it.
+fn hx_exe(dir: &Path) -> Result<PathBuf> {
     let proc = Path::new("/proc/self/exe");
-    if cfg!(target_os = "linux") && proc.exists() { return Ok(proc.to_path_buf()); }
-    Ok(std::env::current_exe()?)
+    let from = if cfg!(target_os = "linux") && proc.exists() { proc.to_path_buf() } else { std::env::current_exe()? };
+    let (to, tmp) = (dir.join("hx"), dir.join(".hx.tmp"));
+    std::fs::copy(&from, &tmp).with_context(|| format!("copying the hx binary into {}", dir.display()))?;
+    std::fs::rename(&tmp, &to)?;
+    Ok(to)
 }
 
 /// `hx run --ar`: search until two rounds in a row make no progress, or continue the run in `resume` (a run directory).
@@ -1186,7 +1190,8 @@ this version reads differently; it cannot be resumed or finished here: start a n
         }
         (None, None) => bail!("--ar needs a program, or --resume RUN_DIR"),
     };
-    let mut o = Orchestrator::new(workspace, dir, launch, hx_exe()?);
+    let exe = hx_exe(&dir)?;
+    let mut o = Orchestrator::new(workspace, dir, launch, exe);
     let report = if options.finish {
         o.close()?;
         eprintln!("hx ar: finishing run {} from its last gate", o.dir.display());
@@ -1452,10 +1457,12 @@ mod tests {
     }
 
     #[test]
-    fn episodes_spawn_the_running_binary() {
-        let exe = hx_exe().unwrap();
-        if cfg!(target_os = "linux") { assert_eq!(exe, Path::new("/proc/self/exe")); }
-        assert!(exe.exists());
+    fn episodes_spawn_a_copy_of_the_running_binary() {
+        let dir = temp("exe");
+        let exe = hx_exe(&dir).unwrap();
+        assert_eq!(exe, dir.join("hx"));
+        assert_eq!(std::fs::read(&exe).unwrap(), std::fs::read(std::env::current_exe().unwrap()).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1464,7 +1471,7 @@ mod tests {
             "a {{y}} 2 {{z}}\nkept\n");
         let dir = temp("tasks");
         let launch = Launch { format: FORMAT, spec: spec("select = \"s\"\n"), program: "PROGRAM".into(), child_args: vec![], commit: String::new() };
-        let o = Orchestrator::new(&dir.join("ws"), dir.clone(), launch, hx_exe().unwrap());
+        let o = Orchestrator::new(&dir.join("ws"), dir.clone(), launch, PathBuf::new());
         std::fs::write(dir.join("seed"), "seed").unwrap();
         let view = View { rows: vec![row(1, 1, "x3", 3.0)], claims: vec![claim(1)], brief: "BRIEF".into(), findings: String::new(),
             checks: Checks { verdicts: [("x3".to_string(), (false, "lookahead".to_string()))].into(), ..Checks::default() },
@@ -1517,7 +1524,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let spec = spec(&format!("select = \"python3 secret_select.py\"\ngrader = [\"{}\"]\nholdout = [\"{}\"]\n", grader.display(), holdout.display()));
         let launch = Launch { format: FORMAT, spec, program: String::new(), child_args: vec![], commit: String::new() };
-        let o = Orchestrator::new(&dir.join("ws"), run.clone(), launch, hx_exe().unwrap());
+        let o = Orchestrator::new(&dir.join("ws"), run.clone(), launch, PathBuf::new());
         let plan = plan("r1-w1", Role::Explore);
         let episode = o.child_episode(&plan, "r1-w1").unwrap();
         let text = serde_json::to_string(&episode.spec).unwrap();

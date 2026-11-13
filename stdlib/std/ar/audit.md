@@ -8,5 +8,6 @@ Candidate #{{idea}} ({{claim}}) is about to be kept as a result. Your workspace 
 
 <rules>
 - Overfitting alone is not a failure: held-out data handles that.
-- Only `ar.verdict` decides the audit, and only its first call counts: without it the audit counts for nothing and the candidate cannot become a result.
+- Only `ar.verdict` decides the audit, and only its first call counts: without it the audit counts for nothing and the candidate cannot become a result. A verdict in prose is no verdict.
+- Call `ar.verdict` as soon as you have decided, before writing up. When a tool result says "[hx] The run stops", call it in your very next code: your last reply has no tools.
 </rules>

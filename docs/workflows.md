@@ -58,7 +58,8 @@ Program design must plan at least one executable check. Verification checks exac
 
 ```bash
 hx run --ar --prompt-file program.md --model MODEL
-hx run --ar --resume RUN                   # continue an interrupted search (`hx runs` lists RUN)
+hx run --ar --resume RUN                   # continue a stopped search (`hx runs` lists RUN)
+hx run --ar --resume RUN --finish          # write the result of the last gate now, start nothing
 ```
 
 ### `.harness/ar.toml`
@@ -71,24 +72,31 @@ eval = "$HOME/grader/eval search --file ar/strategy.pine"    # the agent sees th
 select = "$HOME/grader/eval select --file ar/strategy.pine"  # held out: only the controller sees these
 grader = ["~/grader/bin", "~/grader/search"]                 # read-only for both evaluators
 holdout = ["~/grader/select"]                                # read-only for select only
-min_delta = 0.05
+direction = "max"                                             # or "min"
+min_delta = 0.05                                              # the smallest lift that counts
 episode_secs = 900                                            # wall-clock cap per episode (default 15 min)
+workers = 8                                                   # episodes side by side per round (default 8)
+max_rounds = 20                                               # rounds at most (default 20)
 ```
 
-`select` must reach the shift the result has to survive (other years, symbols or input ranges) and have enough cases to tell candidates apart.
+`select` must reach the shift the result has to survive (other years, symbols or input ranges) and have enough cases to tell candidates apart. A seed the search evaluator cannot score, or with `select` one the select evaluator cannot score, stops the run before any episode.
 
 ### How a search runs
 
-1. **Freeze.** The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it. `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, with a scrubbed environment, confined on Linux to its copy and the `grader` roots; network confinement must be supplied externally. Only the editable paths carry between episodes.
-2. **Research.** A research episode writes a brief.
-3. **Workers.** Eight workers (six after a provider rate limit) run side by side. Each derives its own idea from a host seed with [String Seed of Thought](https://pub.sakana.ai/ssot/) and claims it with `ar.claim`, first come, first served, so no two pursue the same core approach. `ar.claims()` lists what is taken; a placeholder claim is refused. Workers implement and fix their idea, then return without tuning it; depth comes from rounds.
-4. **Gate.** The three most promising candidates pass to the next rounds, even raw ones below the seed. Candidates that beat the seed on search and are not worse on `select` are audited for evaluator holes; only those can become results.
-5. **Rounds.** Refinement continues while it moves the chosen candidates; exploring starts again when it doesn't. Two rounds in a row without progress (a new good candidate, or a gain above `min_delta` and the evaluator's `se`) end the run, and no run takes more than 20 rounds.
+1. **Freeze.** The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it, and only snapshots of the editable paths carry between episodes. `ar.eval("hypothesis")` scores a snapshot in another throwaway copy.
+2. **Research.** A research episode writes a brief for every worker.
+3. **Explore.** Workers run side by side. Each derives its own idea from a host seed with [String Seed of Thought](https://pub.sakana.ai/ssot/) and claims it with `ar.claim`, so no two pursue the same core approach; each idea is a candidate.
+4. **Gate.** For each candidate the gate finds its *frontier*, its best state that no check rejected, and its *result*, its best state that beats the seed by the margin, is not worse than the seed on `select` and passed an audit. A failed audit or a `select` veto costs only that state. An auditor records its verdict with `ar.verdict{pass, reason}`; one that does not gives none, and nothing becomes a result without a passing audit. A candidate is audited when it first beats the seed, and again at the end of the run if it improved by more than the margin.
+5. **Refine.** The three strongest frontiers go on to the next round, which refines them; a round that moves none explores again. Two rounds in a row without progress (a new good candidate, or a lift by more than the margin) or `max_rounds` end the run.
 
-A failed audit costs only the audited state: its candidate falls back to its best state that no audit failed, and a later refinement is audited in turn. An audit counts only with an explicit `VERDICT: PASS` or `VERDICT: FAIL`. Evaluators and episode shell commands cannot use `/dev/shm`, so Python multiprocessing locks, queues and pools fail inside them; use threads or plain subprocesses. Ordinary runs keep `/dev/shm`.
+The margin is `min_delta`, or the standard error of the difference when the evaluator reports `se` and that is larger. The held-out score is only a veto, computed only for states that beat the seed and never shown to agents: ranking on it too would select on it every round until it is as optimistic as the search score.
 
-Episodes are limited in model turns, not dollars. The result is a portfolio of distinct good candidates, best search score first.
+### Isolation
 
-The held-out score is only a veto. Ranking on it too would select on it every round until it is as optimistic as the search score.
+On Linux with Landlock, episode shell commands and evaluators are confined to their copies: the agent cannot read the grader or held-out roots, the run's records or the owner's workspace, and only the select evaluator reads `holdout`. Network isolation is up to you. Without Landlock (macOS, older kernels, containers that filter it) a spec with `select`, `grader` or `holdout` is refused unless you pass `--ar-unconfined` inside a sandbox of your own. Evaluators and episode shell commands cannot use `/dev/shm`, so Python multiprocessing locks, queues and pools fail inside them; use threads or plain subprocesses.
+
+### Result and resume
+
+The portfolio is the distinct results, best search score first, at most three: in `portfolio/c<id>/` of the run directory, and the first goes into the workspace's editable paths. With no result the workspace is not touched. `--resume RUN` continues a stopped run where it was, with the settings frozen at launch; `--resume RUN --finish` writes the result from the last gate instead. Runs started by an older hx cannot be resumed.
 
 See [Runtime v2](runtime-v2.md#autoresearch-workflow).
