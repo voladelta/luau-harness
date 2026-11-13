@@ -393,15 +393,19 @@ impl Host {
 
 }
 
-/// A bounded, gitignore-aware listing used only to initialize the controller's saved conversation.
+/// A bounded, gitignore-aware listing of at most 80 files with their sizes, used only to initialize the controller's
+/// saved conversation. Hidden files and directories (`.git`, `.harness` among them) are left out. It stats each
+/// listed file and reads none.
 pub fn file_tree(root: &std::path::Path) -> String {
     let mut out = Vec::new();
     for entry in ignore::WalkBuilder::new(root).require_git(false).parents(false).sort_by_file_path(|a,b| a.cmp(b)).build().flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
         let rel = entry.path().strip_prefix(root).unwrap_or(entry.path()).to_string_lossy().to_string();
-        if rel.contains("__pycache__") || rel.starts_with(".git/") || rel.starts_with(".harness/") { continue; }
-        let lines = std::fs::read_to_string(entry.path()).map(|t| t.lines().count()).unwrap_or(0);
-        out.push(format!("{rel} ({lines} lines)"));
+        if rel.contains("__pycache__") { continue; }
+        match entry.metadata() {
+            Ok(meta) => out.push(format!("{rel} ({} bytes)", meta.len())),
+            Err(_) => out.push(rel),
+        }
         if out.len() >= 80 { out.push("…".into()); break; }
     }
     out.join("\n")
