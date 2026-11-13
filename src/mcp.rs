@@ -144,6 +144,8 @@ struct Stdio {
     stdin: ChildStdin,
     out: BufReader<ChildStdout>,
     next_id: u64,
+    /// How long one request may take, from the first byte written to its response (`REQUEST_TIMEOUT`).
+    deadline: Duration,
 }
 
 impl Stdio {
@@ -161,8 +163,11 @@ impl Stdio {
         if let Ok(Some(status)) = self.child.try_wait() {
             return Err(McpError::not_sent(format!("MCP server is not running ({status})")));
         }
-        self.send(&msg).await.map_err(|e| McpError::not_sent(format!("MCP server is not running ({e})")))?;
+        let deadline = self.deadline;
+        // The write is inside the deadline: a server that stops reading its stdin (blocked writing its stdout, say)
+        // must not hold this call, and the server's lock, forever once the frame outgrows the pipe buffer.
         let work = async {
+            self.send(&msg).await.map_err(|e| McpError::not_sent(format!("MCP server is not running ({e})")))?;
             let mut budget = ResponseBudget::new(MAX_BODY);
             loop {
                 let line = budget.line(&mut self.out).await.map_err(body_lost)?;
@@ -180,12 +185,19 @@ impl Stdio {
                 }
             }
         };
-        tokio::time::timeout(REQUEST_TIMEOUT, work).await
-            .map_err(|_| McpError::lost(format!("MCP server did not answer {method} within {}s", REQUEST_TIMEOUT.as_secs())))?
+        // On timeout the frame may have been read in part or whole, so the outcome is unknown; `lost` drops the
+        // connection, which kills the server's group.
+        tokio::time::timeout(deadline, work).await
+            .map_err(|_| McpError::lost(format!("MCP server did not read and answer {method} within {}s", deadline.as_secs())))?
     }
 
     async fn notify(&mut self, method: &str) -> McpResult<()> {
-        self.send(&json!({"jsonrpc": "2.0", "method": method})).await.map_err(|e| McpError::not_sent(format!("MCP server is not running ({e})")))
+        let deadline = self.deadline;
+        let msg = json!({"jsonrpc": "2.0", "method": method});
+        match tokio::time::timeout(deadline, self.send(&msg)).await {
+            Ok(sent) => sent.map_err(|e| McpError::not_sent(format!("MCP server is not running ({e})"))),
+            Err(_) => Err(McpError::lost(format!("MCP server did not read {method} within {}s", deadline.as_secs()))),
+        }
     }
 }
 
@@ -428,7 +440,7 @@ impl Mcp {
         let group = GroupKill::new(&child);
         let stdin = child.stdin.take().expect("stdin is piped");
         let out = BufReader::new(child.stdout.take().expect("stdout is piped"));
-        Ok(Conn::Stdio(Stdio { _group: group, child, stdin, out, next_id: 1 }))
+        Ok(Conn::Stdio(Stdio { _group: group, child, stdin, out, next_id: 1, deadline: REQUEST_TIMEOUT }))
     }
 
     /// Auth headers are resolved from the environment here, in Rust: the model and Luau never see them.
@@ -536,6 +548,18 @@ mod tests {
         let result = http.request("tools/list", json!({})).await;
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stops_reading_cannot_block_a_request_past_its_deadline() {
+        // `sleep` never reads its stdin: a frame larger than the pipe buffer blocks the write.
+        let mut child = Command::new("sleep").arg("1000").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .kill_on_drop(true).spawn().unwrap();
+        let (stdin, out) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
+        let mut stdio = Stdio { _group: None, child, stdin, out, next_id: 1, deadline: Duration::from_secs(1) };
+        let call = stdio.request("tools/call", json!({"name": "put", "arguments": {"text": "x".repeat(300_000)}}));
+        let error = tokio::time::timeout(Duration::from_secs(20), call).await.expect("the request outlived its deadline").unwrap_err();
+        assert_eq!((error.delivery, error.reset), (Delivery::Lost, true), "{error}");
     }
 
     fn too_large(error: &McpError) -> bool { error.delivery == Delivery::Lost && error.reset && error.to_string().contains("too large") }
