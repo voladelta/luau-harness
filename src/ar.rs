@@ -78,8 +78,8 @@ pub struct Spec {
     /// can never see them.
     #[serde(default)]
     pub holdout: Vec<String>,
-    #[serde(default = "Spec::max")]
-    pub direction: String,
+    #[serde(default)]
+    pub direction: Direction,
     #[serde(default = "Spec::timeout")]
     pub timeout: f64,
     /// The margin, besides their combined standard error, by which a candidate's search score must beat the seed's
@@ -88,8 +88,16 @@ pub struct Spec {
     #[serde(default)]
     pub min_delta: f64,
 }
+/// Which way the score improves, stored as `"max"` or `"min"` in `ar.toml` and the frozen `launch.json`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    #[default]
+    Max,
+    Min,
+}
+
 impl Spec {
-    fn max() -> String { "max".into() }
     fn timeout() -> f64 { 600.0 }
     /// The spec in `config`, the workspace config the trust decision covered (never a second read of the file).
     pub fn load(workspace: &Path, config: &crate::trust::Config) -> Result<Spec> {
@@ -115,7 +123,6 @@ impl Spec {
             }
         }
         search_read_roots(&spec)?;
-        ensure!(matches!(spec.direction.as_str(), "max" | "min"), "ar.toml: direction must be max or min");
         ensure!(spec.timeout > 0.0 && spec.min_delta >= 0.0, "ar.toml: timeout must be positive and min_delta nonnegative");
         Ok(spec)
     }
@@ -132,7 +139,7 @@ impl Spec {
     fn better(&self, a: f64, b: Option<f64>, margin: f64) -> bool {
         match b {
             None => true,
-            Some(b) if self.direction == "max" => a > b + margin,
+            Some(b) if self.direction == Direction::Max => a > b + margin,
             Some(b) => a < b - margin,
         }
     }
@@ -572,7 +579,7 @@ impl Orchestrator {
     /// The tools an episode has, in the order the prompt guide asks for: grounding before the task, rules last.
     fn tools(&self, role: Role) -> String {
         let spec = self.spec();
-        let better = if spec.direction == "max" { "higher" } else { "lower" };
+        let better = if spec.direction == Direction::Max { "higher" } else { "lower" };
         let mut t = format!("<tools>\n- `ar.eval(\"one-line note\")` scores the editable files ({}) with the owner's frozen evaluator and \
 returns {{n, score, valid, se, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count. \
 A deterministic evaluator (one that has reported no `se` in this run) returns a state it already scored from its cache.\n\
@@ -1034,6 +1041,20 @@ fn chrono_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direction_is_max_or_min_and_stored_as_before() {
+        let spec = |extra: &str| toml::from_str::<Spec>(&format!("editable = [\"x\"]\neval = \"true\"\n{extra}"));
+        assert_eq!(spec("").unwrap().direction, Direction::Max);
+        assert_eq!(spec("direction = \"min\"").unwrap().direction, Direction::Min);
+        assert!(spec("direction = \"lowest\"").is_err(), "an unknown direction is refused, not read as min");
+        let stored = serde_json::to_value(spec("direction = \"min\"").unwrap()).unwrap();
+        assert_eq!(stored["direction"], "min");
+        let mut s = spec("direction = \"min\"").unwrap();
+        assert!(s.better(1.0, Some(2.0), 0.0) && !s.better(3.0, Some(2.0), 0.0));
+        s.direction = Direction::Max;
+        assert!(s.better(3.0, Some(2.0), 0.0));
+    }
 
     #[test]
     fn audit_verdicts() {

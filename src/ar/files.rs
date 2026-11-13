@@ -623,7 +623,7 @@ mod tests {
 
     fn spec(editable: &[&str]) -> Spec {
         Spec { editable: editable.iter().map(|e| e.to_string()).collect(), eval: "true".into(), select: None, grader: vec![],
-            holdout: vec![], direction: "max".into(), timeout: 1.0, min_delta: 0.0 }
+            holdout: vec![], direction: super::Direction::Max, timeout: 1.0, min_delta: 0.0 }
     }
 
     #[test]
