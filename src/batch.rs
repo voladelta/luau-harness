@@ -1,6 +1,6 @@
 //! Sealed data descriptions of independent read-only operations, run concurrently and published in input order.
 use crate::{effects::Effects, host::{AgentOptions, Host}, prims};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use mlua::{Lua, Table, Value};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value as Json};
@@ -26,7 +26,7 @@ enum Published {
 fn options<T: DeserializeOwned + Default>(op: &str, value: Option<Json>) -> Result<T> {
     match value {
         None | Some(Json::Null) => Ok(T::default()),
-        Some(value) => serde_json::from_value(value).with_context(|| format!("batch {op}: invalid options")),
+        Some(value) => serde_json::from_value(value).map_err(|e| anyhow::anyhow!("batch {op}: options: {e}")),
     }
 }
 
@@ -107,5 +107,18 @@ fn error_text(error: &mlua::Error) -> String {
         mlua::Error::RuntimeError(m) => m.clone(),
         mlua::Error::CallbackError { cause, .. } | mlua::Error::WithContext { cause, .. } => error_text(cause),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_option_names_its_cause() {
+        let error = parse(json!([{"op": "read", "args": ["f", {"bogus": 2}]}]), false).err().expect("an unknown option is refused");
+        assert_eq!(error.to_string(), "batch read: options: unknown field `bogus`, expected `offset` or `limit`");
+        let error = parse(json!([{"op": "search", "args": ["x", {"max": "lots"}]}]), false).err().expect("a mistyped option is refused");
+        assert!(error.to_string().starts_with("batch search: options: invalid type: string \"lots\""), "{error}");
     }
 }
