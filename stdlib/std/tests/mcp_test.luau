@@ -33,3 +33,23 @@ test.case("results: isError raises with the server's message", function()
 	test.eq(ok, false)
 	test.ok(tostring(err):find("mcp tool error (s.t): boom", 1, true), tostring(err))
 end)
+
+test.case("an alias never replaces an exact name", function()
+	local names = mcp.names({ "a.b", "a_b", "c-d" })
+	test.eq(names["a.b"], "a.b")
+	test.eq(names.a_b, "a_b")
+	test.eq(names.c_d, "c-d")
+	test.eq(mcp.key(names, "a_b"), ".a_b")
+	test.eq(mcp.key(names, "a.b"), '["a.b"]')
+	test.eq(mcp.key(names, "c-d"), ".c_d")
+	-- whichever comes first, the exact name wins
+	test.eq(mcp.names({ "a_b", "a.b" }).a_b, "a_b")
+	-- two aliases that collide: the first keeps it, the second is reachable by its exact name only
+	local both = mcp.names({ "x.y", "x-y" })
+	test.eq(both.x_y, "x.y")
+	test.eq(mcp.key(both, "x-y"), '["x-y"]')
+end)
+
+test.case("the prompt shows the path a tool is bound under", function()
+	test.eq(mcp.sig("s", { name = "a.b" }, 'mcp.s["a.b"]'), 'mcp.s["a.b"]{}')
+end)

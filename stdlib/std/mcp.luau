@@ -52,13 +52,39 @@ local function ty(schema, depth: number): string
 	return "any"
 end
 
--- e.g.  mcp.demo.add{ a: number, b: number }
-function M.sig(server: string, tool): string
+-- Binding names for a set of names (tools of one server, or servers): every exact name, then each safe alias
+-- (`a.b` -> `a_b`) that no exact name or earlier alias already holds. An alias never replaces a binding.
+function M.names(list: { string }): { [string]: string }
+	local names = {}
+	for _, name in list do
+		names[name] = name
+	end
+	for _, name in list do
+		local alias = safe(name)
+		if names[alias] == nil then
+			names[alias] = name
+		end
+	end
+	return names
+end
+
+-- How the prompt refers to `name` in a table bound with `names`: `.alias` when the alias is its own, else `["name"]`.
+function M.key(names: { [string]: string }, name: string): string
+	local alias = safe(name)
+	if names[alias] == name then
+		return "." .. alias
+	end
+	return "[" .. string.format("%q", name) .. "]"
+end
+
+-- e.g.  mcp.demo.add{ a: number, b: number }; `path` is the callable path (default: the safe aliases).
+function M.sig(server: string, tool, path: string?): string
 	local args = ty(tool.inputSchema or { type = "object" }, 0)
 	if args == "table" or args == "{  }" then
 		args = ""
 	end
-	return "mcp." .. safe(server) .. "." .. safe(tool.name) .. "{" .. (args:match("^{ (.*) }$") or args) .. "}"
+	local callee = path or ("mcp." .. safe(server) .. "." .. safe(tool.name))
+	return callee .. "{" .. (args:match("^{ (.*) }$") or args) .. "}"
 end
 
 -- tools/call result -> a Luau value: text when it is one text block, otherwise the content table; errors raise.
@@ -88,24 +114,43 @@ function M.install(ctx)
 	end
 	local mcp = {}
 	local lines = {}
+	local server_names = M.names(servers)
 	for _, server in servers do
 		local ok, tools = pcall(__mcp_list, server)
 		if not ok then
 			hx.log("mcp server " .. server .. " unavailable: " .. tostring(tools))
 			continue
 		end
-		local bound = {}
+		local by_name = {}
+		local list = {}
 		for _, tool in tools do
-			local label = server .. "." .. tool.name
-			local fn = function(args)
-				return M.unwrap(__mcp_call(server, tool.name, args or {}), label)
+			if type(tool) ~= "table" or type(tool.name) ~= "string" then
+				continue
 			end
-			bound[safe(tool.name)] = fn
-			bound[tool.name] = fn
-			local desc = (tool.description or ""):match("^[^\n]*") :: string
-			table.insert(lines, "- " .. M.sig(server, tool) .. (if desc ~= "" then "  -- " .. desc:sub(1, 120) else ""))
+			if by_name[tool.name] == nil then
+				table.insert(list, tool.name)
+			end
+			by_name[tool.name] = tool
 		end
-		mcp[safe(server)] = bound
+		local tool_names = M.names(list)
+		local bound = {}
+		for _, name in list do
+			local tool = by_name[name]
+			local label = server .. "." .. name
+			bound[name] = function(args)
+				return M.unwrap(__mcp_call(server, name, args or {}), label)
+			end
+			local path = "mcp" .. M.key(server_names, server) .. M.key(tool_names, name)
+			local desc = (tool.description or ""):match("^[^\n]*") :: string
+			table.insert(lines, "- " .. M.sig(server, tool, path) .. (if desc ~= "" then "  -- " .. desc:sub(1, 120) else ""))
+		end
+		for alias, name in tool_names do
+			bound[alias] = bound[name]
+		end
+		mcp[server] = bound
+	end
+	for alias, server in server_names do
+		mcp[alias] = mcp[server] -- nil for an unavailable server
 	end
 	hx.expose("mcp", mcp)
 	if #lines > 0 then
