@@ -483,7 +483,8 @@ impl Policy {
         let log = EventLog::open(&dir)?;
         log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,
             "approval_mode": p.mode, "config_sha": crate::trust::config_hash(&workspace), "trusted": trusted, "modules_sha": modules_sha,
-            "confinement": crate::confine::describe()}), true)?;
+            "confinement": crate::confine::describe(),
+            "isolation": p.episode.as_ref().map(|_| crate::confine::describe_isolation())}), true)?;
         p.read_roots.sort();
         p.read_roots.dedup();
         let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
@@ -509,8 +510,8 @@ impl Policy {
         hidden.push(self.workspace.join(".harness/secrets.toml"));
         hidden.extend(crate::state::guarded());
         hidden.extend(self.track_hidden(&hidden, &write));
-        let rules = crate::confine::Rules { read, write, hidden, exposed: vec![self.skills()] }.with_system();
-        if self.episode.is_some() { rules.without_shm() } else { rules }
+        let rules = crate::confine::Rules { read, write, hidden, exposed: vec![self.skills()], scoped: false }.with_system();
+        if self.episode.is_some() { rules.isolated() } else { rules }
     }
 
     /// Where the hidden files seen so far are now. A file moved away from its hidden path, or given a second name by a

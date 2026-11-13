@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 mod episode;
 pub(crate) mod files;
 mod ssot;
-pub use episode::{Episode, Progress, claim, claims, eval, load_episode, reset};
+pub use episode::{Episode, Progress, claim, claims, eval, load_episode, reset, submit_verdict};
 use files::*;
 
 /// Workers side by side in a round, and fewer once the provider has rate-limited an episode of the run.

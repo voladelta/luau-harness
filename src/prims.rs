@@ -360,21 +360,24 @@ fn search(root: &Path, pat: &str, opts: &Option<Table>, skip_secrets: bool, work
     Ok(Ok((rows, capped)))
 }
 
-/// A shell command's environment (None: inherited) and its kernel confinement (None: unconfined).
+/// A shell command's environment (None: inherited), its kernel confinement (None: unconfined) and its isolation
+/// (autoresearch children: `crate::confine::Isolate`).
 pub struct ShellEnv {
     pub env: Option<Vec<(String, String)>>,
     pub confine: Option<Arc<crate::confine::Ruleset>>,
+    pub isolate: Option<crate::confine::Isolate>,
 }
 impl ShellEnv {
     /// The agent's `sh`: scrub credentials by default and in every autoresearch episode, and confine it to the run's
-    /// current file policy (grants approved so far included).
+    /// current file policy (grants approved so far included). An episode's commands also run isolated, so nothing one
+    /// leaves behind outlives it and none sees another's processes; they keep the environment's network.
     pub fn agent(pol: &crate::policy::Policy) -> mlua::Result<ShellEnv> {
         let confine = pol.confinement().prepare().map_err(|e| rt(format!("sh: cannot prepare confinement: {e}")))?;
-        Ok(ShellEnv { env: Some(pol.env()), confine: confine.map(Arc::new) })
+        Ok(ShellEnv { env: Some(pol.env()), confine: confine.map(Arc::new), isolate: pol.episode.is_some().then(Default::default) })
     }
 }
 
-/// Run `cmd` with bash: own process group, Landlock ruleset when given, capped output, killed at `secs`.
+/// Run `cmd` with bash: own process group, isolation and Landlock ruleset when given, capped output, killed at `secs`.
 /// -> (stdout, stderr, exit code, timed out, either stream cut to its first and last MAX_CAPTURE / 2 bytes)
 pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool, bool)> {
     let mut command = tokio::process::Command::new("bash");
@@ -388,13 +391,20 @@ pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     // Own process group (killed as a whole), a cap on how many processes this user may have, so a fork bomb inside
-    // `sh` hits EAGAIN instead of taking the machine down, and the Landlock ruleset (applied last, after setsid).
+    // `sh` hits EAGAIN instead of taking the machine down, isolation (namespaces or a cgroup, kept until the command is
+    // over: dropping it kills what is left in a cgroup), and the Landlock ruleset (applied last, inside the namespaces).
     let confine = env.confine.clone();
+    let sandbox = match &env.isolate {
+        Some(isolate) => Some(Arc::new(isolate.prepare().map_err(|e| rt(format!("sh: {e}")))?)),
+        None => None,
+    };
+    let entered = sandbox.clone();
     unsafe {
         command.pre_exec(move || {
             libc::setsid();
             let lim = libc::rlimit { rlim_cur: nproc_cap, rlim_max: nproc_cap };
             libc::setrlimit(libc::RLIMIT_NPROC, &lim);
+            if let Some(sandbox) = &entered { sandbox.enter()?; }
             if let Some(ruleset) = &confine { ruleset.apply()?; }
             Ok(())
         });
@@ -420,8 +430,11 @@ pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::
     // The command is over: kill stragglers and background jobs now. That also closes the pipes they held, so the
     // readers finish; whatever was printed before a timeout is kept. A descendant that left the process group
     // (`setsid cmd &`) survives and can keep a pipe open: after one shared grace period the stream is cut, keeping
-    // what was read, and says so.
+    // what was read, and says so. An isolated command leaves no such descendant: its namespace died with its first
+    // process, or its cgroup is killed here.
     drop(group);
+    drop(command);
+    if let Some(sandbox) = sandbox { let _ = tokio::task::spawn_blocking(move || drop(sandbox)).await; }
     let until = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut cut_open = false;
     for (mut handle, capture) in [(out_h, &cap_out), (err_h, &cap_err)] {
@@ -520,6 +533,7 @@ impl Drop for Child {
 pub fn stop(code: i32) -> ! {
     for group in GROUPS.lock().unwrap().iter() { unsafe { libc::killpg(*group, libc::SIGKILL) }; }
     for child in CHILDREN.lock().unwrap().iter() { unsafe { libc::kill(*child, libc::SIGTERM) }; }
+    crate::ar::files::remove_scratch();
     std::process::exit(code)
 }
 
@@ -608,7 +622,7 @@ mod shell_tests {
 
     #[tokio::test]
     async fn a_daemonized_descendant_holding_the_pipes_keeps_the_partial_capture() {
-        let env = ShellEnv { env: None, confine: None };
+        let env = ShellEnv { env: None, confine: None, isolate: None };
         let started = std::time::Instant::now();
         let (so, se, code, timed_out, cut) = shell(&env, "echo before; setsid sleep 5 & sleep .3; echo after", std::env::temp_dir(), 10.0).await.unwrap();
         let so = String::from_utf8(so).unwrap();
