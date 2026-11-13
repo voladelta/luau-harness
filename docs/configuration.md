@@ -1,6 +1,6 @@
 # Configuration
 
-All configuration lives in `.harness/` in the workspace. File tools can read it but refuse writes; on Linux, shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
+All configuration lives in `.harness/` in the workspace; run state (journals, blobs, autoresearch runs) does not: it lives in `$XDG_STATE_HOME/hx` (default `~/.local/state/hx`, see [the command reference](cli.md#report-and-logs)). File tools can read the configuration but refuse writes; on Linux, shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
 
 | File | Purpose |
 |---|---|
@@ -66,14 +66,15 @@ On Linux 5.13 or newer, every shell command, local MCP server and autoresearch e
 |---|---|---|
 | Read | Read roots (workspace, private temp dir, `[fs]` roots, approved grants, toolchains, approved skills), `/usr`, `/bin`, `/sbin`, `/etc`, `/dev`, `/opt`, `/lib*`, `/proc`, `/sys` | Their scratch copy, the same system and toolchain directories, `grader` roots (and `holdout` for `select`) |
 | Write | Write roots (workspace, private temp dir, `[fs] write`, approved write grants), `/dev/null` and similar devices | Their scratch copy |
-| Never readable | `.harness/secrets.toml`, sealed state (`.harness/ar`, grader and held-out roots in an episode), the trust store (`~/.config/hx`) | |
+| Never readable | `.harness/secrets.toml`, grader and held-out roots in an episode, the run state (`~/.local/state/hx`; only the run's own copy of its approved skills' files is readable) and the trust store (`~/.config/hx`) | |
+| Never writable | The run state and the trust store: no write root may overlap them | |
 
-A grant approved mid-run applies to the next command. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. A credential file a command copies cannot be read; one it moves or hard-links is found by its inode and stays hidden for the rest of the run. When a hidden file sits inside a read root, the directories on the way to it (usually the workspace root and `.harness`) are granted entry by entry, so a file created directly in one of them is readable from the next command on.
+A grant approved mid-run applies to the next command. Write roots must stay clear of the run state and the trust store, because hiding a directory removes reads only: a `[fs] write` root that contains either (`write = ["~"]`) or lies inside one is refused at launch, as is a workspace that contains them, and a resumed run whose frozen roots now do (after `XDG_STATE_HOME` moved). They are refused rather than carved, since carving a write root takes file creation away from every directory on the way down (`~` itself). A file-tool write outside the roots normally grants its directory; where that directory overlaps them (`~/notes.txt`), the grant is that one file. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. A credential file a command copies cannot be read; one it moves or hard-links is found by its inode and stays hidden for the rest of the run. When a hidden file sits inside a read root, the directories on the way to it (usually the workspace root and `.harness`, or `~/.local/state` under a `read = ["~"]` root) are granted entry by entry, so a file created directly in one of them is readable from the next command on; their entries can be listed by name, never read.
 
 What stays open:
 
 - Network and GPU access: use your container or sandbox.
-- Protected configuration inside a write root (`.harness/`, `hx.lock`) is still writable by shell commands; Landlock cannot remove write access from part of a writable tree without breaking file creation in it. Edited config is no longer trusted, and the journal's hash chain shows tampering.
+- Protected configuration inside a write root (`.harness/`, `hx.lock`) is still writable by shell commands; Landlock cannot remove write access from part of a writable tree without breaking file creation in it. Edited config is no longer trusted. This is why run state lives outside the workspace: journals, blobs and autoresearch runs used to sit in `.harness/`, where a command could append to its own journal, read its manifest or rewrite what `--ar --resume` trusts.
 - Credential files other than `.harness/secrets.toml` (`id_rsa`, `.netrc` and the rest that file tools refuse by name) are readable by shell commands when they sit inside a read root.
 
 Without Landlock (an older kernel, or a container whose seccomp filter blocks it) hx runs children unconfined, prints one note on stderr per run and records `"confinement": "off: ..."` in the journal's session record; it never fails a command for lack of Landlock.

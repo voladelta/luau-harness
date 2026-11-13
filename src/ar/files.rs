@@ -223,7 +223,7 @@ pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, 
     let mut read = crate::policy::system_read_roots();
     read.extend(spec.roots(holdout)?);
     read.push(scratch.0.clone());
-    let rules = crate::confine::Rules { read, write: vec![scratch.0.clone()], hidden: vec![] }.with_system().without_shm();
+    let rules = crate::confine::Rules { read, write: vec![scratch.0.clone()], hidden: vec![], exposed: vec![] }.with_system().without_shm();
     let env = crate::prims::ShellEnv { env: Some(evaluator_env(&tmp)), confine: rules.prepare()?.map(std::sync::Arc::new) };
     let (stdout, stderr, code, timed_out, _) = crate::prims::shell(&env, cmd, tree, spec.timeout).await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -330,16 +330,6 @@ pub(super) fn freeze(workspace: &Path, run: &Path) -> Result<String> {
     drop(input);
     ensure!(child.wait()?.success(), "git cat-file failed");
     Ok(commit)
-}
-
-/// Copy an episode workspace's journals into the run as `episodes/LABEL.log`; returns that directory.
-pub(super) fn keep_logs(ws: &Path, episodes: &Path, label: &str) -> Result<PathBuf> {
-    let logs = episodes.join(format!("{label}.log"));
-    if ws.join(".harness/log").is_dir() && !logs.exists() {
-        std::fs::create_dir_all(episodes)?;
-        copy_tree(&ws.join(".harness/log"), &logs)?;
-    }
-    Ok(logs)
 }
 
 /// How often a child without a report was rate-limited: the HTTP 429s its journals recorded.

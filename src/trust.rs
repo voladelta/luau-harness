@@ -28,18 +28,7 @@ pub fn store_dir() -> Option<PathBuf> {
 /// The store dir with its deepest existing ancestor canonicalized (symlinks resolved), for the protected-path list:
 /// the policy compares canonical paths, so `~/.config -> dotfiles/config` must not slip past the protection.
 pub fn store_dir_canonical() -> Option<PathBuf> {
-    let d = store_dir()?;
-    let mut base = d.clone();
-    let mut rest = Vec::new();
-    while !base.exists() {
-        rest.push(base.file_name()?.to_os_string());
-        base = base.parent()?.to_path_buf();
-    }
-    let mut c = std::fs::canonicalize(&base).ok()?;
-    for r in rest.into_iter().rev() {
-        c.push(r);
-    }
-    Some(c)
+    crate::state::resolved(&store_dir()?)
 }
 
 fn store_file() -> Result<PathBuf> {

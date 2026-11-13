@@ -10,6 +10,7 @@ mod mcp;
 mod modules;
 mod policy;
 mod prims;
+mod state;
 mod trust;
 mod vm;
 mod supervisor;
@@ -88,6 +89,7 @@ COMMANDS:
     accept       review and activate something staged
     reject       discard something staged
     rollback     undo the last accepted replacement of a harness module
+    runs         list this workspace's runs and where their journals are
     log verify   check an event log's hash chain and list unknown-outcome effects
 ";
 
@@ -97,7 +99,8 @@ const TOP_HELP_TAIL: &str = "    -h, --help            show help (also `hx <comm
 EXAMPLES:
     hx exec --workspace . 'print(1+1)'
     hx run \"Fix the failing tests\" --yes --model claude-sonnet-5-5
-    hx log verify .harness/run.jsonl
+    hx runs
+    hx log verify ~/.local/state/hx/projects/app-3f2a9c1b04de/log/1731500000-1234.jsonl
 
 ENVIRONMENT:
     HX_MODEL, HX_BASE_URL   defaults for the matching `run` flags
@@ -153,7 +156,7 @@ const FLAGS: &[Flag] = {
         flag(RUN, "--trace", Text, "FILE", "write a readable trace"),
         flag(RUN, "--rpi", Switch, "", "research, design, implement, verify and repair automatically"),
         flag(RUN, "--manual", Switch, "", "require RPI artifact review (requires --rpi)"),
-        flag(RUN, "--ar", Switch, "", "autoresearch over .harness/ar.toml until progress stops (--ar --resume .harness/ar/RUN continues one)"),
+        flag(RUN, "--ar", Switch, "", "autoresearch over .harness/ar.toml until progress stops (--ar --resume RUN continues one; see hx runs)"),
         flag(&["review"], "--gate", Text, "ID", "the gate to decide"),
         flag(&["review"], "--decision", Text, "D", "approve, revise, answer or waive"),
         flag(&["review"], "--input-file", Text, "F", "feedback, answers or the waiver reason"),
@@ -203,6 +206,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "accept" => "hx accept NAME [--yes]\n\nReview something staged, then activate exactly what was shown (refused if it changes meanwhile). A package\n(every file is printed) is locked in hx.lock and granted the capabilities it requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
+        "runs" => "hx runs\n\nList this workspace's runs: journals and autoresearch runs, with their paths. Run state lives outside the\nworkspace, in $XDG_STATE_HOME/hx (default ~/.local/state/hx), one directory per workspace. Wherever a command takes\nLOG (or --ar --resume RUN), a run id from this list (1731500000-1234) works too.\n",
         "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 corrupt chain or invalid recovery accounting, 3 unknown outcomes.\n",
         _ => return None,
     })
@@ -346,7 +350,8 @@ async fn real_main() -> Result<()> {
     validate_args(&args)?;
     let workspace = PathBuf::from(arg(&args, "--workspace").unwrap_or_else(|| ".".into())).canonicalize()?;
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
-    let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, has(&args, "--yes"), arg(&args, "--approval").map(|m| m.parse()).transpose()?, arg(&args, "--resume").map(PathBuf::from).as_deref(), episode)?)) };
+    let resume = arg(&args, "--resume").filter(|_| !has(&args, "--ar")).map(|l| log_path(&workspace, &l));
+    let mk_policy = |episode| -> Result<Arc<policy::Policy>> { Ok(Arc::new(policy::Policy::new(&workspace, has(&args, "--yes"), arg(&args, "--approval").map(|m| m.parse()).transpose()?, resume.as_deref(), episode)?)) };
     if has(&args, "--ignore-config") { trust::ignore_config(); }
     // A resumed run uses only its frozen manifest, so workspace config edited since launch neither changes nor blocks it.
     if matches!(args[0].as_str(), "exec" | "run") && !has(&args, "--resume") { trust::require_trusted(&workspace)?; }
@@ -361,10 +366,15 @@ async fn real_main() -> Result<()> {
             // A child run of an autoresearch episode: the episode becomes part of its frozen policy.
             cmd_run(&args, workspace.clone(), mk_policy(ar::load_episode()?)?).await
         }
-        "recover" => cmd_recover(&args),
-        "review" => workflow_runtime::review(Path::new(positionals(&args)[0]), &arg(&args,"--gate").unwrap(), &arg(&args,"--decision").unwrap(), arg(&args,"--input-file").as_deref().map(Path::new)),
+        "recover" => cmd_recover(&args, &workspace),
+        "runs" => {
+            operands(&args, 0, "hx runs")?;
+            print!("{}", state::list(&workspace)?);
+            Ok(())
+        }
+        "review" => workflow_runtime::review(&log_path(&workspace, positionals(&args)[0]), &arg(&args,"--gate").unwrap(), &arg(&args,"--decision").unwrap(), arg(&args,"--input-file").as_deref().map(Path::new)),
         "revoke" => {
-            let path = PathBuf::from(operands(&args, 1, "hx revoke LOG")?[0]);
+            let path = log_path(&workspace, operands(&args, 1, "hx revoke LOG")?[0]);
             anyhow::ensure!(path.is_file(), "run log does not exist");
             // Only a run journal: the marker is written beside the given file, so any other path would just litter. The
             // chain is not verified here: revoking a damaged or live journal must still work.
@@ -399,9 +409,17 @@ async fn real_main() -> Result<()> {
         }
         "accept" => cmd_accept(&args, &workspace),
         "rollback" => cmd_rollback(&args, &workspace),
-        "log" if positionals(&args).first() == Some(&"verify") => cmd_log_verify(&args),
+        "log" if positionals(&args).first() == Some(&"verify") => cmd_log_verify(&args, &workspace),
         _ => Err(usage("usage: hx log verify FILE (see `hx log --help`)")),
     }
+}
+
+/// A LOG operand: a journal path, or a run id of this workspace (`hx runs` lists both). A journal from before the run
+/// store left the workspace still works, with a note that shell commands could have changed it.
+fn log_path(workspace: &Path, given: &str) -> PathBuf {
+    let path = state::resolve_log(workspace, given);
+    state::note_legacy(&path);
+    path
 }
 
 /// The Luau chunks of `hx exec`: every argument after the command that is not a global flag or its value.
@@ -451,12 +469,11 @@ async fn with_provider_limits(mut cfg: llm::LlmCfg, args: &[String]) -> llm::Llm
 
 /// hx run --workspace DIR --prompt-file F --model M [--base-url U --key-env E --reasoning R] [--max-turns N] [--trace FILE]
 async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy>) -> Result<()> {
-    let _ = workspace;
     let trace = arg(args, "--trace").map(PathBuf::from);
     let host = if has(args, "--resume") {
         host::Host::resume(policy, trace)?
     } else {
-        let inherited = arg(args, "--branch").map(|path| -> Result<_> {
+        let inherited = arg(args, "--branch").map(|path| log_path(&workspace, &path)).map(|path| -> Result<_> {
             let journal = eventlog::EventLog::reopen(Path::new(&path))?;
             let manifest = supervisor::Manifest::inspect(Path::new(&path))?;
             supervisor::reconcile(&journal, &eventlog::load(Path::new(&path))?)?;
@@ -512,7 +529,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
 /// hx run --ar: every flag except the program passes through to the episodes' child runs.
 async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
     if let Some(dir) = arg(args, "--resume") {
-        return ar::orchestrate(workspace, None, Some(PathBuf::from(dir))).await;
+        return ar::orchestrate(workspace, None, Some(state::resolve_ar(workspace, &dir))).await;
     }
     let mut child = vec![];
     for argument in cli_args(args) {
@@ -533,9 +550,9 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
     ar::orchestrate(workspace, Some((child, program)), None).await
 }
 
-fn cmd_recover(args: &[String]) -> Result<()> {
+fn cmd_recover(args: &[String], workspace: &Path) -> Result<()> {
     let operands = operands(args, 2, "hx recover LOG OP --decision complete|abandon")?;
-    let path = Path::new(operands[0]);
+    let path = &log_path(workspace, operands[0]);
     let id: u64 = operands[1].parse().map_err(|_| usage(&format!("operation ID must be a number, got {:?}", operands[1])))?;
     let decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?;
     anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon"), "decision must be complete or abandon");
@@ -634,8 +651,8 @@ fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
 }
 
 /// hx log verify FILE : check the hash chain and list effects with an unknown outcome (exit 1 tampered, 3 unknown)
-fn cmd_log_verify(args: &[String]) -> Result<()> {
-    let f = PathBuf::from(operands(args, 2, "hx log verify FILE")?[1]);
+fn cmd_log_verify(args: &[String], workspace: &Path) -> Result<()> {
+    let f = log_path(workspace, operands(args, 2, "hx log verify FILE")?[1]);
     let r = eventlog::verify(&f)?;
     println!("{} records, hash chain {}", r.records, if r.chain_ok { "intact".to_string() } else { format!("BROKEN at line {}", r.bad_line.unwrap_or(0)) });
     for (seq, tool, summary) in &r.unknown {

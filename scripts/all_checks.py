@@ -5,8 +5,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -53,6 +55,8 @@ def main():
     started = time.monotonic()
     deadline = started + 290  # Leave cleanup time before five minutes.
     output_lock = threading.Lock()
+    # hx keeps run state in XDG_STATE_HOME/hx: one directory per suite, never the user's, so suites stay independent.
+    states = Path(tempfile.mkdtemp(prefix="hx-checks-state-"))
 
     def run(name, command, cap=90):
         begin = time.monotonic()
@@ -61,7 +65,8 @@ def main():
             with output_lock:
                 print(f"{name:18} FAIL: five-minute budget exhausted", flush=True)
             return False
-        process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env = {**os.environ, "XDG_STATE_HOME": str(states / name.replace(" ", "_"))}
+        process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, start_new_session=True)
         try:
             output = process.communicate(timeout=remaining)[0]
@@ -99,6 +104,7 @@ def main():
             results.append(future.result())
     # ar runs four scenarios at a time on its own; beside other suites it starves them past their caps.
     results.append(run("ar", ["python3", "scripts/ar_checks.py"], cap=280))
+    shutil.rmtree(states, ignore_errors=True)
     elapsed = time.monotonic() - started
     print(f"\n{sum(results)}/{len(results)} suites passed in {elapsed:.1f}s (limit: 5 minutes)", flush=True)
     return 0 if all(results) and elapsed < 300 else 1

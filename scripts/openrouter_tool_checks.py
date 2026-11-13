@@ -185,7 +185,8 @@ class OpenRouterToolTests(unittest.TestCase):
         self.dir = self.ws / ".harness/tools"
         self.dir.mkdir(parents=True)
         self.env = {k: v for k, v in os.environ.items() if k not in ("OPENROUTER_API_KEY", "HX_TRUST")}
-        self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"))
+        self.env.update(HX_TRUST="current", XDG_CONFIG_HOME=str(self.root / "config"),
+                        XDG_STATE_HOME=str(self.root / "state"))
         CALLS.clear()
 
         # Install openrouter.lua with mock base URLs

@@ -29,8 +29,8 @@ Manual mode also pauses after research questions, research, system design and pr
 Review pauses return `finished:false` and the gate identity. A paused resume performs no model work until you record a valid decision:
 
 ```bash
-hx review .harness/log/RUN.jsonl --gate GATE_ID --decision approve
-hx run --resume .harness/log/RUN.jsonl
+hx review LOG --gate GATE_ID --decision approve   # LOG: the report's `log`, or a run id from `hx runs`
+hx run --resume LOG
 ```
 
 | Decision | Use |
@@ -58,7 +58,7 @@ Program design must plan at least one executable check. Verification checks exac
 
 ```bash
 hx run --ar --prompt-file program.md --model MODEL
-hx run --ar --resume .harness/ar/RUN       # continue an interrupted search
+hx run --ar --resume RUN                   # continue an interrupted search (`hx runs` lists RUN)
 ```
 
 ### `.harness/ar.toml`

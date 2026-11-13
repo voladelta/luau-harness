@@ -24,7 +24,7 @@ check "approval is per tool: delete_note is still refused" "$(x 'print(pcall(mcp
 check "an allowed tool's name in another tool's arguments approves nothing" "$(x 'print(pcall(mcp.demo.delete_note, {name = "n", why = "mcp demo.add"}))' | head -1 | grep -c approval_required)" "1"
 check "...and the refusal journals no intent" "$(python3 -c "
 import json,glob,os
-log=max(glob.glob('$W/.harness/log/*.jsonl'), key=os.path.getmtime)
+log=max(glob.glob('$(logs $W)/*.jsonl'), key=os.path.getmtime)
 print(sum(1 for r in map(json.loads, open(log)) if r['kind']=='intent'))")" "0"
 cfg "" '[approval]
 allow = ["mcp demo."]'
@@ -33,7 +33,7 @@ cfg "" '[approval]
 allow = ["mcp demo.*"]'
 check "a server-wide allow covers its tools" "$(x 'print(mcp.demo.delete_note{name = "n"})' | head -1)" "deleted n"
 out=$(x 'print(pcall(__mcp_call, "demo", "no_such_tool", {})); print(mcp.demo.add{a = 1, b = 1})' | tr '\n' ' ')
-check "a JSON-RPC error is a definite failure: the next mutation runs" "$(echo "$out" | grep -c 'MCP error -32602: unknown tool: no_such_tool.* 2 $')$($H log verify $(ls -t $W/.harness/log/*.jsonl | head -1) >/dev/null; echo $?)" "10"
+check "a JSON-RPC error is a definite failure: the next mutation runs" "$(echo "$out" | grep -c 'MCP error -32602: unknown tool: no_such_tool.* 2 $')$($H log verify $(ls -t "$(logs $W)"/*.jsonl | head -1) >/dev/null; echo $?)" "10"
 touch $W/demo_extra
 check "a server that exited is started again on the next call" "$(x 'print(mcp.demo.quit{}); sh("sleep 0.5"); print(mcp.demo.add{a = 2, b = 2})' | grep -v "^mcp tool" | tr '\n' ' ')" "quit 4 "
 rm $W/demo_extra
@@ -114,7 +114,7 @@ hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "NO_SUCH_VAR"'
 check "http: unset env var fails clearly before any request" "$(hx 'print(pcall(mcp.web.add, {a=1,b=2}))' | head -1 | grep -c 'NO_SUCH_VAR.*not set')" "1"
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
 hx 'print(mcp.web.add{a = 1, b = 1})' >/dev/null; hx 'print(mcp.web.add{a = 1, b = 1})' >/dev/null
-check "http: the key never reaches the event log" "$(grep -rl sk-web-secret $W/.harness 2>/dev/null | grep -v 'mcp.toml\|policy.toml' | wc -l | tr -d ' ')" "0"
+check "http: the key never reaches the event log" "$(grep -rl sk-web-secret $W/.harness "$(logs $W)" 2>/dev/null | grep -v 'mcp.toml\|policy.toml' | wc -l | tr -d ' ')" "0"
 kill $SRV; wait $SRV 2>/dev/null
 hcfg "https://127.0.0.1:1/mcp" ''
 check "http: unreachable server is a Luau error, VM survives" "$(hx 'print(pcall(function() return mcp.web.add{a=1,b=2} end)); print("alive")' | tail -1)" "alive"
@@ -130,7 +130,7 @@ SESSION=1 EXPIRE=$T/expire DROP=$T/drop ECHO_RESULT=1 HDR_LOG=$HL serve HP env -
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'
 check "http/sse-split: 3-byte chunks, server request with our id, no final blank line" "$(hx 'print(mcp.web.add{a = 6, b = 7})' | head -1)" "13"
 out=$(hx 'print(mcp.web.add{a = 6, b = 7})')
-check "http: a secret the server echoes in a result is scrubbed, in the result and the journal" "$(echo "$out" | grep -c 'seen Bearer \*\*\*')$(grep -rl sk-web-secret $W/.harness/log 2>/dev/null | wc -l | tr -d ' ')" "10"
+check "http: a secret the server echoes in a result is scrubbed, in the result and the journal" "$(echo "$out" | grep -c 'seen Bearer \*\*\*')$(grep -rl sk-web-secret "$(logs $W)" 2>/dev/null | wc -l | tr -d ' ')" "10"
 touch $T/expire
 check "http: an expired session rejected the call unhandled, so it is sent again on a new session" "$(hx 'print(mcp.web.add{a=1,b=1})' | head -1)" "2"
 touch $T/drop

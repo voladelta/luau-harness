@@ -104,7 +104,7 @@ hx run "Fix the failing tests" --model MODEL --yes
 
 Workspace and configured file-tool paths are allowed without asking. Other file-tool paths and recognized external actions ask on the controlling terminal; without one they are refused. `--yes` automatically approves ordinary requests for that run without changing `policy.toml`; irreversible commands such as a force push still need an exact `allow` entry or your answer on the terminal. Protected harness files, sealed state, credential reads and capability checks still apply. On Linux, shell commands get the same file roots as the file tools.
 
-hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens) and writes the event log to `.harness/log/`.
+hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens, and `log`, the run's journal). Journals live outside the workspace, in `~/.local/state/hx/` (`$XDG_STATE_HOME/hx`), one directory per workspace; `hx runs` lists them.
 
 hx uses the Responses API for every model. For another provider with a compatible `/responses` endpoint, pass its base URL and key variable:
 
@@ -122,6 +122,7 @@ hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1
 | `hx trust` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
 | `hx approve` / `hx skills` / `hx test` | Approve packages and skills, list skills, run a package's tests |
 | `hx staged` / `hx accept` / `hx reject` / `hx rollback` | Review and activate what the agent staged; undo a module replacement |
+| `hx runs` | List this workspace's runs (journals and autoresearch runs) with their paths |
 | `hx log verify FILE` | Check a log's hash chain and recovery accounting |
 
 Every flag and exit code is in the [command reference](docs/cli.md).
@@ -150,8 +151,8 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 
 ## Security model
 
-- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools protect `.harness/`, `hx.lock` and the trust store, and writes refuse symlinks.
-- On Linux with Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and cannot read `.harness/secrets.toml`, sealed autoresearch state, grader and held-out roots or `~/.config/hx`. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Without Landlock hx says so once per run and children run unconfined.
+- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools protect `.harness/`, `hx.lock` and the trust store, cannot read or write hx's run state (journals, blobs and autoresearch runs, kept outside the workspace in `~/.local/state/hx`), and writes refuse symlinks.
+- On Linux with Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and cannot read `.harness/secrets.toml`, grader and held-out roots, the run state or `~/.config/hx`. No write root may overlap the run state or the trust store: such a `[fs] write` root is refused at launch, and so is a path grant that would cover them, so no shell command can write a journal or what `--ar --resume` trusts. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Without Landlock hx says so once per run and children run unconfined.
 - Network and GPU isolation belong to the environment running hx; configure them in your sandbox or container.
 - By default, `sh` and local MCP servers receive a minimal environment without inherited API keys. Shell commands run in their own process group, killed when the command ends, with a per-user process cap.
 - `hx run` refuses workspace config until you [trust](docs/configuration.md#workspace-trust) it (or pass `--ignore-config`). Shell commands are classed read / local write / external / irreversible to decide when to ask; obvious external commands such as `git push` ask for approval unless pre-approved or launched with `--yes`, and irreversible ones always need an exact `allow` entry or your answer. The classifier is approval UX, not a guard: a command can reach the network without naming any known program.
@@ -189,7 +190,7 @@ Suites run concurrently (mock servers bind free ports); the policy suite and the
 
 ## Limitations
 
-- **Confinement covers files, on Linux only.** There is no network isolation, and without Landlock (an old kernel, or a container that filters it) children run unconfined. Shell commands can still write protected configuration inside the workspace (Landlock cannot carve a hole in a writable tree), though edited config becomes untrusted, and can read credential files other than `.harness/secrets.toml` that sit inside a read root. A credential file a command moves stays hidden for the rest of that run, not across runs.
+- **Confinement covers files, on Linux only.** There is no network isolation, and without Landlock (an old kernel, or a container that filters it) children run unconfined. Shell commands can still write the `.harness` configuration inside the workspace (Landlock cannot carve a hole in a writable tree), though edited config becomes untrusted; run state lives outside the workspace for this reason. They can read credential files other than `.harness/secrets.toml` that sit inside a read root. A credential file a command moves stays hidden for the rest of that run, not across runs.
 - **The process cap is per user** (`RLIMIT_NPROC`), so it bounds a fork bomb rather than isolating it.
 - The Responses API is tested against a mock.
 - **Compaction and finish review are heuristics.** Summary and review quality depend on the model. Context size comes from `--context-window` or, on OpenRouter, the provider's model list; other providers need the flag. Resume restores it. Disabling compaction is in [configuration](docs/configuration.md#initluau-compaction-and-recheck).

@@ -323,8 +323,9 @@ impl Supervisor {
         crate::values::validate(&durable)?;
         let workflow = checkpoint.as_ref().and_then(|c|c.workflow.clone()).or_else(||manifest.workflow.as_ref().map(|_|crate::workflow::ExecutionFrame::default()));
         let restored = checkpoint.map(|c| c.run);
-        let recovery = Some(json!({"receipts": receipts, "log_directory":path.parent(), "uncertain_operations": books.open.values().cloned().collect::<Vec<_>>(),
-            "notice": "Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work. Uncertain mutations require the owner's `hx recover` decision. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them."}));
+        // The journal file itself, so a suggested `hx recover` names what the owner must pass (not its directory).
+        let recovery = Some(json!({"receipts": receipts, "journal":path, "uncertain_operations": books.open.values().cloned().collect::<Vec<_>>(),
+            "notice": format!("Recovered into a fresh Luau VM. Ordinary globals and functions are gone; the conversation is restored. Old chunks were NOT executed. Inspect receipts before doing further work. Uncertain mutations require the owner's decision: `hx recover {} OP --decision complete|abandon --yes`, with OP an uncertain operation's seq. To keep data across a future restart, save JSON-like values with `durable.set(key, value)` and read them with `durable.get(key)`; a completed chunk commits them.", path.display())}));
         policy.log.write("resume", json!({"format": FORMAT, "checkpoint": frontier}), true)?;
         // The registry is restored from bytes in the protected journal, never from the workspace.
         let mut registry = manifest.registry.clone();
@@ -350,7 +351,7 @@ impl Supervisor {
         let cap = tool.capability();
         anyhow::ensure!(principal.allows(cap), "capability_denied: {} lacks {cap} for {}", principal.name(), tool.name());
         if class != Class::Read && !self.books.lock().unwrap().uncertain.is_empty() {
-            bail!("unknown_outcome: unresolved mutations block new mutations; inspect receipts and ask the owner to run `hx recover LOG OP --decision complete|abandon --yes`");
+            bail!("unknown_outcome: unresolved mutations block new mutations; inspect receipts and ask the owner to run `hx recover {} OP --decision complete|abandon --yes`", self.policy.log.path.display());
         }
         Ok(())
     }
