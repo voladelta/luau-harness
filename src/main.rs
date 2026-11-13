@@ -158,6 +158,8 @@ const FLAGS: &[Flag] = {
         flag(RUN, "--rpi", Switch, "", "research, design, implement, verify and repair automatically"),
         flag(RUN, "--manual", Switch, "", "require RPI artifact review (requires --rpi)"),
         flag(RUN, "--ar", Switch, "", "autoresearch over .harness/ar.toml until progress stops (--ar --resume RUN continues one; see hx runs)"),
+        flag(RUN, "--ar-unconfined", Switch, "", "with --ar: run although the kernel cannot confine episodes and evaluators (held-out data is then only as safe as your sandbox)"),
+        flag(RUN, "--finish", Switch, "", "with --ar --resume RUN: write the run's result from its last gate and start nothing"),
         flag(&["review"], "--gate", Text, "ID", "the gate to decide"),
         flag(&["review"], "--decision", Text, "D", "approve, revise, answer or waive"),
         flag(&["review"], "--input-file", Text, "F", "feedback, answers or the waiver reason"),
@@ -295,10 +297,14 @@ fn validate_args(args: &[String]) -> Result<()> {
         }
     }
     if seen.contains("--resume")
-        && let Some(flag) = seen.iter().find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace" | "--ar")) {
+        && let Some(flag) = seen.iter().find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace" | "--ar" | "--ar-unconfined" | "--finish")) {
         return Err(usage(&format!("{flag} cannot override a resumed manifest; use --branch LOG for a new configuration")));
     }
     if seen.contains("--manual") && !seen.contains("--rpi") { return Err(usage("--manual requires --rpi")); }
+    if let Some(flag) = ["--ar-unconfined", "--finish"].into_iter().find(|f| seen.contains(f) && !seen.contains("--ar")) {
+        return Err(usage(&format!("{flag} requires --ar")));
+    }
+    if seen.contains("--finish") && !seen.contains("--resume") { return Err(usage("--finish requires --resume RUN")); }
     if seen.contains("--ar") && let Some(flag) = seen.iter().find(|f| matches!(**f, "--rpi" | "--branch" | "--trace" | "--max-tokens" | "--max-wall" | "--max-turns")) {
         return Err(usage(&format!("{flag} cannot be combined with --ar")));
     }
@@ -528,13 +534,14 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
 
 /// hx run --ar: every flag except the program passes through to the episodes' child runs.
 async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
+    let options = ar::Options { unconfined: has(args, "--ar-unconfined"), finish: has(args, "--finish") };
     if let Some(dir) = arg(args, "--resume") {
-        return ar::orchestrate(workspace, None, Some(state::resolve_ar(workspace, &dir))).await;
+        return ar::orchestrate(workspace, None, Some(state::resolve_ar(workspace, &dir)), options).await;
     }
     let mut child = vec![];
     for argument in cli_args(args) {
         let CliArg::Flag(name, value) = argument else { continue };
-        if matches!(name, "--ar" | "--prompt-file" | "--workspace") { continue; }
+        if matches!(name, "--ar" | "--ar-unconfined" | "--prompt-file" | "--workspace") { continue; }
         child.push(name.to_string());
         child.extend(value.map(String::from));
     }
@@ -547,7 +554,7 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
             if arg(args, "--max-output").is_none() { child.extend(["--max-output".into(), limited.max_output.to_string()]); }
         }
     }
-    ar::orchestrate(workspace, Some((child, program)), None).await
+    ar::orchestrate(workspace, Some((child, program)), None, options).await
 }
 
 fn cmd_recover(args: &[String], workspace: &Path) -> Result<()> {

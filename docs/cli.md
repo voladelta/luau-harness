@@ -38,6 +38,8 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
 | `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs a prompt or `--prompt-file` (the program); runs until progress stops. `--ar --resume RUN` continues a run (its directory, or its id from `hx runs`) |
+| `--ar-unconfined` | off | With `--ar` (launch or resume): run although the kernel cannot confine episodes and evaluators. Without Landlock (macOS, old kernels, filtering containers) a spec with `select`, `grader` or `holdout` is refused, since an agent's shell could read that data and rewrite the run's records; pass this only inside a sandbox of your own |
+| `--finish` | off | With `--ar --resume RUN`: write the run's result (portfolio and workspace) from its last gate, starting nothing |
 | `--model M` | `HX_MODEL` | Model id |
 | `--base-url U` | `HX_BASE_URL` | Responses API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |

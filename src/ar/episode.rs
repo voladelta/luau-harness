@@ -84,12 +84,12 @@ pub async fn eval(pol: &Policy, note: String) -> Result<Value> {
     };
     // A worker's step counts when it beats its best by more than the evaluator's noise, so small steps add up across
     // rounds; `min_delta` is the bar against the seed, applied at the gate.
-    let margin = se.unwrap_or(0.0);
+    let margin = super::margin(spec, se, None);
     let (improved, best) = {
         let mut p = progress.lock().unwrap();
         // The state a worker starts from never improves it, so an explore worker's bar is set by the first state it builds.
         let improved = idea != 0 && valid && snap != episode.start
-            && spec.better(score.unwrap(), p.best, if p.best.is_some() { margin } else { 0.0 });
+            && spec.better(score.unwrap(), p.best, margin);
         if improved { p.best = score; }
         (improved, p.best)
     };
