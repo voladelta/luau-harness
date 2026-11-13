@@ -1,6 +1,6 @@
 # Command reference
 
-Every command takes `--help`.
+Every command takes `--help`. Wherever a command takes `LOG` (a run's journal), a run id that `hx runs` lists (`1731500000-1234`) works too.
 
 ## Commands
 
@@ -19,6 +19,7 @@ Every command takes `--help`.
 | `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, print its hash, then trust it; runs refuse untrusted config |
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
 | `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
+| `hx runs` | List this workspace's runs (journals and autoresearch runs) with their paths |
 | `hx log verify FILE` | Check a log's hash chain and recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
 
 ## `hx run` flags
@@ -36,7 +37,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run; irreversible commands still need an exact `allow` entry or a terminal answer |
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
-| `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs a prompt or `--prompt-file` (the program); runs until progress stops |
+| `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs a prompt or `--prompt-file` (the program); runs until progress stops. `--ar --resume RUN` continues a run (its directory, or its id from `hx runs`) |
 | `--model M` | `HX_MODEL` | Model id |
 | `--base-url U` | `HX_BASE_URL` | Responses API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
@@ -65,11 +66,24 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--workspace DIR` | Workspace root (default `.`) |
 | `--approval prompt\|deny` | Override the configured approval mode (default `prompt`); cannot combine with `--yes` |
 
-Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=HASH` trusts exactly the config with that hash for one launch (`HX_TRUST=1` is deprecated; see [workspace trust](configuration.md#workspace-trust)).
+Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` flags; `HX_DEBUG=1` prints the full error chain on failure; `HX_TRUST=HASH` trusts exactly the config with that hash for one launch (`HX_TRUST=1` is deprecated; see [workspace trust](configuration.md#workspace-trust)); `XDG_STATE_HOME` moves the run state (default `~/.local/state`, so `~/.local/state/hx`), and `XDG_CONFIG_HOME` the trust store.
 
 ## Report and logs
 
-`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer` and tokens. The event log is written to `.harness/log/`. The log stores file contents and command output as blobs in `.harness/log/blobs/`, so treat it as sensitive.
+`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer`, tokens and `log`, the path of the run's journal.
+
+Run state lives outside the workspace, in `$XDG_STATE_HOME/hx` (default `~/.local/state/hx`), one directory per workspace named after it plus a hash of its canonical path:
+
+```text
+~/.local/state/hx/projects/app-3f2a9c1b04de/
+  log/1731500000-1234.jsonl   a run's journal (with .lock, and .revoked after hx revoke)
+  log/blobs/  log/registry/   content-addressed file contents, command output, checkpoints and frozen modules
+  ar/1731500000-99.noindex/   an autoresearch run (see workflows)
+```
+
+`hx runs` lists them. Agents cannot reach this directory: file tools refuse to read or write it in every mode, and on Linux shell commands neither read nor write it (see [shell confinement](configuration.md#shell-confinement)). The journal and blobs hold file contents and command output, so treat them as sensitive. RPI artifact projections (`.agents/artifacts/`) stay in the workspace: they are readable copies, regenerated from the run state.
+
+Journals of runs started before hx kept run state there sit in the workspace's `.harness/log/`. Pass such a journal's path to `--resume`, `--branch`, `review`, `recover`, `revoke` or `log verify` as before; hx notes once that it lives in the workspace, where that workspace's shell commands could have changed it. Autoresearch runs kept in `.harness/ar/` cannot be resumed.
 
 ## Checkpoints and resume
 
