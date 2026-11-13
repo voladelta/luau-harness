@@ -149,7 +149,7 @@ pub struct ExecutionFrame {
     pub check_plan: Vec<PlannedCheck>,
     pub boundaries: BTreeMap<String, String>,
     /// The project as the current verification stage started. `None` outside verification, or when the project could
-    /// not be observed then (the stage is told why, and its submission is refused until it can be).
+    /// not be observed then (the stage is told why, and its verification fails).
     pub observation: Option<ProjectObservation>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -32,6 +32,31 @@ pub struct ChunkEnd {
     pub refused: bool,
 }
 
+/// What an effect record says about the workflow stage it ran in.
+#[derive(Clone, Debug)]
+pub struct StageFacts {
+    stage_id: String,
+    /// For a verification-stage shell command: the project as observed for its receipt.
+    project: Option<ProjectFact>,
+}
+#[derive(Clone, Debug)]
+enum ProjectFact {
+    Digest(String),
+    /// The project could not be observed. The command still runs; its receipt cannot satisfy a planned check.
+    Unobservable(String),
+}
+impl StageFacts {
+    /// Add these facts to an intent or outcome record. Only the digest is stored; the inventory is recomputable.
+    pub fn record(&self, fields: &mut Value) {
+        fields["workflow_stage"] = json!(self.stage_id);
+        match &self.project {
+            Some(ProjectFact::Digest(digest)) => fields["project_digest"] = json!(digest),
+            Some(ProjectFact::Unobservable(error)) => fields["project_observation_error"] = json!(error),
+            None => {}
+        }
+    }
+}
+
 /// What a resumed owner gate does next.
 pub(crate) enum OwnerResume {
     /// No unconsumed decision is recorded: the run stays paused.
@@ -77,28 +102,47 @@ impl Supervisor {
         }
         Ok(())
     }
-    /// Stage facts for an effect's intent or outcome record: the stage ID, and for a verification-stage shell command
-    /// the project digest its receipt is checked against. Only the digest is stored; the inventory is recomputable.
-    pub fn workflow_effect_metadata(&self, tool: Tool, fields: &mut Value) -> Result<()> {
+    /// The stage facts for the intent of an effect of `tool`: the stage ID, and for a verification-stage shell
+    /// command the project as observed now. Observation runs Git and hashes up to 256 MiB, so it runs on a blocking
+    /// thread.
+    pub async fn intent_stage(&self, tool: Tool) -> Result<Option<StageFacts>> {
+        self.stage_facts(tool, true).await
+    }
+
+    /// The stage facts for the outcome of an effect whose intent recorded `intent` (none for an effect without an
+    /// intent, whose record no check receipt can use, so the project is not observed for it). A project that could not
+    /// be observed at intent makes the receipt unusable already; its outcome carries the same error unobserved.
+    pub async fn outcome_stage(&self, tool: Tool, intent: Option<&StageFacts>) -> Result<Option<StageFacts>> {
+        match intent.and_then(|facts| facts.project.as_ref()) {
+            Some(ProjectFact::Unobservable(_)) => Ok(intent.cloned()),
+            Some(ProjectFact::Digest(_)) => self.stage_facts(tool, true).await,
+            None => self.stage_facts(tool, false).await,
+        }
+    }
+
+    async fn stage_facts(&self, tool: Tool, observe: bool) -> Result<Option<StageFacts>> {
         let (stage_id, plan) = {
             let guard = self.workflow.lock().unwrap();
             let Some((frame, active)) = guard.as_ref().and_then(|f| f.stage.as_ref().map(|a| (f, a))) else {
-                return Ok(());
+                return Ok(None);
             };
-            let plan = (matches!(tool, Tool::Sh) && active.spec.verify).then(|| frame.check_plan.clone());
-            (active.spec.id.clone(), plan)
+            let verify = observe && matches!(tool, Tool::Sh) && active.spec.verify;
+            (active.spec.id.clone(), verify.then(|| frame.check_plan.clone()))
         };
-        fields["workflow_stage"] = json!(stage_id);
-        if let Some(plan) = plan {
-            match observe_checks(&self.policy.workspace, &plan) {
-                Ok(observation) => fields["project_digest"] = json!(observation.digest),
-                Err(error) if fields.get("ret").is_some() => {
-                    fields["project_observation_error"] = json!(format!("{error:#}"))
-                }
-                Err(error) => return Err(error),
+        let project = match plan {
+            None => None,
+            Some(plan) => {
+                let workspace = self.policy.workspace.clone();
+                let observed = tokio::task::spawn_blocking(move || observe_checks(&workspace, &plan))
+                    .await
+                    .context("project observation thread")?;
+                Some(match observed {
+                    Ok(observation) => ProjectFact::Digest(observation.digest),
+                    Err(error) => ProjectFact::Unobservable(format!("{error:#}")),
+                })
             }
-        }
-        Ok(())
+        };
+        Ok(Some(StageFacts { stage_id, project }))
     }
 
     /// `stage.submit`: check the payload against the active stage and prepare the submission the chunk's boundary
@@ -168,8 +212,25 @@ impl Supervisor {
             );
         }
         if stage.verify {
-            let observation = observe_checks(&self.policy.workspace, &plan)
-                .context("stage.submit: the project cannot be observed")?;
+            let observation = match observe_checks(&self.policy.workspace, &plan) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    // Nothing this stage can submit is verified evidence, and its receipts cannot be checked: the
+                    // host seals a failed verification, which routes to repair, where the project can be fixed.
+                    let error = format!("{error:#}");
+                    let finding = format!(
+                        "The project cannot be observed, so no check can be verified: {error}. Remove or fix what \
+                         the inventory rejects (a symlink leading outside, a file over 32 MiB, a non-UTF-8 path)."
+                    );
+                    let checks = VerificationSummary {
+                        unrun: plan.iter().map(|c| c.id.clone()).collect(),
+                        ..Default::default()
+                    };
+                    payload["verification"] = json!({"passed":false,"findings":[finding],"checks":checks,
+                        "project_error":error});
+                    return self.seal_submission(epoch, stage, payload, document);
+                }
+            };
             let root = std::fs::canonicalize(&self.policy.workspace)?;
             let records = eventlog::load(&self.policy.log.path)?;
             let result = check_result(&plan, &payload, &records, &stage.id, &root, &observation.digest)
@@ -198,6 +259,11 @@ impl Supervisor {
                 "stage.submit: verification could not observe the project; fix this before submitting",
             )?;
         }
+        self.seal_submission(epoch, stage, payload, document)
+    }
+
+    /// Store the checked submission's document and make it the stage's prepared submission.
+    fn seal_submission(&self, epoch: Option<u64>, stage: StageSpec, payload: Value, document: String) -> Result<String> {
         let document_blob = self.policy.log.blob(document.as_bytes())?;
         let id = format!(
             "submission-{}",
@@ -463,8 +529,8 @@ impl Host {
                 let mut metadata = json!({"workspace":self.workspace,"files":crate::host::file_tree(&self.workspace),"check_plan":frame.check_plan});
                 frame.observation = None;
                 if stage.verify {
-                    // An unobservable project does not stop the run: the stage is told why, and stage.submit refuses
-                    // until the project can be observed.
+                    // An unobservable project does not stop the run: the stage is told why, and its verification
+                    // fails, which goes to repair.
                     match observe_checks(&self.workspace, &frame.check_plan) {
                         Ok(observation) => frame.observation = Some(observation),
                         Err(error) => metadata["project_error"] = json!(format!("{error:#}")),

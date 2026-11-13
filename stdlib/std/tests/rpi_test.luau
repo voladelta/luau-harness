@@ -110,6 +110,18 @@ test.case("verification failures trigger three bounded repair cycles", function(
 	test.eq(command.next.report.repairs, 3)
 end)
 
+test.case("a verification over an unobservable project goes to repair, even when it asked the owner", function()
+	local s, command = initial()
+	for _ = 1, 5 do s = deliver(s, command); s, command = submit(s, complete("phase")) end
+	s = deliver(s, command)
+	local payload = { outcome = "needs_input", summary = "stuck", evidence = {}, questions = { "Remove the link?" },
+		verification = { passed = false, findings = { "cannot be observed" }, project_error = "inventory symlink escapes project: leak" } }
+	s, command = submit(s, payload)
+	test.eq(command.next.kind, "stage")
+	test.eq(command.next.stage.name, "repair")
+	test.eq(s.repairs, 1)
+end)
+
 test.case("necessary input pauses even automatic mode and answer retries same stage", function()
 	local s, command = initial()
 	s = deliver(s, command)

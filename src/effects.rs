@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use crate::supervisor::{Principal, Supervisor, Tool};
+use crate::workflow_runtime::StageFacts;
 
 pub fn rt(msg: impl Into<String>) -> mlua::Error {
     mlua::Error::runtime(msg.into())
@@ -138,13 +139,13 @@ impl Effects {
         json!({"depth": self.depth, "args_sha": sha})
     }
 
-    fn begin(&self, c: &Call) -> mlua::Result<Option<u64>> {
+    fn begin(&self, c: &Call, stage: Option<&StageFacts>) -> mlua::Result<Option<u64>> {
         let Call { tool, class, args, sha } = *c;
-        (class != Class::Read).then(|| self.supervisor.intent(tool, class, args, sha, self.depth, &self.principal))
+        (class != Class::Read).then(|| self.supervisor.intent(tool, class, args, sha, self.depth, &self.principal, stage))
             .transpose().map_err(|e| rt(e.to_string()))
     }
 
-    fn finish(&self, intent: Option<u64>, c: &Call, res: &mlua::Result<Ret>, ms: u64) -> mlua::Result<()> {
+    fn finish(&self, intent: Option<u64>, c: &Call, res: &mlua::Result<Ret>, ms: u64, stage: Option<&StageFacts>) -> mlua::Result<()> {
         let Call { tool, class, args, sha } = *c;
         if let (Some(id), Err(error)) = (intent, res) {
             let message = err_text(error);
@@ -162,7 +163,7 @@ impl Effects {
         r["ms"] = json!(ms);
         r["ret"] = ret.to_json(self.log()).map_err(|e| rt(e.to_string()))?;
         if let Ret::Sh { approval, .. } = &ret { r["approval"] = json!(approval.name()); }
-        self.supervisor.workflow_effect_metadata(tool, &mut r).map_err(mlua::Error::external)?;
+        if let Some(stage) = stage { stage.record(&mut r); }
         if let Ret::Err(m) = &ret {
             r["detail"] = json!({"error": m.chars().take(300).collect::<String>()});
         }
@@ -223,7 +224,8 @@ impl Effects {
         let t0 = std::time::Instant::now();
         let _wait = self.awaiting(lua);
         let call = Call { tool, class, args: &args, sha: &sha };
-        let intent = self.begin(&call)?;
+        let intent_stage = if class != Class::Read { self.supervisor.intent_stage(tool).await.map_err(mlua::Error::external)? } else { None };
+        let intent = self.begin(&call, intent_stage.as_ref())?;
         let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
         let authorization = async {
             let path = match tool {
@@ -258,7 +260,8 @@ impl Effects {
             },
         };
         if let Ok(Ret::Sh {operation_id,..}) = &mut res { *operation_id = intent; }
-        self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64)?;
+        let outcome_stage = self.supervisor.outcome_stage(tool, intent_stage.as_ref()).await.map_err(mlua::Error::external)?;
+        self.finish(intent, &call, &res, t0.elapsed().as_millis() as u64, outcome_stage.as_ref())?;
         res
     }
 }
@@ -330,7 +333,7 @@ mod tests {
         let (fx, dir) = effects("queued");
         let lua = Lua::new();
         let permit = fx.supervisor.mutations.clone().acquire_owned().await.unwrap();
-        let id = fx.supervisor.intent(Tool::McpCall, Class::External, &json!({}), "hash", 0, &fx.principal).unwrap();
+        let id = fx.supervisor.intent(Tool::McpCall, Class::External, &json!({}), "hash", 0, &fx.principal, None).unwrap();
         let executed = std::cell::Cell::new(false);
         let queued = fx.run(&lua, Tool::Sh, Class::LocalWrite, json!({}), || async {
             executed.set(true);

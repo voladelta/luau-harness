@@ -548,6 +548,56 @@ def unobservable_project_fails_at_launch():
     (path / "big.bin").unlink()
 
 
+def verification_shell_runs_while_unobservable():
+    path = workspace("unobservable-shell")
+    script = Script()
+    def answer(body, index):
+        name = stage(body)
+        if name == "verification" and script.counts.get(name, 0) < 2:
+            script.counts[name] = script.counts.get(name, 0) + 1
+            if script.counts[name] == 1:
+                return harness.tool('assert(sh("ln -s /etc/passwd leak").code == 0)')
+            # The project cannot be observed now; the command that fixes it must still run.
+            return harness.tool('assert(sh("rm leak").code == 0)')
+        return script(body, index)
+    with harness.provider(answer) as (url, calls):
+        value = report(start(path, url))
+        assert value["finished"] and value["repairs"] == 0, value
+        assert not os.path.lexists(path / "leak")
+        records = harness.records(Path(value["log"]))
+        intent = next(r for r in records if r["kind"] == "intent" and r.get("args", {}).get("cmd") == "rm leak")
+        outcome = next(r for r in records if r["kind"] == "outcome" and r.get("of") == intent["seq"])
+        for record in (intent, outcome):
+            assert "escapes" in record["project_observation_error"] and "project_digest" not in record, record
+        verification = [a for a in value["artifact_refs"] if a["submission"].get("verification")]
+        assert len(verification) == 1 and verification[0]["submission"]["verification"]["passed"], verification
+
+
+def unobservable_verification_goes_to_repair():
+    path = workspace("unobservable-submit")
+    script = Script()
+    def answer(body, index):
+        name = stage(body)
+        if name == "verification" and name not in script.counts:
+            script.counts[name] = 1
+            # Asking the owner cannot help: only repair can change the project.
+            return harness.tool('sh("ln -s /etc/passwd leak"); '
+                                + submit(name, 'findings={},', outcome="needs_input", questions='{"Remove the link?"}'))
+        if name == "repair":
+            return harness.tool('sh("rm leak"); ' + submit(name))
+        return script(body, index)
+    with harness.provider(answer) as (url, calls):
+        value = report(start(path, url))
+        assert value["finished"] and value["repairs"] == 1, value
+        assert not os.path.lexists(path / "leak")
+        verification = [a["submission"]["verification"] for a in value["artifact_refs"] if a["submission"].get("verification")]
+        assert len(verification) == 2, verification
+        first, last = verification
+        assert not first["passed"] and "escapes" in first["project_error"], first
+        assert any("cannot be observed" in f for f in first["findings"]) and first["checks"]["unrun"] == ["content"], first
+        assert last["passed"], last
+
+
 def check(name, fn):
     global passed
     if os.environ.get("HX_CHECK_FILTER") and os.environ["HX_CHECK_FILTER"] not in name:
@@ -576,4 +626,6 @@ if __name__ == "__main__":
     check("records keep project digests, the transcript once and the frozen plan in view", records_store_digests_once)
     check("a projection failure does not stop or block the run", projection_failure_is_not_fatal)
     check("a project that cannot be observed is refused at launch", unobservable_project_fails_at_launch)
+    check("verification shell commands run while the project cannot be observed", verification_shell_runs_while_unobservable)
+    check("a verification over an unobservable project is sealed failed and goes to repair", unobservable_verification_goes_to_repair)
     print(f"{passed} passed; artifacts: {BASE}")

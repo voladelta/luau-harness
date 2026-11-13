@@ -243,6 +243,11 @@ function M.step(s, event)
 	local error_text = valid(payload, s.stage.name)
 	if error_text then return correct(s, error_text) end
 	s.artifacts[s.stage.name] = submission.id
+	-- The host seals a failed verification over a project it cannot observe, whatever the stage asked: only repair,
+	-- which can change the project, can fix that, so owner questions wait for the next verification.
+	if s.stage.name == "verification" and type(payload.verification) == "table" and payload.verification.project_error ~= nil then
+		return repair(s, submission.id)
+	end
 	if payload.outcome ~= "complete" then return gate(s, "input", payload.questions, {}, "same_stage", submission.id) end
 	if s.stage.name == "repair" and type(payload.redesign_stage) == "string" then
 		local name = payload.redesign_stage

@@ -1291,7 +1291,7 @@ mod tests {
     fn unknown_programs_need_approval_and_everyday_commands_do_not() {
         let (p, dir) = test_policy("unknown", false, &[]);
         let padded = |wrapper: &str, pad: &str, n: usize| format!("{wrapper} {} git push --force origin main", vec![pad; n].join(" "));
-        let mut must_ask = vec![
+        let must_ask = vec![
             "g$'i't push origin main".to_string(), "$x push origin main".into(), "\"$(echo git)\" push origin main".into(),
             "`echo git` push origin main".into(), "$(echo git) push origin main".into(), "${GIT} push origin main".into(),
             "$'git' push origin main".into(), "sudo $x push origin main".into(), "env A=1 \"$PROG\" push".into(),

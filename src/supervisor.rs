@@ -645,11 +645,14 @@ impl Supervisor {
         Ok(())
     }
 
-    pub fn intent(&self, tool: Tool, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal) -> Result<u64> {
+    /// Journal the intent of an effect. `stage` holds the workflow facts its receipt carries, observed by the caller
+    /// off the async threads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn intent(&self, tool: Tool, class: Class, args: &Value, args_sha: &str, depth: usize, principal: &Principal, stage: Option<&crate::workflow_runtime::StageFacts>) -> Result<u64> {
         let mut fields = json!({"tool":tool.name(), "class":class.name(), "args":args,
             "args_sha":args_sha, "depth":depth, "principal":principal.name(),
             "summary":args.to_string().chars().take(300).collect::<String>()});
-        self.workflow_effect_metadata(tool, &mut fields)?;
+        if let Some(stage) = stage { stage.record(&mut fields); }
         self.record(LedgerKind::Intent, fields, true)
     }
 
@@ -866,7 +869,7 @@ mod checkpoint_tests {
         let (supervisor, dir) = journal(tag);
         let file = dir.join("note.txt");
         if let Some(text) = before { std::fs::write(&file, text).unwrap(); }
-        let id = supervisor.intent(Tool::Write, Class::LocalWrite, &json!({"path": "note.txt"}), "sha", 0, &Principal::Agent { read_only: false }).unwrap();
+        let id = supervisor.intent(Tool::Write, Class::LocalWrite, &json!({"path": "note.txt"}), "sha", 0, &Principal::Agent { read_only: false }, None).unwrap();
         let target = crate::atomic_file::Target::open(&file, false).unwrap();
         // Journal the expectation as replace_file does, then stop where a crash before the rename would.
         let tmp = temp_name(&supervisor.policy.log.session, id);
