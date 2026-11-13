@@ -712,7 +712,8 @@ assert(#durable.get("1")==#s); print("BOUNDED_OK")'''
         log = journal(path)
         checkpoint = next(r for r in reversed(records(log)) if r["kind"] == "checkpoint" and r["lane"] == "root")
         saved = json.loads((log.parent / "blobs" / checkpoint["blob"]).read_text())
-        assert saved["durable"]["report"]["uncertain_operations"] == [], saved["durable"]
+        # a package's agent() returns what the agent's own agent() does
+        assert saved["durable"]["report"] == {"answer": "child done", "finished": True, "turns": 2}, saved["durable"]
 
 
 def review_branch_and_revocation():

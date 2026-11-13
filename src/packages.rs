@@ -44,12 +44,9 @@ fn worker(supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, package: &str) -
             async move {
                 fx.supervisor.authorize(&fx.principal, crate::supervisor::Tool::Agent, crate::policy::Class::Read).map_err(mlua::Error::external)?;
                 let options = crate::host::AgentOptions::from_lua(opts)?;
+                // The child inherits the package's principal, so it can do no more than the package.
                 let child = host.child(&options, fx.principal.clone()).map_err(mlua::Error::external)?;
-                let ret = fx.run(&lua, crate::supervisor::Tool::Agent, crate::policy::Class::Read, serde_json::json!({"task":task, "max_turns":options.max_turns, "model":options.model, "effort":options.effort}), || async {
-                    let rep = child.run_task(task, options.max_turns).await.map_err(mlua::Error::external)?;
-                    Ok(crate::effects::Ret::Json(rep))
-                }).await?;
-                prims::json_value(&lua, ret)
+                prims::agent(&fx, &lua, child, task, &options).await?.into_lua(&lua)
             }
         })?)?;
     } else {
