@@ -1,5 +1,6 @@
 mod ar;
 mod atomic_file;
+mod cas;
 mod confine;
 mod effects;
 mod eventlog;
@@ -22,7 +23,7 @@ mod tools;
 mod workflow;
 mod workflow_runtime;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -207,7 +208,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
         "runs" => "hx runs\n\nList this workspace's runs: journals and autoresearch runs, with their paths. Run state lives outside the\nworkspace, in $XDG_STATE_HOME/hx (default ~/.local/state/hx), one directory per workspace. Wherever a command takes\nLOG (or --ar --resume RUN), a run id from this list (1731500000-1234) works too.\n",
-        "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 corrupt chain or invalid recovery accounting, 3 unknown outcomes.\n",
+        "log" => "hx log verify FILE\n\nCheck the hash chain, that every stored checkpoint and manifest blob is present and intact, and list effects with an\nunknown outcome.\nExit codes: 0 ok, 1 corrupt chain, invalid recovery accounting or damaged stored state, 3 unknown outcomes.\n",
         _ => return None,
     })
 }
@@ -481,8 +482,7 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
             anyhow::ensure!(recovery.unknown.is_empty() && recovery.unknown_models.is_empty(), "reconcile uncertain operations and model billing before branching");
             let records = eventlog::load(Path::new(&path))?;
             let state = records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
-                .map(|r| eventlog::read_blob(Path::new(&path).parent().unwrap(), r["blob"].as_str().unwrap())).transpose()?
-                .map(|b| supervisor::Checkpoint::load(&b)).transpose()?;
+                .map(|r| supervisor::Checkpoint::read(Path::new(&path).parent().unwrap(), r["blob"].as_str().unwrap_or_default())).transpose()?;
             Ok((journal, manifest, state))
         }).transpose()?;
         let task = task_text(args)?.or_else(|| inherited.as_ref().map(|(_, m, _)| m.task.clone()))
@@ -660,7 +660,24 @@ fn cmd_log_verify(args: &[String], workspace: &Path) -> Result<()> {
     }
     for seq in &r.unknown_models { println!("UNKNOWN BILLING: #{seq} model request (charged its reserved tokens on resume)"); }
     if let Some(error) = &r.recovery_error { println!("INVALID RECOVERY ACCOUNTING: {error}"); }
-    if !r.chain_ok || r.recovery_error.is_some() {
+    // A record commits a stored tree only if every blob it references is there and intact: resume, branch and history
+    // would fail on it. Trees of one run share most blobs, so each is read once.
+    let stored = (|| -> Result<usize> {
+        let mut seen = std::collections::HashSet::new();
+        let dir = f.parent().context("log has no parent directory")?;
+        let mut read = 0;
+        for record in eventlog::load(&f)?.iter().filter(|r| matches!(r["kind"].as_str(), Some("manifest" | "checkpoint"))) {
+            let blob = record["blob"].as_str().with_context(|| format!("record {} names no blob", record["seq"]))?;
+            read += cas::verify(dir, blob, &mut seen).with_context(|| format!("{} record {}", record["kind"].as_str().unwrap_or_default(), record["seq"]))?;
+        }
+        Ok(read)
+    })();
+    match &stored {
+        Ok(n) => println!("stored state: {n} blobs verified"),
+        Err(error) if r.chain_ok && r.recovery_error.is_none() => println!("INVALID STORED STATE: {error:#}"),
+        Err(_) => {},
+    }
+    if !r.chain_ok || r.recovery_error.is_some() || stored.is_err() {
         std::process::exit(1);
     }
     if !r.unknown.is_empty() || !r.unknown_models.is_empty() {
@@ -794,6 +811,7 @@ mod tests {
             ("docs/runtime-v2.md", runtime, format!("Serialized responses are capped at {} KiB", history::MAX_RESPONSE >> 10)),
             ("docs/runtime-v2.md", runtime, format!("A search examines at most {} entries and charges at most {} of checkpoint source bytes", history::MAX_SCAN, mib(history::MAX_SOURCE))),
             ("docs/runtime-v2.md", runtime, format!("a cache holds at most {} of encoded source bodies", mib(history::CACHE_BYTES))),
+            ("docs/runtime-v2.md", runtime, format!("every subtree whose JSON encoding exceeds {} KiB is its own blob", cas::SPLIT >> 10)),
             ("docs/runtime-v2.md", runtime, format!("under a {}-second CPU deadline and a {} memory limit", word(tools::REGISTER_SECS as usize), mib(tools::REGISTER_MEMORY))),
             ("docs/extending.md", extending, format!("limited to {} second and {}", word(tools::REGISTER_SECS as usize), mib(tools::REGISTER_MEMORY))),
             ("docs/extending.md", extending, format!("Requests have a {}-second timeout, an {} response limit", tools::HTTP_TIMEOUT_SECS, mib(tools::HTTP_MAX_BODY))),

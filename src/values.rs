@@ -36,10 +36,42 @@ impl Limit {
         Ok(())
     }
     pub(crate) fn string(&mut self, s: &str) -> mlua::Result<()> {
-        // Conservative JSON escaping bound, charged before allocating a Rust copy (one charge: images are megabytes).
-        self.charge(2 + s.bytes().map(|b| if b < 32 { 6 } else if b == b'"' || b == b'\\' { 2 } else { 1 }).sum::<usize>(), 0)
+        // Charged before allocating a Rust copy (one charge: images are megabytes).
+        self.charge(string_bytes(s), 0)
     }
 }
+
+/// Conservative JSON escaping bound for a string.
+fn string_bytes(s: &str) -> usize {
+    2 + s.bytes().map(|b| if b < 32 { 6 } else if b == b'"' || b == b'\\' { 2 } else { 1 }).sum::<usize>()
+}
+
+/// The bytes `validate` charges for one node, its children excluded; each node also counts once toward MAX_NODES.
+fn node_bytes(value: &serde_json::Value) -> usize {
+    1 + match value {
+        serde_json::Value::String(s) => string_bytes(s),
+        serde_json::Value::Array(_) => 2,
+        serde_json::Value::Object(o) => 2 + o.keys().map(|k| string_bytes(k)).sum::<usize>(),
+        _ => 24,
+    }
+}
+
+/// What `validate` charges for `value` as (bytes, nodes), plus its key's string when it is an object member. The durable
+/// store keeps its store-wide total with this, per entry, so the total and `validate` cannot disagree.
+pub(crate) fn charge(key: Option<&str>, value: &serde_json::Value) -> (usize, usize) {
+    fn walk(v: &serde_json::Value, total: &mut (usize, usize)) {
+        total.0 += node_bytes(v);
+        total.1 += 1;
+        match v { serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, total)), serde_json::Value::Object(o) => o.values().for_each(|v| walk(v, total)), _ => {} }
+    }
+    let mut total = (key.map_or(0, string_bytes), 0);
+    walk(value, &mut total);
+    total
+}
+
+/// The stored-state reference key (`cas::MARKER`) is reserved: data that could name a blob could, once checkpointed,
+/// be expanded into another blob of the run store on resume.
+fn reserved() -> mlua::Error { mlua::Error::runtime(format!("the key {:?} is reserved for stored state", crate::cas::MARKER)) }
 
 pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
     fn visit(value: Value, stack: &mut HashSet<usize>, depth: usize, limit: &mut Limit) -> mlua::Result<serde_json::Value> {
@@ -85,6 +117,7 @@ pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
                         let (key, value) = pair?;
                         let Value::String(key) = key else { return Err(bad()); };
                         let key = key.to_str()?;
+                        if *key == *crate::cas::MARKER { return Err(reserved()); }
                         limit.string(&key)?;
                         fields.insert(key.to_string(), visit(value, stack, depth + 1, limit)?);
                     }
@@ -101,12 +134,14 @@ pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
 
 fn validate_with_limit(value: &serde_json::Value, depth: usize, limit: &mut Limit) -> mlua::Result<()> {
         if depth > MAX_DEPTH { return Err(mlua::Error::runtime(format!("data nesting exceeds {MAX_DEPTH} levels"))); }
-        limit.charge(1, 1)?;
+        limit.charge(node_bytes(value), 1)?;
         match value {
-            serde_json::Value::String(s) => limit.string(s)?,
-            serde_json::Value::Array(v) => { limit.charge(2, 0)?; for v in v { validate_with_limit(v, depth + 1, limit)?; } },
-            serde_json::Value::Object(v) => { limit.charge(2, 0)?; for (k, v) in v { limit.string(k)?; validate_with_limit(v, depth + 1, limit)?; } },
-            _ => limit.charge(24, 0)?,
+            serde_json::Value::Array(v) => { for v in v { validate_with_limit(v, depth + 1, limit)?; } },
+            serde_json::Value::Object(v) => {
+                if v.contains_key(crate::cas::MARKER) { return Err(reserved()); }
+                for v in v.values() { validate_with_limit(v, depth + 1, limit)?; }
+            },
+            _ => {},
         }
         Ok(())
 }
@@ -176,5 +211,25 @@ mod tests {
         lua.globals().set("array", array).unwrap();
         assert_eq!(lua.load("return getmetatable(array)").eval::<String>().unwrap(), "native array");
         assert!(validate(&serde_json::json!({"large":"x".repeat(MAX_BYTES)})).is_err());
+    }
+    #[test]
+    fn stored_state_references_cannot_be_forged_from_data() {
+        let lua = Lua::new();
+        let sha = "0".repeat(64);
+        let forged = lua.load(format!("return {{ messages = {{ {{ ['$hx.blob'] = '{sha}' }} }} }}")).eval().unwrap();
+        assert!(copy_out(forged).unwrap_err().to_string().contains("reserved"));
+        let nested = serde_json::json!({"a":[{"b":{crate::cas::MARKER: sha}}]});
+        assert!(validate(&nested).unwrap_err().to_string().contains("reserved"));
+        assert!(copy_in(&lua, &nested).is_err());
+        assert!(validate(&serde_json::json!({"$hx.blob2": 1, "hx.blob": 2})).is_ok());
+    }
+    #[test]
+    fn charge_is_what_validate_counts() {
+        let value = serde_json::json!({"s":"a\"\u{1}é","n":[1, 2.5, null, true, {}, []],"o":{"k":"v"}});
+        let (bytes, nodes) = charge(None, &value);
+        let mut limit = Limit::default();
+        validate_with_limit(&value, 0, &mut limit).unwrap();
+        assert_eq!((limit.bytes, limit.nodes), (bytes, nodes));
+        assert_eq!(charge(Some("key"), &value), (bytes + 5, nodes));
     }
 }

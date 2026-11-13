@@ -132,31 +132,18 @@ impl Printed {
 }
 
 /// What `values::validate` charges for data (conservative encoded bytes, nodes), so the durable store's total can be
-/// kept per entry: the store object costs 3 bytes and 1 node, each entry its key's string plus its value.
+/// kept per entry: the store object itself, then each entry's key and value.
 #[derive(Clone, Copy, Default)]
 struct DataSize { bytes: usize, nodes: usize }
 
 impl DataSize {
-    fn string(s: &str) -> usize {
-        2 + s.bytes().map(|b| if b < 32 { 6 } else if b == b'"' || b == b'\\' { 2 } else { 1 }).sum::<usize>()
-    }
-    fn value(v: &serde_json::Value, size: &mut DataSize) {
-        size.bytes += 1;
-        size.nodes += 1;
-        match v {
-            serde_json::Value::String(s) => size.bytes += Self::string(s),
-            serde_json::Value::Array(a) => { size.bytes += 2; for v in a { Self::value(v, size); } },
-            serde_json::Value::Object(o) => { size.bytes += 2; for (k, v) in o { size.bytes += Self::string(k); Self::value(v, size); } },
-            _ => size.bytes += 24,
-        }
-    }
     fn entry(key: &str, v: &serde_json::Value) -> DataSize {
-        let mut size = DataSize { bytes: Self::string(key), nodes: 0 };
-        Self::value(v, &mut size);
-        size
+        let (bytes, nodes) = crate::values::charge(Some(key), v);
+        DataSize { bytes, nodes }
     }
     fn entries(store: &serde_json::Map<String, serde_json::Value>) -> DataSize {
-        store.iter().map(|(k, v)| Self::entry(k, v)).fold(DataSize { bytes: 3, nodes: 1 }, |a, b| DataSize { bytes: a.bytes + b.bytes, nodes: a.nodes + b.nodes })
+        let (bytes, nodes) = crate::values::charge(None, &serde_json::Value::Object(Default::default()));
+        store.iter().map(|(k, v)| Self::entry(k, v)).fold(DataSize { bytes, nodes }, |a, b| DataSize { bytes: a.bytes + b.bytes, nodes: a.nodes + b.nodes })
     }
 }
 
@@ -934,6 +921,15 @@ impl Vm {
         let mut request = crate::values::copy_out(prepare.call(req)?)?;
         if let Some(system) = request["system"].as_str() { request["system"] = json!(format!("{system}{}", self.tool_prompt)); }
         Ok(request)
+    }
+
+    /// The messages std/hooks' notification sources (std/vision's queued images) hold for the conversation, each
+    /// delivered once. The host takes them after every chunk, so the controller budgets them before the next request.
+    /// A hooks module without `drain` (an older override) has no sources to drain.
+    pub fn drain_notifications(&self) -> Result<serde_json::Value> {
+        let drain = self.lua.load("local hooks = require('std/hooks'); return if hooks.drain then hooks.drain() else {}")
+            .set_name("=host").set_environment(self.modenv.clone()).into_function()?;
+        Ok(crate::values::copy_out(drain.call(())?)?)
     }
 
     /// Run every tests/*.luau file of a package directory; returns (passed, failed, report).

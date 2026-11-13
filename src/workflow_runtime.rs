@@ -346,11 +346,11 @@ impl Host {
         Ok(Some(event))
     }
 
-    pub(crate) fn apply_boundary(
+    pub(crate) fn apply_boundary<'a>(
         &self,
         boundary: Boundary,
-        controller: &Value,
-    ) -> Result<RunState> {
+        controller: &'a Value,
+    ) -> Result<RunState<&'a Value>> {
         ensure!(
             self.is_workflow_root(),
             "workflow boundary requires explicit root workflow selection"
@@ -460,7 +460,7 @@ impl Host {
                     metadata: json!({"workspace":self.workspace,"files":crate::host::file_tree(&self.workspace),"check_plan":frame.check_plan,"project":project}) }.to_json();
                 frame.pending_event = Some(event);
                 RunState::Running {
-                    controller: controller.clone(),
+                    controller,
                 }
             }
             BoundaryNext::Review { mut request } => {
@@ -478,7 +478,7 @@ impl Host {
                 frame.stage = None;
                 frame.pending_event = None;
                 RunState::AwaitingReview {
-                    controller: controller.clone(),
+                    controller,
                     report: report.as_object().unwrap().clone(),
                     gate: request,
                 }
@@ -536,10 +536,7 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
         .rev()
         .find(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
         .context("run has no checkpoint")?;
-    let checkpoint = Checkpoint::load(&eventlog::read_blob(
-        log.dir(),
-        latest["blob"].as_str().context("checkpoint blob missing")?,
-    )?)?;
+    let checkpoint = Checkpoint::read(log.dir(), latest["blob"].as_str().context("checkpoint blob missing")?)?;
     let RunState::AwaitingReview { gate: request, .. } = checkpoint.run else {
         anyhow::bail!("run is not awaiting review");
     };

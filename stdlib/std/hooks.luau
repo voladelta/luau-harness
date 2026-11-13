@@ -36,13 +36,14 @@ function M.on(event: string, fn: (any) -> any)
 end
 
 -- Notification sources (std/vision's queued images): each returns the messages it has for the conversation, once. The
--- host drains them after every chunk, so the controller sees and budgets them before the next request.
+-- host drains them after every chunk (Vm::drain_notifications calls M.drain), so the controller sees and budgets them
+-- before the next request.
 local sources: { () -> { any } } = {}
 function M.source(fn: () -> { any })
 	table.insert(sources, fn)
 end
 
-local function drain()
+function M.drain()
 	local out = {}
 	for _, fn in sources do
 		for _, message in fn() do table.insert(out, message) end
@@ -77,11 +78,6 @@ end
 
 -- Validate effective payloads, including in-place mutations with no returned replacement.
 function M.emit(event: string, payload: any): any
-	-- The host's drain after a chunk ({ drain = true }) reaches the agent VM the way requests do, but is no request: it
-	-- collects the notification sources and runs no hook.
-	if event == "before_model" and type(payload) == "table" and payload.drain == true then
-		return { system = "", messages = drain() }
-	end
 	for _, fn in handlers[event] or {} do
 		local ok, out = pcall(fn, payload)
 		if not ok then

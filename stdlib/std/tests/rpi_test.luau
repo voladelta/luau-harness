@@ -34,7 +34,7 @@ test.case("auto runs all stages with fresh workers and explicit verification", f
 		test.eq(command.next.stage.access, if name == "implementation" or name == "verification" then "workspace" else "inspect")
 		s = deliver(s, command)
 		test.eq(#s.messages, 1)
-		test.eq(s.messages, s.worker.messages)
+		test.eq(s.worker.messages, nil) -- the conversation is saved once, in s.messages
 		test.eq(s.worker.report.turns, 0)
 		s, command = submit(s, complete(name))
 	end

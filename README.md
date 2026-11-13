@@ -123,7 +123,7 @@ hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1
 | `hx approve` / `hx skills` / `hx test` | Approve packages and skills, list skills, run a package's tests |
 | `hx staged` / `hx accept` / `hx reject` / `hx rollback` | Review and activate what the agent staged; undo a module replacement |
 | `hx runs` | List this workspace's runs (journals and autoresearch runs) with their paths |
-| `hx log verify FILE` | Check a log's hash chain and recovery accounting |
+| `hx log verify FILE` | Check a log's hash chain, recovery accounting and stored state |
 
 Every flag and exit code is in the [command reference](docs/cli.md).
 

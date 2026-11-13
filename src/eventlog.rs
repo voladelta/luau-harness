@@ -29,6 +29,9 @@ pub struct EventLog {
     // A separate inode survives torn-tail repair. The lock is released only when the run drops its journal.
     _writer_lock: Option<std::fs::File>,
     owner_reconciliation: bool,
+    /// Blobs this process wrote or verified. A checkpoint references every unchanged subtree again (`cas::store`); those
+    /// are not reread and rehashed per transition, only checked for their length.
+    known: Mutex<std::collections::HashSet<String>>,
 }
 
 fn lock_writer(path: &Path) -> Result<std::fs::File> {
@@ -62,7 +65,7 @@ impl EventLog {
             }
         };
         let _writer_lock = Some(lock_writer(&path)?);
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: "genesis".into() }), failure: Mutex::new(None), session, path, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false }))
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: "genesis".into() }), failure: Mutex::new(None), session, path, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false, known: Mutex::default() }))
     }
 
     /// Continue an existing log after a crash: restore seq and the hash chain, drop a torn final line. A malformed line
@@ -95,7 +98,7 @@ impl EventLog {
         }
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
         let session = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev }), failure: Mutex::new(None), session, path: path.to_path_buf(), crash_after: crash_hook(), _writer_lock, owner_reconciliation }))
+        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev }), failure: Mutex::new(None), session, path: path.to_path_buf(), crash_after: crash_hook(), _writer_lock, owner_reconciliation, known: Mutex::default() }))
     }
 
     /// Audit failures are fatal to the run, even if Luau catches the returned error.
@@ -119,19 +122,26 @@ impl EventLog {
         self.path.parent().expect("a journal path has a parent directory")
     }
 
-    /// Store `bytes` content-addressed next to the log (write-once) and return its sha256.
+    /// Store `bytes` content-addressed next to the log (write-once) and return its sha256. The blob is durable when this
+    /// returns (file fsynced before its rename, directory synced after), so a synced record naming it commits it.
     pub fn blob(&self, bytes: &[u8]) -> Result<String> {
         self.check()?;
         let h = sha_bytes(bytes);
         let dir = self.dir().join("blobs");
-        std::fs::create_dir_all(&dir).map_err(|e| self.fail(format!("event log blob: {e}")))?;
         let f = dir.join(&h);
+        if self.known.lock().unwrap().contains(&h) && std::fs::metadata(&f).is_ok_and(|m| m.len() == bytes.len() as u64) { return Ok(h); }
+        if !dir.exists() {
+            // the new directory's own entry must survive a crash too, before a record names a blob in it
+            std::fs::create_dir_all(&dir).and_then(|_| std::fs::File::open(self.dir())?.sync_all())
+                .map_err(|e| self.fail(format!("event log blob: {e}")))?;
+        }
         if !f.exists() {
             // atomic: a crash mid-write must not leave a truncated blob under its final name
             write_atomic(&f, bytes).map_err(|e| self.fail(format!("event log blob: {e}")))?;
         } else {
             read_blob(self.dir(), &h).map_err(|e| self.fail(e))?;
         }
+        self.known.lock().unwrap().insert(h.clone());
         Ok(h)
     }
 
@@ -511,7 +521,7 @@ mod open_tests {
         pol.log = Arc::new(EventLog {
             inner: Mutex::new(Inner { file: std::fs::File::open(&path).unwrap(), seq: 0, prev: "genesis".into() }),
             failure: Mutex::new(None),
-            session: "read-only".into(), path: path.clone(), crash_after: None, _writer_lock: None, owner_reconciliation: false,
+            session: "read-only".into(), path: path.clone(), crash_after: None, _writer_lock: None, owner_reconciliation: false, known: Mutex::default(),
         });
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
         let lua = mlua::Lua::new();

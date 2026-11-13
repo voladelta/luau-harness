@@ -104,12 +104,22 @@ local function valid(payload, name)
 	end
 	return nil
 end
+-- The stage conversation is kept once, as `s.messages`: the field the host reads, extends with images and archives.
+-- The worker borrows it for each std/loop call, so saved state (and its 16 MiB bound) never holds a second copy.
+local function lend(s)
+	s.worker.messages = s.messages
+end
+local function take(s)
+	s.messages = s.worker.messages
+	s.worker.messages = nil
+end
 local function correct(s, message)
 	s.corrections += 1
 	if s.corrections >= MAX_CORRECTIONS then return finish(s, "stopped", "Stage submission protocol failed: " .. message) end
 	local command
+	lend(s)
 	s.worker, command = loop.continue(s.worker, "RPI stage is not complete. " .. message .. " Call stage.submit with the full document, summary, evidence array and required stage fields in the luau tool; plain text cannot finish this stage.")
-	s.messages = s.worker.messages
+	take(s)
 	return s, command
 end
 function M.init(cfg)
@@ -176,7 +186,7 @@ function M.step(s, event)
 		-- First boundary is created before the host request artifact exists.
 		if s.stage.name == "research_questions" and #s.stage.inputs == 0 and s.artifacts.request then s.stage.inputs = { s.artifacts.request } end
 		s.worker = loop.init({ max_turns = s.cfg.max_turns - s.turns, task_message = packet(s, event) })
-		s.messages = s.worker.messages
+		take(s)
 		s.phase = "worker"
 		return s, { kind = "next" }
 	elseif event.kind == "owner_decision" then
@@ -210,13 +220,13 @@ function M.step(s, event)
 		end
 	end
 	assert(s.phase == "worker", "worker event received outside active stage")
-	-- Host additions (including images) update this same worker transcript.
-	s.worker.messages = s.messages
+	-- Host additions (including images) are in s.messages, which the worker borrows.
+	lend(s)
 	local before = s.worker.report.turns
 	local outcome
 	s.worker, outcome = loop.advance(s.worker, event, { submissions = true, recheck = false })
 	s.turns += s.worker.report.turns - before
-	s.messages = s.worker.messages
+	take(s)
 	if outcome.kind == "command" then
 		local result = if event.kind == "run_result" then event.result else nil
 		local error_text = if result and type(result.error) == "string" then result.error else ""

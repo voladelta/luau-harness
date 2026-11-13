@@ -185,7 +185,7 @@ def rpi_compaction():
         assert any(rec.get("tool") == "history" and rec.get("workflow_stage", "").startswith("research_questions") for rec in h.records(log))
         for rec in h.records(log):
             if rec["kind"] == "checkpoint":
-                state = json.loads((log.parent / "blobs" / rec["blob"]).read_text())
+                state = h.stored(log, rec["blob"])
                 worker = state.get("controller", {}).get("worker", {})
                 assert worker.get("report", {}).get("luau_errors", 0) == 0, worker
 

@@ -20,7 +20,7 @@ Every command takes `--help`. Wherever a command takes `LOG` (a run's journal), 
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
 | `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
 | `hx runs` | List this workspace's runs (journals and autoresearch runs) with their paths |
-| `hx log verify FILE` | Check a log's hash chain and recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
+| `hx log verify FILE` | Check a log's hash chain, recovery accounting and stored checkpoint/manifest blobs; exit 0 ok, 1 invalid, 3 unknown outcomes |
 
 ## `hx run` flags
 
@@ -89,7 +89,7 @@ Journals of runs started before hx kept run state there sit in the workspace's `
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Runs created before per-run approvals, or before intents recorded their approval source, use an older journal format; start a new run with this version.
+Runs created before per-run approvals, before intents recorded their approval source, or before checkpoints and manifests were stored as trees of shared blobs (journal format 11), use an older journal format; start a new run with this version.
 
 Interrupted local `write`/`edit` settle themselves from the evidence. Interrupted shell commands require owner reconciliation. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
 

@@ -67,7 +67,7 @@ def gate(result):
     log = Path(result["log"])
     records = harness.records(log)
     checkpoint = next(r for r in reversed(records) if r["kind"] == "checkpoint" and r.get("lane") == "root")
-    state = json.loads((log.parent / "blobs" / checkpoint["blob"]).read_text())
+    state = harness.stored(log, checkpoint["blob"])
     return state["gate"]
 
 
@@ -242,7 +242,7 @@ def crash_delivery():
         # Crash both immediately before and at an early durable stage handoff.
         selected = []
         for r in checkpoints:
-            state = json.loads((Path(value["log"]).parent / "blobs" / r["blob"]).read_text())
+            state = harness.stored(value["log"], r["blob"])
             frame = state.get("workflow") or {}
             if frame.get("pending_event") and frame.get("artifacts"):
                 selected = [r["seq"] - 1, r["seq"]]
@@ -279,7 +279,7 @@ def opt_in_and_preflight():
 def saved_state(log):
     log = Path(log)
     record = next(r for r in reversed(harness.records(log)) if r["kind"] == "checkpoint" and r.get("lane") == "root")
-    return json.loads((log.parent / "blobs" / record["blob"]).read_text())
+    return harness.stored(log, record["blob"])
 
 
 def deadline(log):

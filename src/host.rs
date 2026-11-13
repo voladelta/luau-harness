@@ -339,10 +339,8 @@ impl Host {
                         let prepared=vm.as_ref().unwrap().prepare_request(request)?;
                         crate::controller::validate_request(&prepared)?;
                         // Hooks seldom change the history (images arrive with run results), so it is copied only when they do.
-                        if state["messages"]!=prepared["messages"] {
-                            state["messages"]=prepared["messages"].clone();
-                            if workflow {state["worker"]["messages"]=prepared["messages"].clone();}
-                        }
+                        // (std/rpi keeps its stage conversation here too, once: its worker borrows it per step.)
+                        if state["messages"]!=prepared["messages"] {state["messages"]=prepared["messages"].clone();}
                         agent_system=Some(prepared["system"].clone());
                         *request=prepared;
                     },
@@ -361,7 +359,8 @@ impl Host {
             let saved=match &command {
                 Command::Boundary{id,submission,next}=>self.apply_boundary(crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()},&state)?,
                 Command::Finish{report}=>{anyhow::ensure!(!workflow,"RPI must finish through a durable workflow boundary");RunState::Finished{report:report.clone()}},
-                _=>RunState::Running{controller:state.clone()},
+                // borrowed: the checkpoint stores the state's subtrees without copying the conversation
+                _=>RunState::Running{controller:&state},
             };
             if workflow && matches!(&command,Command::Model{..}) {
                 let at_limit={
@@ -376,14 +375,14 @@ impl Host {
                 }
             }
             drop(previous);
-            if !matches!(command,Command::Boundary{..}) {self.supervisor.checkpoint_archived(&self.lane,saved,&self.durable.lock().unwrap(),archive)?;}
-            else {
-                self.supervisor.checkpoint_archived(&self.lane,saved.clone(),&self.durable.lock().unwrap(),archive)?;
+            // A boundary's report is returned after its checkpoint commits; the checkpoint itself only borrows it.
+            let stop=match &saved {RunState::Finished{report}|RunState::AwaitingReview{report,..} if matches!(command,Command::Boundary{..}) => Some(report.clone()), _ => None};
+            self.supervisor.checkpoint_archived(&self.lane,saved,&self.durable.lock().unwrap(),archive)?;
+            if matches!(command,Command::Boundary{..}) {
                 vm=None;self.project_workflow_artifacts()?;
-                match saved {
-                    RunState::Finished{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
-                    RunState::AwaitingReview{report,..}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
-                    _=>{event=self.supervisor.workflow.lock().unwrap().as_ref().unwrap().pending_event.clone().context("boundary delivery missing")?;continue;},
+                match stop {
+                    Some(report)=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
+                    None=>{event=self.supervisor.workflow.lock().unwrap().as_ref().unwrap().pending_event.clone().context("boundary delivery missing")?;continue;},
                 }
             }
             match command {
@@ -408,10 +407,8 @@ impl Host {
                         if self.supervisor.take_submit_failure() {result["submission_error"]=json!(true);}
                     }
                     // Images view() queued go to the controller with the result, so it budgets them before the next request.
-                    // A drain is not a request: std/hooks runs no before_model hook for it (prepare_request is the VM's
-                    // only way in to the hooks).
-                    let mut drained=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"drain":true}))?;
-                    event=Event::RunResult{result,notifications:drained["messages"].take()}.to_json();
+                    let notifications=vm.as_ref().unwrap().drain_notifications()?;
+                    event=Event::RunResult{result,notifications}.to_json();
                 },
                 Command::Finish{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
                 Command::Boundary{..}=>unreachable!(),
