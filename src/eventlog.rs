@@ -9,7 +9,7 @@
 //! record (`of` = the intent's seq) after. An intent with no outcome is an UNKNOWN outcome: the process died mid-effect,
 //! and a human decides.
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -31,7 +31,15 @@ pub enum LedgerKind {
 }
 
 impl LedgerKind {
-    pub const ALL: [Self; 7] = [Self::Intent, Self::Outcome, Self::Resolution, Self::Uncertain, Self::ModelIntent, Self::Llm, Self::Billing];
+    pub const ALL: [Self; 7] = [
+        Self::Intent,
+        Self::Outcome,
+        Self::Resolution,
+        Self::Uncertain,
+        Self::ModelIntent,
+        Self::Llm,
+        Self::Billing,
+    ];
 
     /// The record's `kind` in the journal.
     pub fn name(self) -> &'static str {
@@ -89,19 +97,32 @@ impl FileId {
     fn of(path: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let m = std::fs::symlink_metadata(path)?;
-        Ok(Self { ino: m.ino(), len: m.len(), ctime: (m.ctime(), m.ctime_nsec()) })
+        Ok(Self {
+            ino: m.ino(),
+            len: m.len(),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        })
     }
 }
 
 /// Take the journal's single-writer lock: an exclusive lock on `PATH.lock`, a file of its own so replacing the journal
 /// cannot drop it. Fails at once when another process holds it; released when the returned file is dropped.
 fn lock_writer(path: &Path) -> Result<std::fs::File> {
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
-        .custom_flags(libc::O_NOFOLLOW).open(path.with_extension("lock"))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path.with_extension("lock"))?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!("run is already open by another process: {}", path.display()),
-        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("lock {}", path.display())),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("run is already open by another process: {}", path.display())
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("lock {}", path.display()))
+        }
     }
 }
 
@@ -123,11 +144,14 @@ fn create_dirs(dir: &Path) -> std::io::Result<()> {
     if dir.as_os_str().is_empty() || dir.is_dir() {
         return Ok(());
     }
-    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     create_dirs(parent)?;
     match std::fs::create_dir(dir) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
-        _ => {},
+        _ => {}
     }
     sync_dir(parent)
 }
@@ -145,9 +169,17 @@ impl EventLog {
         let base = format!("{}-{}", ts.as_secs(), std::process::id());
         let mut n = 0;
         let (session, path, file) = loop {
-            let session = if n == 0 { base.clone() } else { format!("{base}-{n}") };
+            let session = if n == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            };
             let path = dir.join(format!("{session}.jsonl"));
-            match std::fs::OpenOptions::new().create_new(true).append(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&path)
+            {
                 Ok(f) => break (session, path, f),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n += 1,
                 Err(e) => return Err(e.into()),
@@ -156,7 +188,20 @@ impl EventLog {
         // The journal's name must be durable before the first intent synced into it is.
         sync_dir(dir).with_context(|| format!("journal directory {}", dir.display()))?;
         let _writer_lock = Some(lock_writer(&path)?);
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq: 0, prev: GENESIS.into() }), failure: Mutex::new(None), session, path, crash_after: crash_hook(), _writer_lock, owner_reconciliation: false, known: Mutex::default() }))
+        Ok(Arc::new(EventLog {
+            inner: Mutex::new(Inner {
+                file,
+                seq: 0,
+                prev: GENESIS.into(),
+            }),
+            failure: Mutex::new(None),
+            session,
+            path,
+            crash_after: crash_hook(),
+            _writer_lock,
+            owner_reconciliation: false,
+            known: Mutex::default(),
+        }))
     }
 
     /// Continue an existing log after a crash: verify the chain and the session, restore seq and the chain, drop a torn
@@ -176,18 +221,39 @@ impl EventLog {
         let _writer_lock = Some(lock_writer(path)?);
         let text = read_text(path)?;
         let session = session_of(path)?;
-        let chain = Chain::check(&text, &session).map_err(|e| anyhow::anyhow!("{}: {e}; not resuming a damaged log", path.display()))?;
+        let chain = Chain::check(&text, &session)
+            .map_err(|e| anyhow::anyhow!("{}: {e}; not resuming a damaged log", path.display()))?;
         if let Some((line, why)) = &chain.broken {
-            anyhow::bail!("{}: {why} at line {line}; not resuming a damaged log", path.display());
+            anyhow::bail!(
+                "{}: {why} at line {line}; not resuming a damaged log",
+                path.display()
+            );
         }
         let seq = chain.records.len() as u64;
         // a torn tail is dropped; a complete final record that lost its newline gets one, so appends start a new line
         if chain.torn || !text.is_empty() && !text.ends_with('\n') {
-            let keep: String = chain.records.iter().map(|(l, _)| format!("{l}\n")).collect();
+            let keep: String = chain
+                .records
+                .iter()
+                .map(|(l, _)| format!("{l}\n"))
+                .collect();
             write_atomic(path, keep.as_bytes())?;
         }
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
-        Ok(Arc::new(EventLog { inner: Mutex::new(Inner { file, seq, prev: chain.next }), failure: Mutex::new(None), session, path: path.to_path_buf(), crash_after: crash_hook(), _writer_lock, owner_reconciliation, known: Mutex::default() }))
+        Ok(Arc::new(EventLog {
+            inner: Mutex::new(Inner {
+                file,
+                seq,
+                prev: chain.next,
+            }),
+            failure: Mutex::new(None),
+            session,
+            path: path.to_path_buf(),
+            crash_after: crash_hook(),
+            _writer_lock,
+            owner_reconciliation,
+            known: Mutex::default(),
+        }))
     }
 
     /// Audit failures are fatal to the run, even if Luau catches the returned error.
@@ -208,7 +274,9 @@ impl EventLog {
     }
 
     pub fn dir(&self) -> &Path {
-        self.path.parent().expect("a journal path has a parent directory")
+        self.path
+            .parent()
+            .expect("a journal path has a parent directory")
     }
 
     /// Store `bytes` content-addressed next to the log (write-once, synced) and return its sha256. A blob that already
@@ -222,16 +290,16 @@ impl EventLog {
         let f = dir.join(&h);
         let known = self.known.lock().unwrap().get(&h).copied();
         match FileId::of(&f) {
-            Ok(id) if known == Some(id) => {},
+            Ok(id) if known == Some(id) => {}
             Ok(id) => {
                 // The identity taken before the read: a change during it shows as a different identity next time.
                 read_blob(self.dir(), &h).map_err(|e| self.fail(format!("{e:#}")))?;
                 self.known.lock().unwrap().insert(h.clone(), id);
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // atomic: a crash mid-write must not leave a truncated blob under its final name
                 write_atomic(&f, bytes).map_err(|e| self.fail(format!("event log blob: {e}")))?;
-            },
+            }
             Err(e) => return Err(self.fail(format!("event log blob {}: {e}", f.display()))),
         }
         Ok(h)
@@ -239,22 +307,35 @@ impl EventLog {
 
     /// Append a record of any kind but the ledger's (`LedgerKind`); `sync` forces it to disk. Returns its seq.
     pub fn write(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
-        anyhow::ensure!(LedgerKind::parse(kind).is_none(), "{kind} records change the books; the supervisor's ledger appends them");
-        anyhow::ensure!(!self.owner_reconciliation, "owner reconciliation can only record resolutions or billing");
+        anyhow::ensure!(
+            LedgerKind::parse(kind).is_none(),
+            "{kind} records change the books; the supervisor's ledger appends them"
+        );
+        anyhow::ensure!(
+            !self.owner_reconciliation,
+            "owner reconciliation can only record resolutions or billing"
+        );
         self.append(kind, fields, sync)
     }
 
     /// Append a ledger record. Only `supervisor`'s ledger calls this, after checking the record against the books it
     /// then applies it to, so the live books stay the journal's fold.
     pub(crate) fn append_ledger(&self, kind: LedgerKind, fields: Value, sync: bool) -> Result<u64> {
-        anyhow::ensure!(!self.owner_reconciliation || matches!(kind, LedgerKind::Resolution | LedgerKind::Billing),
-            "owner reconciliation can only record resolutions or billing");
+        anyhow::ensure!(
+            !self.owner_reconciliation
+                || matches!(kind, LedgerKind::Resolution | LedgerKind::Billing),
+            "owner reconciliation can only record resolutions or billing"
+        );
         self.append(kind.name(), fields, sync)
     }
 
     fn append(&self, kind: &str, fields: Value, sync: bool) -> Result<u64> {
         self.check()?;
-        if !fields.as_object().is_some_and(|fields| ["seq", "prev", "kind", "session", "ts_ms"].iter().all(|key| !fields.contains_key(*key))) {
+        if !fields.as_object().is_some_and(|fields| {
+            ["seq", "prev", "kind", "session", "ts_ms"]
+                .iter()
+                .all(|key| !fields.contains_key(*key))
+        }) {
             return Err(self.fail("journal fields cannot replace record metadata"));
         }
         let mut g = self.inner.lock().unwrap();
@@ -268,10 +349,16 @@ impl EventLog {
             }
         }
         let line = serde_json::to_string(&obj).unwrap_or_default();
-        g.file.write_all(format!("{line}\n").as_bytes()).map_err(|e| self.fail(format!("event log write: {e}")))?;
-        g.file.flush().map_err(|e| self.fail(format!("event log flush: {e}")))?;
+        g.file
+            .write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| self.fail(format!("event log write: {e}")))?;
+        g.file
+            .flush()
+            .map_err(|e| self.fail(format!("event log flush: {e}")))?;
         if sync {
-            g.file.sync_data().map_err(|e| self.fail(format!("event log sync: {e}")))?;
+            g.file
+                .sync_data()
+                .map_err(|e| self.fail(format!("event log sync: {e}")))?;
         }
         g.prev = link(&line);
         if self.crash_after == Some(seq) {
@@ -300,7 +387,9 @@ type Record<'a> = (&'a str, Value);
 fn read_text(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("journal {}", path.display()))?;
     let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    let mut text = std::str::from_utf8(&bytes[..end]).with_context(|| format!("{}: invalid UTF-8", path.display()))?.to_string();
+    let mut text = std::str::from_utf8(&bytes[..end])
+        .with_context(|| format!("{}: invalid UTF-8", path.display()))?
+        .to_string();
     text.push_str(std::str::from_utf8(&bytes[end..]).unwrap_or("{torn UTF-8"));
     Ok(text)
 }
@@ -322,7 +411,10 @@ fn parse(text: &str) -> std::result::Result<(Vec<Record<'_>>, bool), usize> {
 
 /// The session a journal belongs to: its file name without `.jsonl`.
 fn session_of(path: &Path) -> Result<String> {
-    path.file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).map(String::from)
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
         .with_context(|| format!("{}: not a journal file name", path.display()))
 }
 
@@ -338,14 +430,18 @@ struct Chain<'a> {
 
 impl<'a> Chain<'a> {
     fn check(text: &'a str, session: &str) -> Result<Self> {
-        let (records, torn) = parse(text).map_err(|n| anyhow::anyhow!("line {n} is not valid JSON"))?;
+        let (records, torn) =
+            parse(text).map_err(|n| anyhow::anyhow!("line {n} is not valid JSON"))?;
         let (mut next, mut broken) = (GENESIS.to_string(), None);
         for (i, (line, v)) in records.iter().enumerate() {
             let n = i + 1;
             let problem = if v["prev"].as_str() != Some(next.as_str()) {
                 Some("hash chain broken".to_string())
             } else if v["session"].as_str() != Some(session) {
-                Some(format!("record belongs to session {}, not to this journal's {session}", v["session"]))
+                Some(format!(
+                    "record belongs to session {}, not to this journal's {session}",
+                    v["session"]
+                ))
             } else if v["seq"].as_u64() != Some(n as u64) {
                 Some("record sequence is not consecutive".to_string())
             } else if !v["kind"].is_string() {
@@ -359,15 +455,23 @@ impl<'a> Chain<'a> {
             }
             next = link(line);
         }
-        Ok(Self { records, torn, broken, next })
+        Ok(Self {
+            records,
+            torn,
+            broken,
+            next,
+        })
     }
 }
 
 /// Verify the chain, the record sequence and the session, and every blob a record references.
 pub fn verify(path: &Path) -> Result<Report> {
     let text = read_text(path)?;
-    let chain = Chain::check(&text, &session_of(path)?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    let dir = path.parent().context("a journal path has a parent directory")?;
+    let chain = Chain::check(&text, &session_of(path)?)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let dir = path
+        .parent()
+        .context("a journal path has a parent directory")?;
     let mut seen = std::collections::BTreeSet::new();
     let mut blob_errors = vec![];
     for (_, record) in &chain.records {
@@ -380,7 +484,7 @@ pub fn verify(path: &Path) -> Result<Report> {
                 Err(e) => {
                     blob_errors.push(format!("record {}: {e:#}", record["seq"]));
                     continue;
-                },
+                }
             };
             if record["kind"] != "checkpoint" || record["blob"] != sha {
                 continue;
@@ -390,7 +494,11 @@ pub fn verify(path: &Path) -> Result<Report> {
             }
         }
     }
-    Ok(Report { records: chain.records.len(), broken: chain.broken, blob_errors })
+    Ok(Report {
+        records: chain.records.len(),
+        broken: chain.broken,
+        blob_errors,
+    })
 }
 
 /// Hashes per chunk of a chunked hash list, such as a checkpoint's messages. Appending to the list rewrites only its
@@ -399,25 +507,36 @@ pub const CHUNK: usize = 64;
 
 /// The hashes a chunk blob lists: `CHUNK` of them, or 1 to `CHUNK` for a list's `last` chunk.
 pub fn parse_chunk(bytes: &[u8], last: bool) -> Result<Vec<String>> {
-    let hashes: Vec<String> = serde_json::from_slice(bytes).context("chunk is not a list of hashes")?;
-    anyhow::ensure!(hashes.len() == CHUNK || last && (1..=CHUNK).contains(&hashes.len()), "chunk of {} hashes", hashes.len());
+    let hashes: Vec<String> =
+        serde_json::from_slice(bytes).context("chunk is not a list of hashes")?;
+    anyhow::ensure!(
+        hashes.len() == CHUNK || last && (1..=CHUNK).contains(&hashes.len()),
+        "chunk of {} hashes",
+        hashes.len()
+    );
     Ok(hashes)
 }
 
 /// Check the message chunks a checkpoint body names under `message_chunks`, and the message blobs they list
 /// (`supervisor::CheckpointBody`). Stops at the first bad blob, which the error names.
-fn verify_messages(dir: &Path, body: &[u8], seen: &mut std::collections::BTreeSet<String>) -> Result<()> {
+fn verify_messages(
+    dir: &Path,
+    body: &[u8],
+    seen: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
     let body: Value = serde_json::from_slice(body).context("checkpoint body is not JSON")?;
     let chunks = match &body["message_chunks"] {
         Value::Null => return Ok(()),
-        chunks => serde_json::from_value::<Vec<String>>(chunks.clone()).context("message chunks are not a list of hashes")?,
+        chunks => serde_json::from_value::<Vec<String>>(chunks.clone())
+            .context("message chunks are not a list of hashes")?,
     };
     for (c, chunk) in chunks.iter().enumerate() {
         if !seen.insert(chunk.clone()) {
             continue;
         }
         let bytes = read_blob(dir, chunk)?;
-        let messages = parse_chunk(&bytes, c + 1 == chunks.len()).with_context(|| format!("message chunk {chunk}"))?;
+        let messages = parse_chunk(&bytes, c + 1 == chunks.len())
+            .with_context(|| format!("message chunk {chunk}"))?;
         for (i, message) in messages.into_iter().enumerate() {
             if seen.insert(message.clone()) {
                 read_blob(dir, &message).with_context(|| format!("message {}", c * CHUNK + i))?;
@@ -437,11 +556,16 @@ fn blob_refs(record: &Value) -> impl Iterator<Item = &str> {
         Some("json") => &["v"],
         _ => &[],
     };
-    [&record["blob"], &record["reply"]].into_iter().chain(receipt.iter().map(move |k| &ret[*k])).filter_map(Value::as_str)
+    [&record["blob"], &record["reply"]]
+        .into_iter()
+        .chain(receipt.iter().map(move |k| &ret[*k]))
+        .filter_map(Value::as_str)
 }
 
 fn crash_hook() -> Option<u64> {
-    std::env::var("HX_TEST_CRASH_AFTER_RECORD").ok().and_then(|v| v.parse().ok())
+    std::env::var("HX_TEST_CRASH_AFTER_RECORD")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 pub fn read_blob(log_dir: &Path, sha: &str) -> Result<Vec<u8>> {
@@ -449,20 +573,39 @@ pub fn read_blob(log_dir: &Path, sha: &str) -> Result<Vec<u8>> {
 }
 
 /// Read a blob of at most `max` bytes, calling `check` (a deadline) between chunks, and verify its content hash.
-pub fn read_blob_bounded(log_dir: &Path, sha: &str, max: usize, mut check: impl FnMut() -> Result<()>) -> Result<Vec<u8>> {
-    anyhow::ensure!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "invalid blob hash {sha:?}");
+pub fn read_blob_bounded(
+    log_dir: &Path,
+    sha: &str,
+    max: usize,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid blob hash {sha:?}"
+    );
     let path = log_dir.join("blobs").join(sha);
-    let mut file = std::fs::File::open(&path).with_context(|| format!("journal blob {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(&path).with_context(|| format!("journal blob {}", path.display()))?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 65536];
     loop {
         check()?;
-        let n = file.read(&mut chunk).with_context(|| format!("journal blob {}", path.display()))?;
-        if n == 0 { break; }
-        anyhow::ensure!(bytes.len() + n <= max, "blob {sha}: over the {max}-byte read limit");
+        let n = file
+            .read(&mut chunk)
+            .with_context(|| format!("journal blob {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        anyhow::ensure!(
+            bytes.len() + n <= max,
+            "blob {sha}: over the {max}-byte read limit"
+        );
         bytes.extend_from_slice(&chunk[..n]);
     }
-    anyhow::ensure!(sha_bytes(&bytes) == sha, "blob {sha}: content hash mismatch");
+    anyhow::ensure!(
+        sha_bytes(&bytes) == sha,
+        "blob {sha}: content hash mismatch"
+    );
     Ok(bytes)
 }
 
@@ -470,7 +613,8 @@ pub fn read_blob_bounded(log_dir: &Path, sha: &str, max: usize, mut check: impl 
 /// ignored; a malformed line before it, a broken chain, a sequence gap or another session's record is an error).
 pub fn load(path: &Path) -> Result<Vec<Value>> {
     let text = read_text(path)?;
-    let chain = Chain::check(&text, &session_of(path)?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let chain = Chain::check(&text, &session_of(path)?)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     if let Some((line, why)) = chain.broken {
         anyhow::bail!("{}: {why} at line {line}", path.display());
     }
@@ -503,10 +647,18 @@ mod open_tests {
         assert_ne!(edited, text);
         std::fs::write(&path, &edited).unwrap();
         let report = verify(&path).unwrap();
-        assert_eq!(report.broken.as_ref().map(|b| b.0), Some(3), "the line after the edited one no longer links");
+        assert_eq!(
+            report.broken.as_ref().map(|b| b.0),
+            Some(3),
+            "the line after the edited one no longer links"
+        );
         assert!(EventLog::reopen(&path).is_err());
         assert!(load(&path).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "a refused log is left as it is");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            edited,
+            "a refused log is left as it is"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -514,30 +666,53 @@ mod open_tests {
     fn another_runs_journal_cannot_stand_in_for_this_one() {
         let mine = three_records("identity");
         let other = EventLog::open(mine.parent().unwrap()).unwrap();
-        other.write("path_grant", json!({"grant": {"path": "/", "recursive": true, "write": true}}), true).unwrap();
+        other
+            .write(
+                "path_grant",
+                json!({"grant": {"path": "/", "recursive": true, "write": true}}),
+                true,
+            )
+            .unwrap();
         assert_ne!(other.session, mine.file_stem().unwrap().to_str().unwrap());
         // Every record names its session, and the session is the file name: a copy under another run's name fails.
         std::fs::copy(&other.path, &mine).unwrap();
         let report = verify(&mine).unwrap();
         let (line, why) = report.broken.expect("a substituted journal is refused");
-        assert!(line == 1 && why.contains("belongs to session"), "{line}: {why}");
+        assert!(
+            line == 1 && why.contains("belongs to session"),
+            "{line}: {why}"
+        );
         assert!(EventLog::reopen(&mine).is_err());
         assert!(load(&mine).is_err());
         // A single record of another session spliced in is refused the same way, chain or no chain.
         let path = three_records("identity-splice");
         let forged = json!({"seq": 4, "kind": "path_grant", "session": "elsewhere", "ts_ms": 0, "grant": {"path": "/", "write": true}});
         append_linked(&path, forged, link);
-        assert!(verify(&path).unwrap().broken.is_some_and(|(n, why)| n == 4 && why.contains("belongs to session")));
-        for p in [mine, path] { let _ = std::fs::remove_dir_all(p.parent().unwrap()); }
+        assert!(
+            verify(&path)
+                .unwrap()
+                .broken
+                .is_some_and(|(n, why)| n == 4 && why.contains("belongs to session"))
+        );
+        for p in [mine, path] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
     }
 
     #[test]
     fn a_linked_chain_does_not_hide_a_sequence_gap() {
         let path = three_records("invalid-sequence");
         let session = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let text = append_linked(&path, json!({"seq": 5, "kind": "note", "session": session}), link);
+        let text = append_linked(
+            &path,
+            json!({"seq": 5, "kind": "note", "session": session}),
+            link,
+        );
         let report = verify(&path).unwrap();
-        assert_eq!(report.broken, Some((4, "record sequence is not consecutive".into())));
+        assert_eq!(
+            report.broken,
+            Some((4, "record sequence is not consecutive".into()))
+        );
         assert!(EventLog::reopen(&path).is_err());
         assert!(load(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
@@ -563,7 +738,11 @@ mod open_tests {
         let log = EventLog::reopen(&path).unwrap();
         for kind in LedgerKind::ALL {
             assert_eq!(LedgerKind::parse(kind.name()), Some(kind));
-            assert!(log.write(kind.name(), json!({"of": 1, "tokens": 1}), false).is_err(), "{kind:?}");
+            assert!(
+                log.write(kind.name(), json!({"of": 1, "tokens": 1}), false)
+                    .is_err(),
+                "{kind:?}"
+            );
         }
         assert_eq!(LedgerKind::parse("note"), None);
         assert_eq!(load(&path).unwrap().len(), 3);
@@ -574,23 +753,39 @@ mod open_tests {
     fn verify_reports_missing_and_corrupt_blobs() {
         let path = three_records("blob-refs");
         let log = EventLog::reopen(&path).unwrap();
-        let (kept, lost, bad) = (log.blob(br#"{"durable":{}}"#).unwrap(), log.blob(b"lost").unwrap(), log.blob(b"bad").unwrap());
-        log.write("checkpoint", json!({"lane": "root", "blob": kept}), false).unwrap();
-        log.write("call", json!({"ret": {"t": "sh", "stdout": lost, "stderr": bad}}), false).unwrap();
+        let (kept, lost, bad) = (
+            log.blob(br#"{"durable":{}}"#).unwrap(),
+            log.blob(b"lost").unwrap(),
+            log.blob(b"bad").unwrap(),
+        );
+        log.write("checkpoint", json!({"lane": "root", "blob": kept}), false)
+            .unwrap();
+        log.write(
+            "call",
+            json!({"ret": {"t": "sh", "stdout": lost, "stderr": bad}}),
+            false,
+        )
+        .unwrap();
         assert!(verify(&path).unwrap().blob_errors.is_empty());
         let blobs = path.parent().unwrap().join("blobs");
         std::fs::remove_file(blobs.join(&lost)).unwrap();
         std::fs::write(blobs.join(&bad), "changed").unwrap();
         let errors = verify(&path).unwrap().blob_errors;
         assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(errors[0].contains(&lost) && errors[1].contains("hash mismatch"), "{errors:?}");
+        assert!(
+            errors[0].contains(&lost) && errors[1].contains("hash mismatch"),
+            "{errors:?}"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn two_sessions_in_the_same_second_get_distinct_logs() {
         let dir = std::env::temp_dir().join(format!("hx-eventlog-{}", std::process::id()));
-        let (a, b) = (super::EventLog::open(&dir).unwrap(), super::EventLog::open(&dir).unwrap());
+        let (a, b) = (
+            super::EventLog::open(&dir).unwrap(),
+            super::EventLog::open(&dir).unwrap(),
+        );
         assert_ne!(a.session, b.session);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -615,7 +810,12 @@ mod open_tests {
         let log = EventLog::reopen(&path).unwrap();
         assert_eq!(log.write("note", json!({}), false).unwrap(), 4);
         let r = verify(&path).unwrap();
-        assert!(r.broken.is_none() && r.records == 4, "{} records, chain {:?}", r.records, r.broken);
+        assert!(
+            r.broken.is_none() && r.records == 4,
+            "{} records, chain {:?}",
+            r.records,
+            r.broken
+        );
         assert_eq!(load(&path).unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -625,9 +825,17 @@ mod open_tests {
         let path = three_records("nonl");
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, text.trim_end_matches('\n')).unwrap();
-        EventLog::reopen(&path).unwrap().write("note", json!({}), false).unwrap();
+        EventLog::reopen(&path)
+            .unwrap()
+            .write("note", json!({}), false)
+            .unwrap();
         let r = verify(&path).unwrap();
-        assert!(r.broken.is_none() && r.records == 4, "{} records, chain {:?}", r.records, r.broken);
+        assert!(
+            r.broken.is_none() && r.records == 4,
+            "{} records, chain {:?}",
+            r.records,
+            r.broken
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -640,7 +848,11 @@ mod open_tests {
         let bad = lines.join("\n") + "\n";
         std::fs::write(&path, &bad).unwrap();
         assert!(EventLog::reopen(&path).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad, "resume must not delete the records after the bad line");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            bad,
+            "resume must not delete the records after the bad line"
+        );
         assert!(load(&path).is_err());
         assert!(verify(&path).is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -665,7 +877,10 @@ mod open_tests {
         torn.extend_from_slice(b"{\"cmd\":\"\xe2");
         std::fs::write(&path, &torn).unwrap();
         assert_eq!(load(&path).unwrap().len(), 3);
-        EventLog::reopen(&path).unwrap().write("note", json!({}), false).unwrap();
+        EventLog::reopen(&path)
+            .unwrap()
+            .write("note", json!({}), false)
+            .unwrap();
         let r = verify(&path).unwrap();
         assert!(r.broken.is_none() && r.records == 4);
         torn.push(b'\n');
@@ -679,22 +894,43 @@ mod open_tests {
     async fn failed_intent_write_prevents_the_effect_even_if_the_error_is_caught() {
         let path = three_records("write-failure");
         let dirs = crate::dirs::TestDirs::new();
-        let mut pol = crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None).unwrap();
+        let mut pol =
+            crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None)
+                .unwrap();
         pol.log = Arc::new(EventLog {
-            inner: Mutex::new(Inner { file: std::fs::File::open(&path).unwrap(), seq: 0, prev: "genesis".into() }),
+            inner: Mutex::new(Inner {
+                file: std::fs::File::open(&path).unwrap(),
+                seq: 0,
+                prev: "genesis".into(),
+            }),
             failure: Mutex::new(None),
-            session: "read-only".into(), path: path.clone(), crash_after: None, _writer_lock: None, owner_reconciliation: false,
+            session: "read-only".into(),
+            path: path.clone(),
+            crash_after: None,
+            _writer_lock: None,
+            owner_reconciliation: false,
             known: Mutex::default(),
         });
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
         let lua = mlua::Lua::new();
         let mut executed = false;
         for _ in 0..2 {
-            let result = fx.run(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), || async {
-                executed = true;
-                Ok(crate::effects::Ret::Num(0.0))
-            }).await;
-            assert!(result.is_err(), "a failed WAL must be fatal before executing the effect");
+            let result = fx
+                .run(
+                    &lua,
+                    crate::supervisor::Tool::Write,
+                    crate::policy::Class::LocalWrite,
+                    json!({}),
+                    || async {
+                        executed = true;
+                        Ok(crate::effects::Ret::Num(0.0))
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a failed WAL must be fatal before executing the effect"
+            );
         }
         assert!(!executed);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -704,23 +940,40 @@ mod open_tests {
     async fn failed_outcome_blob_keeps_an_unknown_intent_and_blocks_later_effects() {
         let path = three_records("blob-failure");
         let dirs = crate::dirs::TestDirs::new();
-        let pol = crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None).unwrap();
+        let pol =
+            crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None)
+                .unwrap();
         let log_path = pol.log.path.clone();
         std::fs::write(log_path.parent().unwrap().join("blobs"), "not a directory").unwrap();
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
         let lua = mlua::Lua::new();
         let mut executions = 0;
         for _ in 0..2 {
-            let result = fx.run(&lua, crate::supervisor::Tool::Write, crate::policy::Class::LocalWrite, json!({}), || async {
-                executions += 1;
-                Ok(crate::effects::Ret::Str("result".into()))
-            }).await;
+            let result = fx
+                .run(
+                    &lua,
+                    crate::supervisor::Tool::Write,
+                    crate::policy::Class::LocalWrite,
+                    json!({}),
+                    || async {
+                        executions += 1;
+                        Ok(crate::effects::Ret::Str("result".into()))
+                    },
+                )
+                .await;
             assert!(result.is_err());
         }
-        assert_eq!(executions, 1, "the first effect precedes the outcome failure; the second must not execute");
+        assert_eq!(
+            executions, 1,
+            "the first effect precedes the outcome failure; the second must not execute"
+        );
         assert!(verify(&log_path).unwrap().broken.is_none());
         let books = crate::supervisor::Books::of(&load(&log_path).unwrap()).unwrap();
-        assert_eq!(books.open.len(), 1, "the failed outcome must remain recoverable as unknown");
+        assert_eq!(
+            books.open.len(),
+            1,
+            "the failed outcome must remain recoverable as unknown"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -729,10 +982,20 @@ mod open_tests {
         let path = three_records("blob-hash");
         let log = EventLog::reopen(&path).unwrap();
         let hash = log.blob(b"original").unwrap();
-        assert_eq!(read_blob(path.parent().unwrap(), &hash).unwrap(), b"original");
-        std::fs::write(path.parent().unwrap().join("blobs").join(&hash), "corrupted").unwrap();
+        assert_eq!(
+            read_blob(path.parent().unwrap(), &hash).unwrap(),
+            b"original"
+        );
+        std::fs::write(
+            path.parent().unwrap().join("blobs").join(&hash),
+            "corrupted",
+        )
+        .unwrap();
         assert!(read_blob(path.parent().unwrap(), &hash).is_err());
-        assert!(log.blob(b"original").is_err(), "deduplication must not reuse a corrupted existing blob");
+        assert!(
+            log.blob(b"original").is_err(),
+            "deduplication must not reuse a corrupted existing blob"
+        );
         assert!(read_blob(path.parent().unwrap(), "../outside").is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -748,8 +1011,16 @@ mod open_tests {
         assert!(log.known.lock().unwrap().contains_key(&hash));
         assert_eq!(log.blob(b"original").unwrap(), hash);
         // an in-place rewrite of the same length moves the change time, so the blob is verified again
-        std::fs::OpenOptions::new().write(true).open(&file).unwrap().write_all(b"0riginal").unwrap();
-        assert!(log.blob(b"original").is_err(), "deduplication must not reuse a blob changed after verification");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"0riginal")
+            .unwrap();
+        assert!(
+            log.blob(b"original").is_err(),
+            "deduplication must not reuse a blob changed after verification"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

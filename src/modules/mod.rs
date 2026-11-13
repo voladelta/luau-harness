@@ -26,7 +26,7 @@ mod staging;
 #[cfg(test)]
 mod tests;
 
-pub use registry::{test_files, Registry, Source, TestTarget};
+pub use registry::{Registry, Source, TestTarget, test_files};
 
 use crate::supervisor::Capabilities;
 use serde::Deserialize;
@@ -35,29 +35,113 @@ use std::path::PathBuf;
 /// Packages built into the binary: (package, file, text). Trusted like the binary itself.
 pub const EMBEDDED: &[(&str, &str, &str)] = &[
     ("std", "hx.toml", include_str!("../../stdlib/std/hx.toml")),
-    ("std", "init.luau", include_str!("../../stdlib/std/init.luau")),
-    ("std", "loop.luau", include_str!("../../stdlib/std/loop.luau")),
+    (
+        "std",
+        "init.luau",
+        include_str!("../../stdlib/std/init.luau"),
+    ),
+    (
+        "std",
+        "loop.luau",
+        include_str!("../../stdlib/std/loop.luau"),
+    ),
     ("std", "rpi.luau", include_str!("../../stdlib/std/rpi.luau")),
-    ("std", "rpi/common.md", include_str!("../../stdlib/std/rpi/common.md")),
-    ("std", "rpi/research_questions.md", include_str!("../../stdlib/std/rpi/research_questions.md")),
-    ("std", "rpi/research.md", include_str!("../../stdlib/std/rpi/research.md")),
-    ("std", "rpi/system_design.md", include_str!("../../stdlib/std/rpi/system_design.md")),
-    ("std", "rpi/program_design.md", include_str!("../../stdlib/std/rpi/program_design.md")),
-    ("std", "rpi/implementation.md", include_str!("../../stdlib/std/rpi/implementation.md")),
-    ("std", "rpi/verification.md", include_str!("../../stdlib/std/rpi/verification.md")),
-    ("std", "rpi/repair.md", include_str!("../../stdlib/std/rpi/repair.md")),
-    ("std", "rpi/PROVENANCE.md", include_str!("../../stdlib/std/rpi/PROVENANCE.md")),
-    ("std", "prompt.luau", include_str!("../../stdlib/std/prompt.luau")),
-    ("std", "printer.luau", include_str!("../../stdlib/std/printer.luau")),
-    ("std", "feedback.luau", include_str!("../../stdlib/std/feedback.luau")),
-    ("std", "hooks.luau", include_str!("../../stdlib/std/hooks.luau")),
-    ("std", "testlib.luau", include_str!("../../stdlib/std/testlib.luau")),
-    ("std", "packages.luau", include_str!("../../stdlib/std/packages.luau")),
+    (
+        "std",
+        "rpi/common.md",
+        include_str!("../../stdlib/std/rpi/common.md"),
+    ),
+    (
+        "std",
+        "rpi/research_questions.md",
+        include_str!("../../stdlib/std/rpi/research_questions.md"),
+    ),
+    (
+        "std",
+        "rpi/research.md",
+        include_str!("../../stdlib/std/rpi/research.md"),
+    ),
+    (
+        "std",
+        "rpi/system_design.md",
+        include_str!("../../stdlib/std/rpi/system_design.md"),
+    ),
+    (
+        "std",
+        "rpi/program_design.md",
+        include_str!("../../stdlib/std/rpi/program_design.md"),
+    ),
+    (
+        "std",
+        "rpi/implementation.md",
+        include_str!("../../stdlib/std/rpi/implementation.md"),
+    ),
+    (
+        "std",
+        "rpi/verification.md",
+        include_str!("../../stdlib/std/rpi/verification.md"),
+    ),
+    (
+        "std",
+        "rpi/repair.md",
+        include_str!("../../stdlib/std/rpi/repair.md"),
+    ),
+    (
+        "std",
+        "rpi/PROVENANCE.md",
+        include_str!("../../stdlib/std/rpi/PROVENANCE.md"),
+    ),
+    (
+        "std",
+        "prompt.luau",
+        include_str!("../../stdlib/std/prompt.luau"),
+    ),
+    (
+        "std",
+        "printer.luau",
+        include_str!("../../stdlib/std/printer.luau"),
+    ),
+    (
+        "std",
+        "feedback.luau",
+        include_str!("../../stdlib/std/feedback.luau"),
+    ),
+    (
+        "std",
+        "hooks.luau",
+        include_str!("../../stdlib/std/hooks.luau"),
+    ),
+    (
+        "std",
+        "testlib.luau",
+        include_str!("../../stdlib/std/testlib.luau"),
+    ),
+    (
+        "std",
+        "packages.luau",
+        include_str!("../../stdlib/std/packages.luau"),
+    ),
     ("std", "mcp.luau", include_str!("../../stdlib/std/mcp.luau")),
-    ("std", "authoring.luau", include_str!("../../stdlib/std/authoring.luau")),
-    ("std", "vision.luau", include_str!("../../stdlib/std/vision.luau")),
-    ("std", "compact.luau", include_str!("../../stdlib/std/compact.luau")),
-    ("std", "recheck.luau", include_str!("../../stdlib/std/recheck.luau")),
+    (
+        "std",
+        "authoring.luau",
+        include_str!("../../stdlib/std/authoring.luau"),
+    ),
+    (
+        "std",
+        "vision.luau",
+        include_str!("../../stdlib/std/vision.luau"),
+    ),
+    (
+        "std",
+        "compact.luau",
+        include_str!("../../stdlib/std/compact.luau"),
+    ),
+    (
+        "std",
+        "recheck.luau",
+        include_str!("../../stdlib/std/recheck.luau"),
+    ),
     ("std", "system.md", include_str!("../../prompts/system.md")),
 ];
 
@@ -123,7 +207,11 @@ pub struct PkgInfo {
 /// A name the model can use as a Luau identifier (`deftool` names, and so promoted packages): lowercase letters,
 /// digits and `_`, starting with a letter, at most 40 bytes.
 pub fn valid_name(n: &str) -> bool {
-    !n.is_empty() && n.len() <= 40 && n.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    !n.is_empty()
+        && n.len() <= 40
+        && n.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && n.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// A package or skill name: lowercase letters, digits, `_` and `-` (agent skills are conventionally hyphenated),
@@ -131,8 +219,11 @@ pub fn valid_name(n: &str) -> bool {
 /// `.`, so a name can never reach another package's modules, the `base:`/`tool:` namespaces or a path outside its
 /// directory.
 pub fn valid_package_name(n: &str) -> bool {
-    n.len() <= 64 && !matches!(n, "std" | "project") && n.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    n.len() <= 64
+        && !matches!(n, "std" | "project")
+        && n.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && n.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 pub struct Resolver {
@@ -141,13 +232,23 @@ pub struct Resolver {
 
 /// The value of `description:` in SKILL.md frontmatter (plain, quoted, or a `>`/`|` block).
 pub(super) fn frontmatter_description(text: &str) -> String {
-    let Some(fm) = text.strip_prefix("---\n").and_then(|t| t.split_once("\n---").map(|(f, _)| f)) else { return String::new() };
+    let Some(fm) = text
+        .strip_prefix("---\n")
+        .and_then(|t| t.split_once("\n---").map(|(f, _)| f))
+    else {
+        return String::new();
+    };
     let mut lines = fm.lines();
     while let Some(l) = lines.next() {
-        let Some(v) = l.strip_prefix("description:") else { continue };
+        let Some(v) = l.strip_prefix("description:") else {
+            continue;
+        };
         let v = v.trim();
         if v.is_empty() || v.starts_with('>') || v.starts_with('|') {
-            let block: Vec<&str> = lines.take_while(|l| l.starts_with(' ') || l.starts_with('\t') || l.is_empty()).map(str::trim).collect();
+            let block: Vec<&str> = lines
+                .take_while(|l| l.starts_with(' ') || l.starts_with('\t') || l.is_empty())
+                .map(str::trim)
+                .collect();
             return block.join(" ").trim().to_string();
         }
         return v.trim_matches(|c| c == '"' || c == '\'').to_string();
@@ -156,7 +257,11 @@ pub(super) fn frontmatter_description(text: &str) -> String {
 }
 
 pub(super) fn file_for(module: &str) -> String {
-    if module.is_empty() { "init.luau".into() } else { format!("{module}.luau") }
+    if module.is_empty() {
+        "init.luau".into()
+    } else {
+        format!("{module}.luau")
+    }
 }
 
 pub(super) fn split_name(name: &str) -> (&str, &str) {
@@ -173,6 +278,9 @@ impl Resolver {
     }
 
     pub fn embedded(pkg: &str, file: &str) -> Option<&'static str> {
-        EMBEDDED.iter().find(|(p, n, _)| *p == pkg && *n == file).map(|(_, _, t)| *t)
+        EMBEDDED
+            .iter()
+            .find(|(p, n, _)| *p == pkg && *n == file)
+            .map(|(_, _, t)| *t)
     }
 }

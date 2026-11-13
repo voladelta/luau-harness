@@ -39,7 +39,10 @@ impl WorkflowConfig {
             matches!(self.mode.as_str(), "auto" | "manual"),
             "workflow mode must be auto or manual"
         );
-        ensure!(self.max_repairs <= MAX_REPAIRS, "workflow repair limit exceeds {MAX_REPAIRS}");
+        ensure!(
+            self.max_repairs <= MAX_REPAIRS,
+            "workflow repair limit exceeds {MAX_REPAIRS}"
+        );
         Ok(())
     }
 }
@@ -266,7 +269,9 @@ pub fn validate_submission(value: &Value) -> Result<()> {
         "stage document must be nonempty text"
     );
     ensure!(
-        value["summary"].as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 16_384),
+        value["summary"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty() && s.len() <= 16_384),
         "stage summary must be nonempty text up to 16 KiB"
     );
     ensure!(
@@ -312,7 +317,8 @@ pub fn planned_checks(value: &Value) -> Result<Vec<PlannedCheck>> {
             let check: PlannedCheck = serde_json::from_value(v).context("invalid planned check")?;
             identifier(&check.id)?;
             for input in &check.inputs {
-                relative(Path::new(input)).with_context(|| format!("check {}: input {input:?}", check.id))?;
+                relative(Path::new(input))
+                    .with_context(|| format!("check {}: input {input:?}", check.id))?;
             }
             if let Some(cwd) = &check.cwd {
                 ensure!(
@@ -396,7 +402,11 @@ pub fn validate_check_receipt(
     let code = outcome["ret"]["code"].as_i64().unwrap_or(-1);
     ensure!(
         outcome["ok"] == true && outcome["ret"]["t"] == "sh" && !timed_out && code == 0,
-        if timed_out { "command timed out" } else { "command failed with non-zero exit code" }
+        if timed_out {
+            "command timed out"
+        } else {
+            "command failed with non-zero exit code"
+        }
     );
     ensure!(
         intent["workflow_stage"].as_str() == Some(stage_id),
@@ -457,7 +467,9 @@ fn relative(path: &Path) -> Result<()> {
 }
 /// Harness state and artifact projections are never project content.
 fn excluded(path: &Path) -> bool {
-    path.starts_with(".git") || path.starts_with(".harness") || path.starts_with(".agents/artifacts")
+    path.starts_with(".git")
+        || path.starts_with(".harness")
+        || path.starts_with(".agents/artifacts")
 }
 /// Fixed Git metadata command, with bounded output and a five second deadline.
 fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
@@ -587,14 +599,21 @@ fn inventory_paths(root: &Path, extra_inputs: &[String]) -> Result<BTreeSet<Path
             .follow_links(false)
             .build();
         for entry in walk {
-            let entry = entry.with_context(|| format!("walking check input {}", input.display()))?;
+            let entry =
+                entry.with_context(|| format!("walking check input {}", input.display()))?;
             if entry.file_type().is_some_and(|t| !t.is_dir()) {
                 paths.insert(entry.path().strip_prefix(root)?.to_path_buf());
             }
-            ensure!(paths.len() <= MAX_FILES, "project inventory exceeds {MAX_FILES} files");
+            ensure!(
+                paths.len() <= MAX_FILES,
+                "project inventory exceeds {MAX_FILES} files"
+            );
         }
     }
-    ensure!(paths.len() <= MAX_FILES, "project inventory exceeds {MAX_FILES} files");
+    ensure!(
+        paths.len() <= MAX_FILES,
+        "project inventory exceeds {MAX_FILES} files"
+    );
     Ok(paths)
 }
 /// The observed inventory: path to `file:MODE:SHA`, `symlink:SHA`, or `deleted` for a listed path that is gone.
@@ -609,10 +628,17 @@ fn inventory(root: &Path, extra_inputs: &[String]) -> Result<BTreeMap<String, St
         }
         let name = path
             .to_str()
-            .with_context(|| format!("project inventory requires UTF-8 file paths: {}", path.display()))?
+            .with_context(|| {
+                format!(
+                    "project inventory requires UTF-8 file paths: {}",
+                    path.display()
+                )
+            })?
             .to_string();
         let absolute = root.join(&path);
-        let parent = absolute.parent().expect("a joined relative path has a parent");
+        let parent = absolute
+            .parent()
+            .expect("a joined relative path has a parent");
         // Resolve parents only: hash a symlink's identity without following it.
         if parent.exists() {
             ensure!(
@@ -631,7 +657,10 @@ fn inventory(root: &Path, extra_inputs: &[String]) -> Result<BTreeMap<String, St
         let hash = if meta.file_type().is_symlink() {
             let target = std::fs::read_link(&absolute)?;
             if let Ok(resolved) = std::fs::canonicalize(parent.join(&target)) {
-                ensure!(resolved.starts_with(root), "inventory symlink escapes project: {name}");
+                ensure!(
+                    resolved.starts_with(root),
+                    "inventory symlink escapes project: {name}"
+                );
             } else {
                 ensure!(
                     !target.is_absolute()
@@ -761,11 +790,7 @@ pub fn project_artifact(
 pub fn check_plan_section(plan: &[PlannedCheck]) -> Result<String> {
     let json = serde_json::to_string_pretty(plan)?;
     // A fence longer than any backtick run in the content cannot be closed by the content.
-    let longest = json
-        .split(|c| c != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
+    let longest = json.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
     Ok(format!(
         "\n\n## Frozen check plan (generated by hx)\n\nVerification must run each command exactly, with this cwd \
@@ -941,7 +966,10 @@ mod tests {
         let gate = json!({"gate_id":"rpi-gate-1","kind":"input","check_ids":["unit"],"decisions":["answer","waive"],
             "continuation":"manual_results"});
         let request: ReviewRequest = serde_json::from_value(gate.clone()).unwrap();
-        assert_eq!((request.kind, request.continuation), (GateKind::Input, Continuation::ManualResults));
+        assert_eq!(
+            (request.kind, request.continuation),
+            (GateKind::Input, Continuation::ManualResults)
+        );
         let stored = serde_json::to_value(&request).unwrap();
         for field in ["kind", "decisions", "continuation"] {
             assert_eq!(stored[field], gate[field], "{field}");
@@ -952,7 +980,10 @@ mod tests {
         for (field, value) in [("kind", "inputs"), ("continuation", "finish_now")] {
             let mut bad = gate.clone();
             bad[field] = json!(value);
-            assert!(serde_json::from_value::<ReviewRequest>(bad).is_err(), "{field}");
+            assert!(
+                serde_json::from_value::<ReviewRequest>(bad).is_err(),
+                "{field}"
+            );
         }
         let mut bad = gate;
         bad["decisions"] = json!(["answer", "skip"]);
@@ -999,7 +1030,10 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "build\n").unwrap();
         std::fs::write(root.join("build"), "generated").unwrap();
         let error = observe_project(&root, &[]).unwrap_err();
-        assert!(error.to_string().contains("requires a Git repository"), "{error}");
+        assert!(
+            error.to_string().contains("requires a Git repository"),
+            "{error}"
+        );
         git(&root, &["init", "-q"]);
         let first = inventory(&root, &[]).unwrap();
         assert!(first.contains_key("app.js") && !first.contains_key("build"));
@@ -1016,12 +1050,18 @@ mod tests {
         let listed = inventory(&root, &[]).unwrap();
         assert!(listed.contains_key("tracked") && !listed.contains_key("build"));
         let explicit = observe_project(&root, &["build".into()]).unwrap();
-        assert!(inventory(&root, &["build".into()]).unwrap().contains_key("build"));
+        assert!(
+            inventory(&root, &["build".into()])
+                .unwrap()
+                .contains_key("build")
+        );
         assert_eq!(explicit.extra_inputs, vec!["build".to_string()]);
         std::fs::write(root.join("build"), "changed ignored input").unwrap();
         assert_ne!(
             explicit.digest,
-            observe_project(&root, &explicit.extra_inputs).unwrap().digest
+            observe_project(&root, &explicit.extra_inputs)
+                .unwrap()
+                .digest
         );
         assert_eq!(a.digest, observe_project(&root, &[]).unwrap().digest);
         std::fs::remove_file(root.join("tracked")).unwrap();
@@ -1039,16 +1079,29 @@ mod tests {
         std::os::unix::fs::symlink("js/a.js", root.join("dist/link")).unwrap();
         let inputs = vec!["dist".to_string()];
         let listed = inventory(&root, &inputs).unwrap();
-        assert!(listed.contains_key("dist/js/a.js") && listed.contains_key("dist/link"), "{listed:?}");
+        assert!(
+            listed.contains_key("dist/js/a.js") && listed.contains_key("dist/link"),
+            "{listed:?}"
+        );
         assert!(!listed.contains_key("dist"));
         let before = observe_project(&root, &inputs).unwrap();
         std::fs::write(root.join("dist/js/a.js"), "2").unwrap();
-        assert_ne!(before.digest, observe_project(&root, &inputs).unwrap().digest);
+        assert_ne!(
+            before.digest,
+            observe_project(&root, &inputs).unwrap().digest
+        );
         std::fs::write(root.join("dist/js/b.js"), "new").unwrap();
-        assert!(inventory(&root, &inputs).unwrap().contains_key("dist/js/b.js"));
+        assert!(
+            inventory(&root, &inputs)
+                .unwrap()
+                .contains_key("dist/js/b.js")
+        );
         std::fs::remove_dir_all(root.join("dist")).unwrap();
         std::os::unix::fs::symlink("/etc", root.join("dist")).unwrap();
-        assert!(observe_project(&root, &inputs).is_err(), "a symlinked input directory must not lead outside");
+        assert!(
+            observe_project(&root, &inputs).is_err(),
+            "a symlinked input directory must not lead outside"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1063,7 +1116,9 @@ mod tests {
             requirements: vec![],
             inputs: vec![],
         };
-        let valid = |intent: &Value, outcome: &Value| validate_check_receipt(&check, intent, outcome, "verify", &root, &digest);
+        let valid = |intent: &Value, outcome: &Value| {
+            validate_check_receipt(&check, intent, outcome, "verify", &root, &digest)
+        };
         let mut intent = json!({"kind":"intent","seq":4,"tool":"sh","args":{"cmd":"bun test","cwd":null,"timeout":null},"workflow_stage":"verify","project_digest":digest});
         let mut outcome = json!({"kind":"outcome","of":4,"tool":"sh","ok":true,"ret":{"t":"sh","code":0,"timed_out":false},"workflow_stage":"verify","project_digest":digest});
         valid(&intent, &outcome).unwrap();
@@ -1088,8 +1143,14 @@ mod tests {
         let plan = planned_checks(&json!({"checks":[{"id":"unit","command":"echo ```` done","cwd":".","timeout":30,"inputs":["dist"]}]})).unwrap();
         let section = check_plan_section(&plan).unwrap();
         assert!(section.contains("`````json\n"), "{section}");
-        assert!(section.contains("\"command\": \"echo ```` done\"") && section.contains("\"timeout\": 30.0"));
-        assert!(section.contains("\"inputs\": [\n      \"dist\"\n    ]"), "{section}");
+        assert!(
+            section.contains("\"command\": \"echo ```` done\"")
+                && section.contains("\"timeout\": 30.0")
+        );
+        assert!(
+            section.contains("\"inputs\": [\n      \"dist\"\n    ]"),
+            "{section}"
+        );
     }
     #[test]
     fn projection_refuses_unowned_files_and_regenerates_owned_views() {

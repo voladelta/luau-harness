@@ -7,10 +7,16 @@ use std::collections::HashSet;
 // and both the tag table and its registry entry remain owned by this Lua instance.
 static ARRAY_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 fn array_marker() -> mlua::LightUserData {
-    mlua::LightUserData((&ARRAY_TAG as *const std::sync::atomic::AtomicU8).cast_mut().cast())
+    mlua::LightUserData(
+        (&ARRAY_TAG as *const std::sync::atomic::AtomicU8)
+            .cast_mut()
+            .cast(),
+    )
 }
 fn array_metatable(lua: &Lua) -> mlua::Result<Table> {
-    if let Ok(table) = lua.named_registry_value::<Table>("hx.native_array") { return Ok(table); }
+    if let Ok(table) = lua.named_registry_value::<Table>("hx.native_array") {
+        return Ok(table);
+    }
     let table = lua.create_table()?;
     table.raw_set("__hx_array", array_marker())?;
     table.raw_set("__metatable", "native array")?;
@@ -23,7 +29,10 @@ pub(crate) const MAX_BYTES: usize = 16 << 20;
 pub(crate) const MAX_NODES: usize = 262_144;
 pub(crate) const MAX_DEPTH: usize = 64;
 #[derive(Default)]
-pub(crate) struct Limit { bytes: usize, nodes: usize }
+pub(crate) struct Limit {
+    bytes: usize,
+    nodes: usize,
+}
 impl Limit {
     pub(crate) fn charge(&mut self, bytes: usize, nodes: usize) -> mlua::Result<()> {
         self.bytes = self.bytes.saturating_add(bytes);
@@ -36,23 +45,66 @@ impl Limit {
     pub(crate) fn string(&mut self, s: &str) -> mlua::Result<()> {
         self.charge(2, 0)?;
         // Conservative JSON escaping bound, charged before allocating a Rust copy.
-        for b in s.bytes() { self.charge(if b < 32 { 6 } else if b == b'"' || b == b'\\' { 2 } else { 1 }, 0)?; }
+        for b in s.bytes() {
+            self.charge(
+                if b < 32 {
+                    6
+                } else if b == b'"' || b == b'\\' {
+                    2
+                } else {
+                    1
+                },
+                0,
+            )?;
+        }
         Ok(())
     }
 }
 
 pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
-    fn visit(value: Value, stack: &mut HashSet<usize>, depth: usize, limit: &mut Limit) -> mlua::Result<serde_json::Value> {
-        if depth > MAX_DEPTH { return Err(mlua::Error::runtime(format!("data nesting exceeds {MAX_DEPTH} levels"))); }
+    fn visit(
+        value: Value,
+        stack: &mut HashSet<usize>,
+        depth: usize,
+        limit: &mut Limit,
+    ) -> mlua::Result<serde_json::Value> {
+        if depth > MAX_DEPTH {
+            return Err(mlua::Error::runtime(format!(
+                "data nesting exceeds {MAX_DEPTH} levels"
+            )));
+        }
         limit.charge(1, 1)?;
-        let bad = || mlua::Error::runtime("expected data only: finite numbers, strings, booleans, null, arrays or string-keyed objects; functions, handles, cycles and metatables are forbidden");
+        let bad = || {
+            mlua::Error::runtime(
+                "expected data only: finite numbers, strings, booleans, null, arrays or string-keyed objects; functions, handles, cycles and metatables are forbidden",
+            )
+        };
         Ok(match value {
-            Value::Nil => { limit.charge(4, 0)?; serde_json::Value::Null },
-            Value::LightUserData(p) if p.0.is_null() => { limit.charge(4, 0)?; serde_json::Value::Null },
-            Value::Boolean(v) => { limit.charge(5, 0)?; v.into() },
-            Value::Integer(v) => { limit.charge(24, 0)?; v.into() },
-            Value::Number(v) => { limit.charge(24, 0)?; serde_json::Value::Number(Number::from_f64(v).ok_or_else(bad)?) },
-            Value::String(v) => { let s = v.to_str()?; limit.string(&s)?; serde_json::Value::String(s.to_string()) },
+            Value::Nil => {
+                limit.charge(4, 0)?;
+                serde_json::Value::Null
+            }
+            Value::LightUserData(p) if p.0.is_null() => {
+                limit.charge(4, 0)?;
+                serde_json::Value::Null
+            }
+            Value::Boolean(v) => {
+                limit.charge(5, 0)?;
+                v.into()
+            }
+            Value::Integer(v) => {
+                limit.charge(24, 0)?;
+                v.into()
+            }
+            Value::Number(v) => {
+                limit.charge(24, 0)?;
+                serde_json::Value::Number(Number::from_f64(v).ok_or_else(bad)?)
+            }
+            Value::String(v) => {
+                let s = v.to_str()?;
+                limit.string(&s)?;
+                serde_json::Value::String(s.to_string())
+            }
             Value::Table(t) => {
                 let tagged_array = match t.metatable() {
                     Some(mt) => match mt.raw_get::<Value>("__hx_array")? {
@@ -62,28 +114,42 @@ pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
                     None => false,
                 };
                 let ptr = t.to_pointer() as usize;
-                if !stack.insert(ptr) { return Err(bad()); }
+                if !stack.insert(ptr) {
+                    return Err(bad());
+                }
                 let mut len = 0;
                 let mut numeric = true;
                 // Do not collect all pairs before checking the traversal budget.
                 for pair in t.pairs::<Value, Value>() {
                     let (k, _) = pair?;
                     len += 1;
-                    if len > MAX_NODES - limit.nodes { return Err(mlua::Error::runtime("data exceeds 262144 nodes")); }
+                    if len > MAX_NODES - limit.nodes {
+                        return Err(mlua::Error::runtime("data exceeds 262144 nodes"));
+                    }
                     numeric &= matches!(k, Value::Integer(i) if i > 0);
                 }
                 limit.charge(2, 0)?;
                 let out = if tagged_array || (len > 0 && numeric) {
-                    if !numeric { return Err(bad()); }
-                    for pair in t.pairs::<usize, Value>() { if pair?.0 > len { return Err(bad()); } }
+                    if !numeric {
+                        return Err(bad());
+                    }
+                    for pair in t.pairs::<usize, Value>() {
+                        if pair?.0 > len {
+                            return Err(bad());
+                        }
+                    }
                     let mut items = Vec::new();
-                    for i in 1..=len { items.push(visit(t.raw_get(i)?, stack, depth + 1, limit)?); }
+                    for i in 1..=len {
+                        items.push(visit(t.raw_get(i)?, stack, depth + 1, limit)?);
+                    }
                     serde_json::Value::Array(items)
                 } else {
                     let mut fields = Map::new();
                     for pair in t.pairs::<Value, Value>() {
                         let (key, value) = pair?;
-                        let Value::String(key) = key else { return Err(bad()); };
+                        let Value::String(key) = key else {
+                            return Err(bad());
+                        };
                         let key = key.to_str()?;
                         limit.string(&key)?;
                         fields.insert(key.to_string(), visit(value, stack, depth + 1, limit)?);
@@ -99,16 +165,35 @@ pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
     visit(value, &mut HashSet::new(), 0, &mut Limit::default())
 }
 
-fn validate_with_limit(value: &serde_json::Value, depth: usize, limit: &mut Limit) -> mlua::Result<()> {
-        if depth > MAX_DEPTH { return Err(mlua::Error::runtime(format!("data nesting exceeds {MAX_DEPTH} levels"))); }
-        limit.charge(1, 1)?;
-        match value {
-            serde_json::Value::String(s) => limit.string(s)?,
-            serde_json::Value::Array(v) => { limit.charge(2, 0)?; for v in v { validate_with_limit(v, depth + 1, limit)?; } },
-            serde_json::Value::Object(v) => { limit.charge(2, 0)?; for (k, v) in v { limit.string(k)?; validate_with_limit(v, depth + 1, limit)?; } },
-            _ => limit.charge(24, 0)?,
+fn validate_with_limit(
+    value: &serde_json::Value,
+    depth: usize,
+    limit: &mut Limit,
+) -> mlua::Result<()> {
+    if depth > MAX_DEPTH {
+        return Err(mlua::Error::runtime(format!(
+            "data nesting exceeds {MAX_DEPTH} levels"
+        )));
+    }
+    limit.charge(1, 1)?;
+    match value {
+        serde_json::Value::String(s) => limit.string(s)?,
+        serde_json::Value::Array(v) => {
+            limit.charge(2, 0)?;
+            for v in v {
+                validate_with_limit(v, depth + 1, limit)?;
+            }
         }
-        Ok(())
+        serde_json::Value::Object(v) => {
+            limit.charge(2, 0)?;
+            for (k, v) in v {
+                limit.string(k)?;
+                validate_with_limit(v, depth + 1, limit)?;
+            }
+        }
+        _ => limit.charge(24, 0)?,
+    }
+    Ok(())
 }
 
 pub fn validate(value: &serde_json::Value) -> mlua::Result<()> {
@@ -131,17 +216,24 @@ pub fn copy_in(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
         Ok(match value {
             serde_json::Value::Null => Value::NULL,
             serde_json::Value::Bool(v) => Value::Boolean(*v),
-            serde_json::Value::Number(v) => match v.as_i64() { Some(v) => Value::Integer(v), None => Value::Number(v.as_f64().unwrap()) },
+            serde_json::Value::Number(v) => match v.as_i64() {
+                Some(v) => Value::Integer(v),
+                None => Value::Number(v.as_f64().unwrap()),
+            },
             serde_json::Value::String(v) => Value::String(lua.create_string(v)?),
             serde_json::Value::Array(v) => {
                 let t = lua.create_table()?;
-                for (i, value) in v.iter().enumerate() { t.raw_set(i + 1, visit(lua, value)?)?; }
+                for (i, value) in v.iter().enumerate() {
+                    t.raw_set(i + 1, visit(lua, value)?)?;
+                }
                 t.set_metatable(Some(array_metatable(lua)?))?;
                 Value::Table(t)
             }
             serde_json::Value::Object(v) => {
                 let t: Table = lua.create_table()?;
-                for (key, value) in v { t.raw_set(key.as_str(), visit(lua, value)?)?; }
+                for (key, value) in v {
+                    t.raw_set(key.as_str(), visit(lua, value)?)?;
+                }
                 Value::Table(t)
             }
         })
@@ -156,7 +248,13 @@ mod tests {
     #[test]
     fn boundaries_reject_hidden_state_and_copy_aliases() {
         let lua = Lua::new();
-        for code in ["return function() end", "local t = {}; t.t=t; return t", "return setmetatable({}, {})", "return { [1]=1, x=2 }", "return 0/0"] {
+        for code in [
+            "return function() end",
+            "local t = {}; t.t=t; return t",
+            "return setmetatable({}, {})",
+            "return { [1]=1, x=2 }",
+            "return 0/0",
+        ] {
             assert!(copy_out(lua.load(code).eval().unwrap()).is_err(), "{code}");
         }
         let source: Table = lua.load("return {x={n=1}, list={2,3}} ").eval().unwrap();
@@ -168,13 +266,26 @@ mod tests {
     #[test]
     fn alias_expansion_is_bounded_and_native_arrays_are_plain() {
         let lua = Lua::new();
-        let dag = lua.load("local t={x=1}; for i=1,30 do t={a=t,b=t} end; return t").eval().unwrap();
-        assert!(copy_out(dag).unwrap_err().to_string().contains("data exceeds"));
+        let dag = lua
+            .load("local t={x=1}; for i=1,30 do t={a=t,b=t} end; return t")
+            .eval()
+            .unwrap();
+        assert!(
+            copy_out(dag)
+                .unwrap_err()
+                .to_string()
+                .contains("data exceeds")
+        );
         let json = serde_json::json!({"nested":[[1,2], [3], []], "empty":[]});
         assert_eq!(copy_out(copy_in(&lua, &json).unwrap()).unwrap(), json);
         let array = copy_in(&lua, &serde_json::json!([])).unwrap();
         lua.globals().set("array", array).unwrap();
-        assert_eq!(lua.load("return getmetatable(array)").eval::<String>().unwrap(), "native array");
+        assert_eq!(
+            lua.load("return getmetatable(array)")
+                .eval::<String>()
+                .unwrap(),
+            "native array"
+        );
         assert!(validate(&serde_json::json!({"large":"x".repeat(MAX_BYTES)})).is_err());
     }
 }

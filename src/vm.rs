@@ -7,13 +7,13 @@ use crate::modules::Resolver;
 use crate::policy::{Class, Policy};
 use crate::prims;
 use anyhow::{Context, Result};
-use serde_json::json;
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic, VmState};
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -92,7 +92,11 @@ impl Printed {
 
     /// The captured text (invalid UTF-8 replaced) and the number of bytes left out of its middle; empties the buffer.
     fn take(&mut self) -> (String, usize) {
-        let Printed { mut head, tail, total } = std::mem::take(self);
+        let Printed {
+            mut head,
+            tail,
+            total,
+        } = std::mem::take(self);
         if total <= PRINT_CAP {
             head.extend_from_slice(&tail);
             return (String::from_utf8_lossy(&head).into_owned(), 0);
@@ -100,7 +104,11 @@ impl Printed {
         // Over the cap the head is full and the tail holds at least half; cut both on character boundaries.
         let tail = &tail[tail.len() - PRINT_CAP / 2..];
         let head = &head[..whole_prefix(&head)];
-        let tail = &tail[tail.iter().take(3).take_while(|&&b| is_continuation(b)).count()..];
+        let tail = &tail[tail
+            .iter()
+            .take(3)
+            .take_while(|&&b| is_continuation(b))
+            .count()..];
         let omitted = total - head.len() - tail.len();
         let text = format!(
             "{}\n…[hx: {omitted} bytes omitted from the middle of the printed output]…\n{}",
@@ -126,7 +134,11 @@ fn whole_prefix(b: &[u8]) -> usize {
                 0xC0.. => 2,
                 _ => 1,
             };
-            return if width > back { b.len() - back } else { b.len() };
+            return if width > back {
+                b.len() - back
+            } else {
+                b.len()
+            };
         }
     }
     b.len()
@@ -139,11 +151,16 @@ type Waiting = Arc<Mutex<HashMap<usize, (usize, mlua::Thread)>>>;
 /// and call, so the interrupt reads the time on each one; this clock is a vDSO read of a few nanoseconds, a fraction of
 /// what `Instant::now` costs, and is accurate to a scheduler tick (a few milliseconds), which is plenty for budgets.
 pub(crate) fn coarse_now() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: clock_gettime(2) writes one timespec through a pointer to a live local and has no other effect.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts) };
     debug_assert_eq!(rc, 0, "Linux has had CLOCK_MONOTONIC_COARSE since 2.6.32");
-    (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64)
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 fn nanos(d: Duration) -> u64 {
@@ -175,7 +192,10 @@ impl Deadline {
 
     /// Time the code that runs next: it must stop `budget` from now.
     pub fn start(&self, budget: Duration) {
-        self.0.store(coarse_now().saturating_add(nanos(budget)), Ordering::Relaxed);
+        self.0.store(
+            coarse_now().saturating_add(nanos(budget)),
+            Ordering::Relaxed,
+        );
     }
 
     /// Nothing is timed until the next `start`.
@@ -191,7 +211,11 @@ impl Deadline {
     /// Move a timed deadline to `at` if that is later; an untimed one stays untimed.
     pub(crate) fn extend_to(&self, at: u64) {
         // An error is the documented no-op: untimed, or already as late.
-        let _ = self.0.try_update(Ordering::Relaxed, Ordering::Relaxed, |now| (now != UNTIMED && now < at).then_some(at));
+        let _ = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
+                (now != UNTIMED && now < at).then_some(at)
+            });
     }
 }
 
@@ -213,7 +237,8 @@ impl Budget {
     pub(crate) fn install(self, lua: &Lua) {
         // The run deadline is wall-clock time; within this process it is the same distance away on the budget clock.
         let run_end = self.run_deadline.map_or(UNTIMED, |end| {
-            let left = Duration::try_from_secs_f64(end - crate::supervisor::now()).unwrap_or(Duration::ZERO);
+            let left = Duration::try_from_secs_f64(end - crate::supervisor::now())
+                .unwrap_or(Duration::ZERO);
             coarse_now().saturating_add(nanos(left))
         });
         lua.set_interrupt(move |lua| {
@@ -223,14 +248,22 @@ impl Budget {
             }
             // The run deadline is judged on its own clock, as the supervisor judges it: the budget clock may be a
             // tick ahead of it.
-            if self.run_deadline.is_some_and(|end| crate::supervisor::now() >= end) {
-                return Err(mlua::Error::runtime("budget_exceeded: absolute run deadline reached"));
+            if self
+                .run_deadline
+                .is_some_and(|end| crate::supervisor::now() >= end)
+            {
+                return Err(mlua::Error::runtime(
+                    "budget_exceeded: absolute run deadline reached",
+                ));
             }
             if now < self.deadline.0.load(Ordering::Relaxed) {
                 return Ok(VmState::Continue);
             }
             if let Some(waiting) = &self.waiting
-                && waiting.lock().unwrap().contains_key(&(lua.current_thread().to_pointer() as usize))
+                && waiting
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(lua.current_thread().to_pointer() as usize))
             {
                 return Ok(VmState::Continue);
             }
@@ -246,7 +279,8 @@ pub(crate) fn locked_env(lua: &Lua, globals: &Table) -> mlua::Result<Table> {
     let view = lua.create_table()?;
     for pair in globals.pairs::<Value, Value>() {
         let (key, value) = pair?;
-        if matches!(&key, Value::String(s) if matches!(s.as_bytes().as_ref(), b"_G" | b"coroutine")) {
+        if matches!(&key, Value::String(s) if matches!(s.as_bytes().as_ref(), b"_G" | b"coroutine"))
+        {
             continue;
         }
         view.raw_set(key, value)?;
@@ -269,11 +303,18 @@ mod session_budget_tests {
         let dirs = crate::dirs::TestDirs::new();
         let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
         let vm = Vm::new(policy, Duration::from_millis(30), 32 << 20, None).unwrap();
-        let waited = vm.session.run("local r=sh('sleep 0.1; echo waited'); assert(r.code==0); print(r.stdout)").await;
+        let waited = vm
+            .session
+            .run("local r=sh('sleep 0.1; echo waited'); assert(r.code==0); print(r.stdout)")
+            .await;
         assert!(waited.error.is_none(), "{:?}", waited.error);
         assert!(waited.output.contains("waited"));
         let spun = vm.session.run("sh('sleep 0.1'); while true do end").await;
-        assert!(spun.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")));
+        assert!(
+            spun.error
+                .as_deref()
+                .is_some_and(|e| e.contains("time budget exceeded"))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -287,9 +328,21 @@ mod session_budget_tests {
         // Each iteration is one interrupt and a sort of tens of milliseconds.
         let code = "local t = table.create(1e6, 0); for i = 1, 1e6 do t[i] = i end; while true do table.sort(t) end";
         let t0 = std::time::Instant::now();
-        let r = tokio::time::timeout(Duration::from_secs(20), vm.session.run(code)).await.expect("the chunk must stop");
-        assert!(r.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")), "{:?}", r.error);
-        assert!(t0.elapsed() < Duration::from_secs(2), "a 300 ms budget took {:?}", t0.elapsed());
+        let r = tokio::time::timeout(Duration::from_secs(20), vm.session.run(code))
+            .await
+            .expect("the chunk must stop");
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("time budget exceeded")),
+            "{:?}",
+            r.error
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "a 300 ms budget took {:?}",
+            t0.elapsed()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -300,8 +353,18 @@ mod session_budget_tests {
         for _ in 0..20 {
             let lua = Lua::new();
             let end = crate::supervisor::now() + 0.02;
-            Budget { run_deadline: Some(end), deadline: Arc::default(), waiting: None, exceeded: "chunk budget" }.install(&lua);
-            let error = lua.load("while true do end").exec().unwrap_err().to_string();
+            Budget {
+                run_deadline: Some(end),
+                deadline: Arc::default(),
+                waiting: None,
+                exceeded: "chunk budget",
+            }
+            .install(&lua);
+            let error = lua
+                .load("while true do end")
+                .exec()
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("absolute run deadline reached"), "{error}");
             assert!(crate::supervisor::now() >= end);
         }
@@ -317,20 +380,36 @@ mod session_budget_tests {
         let mut registry = crate::modules::Registry::capture(&dir, &dirs).unwrap();
         let caps = crate::supervisor::Capabilities::from([crate::supervisor::Capability::ProcSh]);
         registry.capabilities.insert("probe".into(), caps.clone());
-        registry.sources.insert("probe".into(), crate::modules::Source {
-            text: "return {run=function() return sh('sleep 0.1; echo waited').stdout end}".into(),
-            origin: "probe/init.luau".into(), is_override: false, pkg: Some(("probe".into(), caps)),
-        });
+        registry.sources.insert(
+            "probe".into(),
+            crate::modules::Source {
+                text: "return {run=function() return sh('sleep 0.1; echo waited').stdout end}"
+                    .into(),
+                origin: "probe/init.luau".into(),
+                is_override: false,
+                pkg: Some(("probe".into(), caps)),
+            },
+        );
         let supervisor = crate::supervisor::Supervisor::ephemeral(policy, Arc::new(registry));
         let caller = vm.effects.clone();
         let proxy = crate::packages::proxy(&vm.lua, supervisor, None, "probe", caller).unwrap();
         vm.session.env.set("probe", proxy).unwrap();
-        let waited = vm.session.run("assert(probe.run():find('waited')); print('ok')").await;
+        let waited = vm
+            .session
+            .run("assert(probe.run():find('waited')); print('ok')")
+            .await;
         assert!(waited.error.is_none(), "{:?}", waited.error);
         let spun = vm.session.run("probe.run(); while true do end").await;
-        assert!(spun.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")));
+        assert!(
+            spun.error
+                .as_deref()
+                .is_some_and(|e| e.contains("time budget exceeded"))
+        );
         // a call that cannot yield leaves no thread marked as awaiting (exempt from the budget) behind it
-        let failed = vm.session.run("assert(not pcall(string.gsub, 'a', 'a', function() return probe.run() end))").await;
+        let failed = vm
+            .session
+            .run("assert(not pcall(string.gsub, 'a', 'a', function() return probe.run() end))")
+            .await;
         assert!(failed.error.is_none(), "{:?}", failed.error);
         assert!(vm.effects.waiting.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
@@ -353,10 +432,16 @@ mod boundary_tests {
     #[tokio::test]
     async fn a_result_that_is_not_utf8_still_reaches_the_model() {
         let (vm, dir, _dirs) = vm("utf8", Duration::from_secs(5), 64 << 20);
-        let r = vm.run_chunk("local s = 'café au lait'; print(s:sub(1, 4)); return s:sub(1, 4)").await.unwrap();
+        let r = vm
+            .run_chunk("local s = 'café au lait'; print(s:sub(1, 4)); return s:sub(1, 4)")
+            .await
+            .unwrap();
         let feedback = r["feedback"].as_str().unwrap();
         assert!(feedback.contains("=> caf\u{FFFD}"), "{feedback}");
-        assert!(r["output"].as_str().unwrap().starts_with("caf\u{FFFD}"), "{r}");
+        assert!(
+            r["output"].as_str().unwrap().starts_with("caf\u{FFFD}"),
+            "{r}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -367,11 +452,23 @@ mod boundary_tests {
         let r = vm.run_chunk(code).await.unwrap();
         assert_eq!(r["feedback"], "before\n=> {}\n", "{r}");
         // userdata: the session cannot make any with a metatable of its own; hx's errors show their message
-        assert_eq!(vm.exec_text("return newproxy == nil").await.unwrap(), "=> true\n-- ops=0 error=false");
-        let r = vm.run_chunk("return select(2, pcall(read, 'missing'))").await.unwrap();
+        assert_eq!(
+            vm.exec_text("return newproxy == nil").await.unwrap(),
+            "=> true\n-- ops=0 error=false"
+        );
+        let r = vm
+            .run_chunk("return select(2, pcall(read, 'missing'))")
+            .await
+            .unwrap();
         let feedback = r["feedback"].as_str().unwrap();
-        assert!(feedback.starts_with("=> missing: No such file"), "{feedback}");
-        assert!(!feedback.contains("traceback") && !feedback.contains("runtime error"), "{feedback}");
+        assert!(
+            feedback.starts_with("=> missing: No such file"),
+            "{feedback}"
+        );
+        assert!(
+            !feedback.contains("traceback") && !feedback.contains("runtime error"),
+            "{feedback}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -379,19 +476,42 @@ mod boundary_tests {
     fn the_printer_names_userdata_without_running_its_metamethods() {
         // A plain Luau state still has newproxy: the printer must not need the session's sandbox to be safe.
         let lua = Lua::new();
-        let printer: Table = lua.load(crate::modules::Resolver::embedded("std", "printer.luau").expect("std/printer is embedded")).eval().unwrap();
+        let printer: Table = lua
+            .load(
+                crate::modules::Resolver::embedded("std", "printer.luau")
+                    .expect("std/printer is embedded"),
+            )
+            .eval()
+            .unwrap();
         let u: Value = lua.load("local u = newproxy(true); getmetatable(u).__tostring = function() ran = true; return 'mine' end; return u").eval().unwrap();
-        let shown: String = printer.get::<Function>("top").unwrap().call(u.clone()).unwrap();
+        let shown: String = printer
+            .get::<Function>("top")
+            .unwrap()
+            .call(u.clone())
+            .unwrap();
         assert_eq!(shown, "<userdata>");
-        let nested: String = printer.get::<Function>("top").unwrap().call(lua.create_sequence_from([u]).unwrap()).unwrap();
+        let nested: String = printer
+            .get::<Function>("top")
+            .unwrap()
+            .call(lua.create_sequence_from([u]).unwrap())
+            .unwrap();
         assert_eq!(nested, "<array: 1 items> [<userdata>]");
         assert_eq!(lua.globals().get::<Value>("ran").unwrap(), Value::Nil);
     }
 
     #[test]
     fn feedback_that_cannot_be_composed_falls_back_to_output_and_error() {
-        let result = RunResult { output: "before\n".into(), omitted: 7, values: vec![Value::Integer(1)], error: Some("chunk failed".into()), ops: 0 };
-        let feedback = fallback_feedback(&result, &mlua::Error::runtime("printer broke\nstack traceback: ..."));
+        let result = RunResult {
+            output: "before\n".into(),
+            omitted: 7,
+            values: vec![Value::Integer(1)],
+            error: Some("chunk failed".into()),
+            ops: 0,
+        };
+        let feedback = fallback_feedback(
+            &result,
+            &mlua::Error::runtime("printer broke\nstack traceback: ..."),
+        );
         assert_eq!(
             feedback,
             "before\nnote: 7 bytes printed in the middle of this chunk were dropped\nerror: chunk failed\n\
@@ -403,13 +523,19 @@ mod boundary_tests {
     async fn harness_luau_between_chunks_runs_under_a_deadline() {
         let (vm, dir, _dirs) = vm("compose-deadline", Duration::from_millis(300), 64 << 20);
         let t0 = Instant::now();
-        let spin = vm.lua.load("while true do end").set_environment(vm.modenv.clone());
+        let spin = vm
+            .lua
+            .load("while true do end")
+            .set_environment(vm.modenv.clone());
         let error = {
             let _harness = vm.session.harness();
             spin.exec().unwrap_err()
         };
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
-        assert!(error.to_string().contains("time budget exceeded"), "{error}");
+        assert!(
+            error.to_string().contains("time budget exceeded"),
+            "{error}"
+        );
         // the deadline is cleared again: harness code between chunks is not left on a stale clock
         assert!(vm.session.deadline.get().is_none());
         let _ = std::fs::remove_dir_all(dir);
@@ -418,16 +544,32 @@ mod boundary_tests {
     #[tokio::test]
     async fn a_chunk_that_fills_memory_still_gets_feedback() {
         let (vm, dir, _dirs) = vm("memory", Duration::from_secs(10), 32 << 20);
-        let r = vm.run_chunk("keep = {}; for i = 1, 1e8 do keep[i] = string.rep('x', 64) .. i end").await.unwrap();
+        let r = vm
+            .run_chunk("keep = {}; for i = 1, 1e8 do keep[i] = string.rep('x', 64) .. i end")
+            .await
+            .unwrap();
         let feedback = r["feedback"].as_str().unwrap();
-        assert!(feedback.contains("error:") && feedback.contains("memory"), "{feedback}");
+        assert!(
+            feedback.contains("error:") && feedback.contains("memory"),
+            "{feedback}"
+        );
         assert!(!feedback.contains("hx could not format"), "{feedback}");
         // the model's data still fills the allowance: a chunk that allocates fails, and its feedback and the request
         // hooks still work
-        let next = vm.exec_text("return string.rep('y', 16 * 1024 * 1024)").await.unwrap();
-        assert!(next.starts_with("error: memory error: not enough memory\n"), "{next}");
-        let request = json!({"system": "s", "messages": [{"role": "user", "content": "hi"}], "tools": []});
-        assert_eq!(vm.prepare_request(&request).unwrap()["messages"], request["messages"]);
+        let next = vm
+            .exec_text("return string.rep('y', 16 * 1024 * 1024)")
+            .await
+            .unwrap();
+        assert!(
+            next.starts_with("error: memory error: not enough memory\n"),
+            "{next}"
+        );
+        let request =
+            json!({"system": "s", "messages": [{"role": "user", "content": "hi"}], "tools": []});
+        assert_eq!(
+            vm.prepare_request(&request).unwrap()["messages"],
+            request["messages"]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -440,25 +582,56 @@ mod boundary_tests {
             let _ = vm.lua.load(hoard).set_environment(vm.modenv.clone()).exec();
         }
         let ceiling = (32 << 20) + HARNESS_HEADROOM;
-        assert!(vm.lua.used_memory() <= ceiling, "{} MiB", vm.lua.used_memory() >> 20);
+        assert!(
+            vm.lua.used_memory() <= ceiling,
+            "{} MiB",
+            vm.lua.used_memory() >> 20
+        );
         // what harness code kept puts the session over its limit: the model is told, and can still run a chunk
         let over = vm.exec_text("return 1").await.unwrap();
-        assert!(over.starts_with("=> 1\nnote: the session now holds ") && over.contains("over its 32 MiB memory limit"), "{over}");
+        assert!(
+            over.starts_with("=> 1\nnote: the session now holds ")
+                && over.contains("over its 32 MiB memory limit"),
+            "{over}"
+        );
         vm.modenv.raw_set("kept", Value::Nil).unwrap();
-        assert_eq!(vm.exec_text("return 2").await.unwrap(), "=> 2\n-- ops=0 error=false");
+        assert_eq!(
+            vm.exec_text("return 2").await.unwrap(),
+            "=> 2\n-- ops=0 error=false"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn print_output_is_bounded_and_the_feedback_says_so() {
         let (vm, dir, _dirs) = vm("print", Duration::from_secs(30), 64 << 20);
-        let r = vm.session.run("for i = 1, 30000 do print(string.rep('é', 50)) end").await;
+        let r = vm
+            .session
+            .run("for i = 1, 30000 do print(string.rep('é', 50)) end")
+            .await;
         let printed = 30000 * 101;
-        assert!(r.output.len() < PRINT_CAP + 200 && r.omitted > printed - PRINT_CAP - 8, "{} {}", r.output.len(), r.omitted);
+        assert!(
+            r.output.len() < PRINT_CAP + 200 && r.omitted > printed - PRINT_CAP - 8,
+            "{} {}",
+            r.output.len(),
+            r.omitted
+        );
         assert!(!r.output.contains('\u{FFFD}'), "cut inside a character");
-        assert!(r.output.contains(&format!("[hx: {} bytes omitted", r.omitted)));
-        let text = vm.exec_text("for i = 1, 30000 do print(string.rep('é', 50)) end").await.unwrap();
-        assert!(text.contains(&format!("note: {} bytes printed in the middle of this chunk were dropped", r.omitted)), "{text}");
+        assert!(
+            r.output
+                .contains(&format!("[hx: {} bytes omitted", r.omitted))
+        );
+        let text = vm
+            .exec_text("for i = 1, 30000 do print(string.rep('é', 50)) end")
+            .await
+            .unwrap();
+        assert!(
+            text.contains(&format!(
+                "note: {} bytes printed in the middle of this chunk were dropped",
+                r.omitted
+            )),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -474,14 +647,21 @@ mod boundary_tests {
         }
         let (text, omitted) = p.take();
         assert!(!text.contains('\u{FFFD}'));
-        let kept: usize = text.split('\n').filter(|s| !s.contains("omitted")).map(str::len).sum();
+        let kept: usize = text
+            .split('\n')
+            .filter(|s| !s.contains("omitted"))
+            .map(str::len)
+            .sum();
         assert_eq!(kept + omitted, 3_000_000);
         assert_eq!(p.take(), (String::new(), 0));
     }
 
     #[test]
     fn a_failed_durable_set_keeps_the_previous_value() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let (vm, dir, _dirs) = vm("durable", Duration::from_secs(10), 128 << 20);
         let code = "durable.set('k', {n = 1})
             local big = string.rep('x', 17 * 1024 * 1024)
@@ -506,13 +686,29 @@ mod boundary_tests {
         ];
         for probe in probes {
             let r = vm.session.run(&format!("return {probe}")).await;
-            assert!(r.error.is_none() && matches!(r.values.as_slice(), [Value::Boolean(true)]), "{probe}: {:?}", r.error);
+            assert!(
+                r.error.is_none() && matches!(r.values.as_slice(), [Value::Boolean(true)]),
+                "{probe}: {:?}",
+                r.error
+            );
         }
         // a copied array's tag cannot be read, removed or reproduced
-        crate::values::copy_in(&vm.lua, &json!([1, 2])).and_then(|a| vm.session.env.raw_set("arr", a)).unwrap();
-        let r = vm.session.run("return getmetatable(arr) == 'native array' and not pcall(setmetatable, arr, nil)").await;
-        assert!(matches!(r.values.as_slice(), [Value::Boolean(true)]), "{:?}", r.error);
-        let forged = vm.session.run("durable.set('x', setmetatable({}, {__hx_array = true}))").await;
+        crate::values::copy_in(&vm.lua, &json!([1, 2]))
+            .and_then(|a| vm.session.env.raw_set("arr", a))
+            .unwrap();
+        let r = vm
+            .session
+            .run("return getmetatable(arr) == 'native array' and not pcall(setmetatable, arr, nil)")
+            .await;
+        assert!(
+            matches!(r.values.as_slice(), [Value::Boolean(true)]),
+            "{:?}",
+            r.error
+        );
+        let forged = vm
+            .session
+            .run("durable.set('x', setmetatable({}, {__hx_array = true}))")
+            .await;
         assert!(forged.error.is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -535,16 +731,28 @@ pub struct Session {
 impl Session {
     /// Compile `code`; if its last line is an expression, return it so the value is captured.
     fn compile(&self, code: &str) -> mlua::Result<Function> {
-        let load = |src: &str| self.lua.load(src).set_name("=chunk").set_environment(self.env.clone()).into_function();
+        let load = |src: &str| {
+            self.lua
+                .load(src)
+                .set_name("=chunk")
+                .set_environment(self.env.clone())
+                .into_function()
+        };
         let trimmed = code.trim_end();
         if let Some(idx) = trimmed.rfind('\n') {
             let (head, last) = trimmed.split_at(idx + 1);
             // Only rewrite when `head` is a complete chunk by itself; otherwise the last line closes a block
             // (`end`) and `return end` would silently exit the loop/if body early.
-            if self.lua.load(head).set_name("=chunk").into_function().is_ok()
-                && let Ok(f) = load(&format!("{head}return {last}")) {
-                    return Ok(f);
-                }
+            if self
+                .lua
+                .load(head)
+                .set_name("=chunk")
+                .into_function()
+                .is_ok()
+                && let Ok(f) = load(&format!("{head}return {last}"))
+            {
+                return Ok(f);
+            }
         } else if let Ok(f) = load(&format!("return {trimmed}")) {
             return Ok(f);
         }
@@ -557,9 +765,13 @@ impl Session {
         self.chunks.fetch_add(1, Ordering::Relaxed);
         // Compiling runs none of the model's code, so it gets the harness ceiling: a session over its limit can still
         // run the chunk that frees memory.
-        self.lua.set_memory_limit(self.harness_ceiling()).expect(MEMORY_CONTROL);
+        self.lua
+            .set_memory_limit(self.harness_ceiling())
+            .expect(MEMORY_CONTROL);
         let compiled = self.compile(code);
-        self.lua.set_memory_limit(self.mem_limit).expect(MEMORY_CONTROL);
+        self.lua
+            .set_memory_limit(self.mem_limit)
+            .expect(MEMORY_CONTROL);
         self.deadline.start(self.budget);
         let result = match compiled {
             Ok(f) => f.call_async::<MultiValue>(()).await,
@@ -571,7 +783,13 @@ impl Session {
             Ok(vals) => (vals.into_iter().filter(|v| !v.is_nil()).collect(), None),
             Err(e) => (vec![], Some(clean_error(&e))),
         };
-        RunResult { output, omitted, values, error, ops: self.ops.load(Ordering::Relaxed) }
+        RunResult {
+            output,
+            omitted,
+            values,
+            error,
+            ops: self.ops.load(Ordering::Relaxed),
+        }
     }
 
     /// Time and memory for harness Luau that runs between chunks (feedback, request hooks). It runs no code of the
@@ -580,7 +798,9 @@ impl Session {
     /// fixed ceiling, so nothing the harness keeps can raise the next one. Both are restored when the guard drops;
     /// a session left over its limit is collected then.
     fn harness(&self) -> HarnessGuard<'_> {
-        self.lua.set_memory_limit(self.harness_ceiling()).expect(MEMORY_CONTROL);
+        self.lua
+            .set_memory_limit(self.harness_ceiling())
+            .expect(MEMORY_CONTROL);
         self.deadline.start(self.budget.min(HARNESS_TIME));
         HarnessGuard { session: self }
     }
@@ -618,9 +838,15 @@ impl Drop for HarnessGuard<'_> {
         let session = self.session;
         session.deadline.clear();
         if session.lua.used_memory() > session.mem_limit {
-            session.lua.gc_collect().expect("Luau runs no finalizer that can fail a collection");
+            session
+                .lua
+                .gc_collect()
+                .expect("Luau runs no finalizer that can fail a collection");
         }
-        session.lua.set_memory_limit(session.mem_limit).expect(MEMORY_CONTROL);
+        session
+            .lua
+            .set_memory_limit(session.mem_limit)
+            .expect(MEMORY_CONTROL);
     }
 }
 
@@ -632,14 +858,21 @@ const FALLBACK_CHARS: usize = 12_000;
 fn fallback_feedback(result: &RunResult, why: &mlua::Error) -> String {
     let mut text = clip(&result.output, FALLBACK_CHARS * 2 / 3);
     if result.omitted > 0 {
-        text.push_str(&format!("note: {} bytes printed in the middle of this chunk were dropped\n", result.omitted));
+        text.push_str(&format!(
+            "note: {} bytes printed in the middle of this chunk were dropped\n",
+            result.omitted
+        ));
     }
     if let Some(error) = &result.error {
         text.push_str(&format!("error: {}\n", clip(error, FALLBACK_CHARS / 3)));
     }
     let why = clean_error(why);
     let why = clip(why.lines().next().unwrap_or(""), 300);
-    let lost = if result.values.is_empty() { "" } else { "; the returned values are not shown" };
+    let lost = if result.values.is_empty() {
+        ""
+    } else {
+        "; the returned values are not shown"
+    };
     text.push_str(&format!("(hx could not format this result: {why}{lost})\n"));
     text
 }
@@ -658,7 +891,9 @@ fn clip(s: &str, max: usize) -> String {
 
 fn clean_error(e: &mlua::Error) -> String {
     match e {
-        mlua::Error::CallbackError { cause, traceback } => format!("{}\n{}", clean_error(cause), traceback.trim_end()),
+        mlua::Error::CallbackError { cause, traceback } => {
+            format!("{}\n{}", clean_error(cause), traceback.trim_end())
+        }
         other => other.to_string(),
     }
 }
@@ -678,7 +913,13 @@ fn opt_string(o: &Option<Table>, k: &str) -> String {
 }
 
 fn stderr_print(_: &Lua, args: Variadic<Value>) -> mlua::Result<()> {
-    eprintln!("{}", args.iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t"));
+    eprintln!(
+        "{}",
+        args.iter()
+            .map(|v| v.to_string().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\t")
+    );
     Ok(())
 }
 
@@ -699,9 +940,18 @@ fn toml_str(s: &str) -> String {
 }
 
 fn render_manifest(name: &str, d: &ToolDef) -> String {
-    let mut t = format!("[package]\nname = {}\nversion = \"0.1.0\"\nkind = \"tool\"\ndescription = {}\n\n[tool]\nsignature = {}\ndoc = {}\n\n[capabilities]\n", toml_str(name), toml_str(&d.doc), toml_str(&d.signature), toml_str(&d.doc));
+    let mut t = format!(
+        "[package]\nname = {}\nversion = \"0.1.0\"\nkind = \"tool\"\ndescription = {}\n\n[tool]\nsignature = {}\ndoc = {}\n\n[capabilities]\n",
+        toml_str(name),
+        toml_str(&d.doc),
+        toml_str(&d.signature),
+        toml_str(&d.doc)
+    );
     for (k, v) in d.caps.to_map() {
-        t.push_str(&format!("{k} = [{}]\n", v.iter().map(|x| toml_str(x)).collect::<Vec<_>>().join(", ")));
+        t.push_str(&format!(
+            "{k} = [{}]\n",
+            v.iter().map(|x| toml_str(x)).collect::<Vec<_>>().join(", ")
+        ));
     }
     t
 }
@@ -716,9 +966,11 @@ pub const OPTIONAL_PACKS: [&str; 2] = ["std/authoring", "std/vision"];
 /// Refuse any pack that is not one of `OPTIONAL_PACKS`, rather than enable nothing.
 pub fn check_packs(packs: &[String]) -> Result<()> {
     for pack in packs {
-        anyhow::ensure!(OPTIONAL_PACKS.contains(&pack.as_str()),
+        anyhow::ensure!(
+            OPTIONAL_PACKS.contains(&pack.as_str()),
             "unknown pack {pack:?}: the packs are {} (compaction and recheck are set in .harness/init.luau; RPI is --rpi)",
-            OPTIONAL_PACKS.join(", "));
+            OPTIONAL_PACKS.join(", ")
+        );
     }
     Ok(())
 }
@@ -733,7 +985,12 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(policy: Arc<Policy>, budget: Duration, mem_limit: usize, host: Option<Arc<Host>>) -> Result<Vm> {
+    pub fn new(
+        policy: Arc<Policy>,
+        budget: Duration,
+        mem_limit: usize,
+        host: Option<Arc<Host>>,
+    ) -> Result<Vm> {
         let root: PathBuf = policy.workspace.clone();
         let lua = Lua::new();
         let out = Arc::new(Mutex::new(Printed::default()));
@@ -746,44 +1003,64 @@ impl Vm {
                 let mut registry = crate::modules::Registry::capture(&root, &policy.dirs)?;
                 registry.materialize_skills(&policy.log)?;
                 crate::supervisor::Supervisor::ephemeral(policy.clone(), Arc::new(registry))
-            },
+            }
         };
         let registry = supervisor.registry.clone();
         let g = lua.globals();
-        let principal = host.as_ref().map(|h| h.principal.clone()).unwrap_or(crate::supervisor::Principal::Agent { read_only: false });
-        let fx = Effects::supervised(supervisor.clone(), principal, host.as_ref().map(|h| h.depth).unwrap_or(0), deadline.clone());
+        let principal = host
+            .as_ref()
+            .map(|h| h.principal.clone())
+            .unwrap_or(crate::supervisor::Principal::Agent { read_only: false });
+        let fx = Effects::supervised(
+            supervisor.clone(),
+            principal,
+            host.as_ref().map(|h| h.depth).unwrap_or(0),
+            deadline.clone(),
+        );
 
         // --- session-side builtins (visible to the model) ---
         let session_env = lua.create_table()?;
         let buf = out.clone();
-        g.set("__emit", lua.create_function(move |_, s: mlua::LuaString| {
-            let mut b = buf.lock().unwrap();
-            b.push(&s.as_bytes());
-            b.push(b"\n");
-            Ok(())
-        })?)?;
+        g.set(
+            "__emit",
+            lua.create_function(move |_, s: mlua::LuaString| {
+                let mut b = buf.lock().unwrap();
+                b.push(&s.as_bytes());
+                b.push(b"\n");
+                Ok(())
+            })?,
+        )?;
         // Use the frozen std/printer module; fall back to tostring if it fails.
         let printer: Arc<Mutex<Option<Function>>> = Arc::new(Mutex::new(None));
         let require_cell: Arc<Mutex<Option<Function>>> = Arc::new(Mutex::new(None));
         let (pf, rc) = (printer.clone(), require_cell.clone());
-        g.set("__format", lua.create_function(move |lua, v: Value| {
-            if pf.lock().unwrap().is_none() {
-                let req = rc.lock().unwrap().clone();
-                if let Some(req) = req
-                    && let Ok(Value::Table(m)) = req.call::<Value>("std/printer")
-                        && let Ok(f) = m.get::<Function>("top") {
-                            *pf.lock().unwrap() = Some(f);
-                        }
-            }
-            let f = pf.lock().unwrap().clone();
-            if let Some(f) = f
-                && let Ok(s) = f.call::<mlua::LuaString>(v.clone()) {
+        g.set(
+            "__format",
+            lua.create_function(move |lua, v: Value| {
+                if pf.lock().unwrap().is_none() {
+                    let req = rc.lock().unwrap().clone();
+                    if let Some(req) = req
+                        && let Ok(Value::Table(m)) = req.call::<Value>("std/printer")
+                        && let Ok(f) = m.get::<Function>("top")
+                    {
+                        *pf.lock().unwrap() = Some(f);
+                    }
+                }
+                let f = pf.lock().unwrap().clone();
+                if let Some(f) = f
+                    && let Ok(s) = f.call::<mlua::LuaString>(v.clone())
+                {
                     return Ok(s.to_string_lossy());
                 }
-            Ok(lua.coerce_string(v.clone())?.map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| format!("<{}>", v.type_name())))
-        })?)?;
+                Ok(lua
+                    .coerce_string(v.clone())?
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("<{}>", v.type_name())))
+            })?,
+        )?;
         let env_for_vars = session_env.clone();
-        let exposed: Arc<Mutex<std::collections::HashSet<String>>> = Arc::new(Mutex::new(Default::default()));
+        let exposed: Arc<Mutex<std::collections::HashSet<String>>> =
+            Arc::new(Mutex::new(Default::default()));
         let ex_vars = exposed.clone();
         g.set("vars", lua.create_function(move |lua, ()| {
             let t = lua.create_table()?;
@@ -797,143 +1074,251 @@ impl Vm {
         if let Some(h) = host.clone().filter(|h| h.depth == 0) {
             let hfx = fx.clone();
             let hops = ops.clone();
-            g.set("history", lua.create_async_function(move |lua, input: Option<Value>| {
-                let (h, fx, ops) = (h.clone(), hfx.clone(), hops.clone());
-                async move {
-                    let args = input.map(crate::values::copy_out).transpose()?.unwrap_or(json!({}));
-                    let query = crate::history::Query::parse(args.clone()).map_err(mlua::Error::external)?;
-                    ops.fetch_add(1, Ordering::Relaxed);
-                    let result = fx.run(&lua, crate::supervisor::Tool::History, Class::Read, args, || async move {
-                        let deadline = h.supervisor.manifest.as_ref().and_then(|m| m.deadline);
-                        let value = tokio::task::spawn_blocking(move || h.supervisor.history.query(
-                            h.policy.log.dir(), &h.policy.log.session, query, deadline)).await
-                            .map_err(mlua::Error::external)?.map_err(mlua::Error::external)?;
-                        Ok(Ret::Json(value))
-                    }).await?;
-                    prims::json_value(&lua, result)
-                }
-            })?)?;
+            g.set(
+                "history",
+                lua.create_async_function(move |lua, input: Option<Value>| {
+                    let (h, fx, ops) = (h.clone(), hfx.clone(), hops.clone());
+                    async move {
+                        let args = input
+                            .map(crate::values::copy_out)
+                            .transpose()?
+                            .unwrap_or(json!({}));
+                        let query = crate::history::Query::parse(args.clone())
+                            .map_err(mlua::Error::external)?;
+                        ops.fetch_add(1, Ordering::Relaxed);
+                        let result = fx
+                            .run(
+                                &lua,
+                                crate::supervisor::Tool::History,
+                                Class::Read,
+                                args,
+                                || async move {
+                                    let deadline =
+                                        h.supervisor.manifest.as_ref().and_then(|m| m.deadline);
+                                    let value = tokio::task::spawn_blocking(move || {
+                                        h.supervisor.history.query(
+                                            h.policy.log.dir(),
+                                            &h.policy.log.session,
+                                            query,
+                                            deadline,
+                                        )
+                                    })
+                                    .await
+                                    .map_err(mlua::Error::external)?
+                                    .map_err(mlua::Error::external)?;
+                                    Ok(Ret::Json(value))
+                                },
+                            )
+                            .await?;
+                        prims::json_value(&lua, result)
+                    }
+                })?,
+            )?;
         }
         let (bs, bh, bfx, bops) = (supervisor.clone(), host.clone(), fx.clone(), ops.clone());
-        g.set("batch", lua.create_async_function(move |lua, input: Value| {
-            let (s, h, fx, ops) = (bs.clone(), bh.clone(), bfx.clone(), bops.clone());
-            async move {
-                crate::effects::yield_first().await;
-                s.authorize_stage(fx.stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
-                let _active = crate::workflow_runtime::EffectGuard::new(&s);
-                let operations = crate::values::copy_out(input)?;
-                let _wait = fx.awaiting(&lua);
-                crate::batch::run(&fx, &lua, h, &ops, operations).await
-            }
-        })?)?;
-        if host.as_ref().is_some_and(|h|h.is_workflow_root()) {
+        g.set(
+            "batch",
+            lua.create_async_function(move |lua, input: Value| {
+                let (s, h, fx, ops) = (bs.clone(), bh.clone(), bfx.clone(), bops.clone());
+                async move {
+                    crate::effects::yield_first().await;
+                    s.authorize_stage(fx.stage_epoch, crate::supervisor::Tool::Read, Class::Read)
+                        .map_err(mlua::Error::external)?;
+                    let _active = crate::workflow_runtime::EffectGuard::new(&s);
+                    let operations = crate::values::copy_out(input)?;
+                    let _wait = fx.awaiting(&lua);
+                    crate::batch::run(&fx, &lua, h, &ops, operations).await
+                }
+            })?,
+        )?;
+        if host.as_ref().is_some_and(|h| h.is_workflow_root()) {
             let stage = lua.create_table()?;
             let frame = supervisor.workflow.lock().unwrap().clone().unwrap();
             if let Some(active) = frame.stage.as_ref().map(|a| &a.spec) {
-                stage.set("id",active.id.clone())?;
-                stage.set("name",active.name.clone())?;
-                stage.set("checks",crate::values::copy_in(&lua,&serde_json::to_value(&frame.check_plan).map_err(mlua::Error::external)?)?)?;
+                stage.set("id", active.id.clone())?;
+                stage.set("name", active.name.clone())?;
+                stage.set(
+                    "checks",
+                    crate::values::copy_in(
+                        &lua,
+                        &serde_json::to_value(&frame.check_plan).map_err(mlua::Error::external)?,
+                    )?,
+                )?;
             }
             let owner = supervisor.clone();
             let epoch = supervisor.workflow_epoch();
             // Preparing a submission hashes the project and reads the journal: blocking work, kept off the VM's thread.
-            stage.set("submit",lua.create_async_function(move |_,value:Value| {
-                let owner = owner.clone();
-                let payload = crate::values::copy_out(value);
-                async move {
-                    let payload = payload?;
-                    crate::effects::yield_first().await;
-                    tokio::task::spawn_blocking(move || owner.submit_stage(epoch, payload)).await
-                        .map_err(mlua::Error::external)?.map_err(mlua::Error::external)
-                }
-            })?)?;
+            stage.set(
+                "submit",
+                lua.create_async_function(move |_, value: Value| {
+                    let owner = owner.clone();
+                    let payload = crate::values::copy_out(value);
+                    async move {
+                        let payload = payload?;
+                        crate::effects::yield_first().await;
+                        tokio::task::spawn_blocking(move || owner.submit_stage(epoch, payload))
+                            .await
+                            .map_err(mlua::Error::external)?
+                            .map_err(mlua::Error::external)
+                    }
+                })?,
+            )?;
             stage.set_readonly(true);
-            g.set("stage",stage)?;
+            g.set("stage", stage)?;
         }
         if policy.episode.is_some() && host.as_ref().is_some_and(|h| h.depth == 0) {
             // ar.eval(note) is the only way an autoresearch episode scores a state, ar.claim(idea) claims what a worker tests,
             // and ar.reset() restores the worker's best state (see ar.rs).
             let ar = lua.create_table()?;
             let afx = fx.clone();
-            ar.set("eval", lua.create_async_function(move |lua, note: Option<String>| {
-                let fx = afx.clone();
-                async move {
-                    let note = note.unwrap_or_default();
-                    let result = fx.run(&lua, crate::supervisor::Tool::Sh, Class::LocalWrite, json!({"ar_eval": &note}), || async {
-                        crate::ar::eval(&fx.pol, note.clone()).await.map(Ret::Json).map_err(|e| crate::effects::rt(format!("ar.eval: {e}")))
-                    }).await?;
-                    prims::json_value(&lua, result)
-                }
-            })?)?;
+            ar.set(
+                "eval",
+                lua.create_async_function(move |lua, note: Option<String>| {
+                    let fx = afx.clone();
+                    async move {
+                        let note = note.unwrap_or_default();
+                        let result = fx
+                            .run(
+                                &lua,
+                                crate::supervisor::Tool::Sh,
+                                Class::LocalWrite,
+                                json!({"ar_eval": &note}),
+                                || async {
+                                    crate::ar::eval(&fx.pol, note.clone())
+                                        .await
+                                        .map(Ret::Json)
+                                        .map_err(|e| crate::effects::rt(format!("ar.eval: {e}")))
+                                },
+                            )
+                            .await?;
+                        prims::json_value(&lua, result)
+                    }
+                })?,
+            )?;
             let afx = fx.clone();
-            let ahost = host.clone().expect("autoresearch episodes run at depth 0 with a host");
-            ar.set("claim", lua.create_async_function(move |lua, idea: String| {
-                let (fx, host) = (afx.clone(), ahost.clone());
-                async move {
-                    let result = fx.run(&lua, crate::supervisor::Tool::Sh, Class::LocalWrite, json!({"ar_claim": &idea}), || async {
-                        crate::ar::claim(&host, idea.clone()).await.map(Ret::Json).map_err(|e| crate::effects::rt(format!("ar.claim: {e}")))
-                    }).await?;
-                    prims::json_value(&lua, result)
-                }
-            })?)?;
+            let ahost = host
+                .clone()
+                .expect("autoresearch episodes run at depth 0 with a host");
+            ar.set(
+                "claim",
+                lua.create_async_function(move |lua, idea: String| {
+                    let (fx, host) = (afx.clone(), ahost.clone());
+                    async move {
+                        let result = fx
+                            .run(
+                                &lua,
+                                crate::supervisor::Tool::Sh,
+                                Class::LocalWrite,
+                                json!({"ar_claim": &idea}),
+                                || async {
+                                    crate::ar::claim(&host, idea.clone())
+                                        .await
+                                        .map(Ret::Json)
+                                        .map_err(|e| crate::effects::rt(format!("ar.claim: {e}")))
+                                },
+                            )
+                            .await?;
+                        prims::json_value(&lua, result)
+                    }
+                })?,
+            )?;
             let afx = fx.clone();
             let cpol = policy.clone();
-            ar.set("claims", lua.create_function(move |lua, ()| {
-                let listed = crate::ar::claims(&cpol).map_err(|e| crate::effects::rt(format!("ar.claims: {e}")))?;
-                prims::json_value(lua, Ret::Json(listed))
-            })?)?;
-            ar.set("reset", lua.create_async_function(move |lua, ()| {
-                let fx = afx.clone();
-                async move {
-                    let result = fx.run(&lua, crate::supervisor::Tool::Sh, Class::LocalWrite, json!({"ar_reset": true}), || async {
-                        crate::ar::reset(&fx.pol).map(Ret::Json).map_err(|e| crate::effects::rt(format!("ar.reset: {e}")))
-                    }).await?;
-                    prims::json_value(&lua, result)
-                }
-            })?)?;
+            ar.set(
+                "claims",
+                lua.create_function(move |lua, ()| {
+                    let listed = crate::ar::claims(&cpol)
+                        .map_err(|e| crate::effects::rt(format!("ar.claims: {e}")))?;
+                    prims::json_value(lua, Ret::Json(listed))
+                })?,
+            )?;
+            ar.set(
+                "reset",
+                lua.create_async_function(move |lua, ()| {
+                    let fx = afx.clone();
+                    async move {
+                        let result = fx
+                            .run(
+                                &lua,
+                                crate::supervisor::Tool::Sh,
+                                Class::LocalWrite,
+                                json!({"ar_reset": true}),
+                                || async {
+                                    crate::ar::reset(&fx.pol)
+                                        .map(Ret::Json)
+                                        .map_err(|e| crate::effects::rt(format!("ar.reset: {e}")))
+                                },
+                            )
+                            .await?;
+                        prims::json_value(&lua, result)
+                    }
+                })?,
+            )?;
             ar.set_readonly(true);
             g.set("ar", ar)?;
         }
-        let saved = host.as_ref().map(|h| h.durable.clone()).unwrap_or_else(|| supervisor.durable.clone());
+        let saved = host
+            .as_ref()
+            .map(|h| h.durable.clone())
+            .unwrap_or_else(|| supervisor.durable.clone());
         let durable = lua.create_table()?;
         let data = saved.clone();
-        durable.set("get", lua.create_function(move |lua, key: String| {
-            match data.lock().unwrap().get(&key) {
-                Some(value) => crate::values::copy_in(lua, value),
-                None => Ok(Value::Nil),
-            }
-        })?)?;
-        let stage_owner=supervisor.clone();
-        let stage_epoch=supervisor.workflow_epoch();
-        durable.set("set", lua.create_function(move |_, (key, value): (String, Value)| {
-            stage_owner.authorize_stage(stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
-            let value = crate::values::copy_out(value)?;
-            let mut saved = saved.lock().unwrap();
-            fn store(saved: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
-                saved.as_object_mut().expect("the durable store is validated as an object when loaded")
-            }
-            let previous = store(&mut saved).insert(key.clone(), value);
-            if let Err(e) = crate::values::validate(&saved) {
-                match previous {
-                    Some(previous) => store(&mut saved).insert(key, previous),
-                    None => store(&mut saved).remove(&key),
-                };
-                return Err(e);
-            }
-            Ok(())
-        })?)?;
+        durable.set(
+            "get",
+            lua.create_function(
+                move |lua, key: String| match data.lock().unwrap().get(&key) {
+                    Some(value) => crate::values::copy_in(lua, value),
+                    None => Ok(Value::Nil),
+                },
+            )?,
+        )?;
+        let stage_owner = supervisor.clone();
+        let stage_epoch = supervisor.workflow_epoch();
+        durable.set(
+            "set",
+            lua.create_function(move |_, (key, value): (String, Value)| {
+                stage_owner
+                    .authorize_stage(stage_epoch, crate::supervisor::Tool::Read, Class::Read)
+                    .map_err(mlua::Error::external)?;
+                let value = crate::values::copy_out(value)?;
+                let mut saved = saved.lock().unwrap();
+                fn store(
+                    saved: &mut serde_json::Value,
+                ) -> &mut serde_json::Map<String, serde_json::Value> {
+                    saved
+                        .as_object_mut()
+                        .expect("the durable store is validated as an object when loaded")
+                }
+                let previous = store(&mut saved).insert(key.clone(), value);
+                if let Err(e) = crate::values::validate(&saved) {
+                    match previous {
+                        Some(previous) => store(&mut saved).insert(key, previous),
+                        None => store(&mut saved).remove(&key),
+                    };
+                    return Err(e);
+                }
+                Ok(())
+            })?,
+        )?;
         durable.set_readonly(true);
         g.set("durable", durable)?;
         if let Some(h) = host.clone() {
             let afx = fx.clone();
-            g.set("agent", lua.create_async_function(move |lua, (task, opts): (String, Option<Table>)| {
-                let (h, afx) = (h.clone(), afx.clone());
-                async move {
-                    let options = crate::host::AgentOptions::from_lua(opts)?;
-                    let child = h.child(&options, afx.principal.clone()).map_err(mlua::Error::external)?;
-                    prims::agent(&afx, &lua, child, task, &options).await?.into_lua(&lua)
-                }
-            })?)?;
+            g.set(
+                "agent",
+                lua.create_async_function(move |lua, (task, opts): (String, Option<Table>)| {
+                    let (h, afx) = (h.clone(), afx.clone());
+                    async move {
+                        let options = crate::host::AgentOptions::from_lua(opts)?;
+                        let child = h
+                            .child(&options, afx.principal.clone())
+                            .map_err(mlua::Error::external)?;
+                        prims::agent(&afx, &lua, child, task, &options)
+                            .await?
+                            .into_lua(&lua)
+                    }
+                })?,
+            )?;
         }
         prims::install(&lua, fx.clone(), ops.clone())?;
 
@@ -941,35 +1326,81 @@ impl Vm {
         let mcp = crate::mcp::Mcp::frozen(policy.clone(), registry.mcp.clone())?;
         if let Some(m) = mcp.clone() {
             let (lfx, lm) = (fx.clone(), m.clone());
-            g.set("__mcp_list", lua.create_async_function(move |lua, server: String| {
-                let (fx, m) = (lfx.clone(), lm.clone());
-                async move {
-                    let ret = fx.run(&lua, crate::supervisor::Tool::McpList, Class::Read, json!({"server": server}), || async {
-                        let tools = m.list_tools(&server).await.map_err(|e| mlua::Error::runtime(e.to_string()))?;
-                        Ok(Ret::Json(serde_json::Value::Array(tools)))
-                    }).await?;
-                    prims::json_value(&lua, ret)
-                }
-            })?)?;
+            g.set(
+                "__mcp_list",
+                lua.create_async_function(move |lua, server: String| {
+                    let (fx, m) = (lfx.clone(), lm.clone());
+                    async move {
+                        let ret = fx
+                            .run(
+                                &lua,
+                                crate::supervisor::Tool::McpList,
+                                Class::Read,
+                                json!({"server": server}),
+                                || async {
+                                    let tools = m
+                                        .list_tools(&server)
+                                        .await
+                                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                                    Ok(Ret::Json(serde_json::Value::Array(tools)))
+                                },
+                            )
+                            .await?;
+                        prims::json_value(&lua, ret)
+                    }
+                })?,
+            )?;
             let (cfx, cm) = (fx.clone(), m.clone());
-            g.set("__mcp_call", lua.create_async_function(move |lua, (server, tool, args): (String, String, Value)| {
-                let (fx, m) = (cfx.clone(), cm.clone());
-                async move {
-                    let args_json = crate::values::copy_out(args)?;
-                    let class = if m.is_read_only(&server, &tool) { Class::Read } else { Class::External };
-                    let a = json!({"server": server, "tool": tool, "args": args_json});
-                    let ret = fx.run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
-                        let call = crate::policy::Call::Mcp { server: &server, tool: &tool };
-                        fx.pol.approve_call(call, &args_json, class).await.map_err(mlua::Error::external)?;
-                        let r = m.request(&server, "tools/call", json!({"name": tool, "arguments": args_json})).await
-                            .map_err(|e| crate::net::effect_error(class, e.delivery, e.to_string()))?;
-                        Ok(Ret::Json(r))
-                    }).await?;
-                    prims::json_value(&lua, ret)
-                }
-            })?)?;
+            g.set(
+                "__mcp_call",
+                lua.create_async_function(
+                    move |lua, (server, tool, args): (String, String, Value)| {
+                        let (fx, m) = (cfx.clone(), cm.clone());
+                        async move {
+                            let args_json = crate::values::copy_out(args)?;
+                            let class = if m.is_read_only(&server, &tool) {
+                                Class::Read
+                            } else {
+                                Class::External
+                            };
+                            let a = json!({"server": server, "tool": tool, "args": args_json});
+                            let ret = fx
+                                .run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
+                                    let call = crate::policy::Call::Mcp {
+                                        server: &server,
+                                        tool: &tool,
+                                    };
+                                    fx.pol
+                                        .approve_call(call, &args_json, class)
+                                        .await
+                                        .map_err(mlua::Error::external)?;
+                                    let r = m
+                                        .request(
+                                            &server,
+                                            "tools/call",
+                                            json!({"name": tool, "arguments": args_json}),
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            crate::net::effect_error(
+                                                class,
+                                                e.delivery,
+                                                e.to_string(),
+                                            )
+                                        })?;
+                                    Ok(Ret::Json(r))
+                                })
+                                .await?;
+                            prims::json_value(&lua, ret)
+                        }
+                    },
+                )?,
+            )?;
         }
-        let mcp_names: Vec<String> = mcp.as_ref().map(|m| m.servers.keys().cloned().collect()).unwrap_or_default();
+        let mcp_names: Vec<String> = mcp
+            .as_ref()
+            .map(|m| m.servers.keys().cloned().collect())
+            .unwrap_or_default();
         lua.load(PRELUDE).set_name("=prelude").exec()?;
 
         lua.sandbox(true)?;
@@ -988,7 +1419,14 @@ impl Vm {
         let modenv = lua.create_table()?;
         modenv.set_metatable(Some(gmt))?;
         let loaded = lua.create_table()?;
-        let (res, menv, ld, supervisor_for_load, package_host, package_fx) = (registry.clone(), modenv.clone(), loaded.clone(), supervisor.clone(), host.clone(), fx.clone());
+        let (res, menv, ld, supervisor_for_load, package_host, package_fx) = (
+            registry.clone(),
+            modenv.clone(),
+            loaded.clone(),
+            supervisor.clone(),
+            host.clone(),
+            fx.clone(),
+        );
         let require = lua.create_function(move |lua, name: String| {
             let cached: Value = ld.get(name.as_str())?;
             if !cached.is_nil() {
@@ -996,14 +1434,31 @@ impl Vm {
             }
             let load = |src: &crate::modules::Source| -> mlua::Result<Value> {
                 if let Some((pkg, _)) = &src.pkg {
-                    if name != *pkg { return Err(mlua::Error::runtime("package submodules are private; call exported package methods")); }
-                    return crate::packages::proxy(lua, supervisor_for_load.clone(), package_host.clone(), pkg, package_fx.clone()).map(Value::Table);
+                    if name != *pkg {
+                        return Err(mlua::Error::runtime(
+                            "package submodules are private; call exported package methods",
+                        ));
+                    }
+                    return crate::packages::proxy(
+                        lua,
+                        supervisor_for_load.clone(),
+                        package_host.clone(),
+                        pkg,
+                        package_fx.clone(),
+                    )
+                    .map(Value::Table);
                 }
                 let env = menv.clone();
-                let f = lua.load(&src.text).set_name(format!("={name}")).set_environment(env).into_function()?;
+                let f = lua
+                    .load(&src.text)
+                    .set_name(format!("={name}"))
+                    .set_environment(env)
+                    .into_function()?;
                 f.call(())
             };
-            let src = res.resolve(&name).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            let src = res
+                .resolve(&name)
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let v = match load(&src) {
                 // A project override must load and return a table (every harness module does); otherwise fall back
                 // to the built-in module so a typo in an override cannot take the harness down.
@@ -1013,8 +1468,13 @@ impl Vm {
                         Err(e) => e.to_string().lines().next().unwrap_or("").to_string(),
                         Ok(v) => format!("returned {} instead of a table", v.type_name()),
                     };
-                    eprintln!("warning: override {} is broken ({why}); using the built-in {name}", src.origin);
-                    let base = res.resolve(&format!("base:{name}")).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    eprintln!(
+                        "warning: override {} is broken ({why}); using the built-in {name}",
+                        src.origin
+                    );
+                    let base = res
+                        .resolve(&format!("base:{name}"))
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     load(&base)?
                 }
                 other => other?,
@@ -1029,26 +1489,51 @@ impl Vm {
         let hx = lua.create_table()?;
         // A pack adds functions/tables to the model's session (not to `vars()`): hx.expose("tests", tests)
         let (sess_env, ex_set) = (session_env.clone(), exposed.clone());
-        hx.set("expose", lua.create_function(move |_, (name, v): (String, Value)| {
-            sess_env.raw_set(name.as_str(), v)?;
-            ex_set.lock().unwrap().insert(name);
-            Ok(())
-        })?)?;
+        hx.set(
+            "expose",
+            lua.create_function(move |_, (name, v): (String, Value)| {
+                sess_env.raw_set(name.as_str(), v)?;
+                ex_set.lock().unwrap().insert(name);
+                Ok(())
+            })?,
+        )?;
         // hx.retain(v) -> n: keep a value the printer cut as `_cut[n]` in the session, so its notice can name it. The list
         // belongs to the latest chunk that cut something; the next chunk can read it until it cuts something itself.
         let chunks = Arc::new(AtomicU64::new(0));
-        let (cut_env, cut_chunks, cut_seq) = (session_env.clone(), chunks.clone(), Arc::new(Mutex::new(u64::MAX)));
-        hx.set("retain", lua.create_function(move |lua, v: Value| {
-            let chunk = cut_chunks.load(Ordering::Relaxed);
-            let mut seq = cut_seq.lock().unwrap();
-            let list = match cut_env.raw_get::<Value>("_cut")? {
-                Value::Table(t) if *seq == chunk => t,
-                _ => { let t = lua.create_table()?; cut_env.raw_set("_cut", t.clone())?; *seq = chunk; t },
-            };
-            list.raw_push(v)?;
-            Ok(list.raw_len())
-        })?)?;
-        let session = Session { lua: lua.clone(), log: policy.log.clone(), env: session_env, out, ops, deadline, budget, mem_limit, chunks };
+        let (cut_env, cut_chunks, cut_seq) = (
+            session_env.clone(),
+            chunks.clone(),
+            Arc::new(Mutex::new(u64::MAX)),
+        );
+        hx.set(
+            "retain",
+            lua.create_function(move |lua, v: Value| {
+                let chunk = cut_chunks.load(Ordering::Relaxed);
+                let mut seq = cut_seq.lock().unwrap();
+                let list = match cut_env.raw_get::<Value>("_cut")? {
+                    Value::Table(t) if *seq == chunk => t,
+                    _ => {
+                        let t = lua.create_table()?;
+                        cut_env.raw_set("_cut", t.clone())?;
+                        *seq = chunk;
+                        t
+                    }
+                };
+                list.raw_push(v)?;
+                Ok(list.raw_len())
+            })?,
+        )?;
+        let session = Session {
+            lua: lua.clone(),
+            log: policy.log.clone(),
+            env: session_env,
+            out,
+            ops,
+            deadline,
+            budget,
+            mem_limit,
+            chunks,
+        };
         // hx.view_image(path, max) -> { path, width, height, orig_width, orig_height, mime, data } for the vision pack.
         // Record the live image identity once and return the same loaded bytes.
         let vfx = fx.clone();
@@ -1079,32 +1564,67 @@ impl Vm {
             }
         })?)?;
         let h2 = host.clone();
-        hx.set("log", lua.create_function(move |_, line: String| {
-            match &h2 {
-                Some(h) => h.log(&line),
-                None => eprintln!("{line}"),
-            }
-            Ok(())
-        })?)?;
+        hx.set(
+            "log",
+            lua.create_function(move |_, line: String| {
+                match &h2 {
+                    Some(h) => h.log(&line),
+                    None => eprintln!("{line}"),
+                }
+                Ok(())
+            })?,
+        )?;
         let rroot = registry.clone();
-        hx.set("asset", lua.create_function(move |_, name: String| {
-            rroot.asset(&name).map_err(mlua::Error::external)
-        })?)?;
+        hx.set(
+            "asset",
+            lua.create_function(move |_, name: String| {
+                rroot.asset(&name).map_err(mlua::Error::external)
+            })?,
+        )?;
         if let Some(h) = host.clone() {
             let bh = h.clone();
-            hx.set("budget", lua.create_function(move |lua, ()| crate::values::copy_in(lua, &bh.budget_status()))?)?;
+            hx.set(
+                "budget",
+                lua.create_function(move |lua, ()| {
+                    crate::values::copy_in(lua, &bh.budget_status())
+                })?,
+            )?;
             let mh = h.clone();
-            hx.set("model_info", lua.create_function(move |lua, ()| crate::values::copy_in(lua, &mh.model_info()))?)?;
+            hx.set(
+                "model_info",
+                lua.create_function(move |lua, ()| crate::values::copy_in(lua, &mh.model_info()))?,
+            )?;
         }
         // ---- extension API: installed packages, agent-defined tools, staging for promotion ----
         let pres = registry.clone();
         hx.set("autopilot", policy.autopilot)?;
         hx.set("confined", crate::confine::status().is_ok())?;
-        hx.set("limits", crate::values::copy_in(&lua, &prims::prompt_limits())?)?;
-        hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_names.clone()))?)?;
-        hx.set("packages", lua.create_function(move |lua, ()| crate::values::copy_in(lua, &serde_json::to_value(&pres.packages).map_err(mlua::Error::external)?))?)?;
+        hx.set(
+            "limits",
+            crate::values::copy_in(&lua, &prims::prompt_limits())?,
+        )?;
+        hx.set(
+            "mcp_servers",
+            lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_names.clone()))?,
+        )?;
+        hx.set(
+            "packages",
+            lua.create_function(move |lua, ()| {
+                crate::values::copy_in(
+                    lua,
+                    &serde_json::to_value(&pres.packages).map_err(mlua::Error::external)?,
+                )
+            })?,
+        )?;
         let assets = registry.clone();
-        hx.set("skill_asset", lua.create_function(move |_, (name, file): (String, String)| assets.asset(&format!("{name}/{file}")).map_err(mlua::Error::external))?)?;
+        hx.set(
+            "skill_asset",
+            lua.create_function(move |_, (name, file): (String, String)| {
+                assets
+                    .asset(&format!("{name}/{file}"))
+                    .map_err(mlua::Error::external)
+            })?,
+        )?;
         let defs: Arc<Mutex<HashMap<String, ToolDef>>> = Arc::new(Mutex::new(HashMap::new()));
         let d_defs = defs.clone();
         let deftool = lua.create_function(move |lua, (name, source, opts): (String, String, Option<Table>)| {
@@ -1163,44 +1683,77 @@ impl Vm {
         })?;
         // the opt-in std/authoring pack exposes these to the model's session (hx.expose)
         let authoring = lua.create_table()?;
-        for (n, f) in [("deftool", deftool), ("promote", promote), ("propose_module", propose_module)] {
+        for (n, f) in [
+            ("deftool", deftool),
+            ("promote", promote),
+            ("propose_module", propose_module),
+        ] {
             authoring.set(n, f)?;
         }
         hx.set("authoring", authoring)?;
         modenv.set("hx", hx)?;
         let lines = crate::tools::install(&lua, &session.env, supervisor, host, fx.clone())?;
         for name in registry.tools.keys() {
-            if !session.env.raw_get::<Value>(name.as_str())?.is_nil() { exposed.lock().unwrap().insert(name.clone()); }
+            if !session.env.raw_get::<Value>(name.as_str())?.is_nil() {
+                exposed.lock().unwrap().insert(name.clone());
+            }
         }
-        let tool_prompt = if lines.is_empty() { String::new() } else { format!("\n\n# Local tools (user-configured)\n{}", lines.join("\n")) };
-        Ok(Vm { lua, session, modenv, tool_prompt, #[cfg(test)] effects: fx })
+        let tool_prompt = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n# Local tools (user-configured)\n{}", lines.join("\n"))
+        };
+        Ok(Vm {
+            lua,
+            session,
+            modenv,
+            tool_prompt,
+            #[cfg(test)]
+            effects: fx,
+        })
     }
 
     /// Install the base packs, then the opt-in `extra` ones (`require(name).install(ctx)`), in this agent VM.
     pub async fn install_packs(&self, extra: &[String]) -> Result<()> {
         check_packs(extra)?;
         let mut packs: Vec<&str> = BASE_PACKS.to_vec();
-        for pack in extra { if !packs.contains(&pack.as_str()) { packs.push(pack); } }
+        for pack in extra {
+            if !packs.contains(&pack.as_str()) {
+                packs.push(pack);
+            }
+        }
         let f = self
             .lua
             .load("for _, name in {...} do require(name).install({ hooks = require('std/hooks') }) end")
             .set_name("=host")
             .set_environment(self.modenv.clone())
             .into_function()?;
-        f.call_async::<()>(packs.into_iter().map(|p| self.lua.create_string(p).map(Value::String)).collect::<mlua::Result<MultiValue>>()?).await?;
+        f.call_async::<()>(
+            packs
+                .into_iter()
+                .map(|p| self.lua.create_string(p).map(Value::String))
+                .collect::<mlua::Result<MultiValue>>()?,
+        )
+        .await?;
         Ok(())
     }
 
     /// Run a chunk in the session and render it exactly as the loop would (std/feedback).
     pub async fn exec_text(&self, code: &str) -> Result<String> {
         let (result, feedback) = self.run_with_feedback(code).await?;
-        Ok(format!("{feedback}-- ops={} error={}", result.ops, result.error.is_some()))
+        Ok(format!(
+            "{feedback}-- ops={} error={}",
+            result.ops,
+            result.error.is_some()
+        ))
     }
 
     /// Run a chunk in the session: its output, error, effect count and the feedback the model sees.
     pub async fn run_chunk(&self, code: &str) -> Result<serde_json::Value> {
         let (result, feedback) = self.run_with_feedback(code).await?;
-        Ok(json!({"output":result.output, "error":result.error, "ops":result.ops, "feedback":feedback}))
+        Ok(
+            json!({"output":result.output, "error":result.error, "ops":result.ops, "feedback":feedback}),
+        )
     }
 
     /// Run a chunk and compose its feedback. Only a journal failure is an error: whatever the chunk returned, its
@@ -1225,11 +1778,19 @@ impl Vm {
         let value = self.lua.create_table()?;
         value.set("output", result.output.as_str())?;
         value.set("omitted", result.omitted)?;
-        value.set("values", self.lua.create_sequence_from(result.values.iter().cloned())?)?;
+        value.set(
+            "values",
+            self.lua
+                .create_sequence_from(result.values.iter().cloned())?,
+        )?;
         value.set("error", result.error.as_deref())?;
         value.set("ops", result.ops)?;
-        let compose = self.lua.load("local r, code = ...; return require('std/feedback').compose(r, code)")
-            .set_name("=feedback").set_environment(self.modenv.clone()).into_function()?;
+        let compose = self
+            .lua
+            .load("local r, code = ...; return require('std/feedback').compose(r, code)")
+            .set_name("=feedback")
+            .set_environment(self.modenv.clone())
+            .into_function()?;
         let text: mlua::LuaString = compose.call_async((value, code)).await?;
         Ok(text.to_string_lossy())
     }
@@ -1243,20 +1804,35 @@ impl Vm {
                 .set_name("=before_model").set_environment(self.modenv.clone()).into_function()?;
             prepare.call(req)?
         };
-        let mut request = crate::values::copy_out(prepared).context("before_model hooks returned a request that is not data")?;
-        if let Some(system) = request["system"].as_str() { request["system"] = json!(format!("{system}{}", self.tool_prompt)); }
+        let mut request = crate::values::copy_out(prepared)
+            .context("before_model hooks returned a request that is not data")?;
+        if let Some(system) = request["system"].as_str() {
+            request["system"] = json!(format!("{system}{}", self.tool_prompt));
+        }
         Ok(request)
     }
 
     /// Run test files `(file name, source)` in the module environment, with the agent's authority (`hx test` of the
     /// built-in package or a directory that is not a package; packages run theirs through `packages::run_tests`).
-    pub async fn run_tests(&self, tests: &[(String, String)]) -> Result<crate::packages::TestReport> {
-        let testlib: Table = self.modenv.get::<Function>("require")?.call("std/testlib")?;
+    pub async fn run_tests(
+        &self,
+        tests: &[(String, String)],
+    ) -> Result<crate::packages::TestReport> {
+        let testlib: Table = self
+            .modenv
+            .get::<Function>("require")?
+            .call("std/testlib")?;
         self.modenv.set("test", testlib.clone())?;
         let mut report = crate::packages::TestReport::default();
         for (name, src) in tests {
             testlib.set("results", self.lua.create_table()?)?;
-            let ran = match self.lua.load(src).set_name(format!("={name}")).set_environment(self.modenv.clone()).into_function() {
+            let ran = match self
+                .lua
+                .load(src)
+                .set_name(format!("={name}"))
+                .set_environment(self.modenv.clone())
+                .into_function()
+            {
                 Ok(f) => f.call_async::<()>(()).await,
                 Err(e) => Err(e),
             };

@@ -8,12 +8,25 @@ use std::{sync::Arc, time::Duration};
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    Next { archive: Option<crate::history::Directive> },
+    Next {
+        archive: Option<crate::history::Directive>,
+    },
     NextCall,
-    Model { request: Json, purpose: Option<String> },
-    Run { code: String },
-    Boundary { id: String, submission: Option<String>, next: crate::workflow::BoundaryNext },
-    Finish { report: serde_json::Map<String, Json> },
+    Model {
+        request: Json,
+        purpose: Option<String>,
+    },
+    Run {
+        code: String,
+    },
+    Boundary {
+        id: String,
+        submission: Option<String>,
+        next: crate::workflow::BoundaryNext,
+    },
+    Finish {
+        report: serde_json::Map<String, Json>,
+    },
 }
 
 /// What the host hands the controller's `step(state, event)`: the one place the host names event kinds, so it cannot
@@ -24,66 +37,147 @@ pub enum Event {
     Next,
     NextCall,
     /// Resume notice: receipts and uncertain operations, as pretty JSON.
-    Recover { message: String },
-    ModelReply { reply: Json, system_chars: Option<usize> },
-    ModelError { error: String, safe_context_rejection: bool },
-    RunResult { result: Json, notifications: Json },
+    Recover {
+        message: String,
+    },
+    ModelReply {
+        reply: Json,
+        system_chars: Option<usize>,
+    },
+    ModelError {
+        error: String,
+        safe_context_rejection: bool,
+    },
+    RunResult {
+        result: Json,
+        notifications: Json,
+    },
     /// An owner's review decision; `document` holds the workflow's artifacts and owner inputs.
-    OwnerDecision { #[serde(flatten)] document: serde_json::Map<String, Json>, decision: Json, text: String, request: Json },
+    OwnerDecision {
+        #[serde(flatten)]
+        document: serde_json::Map<String, Json>,
+        decision: Json,
+        text: String,
+        request: Json,
+    },
     /// A workflow stage is ready to start.
     BoundaryReady {
-        #[serde(flatten)] document: serde_json::Map<String, Json>,
+        #[serde(flatten)]
+        document: serde_json::Map<String, Json>,
         stage: Json,
         metadata: Json,
     },
 }
 
 impl Event {
-    pub fn to_json(&self) -> Json { serde_json::to_value(self).expect("controller events serialize") }
+    pub fn to_json(&self) -> Json {
+        serde_json::to_value(self).expect("controller events serialize")
+    }
 }
 
 pub fn validate_request(request: &Json) -> Result<()> {
-    anyhow::ensure!(request.is_object() && request["system"].is_string(), "model request needs a string system prompt");
-    let messages = request["messages"].as_array().ok_or_else(|| anyhow::anyhow!("model request needs a messages array"))?;
-    anyhow::ensure!(!messages.is_empty(), "model request messages cannot be empty");
+    anyhow::ensure!(
+        request.is_object() && request["system"].is_string(),
+        "model request needs a string system prompt"
+    );
+    let messages = request["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("model request needs a messages array"))?;
+    anyhow::ensure!(
+        !messages.is_empty(),
+        "model request messages cannot be empty"
+    );
     for message in messages {
-        anyhow::ensure!(matches!(message["role"].as_str(), Some("user" | "assistant" | "tool")), "model message has an invalid role");
-        anyhow::ensure!(message["content"].is_string() || (message["role"] == "assistant" && message["content"].is_null()), "model message content must be text");
+        anyhow::ensure!(
+            matches!(
+                message["role"].as_str(),
+                Some("user" | "assistant" | "tool")
+            ),
+            "model message has an invalid role"
+        );
+        anyhow::ensure!(
+            message["content"].is_string()
+                || (message["role"] == "assistant" && message["content"].is_null()),
+            "model message content must be text"
+        );
     }
     if let Some(tools) = request.get("tools") {
         // Empty Luau tables have no array identity at the copied-data boundary.
-        anyhow::ensure!(tools.is_array() || tools.as_object().is_some_and(|v| v.is_empty()), "model request tools must be an array");
+        anyhow::ensure!(
+            tools.is_array() || tools.as_object().is_some_and(|v| v.is_empty()),
+            "model request tools must be an array"
+        );
         for tool in tools.as_array().into_iter().flatten() {
-            anyhow::ensure!(tool["name"].is_string() && tool["parameters"].is_object(), "model tool needs name and parameters");
+            anyhow::ensure!(
+                tool["name"].is_string() && tool["parameters"].is_object(),
+                "model tool needs name and parameters"
+            );
         }
     }
-    if let Some(max) = request.get("max_tokens") { anyhow::ensure!(max.as_u64().is_some_and(|v| v > 0), "max_tokens must be a positive integer"); }
+    if let Some(max) = request.get("max_tokens") {
+        anyhow::ensure!(
+            max.as_u64().is_some_and(|v| v > 0),
+            "max_tokens must be a positive integer"
+        );
+    }
     Ok(())
 }
 
 fn normalize_lists(value: &mut Json) {
-    if let Some(object)=value.as_object_mut() {
-        for (key,value) in object.iter_mut() {
-            if matches!(key.as_str(),"inputs"|"artifacts"|"questions"|"check_ids"|"decisions") && value.as_object().is_some_and(|v|v.is_empty()) { *value=serde_json::json!([]); }
-            else {normalize_lists(value);}
+    if let Some(object) = value.as_object_mut() {
+        for (key, value) in object.iter_mut() {
+            if matches!(
+                key.as_str(),
+                "inputs" | "artifacts" | "questions" | "check_ids" | "decisions"
+            ) && value.as_object().is_some_and(|v| v.is_empty())
+            {
+                *value = serde_json::json!([]);
+            } else {
+                normalize_lists(value);
+            }
         }
-    } else if let Some(array)=value.as_array_mut() { for value in array {normalize_lists(value);} }
+    } else if let Some(array) = value.as_array_mut() {
+        for value in array {
+            normalize_lists(value);
+        }
+    }
 }
 
 pub fn command(value: &Json) -> Result<Command> {
-    let mut value=value.clone();
-    if value["kind"]=="boundary" { normalize_lists(&mut value); }
-    let command: Command = serde_json::from_value(value).map_err(|e| anyhow::anyhow!("invalid controller command: {e}"))?;
+    let mut value = value.clone();
+    if value["kind"] == "boundary" {
+        normalize_lists(&mut value);
+    }
+    let command: Command = serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("invalid controller command: {e}"))?;
     match &command {
         Command::Model { request, purpose } => {
-            anyhow::ensure!(matches!(purpose.as_deref(), None | Some("agent" | "compact")), "invalid model command purpose");
+            anyhow::ensure!(
+                matches!(purpose.as_deref(), None | Some("agent" | "compact")),
+                "invalid model command purpose"
+            );
             validate_request(request)?;
-        },
-        Command::Boundary {id,submission,next} => { crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()}.validate()?; },
+        }
+        Command::Boundary {
+            id,
+            submission,
+            next,
+        } => {
+            crate::workflow::Boundary {
+                id: id.clone(),
+                submission: submission.clone(),
+                next: next.clone(),
+            }
+            .validate()?;
+        }
         Command::Finish { report } => {
-            anyhow::ensure!(report.get("finished").is_some_and(Json::is_boolean) && report.get("final_answer").is_some_and(Json::is_string), "finish report needs finished and final_answer");
-        },
-        _ => {},
+            anyhow::ensure!(
+                report.get("finished").is_some_and(Json::is_boolean)
+                    && report.get("final_answer").is_some_and(Json::is_string),
+                "finish report needs finished and final_answer"
+            );
+        }
+        _ => {}
     }
     Ok(command)
 }
@@ -99,47 +193,126 @@ pub struct Controller {
 const STEP_TIME: Duration = Duration::from_secs(10);
 
 impl Controller {
-    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, run_deadline: Option<f64>, entrypoint: &str) -> Result<Self> {
+    pub fn new(
+        registry: Arc<Registry>,
+        profile: Json,
+        contributions: String,
+        run_deadline: Option<f64>,
+        entrypoint: &str,
+    ) -> Result<Self> {
         let lua = Lua::new();
         let g = lua.globals();
-        g.set("print", lua.create_function(|_, args: MultiValue| { eprintln!("{}", args.into_iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t")); Ok(()) })?)?;
-        for name in ["_G", "os", "coroutine", "getfenv", "setfenv", "loadstring", "require"] { g.set(name, Value::Nil)?; }
+        g.set(
+            "print",
+            lua.create_function(|_, args: MultiValue| {
+                eprintln!(
+                    "{}",
+                    args.into_iter()
+                        .map(|v| v.to_string().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                );
+                Ok(())
+            })?,
+        )?;
+        for name in [
+            "_G",
+            "os",
+            "coroutine",
+            "getfenv",
+            "setfenv",
+            "loadstring",
+            "require",
+        ] {
+            g.set(name, Value::Nil)?;
+        }
         let math: Table = g.get("math")?;
-        math.set("random", Value::Nil)?; math.set("randomseed", Value::Nil)?;
+        math.set("random", Value::Nil)?;
+        math.set("randomseed", Value::Nil)?;
         let deadline = Arc::new(crate::vm::Deadline::after(STEP_TIME));
-        crate::vm::Budget { run_deadline, deadline: deadline.clone(), waiting: None, exceeded: "controller time budget exceeded" }.install(&lua);
+        crate::vm::Budget {
+            run_deadline,
+            deadline: deadline.clone(),
+            waiting: None,
+            exceeded: "controller time budget exceeded",
+        }
+        .install(&lua);
         lua.set_memory_limit(128 << 20)?;
         let env = lua.create_table()?;
         env.set_metatable(Some(crate::vm::locked_env(&lua, &g)?))?;
         let loaded = lua.create_table()?;
         let (r, e, l) = (registry.clone(), env.clone(), loaded);
         let require = lua.create_function(move |lua, name: String| {
-            if let Ok(Value::Table(t)) = l.raw_get::<Value>(name.as_str()) { return Ok(t); }
+            if let Ok(Value::Table(t)) = l.raw_get::<Value>(name.as_str()) {
+                return Ok(t);
+            }
             let source = r.resolve(&name).map_err(mlua::Error::external)?;
-            if source.pkg.is_some() { return Err(mlua::Error::runtime("controller cannot import tool packages")); }
-            let value: Value = lua.load(&source.text).set_name(format!("=controller:{name}")).set_environment(e.clone()).eval()?;
-            let module = match value { Value::Table(t) => t, Value::Nil if name == "project/init" => lua.create_table()?, _ => return Err(mlua::Error::runtime("controller modules must return a table")) };
+            if source.pkg.is_some() {
+                return Err(mlua::Error::runtime(
+                    "controller cannot import tool packages",
+                ));
+            }
+            let value: Value = lua
+                .load(&source.text)
+                .set_name(format!("=controller:{name}"))
+                .set_environment(e.clone())
+                .eval()?;
+            let module = match value {
+                Value::Table(t) => t,
+                Value::Nil if name == "project/init" => lua.create_table()?,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "controller modules must return a table",
+                    ));
+                }
+            };
             l.raw_set(name.as_str(), module.clone())?;
             Ok(module)
         })?;
         env.set("require", require.clone())?;
         let hx = lua.create_table()?;
         let r = registry.clone();
-        hx.set("asset", lua.create_function(move |_, name: String| r.asset(&name).map_err(mlua::Error::external))?)?;
+        hx.set(
+            "asset",
+            lua.create_function(move |_, name: String| {
+                r.asset(&name).map_err(mlua::Error::external)
+            })?,
+        )?;
         let p = profile.clone();
-        hx.set("model_info", lua.create_function(move |lua, ()| values::copy_in(lua, &p))?)?;
+        hx.set(
+            "model_info",
+            lua.create_function(move |lua, ()| values::copy_in(lua, &p))?,
+        )?;
         hx.set("autopilot", profile["autopilot"].as_bool().unwrap_or(false))?;
         hx.set("confined", profile["confined"].as_bool().unwrap_or(false))?;
-        hx.set("limits", values::copy_in(&lua, &crate::prims::prompt_limits())?)?;
+        hx.set(
+            "limits",
+            values::copy_in(&lua, &crate::prims::prompt_limits())?,
+        )?;
         let names = registry.mcp.keys().cloned().collect::<Vec<_>>();
-        hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(names.clone()))?)?;
+        hx.set(
+            "mcp_servers",
+            lua.create_function(move |lua, ()| lua.create_sequence_from(names.clone()))?,
+        )?;
         hx.set("prompt_contributions", contributions)?;
-        hx.set("log", lua.create_function(|_, line: String| { eprintln!("{line}"); Ok(()) })?)?;
+        hx.set(
+            "log",
+            lua.create_function(|_, line: String| {
+                eprintln!("{line}");
+                Ok(())
+            })?,
+        )?;
         env.set("hx", hx)?;
         lua.sandbox(true)?;
-        if registry.sources.contains_key("project/init") { require.call::<Table>("project/init")?; }
+        if registry.sources.contains_key("project/init") {
+            require.call::<Table>("project/init")?;
+        }
         let module: Table = require.call(entrypoint)?;
-        Ok(Self { lua, module, deadline })
+        Ok(Self {
+            lua,
+            module,
+            deadline,
+        })
     }
 
     fn start_transition(&self) {
@@ -148,7 +321,10 @@ impl Controller {
 
     pub fn init(&self, cfg: &Json) -> Result<Json> {
         self.start_transition();
-        let result: Value = self.module.get::<Function>("init")?.call(values::copy_in(&self.lua, cfg)?)?;
+        let result: Value = self
+            .module
+            .get::<Function>("init")?
+            .call(values::copy_in(&self.lua, cfg)?)?;
         let state = values::copy_out(result)?;
         anyhow::ensure!(state.is_object(), "controller state must be an object");
         Ok(state)
@@ -156,10 +332,19 @@ impl Controller {
 
     pub fn step(&self, state: &Json, event: &Json) -> Result<(Json, Json)> {
         self.start_transition();
-        let result: MultiValue = self.module.get::<Function>("step")?.call((values::copy_in(&self.lua, state)?, values::copy_in(&self.lua, event)?))?;
-        anyhow::ensure!(result.len() == 2, "controller step must return state and one command");
+        let result: MultiValue = self.module.get::<Function>("step")?.call((
+            values::copy_in(&self.lua, state)?,
+            values::copy_in(&self.lua, event)?,
+        ))?;
+        anyhow::ensure!(
+            result.len() == 2,
+            "controller step must return state and one command"
+        );
         let mut result = result.into_iter();
-        Ok((values::copy_out(result.next().unwrap())?, values::copy_out(result.next().unwrap())?))
+        Ok((
+            values::copy_out(result.next().unwrap())?,
+            values::copy_out(result.next().unwrap())?,
+        ))
     }
 }
 
@@ -171,8 +356,18 @@ mod tests {
 
     fn controller(step: &str) -> Controller {
         let mut registry = Registry::default();
-        let text = format!("return {{init = function(cfg) return {{}} end, step = function(state, event) {step} end}}");
-        registry.sources.insert("t".into(), crate::modules::Source { text, origin: "t.luau".into(), is_override: false, pkg: None });
+        let text = format!(
+            "return {{init = function(cfg) return {{}} end, step = function(state, event) {step} end}}"
+        );
+        registry.sources.insert(
+            "t".into(),
+            crate::modules::Source {
+                text,
+                origin: "t.luau".into(),
+                is_override: false,
+                pkg: None,
+            },
+        );
         Controller::new(Arc::new(registry), json!({}), String::new(), None, "t").unwrap()
     }
 
@@ -181,22 +376,29 @@ mod tests {
         let request = |content: Json| json!({"system": "s", "messages": [{"role": "user", "content": content}]});
         assert!(validate_request(&request(json!("hi"))).is_ok());
         assert!(validate_request(&request(json!([{"type": "text", "text": "hi"}]))).is_err());
-        let assistant = json!({"system": "s", "messages": [{"role": "assistant", "content": null}]});
+        let assistant =
+            json!({"system": "s", "messages": [{"role": "assistant", "content": null}]});
         assert!(validate_request(&assistant).is_ok());
     }
 
     #[test]
     fn every_transition_gets_its_own_deadline_and_a_sandboxed_env() {
-        let probe = controller("return state, {kind = 'next', \
+        let probe = controller(
+            "return state, {kind = 'next', \
             sealed = _G == nil and coroutine == nil and os == nil and getfenv == nil and math.random == nil \
-                and not pcall(function() string.lower = nil end)}");
+                and not pcall(function() string.lower = nil end)}",
+        );
         let (_, command) = probe.step(&json!({}), &json!({})).unwrap();
         assert_eq!(command["sealed"], true);
-        let spin = controller("if event.spin then while true do end end return state, {kind = 'next'}");
+        let spin =
+            controller("if event.spin then while true do end end return state, {kind = 'next'}");
         assert!(spin.step(&json!({}), &json!({"spin": false})).is_ok());
         let t0 = Instant::now();
         let err = spin.step(&json!({}), &json!({"spin": true})).unwrap_err();
-        assert!(err.to_string().contains("controller time budget exceeded"), "{err}");
+        assert!(
+            err.to_string().contains("controller time budget exceeded"),
+            "{err}"
+        );
         assert!(t0.elapsed() < STEP_TIME + Duration::from_secs(5));
         // the next transition starts on a fresh allowance
         assert!(spin.step(&json!({}), &json!({"spin": false})).is_ok());

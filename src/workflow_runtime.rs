@@ -51,7 +51,9 @@ impl StageFacts {
         fields["workflow_stage"] = json!(self.stage_id);
         match &self.project {
             Some(ProjectFact::Digest(digest)) => fields["project_digest"] = json!(digest),
-            Some(ProjectFact::Unobservable(error)) => fields["project_observation_error"] = json!(error),
+            Some(ProjectFact::Unobservable(error)) => {
+                fields["project_observation_error"] = json!(error)
+            }
             None => {}
         }
     }
@@ -94,7 +96,13 @@ impl Supervisor {
             ensure!(
                 matches!(
                     tool,
-                    Tool::Read | Tool::Search | Tool::History | Tool::View | Tool::Agent | Tool::Llm | Tool::McpList
+                    Tool::Read
+                        | Tool::Search
+                        | Tool::History
+                        | Tool::View
+                        | Tool::Agent
+                        | Tool::Llm
+                        | Tool::McpList
                 ) || matches!(tool, Tool::Http | Tool::McpCall) && class == Class::Read,
                 "stage inspect access denies {}",
                 tool.name()
@@ -112,7 +120,11 @@ impl Supervisor {
     /// The stage facts for the outcome of an effect whose intent recorded `intent` (none for an effect without an
     /// intent, whose record no check receipt can use, so the project is not observed for it). A project that could not
     /// be observed at intent makes the receipt unusable already; its outcome carries the same error unobserved.
-    pub async fn outcome_stage(&self, tool: Tool, intent: Option<&StageFacts>) -> Result<Option<StageFacts>> {
+    pub async fn outcome_stage(
+        &self,
+        tool: Tool,
+        intent: Option<&StageFacts>,
+    ) -> Result<Option<StageFacts>> {
         match intent.and_then(|facts| facts.project.as_ref()) {
             Some(ProjectFact::Unobservable(_)) => Ok(intent.cloned()),
             Some(ProjectFact::Digest(_)) => self.stage_facts(tool, true).await,
@@ -123,19 +135,26 @@ impl Supervisor {
     async fn stage_facts(&self, tool: Tool, observe: bool) -> Result<Option<StageFacts>> {
         let (stage_id, plan) = {
             let guard = self.workflow.lock().unwrap();
-            let Some((frame, active)) = guard.as_ref().and_then(|f| f.stage.as_ref().map(|a| (f, a))) else {
+            let Some((frame, active)) = guard
+                .as_ref()
+                .and_then(|f| f.stage.as_ref().map(|a| (f, a)))
+            else {
                 return Ok(None);
             };
             let verify = observe && matches!(tool, Tool::Sh) && active.spec.verify;
-            (active.spec.id.clone(), verify.then(|| frame.check_plan.clone()))
+            (
+                active.spec.id.clone(),
+                verify.then(|| frame.check_plan.clone()),
+            )
         };
         let project = match plan {
             None => None,
             Some(plan) => {
                 let workspace = self.policy.workspace.clone();
-                let observed = tokio::task::spawn_blocking(move || observe_checks(&workspace, &plan))
-                    .await
-                    .context("project observation thread")?;
+                let observed =
+                    tokio::task::spawn_blocking(move || observe_checks(&workspace, &plan))
+                        .await
+                        .context("project observation thread")?;
                 Some(match observed {
                     Ok(observation) => ProjectFact::Digest(observation.digest),
                     Err(error) => ProjectFact::Unobservable(format!("{error:#}")),
@@ -233,8 +252,15 @@ impl Supervisor {
             };
             let root = std::fs::canonicalize(&self.policy.workspace)?;
             let records = eventlog::load(&self.policy.log.path)?;
-            let result = check_result(&plan, &payload, &records, &stage.id, &root, &observation.digest)
-                .context("stage.submit")?;
+            let result = check_result(
+                &plan,
+                &payload,
+                &records,
+                &stage.id,
+                &root,
+                &observation.digest,
+            )
+            .context("stage.submit")?;
             let mut findings = result.failed.clone();
             findings.extend(
                 result
@@ -263,7 +289,13 @@ impl Supervisor {
     }
 
     /// Store the checked submission's document and make it the stage's prepared submission.
-    fn seal_submission(&self, epoch: Option<u64>, stage: StageSpec, payload: Value, document: String) -> Result<String> {
+    fn seal_submission(
+        &self,
+        epoch: Option<u64>,
+        stage: StageSpec,
+        payload: Value,
+        document: String,
+    ) -> Result<String> {
         let document_blob = self.policy.log.blob(document.as_bytes())?;
         let id = format!(
             "submission-{}",
@@ -306,7 +338,10 @@ impl Supervisor {
     }
 }
 
-fn document_event(frame: &ExecutionFrame, log: &eventlog::EventLog) -> Result<serde_json::Map<String, Value>> {
+fn document_event(
+    frame: &ExecutionFrame,
+    log: &eventlog::EventLog,
+) -> Result<serde_json::Map<String, Value>> {
     let artifacts = frame.artifacts.iter().map(|a| -> Result<Value> {
         let name = if a.stage_id == "request" {"request"} else {a.stage_id.rsplit_once('-').map_or(a.stage_id.as_str(),|(name,_)|name)};
         Ok(json!({"id":a.id,"name":name,"path":a.name,"summary":a.summary,"submission":a.submission,
@@ -316,7 +351,10 @@ fn document_event(frame: &ExecutionFrame, log: &eventlog::EventLog) -> Result<se
         let text = i.content_blob.as_ref().map(|b|eventlog::read_blob(log.dir(),b)).transpose()?.map(String::from_utf8).transpose()?.unwrap_or_default();
         Ok(json!({"id":i.id,"gate_id":i.gate_id,"decision":i.decision,"text":text,"check_ids":i.check_ids}))
     }).collect::<Result<Vec<_>>>()?;
-    Ok(serde_json::Map::from_iter([("artifacts".into(), json!(artifacts)), ("owner_inputs".into(), json!(owner_inputs))]))
+    Ok(serde_json::Map::from_iter([
+        ("artifacts".into(), json!(artifacts)),
+        ("owner_inputs".into(), json!(owner_inputs)),
+    ]))
 }
 
 impl Host {
@@ -383,12 +421,16 @@ impl Host {
         let decision = records.iter().rev().find(|r| {
             r["kind"] == "owner_decision"
                 && r["gate_id"] == request.gate_id
-                && r["seq"].as_u64().is_some_and(|seq| !frame.consumed_decisions.contains(&seq))
+                && r["seq"]
+                    .as_u64()
+                    .is_some_and(|seq| !frame.consumed_decisions.contains(&seq))
         });
         let Some(decision) = decision else {
             return Ok(OwnerResume::Waiting);
         };
-        let id = decision["seq"].as_u64().expect("matched by its sequence number");
+        let id = decision["seq"]
+            .as_u64()
+            .expect("matched by its sequence number");
         let kind: Decision = serde_json::from_value(decision["decision"].clone())
             .context("owner decision without a valid decision")?;
         // A final acceptance reduction dispatches no model or workspace effects.
@@ -485,7 +527,10 @@ impl Host {
             });
         }
         if let Some(id) = &boundary.submission {
-            let active = frame.stage.as_mut().context("boundary missing active stage")?;
+            let active = frame
+                .stage
+                .as_mut()
+                .context("boundary missing active stage")?;
             let submission = active
                 .submission
                 .take()
@@ -632,7 +677,8 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
     let manifest = crate::supervisor::Manifest::inspect(path)?;
     ensure!(manifest.workflow.is_some(), "run has no review workflow");
     let records = eventlog::load(path)?;
-    let (_, checkpoint) = Checkpoint::latest(log.dir(), &records)?.context("run has no checkpoint")?;
+    let (_, checkpoint) =
+        Checkpoint::latest(log.dir(), &records)?.context("run has no checkpoint")?;
     let RunState::AwaitingReview { gate: request, .. } = checkpoint.run else {
         anyhow::bail!("run is not awaiting review");
     };
@@ -664,7 +710,9 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
     if let Some(old) = records.iter().find(|r| {
         r["kind"] == "owner_decision"
             && r["gate_id"] == gate_id
-            && r["seq"].as_u64().is_some_and(|seq| !consumed.contains(&seq))
+            && r["seq"]
+                .as_u64()
+                .is_some_and(|seq| !consumed.contains(&seq))
     }) {
         ensure!(
             old["decision"] == json!(decision) && old["content_blob"] == json!(content_blob),

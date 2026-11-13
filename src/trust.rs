@@ -14,11 +14,20 @@ use std::path::{Path, PathBuf};
 /// Config files whose content trust covers (paths relative to the workspace), plus whole trees: module overrides and
 /// the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
 /// asks, and the agent stages there itself.)
-const FILES: [&str; 5] = [".harness/policy.toml", ".harness/mcp.toml", ".harness/init.luau", ".harness/ar.toml", "hx.lock"];
+const FILES: [&str; 5] = [
+    ".harness/policy.toml",
+    ".harness/mcp.toml",
+    ".harness/init.luau",
+    ".harness/ar.toml",
+    "hx.lock",
+];
 const TREES: [&str; 3] = [".harness/override", ".harness/versions", ".harness/tools"];
 
 fn key(ws: &Path) -> String {
-    std::fs::canonicalize(ws).unwrap_or_else(|_| ws.to_path_buf()).to_string_lossy().to_string()
+    std::fs::canonicalize(ws)
+        .unwrap_or_else(|_| ws.to_path_buf())
+        .to_string_lossy()
+        .to_string()
 }
 
 /// One config entry: a regular file's bytes, or a symlink, whose target the hash cannot cover.
@@ -44,33 +53,53 @@ impl Config {
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => return Err(e).with_context(|| format!("cannot read workspace config {rel}")),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot read workspace config {rel}"));
+                }
             };
             if meta.file_type().is_symlink() {
                 entries.insert(rel, Entry::Symlink);
             } else if meta.is_dir() {
-                for entry in std::fs::read_dir(&path).with_context(|| format!("cannot read workspace config {rel}"))? {
+                for entry in std::fs::read_dir(&path)
+                    .with_context(|| format!("cannot read workspace config {rel}"))?
+                {
                     let name = entry?.file_name();
-                    let name = name.to_str().with_context(|| format!("non-UTF-8 file name in workspace config {rel}"))?;
+                    let name = name.to_str().with_context(|| {
+                        format!("non-UTF-8 file name in workspace config {rel}")
+                    })?;
                     add(entries, ws, format!("{rel}/{name}"))?;
                 }
             } else {
-                anyhow::ensure!(meta.is_file(), "workspace config {rel} is not a regular file");
-                let bytes = std::fs::read(&path).with_context(|| format!("cannot read workspace config {rel}"))?;
+                anyhow::ensure!(
+                    meta.is_file(),
+                    "workspace config {rel} is not a regular file"
+                );
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("cannot read workspace config {rel}"))?;
                 entries.insert(rel, Entry::File(bytes));
             }
             Ok(())
         }
-        let kind = |rel: &str| std::fs::symlink_metadata(ws.join(rel)).ok().map(|m| m.file_type());
+        let kind = |rel: &str| {
+            std::fs::symlink_metadata(ws.join(rel))
+                .ok()
+                .map(|m| m.file_type())
+        };
         let mut entries = BTreeMap::new();
         let harness_link = kind(".harness").is_some_and(|t| t.is_symlink());
         if harness_link {
             entries.insert(".harness".to_string(), Entry::Symlink);
         }
         for f in FILES.into_iter().chain(TREES) {
-            if harness_link && f.starts_with(".harness/") { continue; }
+            if harness_link && f.starts_with(".harness/") {
+                continue;
+            }
             // a directory where a file belongs, or a file where a tree belongs, is not config
-            let misplaced = if FILES.contains(&f) { kind(f).is_some_and(|t| t.is_dir()) } else { kind(f).is_some_and(|t| t.is_file()) };
+            let misplaced = if FILES.contains(&f) {
+                kind(f).is_some_and(|t| t.is_dir())
+            } else {
+                kind(f).is_some_and(|t| t.is_file())
+            };
             if !misplaced {
                 add(&mut entries, ws, f.to_string())?;
             }
@@ -80,17 +109,25 @@ impl Config {
 
     /// The entries as `hx trust` lists them, sorted: a path, or `symlink:<path>`.
     pub fn names(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.entries.iter().map(|(rel, entry)| match entry {
-            Entry::File(_) => rel.clone(),
-            Entry::Symlink => format!("symlink:{rel}"),
-        }).collect();
+        let mut out: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(rel, entry)| match entry {
+                Entry::File(_) => rel.clone(),
+                Entry::Symlink => format!("symlink:{rel}"),
+            })
+            .collect();
         out.sort();
         out
     }
 
     /// Symlinked entries (they make the config untrustable).
     pub fn symlinks(&self) -> Vec<String> {
-        self.entries.iter().filter(|(_, e)| matches!(e, Entry::Symlink)).map(|(rel, _)| rel.clone()).collect()
+        self.entries
+            .iter()
+            .filter(|(_, e)| matches!(e, Entry::Symlink))
+            .map(|(rel, _)| rel.clone())
+            .collect()
     }
 
     /// Hash of the config (length-framed name and content of every entry, in `names()` order), or None when there is
@@ -100,10 +137,14 @@ impl Config {
         if self.entries.is_empty() {
             return None;
         }
-        let bodies: BTreeMap<String, &[u8]> = self.entries.iter().map(|(rel, entry)| match entry {
-            Entry::File(bytes) => (rel.clone(), bytes.as_slice()),
-            Entry::Symlink => (format!("symlink:{rel}"), &[][..]),
-        }).collect();
+        let bodies: BTreeMap<String, &[u8]> = self
+            .entries
+            .iter()
+            .map(|(rel, entry)| match entry {
+                Entry::File(bytes) => (rel.clone(), bytes.as_slice()),
+                Entry::Symlink => (format!("symlink:{rel}"), &[][..]),
+            })
+            .collect();
         let mut h = Sha256::new();
         for (name, body) in bodies {
             h.update((name.len() as u64).to_le_bytes());
@@ -125,10 +166,14 @@ impl Config {
     /// The files of one config tree (`.harness/override`, ...), keyed by path relative to the tree.
     pub fn tree<'a>(&'a self, tree: &str) -> impl Iterator<Item = (&'a str, &'a [u8])> {
         let prefix = format!("{tree}/");
-        self.entries.iter().filter_map(move |(rel, entry)| match entry {
-            Entry::File(bytes) => rel.strip_prefix(prefix.as_str()).map(|r| (r, bytes.as_slice())),
-            Entry::Symlink => None,
-        })
+        self.entries
+            .iter()
+            .filter_map(move |(rel, entry)| match entry {
+                Entry::File(bytes) => rel
+                    .strip_prefix(prefix.as_str())
+                    .map(|r| (r, bytes.as_slice())),
+                Entry::Symlink => None,
+            })
     }
 }
 
@@ -170,8 +215,11 @@ pub fn trusted(ws: &Path, dirs: &Dirs) -> Result<Option<Config>> {
         return Ok(None);
     }
     let config = Config::read(ws)?;
-    let Some(h) = config.hash() else { return Ok(Some(config)) };
-    let consented = std::env::var("HX_TRUST").is_ok_and(|v| v == h) || read_store(dirs).get(&key(ws)) == Some(&h);
+    let Some(h) = config.hash() else {
+        return Ok(Some(config));
+    };
+    let consented = std::env::var("HX_TRUST").is_ok_and(|v| v == h)
+        || read_store(dirs).get(&key(ws)) == Some(&h);
     Ok((consented && config.symlinks().is_empty()).then_some(config))
 }
 
@@ -197,16 +245,25 @@ pub fn record(ws: &Path, dirs: &Dirs) -> Result<Option<String>> {
     let config = Config::read(ws)?;
     let links = config.symlinks();
     if !links.is_empty() {
-        anyhow::bail!("cannot trust a config with symlinks (their targets are not covered): {}; replace them with real files", links.join(", "));
+        anyhow::bail!(
+            "cannot trust a config with symlinks (their targets are not covered): {}; replace them with real files",
+            links.join(", ")
+        );
     }
-    let Some(h) = config.hash() else { return Ok(None) };
+    let Some(h) = config.hash() else {
+        return Ok(None);
+    };
     let path = dirs.trust_store();
     std::fs::create_dir_all(dirs.config())?;
     // Concurrent `hx trust` runs would otherwise lose each other's entries: read-modify-write under an exclusive lock,
     // replacing the file atomically.
     use std::os::unix::fs::OpenOptionsExt;
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
-        .custom_flags(libc::O_NOFOLLOW).open(path.with_extension("lock"))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path.with_extension("lock"))?;
     lock.lock().context("cannot lock the trust store")?;
     let mut all = read_store(dirs);
     all.insert(key(ws), h.clone());
@@ -227,20 +284,29 @@ pub struct Retrust<'a> {
 impl<'a> Retrust<'a> {
     pub fn before(ws: &Path, dirs: &'a Dirs) -> Self {
         // HX_TRUST is consent for one launch only: it must not make the trust permanent here
-        let hash = Config::read(ws).ok().filter(|c| c.symlinks().is_empty()).map(|c| c.hash());
+        let hash = Config::read(ws)
+            .ok()
+            .filter(|c| c.symlinks().is_empty())
+            .map(|c| c.hash());
         let was = match hash {
             Some(None) => true,
             Some(Some(h)) => read_store(dirs).get(&key(ws)) == Some(&h),
             None => false,
         };
-        Retrust { ws: ws.to_path_buf(), dirs, was }
+        Retrust {
+            ws: ws.to_path_buf(),
+            dirs,
+            was,
+        }
     }
 
     pub fn after(self) -> Result<()> {
         if self.was {
             record(&self.ws, self.dirs)?;
         } else {
-            eprintln!("note: this workspace's .harness config is not trusted, so `hx run` refuses it; review it and run `hx trust`");
+            eprintln!(
+                "note: this workspace's .harness config is not trusted, so `hx run` refuses it; review it and run `hx trust`"
+            );
         }
         Ok(())
     }

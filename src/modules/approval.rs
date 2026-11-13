@@ -1,7 +1,7 @@
 //! Approval: the one package reader (`snapshot`), its digest, `hx.lock`, `hx approve` and `hx skills`.
 use super::staging::terminal_safe;
-use super::{valid_package_name, Manifest, PkgInfo, Resolver};
-use anyhow::{anyhow, bail, Context, Result};
+use super::{Manifest, PkgInfo, Resolver, valid_package_name};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -59,8 +59,11 @@ impl std::fmt::Display for Kind {
 
 impl Lockfile {
     pub(super) fn parse(bytes: Option<&[u8]>) -> Result<Lockfile> {
-        let Some(bytes) = bytes else { return Ok(Lockfile::default()) };
-        toml::from_str(std::str::from_utf8(bytes).context("hx.lock is not UTF-8")?).context("hx.lock is not valid")
+        let Some(bytes) = bytes else {
+            return Ok(Lockfile::default());
+        };
+        toml::from_str(std::str::from_utf8(bytes).context("hx.lock is not UTF-8")?)
+            .context("hx.lock is not valid")
     }
 
     /// The lock on disk, for the owner's commands (a run reads it through trust, see `Registry::capture`).
@@ -79,14 +82,29 @@ impl Lockfile {
     /// The snapshot of `location` when the lock approves exactly its content; else why not.
     pub(super) fn approved(&self, name: &str, location: Location) -> Result<Snapshot> {
         // checked before reading anything: ~/.agents/skills can be large
-        let entry = self.entry(name).ok_or_else(|| LockError::NotLocked(name.to_string()))?;
+        let entry = self
+            .entry(name)
+            .ok_or_else(|| LockError::NotLocked(name.to_string()))?;
         let kind = location.kind();
         if let Some(approved) = entry.kind.filter(|approved| *approved != kind) {
-            return Err(LockError::OtherKind { name: name.to_string(), approved, now: kind }.into());
+            return Err(LockError::OtherKind {
+                name: name.to_string(),
+                approved,
+                now: kind,
+            }
+            .into());
         }
         let snap = snapshot(location)?;
-        if entry.kind != Some(kind) || entry.hash != snap.digest || entry.version != snap.manifest.package.version {
-            return Err(LockError::Changed { name: name.to_string(), locked: entry.hash.clone(), now: snap.digest }.into());
+        if entry.kind != Some(kind)
+            || entry.hash != snap.digest
+            || entry.version != snap.manifest.package.version
+        {
+            return Err(LockError::Changed {
+                name: name.to_string(),
+                locked: entry.hash.clone(),
+                now: snap.digest,
+            }
+            .into());
         }
         Ok(snap)
     }
@@ -96,20 +114,40 @@ impl Lockfile {
 #[derive(Debug)]
 pub enum LockError {
     NotLocked(String),
-    Changed { name: String, locked: String, now: String },
+    Changed {
+        name: String,
+        locked: String,
+        now: String,
+    },
     /// Approved as one kind of thing and now found as another (a skill copied into `.harness/pkgs`).
-    OtherKind { name: String, approved: Kind, now: Kind },
+    OtherKind {
+        name: String,
+        approved: Kind,
+        now: Kind,
+    },
 }
 
 impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotLocked(pkg) => write!(f, "package {pkg} is not locked; review it, then run `hx approve {pkg}`"),
-            Self::Changed { name, locked, now } => write!(f,
+            Self::NotLocked(pkg) => write!(
+                f,
+                "package {pkg} is not locked; review it, then run `hx approve {pkg}`"
+            ),
+            Self::Changed { name, locked, now } => write!(
+                f,
                 "package {name} changed since it was approved (locked {}…, now {}…); review it and run `hx approve {name}` again",
-                locked.get(..8).unwrap_or(locked), now.get(..8).unwrap_or(now)),
-            Self::OtherKind { name, approved, now } => write!(f,
-                "{name} was approved as {approved}, not as {now}; review it and run `hx approve {name}` again"),
+                locked.get(..8).unwrap_or(locked),
+                now.get(..8).unwrap_or(now)
+            ),
+            Self::OtherKind {
+                name,
+                approved,
+                now,
+            } => write!(
+                f,
+                "{name} was approved as {approved}, not as {now}; review it and run `hx approve {name}` again"
+            ),
         }
     }
 }
@@ -165,43 +203,84 @@ pub fn snapshot(location: Location) -> Result<Snapshot> {
     let files = read_tree(dir)?;
     let manifest = match &location {
         Location::Package(_) => {
-            let text = files.get("hx.toml").with_context(|| format!("{}: missing hx.toml", dir.display()))?;
-            let text = std::str::from_utf8(text).with_context(|| format!("{}: hx.toml is not UTF-8", dir.display()))?;
+            let text = files
+                .get("hx.toml")
+                .with_context(|| format!("{}: missing hx.toml", dir.display()))?;
+            let text = std::str::from_utf8(text)
+                .with_context(|| format!("{}: hx.toml is not UTF-8", dir.display()))?;
             toml::from_str(text).map_err(|e| anyhow!("{}: bad hx.toml: {e}", dir.display()))?
-        },
+        }
         Location::AgentSkill(_) => {
-            let text = files.get("SKILL.md").with_context(|| format!("{}: missing SKILL.md", dir.display()))?;
+            let text = files
+                .get("SKILL.md")
+                .with_context(|| format!("{}: missing SKILL.md", dir.display()))?;
             Manifest::agent_skill(&String::from_utf8_lossy(text))
-        },
+        }
     };
-    Ok(Snapshot { digest: digest(location.kind(), &files), files, manifest, location })
+    Ok(Snapshot {
+        digest: digest(location.kind(), &files),
+        files,
+        manifest,
+        location,
+    })
 }
 
 fn read_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>, total: &mut usize) -> Result<()> {
+    fn walk(
+        dir: &Path,
+        prefix: &str,
+        out: &mut BTreeMap<String, Vec<u8>>,
+        total: &mut usize,
+    ) -> Result<()> {
         use std::{io::Read, os::unix::fs::OpenOptionsExt};
-        for entry in std::fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))? {
+        for entry in
+            std::fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))?
+        {
             let entry = entry?;
             let name = entry.file_name();
-            let name = name.to_str().with_context(|| format!("non-UTF-8 file name in {}", dir.display()))?;
+            let name = name
+                .to_str()
+                .with_context(|| format!("non-UTF-8 file name in {}", dir.display()))?;
             if name.starts_with('.') {
                 continue;
             }
-            let rel = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
+            let rel = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
             let kind = entry.file_type()?;
             if kind.is_dir() {
                 walk(&entry.path(), &rel, out, total)?;
             } else if kind.is_file() {
-                anyhow::ensure!(out.len() < SNAPSHOT_FILES, "{} has more than {SNAPSHOT_FILES} files", root_hint(dir, prefix));
+                anyhow::ensure!(
+                    out.len() < SNAPSHOT_FILES,
+                    "{} has more than {SNAPSHOT_FILES} files",
+                    root_hint(dir, prefix)
+                );
                 let mut bytes = Vec::new();
-                std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(entry.path())
-                    .and_then(|f| f.take((SNAPSHOT_BYTES - *total) as u64 + 1).read_to_end(&mut bytes))
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(entry.path())
+                    .and_then(|f| {
+                        f.take((SNAPSHOT_BYTES - *total) as u64 + 1)
+                            .read_to_end(&mut bytes)
+                    })
                     .with_context(|| format!("cannot read {}", entry.path().display()))?;
                 *total += bytes.len();
-                anyhow::ensure!(*total <= SNAPSHOT_BYTES, "{} is larger than {} MiB", root_hint(dir, prefix), SNAPSHOT_BYTES >> 20);
+                anyhow::ensure!(
+                    *total <= SNAPSHOT_BYTES,
+                    "{} is larger than {} MiB",
+                    root_hint(dir, prefix),
+                    SNAPSHOT_BYTES >> 20
+                );
                 out.insert(rel, bytes);
             } else if kind.is_symlink() {
-                bail!("{} is a symlink; a package or skill may not contain symlinks (their targets are not covered by its approval): copy the file in instead", entry.path().display());
+                bail!(
+                    "{} is a symlink; a package or skill may not contain symlinks (their targets are not covered by its approval): copy the file in instead",
+                    entry.path().display()
+                );
             } else {
                 bail!("{} is not a regular file", entry.path().display());
             }
@@ -210,10 +289,24 @@ fn read_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
     }
     /// The package root, for messages about the whole tree.
     fn root_hint(dir: &Path, prefix: &str) -> String {
-        let depth = if prefix.is_empty() { 0 } else { prefix.split('/').count() };
-        dir.ancestors().nth(depth).unwrap_or(dir).display().to_string()
+        let depth = if prefix.is_empty() {
+            0
+        } else {
+            prefix.split('/').count()
+        };
+        dir.ancestors()
+            .nth(depth)
+            .unwrap_or(dir)
+            .display()
+            .to_string()
     }
-    anyhow::ensure!(std::fs::metadata(root).with_context(|| format!("cannot read {}", root.display()))?.is_dir(), "{} is not a directory", root.display());
+    anyhow::ensure!(
+        std::fs::metadata(root)
+            .with_context(|| format!("cannot read {}", root.display()))?
+            .is_dir(),
+        "{} is not a directory",
+        root.display()
+    );
     let mut files = BTreeMap::new();
     walk(root, "", &mut files, &mut 0)?;
     Ok(files)
@@ -244,10 +337,20 @@ impl Snapshot {
         if self.is_agent_skill() {
             return Ok(Vec::new());
         }
-        self.files.iter().filter_map(|(file, bytes)| file.strip_suffix(".luau").map(|module| (module, file, bytes)))
+        self.files
+            .iter()
+            .filter_map(|(file, bytes)| {
+                file.strip_suffix(".luau")
+                    .map(|module| (module, file, bytes))
+            })
             .map(|(module, file, bytes)| {
-                let text = String::from_utf8(bytes.clone()).with_context(|| format!("package {name}: {file} is not UTF-8"))?;
-                let module = if module == "init" { name.to_string() } else { format!("{name}/{module}") };
+                let text = String::from_utf8(bytes.clone())
+                    .with_context(|| format!("package {name}: {file} is not UTF-8"))?;
+                let module = if module == "init" {
+                    name.to_string()
+                } else {
+                    format!("{name}/{module}")
+                };
                 Ok((module, file.clone(), text))
             })
             .collect()
@@ -263,7 +366,11 @@ impl Snapshot {
             signature: self.manifest.tool.signature.clone().unwrap_or_default(),
             doc: self.manifest.tool.doc.clone().unwrap_or_default(),
             dir: String::new(),
-            files: if kind == "skill" { self.files.keys().cloned().collect() } else { Vec::new() },
+            files: if kind == "skill" {
+                self.files.keys().cloned().collect()
+            } else {
+                Vec::new()
+            },
             kind,
         }
     }
@@ -272,7 +379,9 @@ impl Snapshot {
 /// Write a whole file so a crash leaves the old content or the new, never a truncated one. `path` lies under the
 /// canonical workspace; no link on the way to it, or at it, is followed, and missing directories are created.
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::atomic_file::Target::open(path, true).map_err(anyhow::Error::from).and_then(|file| file.replace(bytes))
+    crate::atomic_file::Target::open(path, true)
+        .map_err(anyhow::Error::from)
+        .and_then(|file| file.replace(bytes))
         .with_context(|| format!("cannot write {}", path.display()))
 }
 
@@ -290,7 +399,10 @@ impl Resolver {
         if name.is_empty() || name.starts_with('.') || name.contains('/') {
             return None;
         }
-        self.agent_skill_roots().into_iter().map(|r| r.join(name)).find(|d| d.join("SKILL.md").is_file())
+        self.agent_skill_roots()
+            .into_iter()
+            .map(|r| r.join(name))
+            .find(|d| d.join("SKILL.md").is_file())
     }
 
     /// Where package `name` lives: `.harness/pkgs/<name>`, else an agent skill.
@@ -302,18 +414,29 @@ impl Resolver {
         if let Some(d) = self.agent_skill_dir(name) {
             return Ok(Location::AgentSkill(d));
         }
-        bail!("no package or skill named {name} (looked in .harness/pkgs, .agents/skills, ~/.agents/skills)")
+        bail!(
+            "no package or skill named {name} (looked in .harness/pkgs, .agents/skills, ~/.agents/skills)"
+        )
     }
 
     /// Every skill found under the `.agents/skills` roots: (name, dir), first root wins.
     pub fn agent_skills(&self) -> Vec<(String, PathBuf)> {
         let mut out: Vec<(String, PathBuf)> = Vec::new();
         for root in self.agent_skill_roots() {
-            let Ok(rd) = std::fs::read_dir(&root) else { continue };
-            let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+            let Ok(rd) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            let mut names: Vec<String> = rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
             names.sort();
             for n in names {
-                if !out.iter().any(|(m, _)| *m == n) && self.agent_skill_dir(&n).is_some_and(|d| d.parent() == Some(root.as_path())) {
+                if !out.iter().any(|(m, _)| *m == n)
+                    && self
+                        .agent_skill_dir(&n)
+                        .is_some_and(|d| d.parent() == Some(root.as_path()))
+                {
                     out.push((n.clone(), root.join(&n)));
                 }
             }
@@ -324,9 +447,17 @@ impl Resolver {
     /// Every installed package (`.harness/pkgs`, sorted), then every agent skill no package shadows. Dot-entries in
     /// `.harness/pkgs` (an interrupted `hx accept`) are not packages.
     pub(super) fn installed(&self) -> Vec<(String, Location)> {
-        let mut out: Vec<(String, Location)> = std::fs::read_dir(self.harness().join("pkgs")).into_iter().flatten().flatten()
+        let mut out: Vec<(String, Location)> = std::fs::read_dir(self.harness().join("pkgs"))
+            .into_iter()
+            .flatten()
+            .flatten()
             .filter(|e| e.path().is_dir())
-            .map(|e| (e.file_name().to_string_lossy().to_string(), Location::Package(e.path())))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().to_string(),
+                    Location::Package(e.path()),
+                )
+            })
             .filter(|(name, _)| !name.starts_with('.'))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -352,17 +483,29 @@ impl Resolver {
                     Ok(_) => "approved".into(),
                     Err(e) => match e.downcast_ref::<LockError>() {
                         Some(LockError::NotLocked(_)) => "not approved".into(),
-                        Some(LockError::Changed { .. } | LockError::OtherKind { .. }) => "changed since approval".into(),
-                        None => format!("error: {}", terminal_safe(e.to_string().lines().next().unwrap_or(""))),
+                        Some(LockError::Changed { .. } | LockError::OtherKind { .. }) => {
+                            "changed since approval".into()
+                        }
+                        None => format!(
+                            "error: {}",
+                            terminal_safe(e.to_string().lines().next().unwrap_or(""))
+                        ),
                     },
                 }
             };
             s.push_str(&format!("{name:<28} {state:<24} {}\n", dir.display()));
         }
         if !crate::trust::is_trusted(&self.root, dirs) {
-            s.insert_str(0, "workspace config not trusted: no skill is visible until you run `hx trust`\n");
+            s.insert_str(
+                0,
+                "workspace config not trusted: no skill is visible until you run `hx trust`\n",
+            );
         }
-        Ok(if s.is_empty() { "no skills in .agents/skills or ~/.agents/skills\n".into() } else { s })
+        Ok(if s.is_empty() {
+            "no skills in .agents/skills or ~/.agents/skills\n".into()
+        } else {
+            s
+        })
     }
 
     /// Record `snap` as the approved content of `name` in `hx.lock`.
@@ -377,18 +520,32 @@ impl Resolver {
             hash: snap.digest.clone(),
         });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        write_atomic(&lock_path, toml::to_string(&Lockfile { package: entries })?.as_bytes())
+        write_atomic(
+            &lock_path,
+            toml::to_string(&Lockfile { package: entries })?.as_bytes(),
+        )
     }
 
     /// `hx approve <pkg>`: lock the package's exact content, which grants exactly the capabilities its manifest requests.
     pub fn approve(&self, pkg: &str) -> Result<String> {
-        anyhow::ensure!(valid_package_name(pkg), "{pkg:?} is not a valid package name (lowercase letters, digits, _ and -, starting with a letter; not std or project)");
+        anyhow::ensure!(
+            valid_package_name(pkg),
+            "{pkg:?} is not a valid package name (lowercase letters, digits, _ and -, starting with a letter; not std or project)"
+        );
         let snap = snapshot(self.locate(pkg)?)?;
         self.lock(pkg, &snap)?;
         let dir = snap.location.dir();
-        let mut out = format!("approved {pkg} {} ({}…) from {}", snap.manifest.package.version, &snap.digest[..8], dir.display());
+        let mut out = format!(
+            "approved {pkg} {} ({}…) from {}",
+            snap.manifest.package.version,
+            &snap.digest[..8],
+            dir.display()
+        );
         if let Ok(target) = std::fs::read_link(dir) {
-            out.push_str(&format!(" (a link to {}; its content is what was approved)", target.display()));
+            out.push_str(&format!(
+                " (a link to {}; its content is what was approved)",
+                target.display()
+            ));
         }
         if snap.is_agent_skill() {
             out.push_str(": an agent skill, so SKILL.md and its files only, with no Luau and no capabilities");
@@ -396,7 +553,10 @@ impl Resolver {
                 out.push_str(" (its hx.toml is an ordinary file)");
             }
         } else {
-            out.push_str(&format!(" with capabilities {:?}", snap.manifest.capabilities));
+            out.push_str(&format!(
+                " with capabilities {:?}",
+                snap.manifest.capabilities
+            ));
         }
         Ok(out)
     }

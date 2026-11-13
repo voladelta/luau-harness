@@ -99,13 +99,22 @@ impl Target {
         let file = self.existing()?;
         let meta = file.metadata()?;
         if meta.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "is a directory",
+            ));
         }
         if !meta.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
         }
         let too_large = |len: u64| {
-            io::Error::new(io::ErrorKind::FileTooLarge, format!("file is {len} bytes, over the {max}-byte limit"))
+            io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("file is {len} bytes, over the {max}-byte limit"),
+            )
         };
         if meta.len() > max {
             return Err(too_large(meta.len()));
@@ -127,7 +136,10 @@ impl Target {
             Err(e) => return Err(e),
         };
         if !file.metadata()?.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
         }
         let mut hasher = sha2::Sha256::new();
         let mut chunk = [0u8; 65536];
@@ -137,7 +149,13 @@ impl Target {
                 n => hasher.update(&chunk[..n]),
             }
         }
-        Ok(Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()))
+        Ok(Some(
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        ))
     }
 
     /// The permissions a replacement keeps: the existing file's, or None when there is none.
@@ -179,7 +197,13 @@ impl Target {
         self.commit(&tmp, file, bytes, permissions)
     }
 
-    fn commit(&self, tmp: &CString, mut file: File, bytes: &[u8], permissions: Option<std::fs::Permissions>) -> anyhow::Result<()> {
+    fn commit(
+        &self,
+        tmp: &CString,
+        mut file: File,
+        bytes: &[u8],
+        permissions: Option<std::fs::Permissions>,
+    ) -> anyhow::Result<()> {
         let result = (|| -> io::Result<()> {
             file.write_all(bytes)?;
             if let Some(permissions) = permissions {
@@ -220,12 +244,16 @@ impl Target {
 #[derive(Debug)]
 pub struct Dir(File);
 
-const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+const DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
 /// One entry name: a single path component, never `.`, `..` or empty.
 fn entry(name: &str) -> io::Result<CString> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name:?} is not a single file name")));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name:?} is not a single file name"),
+        ));
     }
     cstr(std::ffi::OsStr::new(name))
 }
@@ -239,7 +267,12 @@ impl Dir {
             match component {
                 Component::RootDir => continue,
                 Component::Normal(part) => dir = dir.child(&cstr(part)?, create)?,
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected normalized path")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "expected normalized path",
+                    ));
+                }
             }
         }
         Ok(dir)
@@ -247,8 +280,13 @@ impl Dir {
 
     fn child(&self, name: &CString, create: bool) -> io::Result<Dir> {
         // SAFETY: `self.0` is an open directory descriptor and `name` a NUL-terminated string; both outlive the call.
-        let mut next = opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), DIR_FLAGS) });
-        if create && next.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        let mut next =
+            opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), DIR_FLAGS) });
+        if create
+            && next
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
             // SAFETY: as above.
             if unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o755) } < 0 {
                 let error = io::Error::last_os_error();
@@ -287,11 +325,20 @@ impl Dir {
     /// Append `bytes` to the file `name`, creating it when missing. A link there is an error.
     pub fn append(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         let name = entry(name)?;
-        let flags = libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let flags = libc::O_WRONLY
+            | libc::O_APPEND
+            | libc::O_CREAT
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC;
         // SAFETY: `self.0` is an open directory descriptor and `name` a NUL-terminated string; both outlive the call.
-        let mut file = opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), flags, 0o666) })?;
+        let mut file =
+            opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), flags, 0o666) })?;
         if !file.metadata()?.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
         }
         file.write_all(bytes)
     }
@@ -300,7 +347,15 @@ impl Dir {
     pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         let (from, to) = (entry(from)?, entry(to)?);
         // SAFETY: `self.0` is an open directory descriptor and both names NUL-terminated strings; all outlive the call.
-        if unsafe { libc::renameat(self.0.as_raw_fd(), from.as_ptr(), self.0.as_raw_fd(), to.as_ptr()) } < 0 {
+        if unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                from.as_ptr(),
+                self.0.as_raw_fd(),
+                to.as_ptr(),
+            )
+        } < 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -308,7 +363,10 @@ impl Dir {
 
     /// The entry `name` as a file target (see `Target`): read, replaced or removed without following a link.
     pub fn file(&self, name: &str) -> io::Result<Target> {
-        Ok(Target { dir: self.0.try_clone()?, name: entry(name)? })
+        Ok(Target {
+            dir: self.0.try_clone()?,
+            name: entry(name)?,
+        })
     }
 
     /// The names in this directory, sorted.
@@ -448,18 +506,33 @@ mod tests {
         assert!(Dir::open(&dir.join("linked"), false).is_err());
         let base = Dir::open(&dir, false).unwrap();
         assert!(base.dir("linked", true).is_err());
-        assert_eq!(base.write_new("linked", b"x").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(base.create_dir("linked").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            base.write_new("linked", b"x").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            base.create_dir("linked").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         assert!(base.append("linked", b"x").is_err());
         assert!(base.dir("../elsewhere", false).is_err() && base.write_new("..", b"x").is_err());
         // removal takes the link, not what it points to
         base.remove_all("linked").unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("elsewhere/kept")).unwrap(), "kept");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("elsewhere/kept")).unwrap(),
+            "kept"
+        );
         let made = base.create_dir("made").unwrap();
-        made.dir("sub", true).unwrap().write_new("file", b"data").unwrap();
+        made.dir("sub", true)
+            .unwrap()
+            .write_new("file", b"data")
+            .unwrap();
         assert_eq!(made.names().unwrap(), ["sub"]);
         base.rename("made", "moved").unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("moved/sub/file")).unwrap(), "data");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("moved/sub/file")).unwrap(),
+            "data"
+        );
         base.remove_all("moved").unwrap();
         assert_eq!(base.names().unwrap(), ["elsewhere"]);
         std::fs::remove_dir_all(dir).unwrap();

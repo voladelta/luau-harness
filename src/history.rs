@@ -193,7 +193,12 @@ impl History {
         let saved = crate::supervisor::Checkpoint::read(dir, &source.blob)
             .context("history_archive_invalid: source unreadable")?;
         ensure!(
-            saved.run.controller().and_then(|c| c["messages"].as_array()).map(Vec::as_slice) == Some(before),
+            saved
+                .run
+                .controller()
+                .and_then(|c| c["messages"].as_array())
+                .map(Vec::as_slice)
+                == Some(before),
             "history_archive_invalid: source differs"
         );
         Ok(Archive {
@@ -276,7 +281,10 @@ impl History {
         }
         let mut entries = Vec::new();
         let mut examined = 0;
-        while seq != 0 && entries.len() < query.limit.unwrap_or(DEFAULT_LIMIT) && examined < MAX_SCAN {
+        while seq != 0
+            && entries.len() < query.limit.unwrap_or(DEFAULT_LIMIT)
+            && examined < MAX_SCAN
+        {
             check_deadline(deadline)?;
             let pos = index
                 .records
@@ -409,8 +417,16 @@ impl<'a> Loader<'a> {
         }
         self.budget -= size;
         let deadline = self.deadline;
-        let data = crate::eventlog::read_blob_bounded(self.dir, hash, MAX_SOURCE, || check_deadline(deadline))
-            .map_err(|e| if e.to_string().starts_with("history:") { e } else { anyhow::anyhow!("history: {e:#}") })?;
+        let data = crate::eventlog::read_blob_bounded(self.dir, hash, MAX_SOURCE, || {
+            check_deadline(deadline)
+        })
+        .map_err(|e| {
+            if e.to_string().starts_with("history:") {
+                e
+            } else {
+                anyhow::anyhow!("history: {e:#}")
+            }
+        })?;
         check_deadline(self.deadline)?;
         Ok(Some(data))
     }
@@ -422,7 +438,10 @@ impl<'a> Loader<'a> {
         let Some(data) = self.read(hash)? else {
             return Ok(None);
         };
-        let body = Rc::new(CheckpointBody::parse(&data).map_err(|e| anyhow::anyhow!("history: checkpoint {hash}: {e:#}"))?);
+        let body = Rc::new(
+            CheckpointBody::parse(&data)
+                .map_err(|e| anyhow::anyhow!("history: checkpoint {hash}: {e:#}"))?,
+        );
         self.bodies.insert(hash.into(), body.clone());
         Ok(Some(body))
     }
@@ -434,7 +453,10 @@ impl<'a> Loader<'a> {
         let Some(data) = self.read(hash)? else {
             return Ok(None);
         };
-        let chunk = Rc::new(crate::eventlog::parse_chunk(&data, last).map_err(|e| anyhow::anyhow!("history: message chunk {hash}: {e:#}"))?);
+        let chunk = Rc::new(
+            crate::eventlog::parse_chunk(&data, last)
+                .map_err(|e| anyhow::anyhow!("history: message chunk {hash}: {e:#}"))?,
+        );
         self.chunks.insert(hash.into(), chunk.clone());
         Ok(Some(chunk))
     }
@@ -444,7 +466,9 @@ impl<'a> Loader<'a> {
         let Some(body) = self.body(record.source(ordinal))? else {
             return Ok(None);
         };
-        let controller = body.controller().context("history: source has no controller state")?;
+        let controller = body
+            .controller()
+            .context("history: source has no controller state")?;
         if ordinal == 0 {
             let summary = summary(controller).context("history: missing summary")?;
             return Ok(Some(("summary".into(), summary.into())));
@@ -455,12 +479,17 @@ impl<'a> Loader<'a> {
         let Some(hashes) = self.chunk(chunk, last)? else {
             return Ok(None);
         };
-        let hash = hashes.get(position).context("history: missing archived message")?;
+        let hash = hashes
+            .get(position)
+            .context("history: missing archived message")?;
         let Some(data) = self.read(hash)? else {
             return Ok(None);
         };
-        let message: Value = serde_json::from_slice(&data).context("history: invalid message JSON")?;
-        let role = message["role"].as_str().context("history: invalid message role")?;
+        let message: Value =
+            serde_json::from_slice(&data).context("history: invalid message JSON")?;
+        let role = message["role"]
+            .as_str()
+            .context("history: invalid message role")?;
         Ok(Some((role.into(), render(&message)?)))
     }
 }
@@ -499,7 +528,12 @@ fn render(message: &Value) -> Result<String> {
     }
     for image in message["images"].as_array().into_iter().flatten() {
         let dim = |k: &str| image[k].as_u64().map_or("?".to_string(), |n| n.to_string());
-        text.push_str(&format!("\n[image {} {}x{} not kept; view() it again to look]\n", image["path"].as_str().unwrap_or("?"), dim("width"), dim("height")));
+        text.push_str(&format!(
+            "\n[image {} {}x{} not kept; view() it again to look]\n",
+            image["path"].as_str().unwrap_or("?"),
+            dim("width"),
+            dim("height")
+        ));
     }
     Ok(text)
 }
@@ -790,7 +824,10 @@ mod tests {
                 message("assistant", "keep"),
                 message("tool", "keep"),
             ]);
-            f.save(json!({"messages":f.messages,"previous_summary":"summary"}), None);
+            f.save(
+                json!({"messages":f.messages,"previous_summary":"summary"}),
+                None,
+            );
             f.compact(f.messages.len() - 1, &format!("summary {round}"));
         }
         let first = f.query(json!({"q":"absent","limit":20})).unwrap();
@@ -818,7 +855,10 @@ mod tests {
             let page = f.query(q.clone()).unwrap();
             for entry in page["entries"].as_array().unwrap() {
                 assert!(ids.insert(entry["id"].as_str().unwrap().to_string()));
-                assert_eq!(f.query(json!({"id":entry["id"]})).unwrap()["text"], "same result");
+                assert_eq!(
+                    f.query(json!({"id":entry["id"]})).unwrap()["text"],
+                    "same result"
+                );
             }
             match page["next"].as_str() {
                 Some(next) => q["before"] = json!(next),
@@ -850,7 +890,11 @@ mod tests {
         );
         let public=render(&json!({"content":[{"type":"text","text":"visible"},{"type":"image","data":"SECRET"}],
             "raw":"PRIVATE","images":[{"data":"SECRET","path":"f.png","width":10,"height":5}],"calls":[{"name":"luau","id":"c","input":{"code":"print(42)"}}]})).unwrap();
-        assert!(public.contains("visible") && public.contains("print(42)") && public.contains("[image f.png 10x5 not kept"));
+        assert!(
+            public.contains("visible")
+                && public.contains("print(42)")
+                && public.contains("[image f.png 10x5 not kept")
+        );
         assert!(!public.contains("PRIVATE") && !public.contains("SECRET"));
         for q in [
             json!({"q":""}),

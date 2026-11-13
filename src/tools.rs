@@ -1,10 +1,22 @@
 //! Single-file, workspace-trusted tools. Definitions and endpoint grants are frozen; secrets never are.
-use crate::{dirs::Dirs, effects::{Effects, Ret}, modules::{Registry, Source}, policy::Class, supervisor::{Capabilities, Capability, Tool}, values};
+use crate::{
+    dirs::Dirs,
+    effects::{Effects, Ret},
+    modules::{Registry, Source},
+    policy::Class,
+    supervisor::{Capabilities, Capability, Tool},
+    values,
+};
 use anyhow::{Context, Result, ensure};
 use mlua::{Function, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,11 +34,18 @@ pub struct Endpoint {
     #[serde(default)]
     pub read_only: bool,
 }
-fn get() -> String { "GET".into() }
-fn header() -> String { "Authorization".into() }
+fn get() -> String {
+    "GET".into()
+}
+fn header() -> String {
+    "Authorization".into()
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Method { pub signature: String, pub description: String }
+pub struct Method {
+    pub signature: String,
+    pub description: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Definition {
@@ -36,16 +55,31 @@ pub struct Definition {
 }
 
 fn identifier(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && name.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
-        && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
-        && !["and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "continue"].contains(&name)
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        && ![
+            "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+            "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+            "continue",
+        ]
+        .contains(&name)
 }
 
 fn fields(table: &Table, allowed: &[&str]) -> Result<()> {
-    ensure!(table.metatable().is_none(), "tool definitions must be plain tables");
+    ensure!(
+        table.metatable().is_none(),
+        "tool definitions must be plain tables"
+    );
     for pair in table.clone().pairs::<String, Value>() {
         let (key, _) = pair?;
-        ensure!(allowed.contains(&key.as_str()), "unknown tool definition field {key:?}");
+        ensure!(
+            allowed.contains(&key.as_str()),
+            "unknown tool definition field {key:?}"
+        );
     }
     Ok(())
 }
@@ -59,28 +93,58 @@ fn data<T: serde::de::DeserializeOwned + Default>(table: &Table, key: &str) -> R
 
 /// Percent-encode one path-segment value. With '/' encoded, only a whole "." or ".." could traverse.
 fn encode_path_segment(value: &str) -> Result<String, &'static str> {
-    if matches!(value, "" | "." | "..") { return Err("URL path parameter cannot be empty, '.' or '..'"); }
+    if matches!(value, "" | "." | "..") {
+        return Err("URL path parameter cannot be empty, '.' or '..'");
+    }
     let mut encoded = String::with_capacity(value.len() * 3);
     for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b':') { encoded.push(b as char); }
-        else { use std::fmt::Write; write!(&mut encoded, "%{b:02X}").unwrap(); }
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b':') {
+            encoded.push(b as char);
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{b:02X}").unwrap();
+        }
     }
     Ok(encoded)
 }
 
-enum Segment { Literal(String), Param(String) }
+enum Segment {
+    Literal(String),
+    Param(String),
+}
 
 /// An endpoint URL is a fixed origin plus path segments. Values fill whole segments and are set as a path, so they cannot reach the origin.
-struct Template { base: reqwest::Url, segments: Vec<Segment> }
+struct Template {
+    base: reqwest::Url,
+    segments: Vec<Segment>,
+}
 
 fn template(url: &str) -> Result<Template> {
-    ensure!(!url.contains(['?', '#']), "endpoint URL cannot contain query or fragment");
-    let authority = url.find("://").map(|i| i + 3).context("endpoint must be an HTTP(S) URL")?;
-    let (origin, path) = url.split_at(url[authority..].find('/').map_or(url.len(), |i| authority + i));
-    ensure!(!origin.contains(['{', '}']), "endpoint origin cannot contain placeholders: {url}");
+    ensure!(
+        !url.contains(['?', '#']),
+        "endpoint URL cannot contain query or fragment"
+    );
+    let authority = url
+        .find("://")
+        .map(|i| i + 3)
+        .context("endpoint must be an HTTP(S) URL")?;
+    let (origin, path) = url.split_at(
+        url[authority..]
+            .find('/')
+            .map_or(url.len(), |i| authority + i),
+    );
+    ensure!(
+        !origin.contains(['{', '}']),
+        "endpoint origin cannot contain placeholders: {url}"
+    );
     let base = reqwest::Url::parse(origin).context("invalid endpoint URL")?;
-    ensure!(matches!(base.scheme(), "https" | "http") && base.host_str().is_some_and(|h| !h.is_empty()) && base.username().is_empty() && base.password().is_none(),
-        "endpoint must be an HTTP(S) URL without credentials, query or fragment");
+    ensure!(
+        matches!(base.scheme(), "https" | "http")
+            && base.host_str().is_some_and(|h| !h.is_empty())
+            && base.username().is_empty()
+            && base.password().is_none(),
+        "endpoint must be an HTTP(S) URL without credentials, query or fragment"
+    );
     let segments = path.split('/').skip(1).map(|s| {
         if let Some(name) = s.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
             ensure!(!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'), "invalid placeholder {s:?} in endpoint URL (a placeholder is a whole path segment)");
@@ -96,7 +160,10 @@ fn template(url: &str) -> Result<Template> {
 
 impl Template {
     /// Fill placeholders from `args` and remove those keys; the rest become the query or body.
-    fn url(&self, args: &mut serde_json::Map<String, serde_json::Value>) -> mlua::Result<reqwest::Url> {
+    fn url(
+        &self,
+        args: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> mlua::Result<reqwest::Url> {
         let mut path = String::new();
         for segment in &self.segments {
             path.push('/');
@@ -105,15 +172,29 @@ impl Template {
                 Segment::Param(name) => {
                     let value = match args.get(name) {
                         Some(serde_json::Value::String(s)) => s.clone(),
-                        Some(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => v.to_string(),
-                        Some(_) => return Err(mlua::Error::runtime("URL parameters must be strings, numbers or booleans")),
-                        None => return Err(mlua::Error::runtime(format!("missing required URL parameter '{name}'"))),
+                        Some(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
+                            v.to_string()
+                        }
+                        Some(_) => {
+                            return Err(mlua::Error::runtime(
+                                "URL parameters must be strings, numbers or booleans",
+                            ));
+                        }
+                        None => {
+                            return Err(mlua::Error::runtime(format!(
+                                "missing required URL parameter '{name}'"
+                            )));
+                        }
                     };
                     path.push_str(&encode_path_segment(&value).map_err(mlua::Error::runtime)?);
-                },
+                }
             }
         }
-        for segment in &self.segments { if let Segment::Param(name) = segment { args.remove(name); } }
+        for segment in &self.segments {
+            if let Segment::Param(name) = segment {
+                args.remove(name);
+            }
+        }
         let mut url = self.base.clone();
         url.set_path(&path);
         Ok(url)
@@ -123,24 +204,39 @@ impl Template {
 /// Pure codecs for tool code, so tools never hand-roll them: `json.encode/decode` and `base64.decode` (bytes for `write`).
 pub fn install_codecs(lua: &Lua) -> mlua::Result<()> {
     let json = lua.create_table()?;
-    json.set("encode", lua.create_function(|_, value: Value| serde_json::to_string(&values::copy_out(value)?).map_err(mlua::Error::external))?)?;
-    json.set("decode", lua.create_function(|lua, text: mlua::LuaString| {
-        let value: serde_json::Value = serde_json::from_slice(&text.as_bytes()).map_err(|e| mlua::Error::runtime(format!("invalid JSON: {e}")))?;
-        values::validate(&value)?;
-        values::copy_in(lua, &value)
-    })?)?;
+    json.set(
+        "encode",
+        lua.create_function(|_, value: Value| {
+            serde_json::to_string(&values::copy_out(value)?).map_err(mlua::Error::external)
+        })?,
+    )?;
+    json.set(
+        "decode",
+        lua.create_function(|lua, text: mlua::LuaString| {
+            let value: serde_json::Value = serde_json::from_slice(&text.as_bytes())
+                .map_err(|e| mlua::Error::runtime(format!("invalid JSON: {e}")))?;
+            values::validate(&value)?;
+            values::copy_in(lua, &value)
+        })?,
+    )?;
     json.set_readonly(true);
     lua.globals().set("json", json)?;
     let b64 = lua.create_table()?;
-    b64.set("decode", lua.create_function(|lua, text: String| {
-        use base64::Engine;
-        let text: String = text.split_ascii_whitespace().collect();
-        let bytes = base64::engine::general_purpose::STANDARD.decode(text).map_err(|e| mlua::Error::runtime(format!("invalid base64: {e}")))?;
-        lua.create_string(bytes)
-    })?)?;
+    b64.set(
+        "decode",
+        lua.create_function(|lua, text: String| {
+            use base64::Engine;
+            let text: String = text.split_ascii_whitespace().collect();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(|e| mlua::Error::runtime(format!("invalid base64: {e}")))?;
+            lua.create_string(bytes)
+        })?,
+    )?;
     b64.set_readonly(true);
     lua.globals().set("base64", b64)?;
-    lua.globals().set("nonce", lua.create_function(|_, ()| Ok(nonce()?))?)
+    lua.globals()
+        .set("nonce", lua.create_function(|_, ()| Ok(nonce()?))?)
 }
 
 /// Fresh OS entropy, for a seed that no earlier call or fixed PRNG state can predict: 32 URL-safe characters.
@@ -156,20 +252,41 @@ pub fn definition(table: &Table) -> Result<Definition> {
     let http: BTreeMap<String, Endpoint> = data(table, "http")?;
     let mut capabilities: Capabilities = data(table, "capabilities")?;
     // `http.request` comes with declared endpoints, and MCP is the agent's own; a tool cannot request either.
-    if let Some(cap) = capabilities.0.iter().find(|c| matches!(c, Capability::HttpRequest | Capability::McpCall)) {
+    if let Some(cap) = capabilities
+        .0
+        .iter()
+        .find(|c| matches!(c, Capability::HttpRequest | Capability::McpCall))
+    {
         anyhow::bail!("unsupported tool capability {cap}");
     }
     for (name, endpoint) in &http {
         ensure!(identifier(name), "invalid endpoint name {name:?}");
         let base = template(&endpoint.url)?.base;
-        ensure!(matches!(endpoint.method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE"), "unsupported HTTP method");
+        ensure!(
+            matches!(
+                endpoint.method.as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+            ),
+            "unsupported HTTP method"
+        );
         reqwest::header::HeaderName::from_bytes(endpoint.header.as_bytes())?;
         if let Some(secret) = &endpoint.secret {
-            ensure!(!secret.is_empty() && secret.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'), "invalid secret name");
-            ensure!(base.scheme() == "https" || crate::net::is_loopback(&base), "authenticated endpoints require HTTPS (except loopback)");
+            ensure!(
+                !secret.is_empty()
+                    && secret
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_'),
+                "invalid secret name"
+            );
+            ensure!(
+                base.scheme() == "https" || crate::net::is_loopback(&base),
+                "authenticated endpoints require HTTPS (except loopback)"
+            );
         }
     }
-    if !http.is_empty() { capabilities.0.insert(Capability::HttpRequest); }
+    if !http.is_empty() {
+        capabilities.0.insert(Capability::HttpRequest);
+    }
     let methods: Table = table.get("tools")?;
     ensure!(methods.metatable().is_none(), "tools must be a plain table");
     let mut tools = BTreeMap::new();
@@ -177,15 +294,37 @@ pub fn definition(table: &Table) -> Result<Definition> {
         let (name, method) = pair?;
         ensure!(identifier(&name), "invalid tool method {name:?}");
         fields(&method, &["signature", "description", "run"])?;
-        method.get::<Function>("run").context("tool method needs a run function")?;
+        method
+            .get::<Function>("run")
+            .context("tool method needs a run function")?;
         let signature: String = method.get("signature")?;
         let description: String = method.get("description")?;
-        ensure!(signature.starts_with(&format!("{name}(")) || signature.starts_with(&format!("{name}{{")), "signature must start with {name}( or {name}{{");
-        ensure!(signature.len() <= 2000 && description.len() <= 4000 && !description.trim().is_empty(), "tool signature/description is empty or too long");
-        tools.insert(name, Method { signature, description });
+        ensure!(
+            signature.starts_with(&format!("{name}("))
+                || signature.starts_with(&format!("{name}{{")),
+            "signature must start with {name}( or {name}{{"
+        );
+        ensure!(
+            signature.len() <= 2000 && description.len() <= 4000 && !description.trim().is_empty(),
+            "tool signature/description is empty or too long"
+        );
+        tools.insert(
+            name,
+            Method {
+                signature,
+                description,
+            },
+        );
     }
-    ensure!(!tools.is_empty(), "tool namespace must export at least one method");
-    Ok(Definition { http, capabilities, tools })
+    ensure!(
+        !tools.is_empty(),
+        "tool namespace must export at least one method"
+    );
+    Ok(Definition {
+        http,
+        capabilities,
+        tools,
+    })
 }
 
 /// Registration (`inspect`) runs a tool file under these: CPU seconds and memory.
@@ -197,26 +336,54 @@ pub(crate) const HTTP_MAX_BODY: usize = 8 << 20;
 
 fn inspect(text: &str) -> Result<Definition> {
     let lua = Lua::new();
-    for key in ["_G", "os", "coroutine", "getfenv", "setfenv", "loadstring", "require", "print"] { lua.globals().set(key, Value::Nil)?; }
+    for key in [
+        "_G",
+        "os",
+        "coroutine",
+        "getfenv",
+        "setfenv",
+        "loadstring",
+        "require",
+        "print",
+    ] {
+        lua.globals().set(key, Value::Nil)?;
+    }
     let math: Table = lua.globals().get("math")?;
-    math.set("random", Value::Nil)?; math.set("randomseed", Value::Nil)?;
+    math.set("random", Value::Nil)?;
+    math.set("randomseed", Value::Nil)?;
     lua.set_memory_limit(REGISTER_MEMORY)?;
     let deadline = Instant::now() + Duration::from_secs(REGISTER_SECS);
     lua.set_interrupt(move |_| {
-        if Instant::now() >= deadline { return Err(mlua::Error::runtime("tool registration time budget exceeded")); }
+        if Instant::now() >= deadline {
+            return Err(mlua::Error::runtime(
+                "tool registration time budget exceeded",
+            ));
+        }
         Ok(mlua::VmState::Continue)
     });
     lua.sandbox(true)?;
-    definition(&lua.load(text).set_name("=tool registration").eval::<Table>()?)
+    definition(
+        &lua.load(text)
+            .set_name("=tool registration")
+            .eval::<Table>()?,
+    )
 }
 
 /// Environment > the workspace's secrets > the user's (both in hx's configuration directory, `crate::dirs`). No
 /// recursive scans or shell evaluation of credential files.
 fn secret(dirs: &Dirs, root: &Path, name: &str) -> Result<String> {
-    if let Ok(value) = std::env::var(name) && !value.trim().is_empty() { return Ok(value); }
+    if let Ok(value) = std::env::var(name)
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
     for path in [dirs.workspace(root).secrets, dirs.user_secrets()] {
         match std::fs::symlink_metadata(&path) {
-            Ok(meta) => ensure!(meta.file_type().is_file(), "secrets file must be a regular file: {}", path.display()),
+            Ok(meta) => ensure!(
+                meta.file_type().is_file(),
+                "secrets file must be a regular file: {}",
+                path.display()
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => anyhow::bail!("cannot inspect secrets file {}", path.display()),
         }
@@ -226,32 +393,77 @@ fn secret(dirs: &Dirs, root: &Path, name: &str) -> Result<String> {
             Err(_) => anyhow::bail!("cannot read secrets file {}", path.display()),
         };
         // Parse errors can quote their input, so never propagate TOML's diagnostic here.
-        let secrets: BTreeMap<String, String> = toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid secrets file {} (expected NAME = \"value\")", path.display()))?;
-        if let Some(value) = secrets.get(name).filter(|v| !v.trim().is_empty()) { return Ok(value.clone()); }
+        let secrets: BTreeMap<String, String> = toml::from_str(&text).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid secrets file {} (expected NAME = \"value\")",
+                path.display()
+            )
+        })?;
+        if let Some(value) = secrets.get(name).filter(|v| !v.trim().is_empty()) {
+            return Ok(value.clone());
+        }
     }
-    anyhow::bail!("missing credential {name}; set it in the environment, the workspace's secrets.toml or your own (see `hx paths`)")
+    anyhow::bail!(
+        "missing credential {name}; set it in the environment, the workspace's secrets.toml or your own (see `hx paths`)"
+    )
 }
 
 pub fn credentials(dirs: &Dirs, root: &Path, def: &Definition) -> Result<()> {
     for endpoint in def.http.values() {
         if let Some(name) = &endpoint.secret {
             let value = secret(dirs, root, name)?;
-            reqwest::header::HeaderValue::from_str(&value).map_err(|_| anyhow::anyhow!("credential {name} is not a valid HTTP header value"))?;
-            ensure!(!endpoint.bearer || !value.starts_with("Bearer "), "credential {name} must be the bare token: bearer = true adds the \"Bearer \" prefix");
+            reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                anyhow::anyhow!("credential {name} is not a valid HTTP header value")
+            })?;
+            ensure!(
+                !endpoint.bearer || !value.starts_with("Bearer "),
+                "credential {name} must be the bare token: bearer = true adds the \"Bearer \" prefix"
+            );
         }
     }
     Ok(())
 }
 
-pub fn capture<'a>(dirs: &Dirs, root: &Path, files: impl Iterator<Item = (&'a str, &'a [u8])>, registry: &mut Registry) -> Result<()> {
+pub fn capture<'a>(
+    dirs: &Dirs,
+    root: &Path,
+    files: impl Iterator<Item = (&'a str, &'a [u8])>,
+    registry: &mut Registry,
+) -> Result<()> {
     for (file, bytes) in files {
-        let Some(name) = file.strip_suffix(".lua").or_else(|| file.strip_suffix(".luau")).filter(|n| !n.contains('/')) else { continue };
+        let Some(name) = file
+            .strip_suffix(".lua")
+            .or_else(|| file.strip_suffix(".luau"))
+            .filter(|n| !n.contains('/'))
+        else {
+            continue;
+        };
         let name = name.to_string();
         let result = (|| -> Result<(String, Definition)> {
             ensure!(identifier(&name), "invalid tool namespace {name:?}");
-            ensure!(!["tools", "skills", "skill", "mcp", "deftool", "promote", "propose_module", "view", "hx", "agent"].contains(&name.as_str()), "reserved tool namespace {name}");
-            ensure!(!registry.tools.contains_key(&name) && !registry.tool_errors.contains_key(&name), "duplicate tool namespace {name}");
-            let text = std::str::from_utf8(bytes).context("tool is not UTF-8")?.to_string();
+            ensure!(
+                ![
+                    "tools",
+                    "skills",
+                    "skill",
+                    "mcp",
+                    "deftool",
+                    "promote",
+                    "propose_module",
+                    "view",
+                    "hx",
+                    "agent"
+                ]
+                .contains(&name.as_str()),
+                "reserved tool namespace {name}"
+            );
+            ensure!(
+                !registry.tools.contains_key(&name) && !registry.tool_errors.contains_key(&name),
+                "duplicate tool namespace {name}"
+            );
+            let text = std::str::from_utf8(bytes)
+                .context("tool is not UTF-8")?
+                .to_string();
             let def = inspect(&text)?;
             credentials(dirs, root, &def)?;
             Ok((text, def))
@@ -259,17 +471,27 @@ pub fn capture<'a>(dirs: &Dirs, root: &Path, files: impl Iterator<Item = (&'a st
         match result {
             Ok((text, def)) => {
                 let id = format!("tool:{name}");
-                registry.capabilities.insert(id.clone(), def.capabilities.clone());
-                registry.sources.insert(id.clone(), Source { text, origin: format!(".harness/tools/{file}"), is_override: false, pkg: Some((id, def.capabilities.clone())) });
+                registry
+                    .capabilities
+                    .insert(id.clone(), def.capabilities.clone());
+                registry.sources.insert(
+                    id.clone(),
+                    Source {
+                        text,
+                        origin: format!(".harness/tools/{file}"),
+                        is_override: false,
+                        pkg: Some((id, def.capabilities.clone())),
+                    },
+                );
                 registry.tools.insert(name, def);
-            },
+            }
             Err(error) => {
                 // A duplicate invalidates both files, independently of directory enumeration order.
                 registry.tools.remove(&name);
                 registry.sources.remove(&format!("tool:{name}"));
                 registry.capabilities.remove(&format!("tool:{name}"));
                 registry.tool_errors.insert(name, error.to_string());
-            },
+            }
         }
     }
     Ok(())
@@ -277,20 +499,43 @@ pub fn capture<'a>(dirs: &Dirs, root: &Path, files: impl Iterator<Item = (&'a st
 
 pub fn exports(lua: &Lua, table: Table, expected: &Definition) -> mlua::Result<Table> {
     let actual = definition(&table).map_err(mlua::Error::external)?;
-    if actual != *expected { return Err(mlua::Error::runtime("tool definition changed shape after registration")); }
+    if actual != *expected {
+        return Err(mlua::Error::runtime(
+            "tool definition changed shape after registration",
+        ));
+    }
     let methods: Table = table.get("tools")?;
     let exports = lua.create_table()?;
-    for name in expected.tools.keys() { exports.set(name.as_str(), methods.get::<Table>(name.as_str())?.get::<Function>("run")?)?; }
+    for name in expected.tools.keys() {
+        exports.set(
+            name.as_str(),
+            methods
+                .get::<Table>(name.as_str())?
+                .get::<Function>("run")?,
+        )?;
+    }
     Ok(exports)
 }
 
-pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definition) -> mlua::Result<()> {
+pub fn install_http(
+    lua: &Lua,
+    fx: Arc<Effects>,
+    namespace: String,
+    def: Definition,
+) -> mlua::Result<()> {
     // One client per endpoint: its fixed origin decides the proxy rule (a loopback origin never goes through one).
-    let clients = def.http.iter().map(|(name, spec)| {
-        let base = template(&spec.url).map_err(mlua::Error::external)?.base;
-        let client = crate::net::client(&base).timeout(Duration::from_secs(HTTP_TIMEOUT_SECS)).build().map_err(mlua::Error::external)?;
-        Ok((name.clone(), client))
-    }).collect::<mlua::Result<BTreeMap<_, _>>>()?;
+    let clients = def
+        .http
+        .iter()
+        .map(|(name, spec)| {
+            let base = template(&spec.url).map_err(mlua::Error::external)?.base;
+            let client = crate::net::client(&base)
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .build()
+                .map_err(mlua::Error::external)?;
+            Ok((name.clone(), client))
+        })
+        .collect::<mlua::Result<BTreeMap<_, _>>>()?;
     let clients = Arc::new(clients);
     lua.globals().set("http", lua.create_async_function(move |lua, (endpoint, args): (String, Value)| {
         let (fx, clients, namespace, def) = (fx.clone(), clients.clone(), namespace.clone(), def.clone());
@@ -368,33 +613,62 @@ pub fn install_http(lua: &Lua, fx: Arc<Effects>, namespace: String, def: Definit
 fn redact(value: &mut serde_json::Value, key: &str) {
     match value {
         serde_json::Value::String(s) => *s = s.replace(key, "[redacted]"),
-        serde_json::Value::Array(items) => { for item in items { redact(item, key); } },
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact(item, key);
+            }
+        }
         serde_json::Value::Object(fields) => {
-            *fields = std::mem::take(fields).into_iter().map(|(name, mut value)| {
-                redact(&mut value, key);
-                (name.replace(key, "[redacted]"), value)
-            }).collect();
-        },
-        _ => {},
+            *fields = std::mem::take(fields)
+                .into_iter()
+                .map(|(name, mut value)| {
+                    redact(&mut value, key);
+                    (name.replace(key, "[redacted]"), value)
+                })
+                .collect();
+        }
+        _ => {}
     }
 }
 
 /// Bind all methods together, rejecting collisions before touching the session environment.
-pub fn install(lua: &Lua, env: &Table, supervisor: Arc<crate::supervisor::Supervisor>, host: Option<Arc<crate::host::Host>>, caller: Arc<Effects>) -> Result<Vec<String>> {
+pub fn install(
+    lua: &Lua,
+    env: &Table,
+    supervisor: Arc<crate::supervisor::Supervisor>,
+    host: Option<Arc<crate::host::Host>>,
+    caller: Arc<Effects>,
+) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    for (name, error) in &supervisor.registry.tool_errors { eprintln!("warning: tool {name} registration failed: {error}"); }
+    for (name, error) in &supervisor.registry.tool_errors {
+        eprintln!("warning: tool {name} registration failed: {error}");
+    }
     for (name, def) in &supervisor.registry.tools {
         let result = (|| -> Result<Table> {
-            ensure!(env.get::<Value>(name.as_str())?.is_nil(), "namespace {name} is already in use");
+            ensure!(
+                env.get::<Value>(name.as_str())?.is_nil(),
+                "namespace {name} is already in use"
+            );
             credentials(&supervisor.policy.dirs, &supervisor.policy.workspace, def)?;
-            Ok(crate::packages::proxy(lua, supervisor.clone(), host.clone(), &format!("tool:{name}"), caller.clone())?)
+            Ok(crate::packages::proxy(
+                lua,
+                supervisor.clone(),
+                host.clone(),
+                &format!("tool:{name}"),
+                caller.clone(),
+            )?)
         })();
         match result {
             Ok(table) => {
                 table.set_readonly(true);
                 env.raw_set(name.as_str(), table)?;
-                for method in def.tools.values() { lines.push(format!("- {name}.{}  -- {}", method.signature, method.description)); }
-            },
+                for method in def.tools.values() {
+                    lines.push(format!(
+                        "- {name}.{}  -- {}",
+                        method.signature, method.description
+                    ));
+                }
+            }
             Err(error) => eprintln!("warning: tool {name} registration failed: {error}"),
         }
     }
@@ -412,36 +686,96 @@ mod tests {
 
     #[test]
     fn template_rejects_origin_placeholders_queries_and_partial_segments() {
-        for bad in ["https://{host}/api", "https://{host}:8080/api", "https://api.{domain}.com/v1", "https://openrouter.ai:{port}/api", "https://{user}@{host}/api",
-            "https://u:p@openrouter.ai/api", "ftp://openrouter.ai/x", "openrouter.ai/x", "https://openrouter.ai/api?q={search}", "https://openrouter.ai/api#frag",
-            "https://openrouter.ai/{a/b}/foo", "https://openrouter.ai/{}/foo", "https://openrouter.ai/{unclosed", "https://openrouter.ai/foo}bar",
-            "https://openrouter.ai/{nested{p}}", "https://openrouter.ai/v{id}", "https://openrouter.ai/../foo", "https://openrouter.ai/%2E%2E/foo", r"https://openrouter.ai/a\..\b"] {
+        for bad in [
+            "https://{host}/api",
+            "https://{host}:8080/api",
+            "https://api.{domain}.com/v1",
+            "https://openrouter.ai:{port}/api",
+            "https://{user}@{host}/api",
+            "https://u:p@openrouter.ai/api",
+            "ftp://openrouter.ai/x",
+            "openrouter.ai/x",
+            "https://openrouter.ai/api?q={search}",
+            "https://openrouter.ai/api#frag",
+            "https://openrouter.ai/{a/b}/foo",
+            "https://openrouter.ai/{}/foo",
+            "https://openrouter.ai/{unclosed",
+            "https://openrouter.ai/foo}bar",
+            "https://openrouter.ai/{nested{p}}",
+            "https://openrouter.ai/v{id}",
+            "https://openrouter.ai/../foo",
+            "https://openrouter.ai/%2E%2E/foo",
+            r"https://openrouter.ai/a\..\b",
+        ] {
             assert!(template(bad).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn template_fills_whole_segments_and_keeps_the_origin() {
-        assert_eq!(url("https://openrouter.ai/api/v1/credits", json!({})).unwrap(), "https://openrouter.ai/api/v1/credits");
-        assert_eq!(url("https://openrouter.ai", json!({})).unwrap(), "https://openrouter.ai/");
-        assert_eq!(url("http://127.0.0.1:8080/{id}/{id}", json!({"id": 7})).unwrap(), "http://127.0.0.1:8080/7/7");
-        assert_eq!(url("https://openrouter.ai/{provider}/{model_id}/llms.txt", json!({"provider": "qwen", "model_id": "a/../b"})).unwrap(),
-            "https://openrouter.ai/qwen/a%2F..%2Fb/llms.txt");
-        assert_eq!(url("https://openrouter.ai/{p}", json!({"p": "//evil.example/@u?x#f"})).unwrap(), "https://openrouter.ai/%2F%2Fevil.example%2F%40u%3Fx%23f");
-        let mut args = json!({"job_id": "j1", "q": "keep"}).as_object().unwrap().clone();
-        template("https://openrouter.ai/videos/{job_id}").unwrap().url(&mut args).unwrap();
+        assert_eq!(
+            url("https://openrouter.ai/api/v1/credits", json!({})).unwrap(),
+            "https://openrouter.ai/api/v1/credits"
+        );
+        assert_eq!(
+            url("https://openrouter.ai", json!({})).unwrap(),
+            "https://openrouter.ai/"
+        );
+        assert_eq!(
+            url("http://127.0.0.1:8080/{id}/{id}", json!({"id": 7})).unwrap(),
+            "http://127.0.0.1:8080/7/7"
+        );
+        assert_eq!(
+            url(
+                "https://openrouter.ai/{provider}/{model_id}/llms.txt",
+                json!({"provider": "qwen", "model_id": "a/../b"})
+            )
+            .unwrap(),
+            "https://openrouter.ai/qwen/a%2F..%2Fb/llms.txt"
+        );
+        assert_eq!(
+            url(
+                "https://openrouter.ai/{p}",
+                json!({"p": "//evil.example/@u?x#f"})
+            )
+            .unwrap(),
+            "https://openrouter.ai/%2F%2Fevil.example%2F%40u%3Fx%23f"
+        );
+        let mut args = json!({"job_id": "j1", "q": "keep"})
+            .as_object()
+            .unwrap()
+            .clone();
+        template("https://openrouter.ai/videos/{job_id}")
+            .unwrap()
+            .url(&mut args)
+            .unwrap();
         assert_eq!(serde_json::Value::Object(args), json!({"q": "keep"}));
-        for bad in [json!({}), json!({"p": {}}), json!({"p": ".."}), json!({"p": ""})] { assert!(url("https://openrouter.ai/{p}", bad).is_err()); }
+        for bad in [
+            json!({}),
+            json!({"p": {}}),
+            json!({"p": ".."}),
+            json!({"p": ""}),
+        ] {
+            assert!(url("https://openrouter.ai/{p}", bad).is_err());
+        }
     }
 
     #[test]
     fn test_encode_path_segment() {
         assert_eq!(encode_path_segment("gpt-4o").unwrap(), "gpt-4o");
-        assert_eq!(encode_path_segment("claude-3.5-sonnet").unwrap(), "claude-3.5-sonnet");
-        assert_eq!(encode_path_segment("laguna-s-2.1:free").unwrap(), "laguna-s-2.1:free");
+        assert_eq!(
+            encode_path_segment("claude-3.5-sonnet").unwrap(),
+            "claude-3.5-sonnet"
+        );
+        assert_eq!(
+            encode_path_segment("laguna-s-2.1:free").unwrap(),
+            "laguna-s-2.1:free"
+        );
         assert_eq!(encode_path_segment("v1..2").unwrap(), "v1..2");
         assert_eq!(encode_path_segment("foo bar").unwrap(), "foo%20bar");
         assert_eq!(encode_path_segment(r"foo\bar").unwrap(), "foo%5Cbar");
-        for bad in ["", ".", ".."] { assert!(encode_path_segment(bad).is_err()); }
+        for bad in ["", ".", ".."] {
+            assert!(encode_path_segment(bad).is_err());
+        }
     }
 }
