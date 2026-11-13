@@ -58,37 +58,61 @@ impl Supervisor {
         }
         Ok(())
     }
+    /// Stamp effect records with their stage; verify-stage shell records also carry the project observation they ran
+    /// against (intent) and left behind (outcome). Records hold only a reference: the inventory is one blob.
     pub fn workflow_effect_metadata(&self, tool: Tool, fields: &mut Value) -> Result<()> {
-        let stage = self
-            .workflow
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|f| f.stage.as_ref().map(|a| a.spec.clone()));
-        if let Some(stage) = stage {
+        let outcome = fields.get("ret").is_some();
+        let plan = {
+            let mut store = self.workflow.lock().unwrap();
+            let Some(frame) = store.as_mut() else { return Ok(()) };
+            let Some(stage) = frame.stage.as_ref().map(|a| &a.spec) else { return Ok(()) };
             fields["workflow_stage"] = json!(stage.id);
-            if matches!(tool, Tool::Sh) && stage.verify {
-                let plan = self
-                    .workflow
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|f| f.check_plan.clone())
-                    .unwrap_or_default();
-                match observe_checks(&self.policy.workspace, &plan) {
-                    Ok(observation) => {
-                        fields["project_observation"] = serde_json::to_value(observation)?
-                    }
-                    Err(error) if fields.get("ret").is_some() => {
-                        fields["project_observation_error"] = json!(error.to_string())
-                    }
-                    Err(error) => return Err(error),
-                }
+            if !stage.verify {
+                return Ok(());
             }
+            if !matches!(tool, Tool::Sh) {
+                // Any other admitted effect may change the project, so the next check's intent observes afresh.
+                if !outcome {
+                    frame.last_observation = None;
+                }
+                return Ok(());
+            }
+            // Mutations are serialized and every journaled one clears the cache, so the previous record's observation
+            // is the project this shell starts from. A writer outside the journal is not covered either way
+            // (docs/workflows.md); its change surfaces as this check's stale intent or changed outcome.
+            if !outcome && let Some(cached) = &frame.last_observation {
+                fields["project_observation"] = serde_json::to_value(cached)?;
+                return Ok(());
+            }
+            frame.check_plan.clone()
+        };
+        let observed = observe_checks(&self.policy.workspace, &plan).and_then(|o| o.record(&self.policy.log));
+        let cached = observed.as_ref().ok().cloned();
+        // A record without an observation can never be check evidence, so an unobservable project leaves the
+        // shell usable for diagnosis; stage.submit reports the reason as a verification finding.
+        match observed {
+            Ok(observation) => fields["project_observation"] = serde_json::to_value(observation)?,
+            Err(error) => fields["project_observation_error"] = json!(error.to_string()),
+        }
+        if let Some(frame) = self.workflow.lock().unwrap().as_mut() {
+            frame.last_observation = cached;
         }
         Ok(())
     }
-    pub fn submit_stage(&self, epoch: Option<u64>, mut payload: Value) -> Result<String> {
+    /// Whether `stage.submit` raised since the last call; host.rs marks that chunk's result as a protocol failure.
+    pub fn take_submit_failure(&self) -> bool {
+        self.workflow.lock().unwrap().as_mut().is_some_and(|f| std::mem::take(&mut f.submit_failed))
+    }
+    pub fn submit_stage(&self, epoch: Option<u64>, payload: Value) -> Result<String> {
+        let result = self.prepare_submission(epoch, payload);
+        if result.is_err()
+            && let Some(frame) = self.workflow.lock().unwrap().as_mut()
+        {
+            frame.submit_failed = true;
+        }
+        result
+    }
+    fn prepare_submission(&self, epoch: Option<u64>, mut payload: Value) -> Result<String> {
         self.check()?;
         validate_submission(&payload).context("stage.submit")?;
         ensure!(
@@ -114,25 +138,26 @@ impl Supervisor {
             "stage.submit may only be called once"
         );
         let stage = &active.spec;
+        // Only program design plans checks. Refusing here keeps this a correctable stage.submit error; at the
+        // boundary it would be a process error after the stage's work was spent.
+        ensure!(
+            stage.access == StageAccess::Inspect || planned_checks(&payload)?.is_empty(),
+            "stage.submit: a workspace stage cannot replace the accepted check plan; omit checks"
+        );
         if stage.verify {
-            let observation = observe_checks(
-                &self.policy.workspace,
-                &self
-                    .workflow
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|f| f.check_plan.clone())
-                    .unwrap_or_default(),
-            )?;
-            let records = eventlog::load(&self.policy.log.path)?;
-            let result = check_result(
-                &frame.check_plan,
-                &payload,
-                &records,
-                &stage.id,
-                &observation,
-            )?;
+            let (result, project_finding, unobserved) = match observe_checks(&self.policy.workspace, &frame.check_plan) {
+                Ok(observation) => {
+                    let records = eventlog::load(&self.policy.log.path)?;
+                    let result = check_result(&frame.check_plan, &payload, &records, &stage.id, &observation)?;
+                    let changed = frame.observation.as_ref().is_none_or(|o| o.digest != observation.digest);
+                    (result, changed.then(|| "Project changed during verification; run a fresh verification after final edits.".to_string()), observation.unobserved())
+                }
+                // An unobservable project fails verification with the reason, so repair can fix it.
+                Err(error) => {
+                    let failed = frame.check_plan.iter().map(|c| format!("{}: project unobservable", c.id)).collect();
+                    (VerificationSummary { failed, ..Default::default() }, Some(format!("Project inventory could not be observed: {error}")), vec![])
+                }
+            };
             let mut findings = result.failed.clone();
             findings.extend(
                 result
@@ -143,15 +168,12 @@ impl Supervisor {
             if frame.check_plan.is_empty() {
                 findings.push("No executable acceptance checks were planned.".into());
             }
-            if frame
-                .observation
-                .as_ref()
-                .is_none_or(|o| o.digest != observation.digest)
-            {
-                findings.push("Project changed during verification; run a fresh verification after final edits.".into());
-            }
+            findings.extend(project_finding);
             payload["verification"] =
                 json!({"passed":findings.is_empty(),"findings":findings,"checks":result});
+            if !unobserved.is_empty() {
+                payload["verification"]["unobserved"] = json!(unobserved);
+            }
         } else {
             // Native facts cannot be forged by including a field with this name.
             payload.as_object_mut().unwrap().remove("verification");
@@ -295,12 +317,9 @@ impl Host {
             .map(String::from_utf8)
             .transpose()?
             .unwrap_or_default();
-        validate_review_decision(
-            &request,
-            decision["decision"].as_str().unwrap_or(""),
-            Some(&text),
-        )?;
-        if decision["decision"] == "approve"
+        let kind = Decision::parse(decision["decision"].as_str().unwrap_or(""))?;
+        validate_review_decision(request, kind, Some(&text))?;
+        if kind == Decision::Approve
             && let Some(project) = &request.project
         {
             ensure!(
@@ -314,7 +333,7 @@ impl Host {
         next.owner_inputs.push(OwnerInputRef {
             id: id.clone(),
             gate_id: request.gate_id.clone(),
-            decision: decision["decision"].as_str().unwrap().into(),
+            decision: kind,
             content_blob: decision["content_blob"].as_str().map(String::from),
             check_ids: request.check_ids.clone(),
             artifacts: request.artifacts.clone(),
@@ -400,7 +419,7 @@ impl Host {
                 stage_id: stage.id.clone(),
                 dependencies: stage.inputs.clone(),
             };
-            sealed = Some(json!({"id":artifact.id,"submission":artifact.id}));
+            sealed = Some(json!({"id":artifact.id}));
             frame.artifacts.push(artifact);
         } else {
             // A reducer may reject malformed phase-specific data and keep working,
@@ -420,15 +439,25 @@ impl Host {
                 }
                 frame.stage_epoch += 1;
                 frame.stage = Some(ActiveStage { spec: stage.clone(), submission: None });
-                frame.evidence.clear();
-                frame.observation = if stage.verify {
-                    Some(observe_checks(&self.workspace, &frame.check_plan)?)
+                frame.submit_failed = false;
+                // An unobservable project is reported to the verifier and fails its submission with the reason
+                // (repair can fix it); it must not end the process after the earlier stages' work was spent.
+                let (observation, project) = if stage.verify {
+                    match observe_checks(&self.workspace, &frame.check_plan) {
+                        Ok(o) => {
+                            let r = o.record(&self.policy.log)?;
+                            (Some(r.clone()), json!({"digest":r.digest,"unobserved":r.unobserved}))
+                        }
+                        Err(error) => (None, json!({"error":error.to_string()})),
+                    }
                 } else {
-                    None
+                    (None, Value::Null)
                 };
+                frame.observation = observation.clone();
+                frame.last_observation = observation;
                 let event = crate::controller::Event::BoundaryReady { document: document_event(&frame, &self.policy.log)?,
                     stage: serde_json::to_value(&stage)?, sealed,
-                    metadata: json!({"workspace":self.workspace,"files":crate::host::file_tree(&self.workspace),"check_plan":frame.check_plan,"project":frame.observation}) }.to_json();
+                    metadata: json!({"workspace":self.workspace,"files":crate::host::file_tree(&self.workspace),"check_plan":frame.check_plan,"project":project}) }.to_json();
                 frame.pending_event = Some(event);
                 RunState::Running {
                     controller: controller.clone(),
@@ -441,10 +470,11 @@ impl Host {
                         "unknown review artifact {id}"
                     );
                 }
-                if request.kind == "acceptance" {
+                if request.kind == GateKind::Acceptance {
                     request.project = frame.observation.clone();
                 }
-                let report = json!({"finished":false,"final_answer":if request.kind=="input" {"Owner input required."} else {"Artifact ready for review."},"workflow":"rpi","status":if request.kind=="input" {"needs_input"} else {"awaiting_review"},"stage":frame.stage.as_ref().map(|a|&a.spec.name),"gate":request,"artifact_directory":self.workspace.join(".agents/artifacts").join(format!("rpi-{}",self.policy.log.session)),"next_command":format!("hx review {} --gate {} --decision {}",self.policy.log.path.display(),request.gate_id,if request.kind=="input" {"answer --input-file answers.md"} else {"approve"})});
+                let input = request.kind == GateKind::Input;
+                let report = json!({"finished":false,"final_answer":if input {"Owner input required."} else {"Artifact ready for review."},"workflow":"rpi","status":if input {"needs_input"} else {"awaiting_review"},"stage":frame.stage.as_ref().map(|a|&a.spec.name),"gate":request,"artifact_directory":self.workspace.join(".agents/artifacts").join(format!("rpi-{}",self.policy.log.session)),"next_command":format!("hx review {} --gate {} --decision {}",self.policy.log.path.display(),request.gate_id,if input {"answer --input-file answers.md"} else {"approve"})});
                 frame.stage = None;
                 frame.pending_event = None;
                 RunState::AwaitingReview {
@@ -521,8 +551,9 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
             Ok(std::fs::read_to_string(p)?)
         })
         .transpose()?;
+    let decision = Decision::parse(decision)?;
     validate_review_decision(&request, decision, text.as_deref())?;
-    if decision == "approve"
+    if decision == Decision::Approve
         && let Some(project) = &request.project
     {
         ensure!(
@@ -537,7 +568,7 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
         .find(|r| r["kind"] == "owner_decision" && r["gate_id"] == gate_id)
     {
         ensure!(
-            old["decision"] == decision && old["content_blob"] == json!(content_blob),
+            old["decision"] == json!(decision) && old["content_blob"] == json!(content_blob),
             "conflicting decision already recorded"
         );
         println!(

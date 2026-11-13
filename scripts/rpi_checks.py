@@ -187,6 +187,12 @@ def input_and_repair():
         value = report(run(path, "run", "--resume", value["log"]))
         assert value["finished"] and "repair" in script.seen and script.counts["verification"] == 2, (value, script.seen)
         assert "OWNER_ANSWER_SENTINEL" in harness.body_text(calls[-1])
+        # The restarted research worker sees the question it asked, not only the answer.
+        restarted = [harness.body_text(body) for body in calls if stage(body) == "research"][-1]
+        assert "restart-cause" in restarted and "Which greeting?" in restarted
+        # Repair sees the rejected verification it repairs.
+        repair = next(harness.body_text(body) for body in calls if stage(body) == "repair")
+        assert "REJECTED" in repair
 
 
 def acceptance_drift():
@@ -442,6 +448,68 @@ def native_admission_ceiling():
         assert len([r for r in harness.records(Path(value["log"])) if r["kind"] == "model_intent"]) == 4
 
 
+def submission_protocol_errors():
+    # Read errors that merely mention a submission are feedback; a workspace stage's check plan is a correctable error.
+    path = workspace("submission-protocol")
+    script = Script()
+    tried = {"research_questions": 0, "implementation": 0}
+    def answer(body, index):
+        name = stage(body)
+        if name == "research_questions" and tried[name] < 3:
+            tried[name] += 1
+            return harness.tool('read("src/submission_form.py")')
+        if name == "implementation" and not tried[name]:
+            tried[name] += 1
+            return harness.tool('write("result.txt","verified"); ' + submit(name, 'checks={{id="extra",command="true"}},'))
+        return script(body, index)
+    with harness.provider(answer) as (url, calls):
+        value = report(start(path, url))
+        assert value["finished"], value
+        implementation = [body for body in calls if stage(body) == "implementation"]
+        assert len(implementation) == 2 and "cannot replace the accepted check plan" in harness.body_text(implementation[1])
+
+
+def project_inventory_boundaries():
+    # An entry verification cannot observe is refused at launch, by name, before any provider work.
+    path = workspace("inventory-escape")
+    os.symlink("/etc/hostname", path / "outside-link")
+    subprocess.run(["git", "add", "outside-link"], cwd=path, check=True)
+    refused = start(path, "http://127.0.0.1:9", ok=False)
+    assert refused.returncode and "cannot observe the project inventory" in refused.stderr and "outside-link" in refused.stderr, refused.stderr
+    assert not any(r["kind"] == "manifest" for log in (path / ".harness").glob("log/*.jsonl") for r in harness.records(log))
+    # A nested repository is recorded as unobserved. An escape created mid-run fails verification with the reason
+    # (instead of the process), and repair can fix it.
+    path = workspace("inventory-nested")
+    nested = path / "vendor/lib"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=nested, check=True)
+    (nested / "code.txt").write_text("nested")
+    script = Script()
+    def answer(body, index):
+        name = stage(body)
+        if name == "implementation":
+            return harness.tool('write("result.txt","verified"); sh("ln -s /etc/hostname escape-link"); ' + submit(name))
+        if name == "repair":
+            return harness.tool('sh("rm escape-link"); ' + submit(name))
+        return script(body, index)
+    with harness.provider(answer) as (url, calls):
+        result = start(path, url)
+        assert "vendor/lib" in result.stderr, result.stderr
+        value = report(result)
+        assert value["finished"] and value["repairs"] == 1, value
+        verification = [a["submission"]["verification"] for a in value["artifact_refs"] if a["submission"].get("verification")]
+        assert "escape-link" in json.dumps(verification[0]["findings"]) and not verification[0]["passed"], verification[0]
+        assert verification[-1]["passed"] and verification[-1]["unobserved"] == ["vendor/lib"], verification[-1]
+        # Effect records, checkpoints and prompts carry the observation by reference; its blob holds the inventory once.
+        log = Path(value["log"])
+        observations = [r["project_observation"] for r in harness.records(log) if "project_observation" in r]
+        assert observations and all(set(o) <= {"digest", "blob", "extra_inputs", "unobserved"} for o in observations), observations[0]
+        inventory = json.loads((log.parent / "blobs" / observations[-1]["blob"]).read_text())["inventory"]
+        assert inventory["vendor/lib"] == "unobserved:repository" and "result.txt" in inventory
+        verify_bodies = [harness.body_text(body) for body in calls if stage(body) == "verification"]
+        assert verify_bodies and not any("file:0:" in text for text in verify_bodies)
+
+
 def check(name, fn):
     global passed
     if os.environ.get("HX_CHECK_FILTER") and os.environ["HX_CHECK_FILTER"] not in name:
@@ -465,4 +533,6 @@ if __name__ == "__main__":
     check("owner decisions survive record and consumption crashes exactly once", decision_crash_exactly_once)
     check("source edits after passing checks force repair and fresh verification", post_check_source_change)
     check("native RPI admission ceiling counts descendant model calls across resume", native_admission_ceiling)
+    check("only stage.submit refusals are protocol failures; workspace check plans are correctable", submission_protocol_errors)
+    check("project inventory: launch refusal, unobserved nested repositories, non-fatal verification", project_inventory_boundaries)
     print(f"{passed} passed; artifacts: {BASE}")

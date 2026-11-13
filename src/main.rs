@@ -469,10 +469,18 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
                 "--rpi requires a Git repository at workspace root ({}); initialize git with a .gitignore first",
                 policy.workspace.display()
             );
+            // Verification observes this inventory; an entry it cannot observe must fail here, not after the
+            // research-to-implementation stages have been paid for.
+            let observed = workflow::observe_project(&policy.workspace, &[], &[]).map_err(|e| anyhow::anyhow!(
+                "--rpi cannot observe the project inventory: {e:#}; remove that entry, or untrack and ignore it, before starting"))?;
+            let unobserved = observed.unobserved();
+            if !unobserved.is_empty() {
+                eprintln!("note: --rpi verification does not observe files inside submodules or nested Git repositories: {}", unobserved.join(", "));
+            }
         }
         let host = host::Host::start(cfg, policy, host::StartOptions {
             task, max_turns, trace, budget, packs: list_arg(args, "--pack"), branch,
-            workflow: has(args,"--rpi").then(|| workflow::WorkflowConfig { name:"rpi".into(),version:1,mode:if has(args,"--manual") {"manual"} else {"auto"}.into(),max_repairs:workflow::MAX_REPAIRS }),
+            workflow: has(args,"--rpi").then(|| workflow::WorkflowConfig { name:"rpi".into(),version:1,mode:if has(args,"--manual") {workflow::WorkflowMode::Manual} else {workflow::WorkflowMode::Auto},max_repairs:workflow::MAX_REPAIRS }),
         })?;
         if let Some((parent, _, _)) = inherited {
             host.policy.log.write("branch", serde_json::json!({"parent":parent.path}), true)?;
