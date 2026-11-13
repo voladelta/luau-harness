@@ -26,9 +26,10 @@
 //!
 //! Episodes are limited in model turns, not dollars. Rounds refine while refining moves a chosen candidate and explore
 //! again when it moves none; a round makes progress when it chooses a new candidate or lifts one by more than
-//! `min_delta`, and two rounds in a row without progress end the run. With no valid candidate after round 1 the run
-//! stops. The result is the audited good candidates of the last gate, best search score first: several distinct good
-//! answers, since the single best score is the one most likely to be an overfit or an evaluator hole.
+//! `min_delta` and the combined standard error of the two scores, and two rounds in a row without progress end the
+//! run. With no valid candidate after round 1 the run stops. The result is the audited good candidates of the last
+//! gate, best search score first: several distinct good answers, since the single best score is the one most likely to
+//! be an overfit or an evaluator hole.
 //!
 //! `episode` holds what runs inside an episode (`ar.eval`, `ar.claim`, `ar.claims`, `ar.reset`); `files` holds what
 //! crosses its boundary (snapshots, throwaway copies, the evaluator, the frozen base).
@@ -81,7 +82,9 @@ pub struct Spec {
     pub direction: String,
     #[serde(default = "Spec::timeout")]
     pub timeout: f64,
-    /// An eval improves on the best only by more than this (and more than the evaluator's reported `se`).
+    /// The margin, besides their combined standard error, by which a candidate's search score must beat the seed's
+    /// for the candidate to be good, and by which a chosen candidate's must beat its score at the last progress for a
+    /// round to make progress. A worker's state improves on its best by more than their combined standard error alone.
     #[serde(default)]
     pub min_delta: f64,
 }
@@ -175,6 +178,12 @@ fn estimate(dir: &Path, rows: &[Row], snap: &str) -> Option<Estimate> {
     let seed = std::fs::read_to_string(dir.join("seed")).is_ok_and(|s| s.trim() == snap);
     let baseline = seed.then(|| baseline(dir)).flatten().and_then(|b| Some((b.score?, b.se)));
     Estimate::of(rows.chain(baseline))
+}
+
+/// Whether the search evaluator is noisy: it has reported `se` for some evaluation of this run (the host's baseline
+/// included). A noisy evaluator's result is never reused for the same state, even one it scored without `se`.
+fn noisy(dir: &Path, rows: &[Row]) -> bool {
+    rows.iter().any(|r| r.se.is_some()) || baseline(dir).is_some_and(|b| b.se.is_some())
 }
 
 /// The host's search evaluation of the seed, written before any episode starts.
@@ -300,6 +309,23 @@ struct Candidate {
     audit: Option<bool>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     reason: String,
+}
+impl Candidate {
+    /// The estimate of its best state's search score, as the gate saw it.
+    fn estimate(&self) -> Option<Estimate> {
+        self.search.map(|mean| Estimate { mean, se: self.se })
+    }
+}
+
+/// Whether a round that chose `chosen` made progress since the round that last did, which left `at` (each chosen
+/// candidate with its estimate then): a candidate is new, or one beats its estimate then by more than `min_delta` and
+/// their combined standard error, the rule the gate uses against the seed. Re-scoring a state moves its mean but
+/// rarely by that much, so a candidate whose files did not change almost never makes progress.
+fn progress(spec: &Spec, chosen: &[&Candidate], at: &[(u32, Option<Estimate>)]) -> bool {
+    chosen.iter().any(|c| match at.iter().find(|(i, _)| *i == c.idea) {
+        None => true,
+        Some((_, before)) => c.estimate().is_some_and(|now| spec.beats(now, *before, spec.min_delta)),
+    })
 }
 
 /// Journal records. An episode is `started` before its child runs and `finished` after; resume closes one that never
@@ -542,7 +568,7 @@ impl Orchestrator {
         let better = if spec.direction == "max" { "higher" } else { "lower" };
         let mut t = format!("<tools>\n- `ar.eval(\"one-line note\")` scores the editable files ({}) with the owner's frozen evaluator and \
 returns {{n, score, valid, se, improved, best, report}}; {better} scores are better. Only states scored by ar.eval count. \
-A deterministic evaluator (no `se`) returns a state it already scored from its cache.\n\
+A deterministic evaluator (one that has reported no `se` in this run) returns a state it already scored from its cache.\n\
 - `ar` is a built-in global table like `sh` and `read`; `vars()` lists only your own globals, so call it directly.\n",
             spec.editable.join(", "));
         if matches!(role, Role::Explore | Role::Exploit) {
@@ -790,12 +816,11 @@ comes from a hole or a rule violation). Without that line the audit counts for n
         }
         self.plan("research", vec![Plan { label: "r0-research".into(), role: Role::Research, idea: 0, start: seed.clone(), best: None, seed: None }])?;
         self.run_batch("research").await?;
-        // Round 1 explores. A round makes progress when it chooses a new candidate or a chosen one beats its score at the
-        // last progress by more than `min_delta`, so small steps add up across rounds until they count. After exploring
-        // the run refines; it refines again while that moves a chosen candidate at all, and explores again after a
-        // refining round that moved none. Two rounds in a row without progress stop the run: every round that makes
-        // progress raises a score by more than `min_delta` or adds a candidate, so the run ends.
-        let (mut at, mut prev) = (Vec::<(u32, Option<f64>)>::new(), Vec::<(u32, String)>::new());
+        // Round 1 explores. A round makes progress as `progress` says, so small steps add up across rounds until they
+        // count. After exploring the run refines; it refines again while that moves a chosen candidate at all, and
+        // explores again after a refining round that moved none. Two rounds in a row without progress stop the run, so
+        // it ends once the search stops finding changes the evaluator can tell apart from its noise.
+        let (mut at, mut prev) = (Vec::<(u32, Option<Estimate>)>::new(), Vec::<(u32, String)>::new());
         let (mut explore, mut quiet) = (true, false);
         for round in 1.. {
             let batch = format!("round{round}");
@@ -832,10 +857,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             // With no candidate after a gate the run stops (in practice after round 1: later gates keep earlier candidates).
             if chosen.is_empty() { break; }
             let chosen: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).collect();
-            let progress = chosen.iter().any(|c| match at.iter().find(|(i, _)| *i == c.idea) {
-                None => true,
-                Some((_, before)) => c.search.is_some_and(|s| self.spec().better(s, *before, self.spec().min_delta)),
-            });
+            let progress = progress(self.spec(), &chosen, &at);
             let moved = chosen.iter().any(|c| !prev.contains(&(c.idea, c.snap.clone())));
             if !progress && quiet {
                 eprintln!("hx ar: two rounds in a row made no progress; stopping");
@@ -843,7 +865,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             }
             quiet = !progress;
             explore = !moved && plans.first().is_some_and(|p| p.role == Role::Exploit);
-            if progress { at = chosen.iter().map(|c| (c.idea, c.search)).collect(); }
+            if progress { at = chosen.iter().map(|c| (c.idea, c.estimate())).collect(); }
             prev = chosen.iter().map(|c| (c.idea, c.snap.clone())).collect();
         }
         let state = self.state()?;
@@ -1043,6 +1065,22 @@ mod tests {
         assert_eq!(attempts(&records, "round1", "r1-w1"), Attempts { started: 4, succeeded: false, crashes: 0 });
         records.extend([started("r1-w1.5", "r1-w1"), finished("r1-w1.5", false, false)]);
         assert!(attempts(&records, "round1", "r1-w1").succeeded);
+    }
+
+    #[test]
+    fn re_scoring_unchanged_files_is_not_progress() {
+        let spec: Spec = toml::from_str("editable = [\"x\"]\neval = \"true\"\n").unwrap();
+        let candidate = |mean: f64, se: Option<f64>| Candidate { idea: 1, claim: String::new(), snap: "s".into(),
+            search: Some(mean), se, select: None, good: true, audit: None, reason: String::new() };
+        let at = [(1, Some(Estimate { mean: 1.0, se: Some(0.5) }))];
+        // A second evaluation of the same state moved the mean by 0.3 and shrank its se to 0.35: well within noise.
+        assert!(!progress(&spec, &[&candidate(1.3, Some(0.35))], &at));
+        assert!(progress(&spec, &[&candidate(2.0, Some(0.35))], &at));
+        // A new candidate is progress; a deterministic one, any gain above min_delta.
+        assert!(progress(&spec, &[&Candidate { idea: 2, ..candidate(0.0, None) }], &at));
+        let exact = [(1, Some(Estimate { mean: 1.0, se: None }))];
+        assert!(progress(&spec, &[&candidate(1.01, None)], &exact));
+        assert!(!progress(&spec, &[&candidate(1.0, None)], &exact));
     }
 
     #[test]

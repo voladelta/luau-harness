@@ -73,12 +73,13 @@ pub async fn eval(pol: &Policy, note: String) -> Result<Value> {
         let held = lock_file(&dir.join("snaps").join(format!("{snap}.lock")))?;
         Ok((files, snap, held))
     }).await??;
-    // An evaluator that reports no `se` is deterministic: a state it already scored validly keeps its stored result. A
-    // probe, or a state its candidate already has, gets that result and no new ledger row; a state only another
-    // candidate scored is recorded for this one, judged against its best, without running the evaluator again.
+    // An evaluator that has never reported `se` in this run is deterministic: a state it already scored validly keeps
+    // its stored result. A probe, or a state its candidate already has, gets that result and no new ledger row; a state
+    // only another candidate scored is recorded for this one, judged against its best, without running the evaluator
+    // again.
     let rows = ledger(&episode.dir)?;
-    let stored = rows.iter().find(|r| r.snap == snap && r.valid && r.se.is_none());
-    if let Some(r) = stored.filter(|_| idea == 0 || rows.iter().any(|o| o.snap == snap && o.idea == idea && o.valid && o.se.is_none())) {
+    let stored = if noisy(&episode.dir, &rows) { None } else { rows.iter().find(|r| r.snap == snap && r.valid) };
+    if let Some(r) = stored.filter(|_| idea == 0 || rows.iter().any(|o| o.snap == snap && o.idea == idea && o.valid)) {
         let best = best_score(episode, progress, &rows);
         return Ok(json!({"n": r.n, "score": r.score, "valid": true, "se": null, "improved": false, "best": best,
             "report": r.report, "cached": true}));

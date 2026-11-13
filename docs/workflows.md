@@ -84,7 +84,7 @@ min_delta = 0.05
 2. **Research.** A research episode writes a brief.
 3. **Workers.** Eight workers (six after a provider rate limit) run side by side. Each derives its own idea from a host seed with [String Seed of Thought](https://pub.sakana.ai/ssot/) and claims it with `ar.claim`, first come, first served, so no two pursue the same core approach. `ar.claims()` lists what is taken; a placeholder claim is refused. Workers implement and fix their idea, then return without tuning it; depth comes from rounds.
 4. **Gate.** The three most promising candidates pass to the next rounds, even raw ones below the seed. Candidates that beat the seed on search and are not worse on `select` are audited for evaluator holes; only those can become results. With a noisy evaluator (one that reports `se`), a state's score is the mean of its evaluations, and both comparisons allow for the combined standard error.
-5. **Rounds.** Refinement continues while it moves the chosen candidates; exploring starts again when it doesn't. Two rounds in a row without progress (a new candidate, or a gain above `min_delta`) end the run.
+5. **Rounds.** Refinement continues while it moves the chosen candidates; exploring starts again when it doesn't. Two rounds in a row without progress (a new candidate, or a gain above both `min_delta` and the evaluator's standard error) end the run.
 
 Episodes are limited in model turns, not dollars. The result is a portfolio of distinct good candidates, best search score first.
 

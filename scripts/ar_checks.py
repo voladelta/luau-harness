@@ -838,6 +838,21 @@ def scenario_noisy():
     check("a noisy state's score is the mean of its evaluations; re-scoring the same files never counts as improved")
 
 
+def scenario_partly_noisy():
+    # An evaluator that has reported `se` once in the run (here for the seed only) is noisy: a state it scored without
+    # `se` is evaluated again, never served from the cache.
+    partly = ('import json, random; x = int(open("x.txt").read())\n'
+              'print(json.dumps({"score": x + random.gauss(0, 0.5), "se": 0.5} if x == 0 else {"score": x + random.random()}))')
+    path = workspace("partly-noisy", {"x.txt": "0\n", "search.py": partly}, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
+    code = 'write("x.txt", "2\\n")\nlocal a, b = ar.eval("two"), ar.eval("two again")\nreturn "CACHED " .. tostring(b.cached)'
+    with harness.provider(once(code, ("r1-w1",))) as (url, requests):
+        report = report_of(ar(path, url))
+    out = [o for o in outputs(requests) if "CACHED " in o][0]
+    mine = [r for r in ledger(path, report) if r["episode"] == "r1-w1"]
+    assert "CACHED nil" in out and len(mine) == 2 and mine[0]["score"] != mine[1]["score"], (out, mine)
+    check("an evaluator that reported se once in the run is noisy: its results are never reused")
+
+
 # Scenarios are independent (own workspace, own mock provider), so a few run side by side; more would load the machine.
 with ThreadPoolExecutor(max_workers=4) as pool:
     for future in [pool.submit(f) for f in [v for k, v in sorted(globals().items()) if k.startswith("scenario_")]]:
