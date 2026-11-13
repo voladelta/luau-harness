@@ -198,20 +198,13 @@ impl Effects {
 
     /// Authorize and record one asynchronous effect; `f` receives the durable intent's ID (None for reads).
     ///
-    /// Nothing is authorized, queued or journaled before the first await, so a caller that cannot yield (a Luau
-    /// callback run by `string.gsub`, `table.sort` or a metamethod) fails before the effect exists, rather than
-    /// leaving behind a dispatched effect that holds the mutation permit after its yield failed.
+    /// Starts with `yield_first`, so nothing is authorized, queued or journaled where the caller cannot yield.
     pub async fn run_with_intent<F, Fut>(&self, lua: &Lua, tool: Tool, class: Class, args: Value, f: F) -> mlua::Result<Ret>
     where
         F: FnOnce(Option<u64>) -> Fut,
         Fut: Future<Output = mlua::Result<Ret>>,
     {
-        if !yieldable(lua) {
-            let name = tool.name();
-            return Err(rt(format!("{name}: cannot run inside a callback that cannot yield (a string.gsub replacement \
-                function, a table.sort comparator or a metamethod); call {name} outside it and use the result")));
-        }
-        tokio::task::yield_now().await;
+        yield_first().await;
         self.supervisor.authorize_stage(self.stage_epoch, tool, class).map_err(mlua::Error::external)?;
         self.supervisor.authorize(&self.principal, tool, class).map_err(|e| rt(e.to_string()))?;
         let _permit = if class != Class::Read {
@@ -266,12 +259,15 @@ impl Effects {
     }
 }
 
-/// Can the Luau thread running the current callback yield? Not inside a callback that C code invoked without a
-/// continuation (`string.gsub`, `table.sort`, metamethods); `pcall` and coroutines can.
-fn yieldable(lua: &Lua) -> bool {
-    // SAFETY: inside a callback mlua's state pointer is the running thread, alive for the whole call;
-    // lua_isyieldable only compares two of its counters.
-    lua.exec_raw_lua(|raw| unsafe { mlua::ffi::lua_isyieldable(raw.state()) != 0 })
+/// The first await of an async binding that acts, before it does anything but parse its arguments.
+///
+/// mlua polls a binding's future once inside the call and yields the Luau thread while it is pending. Where the
+/// thread cannot yield (a callback C code runs without a continuation: a `string.gsub` replacement function, a
+/// `table.sort` comparator, a metamethod), that yield fails with "attempt to yield across metamethod/C-call
+/// boundary" and the future is never polled again, only dropped when Luau collects it. This await makes that one
+/// poll return before the binding has dispatched, authorized, queued or journaled anything, or taken a guard.
+pub async fn yield_first() {
+    tokio::task::yield_now().await;
 }
 
 /// Marks a thread as awaiting an effect; unmarks on drop, so an abandoned future (a coroutine left suspended inside

@@ -307,6 +307,10 @@ mod session_budget_tests {
         assert!(waited.error.is_none(), "{:?}", waited.error);
         let spun = vm.session.run("probe.run(); while true do end").await;
         assert!(spun.error.as_deref().is_some_and(|e| e.contains("time budget exceeded")));
+        // a call that cannot yield leaves no thread marked as awaiting (exempt from the budget) behind it
+        let failed = vm.session.run("assert(not pcall(string.gsub, 'a', 'a', function() return probe.run() end))").await;
+        assert!(failed.error.is_none(), "{:?}", failed.error);
+        assert!(vm.effects.waiting.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
@@ -792,6 +796,7 @@ impl Vm {
         g.set("batch", lua.create_async_function(move |lua, input: Value| {
             let (s, h, fx, ops) = (bs.clone(), bh.clone(), bfx.clone(), bops.clone());
             async move {
+                crate::effects::yield_first().await;
                 s.authorize_stage(fx.stage_epoch,crate::supervisor::Tool::Read,Class::Read).map_err(mlua::Error::external)?;
                 let _active = crate::workflow_runtime::EffectGuard::new(&s);
                 let operations = crate::values::copy_out(input)?;
@@ -815,6 +820,7 @@ impl Vm {
                 let payload = crate::values::copy_out(value);
                 async move {
                     let payload = payload?;
+                    crate::effects::yield_first().await;
                     tokio::task::spawn_blocking(move || owner.submit_stage(epoch, payload)).await
                         .map_err(mlua::Error::external)?.map_err(mlua::Error::external)
                 }

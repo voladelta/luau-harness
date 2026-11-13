@@ -17,6 +17,9 @@ function M.context(code: string, msg: string): string
 			end
 		end
 	end
+	if msg:find("attempt to yield across", 1, true) then
+		out ..= "  hint: effects (sh, read, write, edit, search, batch, tools) cannot run inside a string.gsub replacement function, a table.sort comparator or a metamethod; call them first and use the results there\n"
+	end
 	if msg:find("syntax error", 1, true) and code:find("[[", 1, true) then
 		out ..= '  hint: if a [[ ]] string holds text containing ]] (e.g. code like d[x["k"]]), use [==[ ... ]==] instead\n'
 	end

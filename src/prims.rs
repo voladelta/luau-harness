@@ -899,9 +899,13 @@ mod file_tests {
         let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
         let log = pol.log.path.clone();
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap();
-        let r = vm.session.run(r#"local ok, e = pcall(string.gsub, "a", "a", function() return sh("touch ran").stdout end)
-            assert(not ok and tostring(e):find("cannot run inside a callback that cannot yield", 1, true), tostring(e))
-            assert(not pcall(table.sort, {2, 1}, function() return write("w", "x") > 0 end))
+        let r = vm.session.run(r#"local yield = "attempt to yield across metamethod/C-call boundary"
+            local ok, e = pcall(string.gsub, "a", "a", function() return sh("touch ran").stdout end)
+            assert(not ok and e == yield, tostring(e))
+            ok, e = pcall(table.sort, {2, 1}, function() return write("w", "x") > 0 end)
+            assert(not ok and e == yield, tostring(e))
+            ok, e = pcall(table.sort, {2, 1}, function() return batch({{op = "read", args = {"f"}}})[1].ok end)
+            assert(not ok and e == yield, tostring(e))
             assert(sh("echo again").stdout == "again\n")"#);
         let r = tokio::time::timeout(Duration::from_secs(20), r).await.expect("a later mutation must not hang");
         assert!(r.error.is_none(), "{:?}", r.error);
@@ -909,6 +913,10 @@ mod file_tests {
         let records = crate::eventlog::load(&log).unwrap();
         let outcomes: std::collections::HashSet<_> = records.iter().filter_map(|r| r["of"].as_u64()).collect();
         assert!(records.iter().filter(|r| r["kind"] == "intent").all(|r| outcomes.contains(&r["seq"].as_u64().unwrap())));
+        assert_eq!(records.iter().filter(|r| r["tool"] == "read").count(), 0, "the batch dispatched nothing");
+        // uncaught, the feedback says what to do instead
+        let text = vm.exec_text(r#"("a"):gsub("a", function() return read("f") end)"#).await.unwrap();
+        assert!(text.contains("hint: effects (sh, read, write, edit, search, batch, tools) cannot run inside"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -136,6 +136,7 @@ pub fn proxy(lua: &Lua, supervisor: Arc<Supervisor>, host: Option<Arc<Host>>, pa
                         let (s, h, p, route, caller) = (s.clone(), h.clone(), p.clone(), route.clone(), caller.clone());
                         async move {
                             let args = values::copy_many(args)?;
+                            crate::effects::yield_first().await;
                             let (worker, module, active, _env) = worker(s, h, &p)?;
                             let mut function = Value::Table(module);
                             for name in route { function = match function { Value::Table(t) => t.raw_get(name.as_str())?, _ => return Err(mlua::Error::runtime("package export changed shape")) }; }

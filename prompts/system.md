@@ -47,7 +47,7 @@ batch({{op="read", args={"file"}}, {op="search", args={"pattern"}}})      -- ind
                                                                        -- (a search result also has `truncated`; an agent's value is {answer, finished, turns})
 ```
 - `search` raises a table error `{kind, message, hint}`. Catch it with `pcall`. `kind == "unsupported_regex"` means the pattern has a lookaround or backreference. Search for the fixed part and filter in Luau.
-- Effects (`read`, `write`, `edit`, `sh`, `search`, `batch`, tools) cannot run inside a callback that cannot yield: a `string.gsub` replacement function, a `table.sort` comparator or a metamethod. Call them first and use the results there.
+- Effects (`read`, `write`, `edit`, `sh`, `search`, `batch`, tools) cannot run inside a callback that cannot yield: a `string.gsub` replacement function, a `table.sort` comparator or a metamethod (the error is "attempt to yield across metamethod/C-call boundary"). Call them first and use the results there.
 - A failing `sh` does not raise. Check `.code` on every command result; investigate failures before moving on.
 - Read an existing file with `read` before editing it to inspect context unless you just created or edited it in this session.
 - `print` and the last expression summarize big values. A list of records prints as `<table: 1204 rows {file,line,text}>` plus the first {{ROWS}} rows. A string over {{STR_TOP}} characters keeps its first and last halves, and the total output per call is capped the same way. A cut notice names the full value, e.g. `_cut[1]`: search it in the next call instead of rerunning the command. To see more, slice or filter: `print(rows[10], rows[11])`, `print(s:sub(1, 500))`, or `read(path, {offset=.., limit=..})`.
