@@ -1,6 +1,7 @@
 //! Staging: what the agent proposes, and the owner's review, accept, reject and rollback.
 use super::approval::{snapshot, write_atomic, Location, Snapshot};
 use super::{file_for, split_name, valid_package_name, Resolver};
+use crate::atomic_file::{Dir, Target};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -68,13 +69,11 @@ impl Resolver {
     pub fn stage(&self, name: &str, files: &[(String, String)]) -> Result<PathBuf> {
         anyhow::ensure!(name != "std", "std is the built-in package; stage a replacement for one of its modules instead");
         anyhow::ensure!(valid_package_name(name), "{name:?} is not a valid package name");
+        let staged = open_dir(&self.staged_dir(), true)?;
+        remove_if_present(&staged, name)?;
         let dir = self.staged_dir().join(name);
-        remove_dir_if_present(&dir)?;
-        for (rel, text) in files {
-            let p = dir.join(rel);
-            std::fs::create_dir_all(p.parent().expect("a joined file path has a parent"))?;
-            std::fs::write(p, text)?;
-        }
+        let new = staged.create_dir(name).with_context(|| format!("cannot create {}", dir.display()))?;
+        write_files(&new, &dir, files.iter().map(|(rel, text)| (rel.as_str(), text.as_bytes())))?;
         Ok(dir)
     }
 
@@ -86,11 +85,13 @@ impl Resolver {
             bail!("a module replacement needs 1 byte to 200 KB of Luau source");
         }
         let base_sha = crate::eventlog::sha_bytes(self.effective_source(module)?.as_bytes());
+        let (parent, leaf) = self.staged_parent(module);
+        let parent = open_dir(&parent, true)?;
+        remove_if_present(&parent, leaf)?;
         let dir = self.staged_dir().join(module);
-        remove_dir_if_present(&dir)?;
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("new.luau"), source)?;
-        std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&ModuleMeta { reason: reason.to_string(), base_sha })?)?;
+        let meta = serde_json::to_string_pretty(&ModuleMeta { reason: reason.to_string(), base_sha })?;
+        let new = parent.create_dir(leaf).with_context(|| format!("cannot create {}", dir.display()))?;
+        write_files(&new, &dir, [("new.luau", source.as_bytes()), ("meta.json", meta.as_bytes())])?;
         Ok(dir)
     }
 
@@ -106,21 +107,39 @@ impl Resolver {
         v
     }
 
-    /// The staging directory of NAME: a package name or `std/<module>`, never a path out of the staging area.
+    /// The staging directory of NAME: a package name or `std/<module>`, never a path out of the staging area, and a
+    /// real directory reached without following a link.
     fn staged(&self, name: &str) -> Result<PathBuf> {
         let valid = if name.contains('/') { Self::module_file(name).is_ok() } else { valid_package_name(name) };
         let dir = self.staged_dir().join(name);
-        if !valid || !dir.is_dir() {
+        if !valid || Dir::open(&dir, false).is_err() {
             bail!("nothing staged as {name:?} (see `hx staged`)");
         }
         Ok(dir)
     }
 
+    /// The directory holding the staging entry NAME, and the entry's name in it.
+    fn staged_parent<'a>(&self, name: &'a str) -> (PathBuf, &'a str) {
+        match name.split_once('/') {
+            Some((pkg, module)) => (self.staged_dir().join(pkg), module),
+            None => (self.staged_dir(), name),
+        }
+    }
+
+    /// Remove the staging entry NAME (checked with `staged` first).
+    fn unstage(&self, name: &str) -> Result<()> {
+        let (parent, leaf) = self.staged_parent(name);
+        open_dir(&parent, false)?.remove_all(leaf).with_context(|| format!("cannot remove {}", parent.join(leaf).display()))
+    }
+
     /// The staged module replacement as stored: its source and metadata.
     fn staged_module(dir: &Path) -> Result<(String, ModuleMeta)> {
-        let new = std::fs::read_to_string(dir.join("new.luau")).with_context(|| format!("cannot read {}/new.luau", dir.display()))?;
-        let meta = std::fs::read_to_string(dir.join("meta.json")).with_context(|| format!("cannot read {}/meta.json", dir.display()))?;
-        Ok((new, serde_json::from_str(&meta).context("bad meta.json")?))
+        let staged = open_dir(dir, false)?;
+        let read = |name: &str| -> Result<String> {
+            let bytes = staged.file(name).and_then(|file| file.read(READ_MAX)).with_context(|| format!("cannot read {}/{name}", dir.display()))?;
+            String::from_utf8(bytes).with_context(|| format!("{}/{name} is not UTF-8", dir.display()))
+        };
+        Ok((read("new.luau")?, serde_json::from_str(&read("meta.json")?).context("bad meta.json")?))
     }
 
     /// What the user reviews before accepting, frozen: a package's every file (and what it replaces), or a module
@@ -183,43 +202,53 @@ impl Resolver {
                 anyhow::ensure!(now.is_ok_and(|now| now.digest == snap.digest), "the staged {name} changed after it was shown; run `hx accept {name}` again to review it");
                 let to = self.install(&name, &snap.files)?;
                 self.lock(&name, &snap)?;
-                std::fs::remove_dir_all(&dir)?;
+                self.unstage(&name)?;
                 Ok(format!("approved {name} {} ({}…) into {} with capabilities {:?}", snap.manifest.package.version, &snap.digest[..8], to.display(), snap.manifest.capabilities))
             },
             Staged::Module { module, new, base_sha } => {
                 let dir = self.staged(&module)?;
                 let (now, meta) = Self::staged_module(&dir)?;
                 anyhow::ensure!(now == new && meta.base_sha == base_sha, "the staged {module} changed after it was shown; run `hx accept {module}` again to review it");
-                self.accept_module(&module, &dir, &new, &meta)
+                self.accept_module(&module, &new, &meta)
             },
         }
     }
 
     /// Install `files` as `.harness/pkgs/<name>`, replacing what is there: the new tree is written beside it and
     /// renamed into place, so a crash leaves the old package, the new one, or none, never a mixture.
+    ///
+    /// The owner runs this unconfined while the agent's shell commands can write `.harness/`, so every step goes
+    /// through directory descriptors and follows no link, the temporary names are unpredictable, and every file is
+    /// created exclusively: swapping a directory for a link cannot send these bytes outside the workspace.
     fn install(&self, name: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<PathBuf> {
-        let pkgs = self.harness().join("pkgs");
-        let to = pkgs.join(name);
-        let fresh = pkgs.join(format!(".{name}.new-{}", std::process::id()));
-        let old = pkgs.join(format!(".{name}.old-{}", std::process::id()));
-        remove_dir_if_present(&fresh)?;
-        remove_dir_if_present(&old)?;
-        for (rel, bytes) in files {
-            let path = fresh.join(rel);
-            std::fs::create_dir_all(path.parent().expect("a joined file path has a parent"))?;
-            std::fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+        let path = self.harness().join("pkgs");
+        let pkgs = open_dir(&path, true)?;
+        let to = path.join(name);
+        let nonce = crate::tools::nonce().context("cannot draw a temporary name")?;
+        let (fresh, old) = (format!(".{name}.new-{nonce}"), format!(".{name}.old-{nonce}"));
+        let written = pkgs.create_dir(&fresh).map_err(anyhow::Error::from)
+            .and_then(|dir| write_files(&dir, &to, files.iter().map(|(rel, bytes)| (rel.as_str(), bytes.as_slice()))));
+        if let Err(error) = written {
+            return Err(match remove_if_present(&pkgs, &fresh) {
+                Ok(()) => error,
+                Err(cleanup) => error.context(format!("{cleanup:#}")),
+            });
         }
-        if std::fs::symlink_metadata(&to).is_ok() {
-            std::fs::rename(&to, &old).with_context(|| format!("cannot move {} aside", to.display()))?;
+        let replaces = match pkgs.rename(name, &old) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).with_context(|| format!("cannot move {} aside", to.display())),
+        };
+        pkgs.rename(&fresh, name).with_context(|| format!("cannot install {}", to.display()))?;
+        if replaces {
+            pkgs.remove_all(&old).with_context(|| format!("cannot remove the replaced {}", path.join(&old).display()))?;
         }
-        std::fs::rename(&fresh, &to).with_context(|| format!("cannot install {}", to.display()))?;
-        remove_dir_if_present(&old)?;
         Ok(to)
     }
 
     pub fn reject(&self, name: &str) -> Result<()> {
-        std::fs::remove_dir_all(self.staged(name)?)?;
-        Ok(())
+        self.staged(name)?;
+        self.unstage(name)
     }
 
     pub(super) fn module_file(module: &str) -> Result<(String, String)> {
@@ -242,10 +271,9 @@ impl Resolver {
     pub fn effective_source(&self, module: &str) -> Result<String> {
         let (pkg, m) = Self::module_file(module)?;
         let path = self.override_path(module)?;
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::embedded(&pkg, &file_for(&m)).expect("module_file checked it is embedded").to_string()),
-            Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+        match read_override(&path)? {
+            Some(bytes) => String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8", path.display())),
+            None => Ok(Self::embedded(&pkg, &file_for(&m)).expect("module_file checked it is embedded").to_string()),
         }
     }
 
@@ -309,13 +337,12 @@ impl Resolver {
     }
 
     fn log_upgrade(&self, mut rec: serde_json::Value) -> Result<()> {
-        use std::io::Write;
         rec["ts"] = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().into();
-        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(self.harness().join("upgrades.jsonl"))?, "{rec}")?;
-        Ok(())
+        open_dir(&self.harness(), true)?.append("upgrades.jsonl", format!("{rec}\n").as_bytes())
+            .with_context(|| format!("cannot append to {}", self.harness().join("upgrades.jsonl").display()))
     }
 
-    fn accept_module(&self, module: &str, dir: &Path, new: &str, meta: &ModuleMeta) -> Result<String> {
+    fn accept_module(&self, module: &str, new: &str, meta: &ModuleMeta) -> Result<String> {
         // The replacement covers the whole module and was written against the module in force when it was staged: if
         // that module has changed since (another accept, a rollback), accepting would silently drop the change.
         let current = crate::eventlog::sha_bytes(self.effective_source(module)?.as_bytes());
@@ -324,17 +351,17 @@ impl Resolver {
         }
         self.check_module(module, new)?;
         let target = self.override_path(module)?;
-        let vdir = self.versions_dir(module);
-        std::fs::create_dir_all(&vdir)?;
+        let vdir = open_dir(&self.versions_dir(module), true)?;
         // Each accept saves what it replaces: NNNN.luau holds the previous override, NNNN.none records that there was none.
-        let n = std::fs::read_dir(&vdir)?.count() + 1;
-        match std::fs::read(&target) {
-            Ok(previous) => write_atomic(&vdir.join(format!("{n:04}.luau")), &previous)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_atomic(&vdir.join(format!("{n:04}.none")), b"")?,
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", target.display())),
-        }
+        let n = vdir.names()?.len() + 1;
+        let (version, previous) = match read_override(&target)? {
+            Some(previous) => (format!("{n:04}.luau"), previous),
+            None => (format!("{n:04}.none"), Vec::new()),
+        };
+        vdir.file(&version).map_err(anyhow::Error::from).and_then(|file| file.replace(&previous))
+            .with_context(|| format!("cannot write {}", self.versions_dir(module).join(&version).display()))?;
         write_atomic(&target, new.as_bytes())?;
-        std::fs::remove_dir_all(dir)?;
+        self.unstage(module)?;
         self.log_upgrade(serde_json::json!({"action": "accept", "module": module, "reason": meta.reason, "new_sha": crate::eventlog::sha_bytes(new.as_bytes()), "version": n}))?;
         Ok(format!("activated {module} (version {n}); undo with `hx rollback {module}`"))
     }
@@ -342,27 +369,31 @@ impl Resolver {
     /// `hx rollback MODULE`: restore what the last accepted replacement of MODULE replaced.
     pub fn rollback(&self, module: &str) -> Result<String> {
         let target = self.override_path(module)?;
-        let vdir = self.versions_dir(module);
-        let mut files: Vec<_> = match std::fs::read_dir(&vdir) {
-            Ok(rd) => rd.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", vdir.display())),
+        let path = self.versions_dir(module);
+        let vdir = match Dir::open(&path, false) {
+            Ok(vdir) => Some(vdir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
-        files.sort();
-        let Some(last) = files.pop() else { bail!("nothing to roll back for {module}") };
-        let previous = if last.extension().is_some_and(|e| e == "none") { None } else { Some(std::fs::read(&last)?) };
+        let last = vdir.as_ref().map(Dir::names).transpose().with_context(|| format!("cannot read {}", path.display()))?
+            .and_then(|mut names| names.pop());
+        let (Some(vdir), Some(last)) = (vdir, last) else { bail!("nothing to roll back for {module}") };
+        let version = vdir.file(&last).with_context(|| format!("cannot read {}", path.join(&last).display()))?;
+        let previous = if last.ends_with(".none") { None } else {
+            Some(version.read(READ_MAX).with_context(|| format!("cannot read {}", path.join(&last).display()))?)
+        };
         // Older versions marked "no override" with this text inside a .luau file.
         let restored = match previous.filter(|p| p != b"<<none>>") {
             Some(previous) => { write_atomic(&target, &previous)?; "the previous version" },
             None => {
-                match std::fs::remove_file(&target) {
+                match Target::open(&target, false).and_then(|file| file.remove()) {
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).with_context(|| format!("cannot remove {}", target.display())),
                     _ => {},
                 }
                 "the built-in module"
             },
         };
-        std::fs::remove_file(&last)?;
+        version.remove().with_context(|| format!("cannot remove {}", path.join(&last).display()))?;
         self.log_upgrade(serde_json::json!({"action": "rollback", "module": module}))?;
         Ok(format!("rolled back {module} to {restored}"))
     }
@@ -376,9 +407,45 @@ fn snapshot_version(dir: &Path) -> String {
     }
 }
 
-fn remove_dir_if_present(dir: &Path) -> Result<()> {
-    match std::fs::remove_dir_all(dir) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("cannot remove {}", dir.display())),
+/// Upper bound on a module source or staged file read back: far above any real module, below a memory problem.
+const READ_MAX: u64 = 16 << 20;
+
+/// Open `path`, a directory under the canonical workspace, following no link on the way (see `Dir`).
+fn open_dir(path: &Path, create: bool) -> Result<Dir> {
+    Dir::open(path, create).with_context(|| format!("cannot open {}", path.display()))
+}
+
+/// The override file at `path`, or None when there is none. A link is an error, never followed.
+fn read_override(path: &Path) -> Result<Option<Vec<u8>>> {
+    match Target::open(path, false).and_then(|file| file.read(READ_MAX)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// Write `files` (relative `/`-separated paths) into the new, empty directory `dir` (at `shown`, for messages),
+/// creating subdirectories. Each file is created exclusively and no link is followed.
+fn write_files<'a>(dir: &Dir, shown: &Path, files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Result<()> {
+    for (rel, bytes) in files {
+        let write = || -> std::io::Result<()> {
+            let mut parts: Vec<&str> = rel.split('/').collect();
+            let file = parts.pop().expect("split yields at least one part");
+            let mut sub: Option<Dir> = None;
+            for part in parts {
+                sub = Some(sub.as_ref().unwrap_or(dir).dir(part, true)?);
+            }
+            sub.as_ref().unwrap_or(dir).write_new(file, bytes)
+        };
+        write().with_context(|| format!("cannot write {}", shown.join(rel).display()))?;
+    }
+    Ok(())
+}
+
+/// Remove the entry `name` of `parent` and everything in it, when it exists.
+fn remove_if_present(parent: &Dir, name: &str) -> Result<()> {
+    match parent.remove_all(name) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("cannot remove {name}")),
         _ => Ok(()),
     }
 }

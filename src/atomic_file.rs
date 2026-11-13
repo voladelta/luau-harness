@@ -56,33 +56,7 @@ impl Target {
             cstr(path.file_name().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "expected file name")
             })?)?;
-        let mut dir = File::open("/")?;
-        for component in path.parent().unwrap().components() {
-            let Component::Normal(part) = component else {
-                if component == Component::RootDir {
-                    continue;
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "expected normalized path",
-                ));
-            };
-            let part = cstr(part)?;
-            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            let mut next = opened(unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) });
-            if create_parents
-                && next
-                    .as_ref()
-                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
-            {
-                let made = unsafe { libc::mkdirat(dir.as_raw_fd(), part.as_ptr(), 0o755) };
-                if made < 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
-                    return Err(io::Error::last_os_error());
-                }
-                next = opened(unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) });
-            }
-            dir = next?;
-        }
+        let dir = Dir::open(path.parent().unwrap(), create_parents)?.0;
         Ok(Self { dir, name })
     }
 
@@ -239,6 +213,134 @@ impl Target {
     }
 }
 
+/// A directory reached without following a link in any component, and the operations owner commands need inside it.
+/// Each operation names one entry of this directory and follows no link at that entry either, so a process that can
+/// write the tree (a shell command writing `.harness/`) cannot redirect a write, rename or removal elsewhere by
+/// swapping a directory for a link while the operation runs.
+#[derive(Debug)]
+pub struct Dir(File);
+
+const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// One entry name: a single path component, never `.`, `..` or empty.
+fn entry(name: &str) -> io::Result<CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name:?} is not a single file name")));
+    }
+    cstr(std::ffi::OsStr::new(name))
+}
+
+impl Dir {
+    /// Open the absolute, normalized `path`, every component without following a link; with `create`, missing
+    /// directories are made on the way.
+    pub fn open(path: &Path, create: bool) -> io::Result<Dir> {
+        let mut dir = Dir(File::open("/")?);
+        for component in path.components() {
+            match component {
+                Component::RootDir => continue,
+                Component::Normal(part) => dir = dir.child(&cstr(part)?, create)?,
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected normalized path")),
+            }
+        }
+        Ok(dir)
+    }
+
+    fn child(&self, name: &CString, create: bool) -> io::Result<Dir> {
+        // SAFETY: `self.0` is an open directory descriptor and `name` a NUL-terminated string; both outlive the call.
+        let mut next = opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), DIR_FLAGS) });
+        if create && next.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            // SAFETY: as above.
+            if unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o755) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            // SAFETY: as above.
+            next = opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), DIR_FLAGS) });
+        }
+        Ok(Dir(next?))
+    }
+
+    /// The subdirectory `name`, created when `create` and missing. A link there is an error.
+    pub fn dir(&self, name: &str, create: bool) -> io::Result<Dir> {
+        self.child(&entry(name)?, create)
+    }
+
+    /// Create the subdirectory `name`, which must not exist (`AlreadyExists` otherwise), and open it.
+    pub fn create_dir(&self, name: &str) -> io::Result<Dir> {
+        let name = entry(name)?;
+        // SAFETY: `self.0` is an open directory descriptor and `name` a NUL-terminated string; both outlive the call.
+        if unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o755) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.child(&name, false)
+    }
+
+    /// Create the file `name`, which must not exist (`AlreadyExists` otherwise, a link included), with `bytes`.
+    pub fn write_new(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let mut file = create_temp(&self.0, &entry(name)?)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    /// Append `bytes` to the file `name`, creating it when missing. A link there is an error.
+    pub fn append(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let name = entry(name)?;
+        let flags = libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: `self.0` is an open directory descriptor and `name` a NUL-terminated string; both outlive the call.
+        let mut file = opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), flags, 0o666) })?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        file.write_all(bytes)
+    }
+
+    /// Rename the entry `from` of this directory to `to` in this directory, replacing what `to` names as rename(2) does.
+    pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let (from, to) = (entry(from)?, entry(to)?);
+        // SAFETY: `self.0` is an open directory descriptor and both names NUL-terminated strings; all outlive the call.
+        if unsafe { libc::renameat(self.0.as_raw_fd(), from.as_ptr(), self.0.as_raw_fd(), to.as_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The entry `name` as a file target (see `Target`): read, replaced or removed without following a link.
+    pub fn file(&self, name: &str) -> io::Result<Target> {
+        Ok(Target { dir: self.0.try_clone()?, name: entry(name)? })
+    }
+
+    /// The names in this directory, sorted.
+    pub fn names(&self) -> io::Result<Vec<String>> {
+        let mut names = std::fs::read_dir(self.proc_path())?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    /// Remove the entry `name` and, when it is a directory, everything in it. A link is removed, never followed.
+    pub fn remove_all(&self, name: &str) -> io::Result<()> {
+        let entry = entry(name)?;
+        // SAFETY: `self.0` is an open directory descriptor and `entry` a NUL-terminated string; both outlive the call.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), entry.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EISDIR) {
+            return Err(error);
+        }
+        // `/proc/self/fd/N` names this very directory however its path changes, and std's remove_dir_all walks below
+        // the final component without following links.
+        std::fs::remove_dir_all(self.proc_path().join(name))
+    }
+
+    fn proc_path(&self) -> std::path::PathBuf {
+        Path::new("/proc/self/fd").join(self.0.as_raw_fd().to_string())
+    }
+}
+
 /// Trusted journal paths may contain platform aliases such as macOS /var -> /private/var.
 pub fn replace_trusted(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = std::fs::canonicalize(path.parent().unwrap())?;
@@ -334,6 +436,32 @@ mod tests {
             std::fs::read_to_string(dir.join("original")).unwrap(),
             "unchanged"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn directory_operations_follow_no_link() {
+        let dir = workspace("dir");
+        std::fs::create_dir(dir.join("elsewhere")).unwrap();
+        std::fs::write(dir.join("elsewhere/kept"), "kept").unwrap();
+        symlink(dir.join("elsewhere"), dir.join("linked")).unwrap();
+        assert!(Dir::open(&dir.join("linked"), false).is_err());
+        let base = Dir::open(&dir, false).unwrap();
+        assert!(base.dir("linked", true).is_err());
+        assert_eq!(base.write_new("linked", b"x").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(base.create_dir("linked").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert!(base.append("linked", b"x").is_err());
+        assert!(base.dir("../elsewhere", false).is_err() && base.write_new("..", b"x").is_err());
+        // removal takes the link, not what it points to
+        base.remove_all("linked").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("elsewhere/kept")).unwrap(), "kept");
+        let made = base.create_dir("made").unwrap();
+        made.dir("sub", true).unwrap().write_new("file", b"data").unwrap();
+        assert_eq!(made.names().unwrap(), ["sub"]);
+        base.rename("made", "moved").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("moved/sub/file")).unwrap(), "data");
+        base.remove_all("moved").unwrap();
+        assert_eq!(base.names().unwrap(), ["elsewhere"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

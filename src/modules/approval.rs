@@ -269,10 +269,11 @@ impl Snapshot {
     }
 }
 
-/// Write a whole file so a crash leaves the old content or the new, never a truncated one.
+/// Write a whole file so a crash leaves the old content or the new, never a truncated one. `path` lies under the
+/// canonical workspace; no link on the way to it, or at it, is followed, and missing directories are created.
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::create_dir_all(path.parent().expect("an absolute file path has a parent"))?;
-    crate::atomic_file::replace_trusted(path, bytes).with_context(|| format!("cannot write {}", path.display()))
+    crate::atomic_file::Target::open(path, true).map_err(anyhow::Error::from).and_then(|file| file.replace(bytes))
+        .with_context(|| format!("cannot write {}", path.display()))
 }
 
 impl Resolver {

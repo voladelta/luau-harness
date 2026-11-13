@@ -496,3 +496,52 @@ fn rollback_names_the_override_it_restores() {
     assert_eq!(r.effective_source("std/printer").unwrap(), mine);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn owner_commands_follow_no_link_planted_in_the_harness_directory() {
+    use std::os::unix::fs::symlink;
+    let root = ws("links");
+    let outside = root.join("outside");
+    let r = Resolver::new(root.clone());
+    let files = vec![("hx.toml".to_string(), "[package]\nversion = \"1\"\n".to_string()), ("tests/t.luau".to_string(), "-- t\n".to_string())];
+    r.stage("foo", &files).unwrap();
+    let review = r.review("foo").unwrap();
+    // between the review and the install, .harness/pkgs becomes a link out of the workspace
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, root.join(".harness/pkgs")).unwrap();
+    assert!(r.accept(review).is_err());
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    std::fs::remove_file(root.join(".harness/pkgs")).unwrap();
+    // reject does not remove through a linked staging directory
+    write(outside.join("foo/keep"), "mine");
+    std::fs::rename(root.join(".harness/staged"), root.join("staged.real")).unwrap();
+    symlink(&outside, root.join(".harness/staged")).unwrap();
+    assert!(err(r.reject("foo")).contains("nothing staged"));
+    assert!(err(r.stage("foo", &files)).contains("cannot open"));
+    assert!(err(r.stage_module("std/printer", "return {}", "")).contains("cannot open"));
+    assert_eq!(std::fs::read_to_string(outside.join("foo/keep")).unwrap(), "mine");
+    std::fs::remove_file(root.join(".harness/staged")).unwrap();
+    // rollback neither reads nor removes through a linked versions directory, and an override link is not read
+    let builtin = r.effective_source("std/printer").unwrap();
+    r.stage_module("std/printer", &format!("{builtin}\n-- v2\n"), "").unwrap();
+    accept(&r, "std/printer").unwrap();
+    let versions = root.join(".harness/versions/std__printer");
+    std::fs::rename(&versions, root.join("versions.real")).unwrap();
+    write(outside.join("zzzz.luau"), "secret");
+    symlink(&outside, &versions).unwrap();
+    assert!(r.rollback("std/printer").is_err());
+    assert!(outside.join("zzzz.luau").is_file());
+    let override_file = root.join(".harness/override/std/printer.luau");
+    std::fs::remove_file(&override_file).unwrap();
+    symlink(outside.join("zzzz.luau"), &override_file).unwrap();
+    assert!(r.effective_source("std/printer").is_err());
+    // the upgrade log is never appended through a link
+    std::fs::remove_file(&override_file).unwrap();
+    std::fs::remove_file(root.join(".harness/upgrades.jsonl")).unwrap();
+    symlink(outside.join("zzzz.luau"), root.join(".harness/upgrades.jsonl")).unwrap();
+    std::fs::remove_file(&versions).unwrap();
+    r.stage_module("std/printer", &format!("{builtin}\n-- v3\n"), "").unwrap();
+    assert!(accept(&r, "std/printer").is_err());
+    assert_eq!(std::fs::read_to_string(outside.join("zzzz.luau")).unwrap(), "secret");
+    let _ = std::fs::remove_dir_all(&root);
+}
