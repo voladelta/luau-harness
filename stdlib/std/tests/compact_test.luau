@@ -147,12 +147,23 @@ test.case("a summary that removes images is accepted even when longer", function
 	test.eq(select(2, compact.accept({ text = string.rep("s", 5000) }, "TASK", m, 5, false)), "not smaller")
 end)
 
-test.case("image-limit rejections count as overflow", function()
-	test.ok(compact.overflow("API 413 Payload Too Large"))
-	test.ok(compact.image_overflow("API 400 Too many images in request. Maximum is 100"))
-	test.ok(compact.overflow("API 400 maximum context length is 128000 tokens"))
-	test.ok(not compact.image_overflow("API 400 maximum context length is 128000 tokens"))
-	test.ok(not compact.overflow("API 400 invalid model"))
+test.case("context and image rejections, as the host classifies them, are what a compaction can fix", function()
+	test.ok(compact.rejected("context_rejected"))
+	test.ok(compact.rejected("images_rejected"))
+	for _, kind in { "provider", "unanswered", "budget_exceeded" } do test.ok(not compact.rejected(kind), kind) end
+	test.ok(not compact.rejected(nil))
+end)
+
+test.case("the image budget in force leaves a turn's images and the text room under the state cap", function()
+	local limits, max_bytes = hx.limits, compact.max_image_bytes
+	local turn = require("std/vision").MAX_BYTES_PER_TURN
+	hx.limits = { STATE_BYTES = 16 * 2 ^ 20 }
+	test.eq(compact.image_byte_budget(), 2 * turn) -- the default fits: 8 + 4 MiB of images within 12 of 16 MiB
+	test.ok(compact.image_byte_budget() + turn <= hx.limits.STATE_BYTES * 3 / 4)
+	compact.max_image_bytes = 64 * 2 ^ 20 -- a budget set above the cap is clamped, not trusted
+	test.eq(compact.image_byte_budget(), 12 * 2 ^ 20 - turn)
+	test.eq(compact.images_over({ user("task"), seen(12 * 2 ^ 20 - turn + 1) }), true)
+	hx.limits, compact.max_image_bytes = limits, max_bytes
 end)
 
 test.case("anchor calibrates on the provider count; measure adds later messages at that scale", function()

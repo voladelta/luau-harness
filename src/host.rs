@@ -7,6 +7,22 @@ use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::{Arc, Mutex,
 /// New requests after a 429 that generated nothing; other retryable failures get one.
 const RATE_LIMIT_RETRIES: u32 = 8;
 
+/// Failure classes with their own retry allowance, so waiting out a rate limit does not use up the new request a server
+/// error or a lost response earns (docs/runtime-v2.md, "Dispatch and uncertainty").
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RetryClass { RateLimit, Answered, Lost }
+
+impl RetryClass {
+    fn of(answered: Option<&llm::Answered>) -> Self {
+        match answered {
+            Some(a) if a.status == 429 && a.unbilled() => Self::RateLimit,
+            Some(_) => Self::Answered,
+            None => Self::Lost,
+        }
+    }
+    fn limit(self) -> u32 { if self == Self::RateLimit { RATE_LIMIT_RETRIES } else { 1 } }
+}
+
 /// Seconds before retry number `retries + 1`: the provider's `Retry-After`, else 2, 4, 8 … s; always 1–30 s.
 fn backoff(retries: u32, retry_after: Option<f64>) -> f64 {
     retry_after.unwrap_or(2f64.powi(retries as i32 + 1)).clamp(1.0, 30.0)
@@ -122,6 +138,9 @@ impl Host {
         if let Some(file) = self.trace.lock().unwrap().as_mut() { let _ = writeln!(file, "{line}"); }
     }
 
+    /// `--trace` is on: only then is a transition's new history worth finding.
+    fn tracing(&self) -> bool { self.trace.lock().unwrap().is_some() }
+
     pub fn budget_status(&self) -> Value { self.supervisor.budget_status() }
     pub fn model_info(&self) -> Value {
         json!({"model": self.llm.model, "context_window": self.llm.context_window, "max_output": self.llm.max_output,
@@ -164,7 +183,7 @@ impl Host {
     /// One budgeted, journaled request to `cfg`: the run's provider, key and model, possibly with another reasoning effort.
     pub async fn chat_as(&self, cfg: &LlmCfg, req: &Value) -> Result<Reply> {
         crate::controller::validate_request(req)?;
-        let mut retries = 0;
+        let mut retries = [0u32; 3]; // by RetryClass
         let key = if self.key.is_empty() {cfg.key()?} else {self.key.clone()};
         loop {
             let op = self.supervisor.reserve_model(cfg, req, self.depth).await?;
@@ -183,16 +202,16 @@ impl Host {
             let closed = self.supervisor.fail_model(op, cfg, &error.to_string(), answered.map(|a| a.status), answered.is_some_and(|a| a.unbilled()), self.depth)?;
             let retry = match answered { Some(a) => a.retryable().then_some(a.retry_after), None => closed.then_some(None) };
             // A rate limit generated nothing, so waiting it out is free: up to RATE_LIMIT_RETRIES new requests, backing
-            // off when the provider names no delay. Anything else gets one.
-            let limit = if answered.is_some_and(|a| a.status == 429 && a.unbilled()) { RATE_LIMIT_RETRIES } else { 1 };
-            match retry.filter(|_| retries < limit) {
+            // off when the provider names no delay. Each other class gets one.
+            let class = RetryClass::of(answered);
+            let used = &mut retries[class as usize];
+            match retry.filter(|_| *used < class.limit()) {
                 Some(after) => {
-                    let wait = backoff(retries, after);
+                    let wait = backoff(*used, after);
                     if self.supervisor.remaining().is_some_and(|r| r.as_secs_f64() <= wait) { return Err(error); }
                     self.log(&format!("### MODEL RETRY\n{error}"));
-                    // test hook: the checks exercise retries, not the clock (HX_TEST_NO_BACKOFF)
-                    if std::env::var_os("HX_TEST_NO_BACKOFF").is_none() { tokio::time::sleep(Duration::from_secs_f64(wait)).await; }
-                    retries += 1;
+                    if !llm::test_hooks::on(llm::test_hooks::NO_BACKOFF) { tokio::time::sleep(Duration::from_secs_f64(wait)).await; }
+                    *used += 1;
                 },
                 None => return Err(error),
             }
@@ -227,8 +246,7 @@ impl Host {
         Box::pin(async move {
             let started = Instant::now();
             let result = self.clone().execute_task(task, max_turns).await;
-            if result.is_err() && let Err(error) = self.supervisor.check()
-                && error.to_string().starts_with("budget_exceeded:") {
+            if result.is_err() && let Err(error) = self.supervisor.check() && crate::controller::budget_stop(&error) {
                 // Controller state is opaque; unavailable workflow counters must not masquerade as zero.
                 let report = json!({"finished":false,"final_answer":"","stopped":error.to_string()});
                 self.policy.log.write("budget", json!({"reason":error.to_string(),"depth":self.depth}), true)?;
@@ -240,7 +258,7 @@ impl Host {
     }
 
     pub(crate) fn controller(&self) -> Result<Controller> {
-        Controller::new(self.supervisor.registry.clone(), self.model_info(), String::new(), &self.packs,
+        Controller::new(self.supervisor.registry.clone(), self.model_info(), &self.packs,
             self.supervisor.manifest.as_ref().and_then(|m| m.deadline), if self.is_workflow_root() {"std/rpi"} else {"std/loop"})
     }
 
@@ -255,14 +273,14 @@ impl Host {
             match self.resume_owner_decision(gate) {
                 Ok(Some(event))=>Some(event),
                 Ok(None)=>return Ok(self.workflow_pause_report(report)),
-                Err(error) if error.to_string().starts_with("budget_exceeded")=>return Ok(self.workflow_pause_report(report)),
+                Err(error) if crate::controller::budget_stop(&error)=>return Ok(self.workflow_pause_report(report)),
                 Err(error)=>return Err(error),
             }
         } else {None};
         if owner_event.is_none() {self.supervisor.check()?;}
         let t0 = Instant::now();
         let administrative = owner_event.is_some();
-        let controller = if administrative {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
+        let controller = if administrative {Controller::new(self.supervisor.registry.clone(),self.model_info(),&self.packs,None,"std/rpi")?} else {self.controller()?};
         let mut state = if self.depth == 0 {
             match &self.supervisor.restored {
                 Some(RunState::Running { controller }|RunState::AwaitingReview{controller,..}) => controller.clone(),
@@ -282,14 +300,15 @@ impl Host {
         loop {
             let admin=workflow && matches!(event["kind"].as_str(),Some("owner_decision"|"boundary_ready"));
             if admin {self.policy.log.check()?;} else {self.supervisor.check()?;}
-            let previous_messages=state["messages"].as_array().cloned().unwrap_or_default();
             let was_compacting = compacting;
             let source_stage = self.supervisor.workflow.lock().unwrap().as_ref().and_then(|f| f.stage.as_ref().map(|a| a.spec.id.clone()));
-            let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),String::new(),&self.packs,None,"std/rpi")?} else {self.controller()?};
+            let controller=if admin {Controller::new(self.supervisor.registry.clone(),self.model_info(),&self.packs,None,"std/rpi")?} else {self.controller()?};
             let (next_state,command)=controller.step(&state,&event)?;
             ensure_object(&next_state)?;
-            let mut command=crate::controller::command(&command)?;
-            state=next_state;
+            let mut command=crate::controller::into_command(command)?;
+            // The state before this transition is kept, not copied: the trace and a compaction's archive compare against it.
+            let previous=std::mem::replace(&mut state,next_state);
+            let previous_messages=previous["messages"].as_array().map_or(&[][..],Vec::as_slice);
             if workflow && event["kind"]=="run_result" && !matches!(command,Command::Boundary{..}) {self.supervisor.finish_stage_chunk(false);}
             if workflow && admin {self.supervisor.workflow.lock().unwrap().as_mut().unwrap().pending_event=None;}
             if std::mem::take(&mut compacting) {
@@ -297,7 +316,7 @@ impl Host {
                 let kept=state["messages"].as_array().map_or(0,Vec::len).saturating_sub(1);
                 self.log(&if failed {"### COMPACT FAILED".into()} else {format!("### COMPACT\nsummarized {} messages, kept {kept}, summary committed",previous_messages.len().saturating_sub(kept+1))});
             }
-            if let Some(messages)=state["messages"].as_array() {
+            if self.tracing() && let Some(messages)=state["messages"].as_array() {
                 for (i,message) in messages.iter().enumerate() {
                     if previous_messages.get(i)!=Some(message) && matches!(message["role"].as_str(),Some("user"|"tool")) {
                         self.log(&format!("### {}\n{}",if message["role"]=="tool" {"RESULT"} else {"HARNESS"},message["content"].as_str().unwrap_or("")));
@@ -319,8 +338,11 @@ impl Host {
                         // VM hooks and local tools shape the request as sent; validate it again after them.
                         let prepared=vm.as_ref().unwrap().prepare_request(request)?;
                         crate::controller::validate_request(&prepared)?;
-                        state["messages"]=prepared["messages"].clone();
-                        if workflow {state["worker"]["messages"]=prepared["messages"].clone();}
+                        // Hooks seldom change the history (images arrive with run results), so it is copied only when they do.
+                        if state["messages"]!=prepared["messages"] {
+                            state["messages"]=prepared["messages"].clone();
+                            if workflow {state["worker"]["messages"]=prepared["messages"].clone();}
+                        }
                         agent_system=Some(prepared["system"].clone());
                         *request=prepared;
                     },
@@ -334,7 +356,7 @@ impl Host {
                 anyhow::ensure!(was_compacting && event["kind"] == "model_reply" && event["reply"]["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
                     "history_archive_invalid: no successful compaction reply");
                 anyhow::ensure!(crate::history::summary(&state) == event["reply"]["text"].as_str(), "history_archive_invalid: summary differs from reply");
-                Some(self.supervisor.history.prepare(directive, &previous_messages, &state, source_stage, self.policy.log.dir())?)
+                Some(self.supervisor.history.prepare(directive, previous_messages, &state, source_stage, self.policy.log.dir())?)
             } else {None};
             let saved=match &command {
                 Command::Boundary{id,submission,next}=>self.apply_boundary(crate::workflow::Boundary{id:id.clone(),submission:submission.clone(),next:next.clone()},&state)?,
@@ -353,8 +375,10 @@ impl Host {
                     return Ok(self.report(report,t0.elapsed().as_secs_f64()));
                 }
             }
-            self.supervisor.checkpoint_archived(&self.lane,saved.clone(),&self.durable.lock().unwrap(),archive)?;
-            if let Command::Boundary{..}=&command {
+            drop(previous);
+            if !matches!(command,Command::Boundary{..}) {self.supervisor.checkpoint_archived(&self.lane,saved,&self.durable.lock().unwrap(),archive)?;}
+            else {
+                self.supervisor.checkpoint_archived(&self.lane,saved.clone(),&self.durable.lock().unwrap(),archive)?;
                 vm=None;self.project_workflow_artifacts()?;
                 match saved {
                     RunState::Finished{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
@@ -371,7 +395,7 @@ impl Host {
                             // the anchor's estimate covers the system prompt as sent, so its scale is not skewed by VM additions
                             let system_chars=agent_system.as_ref().and_then(Value::as_str).map(str::len);
                             event=Event::ModelReply{reply:serde_json::to_value(&reply)?,system_chars}.to_json();},
-                        Err(error)=>{let message=error.to_string();let safe_context_rejection=["API 400 ","API 413 ","API 422 "].iter().any(|p|message.starts_with(p));event=Event::ModelError{error:message,safe_context_rejection}.to_json();},
+                        Err(error)=>event=Event::model_error(&error).to_json(),
                     }
                 },
                 Command::Run{code}=>{
@@ -382,8 +406,11 @@ impl Host {
                         if let Some(submission)=self.supervisor.finish_stage_chunk(result["error"].is_null()) {result["submission"]=submission;}
                         if result["error"].as_str().is_some_and(|e|e.contains("stage.submit") || e.contains("submission")) {result["submission_error"]=json!(true);}
                     }
-                    let notifications=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"tools":[]}))?;
-                    event=Event::RunResult{result,notifications:notifications["messages"].clone()}.to_json();
+                    // Images view() queued go to the controller with the result, so it budgets them before the next request.
+                    // A drain is not a request: std/hooks runs no before_model hook for it (prepare_request is the VM's
+                    // only way in to the hooks).
+                    let mut drained=vm.as_ref().unwrap().prepare_request(&json!({"system":"","messages":[],"drain":true}))?;
+                    event=Event::RunResult{result,notifications:drained["messages"].take()}.to_json();
                 },
                 Command::Finish{report}=>return Ok(self.report(Value::Object(report),t0.elapsed().as_secs_f64())),
                 Command::Boundary{..}=>unreachable!(),
@@ -393,6 +420,9 @@ impl Host {
 
 }
 
+/// Largest file `file_tree` reads to count lines; a larger one is listed by size.
+const FILE_TREE_READ: u64 = 1 << 20;
+
 /// A bounded, gitignore-aware listing used only to initialize the controller's saved conversation.
 pub fn file_tree(root: &std::path::Path) -> String {
     let mut out = Vec::new();
@@ -400,8 +430,12 @@ pub fn file_tree(root: &std::path::Path) -> String {
         if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
         let rel = entry.path().strip_prefix(root).unwrap_or(entry.path()).to_string_lossy().to_string();
         if rel.contains("__pycache__") || rel.starts_with(".git/") || rel.starts_with(".harness/") { continue; }
-        let lines = std::fs::read_to_string(entry.path()).map(|t| t.lines().count()).unwrap_or(0);
-        out.push(format!("{rel} ({lines} lines)"));
+        // Only a small file is read to count its lines: the listing is built at every launch, and a workspace can hold
+        // a multi-gigabyte data file or a sparse image.
+        let size = entry.metadata().map_or(0, |m| m.len());
+        out.push(if size > FILE_TREE_READ {format!("{rel} ({} MiB)", size.div_ceil(1 << 20))} else {
+            format!("{rel} ({} lines)", std::fs::read_to_string(entry.path()).map(|t| t.lines().count()).unwrap_or(0))
+        });
         if out.len() >= 80 { out.push("…".into()); break; }
     }
     out.join("\n")
@@ -418,5 +452,29 @@ mod backoff_tests {
         assert_eq!(super::backoff(3, Some(5.0)), 5.0);
         assert_eq!(super::backoff(0, Some(0.0)), 1.0);
         assert_eq!(super::backoff(0, Some(120.0)), 30.0);
+    }
+
+    #[test]
+    fn each_failure_class_has_its_own_retry_allowance() {
+        use super::RetryClass;
+        let answered = |status| crate::llm::Answered::new(status, format!("API {status}"), None);
+        assert_eq!(RetryClass::of(Some(&answered(429))), RetryClass::RateLimit);
+        assert_eq!(RetryClass::of(Some(&answered(502))), RetryClass::Answered);
+        assert_eq!(RetryClass::of(None), RetryClass::Lost);
+        assert_eq!((RetryClass::RateLimit.limit(), RetryClass::Answered.limit(), RetryClass::Lost.limit()), (super::RATE_LIMIT_RETRIES, 1, 1));
+        let classes = [RetryClass::RateLimit, RetryClass::Answered, RetryClass::Lost].map(|c| c as usize);
+        assert_eq!(classes, [0, 1, 2], "chat_as indexes its counters by class");
+    }
+
+    #[test]
+    fn file_tree_lists_a_huge_file_by_size_without_reading_it() {
+        let dir = std::env::temp_dir().join(format!("hx-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("small.txt"), "a\nb\n").unwrap();
+        // sparse: 3 GiB that take no disk and would take 3 GiB of memory to read
+        std::fs::File::create(dir.join("sparse.img")).unwrap().set_len(3 << 30).unwrap();
+        let tree = super::file_tree(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(tree, "small.txt (2 lines)\nsparse.img (3072 MiB)");
     }
 }

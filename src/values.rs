@@ -19,6 +19,8 @@ fn array_metatable(lua: &Lua) -> mlua::Result<Table> {
     Ok(table)
 }
 
+/// Also the cap on controller state, which holds the conversation and its images: std/compact derives its image budget
+/// from it (`hx.limits.STATE_BYTES` in the controller).
 pub(crate) const MAX_BYTES: usize = 16 << 20;
 pub(crate) const MAX_NODES: usize = 262_144;
 pub(crate) const MAX_DEPTH: usize = 64;
@@ -34,10 +36,8 @@ impl Limit {
         Ok(())
     }
     pub(crate) fn string(&mut self, s: &str) -> mlua::Result<()> {
-        self.charge(2, 0)?;
-        // Conservative JSON escaping bound, charged before allocating a Rust copy.
-        for b in s.bytes() { self.charge(if b < 32 { 6 } else if b == b'"' || b == b'\\' { 2 } else { 1 }, 0)?; }
-        Ok(())
+        // Conservative JSON escaping bound, charged before allocating a Rust copy (one charge: images are megabytes).
+        self.charge(2 + s.bytes().map(|b| if b < 32 { 6 } else if b == b'"' || b == b'\\' { 2 } else { 1 }).sum::<usize>(), 0)
     }
 }
 

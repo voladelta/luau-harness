@@ -26,7 +26,9 @@ pub enum Event {
     /// Resume notice: receipts and uncertain operations, as pretty JSON.
     Recover { message: String },
     ModelReply { reply: Json, system_chars: Option<usize> },
-    ModelError { error: String, safe_context_rejection: bool },
+    /// `error` is for display; controllers branch on `error_kind`. `safe_context_rejection` is for controllers frozen in
+    /// older run manifests, which matched `error` against overflow wording when it was set.
+    ModelError { error: String, error_kind: ErrorKind, safe_context_rejection: bool },
     RunResult { result: Json, notifications: Json },
     /// An owner's review decision; `document` holds the workflow's artifacts and owner inputs.
     OwnerDecision { #[serde(flatten)] document: serde_json::Map<String, Json>, decision: Json, text: String, request: Json },
@@ -41,6 +43,46 @@ pub enum Event {
 
 impl Event {
     pub fn to_json(&self) -> Json { serde_json::to_value(self).expect("controller events serialize") }
+
+    pub fn model_error(error: &anyhow::Error) -> Self {
+        let error_kind = ErrorKind::of(error);
+        Event::ModelError { error: error.to_string(), error_kind, safe_context_rejection: matches!(error_kind, ErrorKind::ContextRejected | ErrorKind::ImagesRejected) }
+    }
+}
+
+/// Why a model request failed, as a `model_error` event's `error_kind`.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// a run budget or the run deadline refused or stopped it: the run ends
+    BudgetExceeded,
+    /// rejected, before any generation, as over the model's context window: a compaction can fix it
+    ContextRejected,
+    /// rejected, before any generation, for its images or size: a compaction that drops images can fix it
+    ImagesRejected,
+    /// any other answer without a generation, after the retries it earned
+    Provider,
+    /// no answer: the connection or the stream was lost, or the request was never sent
+    Unanswered,
+}
+
+/// The stable code the supervisor's budget and deadline errors start with.
+const BUDGET_EXCEEDED: &str = "budget_exceeded:";
+
+/// A run budget or the run deadline stopped the work (the supervisor's `budget_exceeded:` errors, read only here).
+pub fn budget_stop(error: &anyhow::Error) -> bool { error.to_string().starts_with(BUDGET_EXCEEDED) }
+
+impl ErrorKind {
+    pub fn of(error: &anyhow::Error) -> Self {
+        use crate::llm::{Answered, Rejection};
+        match error.downcast_ref::<Answered>() {
+            Some(Answered { rejection: Some(Rejection::Context), .. }) => Self::ContextRejected,
+            Some(Answered { rejection: Some(Rejection::Images), .. }) => Self::ImagesRejected,
+            Some(_) => Self::Provider,
+            None if budget_stop(error) => Self::BudgetExceeded,
+            None => Self::Unanswered,
+        }
+    }
 }
 
 pub fn validate_request(request: &Json) -> Result<()> {
@@ -71,8 +113,10 @@ fn normalize_lists(value: &mut Json) {
     } else if let Some(array)=value.as_array_mut() { for value in array {normalize_lists(value);} }
 }
 
-pub fn command(value: &Json) -> Result<Command> {
-    let mut value=value.clone();
+pub fn command(value: &Json) -> Result<Command> { into_command(value.clone()) }
+
+/// `command` for a value the caller is done with: a model command carries the whole conversation, so it is not copied.
+pub fn into_command(mut value: Json) -> Result<Command> {
     if value["kind"]=="boundary" { normalize_lists(&mut value); }
     let command: Command = serde_json::from_value(value).map_err(|e| anyhow::anyhow!("invalid controller command: {e}"))?;
     match &command {
@@ -92,7 +136,7 @@ pub fn command(value: &Json) -> Result<Command> {
 pub struct Controller { lua: Lua, module: Table }
 
 impl Controller {
-    pub fn new(registry: Arc<Registry>, profile: Json, contributions: String, packs: &[String], run_deadline: Option<f64>, entrypoint: &str) -> Result<Self> {
+    pub fn new(registry: Arc<Registry>, profile: Json, packs: &[String], run_deadline: Option<f64>, entrypoint: &str) -> Result<Self> {
         let lua = Lua::new();
         let g = lua.globals();
         g.set("print", lua.create_function(|_, args: MultiValue| { eprintln!("{}", args.into_iter().map(|v| v.to_string().unwrap_or_default()).collect::<Vec<_>>().join("\t")); Ok(()) })?)?;
@@ -130,10 +174,12 @@ impl Controller {
         hx.set("model_info", lua.create_function(move |lua, ()| values::copy_in(lua, &p))?)?;
         hx.set("autopilot", profile["autopilot"].as_bool().unwrap_or(false))?;
         hx.set("confined", profile["confined"].as_bool().unwrap_or(false))?;
-        hx.set("limits", values::copy_in(&lua, &crate::prims::prompt_limits())?)?;
+        let mut limits = crate::prims::prompt_limits();
+        // The conversation, images included, is controller state: std/compact keeps images well below this copy limit.
+        limits["STATE_BYTES"] = values::MAX_BYTES.into();
+        hx.set("limits", values::copy_in(&lua, &limits)?)?;
         let names = registry.mcp.keys().cloned().collect::<Vec<_>>();
         hx.set("mcp_servers", lua.create_function(move |lua, ()| lua.create_sequence_from(names.clone()))?)?;
-        hx.set("prompt_contributions", contributions)?;
         hx.set("log", lua.create_function(|_, line: String| { eprintln!("{line}"); Ok(()) })?)?;
         env.set("hx", hx)?;
         lua.sandbox(true)?;

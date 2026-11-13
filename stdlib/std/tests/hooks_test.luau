@@ -51,3 +51,17 @@ test.case("clear(event) drops only that event", function()
 	test.eq(hooks.emit("a", 0), 0)
 	test.eq(hooks.emit("b", 0), 2)
 end)
+
+test.case("the host's drain collects notification sources and runs no before_model hook", function()
+	hooks.clear()
+	local requests = 0
+	hooks.on("before_model", function(req) requests += 1; return req end)
+	local queued = { { role = "user", content = "Images from view(), in order: a.png (1x1)" } }
+	hooks.source(function() local out = queued; queued = {}; return out end)
+	test.eq(#hooks.emit("before_model", { system = "", messages = {}, drain = true }).messages, 1)
+	test.eq(requests, 0)
+	test.eq(#hooks.emit("before_model", { system = "", messages = {}, drain = true }).messages, 0) -- delivered once
+	hooks.emit("before_model", { system = "", messages = {} })
+	test.eq(requests, 1) -- a real request runs the hooks
+	hooks.clear()
+end)

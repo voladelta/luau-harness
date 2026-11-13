@@ -30,7 +30,7 @@ check "without the pack: no view, no prompt line" "$(tail -1 $T/req.jsonl | grep
 check "without the pack: no images sent" "$(img_parts)" "0"
 check "event log has no pixels anywhere" "$(cat $W/.harness/log/*.jsonl | grep -c 'iVBORw0KGgo')" "0"
 ffmpeg -v error -f rawvideo -pix_fmt rgb24 -s 2000x2000 -i /dev/urandom -frames:v 1 $W/noise.png  # ~16 MB of base64
-check "one turn takes at most half the image byte budget" "$($H exec --workspace $W --pack std/vision 'print(pcall(view, "noise.png", {max = 2000}))' 2>&1 | grep -c 'over the 8 MB')" "1"
+check "one turn takes at most half the image byte budget" "$($H exec --workspace $W --pack std/vision 'print(pcall(view, "noise.png", {max = 2000}))' 2>&1 | grep -c 'over the 4 MB')" "1"
 check "at most 4 images per turn across calls" "$($H exec --workspace $W --pack std/vision 'view({"frame.png","frame.png","frame.png"})' 'print(pcall(view, {"frame.png","frame.png"}))' 2>&1 | grep -c 'per turn')" "1"
 
 # Completed recovery returns the saved report and captured conversation; it does not reread old images.
@@ -64,11 +64,22 @@ check "budget: run finishes" "$(cat $T/budget.rc)" "0"
 check "budget: the summarizer sees the older image" "$(nth_imgs budget.jsonl 2)" "1"
 check "budget: the summarizer is told images are not kept" "$(nth_has budget.jsonl 2 'not kept after this checkpoint')" "1"
 check "budget: the next request carries only the newest image" "$(nth_imgs budget.jsonl 3) $(nth_has budget.jsonl 3 'compaction-summary')" "1 1"
-check "the vision prompt states the limits in force" "$(nth_has budget.jsonl 0 'at most 4 and 8 MB per turn, scaled so the long side is at most `max`, 64..2000')$(nth_has budget.jsonl 0 '{max = 1024}')" "11"
+check "the vision prompt states the limits in force" "$(nth_has budget.jsonl 0 'at most 4 and 4 MB per turn, scaled so the long side is at most `max`, 64..2000')$(nth_has budget.jsonl 0 '{max = 1024}')" "11"
 
 # An image rejection (413) compacts without a token bound; the summarizer gets placeholders, then the agent retries.
 budget_run "[\"$VIEW\",\"$VIEW\",{\"status\":413,\"error\":\"Payload Too Large\"},\"SUM\",\"done\"]" reject ''
 check "413: run finishes after compact-and-retry" "$(cat $T/reject.rc)" "0"
 check "413: the summarizer gets no images, only placeholders" "$(nth_imgs reject.jsonl 3) $(nth_has reject.jsonl 3 '[image frame.png 800x600 not shown')" "0 1"
 check "413: the retry carries the newest image" "$(nth_imgs reject.jsonl 4) $(nth_has reject.jsonl 4 'compaction-summary')" "1 1"
+
+# The history, images included, is controller state (16 MiB cap): the default image budget compacts well before it.
+# Five turns of a ~3.6 MB image each used to end in "data exceeds 16 MiB" at the state boundary.
+ffmpeg -v error -f rawvideo -pix_fmt rgb24 -s 1000x900 -i /dev/urandom -frames:v 1 $T/big.png
+NOISE='```luau\nview(\"big.png\")\n```'
+W2=$T/state; mkdir -p $W2/.harness; cp $T/big.png $W2/; echo 'require("std/recheck").enabled = false' > $W2/.harness/init.luau
+MOCK_REPLIES="[\"$NOISE\",\"$NOISE\",\"$NOISE\",\"SUM\",\"$NOISE\",\"$NOISE\",\"SUM\",\"done\"]" MOCK_LOG=$T/state.jsonl serve MP python3 scripts/mock_llm.py 0 || exit 1; M=$SERVED
+out=$(run $W2 --pack std/vision | tail -1); kill $M 2>/dev/null
+check "state cap: five large images over five turns compact instead of overflowing the controller state" \
+  "$(python3 -c "import sys,json;r=json.loads(sys.argv[1]);print(r['finished'],r['final_answer'],r['code_turns'])" "$out" 2>/dev/null)" "True done 5"
+check "state cap: the image budget compacted twice" "$(grep -c 'not kept after this checkpoint' $T/state.jsonl)" "2"
 finish
