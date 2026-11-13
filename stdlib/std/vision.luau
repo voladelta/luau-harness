@@ -6,13 +6,14 @@
 -- newest exchange always fits that budget.
 local M = {}
 
-M.MAX_PER_CALL = 4
+-- Images one model reply may add, across all of its view() calls.
+M.MAX_PER_TURN = 4
 -- base64 bytes one model reply may add. std/compact's image budget is twice this (a compaction keeps at most half of it),
 -- so a compaction frees room for the next turn instead of recurring every turn. The controller state carries the
 -- images across a data boundary of hx.limits.DATA_BYTES; before a compaction it holds at most the budget plus one
 -- reply's images, three times this, which leaves half the boundary for the text.
 M.MAX_BYTES_PER_TURN = hx.limits.DATA_BYTES // 6
-local MAX_PER_CALL, MAX_BYTES_PER_TURN = M.MAX_PER_CALL, M.MAX_BYTES_PER_TURN
+local MAX_PER_TURN, MAX_BYTES_PER_TURN = M.MAX_PER_TURN, M.MAX_BYTES_PER_TURN
 local MB = 2 ^ 20
 
 -- The prompt section, from the limits in force: these constants and the host's scaling bounds (`hx.limits`).
@@ -23,7 +24,7 @@ local function docs(): string
 - view(path | {paths}, {max = %d}) -> { {path, width, height} }  shows you PNG/JPEG/WebP/GIF files on your next turn
   (at most %d and %.1f MB per turn, scaled so the long side is at most `max`, %d..%d). Use it to check rendered output instead of
   guessing; prefer one contact sheet over many single frames. Each image costs about 1-2k input tokens.
-]==], l.VIEW_MAX, MAX_PER_CALL, MAX_BYTES_PER_TURN / MB, l.VIEW_MAX_MIN, l.VIEW_MAX_LIMIT)
+]==], l.VIEW_MAX, MAX_PER_TURN, MAX_BYTES_PER_TURN / MB, l.VIEW_MAX_MIN, l.VIEW_MAX_LIMIT)
 end
 
 function M.install(ctx)
@@ -39,8 +40,8 @@ function M.install(ctx)
 		if type(paths) ~= "table" or #paths == 0 then
 			error("view: pass a path or a list of paths", 2)
 		end
-		if count + #paths > MAX_PER_CALL then
-			error("view: at most " .. MAX_PER_CALL .. " images per turn (" .. count .. " already viewed, " .. #paths .. " more asked); make a contact sheet instead", 2)
+		if count + #paths > MAX_PER_TURN then
+			error("view: at most " .. MAX_PER_TURN .. " images per turn (" .. count .. " already viewed, " .. #paths .. " more asked); make a contact sheet instead", 2)
 		end
 		local max = if type(opts) == "table" then opts.max else nil
 		local total = bytes
