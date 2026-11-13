@@ -282,8 +282,12 @@ pub(super) fn reap(dir: &Path) {
 }
 
 /// Scratch roots in the system temp directory are named `hx-ar-PID-NANOS`, one per process that needs throwaway
-/// copies, and hold a `lock` file that process keeps locked while it lives.
+/// copies, and hold a `lock` file that process keeps locked while it lives. The lock file goes last when the root is
+/// removed, so a root whose tree could not be removed keeps it and a later `sweep` tries again.
 const ROOT_PREFIX: &str = "hx-ar-";
+/// A root without a lock file is dead once it is this old: it lost its process between creating the directory and
+/// putting the lock in place, a window of microseconds.
+const LOCKLESS_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// This process's scratch root and how many scratch directories in it are in use.
 struct Root {
@@ -331,18 +335,51 @@ impl Scratch {
     }
 }
 
-/// Remove a scratch directory of this process, and the root with the last one.
+/// Remove a scratch directory of this process, and the root with the last one. The root's lock file is removed only
+/// once everything else in it is gone, while it is still held: a root left behind keeps its lock file for `sweep`.
 fn release(path: &Path) {
     reap(path);
-    let _ = std::fs::remove_dir_all(path);
+    if let Err(error) = remove_tree(path) {
+        eprintln!("hx ar: could not remove scratch directory {}: {error}; a later run removes it", path.display());
+    }
     let mut root = ROOT.lock().expect("scratch root lock poisoned");
     if let Some(r) = root.as_mut() {
         r.users -= 1;
         if r.users == 0 {
-            let _ = std::fs::remove_file(r.path.join("lock"));
-            let _ = std::fs::remove_dir(&r.path);
+            let emptied = std::fs::read_dir(&r.path).is_ok_and(|entries| {
+                entries.flatten().filter(|e| e.file_name() != "lock").all(|e| remove_tree(&e.path()).is_ok())
+            });
+            if emptied {
+                let _ = std::fs::remove_file(r.path.join("lock"));
+                let _ = std::fs::remove_dir(&r.path);
+            }
             *root = None;
         }
+    }
+}
+
+/// Remove the tree at `path`, if there is one. A directory a tool left without write or search permission for its owner is made
+/// accessible and the removal tried again, so such a leftover cannot keep a copy of the workspace in TMPDIR.
+fn remove_tree(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => {
+            make_removable(path);
+            std::fs::remove_dir_all(path)
+        }
+        done => done,
+    }
+}
+
+/// Give every directory of the tree at `path` owner read, write and search permission, each before it is listed, never
+/// following a symlink.
+fn make_removable(path: &Path) {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+        make_removable(&entry.path());
     }
 }
 
@@ -368,11 +405,20 @@ pub(super) fn sweep() {
         }
         let path = entry.path();
         let Ok(dir) = File::open(&path) else { continue };
-        let Ok(lock) = open_in(&dir, "lock", libc::O_RDONLY, 0) else { continue };
-        if flock(&lock, false) {
-            reap(&path);
-            let _ = std::fs::remove_dir_all(&path);
-        }
+        // Held until the tree is gone, so the root's owner, if alive after all, cannot be running in it meanwhile.
+        let lock = match open_in(&dir, "lock", libc::O_RDONLY, 0) {
+            Ok(lock) if flock(&lock, false) => Some(lock),
+            Ok(_) => continue,
+            Err(_) => {
+                let old = dir.metadata().and_then(|m| m.modified()).ok()
+                    .and_then(|t| t.elapsed().ok()).is_some_and(|age| age > LOCKLESS_GRACE);
+                if !old { continue; }
+                None
+            }
+        };
+        reap(&path);
+        let _ = remove_tree(&path);
+        drop(lock);
     }
 }
 
@@ -668,6 +714,33 @@ mod tests {
         let status = child.wait().unwrap();
         assert!(!status.success());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_tree_with_closed_directories_is_still_removed() {
+        let d = dir("closed");
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("a/b/f"), "x").unwrap();
+        std::fs::set_permissions(d.join("a/b"), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(d.join("a"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        remove_tree(&d).unwrap();
+        assert!(!d.exists());
+        assert!(remove_tree(&d).is_ok(), "a tree already gone is removed");
+    }
+
+    #[test]
+    fn sweep_removes_a_lockless_root_only_after_the_grace_period() {
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let (old, fresh) = (tmp.join(format!("{ROOT_PREFIX}0-{}-lockless-old", std::process::id())),
+            tmp.join(format!("{ROOT_PREFIX}0-{}-lockless-fresh", std::process::id())));
+        for d in [&old, &fresh] {
+            std::fs::create_dir_all(d.join("eval-0/tree")).unwrap();
+        }
+        let then = std::time::SystemTime::now() - LOCKLESS_GRACE - std::time::Duration::from_secs(5);
+        File::open(&old).unwrap().set_modified(then).unwrap();
+        sweep();
+        assert!(!old.exists() && fresh.exists());
+        std::fs::remove_dir_all(&fresh).unwrap();
     }
 
     #[test]
