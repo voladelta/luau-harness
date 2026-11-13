@@ -55,9 +55,6 @@ fn read_checked(p: &Path, max: u64) -> std::io::Result<Vec<u8>> {
 pub fn opt_str(o: &Option<Table>, k: &str) -> Option<String> {
     o.as_ref().and_then(|t| t.get::<Option<String>>(k).ok().flatten())
 }
-fn opt_num(o: &Option<Table>, k: &str) -> Option<f64> {
-    o.as_ref().and_then(|t| t.get::<Option<f64>>(k).ok().flatten())
-}
 pub fn bad(r: Ret) -> mlua::Error {
     rt(format!("unexpected native result {r:?}"))
 }
@@ -326,17 +323,17 @@ pub fn install(lua: &Lua, fx: Arc<Effects>, ops: Arc<AtomicUsize>) -> Result<()>
         let (f, o) = (f.clone(), o.clone());
         async move {
             o.fetch_add(1, Ordering::Relaxed);
+            let opts = ShOpts::parse(opts)?;
             let pol = f.pol.clone();
             let class = pol.classify_sh(&cmd);
-            let args = json!({"cmd": &cmd, "cwd": opt_str(&opts, "cwd"), "timeout": opt_num(&opts, "timeout")});
+            let args = json!({"cmd": &cmd, "cwd": &opts.cwd, "timeout": opts.timeout});
             let ret = f.run(&lua, crate::supervisor::Tool::Sh, class, args, || async {
                 let approval = pol.approve(&cmd, class).await.map_err(|why| rt(format!("approval_required: {why}")))?;
-                let secs = opt_num(&opts, "timeout").unwrap_or(SH_TIMEOUT).clamp(1.0, SH_TIMEOUT_MAX);
-                let cwd = match opt_str(&opts, "cwd") {
-                    Some(c) => pol.check_read(&c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
+                let cwd = match &opts.cwd {
+                    Some(c) => pol.check_read(c).map_err(|e| rt(format!("sh: cwd: {e}")))?,
                     None => pol.workspace.clone(),
                 };
-                let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol)?, &cmd, cwd, secs).await?;
+                let (so, se, status, timed_out, truncated) = shell(&ShellEnv::agent(&pol)?, &cmd, cwd, opts.secs()).await?;
                 Ok(Ret::Sh { stdout: so, stderr: se, code: status, timed_out, truncated, operation_id:None, approval })
             }).await?;
             match ret {
@@ -479,6 +476,45 @@ fn search_files(root: &Path, base: &Path, pat: &str, opts: &SearchOptions, workf
     Ok(Hits { rows, truncated: false })
 }
 
+/// `sh`'s options, read once when the call is made. Raw access runs no metamethod, so reading them can neither loop
+/// nor run model code, and nothing touches a Lua value once the command is under way.
+#[derive(Debug, Default, PartialEq)]
+struct ShOpts {
+    /// Seconds, as requested (finite); `secs` applies the default and the bounds.
+    timeout: Option<f64>,
+    cwd: Option<String>,
+}
+
+impl ShOpts {
+    /// An unknown key or a value of the wrong type is an error, so a typo or a bad value never silently becomes the
+    /// default.
+    fn parse(opts: Option<Table>) -> mlua::Result<ShOpts> {
+        let mut parsed = ShOpts::default();
+        let Some(opts) = opts else { return Ok(parsed) };
+        for pair in opts.pairs::<Value, Value>() {
+            let (key, value) = pair?;
+            let Value::String(name) = &key else {
+                return Err(rt(format!("sh: option keys are names (timeout, cwd), got a {}", key.type_name())));
+            };
+            match (&*name.to_string_lossy(), value) {
+                ("timeout", Value::Number(n)) if n.is_finite() => parsed.timeout = Some(n),
+                ("timeout", Value::Integer(n)) => parsed.timeout = Some(n as f64),
+                ("timeout", Value::Number(n)) => return Err(rt(format!("sh: timeout must be a finite number of seconds, got {n}"))),
+                ("timeout", v) => return Err(rt(format!("sh: timeout must be a number of seconds, got a {}", v.type_name()))),
+                ("cwd", Value::String(s)) => parsed.cwd = Some(s.to_str()?.to_owned()),
+                ("cwd", v) => return Err(rt(format!("sh: cwd must be a string, got a {}", v.type_name()))),
+                (other, _) => return Err(rt(format!("sh: unknown option `{other}` (options: timeout, cwd)"))),
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// The command's time limit in seconds: the default when none was given, clamped to [1, SH_TIMEOUT_MAX].
+    fn secs(&self) -> f64 {
+        self.timeout.unwrap_or(SH_TIMEOUT).clamp(1.0, SH_TIMEOUT_MAX)
+    }
+}
+
 /// A shell command's environment (None: inherited) and its kernel confinement (None: unconfined).
 pub struct ShellEnv {
     pub env: Option<Vec<(String, String)>>,
@@ -493,42 +529,75 @@ impl ShellEnv {
     }
 }
 
+/// Make `command` start its child in a new session, so the child leads its own process group and `GroupKill` can take
+/// down everything it starts (except processes that leave the group themselves), and, when `ruleset` is given, under
+/// that Landlock ruleset. The ruleset is applied last, after `setsid`.
+pub(crate) fn confine_command(command: &mut tokio::process::Command, ruleset: Option<Arc<crate::confine::Ruleset>>) {
+    // SAFETY: the closure runs in the forked child before exec, where only async-signal-safe calls are allowed. It
+    // calls setsid(2) and `Ruleset::apply` (prctl(2) and landlock_restrict_self(2)), and on failure reads errno into
+    // an `io::Error`, which does not allocate. It takes no lock and does not allocate: the Arc was moved in by the
+    // parent and is only borrowed here.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some(ruleset) = &ruleset {
+                ruleset.apply()?;
+            }
+            Ok(())
+        });
+    }
+}
+
+/// How long the output readers keep reading after the command ends (and its group is killed) before they give up on
+/// a pipe that a process outside the group still holds open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Run `cmd` with bash: own process group, Landlock ruleset when given, capped output, killed at `secs`.
 /// -> (stdout, stderr, exit code, timed out, either stream cut to its first and last MAX_CAPTURE / 2 bytes)
+///
+/// The exit code is the command's status, or 128 + the signal number when a signal killed it (bash's convention);
+/// None when it timed out. `secs` must be a finite, non-negative number; anything else is an error and nothing runs.
 pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::Result<(Vec<u8>, Vec<u8>, Option<i64>, bool, bool)> {
+    let limit = Duration::try_from_secs_f64(secs).map_err(|e| rt(format!("sh: timeout {secs}: {e}")))?;
     let mut command = tokio::process::Command::new("bash");
     command.arg("-c").arg(cmd);
     if let Some(vars) = &env.env { command.env_clear().envs(vars.iter().cloned()); }
-    let nproc_cap = user_process_count() + 300;
     command
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // Own process group (killed as a whole), a cap on how many processes this user may have, so a fork bomb inside
-    // `sh` hits EAGAIN instead of taking the machine down, and the Landlock ruleset (applied last, after setsid).
-    let confine = env.confine.clone();
-    unsafe {
-        command.pre_exec(move || {
-            libc::setsid();
-            let lim = libc::rlimit { rlim_cur: nproc_cap, rlim_max: nproc_cap };
-            libc::setrlimit(libc::RLIMIT_NPROC, &lim);
-            if let Some(ruleset) = &confine { ruleset.apply()?; }
-            Ok(())
-        });
-    }
+    confine_command(&mut command, env.confine.clone());
     let mut child = command.spawn().map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
-    let group = child.id().map(|p| GroupKill::new(p as i32)); // killpg on drop: also covers cancellation
-    let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let group = GroupKill::new(&child); // killpg on drop: also covers cancellation
+    let out = child.stdout.take().expect("stdout is piped");
+    let err = child.stderr.take().expect("stderr is piped");
     /// The whole stream, or its first and last MAX_CAPTURE / 2 bytes around a marker (the end is where a failing
-    /// test or build says why); reads to EOF so the child never blocks on a full pipe.
-    async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R) -> (Vec<u8>, bool) {
+    /// test or build says why); reads to EOF so the child never blocks on a full pipe, or until the cutoff once one
+    /// is set, keeping what it has read.
+    async fn drain<R: tokio::io::AsyncRead + Unpin>(mut s: R, mut cutoff: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>) -> (Vec<u8>, bool) {
         let half = MAX_CAPTURE / 2;
         let (mut head, mut tail, mut total) = (Vec::new(), Vec::new(), 0usize);
         let mut chunk = vec![0u8; 64 * 1024];
-        while let Ok(n) = s.read(&mut chunk).await {
-            if n == 0 { break }
+        let stop = async move {
+            // The sender lives until it has set the cutoff, so a closed channel means the caller is gone.
+            match cutoff.wait_for(Option::is_some).await.ok().and_then(|at| *at) {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(stop);
+        loop {
+            let n = tokio::select! {
+                read = s.read(&mut chunk) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                },
+                () = &mut stop => break,
+            };
             total += n;
             let take = n.min(half - head.len());
             head.extend_from_slice(&chunk[..take]);
@@ -541,43 +610,55 @@ pub async fn shell(env: &ShellEnv, cmd: &str, cwd: PathBuf, secs: f64) -> mlua::
         head.extend_from_slice(&tail[tail.len() - half..]);
         (head, true)
     }
-    let (out_h, err_h) = (tokio::spawn(drain(out)), tokio::spawn(drain(err)));
-    let (status, timed_out) = match tokio::time::timeout(Duration::from_secs_f64(secs), child.wait()).await {
-        Ok(st) => (st.ok().and_then(|s| s.code()), false),
+    let (cutoff, until) = tokio::sync::watch::channel(None);
+    let wait = async move {
+        let status = tokio::time::timeout(limit, child.wait()).await;
+        // The command is over: kill stragglers and background jobs now. That also closes the pipes they held, so the
+        // readers finish; a process that left the group may still hold one, so the readers stop at a shared cutoff.
+        drop(group);
+        cutoff.send_replace(Some(tokio::time::Instant::now() + DRAIN_GRACE));
+        status
+    };
+    let (status, (so, cut_out), (se, cut_err)) = tokio::join!(wait, drain(out, until.clone()), drain(err, until));
+    let (code, timed_out) = match status {
+        Ok(status) => (Some(exit_code(status.map_err(|e| rt(format!("sh: waiting for the command failed: {e}")))?)), false),
         Err(_) => (None, true),
     };
-    // The command is over: kill stragglers and background jobs now. That also closes the pipes they held,
-    // so the readers finish; whatever was printed before a timeout is kept.
-    drop(group);
-    let grace = Duration::from_secs(2);
-    let (so, cut_out) = tokio::time::timeout(grace, out_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-    let (se, cut_err) = tokio::time::timeout(grace, err_h).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-    Ok((so, se, status.map(i64::from), timed_out, cut_out || cut_err))
+    Ok((so, se, code, timed_out, cut_out || cut_err))
 }
 
-/// Processes currently owned by this user (the baseline for the fork-bomb cap).
-fn user_process_count() -> u64 {
-    let uid = unsafe { libc::getuid() };
-    std::process::Command::new("/bin/ps")
-        .args(["-u", &uid.to_string(), "-o", "pid="])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() as u64)
-        .unwrap_or(500)
+/// A reaped child's exit status as a shell reports it: the exit code, or 128 + the signal that killed it.
+fn exit_code(status: std::process::ExitStatus) -> i64 {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => i64::from(code),
+        (None, Some(signal)) => 128 + i64::from(signal),
+        (None, None) => unreachable!("a reaped child either exited or was killed by a signal"),
+    }
 }
 
-/// Kills the whole process group of an `sh` command (or evaluator) when dropped.
-struct GroupKill(i32);
+/// Kills a child's whole process group with SIGKILL when dropped (which also covers a cancelled future), and until
+/// then lists the group so `stop` kills it when hx is told to stop.
+///
+/// Contract: the child was started through `confine_command`, so it leads its own process group. Create the guard
+/// right after spawning and drop it before reaping the child or promptly after: once the leader is reaped and every
+/// member has exited, the kernel may reuse the group id. A process that leaves the group (`setsid`, `setpgid`) is
+/// not killed.
+pub(crate) struct GroupKill(i32);
 
 impl GroupKill {
-    fn new(group: i32) -> Self {
+    /// None when the child has already been reaped (it has no id any more).
+    pub(crate) fn new(child: &tokio::process::Child) -> Option<Self> {
+        let group = i32::try_from(child.id()?).expect("a pid fits in pid_t");
         GROUPS.lock().unwrap().insert(group);
-        GroupKill(group)
+        Some(GroupKill(group))
     }
 }
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
         GROUPS.lock().unwrap().remove(&self.0);
+        // SAFETY: killpg(2) takes plain integers and has no memory-safety preconditions.
         unsafe { libc::killpg(self.0, libc::SIGKILL) };
     }
 }
@@ -854,5 +935,90 @@ mod file_tests {
         swapper.join().unwrap();
         assert_eq!(leaked, 0);
         let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(outside));
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    fn env() -> ShellEnv {
+        ShellEnv { env: None, confine: None }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hx-shell-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn options_are_typed_and_read_raw() {
+        let lua = Lua::new();
+        let parse = |src: &str| ShOpts::parse(lua.load(src).eval::<Option<Table>>().unwrap());
+        assert_eq!(parse("nil").unwrap(), ShOpts::default());
+        assert_eq!(parse("{timeout = 5, cwd = 'sub'}").unwrap(), ShOpts { timeout: Some(5.0), cwd: Some("sub".into()) });
+        for bad in ["{timeout = 0/0}", "{timeout = math.huge}", "{timeout = 'abc'}", "{timeout = '5'}", "{cwd = 1}", "{tiemout = 5}", "{5}"] {
+            assert!(parse(bad).is_err(), "{bad} must be rejected");
+        }
+        // An __index that never returns is never called.
+        let looping = parse("setmetatable({}, {__index = function() while true do end end})").unwrap();
+        assert_eq!(looping, ShOpts::default());
+        assert_eq!(ShOpts { timeout: Some(-3.0), cwd: None }.secs(), 1.0);
+        assert_eq!(ShOpts { timeout: Some(1e9), cwd: None }.secs(), SH_TIMEOUT_MAX);
+    }
+
+    #[tokio::test]
+    async fn a_bad_timeout_is_an_error_before_anything_runs() {
+        let dir = scratch("nan");
+        for secs in [f64::NAN, -1.0, f64::INFINITY] {
+            assert!(shell(&env(), "touch ran", dir.clone(), secs).await.is_err());
+        }
+        assert!(!dir.join("ran").exists(), "the command must not run");
+        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
+        let vm = crate::vm::Vm::new(pol, Duration::from_secs(5), 32 << 20, None).unwrap();
+        let r = vm.session.run("print(pcall(sh, 'touch ran', {timeout = 0/0}))").await;
+        assert!(r.error.is_none() && r.output.starts_with("false"), "{:?} {}", r.error, r.output);
+        assert!(!dir.join("ran").exists(), "the command must not run");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn options_with_a_looping_index_do_not_escape_the_chunk_deadline() {
+        let dir = scratch("index");
+        let pol = Arc::new(crate::policy::Policy::new(&dir, false, None, None, None).unwrap());
+        let vm = crate::vm::Vm::new(pol, Duration::from_secs(5), 32 << 20, None).unwrap();
+        let code = "print(sh('echo hi', setmetatable({}, {__index = function() while true do end end})).stdout)";
+        let r = tokio::time::timeout(Duration::from_secs(30), vm.session.run(code)).await.expect("the chunk must finish");
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.output, "hi\n\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn death_by_signal_is_128_plus_the_signal() {
+        let dir = scratch("signal");
+        let (_, _, code, timed_out, _) = shell(&env(), "echo x; kill -TERM $$", dir.clone(), 10.0).await.unwrap();
+        assert_eq!((code, timed_out), (Some(128 + 15), false));
+        let (_, _, code, timed_out, _) = shell(&env(), "exit 3", dir.clone(), 10.0).await.unwrap();
+        assert_eq!((code, timed_out), (Some(3), false));
+        let (_, _, code, timed_out, _) = shell(&env(), "sleep 10", dir.clone(), 1.0).await.unwrap();
+        assert_eq!((code, timed_out), (None, true));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn output_survives_a_descendant_that_left_the_group_and_holds_the_pipe() {
+        let dir = scratch("escape");
+        let t0 = std::time::Instant::now();
+        // The fifo makes the command wait until the escapee has its own session, so it is not killed with the group.
+        let cmd = "mkfifo f; setsid sh -c 'echo > f; exec sleep 6.4321' & read < f; echo hello; echo oops >&2";
+        let (so, se, code, timed_out, _) = shell(&env(), cmd, dir.clone(), 10.0).await.unwrap();
+        let elapsed = t0.elapsed();
+        let _ = std::process::Command::new("pkill").args(["-f", "sleep 6.4321"]).status();
+        assert_eq!((so.as_slice(), se.as_slice(), code, timed_out), (&b"hello\n"[..], &b"oops\n"[..], Some(0), false));
+        assert!(elapsed < DRAIN_GRACE * 2, "both readers share one cutoff, took {elapsed:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

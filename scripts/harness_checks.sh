@@ -66,6 +66,18 @@ check "vars" "$($H exec --workspace $W $'x = 41\nvars()' | head -1)" "=> <table:
 check "a cut temporary is readable next chunk" "$($H exec --workspace $W 'print(sh("seq 1 3000").stdout)' 'print(_cut[1]:find("\n1500\n", 1, true) ~= nil, vars()._cut == nil)' | sed -n '/^true/p')" "true	true"
 check "sh keeps the end of a stream over 1 MiB" "$($H exec --workspace $W 'local r = sh("seq 1 400000; echo FINAL-LINE"); print(r.truncated, r.stdout:sub(-11) == "FINAL-LINE\n", sh("echo hi").truncated)' | head -1)" "true	true	false"
 
+# 4c. sh forks for an unprivileged user who already owns many threads (a desktop session: browsers, editors). The
+# suites run as root, which the kernel's per-user process limit exempts, so this runs as nobody when it can.
+as_user=(); [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null && as_user=(setpriv --reuid=65534 --regid=65534 --clear-groups)
+U=$(mktemp -d); chmod 755 "$U"; mkdir "$U/ws" "$U/config"; [ ${#as_user[@]} -gt 0 ] && chown 65534:65534 "$U/ws" "$U/config"
+"${as_user[@]}" python3 -c '
+import threading, time
+for _ in range(400): threading.Thread(target=time.sleep, args=(60,), daemon=True).start()
+print("ready", flush=True); time.sleep(60)' > "$U/ready" & THREADS=$!
+for _ in $(seq 100); do grep -q ready "$U/ready" 2>/dev/null && break; sleep 0.05; done
+check "sh forks for a user who owns hundreds of threads" "$(HOME=$U/config XDG_CONFIG_HOME=$U/config "${as_user[@]}" timeout 60 $H exec --workspace "$U/ws" 'local r = sh("echo a | cat"); print(r.stdout == "a\n", r.code)' 2>&1 | head -1)" "true	0"
+kill $THREADS; rm -rf "$U"
+
 # 5. package lock gate
 P=$W/.harness/pkgs/mypkg; mkdir -p $P/tests
 printf '[package]\nname = "mypkg"\nversion = "0.1.0"\n[capabilities]\nnet = ["example.com"]\n' > $P/hx.toml
