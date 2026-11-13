@@ -64,6 +64,11 @@ pub struct Reply {
     pub output: u64,
 }
 
+/// The most bytes hx reads of one model response, error bodies and every streamed event included: far above a real
+/// reply (a long generation streams its text several times over, as deltas and in the final object), and a bound on
+/// what a provider, or anything on the path, can make hx hold.
+pub const MAX_RESPONSE: usize = 256 << 20;
+
 /// The provider hx calls without `--base-url`.
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -213,15 +218,24 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     let retry_after = retry_after(response.headers());
     let answered = |message: String| Answered { status: status.as_u16(), message, retry_after };
     let sse = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
-    if !status.is_success() || !sse {
-        let text = response.text().await?;
-        if !status.is_success() { return Err(answered(format!("API {status}: {text}")).into()); }
+    let mut budget = net::ResponseBudget::new(MAX_RESPONSE);
+    if !status.is_success() {
+        // The status settles it whether or not the body arrives whole.
+        let text = match budget.body(&mut response).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => format!("({e})"),
+        };
+        return Err(answered(format!("API {status}: {text}")).into());
+    }
+    if !sse {
         // a provider that ignores `stream` answers with the plain response object
-        let resp: Value = serde_json::from_str(&text).map_err(|e| answered(format!("API returned a malformed body: {e}")))?;
+        let bytes = budget.body(&mut response).await.map_err(|e| net::Error::new(net::Delivery::Lost, format!("model {e}")))?;
+        let resp: Value = serde_json::from_slice(&bytes).map_err(|e| answered(format!("API returned a malformed body: {e}")))?;
         return reply(resp).map_err(|m| answered(m).into());
     }
     let mut events = net::Sse::default();
     while let Some(chunk) = response.chunk().await? {
+        budget.consume(chunk.len()).map_err(|e| net::Error::new(net::Delivery::Lost, format!("model {e}")))?;
         for data in events.push(&chunk) {
             let Ok(event) = serde_json::from_str::<Value>(&data) else { continue }; // e.g. a `[DONE]` sentinel
             match event["type"].as_str().unwrap_or("") {
@@ -259,7 +273,37 @@ fn reply(resp: Value) -> std::result::Result<Reply, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{retry_after, Answered};
+    use super::{chat, client, retry_after, Answered, LlmCfg};
+
+    #[tokio::test]
+    async fn an_error_status_is_an_answer_even_when_its_body_is_cut_off() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(socket);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).await.unwrap();
+            // the body promises more than it sends, then the connection closes
+            let reply = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"error\"";
+            reader.into_inner().write_all(reply.as_bytes()).await.unwrap();
+        });
+        let cfg = LlmCfg { model: "m".into(), base_url: Some(base), key_env: None, reasoning: None, max_output: 16, context_window: None,
+            cache_key: None, provider_only: Vec::new() };
+        let error = chat(&client(&cfg).unwrap(), &cfg, "k", &serde_json::json!({"messages": []})).await.unwrap_err();
+        server.await.unwrap();
+        let answered = error.downcast_ref::<Answered>().unwrap_or_else(|| panic!("not an answer: {error:#}"));
+        assert!(answered.status == 400 && answered.unbilled(), "{answered}");
+    }
 
     #[test]
     fn only_a_4xx_or_503_answer_is_unbilled() {
