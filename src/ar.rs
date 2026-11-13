@@ -25,9 +25,9 @@
 //! as the search score.
 //!
 //! Episodes are limited in model turns, not dollars. Rounds refine while refining moves a chosen candidate and explore
-//! again when it moves none; a round makes progress when it chooses a new candidate or lifts one by more than
-//! `min_delta`, and two rounds in a row without progress end the run. With no valid candidate after round 1 the run
-//! stops. The result is the audited good candidates of the last gate, best search score first: several distinct good
+//! again when it moves none; a round makes progress when it chooses a new good candidate or lifts one by more than
+//! `min_delta` (and its `se`), and two rounds in a row without progress end the run, after `MAX_ROUNDS` at the latest.
+//! With no valid candidate after round 1 the run stops. The result is the audited good candidates of the last gate, best search score first: several distinct good
 //! answers, since the single best score is the one most likely to be an overfit or an evaluator hole.
 //!
 //! `episode` holds what runs inside an episode (`ar.eval`, `ar.claim`, `ar.claims`, `ar.reset`); `files` holds what
@@ -59,6 +59,12 @@ const BRIEF_CHARS: usize = 8_000;
 const FINDING_CHARS: usize = 1_500;
 /// Attempts of a planned episode that crashes before any eval (usually provider rate limits).
 const MAX_CRASHES: u32 = 3;
+/// Rounds a run takes at most. The progress rule ends a run whose scores are bounded; scores need not be, so this ends
+/// every run.
+const MAX_ROUNDS: usize = 20;
+/// The smallest lift that counts as progress, relative to the score's magnitude (at least 1), when `min_delta` and the
+/// evaluator's `se` are both 0.
+const EPSILON: f64 = 1e-9;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
@@ -93,6 +99,12 @@ impl Spec {
         let path = workspace.join(".harness/ar.toml");
         let text = std::fs::read_to_string(&path).with_context(|| format!("--ar needs {}", path.display()))?;
         let spec: Spec = toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        spec.check(workspace)?;
+        Ok(spec)
+    }
+    /// The rules a spec must keep, at launch and again on resume.
+    fn check(&self, workspace: &Path) -> Result<()> {
+        let spec = self;
         ensure!(!spec.editable.is_empty(), "ar.toml: editable must name at least one path");
         for p in &spec.editable {
             let parts: Vec<&str> = p.trim_end_matches('/').split('/').collect();
@@ -107,7 +119,7 @@ impl Spec {
         }
         ensure!(matches!(spec.direction.as_str(), "max" | "min"), "ar.toml: direction must be max or min");
         ensure!(spec.timeout > 0.0 && spec.min_delta >= 0.0, "ar.toml: timeout must be positive and min_delta nonnegative");
-        Ok(spec)
+        Ok(())
     }
     /// Read roots of an evaluator: `grader`, plus `holdout` for the select evaluator.
     fn roots(&self, holdout: bool) -> Result<Vec<PathBuf>> {
@@ -137,10 +149,11 @@ impl Spec {
 pub enum Role { Research, Explore, Exploit, Audit }
 
 /// Paths a child's policy must seal, so that even with --yes its agent cannot read or change them: every
-/// autoresearch run of the owner's workspace (this run included) and the evaluators' roots.
+/// autoresearch run of the owner's workspace (this run included) and the evaluators' roots, which the orchestrator
+/// resolved before it started the episode (one it cannot resolve stops the run, so nothing is left unsealed).
 pub fn sealed(e: &Episode) -> Vec<PathBuf> {
     let mut out = vec![e.dir.parent().unwrap_or(&e.dir).to_path_buf()];
-    out.extend(e.spec.roots(true).unwrap_or_default());
+    out.extend(e.sealed.iter().cloned());
     out
 }
 
@@ -173,26 +186,66 @@ struct Claim {
     worker: String,
 }
 
+/// The ledger's rows. Read incrementally and kept for the process: the orchestrator and an episode's `ar.eval` read it
+/// again and again while it only grows.
 fn ledger(dir: &Path) -> Result<Vec<Row>> {
-    read_lines(&dir.join("ledger.jsonl"))
+    static CACHE: std::sync::Mutex<Option<Tail<Row>>> = std::sync::Mutex::new(None);
+    let path = dir.join("ledger.jsonl");
+    let mut cache = CACHE.lock().unwrap();
+    if cache.as_ref().is_none_or(|t| t.path != path) { *cache = Some(Tail::new(path)); }
+    Ok(cache.as_mut().unwrap().read()?.to_vec())
 }
 
 /// Records of an append-only JSONL file. A torn final line (a writer killed mid-append) is ignored; damage anywhere
 /// else is an error.
 fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    let Ok(text) = std::fs::read_to_string(path) else { return Ok(vec![]) };
-    let complete = text.rfind('\n').map_or("", |end| &text[..end]);
-    complete.lines().filter(|l| !l.trim().is_empty()).enumerate()
-        .map(|(i, l)| serde_json::from_str(l).with_context(|| format!("{} line {}", path.display(), i + 1)))
-        .collect()
+    let mut tail = Tail::new(path.to_path_buf());
+    tail.read()?;
+    Ok(tail.rows)
 }
 
-/// Append one record durably, first dropping a torn final line so the file stays parseable.
+/// An append-only JSONL file read incrementally: each read parses only the complete lines added since the last one.
+/// (Appends only ever drop a torn line past the last complete one, so what was read stays valid; a file that shrank
+/// below it was replaced and is read again.)
+struct Tail<T> {
+    path: PathBuf,
+    len: u64,
+    rows: Vec<T>,
+}
+impl<T: serde::de::DeserializeOwned> Tail<T> {
+    fn new(path: PathBuf) -> Tail<T> { Tail { path, len: 0, rows: vec![] } }
+    fn read(&mut self) -> Result<&[T]> {
+        use std::io::{Read, Seek};
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            (self.len, self.rows) = (0, vec![]);
+            return Ok(&self.rows);
+        };
+        if file.metadata()?.len() < self.len { (self.len, self.rows) = (0, vec![]); }
+        file.seek(std::io::SeekFrom::Start(self.len))?;
+        let mut text = vec![];
+        file.read_to_end(&mut text)?;
+        let Some(end) = text.iter().rposition(|b| *b == b'\n') else { return Ok(&self.rows) };
+        let mut new = vec![];
+        for line in text[..end].split(|b| *b == b'\n').filter(|l| !l.trim_ascii().is_empty()) {
+            new.push(serde_json::from_slice(line).with_context(|| format!("{} line {}", self.path.display(), self.rows.len() + new.len() + 1))?);
+        }
+        self.rows.extend(new);
+        self.len += end as u64 + 1;
+        Ok(&self.rows)
+    }
+}
+
+/// Append one record durably, first dropping a torn final line so the file stays parseable. Only the last byte is read
+/// unless the line before is torn.
 fn append_line<T: Serialize>(path: &Path, record: &T) -> Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::FileExt;
     let mut file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(path)?;
-    let text = std::fs::read(path)?;
-    if !text.is_empty() && !text.ends_with(b"\n") {
+    let len = file.metadata()?.len();
+    let mut last = [b'\n'];
+    if len > 0 { file.read_exact_at(&mut last, len - 1)?; }
+    if last[0] != b'\n' {
+        let text = std::fs::read(path)?;
         file.set_len(text.iter().rposition(|b| *b == b'\n').map_or(0, |i| i as u64 + 1))?;
     }
     writeln!(file, "{}", serde_json::to_string(record)?)?;
@@ -233,6 +286,9 @@ struct Candidate {
     select: Option<f64>,
     good: bool,
     audit: Option<bool>,
+    /// The evaluator's `se` for the best state, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    se: Option<f64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     reason: String,
 }
@@ -264,9 +320,17 @@ struct Orchestrator {
     workspace: PathBuf,
     dir: PathBuf,
     launch: Launch,
+    /// The journal (written only here) and the claims (written by episodes), read incrementally.
+    journal: std::sync::Mutex<Tail<Record>>,
+    claims: std::sync::Mutex<Tail<Claim>>,
 }
 
 impl Orchestrator {
+    fn new(workspace: &Path, dir: PathBuf, launch: Launch) -> Orchestrator {
+        Orchestrator { workspace: workspace.to_path_buf(), journal: Tail::new(dir.join("journal.jsonl")).into(),
+            claims: Tail::new(dir.join("claims.jsonl")).into(), dir, launch }
+    }
+
     fn spec(&self) -> &Spec { &self.launch.spec }
 
     fn journal(&self, record: &Record) -> Result<()> {
@@ -274,7 +338,11 @@ impl Orchestrator {
     }
 
     fn records(&self) -> Result<Vec<Record>> {
-        read_lines(&self.dir.join("journal.jsonl"))
+        Ok(self.journal.lock().unwrap().read()?.to_vec())
+    }
+
+    fn claims(&self) -> Result<Vec<Claim>> {
+        Ok(self.claims.lock().unwrap().read()?.to_vec())
     }
 
     fn seed(&self) -> Result<String> {
@@ -286,10 +354,8 @@ impl Orchestrator {
     async fn baseline(&self) -> Result<()> {
         let (score, valid, _, report) = evaluate(self.spec(), &self.dir, &load_snap(&self.dir, &self.seed()?)?, &self.spec().eval, false).await?;
         eprintln!("hx ar: seed scores {}", if valid { show(score) } else { "invalid".into() });
-        let tmp = self.dir.join("seed.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&json!({"score": score.filter(|_| valid), "report": report}))?)?;
-        std::fs::rename(&tmp, self.dir.join("seed.json"))?;
-        Ok(())
+        crate::atomic_file::replace_trusted(&self.dir.join("seed.json"),
+            &serde_json::to_vec(&json!({"score": score.filter(|_| valid), "report": report}))?)
     }
 
     /// The search score and report of `snap`: its first valid evaluation, or the host's baseline for the seed.
@@ -385,10 +451,9 @@ impl Orchestrator {
     async fn episode(&self, plan: &Plan, label: &str, task: String) -> Result<Outcome> {
         let ep_dir = self.dir.join("episodes");
         std::fs::create_dir_all(&ep_dir)?;
+        ensure!(valid_label(label), "invalid episode label {label:?} in the journal");
         let ep_path = ep_dir.join(format!("{label}.json"));
-        let episode = Episode { dir: self.dir.clone(), label: label.into(), spec: self.spec().clone(), role: plan.role,
-            idea: plan.idea, start: plan.start.clone(), best: plan.best };
-        std::fs::write(&ep_path, serde_json::to_vec_pretty(&episode)?)?;
+        crate::atomic_file::replace_trusted(&ep_path, &serde_json::to_vec_pretty(&self.child_episode(plan, label)?)?)?;
         let task_path = ep_dir.join(format!("{label}.md"));
         std::fs::write(&task_path, task)?;
         let scratch = Scratch::new("ws")?;
@@ -423,10 +488,19 @@ impl Orchestrator {
         Ok(Outcome { crashed, stderr: String::from_utf8_lossy(&out.stderr).into_owned() })
     }
 
+    /// The episode a child serves, with only what it needs: it records the episode in its frozen policy, which its
+    /// own shell can read, so the held-out evaluator and roots are left out (its `sealed` still names the roots, so
+    /// its policy can seal them; a root that does not resolve stops the run rather than going unsealed).
+    fn child_episode(&self, plan: &Plan, label: &str) -> Result<Episode> {
+        let spec = Spec { select: None, holdout: vec![], ..self.spec().clone() };
+        Ok(Episode { dir: self.dir.clone(), label: label.into(), spec, sealed: self.spec().roots(true)?, role: plan.role,
+            idea: plan.idea, start: plan.start.clone(), best: plan.best })
+    }
+
     fn state(&self) -> Result<State> {
         let records = self.records()?;
         let rows = ledger(&self.dir)?;
-        let claims: Vec<Claim> = read_lines(&self.dir.join("claims.jsonl"))?;
+        let claims = self.claims()?;
         let brief = self.answer(&records, "r0-research").unwrap_or_else(|| "(none: the research episode wrote no brief)".into());
         // A finding per finished worker attempt: its claim, best score and final answer; the most recent are shown.
         let mut findings = vec![];
@@ -566,21 +640,20 @@ comes from a hole or a rule violation). Without that line the audit counts for n
     /// candidate ranked higher already holds never goes on.
     async fn candidates(&self) -> Result<(Vec<Candidate>, Vec<u32>)> {
         let seed = self.seed()?;
-        let state = self.state()?;
+        let (rows, claims) = (ledger(&self.dir)?, self.claims()?);
         let records = self.records()?;
-        let seed_search = self.known(&state.rows, &seed).0;
+        let seed_search = self.known(&rows, &seed).0;
         let seed_select = self.select(&seed).await?;
         let mut candidates = vec![];
         let verdict = |idea: u32, at: &str| records.iter().rev().find_map(|r| match r {
             Record::Audited { idea: i, snap, pass, reason } if *i == idea && snap == at => Some((*pass, reason.clone())),
             _ => None,
         });
-        for c in state.claims.iter().filter(|c| c.scope == "explore") {
-            // Its best state; once an audit has failed one of its states, its best state that passed one, so a
-            // refinement that breaks a rule costs only itself (with none that passed, the candidate is out).
-            let rows: Vec<&Row> = state.rows.iter().filter(|r| r.idea == c.n && r.improved && r.valid).collect();
-            let failed = rows.iter().any(|r| verdict(c.n, &r.snap).is_some_and(|v| !v.0));
-            let best = rows.into_iter().filter(|r| !failed || verdict(c.n, &r.snap).is_some_and(|v| v.0))
+        for c in claims.iter().filter(|c| c.scope == "explore") {
+            // Its best state that no audit failed, so a state that breaks a rule costs only itself: the candidate falls
+            // back to its next best state, and a later refinement is audited at a later gate (with none left, it is out).
+            let best = rows.iter().filter(|r| r.idea == c.n && r.improved && r.valid)
+                .filter(|r| verdict(c.n, &r.snap).is_none_or(|v| v.0))
                 .fold(None::<&Row>, |b, r| if self.spec().better(r.score.unwrap(), b.and_then(|b| b.score), 0.0) { Some(r) } else { b });
             let Some(best) = best else { continue };
             let beats = seed_search.is_none_or(|s| self.spec().better(best.score.unwrap(), Some(s), self.spec().min_delta));
@@ -590,7 +663,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
                 || select.is_some_and(|s| seed_select.is_none_or(|b| !self.spec().better(b, Some(s), 0.0)));
             let audit = verdict(c.n, &best.snap);
             candidates.push(Candidate { idea: c.n, claim: c.idea.clone(), snap: best.snap.clone(), search: best.score, select,
-                good: beats && held, audit: audit.as_ref().map(|a| a.0), reason: audit.map(|a| a.1).unwrap_or_default() });
+                good: beats && held, audit: audit.as_ref().map(|a| a.0), se: best.se, reason: audit.map(|a| a.1).unwrap_or_default() });
         }
         let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.search != seed_search).collect();
         ranked.sort_by(|a, b| b.good.cmp(&a.good).then_with(|| {
@@ -605,7 +678,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
 
     /// The gate after `round`: audit the good candidates among the `TOP` strongest that have no verdict yet, in one
     /// batch, then hand the `TOP` strongest to the next round. A candidate whose state fails falls back to its best
-    /// state that passed, or drops out; a candidate that takes another's place is audited at a later gate. Only audited
+    /// state no audit failed (audited in turn at a later gate), or drops out; a candidate that takes another's place is audited at a later gate. Only audited
     /// good candidates become results.
     async fn gate(&mut self, round: usize) -> Result<Vec<u32>> {
         let batch = format!("audit{round}");
@@ -664,7 +737,14 @@ comes from a hole or a rule violation). Without that line the audit counts for n
         for (label, scratch) in open {
             let evals = rows.iter().filter(|r| r.episode == label).count();
             // The killed child's scratch copy survives a killed orchestrator: keep its journals.
-            let rate_limits = match scratch.filter(|s| s.is_dir()) {
+            // The journal names the directory, but only one shaped like an episode's scratch copy is cleaned up: a
+            // recorded path is not authority to kill processes and delete files anywhere else.
+            let scratch = scratch.filter(|s| {
+                let ok = valid_scratch(s);
+                if !ok { eprintln!("hx ar: ignoring invalid recorded scratch directory {}", s.display()); }
+                ok && s.is_dir()
+            });
+            let rate_limits = match scratch {
                 Some(dir) => {
                     let logs = keep_logs(&dir.join("ws"), &self.dir.join("episodes"), &label)?;
                     drop(Scratch(dir));
@@ -687,14 +767,14 @@ comes from a hole or a rule violation). Without that line the audit counts for n
         }
         self.plan("research", vec![Plan { label: "r0-research".into(), role: Role::Research, idea: 0, start: seed.clone(), best: None, seed: None }])?;
         self.run_batch("research").await?;
-        // Round 1 explores. A round makes progress when it chooses a new candidate or a chosen one beats its score at the
-        // last progress by more than `min_delta`, so small steps add up across rounds until they count. After exploring
-        // the run refines; it refines again while that moves a chosen candidate at all, and explores again after a
-        // refining round that moved none. Two rounds in a row without progress stop the run: every round that makes
-        // progress raises a score by more than `min_delta` or adds a candidate, so the run ends.
-        let (mut at, mut prev) = (Vec::<(u32, Option<f64>)>::new(), Vec::<(u32, String)>::new());
+        // Round 1 explores. A round makes progress when it chooses a new good candidate or a chosen one beats its score
+        // at the last progress by more than its margin (`progressed`), so small steps add up across rounds until they
+        // count. After exploring the run refines; it refines again while that moves a chosen candidate at all, and
+        // explores again after a refining round that moved none. Two rounds in a row without progress stop the run,
+        // and `MAX_ROUNDS` ends it whatever the scores do.
+        let (mut at, mut prev) = (std::collections::BTreeMap::<u32, Option<f64>>::new(), Vec::<(u32, String)>::new());
         let (mut explore, mut quiet) = (true, false);
-        for round in 1.. {
+        for round in 1..=MAX_ROUNDS {
             let batch = format!("round{round}");
             let mut gate = self.records()?.into_iter().find_map(|r| match r { Record::Gate { round: g, candidates, chosen } if g == round => Some((candidates, chosen)), _ => None });
             let plans = match self.planned(&batch)? {
@@ -727,18 +807,15 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             // With no candidate after a gate the run stops (in practice after round 1: later gates keep earlier candidates).
             if chosen.is_empty() { break; }
             let chosen: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).collect();
-            let progress = chosen.iter().any(|c| match at.iter().find(|(i, _)| *i == c.idea) {
-                None => true,
-                Some((_, before)) => c.search.is_some_and(|s| self.spec().better(s, *before, self.spec().min_delta)),
-            });
+            let progress = progressed(self.spec(), &mut at, &chosen);
             let moved = chosen.iter().any(|c| !prev.contains(&(c.idea, c.snap.clone())));
             if !progress && quiet {
                 eprintln!("hx ar: two rounds in a row made no progress; stopping");
                 break;
             }
+            if round == MAX_ROUNDS { eprintln!("hx ar: {MAX_ROUNDS} rounds, the most a run takes; stopping"); }
             quiet = !progress;
             explore = !moved && plans.first().is_some_and(|p| p.role == Role::Exploit);
-            if progress { at = chosen.iter().map(|c| (c.idea, c.search)).collect(); }
             prev = chosen.iter().map(|c| (c.idea, c.snap.clone())).collect();
         }
         let state = self.state()?;
@@ -746,9 +823,14 @@ comes from a hole or a rule violation). Without that line the audit counts for n
         let (candidates, chosen) = self.last_gate()?.unwrap_or_default();
         let portfolio: Vec<&Candidate> = chosen.iter().filter_map(|id| candidates.iter().find(|c| c.idea == *id)).filter(|c| c.good && c.audit == Some(true)).collect();
         // The portfolio's states, best search score first; the first goes into the workspace (the seed when none).
+        // Each written whole or not at all: placed in a temporary directory and renamed, so an existing one is complete.
         for c in &portfolio {
             let dir = self.dir.join("portfolio").join(format!("c{}", c.idea));
-            if !dir.exists() { place(&dir, self.spec(), &load_snap(&self.dir, &c.snap)?)?; }
+            if dir.exists() { continue; }
+            let tmp = self.dir.join("portfolio").join(format!(".c{}.tmp", c.idea));
+            let _ = std::fs::remove_dir_all(&tmp);
+            place(&tmp, self.spec(), &load_snap(&self.dir, &c.snap)?)?;
+            std::fs::rename(&tmp, &dir)?;
         }
         let (snap, search, select) = match portfolio.first() {
             Some(c) => (c.snap.clone(), c.search, c.select),
@@ -762,7 +844,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             "rounds": self.records()?.iter().filter(|r| matches!(r, Record::Gate { .. })).count(),
             "evals": state.rows.len(),
         });
-        std::fs::write(self.dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
+        crate::atomic_file::replace_trusted(&self.dir.join("report.json"), &serde_json::to_vec_pretty(&report)?)?;
         Ok(report)
     }
 
@@ -785,16 +867,49 @@ struct State {
     findings: String,
 }
 
-/// An auditor's verdict from its last `VERDICT:` line: pass, or fail with its reason. None when it gave none.
+/// Did this gate make progress? A chosen candidate makes it when it is good and new, or when it beats its score at the
+/// last progress by more than its margin: `min_delta`, its evaluator's `se`, and at least `EPSILON` of the score. A
+/// candidate that is not good is remembered when first chosen, so its later lifts count but its arrival does not.
+fn progressed(spec: &Spec, at: &mut std::collections::BTreeMap<u32, Option<f64>>, chosen: &[&Candidate]) -> bool {
+    let progress = chosen.iter().any(|c| match at.get(&c.idea) {
+        None => c.good,
+        Some(before) => c.search.is_some_and(|s| {
+            let margin = spec.min_delta.max(c.se.unwrap_or(0.0)).max(EPSILON * before.map_or(1.0, |b| b.abs().max(1.0)));
+            spec.better(s, *before, margin)
+        }),
+    });
+    for c in chosen {
+        if progress || !at.contains_key(&c.idea) { at.insert(c.idea, c.search); }
+    }
+    progress
+}
+
+/// An episode label as the orchestrator makes them (`r1-w3`, `a2-c5`, a retry `r1-w3.2`): it names files in the run.
+fn valid_label(label: &str) -> bool {
+    let (name, retry) = label.split_once('.').unwrap_or((label, "1"));
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !retry.is_empty() && retry.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// An auditor's verdict from its last `VERDICT:` line: pass, or fail with its reason. Markdown around the words
+/// (`**VERDICT:** FAIL`, `` VERDICT: `PASS` ``) is tolerated, but only an explicit PASS passes: anything else after
+/// `VERDICT:` (`UNSURE`, `PASS or FAIL`) is no verdict, so its candidate stays unaudited. None when it gave none.
 fn verdict(answer: Option<&str>) -> Option<(bool, String)> {
+    const DECORATION: [char; 5] = ['*', '_', '`', ' ', '\t'];
     let answer = answer?;
-    let at = answer.to_ascii_uppercase().rfind("VERDICT:")?;
-    let rest = answer[at + "VERDICT:".len()..].trim();
-    Some(if rest.to_ascii_uppercase().starts_with("FAIL") {
-        (false, rest[4..].trim_start_matches([':', ' ', '-']).lines().next().unwrap_or("").chars().take(300).collect())
-    } else {
-        (true, String::new())
-    })
+    let upper = answer.to_ascii_uppercase();
+    // The last `VERDICT` followed (after decoration) by a colon.
+    let rest = upper.rmatch_indices("VERDICT").find_map(|(at, _)| {
+        answer[at + "VERDICT".len()..].trim_start_matches(DECORATION).strip_prefix(':')
+    })?;
+    let rest = rest.lines().next().unwrap_or("").trim_start_matches(DECORATION);
+    let word = rest.chars().take_while(char::is_ascii_alphabetic).collect::<String>().to_ascii_uppercase();
+    let after = &rest[word.len()..];
+    match word.as_str() {
+        "PASS" if !after.to_ascii_uppercase().contains("FAIL") => Some((true, String::new())),
+        "FAIL" => Some((false, after.trim_matches([':', '-', '*', '_', '`', ' ', '\t']).chars().take(300).collect())),
+        _ => None,
+    }
 }
 
 /// At most `max` characters of `text`, marked when cut.
@@ -810,16 +925,24 @@ fn show(v: Option<f64>) -> String {
 /// `hx run --ar`: search until two rounds in a row make no progress, or continue the run in `resume` (a run directory).
 pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>, resume: Option<PathBuf>) -> Result<()> {
     // A resumed run uses the spec frozen in its sealed launch.json, approved when it started; only a launch reads ar.toml.
-    let (dir, launch, records) = match (start, resume) {
+    // Agents of ordinary runs of this workspace can write `.harness/ar` from their shell, so a resume trusts launch.json
+    // only as hashed into the launch record kept in the trust store, and an orchestrator holds its run's lock while it runs.
+    let (dir, launch, records, _lock) = match (start, resume) {
         (_, Some(dir)) => {
             let dir = dir.canonicalize().with_context(|| format!("autoresearch run {}", dir.display()))?;
             ensure!(dir.parent() == Some(&workspace.join(".harness/ar").canonicalize()?), "--resume for --ar takes a run directory under .harness/ar");
-            let launch: Launch = serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?)?;
+            let lock = lock_run(&dir)?;
+            let bytes = std::fs::read(dir.join("launch.json"))?;
+            let recorded = std::fs::read_to_string(launch_record(&dir)?).unwrap_or_default();
+            ensure!(recorded.trim() == crate::eventlog::sha_bytes(&bytes), "autoresearch run {}: launch.json does not match the \
+launch record hx kept when the run started (it was changed, or the run predates the record); start a new run", dir.display());
+            let launch: Launch = serde_json::from_slice(&bytes)?;
+            launch.spec.check(workspace)?;
             ensure!(!dir.join("report.json").exists(), "autoresearch run {} already finished", dir.display());
             ensure!(dir.join("seed.json").exists() || !dir.join("ledger.jsonl").exists(),
                 "autoresearch run {} predates this design and cannot be resumed; start a new run", dir.display());
             let records = read_lines(&dir.join("journal.jsonl"))?;
-            (dir, launch, records)
+            (dir, launch, records, lock)
         }
         (Some((child_args, program)), None) => {
             ensure!(crate::trust::is_trusted(workspace), "--ar runs the evaluator commands in .harness/ar.toml; review them and run `hx trust` first");
@@ -831,19 +954,43 @@ pub async fn orchestrate(workspace: &Path, start: Option<(Vec<String>, String)>,
             let id = format!("{}-{}.noindex", chrono_stamp(), std::process::id());
             let dir = workspace.join(".harness/ar").join(&id);
             std::fs::create_dir_all(&dir)?;
+            let dir = dir.canonicalize()?;
+            let lock = lock_run(&dir)?;
             let commit = freeze(workspace, &dir)?;
-            std::fs::write(dir.join("seed"), save_snap(&dir, &capture(workspace, &spec)?)?)?;
+            crate::atomic_file::replace_trusted(&dir.join("seed"), save_snap(&dir, &capture(workspace, &spec)?)?.as_bytes())?;
             let launch = Launch { spec, program, child_args, commit };
-            std::fs::write(dir.join("launch.json"), serde_json::to_vec_pretty(&launch)?)?;
-            (dir, launch, vec![])
+            let bytes = serde_json::to_vec_pretty(&launch)?;
+            let record = launch_record(&dir)?;
+            std::fs::create_dir_all(record.parent().unwrap())?;
+            crate::atomic_file::replace_trusted(&record, crate::eventlog::sha_bytes(&bytes).as_bytes())?;
+            crate::atomic_file::replace_trusted(&dir.join("launch.json"), &bytes)?;
+            (dir, launch, vec![], lock)
         }
         (None, None) => bail!("--ar needs a program, or --resume RUN_DIR"),
     };
-    let mut o = Orchestrator { workspace: workspace.to_path_buf(), dir, launch };
+    let mut o = Orchestrator::new(workspace, dir, launch);
     eprintln!("hx ar: run {}{}", o.dir.display(), if records.is_empty() { "" } else { ", resumed" });
     let report = o.run(records).await?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
+}
+
+/// Where hx keeps the hash of a run's launch.json: the trust store, which neither agent file tools nor confined shell
+/// commands can write. One small file per run, named by the run directory.
+fn launch_record(dir: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let store = crate::trust::store_dir().context("no HOME or XDG_CONFIG_HOME for the autoresearch launch record")?;
+    Ok(store.join("ar-launch").join(&crate::eventlog::sha_bytes(dir.as_os_str().as_bytes())[..32]))
+}
+
+/// The run's lock, held while an orchestrator works on it: a second `--resume` would take the live run's episodes for
+/// crashed ones, kill them and delete their copies.
+fn lock_run(dir: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("run.lock"))?;
+    ensure!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "autoresearch run {} is in use by another hx; wait for it to stop", dir.display());
+    Ok(file)
 }
 
 fn chrono_stamp() -> String {
@@ -853,14 +1000,124 @@ fn chrono_stamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::verdict;
+    use super::*;
 
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hx-ar-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    fn spec(extra: &str) -> Spec {
+        toml::from_str(&format!("editable = [\"x.txt\"]\neval = \"true\"\n{extra}")).unwrap()
+    }
 
     #[test]
     fn audit_verdicts() {
-        assert_eq!(verdict(Some("ok\nVERDICT: PASS")), Some((true, String::new())));
-        assert_eq!(verdict(Some("verdict: fail: fills below the market")), Some((false, "fills below the market".into())));
+        let pass = Some((true, String::new()));
+        let fail = |r: &str| Some((false, r.to_string()));
+        assert_eq!(verdict(Some("ok\nVERDICT: PASS")), pass);
+        assert_eq!(verdict(Some("**VERDICT:** PASS")), pass);
+        assert_eq!(verdict(Some("VERDICT: `PASS`.")), pass);
+        assert_eq!(verdict(Some("verdict: fail: fills below the market")), fail("fills below the market"));
+        // Markdown around FAIL is still a failure, never a pass.
+        assert_eq!(verdict(Some("**VERDICT:** FAIL: lookahead")), fail("lookahead"));
+        assert_eq!(verdict(Some("VERDICT: **FAIL**")), fail(""));
+        assert_eq!(verdict(Some("VERDICT: `FAIL: x`")), fail("x"));
+        assert_eq!(verdict(Some("**VERDICT**: FAIL - leaks the answer")), fail("leaks the answer"));
+        // Anything but an explicit PASS or FAIL is no verdict.
+        assert_eq!(verdict(Some("VERDICT: UNSURE")), None);
+        assert_eq!(verdict(Some("VERDICT: PASS or FAIL")), None);
+        assert_eq!(verdict(Some("VERDICT: PASSABLE")), None);
+        assert_eq!(verdict(Some("VERDICT:")), None);
+        assert_eq!(verdict(Some("my verdict is that it passes")), None);
+        // The last verdict line counts, even with a mention of the word after it.
+        assert_eq!(verdict(Some("VERDICT: PASS\nVERDICT: FAIL: on second look, lookahead\n(the verdict above stands)")), fail("on second look, lookahead"));
         assert_eq!(verdict(None), None);
         assert_eq!(verdict(Some("ran out")), None);
+    }
+
+    fn candidate(idea: u32, search: f64, good: bool, se: Option<f64>) -> Candidate {
+        Candidate { idea, claim: String::new(), snap: format!("s{idea}-{search}"), search: Some(search), select: None, good,
+            audit: None, se, reason: String::new() }
+    }
+
+    #[test]
+    fn progress_needs_a_good_candidate_or_a_real_lift() {
+        let spec = spec("");
+        let mut at = std::collections::BTreeMap::new();
+        // A new candidate that is not good is remembered, but its arrival is no progress.
+        assert!(!progressed(&spec, &mut at, &[&candidate(1, 5.0, false, None)]));
+        assert_eq!(at.get(&1), Some(&Some(5.0)));
+        // With min_delta 0, a lift below EPSILON is no progress; a real one is.
+        assert!(!progressed(&spec, &mut at, &[&candidate(1, 5.0 + 1e-12, false, None)]));
+        assert!(progressed(&spec, &mut at, &[&candidate(1, 5.5, false, None)]));
+        // A lift within the evaluator's se is noise.
+        assert!(!progressed(&spec, &mut at, &[&candidate(1, 5.7, true, Some(0.5))]));
+        assert!(progressed(&spec, &mut at, &[&candidate(2, 1.0, true, None)]));
+        // A candidate that leaves and comes back is not new.
+        assert!(!progressed(&spec, &mut at, &[&candidate(2, 1.0, true, None)]));
+        let strict = Spec { min_delta: 1.0, ..spec };
+        assert!(!progressed(&strict, &mut at, &[&candidate(2, 1.9, true, None)]));
+        assert!(progressed(&strict, &mut at, &[&candidate(2, 2.5, true, None)]));
+    }
+
+    #[test]
+    fn episode_labels() {
+        for ok in ["r0-research", "r1-w3", "r1-w3.2", "a2-c5"] { assert!(valid_label(ok), "{ok}"); }
+        for bad in ["", "../x", "r1/w1", "r1-w1.", "r1-w1.x", ".2", "r1-w1.2.3"] { assert!(!valid_label(bad), "{bad}"); }
+    }
+
+    #[test]
+    fn jsonl_reads_incrementally_and_appends_drop_a_torn_line() {
+        let dir = temp("tail");
+        let path = dir.join("log.jsonl");
+        let mut tail = Tail::<Value>::new(path.clone());
+        assert!(tail.read().unwrap().is_empty());
+        append_line(&path, &json!({"n": 1})).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&path).and_then(|mut f| std::io::Write::write_all(&mut f, b"{\"n\": ")).unwrap();
+        assert_eq!(tail.read().unwrap(), &[json!({"n": 1})]);
+        append_line(&path, &json!({"n": 2})).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"n\":1}\n{\"n\":2}\n");
+        assert_eq!(tail.read().unwrap(), &[json!({"n": 1}), json!({"n": 2})]);
+        assert_eq!(read_lines::<Value>(&path).unwrap().len(), 2);
+        // A file replaced by a shorter one is read again.
+        std::fs::write(&path, "{\"n\":3}\n").unwrap();
+        assert_eq!(tail.read().unwrap(), &[json!({"n": 3})]);
+        std::fs::write(&path, "{\"n\":3}\nnot json\n").unwrap();
+        assert!(tail.read().is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn children_get_no_held_out_details_and_unresolved_roots_stop_the_run() {
+        let dir = temp("child");
+        let (grader, holdout) = (dir.join("grader"), dir.join("holdout"));
+        std::fs::create_dir_all(&grader).unwrap();
+        std::fs::create_dir_all(&holdout).unwrap();
+        let run = dir.join("ws/.harness/ar/run");
+        std::fs::create_dir_all(&run).unwrap();
+        let spec = spec(&format!("select = \"python3 secret_select.py\"\ngrader = [\"{}\"]\nholdout = [\"{}\"]\n", grader.display(), holdout.display()));
+        let launch = Launch { spec, program: String::new(), child_args: vec![], commit: String::new() };
+        let o = Orchestrator::new(&dir.join("ws"), run.clone(), launch);
+        let plan = Plan { label: "r1-w1".into(), role: Role::Explore, idea: 0, start: "s".into(), best: None, seed: None };
+        let episode = o.child_episode(&plan, "r1-w1").unwrap();
+        let text = serde_json::to_string(&episode.spec).unwrap();
+        assert!(!text.contains("secret_select") && !text.contains("holdout\":[\"") && episode.spec.grader.len() == 1, "{text}");
+        assert_eq!(sealed(&episode), vec![dir.join("ws/.harness/ar"), grader.clone(), holdout.clone()]);
+        std::fs::remove_dir_all(&holdout).unwrap();
+        assert!(o.child_episode(&plan, "r1-w1").is_err(), "an unresolved holdout root must not go unsealed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_run_is_locked_while_an_orchestrator_holds_it() {
+        let dir = temp("lock");
+        let held = lock_run(&dir).unwrap();
+        assert!(lock_run(&dir).unwrap_err().to_string().contains("in use"));
+        drop(held);
+        assert!(lock_run(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -185,8 +185,10 @@ def climbing(body, index):
     if answered(body): return f"FINDING from {label}: done"
     if role == "audit": return "Checked.\nVERDICT: PASS"
     if role == "explore":
+        # Three ideas work (more would keep the run climbing until its round cap); the others build nothing valid.
         w = int(label.split("-w")[1].split(".")[0])
-        return {"code": f'ar.claim("{go(w)}")\nwrite("x.txt", "{w}\\n")\nreturn ar.eval("go {w}")'}
+        x = w + 6 if w <= 3 else "nope"
+        return {"code": f'ar.claim("{go(w)}")\nwrite("x.txt", "{x}\\n")\nreturn ar.eval("go {w}")'}
     if role == "exploit":
         return {"code": f'ar.claim("raise x by one more step, the refinement tried by worker {label}")\n'
                         'write("x.txt", tostring(tonumber(read("x.txt")) + 1) .. "\\n")\nreturn ar.eval("up")'}
@@ -528,8 +530,8 @@ def scenario_10():
             with open(torn, "a") as f:
                 f.write('{"kind": "fini')
         (path / ".harness/ar.toml").write_text((path / ".harness/ar.toml").read_text() + "# edited after launch\n")
+        # The edited ar.toml is not trusted; resume runs on launch.json, which the launch record vouches for.
         untrusted = {k: v for k, v in harness.ENV.items() if k != "HX_TRUST"}
-        untrusted["XDG_CONFIG_HOME"] = str(BASE / "empty-trust-store")
         result = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(journal.parent), "--workspace", str(path)],
                                 env=untrusted, capture_output=True, text=True, timeout=600)
         assert result.returncode == 0, result.stderr[-3000:]
@@ -636,6 +638,10 @@ def scenario_16():
     with harness.provider(once('return ar.eval("baseline")')) as (url, _):
         report = report_of(ar(path, url))
     assert all(r["score"] == -49 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
+    # A child's frozen policy (which its own shell can read in its journal) never names the held-out evaluator.
+    episodes = path / ".harness/ar" / report["run"] / "episodes"
+    seen = [p for p in episodes.rglob("*") if p.is_file() and not p.name.endswith((".report.json", ".md", ".stderr"))]
+    assert seen and not any(b"score.sh" in p.read_bytes() for p in seen), [p.name for p in seen if b"score.sh" in p.read_bytes()]
     check("search and select invoke their configured evaluator commands")
 
 
@@ -757,6 +763,46 @@ def scenario_23():
     result = subprocess.run(base_cmd, env=harness.ENV, capture_output=True, text=True)
     assert result.returncode != 0 and "editable path" in result.stderr, result.stderr
     check("launch requires a program, a clean scope and sane editable paths; episodes are limited in turns, not by flags")
+
+
+def scenario_24():
+    # 7d. Resume trusts only what the owner launched: a rewritten launch.json is refused, a live run cannot be resumed
+    # twice, and a scratch path planted in the journal is never killed in or deleted.
+    path = workspace("tamper")
+    with harness.provider(lambda body, index: hopeless(body, index, "nope")) as (url, _):
+        report = report_of(ar(path, url))
+        run = path / ".harness/ar" / report["run"]
+        (run / "report.json").unlink()
+        resume = [str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)]
+        launch = (run / "launch.json").read_bytes()
+        tampered = json.loads(launch)
+        tampered["spec"]["eval"] = "touch TAMPERED; python3 search.py"
+        (run / "launch.json").write_text(json.dumps(tampered))
+        result = subprocess.run(resume, env=harness.ENV, capture_output=True, text=True, timeout=600)
+        assert result.returncode != 0 and "does not match the launch record" in result.stderr, result.stderr[-1500:]
+        (run / "launch.json").write_bytes(launch)
+
+        holder = subprocess.Popen(["python3", "-c", "import fcntl, sys, time; f = open(sys.argv[1], 'w'); "
+                                   "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)", str(run / "run.lock")],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            result = subprocess.run(resume, env=harness.ENV, capture_output=True, text=True, timeout=600)
+            assert result.returncode != 0 and "in use by another hx" in result.stderr, result.stderr[-1500:]
+        finally:
+            holder.kill()
+            holder.wait()
+
+        victim = BASE / "tamper-victim"
+        victim.mkdir()
+        (victim / "keep.txt").write_text("keep")
+        with open(run / "journal.jsonl", "a") as f:
+            f.write(json.dumps({"kind": "started", "label": "r1-w9", "plan": "r1-w9", "scratch": str(victim)}) + "\n")
+        result = subprocess.run(resume, env=harness.ENV, capture_output=True, text=True, timeout=600)
+        assert result.returncode == 0, result.stderr[-1500:]
+        assert (victim / "keep.txt").read_text() == "keep" and "ignoring invalid recorded scratch" in result.stderr, result.stderr[-1500:]
+        assert not (path / "TAMPERED").exists()
+    check("resume refuses a rewritten launch.json and a run in use, and never deletes a scratch path planted in the journal")
 
 
 def scenario_fallback():

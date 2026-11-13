@@ -12,7 +12,10 @@ pub struct Episode {
     /// The run directory; sealed from the child's agent.
     pub dir: PathBuf,
     pub label: String,
+    /// The spec without what only the orchestrator uses (the `select` command and the `holdout` roots).
     pub spec: Spec,
+    /// The evaluators' grader and holdout roots, resolved by the orchestrator, for the child's policy to seal.
+    pub sealed: Vec<PathBuf>,
     pub role: Role,
     /// The candidate an exploit worker improves (0 for every other role).
     pub idea: u32,

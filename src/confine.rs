@@ -16,8 +16,16 @@ pub struct Rules {
 /// information, the resolver configuration. A confined child cannot reach hx's own `/proc` entries (Landlock refuses
 /// ptrace-style access to a process outside its domain), so `/proc` does not expose hx's environment.
 const CHILD_READ: &[&str] = &["/lib", "/lib32", "/lib64", "/libx32", "/proc", "/sys", "/run/systemd/resolve"];
-/// Devices every child may open for writing.
-const CHILD_WRITE: &[&str] = &["/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/pts", "/dev/shm"];
+/// Devices every child may open for writing. Not `/dev/shm`: it is one directory for every process of the machine and
+/// outlives them, so writable it would be a channel between confined children (an evaluator running candidate code
+/// next to held-out data, and the next episode's shell). Landlock cannot give each child a private one (that takes a
+/// mount namespace), and glibc and Python place POSIX shared memory and named semaphores only there, so confined
+/// children go without them: `shm_open`, `sem_open` and what is built on them (Python multiprocessing locks, queues,
+/// pools and `shared_memory`) fail with a permission error; threads, pipes and files in the child's own directories
+/// work. `CHILD_HIDDEN` also keeps it unreadable, so nothing an unconfined process leaves there reaches a child.
+const CHILD_WRITE: &[&str] = &["/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/pts"];
+/// Carved out of every child's read roots (see `CHILD_WRITE`).
+const CHILD_HIDDEN: &[&str] = &["/dev/shm"];
 
 /// The kernel's Landlock ABI version, or why confinement is unavailable. Probed once per process.
 pub fn status() -> Result<i32, &'static str> {
@@ -57,10 +65,11 @@ pub struct Ruleset(#[cfg(target_os = "linux")] std::os::fd::OwnedFd);
 
 impl Rules {
     /// Add the system paths every child needs: libraries, `/proc`, `/sys`, the resolver configuration (read) and the
-    /// shared devices such as `/dev/null` (write).
+    /// shared devices such as `/dev/null` (write), and hide `/dev/shm`.
     pub fn with_system(mut self) -> Self {
         self.read.extend(CHILD_READ.iter().map(PathBuf::from));
         self.write.extend(CHILD_WRITE.iter().map(PathBuf::from));
+        self.hidden.extend(CHILD_HIDDEN.iter().map(PathBuf::from));
         self
     }
 
@@ -176,5 +185,25 @@ mod tests {
         let secret = run(".harness/secrets.toml");
         assert!(!secret.status.success() && secret.stdout.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confined_children_share_no_dev_shm() {
+        if status().is_err() || !Path::new("/dev/shm").is_dir() { eprintln!("skipped: Landlock or /dev/shm unavailable"); return; }
+        let planted = PathBuf::from(format!("/dev/shm/hx-confine-planted-{}", std::process::id()));
+        std::fs::write(&planted, "LEFT").unwrap();
+        let rules = Rules { read: vec!["/usr".into(), "/bin".into(), "/etc".into(), "/dev".into()], write: vec![], hidden: vec![] }.with_system();
+        let ruleset = std::sync::Arc::new(rules.prepare().unwrap().unwrap());
+        let script = format!("echo x > /dev/shm/hx-confine-{}; cat {}; echo ok > /dev/null && echo NULL", std::process::id(), planted.display());
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        use std::os::unix::process::CommandExt;
+        let r = ruleset.clone();
+        unsafe { cmd.pre_exec(move || r.apply()); }
+        let out = cmd.output().unwrap().stdout;
+        let _ = std::fs::remove_file(&planted);
+        let wrote = std::fs::remove_file(format!("/dev/shm/hx-confine-{}", std::process::id())).is_ok();
+        assert_eq!((String::from_utf8_lossy(&out).as_ref(), wrote), ("NULL\n", false));
     }
 }
