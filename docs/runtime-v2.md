@@ -143,7 +143,7 @@ The complete batch is validated and copied before dispatch. It accepts at most 3
 
 Override `std/loop` with `init(config)` and `step(state, event) → state, command`. Rust accepts only known commands and supplies no ambient effect authority to the controller. Rust reads only the commands and the state's `messages` array (for the trace and to attach image notifications to an agent request); the rest of the state belongs to the controller. The old imperative `hx.run`, `hx.llm` and `hx.tree` helpers have been removed. Controller state must pass the same data-only boundary as durable values.
 
-Use `hooks.state` inside callbacks for persistent per-hook data:
+Use `hooks.state` inside callbacks for persistent per-hook data; the controller VM is rebuilt for every step, so captured upvalues do not last. The loop saves `hooks.state` in its state after every step, whether a hook changed it in place or assigned a new table:
 
 ```luau
 local hooks = require("std/hooks")
@@ -154,7 +154,7 @@ hooks.on("before_finish", function(payload)
 end)
 ```
 
-Control hooks fail the transition on error. Finish hooks return explicit `accept` or `continue` outcomes. Request hooks return validated requests; run hooks return code or an explicit denial. Observers registered with `hooks.observe` receive copies; their failures are diagnostic and their mutations cannot change control flow. Prompts append named runtime-access and finish-review sections instead of editing matching prose.
+Control hooks fail the transition on error. Finish hooks return explicit `accept` or `continue` outcomes. Request hooks (`before_model`) run once per agent request, never for a summarizer call, and return validated requests: the system prompt and tools they return apply to that request, while `messages` is the conversation itself, so a message a hook adds or changes stays in the history; run hooks return code or an explicit denial. Observers registered with `hooks.observe` receive copies; their failures are diagnostic and their mutations cannot change control flow. Prompts append named runtime-access and finish-review sections instead of editing matching prose.
 
 Compaction and finish review remain heuristics. A successful checkpoint proves a transition was committed, not that the model's reasoning or code is correct.
 

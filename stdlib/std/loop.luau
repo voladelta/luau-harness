@@ -67,10 +67,6 @@ local function compaction_failed(s)
 	return ready(s, "skip")
 end
 
-local function save_hook_state(s)
-	hooks.state = s.hook_state
-end
-
 local function next_call(s)
 	local cur = s.phase
 	local c = cur.calls[cur.index]
@@ -95,9 +91,7 @@ local function next_call(s)
 	return s, { kind = "next_call" }
 end
 
-local function step(s, event, options)
-	options = options or {}
-	save_hook_state(s)
+local function transition(s, event, options)
 	if event.kind == "recover" then
 		-- Close every pending tool call with receipts, never dispatch its old code again.
 		local phase = s.phase
@@ -253,7 +247,6 @@ local function step(s, event, options)
 		s.report.stopped = "max_turns: " .. s.max_turns
 		return finish(s)
 	end
-	local req = hooks.emit("before_model", { system = prompt.system(options), messages = s.messages, tools = prompt.tools })
 	local info = hx.model_info()
 	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, phase.bound or math.huge)
 	local max_output = assert(info.max_output, "hx.model_info() lacks max_output")
@@ -275,13 +268,27 @@ local function step(s, event, options)
 			if cut then
 				s.phase = { kind = "compact", cut = cut, size = size, overflow = phase.overflow }
 				local no_images = phase.overflow ~= nil and compact.image_overflow(phase.overflow)
-				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut, reserve, no_images), purpose = "compact" }
+				-- no before_model here: it fires once per agent request. The supervisor sends this under the system prompt of
+				-- the last agent request as sent, so the summarizer shares its cached prefix.
+				return s, { kind = "model", request = compact.request(prompt.system(options), prompt.tools, s.messages, cut, reserve, no_images), purpose = "compact" }
 			end
 		end
 	end
 	if phase.overflow then error(phase.overflow, 0) end
+	-- `messages` is the conversation itself: what a hook adds or changes there stays in the history
+	local req = hooks.emit("before_model", { system = prompt.system(options), messages = s.messages, tools = prompt.tools })
+	s.messages = req.messages
 	s.phase = { kind = "model" }
 	return s, { kind = "model", request = req, purpose = "agent" }
+end
+
+-- The controller VM is rebuilt for every step, so `hooks.state` lives in the state: a hook may change it in place or
+-- assign a new table, and either survives.
+local function step(s, event, options)
+	hooks.state = s.hook_state or {}
+	local state, command = transition(s, event, options or {})
+	state.hook_state = hooks.state
+	return state, command
 end
 
 -- Explicit worker protocol. Stopped states cannot be resumed through continue.

@@ -1,7 +1,10 @@
 -- Hook registry. A hook may transform a payload (return the new payload) or deny (return { deny = "reason" }).
 -- Hooks never approve anything: approval belongs to the Rust gate, which no Luau code can reach.
 local M = {}
-M.state = {} -- controller supplies this serialized store on every transition; use it instead of captured counters
+-- Persistent store for hooks, kept in the controller state: std/loop restores it before every step and saves it after,
+-- so a hook may change it in place or assign a new table. Use it instead of captured upvalues, which the controller
+-- VM (rebuilt for every step) does not keep.
+M.state = {}
 
 local handlers: { [string]: { (any) -> any } } = {}
 local observers = {}
@@ -18,7 +21,10 @@ local function clone(value, seen, depth)
 end
 
 -- Events fired by std/loop:
---   before_model { system, messages }  -> transformed request
+--   before_model { system, messages, tools } -> the request to send. Fired once per agent request (never for a
+--                                         summarizer call). system and tools apply to this request only; messages is
+--                                         the conversation itself, so a message a hook adds or changes stays in the
+--                                         history, is sent again on every later request and is summarized by compaction
 --   after_model  { text, finish, usage = { input, cache_read, cache_write, output } } -> transformed reply
 --   model_error  { error, messages }   -> { retry = true } asks for the same turn again (once per turn; messages may be
 --                                         changed in place first). Fired when the model call fails, except budget stops.

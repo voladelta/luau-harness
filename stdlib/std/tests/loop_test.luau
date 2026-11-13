@@ -200,3 +200,40 @@ test.case("a context overflow still compacts while compaction is paused", functi
 	test.eq(command.purpose, "agent")
 	test.ok(s.messages[1].content:find("SUMMARY", 1, true))
 end)
+
+test.case("before_model fires once per agent request, never for a summarizer call", function()
+	local s, command = start() -- the first agent request, before the hook is registered
+	local fired, requests = 0, 0
+	hooks.on("before_model", function(req)
+		fired += 1
+		table.insert(req.messages, { role = "user", content = "REMINDER" })
+		return req
+	end)
+	local function count(command)
+		if command.purpose == "agent" then requests += 1 end
+	end
+	for n = 1, 6 do s, command = turn(s, 1000 * n, n); count(command) end
+	s, command = turn(s, 9000, 7)
+	test.eq(command.purpose, "compact")
+	test.eq(fired, requests) -- the step that compacts sent no agent request and fired no hook
+	s, command = summary(s, "SUMMARY")
+	s, command = loop.step(s, { kind = "next" })
+	count(command)
+	test.eq(command.purpose, "agent")
+	test.eq(fired, requests)
+	test.eq(command.request.messages[#command.request.messages].content, "REMINDER")
+	test.eq(s.messages[#s.messages].content, "REMINDER") -- the request's messages are the conversation
+end)
+
+test.case("hooks.state survives in-place changes and reassignment", function()
+	local s, command = start()
+	hooks.on("after_model", function(p)
+		hooks.state = { replies = ((hooks.state.replies or 0) + 1) }
+		return p
+	end)
+	hooks.on("after_run", function(p) hooks.state.runs = (hooks.state.runs or 0) + 1; return p end)
+	s, command = turn(s, 1000, 1)
+	s, command = turn(s, 2000, 2)
+	test.eq(s.hook_state.replies, 2) -- counted by reassignment
+	test.eq(s.hook_state.runs, 1) -- counted in place since the last reassignment
+end)
