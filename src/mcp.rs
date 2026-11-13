@@ -134,7 +134,7 @@ fn result(v: Value, scrub: impl Fn(String) -> String) -> McpResult<Value> {
 }
 
 struct Stdio {
-    #[allow(dead_code)] // kept alive; killed when dropped
+    /// Killed when dropped.
     child: Child,
     stdin: ChildStdin,
     out: BufReader<ChildStdout>,
@@ -152,6 +152,10 @@ impl Stdio {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        // A write into the pipe of a server that already exited can still succeed, so ask the kernel first.
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Err(McpError::not_sent(format!("MCP server is not running ({status})")));
+        }
         self.send(&msg).await.map_err(|e| McpError::not_sent(format!("MCP server is not running ({e})")))?;
         let work = async {
             let mut budget = ResponseBudget::new(MAX_BODY);
