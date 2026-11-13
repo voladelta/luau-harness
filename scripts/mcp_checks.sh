@@ -105,6 +105,10 @@ hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'  # each server gets a f
 check "http: bearer_env sends Authorization: Bearer" "$(hx 'print(mcp.web.add{a = 4, b = 5})' | head -1)" "9"
 hcfg "http://127.0.0.1:$HP/redir" 'bearer_env = "WEB_KEY"'
 check "http: a redirect is not followed" "$(hx 'print(pcall(mcp.web.add, {a=1,b=2}))' | head -1 | grep -c 'redirects are not followed')" "1"
+hcfg "http://127.0.0.1:$HP/see-other" 'bearer_env = "WEB_KEY"'
+before=$(cat $T/calls.log 2>/dev/null | wc -l)
+out=$(hx 'print(pcall(function() return mcp.web.add{a=1,b=1} end)); print(pcall(function() return mcp.web.add{a=1,b=2} end))' | tr '\n' ' ')
+check "http: a 303 after a call that ran leaves it uncertain, so it is not repeated" "$(echo "$out" | grep -c 'unknown_outcome.*unresolved mutations')$(( $(wc -l < $T/calls.log) - before ))" "11"
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "NO_SUCH_VAR"'
 check "http: unset env var fails clearly before any request" "$(hx 'print(pcall(mcp.web.add, {a=1,b=2}))' | head -1 | grep -c 'NO_SUCH_VAR.*not set')" "1"
 hcfg "http://127.0.0.1:$HP/mcp" 'bearer_env = "WEB_KEY"'

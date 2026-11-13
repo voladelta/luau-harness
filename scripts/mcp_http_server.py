@@ -5,7 +5,8 @@ request headers per POST), SESSION=1 (issue Mcp-Session-Id, 404 on a wrong one),
 rejected header value), EXPIRE=file (if it exists: delete it, rotate the session, 404 once), DROP=file (if it exists:
 delete it and close the connection without answering one tools/call), CLOSE_AFTER_LIST=1 (stop listening once
 tools/list is answered, so later connections are refused). Mode sse-split sends the
-stream in 3-byte chunks, ends without the final blank line, and precedes the response with a server request using id 1. POST /redir answers 302 to /elsewhere."""
+stream in 3-byte chunks, ends without the final blank line, and precedes the response with a server request using id 1. POST /redir answers 302 to /elsewhere;
+POST /see-other runs a tools/call and answers 303 to /result, as a server that redirects to the outcome of a POST does."""
 import json, os, socket, sys, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +32,9 @@ class H(BaseHTTPRequestHandler):
             if self.headers.get(k) != v:
                 got = self.headers.get(k) or ""
                 return self.reply(401, json.dumps({"error": "bad key " + got if os.environ.get("ECHO_KEY") else "unauthorized"}).encode())
+        if self.path == "/see-other" and m.get("method") == "tools/call":
+            call(m["params"]["name"], m["params"].get("arguments", {}))
+            return self.reply(303, extra=[("Location", "/result")])
         global SID
         exp = os.environ.get("EXPIRE")
         if SID and exp and os.path.exists(exp) and m.get("method") == "tools/call":
