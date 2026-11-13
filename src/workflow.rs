@@ -69,19 +69,53 @@ pub struct StageSpec {
     /// The Markdown filename of the stage's projection under `.agents/artifacts/rpi-RUN/`.
     pub artifact_name: String,
 }
+/// What an owner gate asks for: approval of a stage's artifact, answers to a stage's questions, or acceptance of
+/// verified work.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    Review,
+    Input,
+    Acceptance,
+}
+/// An owner's decision at a gate, as `hx review --decision` names it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Approve,
+    Revise,
+    Answer,
+    Waive,
+}
+impl std::str::FromStr for Decision {
+    type Err = anyhow::Error;
+    fn from_str(name: &str) -> Result<Self> {
+        Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name))
+            .with_context(|| format!("unknown review decision {name:?}"))
+    }
+}
+/// What std/rpi does after the gate's decision (other than `revise`, which always returns to the stage's work).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Continuation {
+    NextStage,
+    SameStage,
+    ManualResults,
+    Finish,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewRequest {
     pub gate_id: String,
-    pub kind: String,
+    pub kind: GateKind,
     #[serde(default)]
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub questions: Vec<String>,
     #[serde(default)]
     pub check_ids: Vec<String>,
-    pub decisions: Vec<String>,
-    pub continuation: String,
+    pub decisions: Vec<Decision>,
+    pub continuation: Continuation,
     /// Acceptance gates only: the project the verification stage observed. Approval requires it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectObservation>,
@@ -120,7 +154,7 @@ pub struct ArtifactRef {
 pub struct OwnerInputRef {
     pub id: String,
     pub gate_id: String,
-    pub decision: String,
+    pub decision: Decision,
     pub content_blob: Option<String>,
     #[serde(default)]
     pub check_ids: Vec<String>,
@@ -144,7 +178,8 @@ pub struct ExecutionFrame {
     pub artifacts: Vec<ArtifactRef>,
     pub owner_inputs: Vec<OwnerInputRef>,
     pub pending_event: Option<Value>,
-    pub consumed_decisions: Vec<String>,
+    /// Journal sequence numbers of the `owner_decision` records already consumed.
+    pub consumed_decisions: Vec<u64>,
     pub stage_epoch: u64,
     pub check_plan: Vec<PlannedCheck>,
     pub boundaries: BTreeMap<String, String>,
@@ -306,23 +341,23 @@ pub fn planned_checks(value: &Value) -> Result<Vec<PlannedCheck>> {
 }
 pub fn validate_review_decision(
     request: &ReviewRequest,
-    decision: &str,
+    decision: Decision,
     input: Option<&str>,
 ) -> Result<()> {
     identifier(&request.gate_id)?;
     ensure!(
-        request.decisions.iter().any(|d| d == decision),
+        request.decisions.contains(&decision),
         "decision is not permitted by this gate"
     );
     let valid = match decision {
-        "approve" => matches!(request.kind.as_str(), "review" | "acceptance"),
-        "revise" => matches!(request.kind.as_str(), "review" | "acceptance"),
-        "answer" => request.kind == "input",
-        "waive" => request.kind == "input" && !request.check_ids.is_empty(),
-        _ => false,
+        Decision::Approve | Decision::Revise => {
+            matches!(request.kind, GateKind::Review | GateKind::Acceptance)
+        }
+        Decision::Answer => request.kind == GateKind::Input,
+        Decision::Waive => request.kind == GateKind::Input && !request.check_ids.is_empty(),
     };
     ensure!(valid, "decision is invalid for this gate kind");
-    if matches!(decision, "revise" | "answer" | "waive") {
+    if decision != Decision::Approve {
         ensure!(
             input.is_some_and(|s| !s.trim().is_empty()),
             "decision requires feedback in --input-file"
@@ -830,16 +865,11 @@ impl Boundary {
             BoundaryNext::Review { request } => {
                 identifier(&request.gate_id)?;
                 ensure!(
-                    matches!(request.kind.as_str(), "review" | "input" | "acceptance"),
-                    "invalid review gate kind"
-                );
-                identifier(&request.continuation)?;
-                ensure!(
                     !request.decisions.is_empty(),
                     "review gate must permit a decision"
                 );
                 let mut decisions = BTreeSet::new();
-                for decision in &request.decisions {
+                for &decision in &request.decisions {
                     ensure!(decisions.insert(decision), "duplicate gate decision");
                     // Feedback is validated at decision recording; here validate the declared action shape.
                     validate_review_decision(request, decision, Some("gate validation"))?;
@@ -905,6 +935,28 @@ mod tests {
         let mut bad = ok.clone();
         bad.as_object_mut().unwrap().remove("evidence");
         assert!(validate_submission(&bad).is_err(), "evidence is required");
+    }
+    #[test]
+    fn gates_are_closed_sets_stored_as_their_names() {
+        let gate = json!({"gate_id":"rpi-gate-1","kind":"input","check_ids":["unit"],"decisions":["answer","waive"],
+            "continuation":"manual_results"});
+        let request: ReviewRequest = serde_json::from_value(gate.clone()).unwrap();
+        assert_eq!((request.kind, request.continuation), (GateKind::Input, Continuation::ManualResults));
+        let stored = serde_json::to_value(&request).unwrap();
+        for field in ["kind", "decisions", "continuation"] {
+            assert_eq!(stored[field], gate[field], "{field}");
+        }
+        validate_review_decision(&request, "waive".parse().unwrap(), Some("not run here")).unwrap();
+        assert!(validate_review_decision(&request, Decision::Approve, None).is_err());
+        assert!("approved".parse::<Decision>().is_err());
+        for (field, value) in [("kind", "inputs"), ("continuation", "finish_now")] {
+            let mut bad = gate.clone();
+            bad[field] = json!(value);
+            assert!(serde_json::from_value::<ReviewRequest>(bad).is_err(), "{field}");
+        }
+        let mut bad = gate;
+        bad["decisions"] = json!(["answer", "skip"]);
+        assert!(serde_json::from_value::<ReviewRequest>(bad).is_err());
     }
     #[test]
     fn check_plans_refuse_escaping_cwds_and_inputs() {

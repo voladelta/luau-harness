@@ -390,7 +390,7 @@ def decision_crash_exactly_once():
                 assert gate(report(run(path, "run", "--resume", value["log"])))["gate_id"] == next_gate["gate_id"]
             state = saved_state(value["log"])["workflow"]
             decisions = [r for r in harness.records(Path(value["log"])) if r["kind"] == "owner_decision"]
-            assert len(decisions) == 1 and state["consumed_decisions"].count(str(decisions[0]["seq"])) == 1
+            assert len(decisions) == 1 and state["consumed_decisions"].count(decisions[0]["seq"]) == 1
             assert len([item for item in state["owner_inputs"] if item["gate_id"] == request["gate_id"]]) == 1
             assert len(calls) == count
 

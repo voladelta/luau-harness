@@ -7,7 +7,8 @@ use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicB
 
 // Approval policy and temporary grants are frozen under this format; shell outcomes carry their approval source; the
 // journal chain is keyed; `expect` records carry the file's previous hash and the temporary name.
-pub const FORMAT: u64 = 10;
+// Workflow checkpoints record consumed owner decisions by their journal sequence numbers.
+pub const FORMAT: u64 = 11;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

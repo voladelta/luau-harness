@@ -383,16 +383,16 @@ impl Host {
         let decision = records.iter().rev().find(|r| {
             r["kind"] == "owner_decision"
                 && r["gate_id"] == request.gate_id
-                && !frame.consumed_decisions.contains(&r["seq"].to_string())
+                && r["seq"].as_u64().is_some_and(|seq| !frame.consumed_decisions.contains(&seq))
         });
         let Some(decision) = decision else {
             return Ok(OwnerResume::Waiting);
         };
-        let kind = decision["decision"]
-            .as_str()
-            .context("owner decision without a decision")?;
+        let id = decision["seq"].as_u64().expect("matched by its sequence number");
+        let kind: Decision = serde_json::from_value(decision["decision"].clone())
+            .context("owner decision without a valid decision")?;
         // A final acceptance reduction dispatches no model or workspace effects.
-        if !(request.continuation == "finish" && kind == "approve") {
+        if !(request.continuation == Continuation::Finish && kind == Decision::Approve) {
             self.supervisor.check()?;
         }
         let text = decision["content_blob"]
@@ -403,8 +403,7 @@ impl Host {
             .transpose()?
             .unwrap_or_default();
         validate_review_decision(request, kind, Some(&text))?;
-        let id = decision["seq"].to_string();
-        if kind == "approve"
+        if kind == Decision::Approve
             && let Some(project) = &request.project
         {
             let stale = match observe_project(&self.workspace, &project.extra_inputs) {
@@ -422,9 +421,9 @@ impl Host {
             }
         }
         frame.owner_inputs.push(OwnerInputRef {
-            id: id.clone(),
+            id: id.to_string(),
             gate_id: request.gate_id.clone(),
-            decision: kind.into(),
+            decision: kind,
             content_blob: decision["content_blob"].as_str().map(String::from),
             check_ids: request.check_ids.clone(),
         });
@@ -559,10 +558,10 @@ impl Host {
                         "unknown review artifact {id}"
                     );
                 }
-                if request.kind == "acceptance" {
+                if request.kind == GateKind::Acceptance {
                     request.project = frame.observation.clone();
                 }
-                let input = request.kind == "input";
+                let input = request.kind == GateKind::Input;
                 let mut report = json!({
                     "finished": false,
                     "final_answer": if input {"Owner input required."} else {"Artifact ready for review."},
@@ -649,8 +648,9 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
             Ok(std::fs::read_to_string(p)?)
         })
         .transpose()?;
+    let decision: Decision = decision.parse()?;
     validate_review_decision(&request, decision, text.as_deref())?;
-    if decision == "approve"
+    if decision == Decision::Approve
         && let Some(project) = &request.project
     {
         ensure!(
@@ -664,10 +664,10 @@ pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Pa
     if let Some(old) = records.iter().find(|r| {
         r["kind"] == "owner_decision"
             && r["gate_id"] == gate_id
-            && !consumed.contains(&r["seq"].to_string())
+            && r["seq"].as_u64().is_some_and(|seq| !consumed.contains(&seq))
     }) {
         ensure!(
-            old["decision"] == decision && old["content_blob"] == json!(content_blob),
+            old["decision"] == json!(decision) && old["content_blob"] == json!(content_blob),
             "conflicting decision already recorded"
         );
         outln!(
