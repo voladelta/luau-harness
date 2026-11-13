@@ -228,11 +228,12 @@ impl AgentReply {
     }
 }
 
-/// Run `task` in `child` (made by `Host::child` with the principal it may have) as one effect: a subagent records an
-/// intent and a receipt, and recovery never redispatches it.
+/// Run `task` in `child` (made by `Host::child` with the principal it may have). Spawning a subagent changes nothing
+/// by itself, so it records a call receipt, not an intent: a crash mid-agent leaves nothing for the owner to settle.
+/// Each effect of the child has its own intent and receipt and goes through admission itself.
 pub async fn agent(fx: &Effects, lua: &Lua, child: Arc<crate::host::Host>, task: String, options: &crate::host::AgentOptions) -> mlua::Result<AgentReply> {
     let args = json!({"task_sha": crate::eventlog::sha_bytes(task.as_bytes()), "preview": task.chars().take(120).collect::<String>(), "max_turns": options.max_turns, "model": options.model, "effort": options.effort});
-    let ret = fx.run(lua, Tool::Agent, Class::LocalWrite, args, || async {
+    let ret = fx.run(lua, Tool::Agent, Class::Read, args, || async {
         child.log(&format!("### SUBAGENT (depth {}, model {}, effort {})\n{task}", child.depth, child.llm.model, child.llm.reasoning.as_deref().unwrap_or("default")));
         let rep = child.clone().run_task(task.clone(), options.max_turns).await.map_err(|e| rt(e.to_string()))?;
         Ok(Ret::Agent { answer: rep["final_answer"].as_str().unwrap_or("").to_string(), finished: rep["finished"].as_bool().unwrap_or(false), turns: rep["turns"].as_u64().unwrap_or(0) })

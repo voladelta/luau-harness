@@ -371,6 +371,32 @@ def local_write_reconciliation():
             assert [(r["decision"], r["by"]) for r in resolutions] == [(decision, "hx")], (number, resolutions)
 
 
+def interrupted_agent():
+    # Starting a subagent changes nothing by itself: a crash inside it leaves nothing for the owner to settle.
+    code = 'local r=agent("SUBTASK"); print("SUB", r.answer)'
+    def answer(body, index):
+        text = body_text(body)
+        if "Recovered into a fresh Luau VM" in text:
+            return tool('print("WROTE", write("after.txt","ok"))') if "WROTE" not in text else "recovered"
+        if task_text(body).startswith("SUBTASK"):
+            return "sub done"
+        return tool(code) if not has_assistant(body) else "done"
+    with provider(answer) as (url, _):
+        control = workspace("agent-control")
+        start(control, url)
+        saved = records(journal(control))
+        assert not any(r["kind"] == "intent" for r in saved), saved
+        assert any(r["kind"] == "call" and r["tool"] == "agent" for r in saved), saved
+        begin = next(r["seq"] for r in saved if r["kind"] == "chunk_begin")
+        child = next(r["seq"] for r in saved if r["kind"] == "model_intent" and r["seq"] > begin)
+    path = workspace("agent-crash")
+    with provider(answer) as (url, _):
+        assert start(path, url, env={"HX_TEST_CRASH_AFTER_RECORD": str(child)}, ok=False).returncode
+        report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
+        assert report["uncertain_operations"] == [] and report["finished"], report
+        assert (path / "after.txt").read_text() == "ok"
+
+
 def model_status_codes():
     # A rate limit is waited out and releases each reservation: nothing was generated.
     path = workspace("status-429")
@@ -662,8 +688,8 @@ assert(#durable.get("1")==#s); print("BOUNDED_OK")'''
     with provider(answer) as (url, calls):
         report = json.loads(start(path, url).stdout)
         assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 4, report
-        intent = next(r for r in records(journal(path)) if r["kind"] == "intent" and r["tool"] == "agent")
-        assert intent["args"]["model"] == "mock" and intent["args"]["effort"] == "medium", intent
+        receipt = next(r for r in records(journal(path)) if r["kind"] == "call" and r["tool"] == "agent")
+        assert receipt["args"]["model"] == "mock" and receipt["args"]["effort"] == "medium", receipt
         log = journal(path)
         checkpoint = next(r for r in reversed(records(log)) if r["kind"] == "checkpoint" and r["lane"] == "root")
         saved = json.loads((log.parent / "blobs" / checkpoint["blob"]).read_text())
@@ -901,6 +927,7 @@ if __name__ == "__main__":
     check("explicit branches inherit only committed data and select a new manifest", branch_saved_state)
     check("owner abandon unblocks a resumed run; retry is no longer a decision", unknown_abandon)
     check("crash-interrupted write/edit settle from the files without the owner", local_write_reconciliation)
+    check("a crash inside a subagent leaves nothing for the owner to settle", interrupted_agent)
     check("rate limits are waited out; definite rejections release reservations", model_status_codes)
     check("concurrent children queue under a token cap instead of failing", concurrent_children_under_token_cap)
     check("lost responses are charged their reserved tokens; one new request follows", lost_response)
