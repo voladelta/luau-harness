@@ -5,9 +5,8 @@
 //! content: `hx trust` records a hash per workspace in `~/.config/hx/trust.toml` (outside every repo, protected from
 //! the model). `hx run` and `hx exec` refuse untrusted config unless `--ignore-config` asks to run without it; other
 //! commands ignore it as if absent. A workspace with none of these files needs no trust. `HX_TRUST=<hash>` in hx's own
-//! environment trusts that exact config for one launch (throwaway copies); `HX_TRUST=1`, which trusted any config, is
-//! deprecated and still accepted for one release.
-use anyhow::{anyhow, Result};
+//! environment trusts that exact config for one launch (throwaway copies).
+use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -50,67 +49,130 @@ fn key(ws: &Path) -> String {
     std::fs::canonicalize(ws).unwrap_or_else(|_| ws.to_path_buf()).to_string_lossy().to_string()
 }
 
-/// The config files present, relative to the workspace and sorted (tree files included). A symlink anywhere in the
-/// config (`.harness` itself, a file, or inside a tree) is listed as `symlink:<path>`: its target is outside what the
-/// hash covers (and may be writable by the model), so such a config can never be trusted.
-pub fn config_files(ws: &Path) -> Vec<String> {
-    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
-    let mut out: Vec<String> = Vec::new();
-    if is_link(&ws.join(".harness")) {
-        out.push("symlink:.harness".into());
-    }
-    for f in FILES {
-        if is_link(&ws.join(f)) {
-            out.push(format!("symlink:{f}"));
-        } else if ws.join(f).is_file() {
-            out.push(f.to_string());
+/// One config entry: a regular file's bytes, or a symlink, whose target the hash cannot cover.
+enum Entry {
+    File(Vec<u8>),
+    Symlink,
+}
+
+/// The workspace config, read once. Trust hashes exactly these bytes, and the run's registry is built from the same
+/// bytes, so nothing written between the trust check and the capture can slip in.
+pub struct Config {
+    /// Keyed by path relative to the workspace.
+    entries: BTreeMap<String, Entry>,
+}
+
+impl Config {
+    /// Read every config file and tree. A symlink anywhere in the config (`.harness` itself, a file, or inside a tree)
+    /// is recorded but not followed: its target is outside what the hash covers (and may be writable by the model), so
+    /// such a config can never be trusted.
+    pub fn read(ws: &Path) -> Result<Config> {
+        fn add(entries: &mut BTreeMap<String, Entry>, ws: &Path, rel: String) -> Result<()> {
+            let path = ws.join(&rel);
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e).with_context(|| format!("cannot read workspace config {rel}")),
+            };
+            if meta.file_type().is_symlink() {
+                entries.insert(rel, Entry::Symlink);
+            } else if meta.is_dir() {
+                for entry in std::fs::read_dir(&path).with_context(|| format!("cannot read workspace config {rel}"))? {
+                    let name = entry?.file_name();
+                    let name = name.to_str().with_context(|| format!("non-UTF-8 file name in workspace config {rel}"))?;
+                    add(entries, ws, format!("{rel}/{name}"))?;
+                }
+            } else {
+                anyhow::ensure!(meta.is_file(), "workspace config {rel} is not a regular file");
+                let bytes = std::fs::read(&path).with_context(|| format!("cannot read workspace config {rel}"))?;
+                entries.insert(rel, Entry::File(bytes));
+            }
+            Ok(())
         }
-    }
-    fn walk(dir: &Path, ws: &Path, out: &mut Vec<String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            let rel = p.strip_prefix(ws).unwrap().to_string_lossy().to_string();
-            match std::fs::symlink_metadata(&p) {
-                Ok(m) if m.file_type().is_symlink() => out.push(format!("symlink:{rel}")),
-                Ok(m) if m.is_dir() => walk(&p, ws, out),
-                _ => out.push(rel),
+        let kind = |rel: &str| std::fs::symlink_metadata(ws.join(rel)).ok().map(|m| m.file_type());
+        let mut entries = BTreeMap::new();
+        let harness_link = kind(".harness").is_some_and(|t| t.is_symlink());
+        if harness_link {
+            entries.insert(".harness".to_string(), Entry::Symlink);
+        }
+        for f in FILES.into_iter().chain(TREES) {
+            if harness_link && f.starts_with(".harness/") { continue; }
+            // a directory where a file belongs, or a file where a tree belongs, is not config
+            let misplaced = if FILES.contains(&f) { kind(f).is_some_and(|t| t.is_dir()) } else { kind(f).is_some_and(|t| t.is_file()) };
+            if !misplaced {
+                add(&mut entries, ws, f.to_string())?;
             }
         }
+        Ok(Config { entries })
     }
-    for t in TREES {
-        let d = ws.join(t);
-        if is_link(&d) {
-            out.push(format!("symlink:{t}"));
-        } else {
-            walk(&d, ws, &mut out);
+
+    /// The entries as `hx trust` lists them, sorted: a path, or `symlink:<path>`.
+    pub fn names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.entries.iter().map(|(rel, entry)| match entry {
+            Entry::File(_) => rel.clone(),
+            Entry::Symlink => format!("symlink:{rel}"),
+        }).collect();
+        out.sort();
+        out
+    }
+
+    /// Symlinked entries (they make the config untrustable).
+    pub fn symlinks(&self) -> Vec<String> {
+        self.entries.iter().filter(|(_, e)| matches!(e, Entry::Symlink)).map(|(rel, _)| rel.clone()).collect()
+    }
+
+    /// Hash of the config (length-framed name and content of every entry, in `names()` order), or None when there is
+    /// none.
+    pub fn hash(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        if self.entries.is_empty() {
+            return None;
+        }
+        let bodies: BTreeMap<String, &[u8]> = self.entries.iter().map(|(rel, entry)| match entry {
+            Entry::File(bytes) => (rel.clone(), bytes.as_slice()),
+            Entry::Symlink => (format!("symlink:{rel}"), &[][..]),
+        }).collect();
+        let mut h = Sha256::new();
+        for (name, body) in bodies {
+            h.update((name.len() as u64).to_le_bytes());
+            h.update(name.as_bytes());
+            h.update((body.len() as u64).to_le_bytes());
+            h.update(body);
+        }
+        Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// The bytes of one config file (`.harness/init.luau`, `hx.lock`, ...), if present.
+    pub fn file(&self, rel: &str) -> Option<&[u8]> {
+        match self.entries.get(rel) {
+            Some(Entry::File(bytes)) => Some(bytes),
+            _ => None,
         }
     }
-    out.sort();
-    out
+
+    /// The files of one config tree (`.harness/override`, ...), keyed by path relative to the tree.
+    pub fn tree<'a>(&'a self, tree: &str) -> impl Iterator<Item = (&'a str, &'a [u8])> {
+        let prefix = format!("{tree}/");
+        self.entries.iter().filter_map(move |(rel, entry)| match entry {
+            Entry::File(bytes) => rel.strip_prefix(prefix.as_str()).map(|r| (r, bytes.as_slice())),
+            Entry::Symlink => None,
+        })
+    }
+}
+
+/// The config files present, as `hx trust` lists them (see `Config::names`). An unreadable config lists as empty.
+pub fn config_files(ws: &Path) -> Vec<String> {
+    Config::read(ws).map(|c| c.names()).unwrap_or_default()
 }
 
 /// Symlinked entries in the config (they make it untrustable).
 pub fn symlinks(ws: &Path) -> Vec<String> {
-    config_files(ws).into_iter().filter_map(|f| f.strip_prefix("symlink:").map(String::from)).collect()
+    Config::read(ws).map(|c| c.symlinks()).unwrap_or_default()
 }
 
-/// Hash of the config (length-framed path + content of every file), or None when there is none.
+/// Hash of the config, or None when there is none (or it cannot be read).
 pub fn config_hash(ws: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let files = config_files(ws);
-    if files.is_empty() {
-        return None;
-    }
-    let mut h = Sha256::new();
-    for f in files {
-        let body = if f.starts_with("symlink:") { Vec::new() } else { std::fs::read(ws.join(&f)).unwrap_or_default() };
-        h.update((f.len() as u64).to_le_bytes());
-        h.update(f.as_bytes());
-        h.update((body.len() as u64).to_le_bytes());
-        h.update(&body);
-    }
-    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Config::read(ws).ok()?.hash()
 }
 
 fn read_store() -> BTreeMap<String, String> {
@@ -129,23 +191,22 @@ pub fn ignore_config() {
     IGNORE_CONFIG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// May hx use this workspace's config? Yes when there is none, when `HX_TRUST` names its hash (or is the deprecated
-/// `1`), or when its hash was trusted; never with `--ignore-config`.
-pub fn is_trusted(ws: &Path) -> bool {
+/// The workspace config, when hx may use it: when there is none, when `HX_TRUST` in hx's own environment names its
+/// hash, or when its hash was trusted; never with `--ignore-config` or with symlinks in it. The returned bytes are the
+/// ones the decision covered: build from them, never from a second read.
+pub fn trusted(ws: &Path) -> Result<Option<Config>> {
     if IGNORE_CONFIG.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
+        return Ok(None);
     }
-    let Some(h) = config_hash(ws) else { return true };
-    match std::env::var("HX_TRUST").as_deref() {
-        Ok("1") => {
-            static NOTED: std::sync::Once = std::sync::Once::new();
-            NOTED.call_once(|| eprintln!("hx: note: HX_TRUST=1 is deprecated and will stop working in the next release; set HX_TRUST to the config hash `hx trust` shows"));
-            return true;
-        },
-        Ok(v) if v == h && symlinks(ws).is_empty() => return true,
-        _ => {},
-    }
-    symlinks(ws).is_empty() && read_store().get(&key(ws)) == Some(&h)
+    let config = Config::read(ws)?;
+    let Some(h) = config.hash() else { return Ok(Some(config)) };
+    let consented = std::env::var("HX_TRUST").is_ok_and(|v| v == h) || read_store().get(&key(ws)) == Some(&h);
+    Ok((consented && config.symlinks().is_empty()).then_some(config))
+}
+
+/// May hx use this workspace's config? See `trusted`; a config that cannot be read is not trusted.
+pub fn is_trusted(ws: &Path) -> bool {
+    matches!(trusted(ws), Ok(Some(_)))
 }
 
 /// `hx run` and `hx exec` refuse to start over workspace config the user has not trusted, rather than silently
@@ -162,11 +223,12 @@ pub fn require_trusted(ws: &Path) -> Result<()> {
 
 /// Record the workspace's current config as trusted. Returns the hash (None: nothing to trust).
 pub fn record(ws: &Path) -> Result<Option<String>> {
-    let links = symlinks(ws);
+    let config = Config::read(ws)?;
+    let links = config.symlinks();
     if !links.is_empty() {
         anyhow::bail!("cannot trust a config with symlinks (their targets are not covered): {}; replace them with real files", links.join(", "));
     }
-    let Some(h) = config_hash(ws) else { return Ok(None) };
+    let Some(h) = config.hash() else { return Ok(None) };
     let path = store_file()?;
     std::fs::create_dir_all(path.parent().unwrap())?;
     // Concurrent `hx trust` runs would otherwise lose each other's entries: read-modify-write under an exclusive lock,
@@ -193,8 +255,13 @@ pub struct Retrust {
 impl Retrust {
     pub fn before(ws: &Path) -> Retrust {
         // HX_TRUST is consent for one launch only: it must not make the trust permanent here
-        let stored = symlinks(ws).is_empty() && config_hash(ws).is_some_and(|h| read_store().get(&key(ws)) == Some(&h));
-        Retrust { ws: ws.to_path_buf(), was: config_hash(ws).is_none() || stored }
+        let hash = Config::read(ws).ok().filter(|c| c.symlinks().is_empty()).map(|c| c.hash());
+        let was = match hash {
+            Some(None) => true,
+            Some(Some(h)) => read_store().get(&key(ws)) == Some(&h),
+            None => false,
+        };
+        Retrust { ws: ws.to_path_buf(), was }
     }
 
     pub fn after(self) -> Result<()> {

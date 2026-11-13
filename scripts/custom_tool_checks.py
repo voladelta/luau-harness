@@ -222,8 +222,10 @@ class Tools(unittest.TestCase):
         result = subprocess.run([str(HX), "trust", "--yes", "--workspace", str(self.ws)], env=env, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("symlinks", result.stderr)
-        # Only the deprecated HX_TRUST=1 still trusts a config with symlinks; registration refuses the link itself.
-        self.assertIn("tool must be a regular file", self.run_code('print(link)', env={**self.env, "HX_TRUST": "1"}))
+        # No consent trusts a config with symlinks: the launch is refused.
+        refused = subprocess.run([str(HX), "exec", "--workspace", str(self.ws), "print(link)"], env=env, text=True, capture_output=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("not trusted", refused.stderr)
 
     def test_effect_capabilities_and_endpoint_grants(self):
         (self.ws / "a.txt").write_text("hello")
