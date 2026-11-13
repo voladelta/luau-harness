@@ -389,6 +389,8 @@ impl Policy {
             let actual = std::fs::canonicalize(path)?;
             p.protected.extend([actual.clone(), actual.with_extension("lock"), actual.with_extension("revoked"),
                 actual.parent().unwrap().join("blobs"), actual.parent().unwrap().join("registry")]);
+            // The key that authenticates this journal is sealed wherever this launch finds it.
+            p.sealed.extend(journal_key());
             // Newly introduced aliases must not turn frozen protected paths into writable paths.
             let aliases: Vec<_> = p.protected.iter().filter_map(canon).collect();
             p.protected.extend(aliases);
@@ -423,6 +425,7 @@ impl Policy {
         if let Some(d) = crate::trust::store_dir_canonical() {
             p.protected.push(d);
         }
+        p.sealed.extend(journal_key());
         // check_write resolves aliases before comparing. Protect the resolved configuration too, including an
         // untrusted workspace's symlinked .harness or hx.lock including automatically approved path requests.
         let canonical_protected: Vec<_> = p.protected.iter().filter_map(canon).collect();
@@ -701,6 +704,12 @@ impl Drop for Policy {
         let _ = self.log.write("session_end", json!({}), true);
         let _ = std::fs::remove_dir_all(&self.tmp);
     }
+}
+
+/// The journal key (`eventlog::KEY_FILE`): sealed, so file tools can neither read nor write it, search skips it and
+/// confined children cannot see it, even when a root covers the configuration directory.
+fn journal_key() -> Option<PathBuf> {
+    crate::trust::store_dir_canonical().map(|d| d.join(crate::eventlog::KEY_FILE))
 }
 
 /// Directories under $HOME that hold the user's toolchains (so `python3`, `git`, `cargo` are readable by file tools).

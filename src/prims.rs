@@ -42,8 +42,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> mlua::Result<T> + Send 
 /// Replace a file's content all at once (temp file, fsync, rename), after journaling the content's hash. A crash leaves
 /// the old or the new file, never a torn one, so resume can tell which from the disk (`supervisor::reconcile`).
 fn replace_file(sup: &crate::supervisor::Supervisor, intent: Option<u64>, p: &Path, target: &crate::atomic_file::Target, bytes: &[u8]) -> Result<()> {
-    if let Some(id) = intent { sup.expect(id, p, &crate::eventlog::sha_bytes(bytes))?; }
-    target.replace(bytes)
+    sup.replace_file(intent, p, target, bytes)
 }
 
 /// Open a policy-checked canonical path for reading: every directory from `/` down is opened without following a

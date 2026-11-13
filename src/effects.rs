@@ -356,7 +356,7 @@ mod tests {
         let result = fx.run(&lua, Tool::Write, Class::LocalWrite, json!({}), || async { Err(unknown("response lost")) }).await;
         assert!(result.is_err());
         assert_eq!(fx.supervisor.uncertain_operations().len(), 1);
-        assert_eq!(crate::eventlog::verify(&fx.log().path).unwrap().unknown.len(), 1);
+        assert_eq!(crate::supervisor::Books::of(&crate::eventlog::load(&fx.log().path).unwrap()).unwrap().open.len(), 1);
         drop(fx);
         let _ = std::fs::remove_dir_all(dir);
     }

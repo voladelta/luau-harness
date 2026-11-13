@@ -5,6 +5,7 @@ Artifacts are retained when HX_CHECK_ARTIFACTS is set. Run after cargo build --r
 """
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,8 @@ if os.environ.get("HX_CHECK_ARTIFACTS"):
 else:
     BASE = Path(tempfile.mkdtemp(prefix="hx-redesign-"))
 BASE.mkdir(parents=True, exist_ok=True)
-ENV = {**os.environ, "HX_TRUST": "current", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1"}  # backoff: host.rs unit test
+ENV = {**os.environ, "HX_TRUST": "current", "HX_TEST_KEY": "local-mock-only", "HX_TEST_NO_BACKOFF": "1",  # backoff: host.rs unit test
+       "XDG_CONFIG_HOME": str(BASE / "config")}  # this suite's own journal key
 for key in ("HX_MODEL", "HX_BASE_URL", "HX_TEST_CRASH_AFTER_RECORD"):
     ENV.pop(key, None)
 passed = 0
@@ -59,6 +61,12 @@ def journal(path):
     files = list((path / ".harness/log").glob("*.jsonl"))
     assert len(files) == 1, files
     return files[0]
+
+
+def chain_link(line):
+    """The `prev` of the record after `line`: its HMAC-SHA256 under the suite's journal key, as only the owner can compute."""
+    key = (Path(ENV["XDG_CONFIG_HOME"]) / "hx/journal.key").read_bytes()
+    return hmac.new(key, line.encode(), hashlib.sha256).hexdigest()
 
 
 def tool(code):
@@ -351,11 +359,12 @@ def local_write_reconciliation():
     write_intent = next(r for r in log if r["kind"] == "intent" and r["tool"] == "write")
     expect = next(r for r in log if r["kind"] == "expect" and r["of"] == write_intent["seq"])
     edit_expect = next(r for r in log if r["kind"] == "expect" and r["of"] != write_intent["seq"])
-    cases = [  # (crash after record, content to plant before resume, expected decision)
+    cases = [  # (crash after record, content to plant before resume, expected decision; None leaves it to the owner)
         (write_intent["seq"], None, "abandon"),       # before the file is touched
         (expect["seq"], None, "abandon"),             # expectation journaled, rename never happened
         (expect["seq"], "new", "complete"),           # rename landed, outcome record lost
         (edit_expect["seq"], "newer", "complete"),
+        (expect["seq"], "other", None),               # neither the content before nor after: something else wrote it
     ]
     for number, plant, decision in cases:
         path = workspace(f"reconcile-{number}-{plant}", "")
@@ -363,12 +372,22 @@ def local_write_reconciliation():
         with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, calls):
             assert start(path, url, env={"HX_TEST_CRASH_AFTER_RECORD": str(number)}, ok=False).returncode
             assert not list(path.glob(".note.txt.hx-tmp-*")) or plant is None
+            expects = [r for r in records(journal(path)) if r["kind"] == "expect"]
+            # A crash between creating the journaled temporary file and the rename leaves it behind.
+            temp = path / expects[-1]["tmp"] if expects else None
+            if temp:
+                temp.write_text("partial")
             if plant is not None:
                 (path / "note.txt").write_text(plant)
             report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
-            assert report["finished"] and report["uncertain_operations"] == [], (number, report)
             resolutions = [r for r in records(journal(path)) if r["kind"] == "resolution"]
+            if decision is None:
+                assert report["uncertain_operations"] and not resolutions and temp.exists(), (number, report)
+                assert (path / "note.txt").read_text() == plant
+                continue
+            assert report["finished"] and report["uncertain_operations"] == [], (number, report)
             assert [(r["decision"], r["by"]) for r in resolutions] == [(decision, "hx")], (number, resolutions)
+            assert not temp or not temp.exists(), number
 
 
 def interrupted_agent():
@@ -732,6 +751,23 @@ def review_branch_and_revocation():
         report = json.loads(run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY").stdout)
         assert report["finished"], report
 
+    # A revoked run whose model response was lost: branching charges it (the owner's reconciliation) and starts.
+    with provider(lambda body, i: "done") as (url, calls):
+        control = workspace("revoked-billing-control")
+        start(control, url)
+        first = next(r["seq"] for r in records(journal(control)) if r["kind"] == "model_intent")
+    path = workspace("revoked-billing")
+    with provider(lambda body, i: "branched") as (url, calls):
+        assert start(path, url, env={"HX_TEST_CRASH_AFTER_RECORD": str(first)}, ok=False).returncode
+        log = journal(path)
+        run(path, "revoke", str(log))
+        refused = run(path, "recover", str(log), str(first), "--decision", "abandon", "--yes", ok=False)
+        assert refused.returncode and "model request" in refused.stderr, refused.stderr
+        report = json.loads(run(path, "run", "--branch", str(log), "--model", "mock", "--base-url", url, "--key-env", "HX_TEST_KEY").stdout)
+        assert report["finished"], report
+        assert [r["of"] for r in records(log) if r["kind"] == "billing"] == [first]
+        assert {r["kind"] for r in records(log)[first:]} == {"billing"}
+
 
 def controller_no_authority():
     path = workspace("controller-authority", 'write("escape.txt","bad")')
@@ -875,7 +911,7 @@ def unsupported_run_format():
             record["prev"] = previous
             line = json.dumps(record, separators=(",", ":"))
             lines.append(line)
-            previous = hashlib.sha256(line.encode()).hexdigest()
+            previous = chain_link(line)
         log.write_text("\n".join(lines) + "\n")
         count = len(calls)
         for flag in ("--resume", "--branch"):
@@ -915,6 +951,11 @@ def corrupt_artifacts():
         count = len(calls)
         result = run(path, "run", "--resume", str(log), ok=False)
         assert result.returncode and "hash mismatch" in result.stderr and len(calls) == count
+        verified = run(path, "log", "verify", str(log), ok=False)
+        assert verified.returncode == 1 and "BAD BLOB" in verified.stdout and "hash mismatch" in verified.stdout, verified.stdout
+        blob.unlink()
+        result = run(path, "run", "--resume", str(log), ok=False)
+        assert result.returncode and manifest["blob"] in result.stderr and len(calls) == count, result.stderr
 
 
 if __name__ == "__main__":

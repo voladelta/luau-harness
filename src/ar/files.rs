@@ -552,7 +552,7 @@ pub(super) fn keep_logs(ws: &Path, episodes: &Path, label: &str) -> Result<PathB
 pub(super) fn rate_limited(logs: &Path) -> u64 {
     std::fs::read_dir(logs).into_iter().flatten().flatten().map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .filter_map(|j| crate::eventlog::Books::of(&crate::eventlog::load(&j).ok()?).ok())
+        .filter_map(|j| crate::supervisor::Books::of(&crate::eventlog::load(&j).ok()?).ok())
         .map(|books| books.usage.rate_limits).sum()
 }
 

@@ -19,7 +19,7 @@ Every command takes `--help`.
 | `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, print its hash, then trust it; runs refuse untrusted config |
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
 | `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
-| `hx log verify FILE` | Check a log's hash chain and recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
+| `hx log verify FILE` | Check a log's keyed hash chain, the blobs it references and its recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
 
 ## `hx run` flags
 
@@ -75,9 +75,9 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 `hx run --resume LOG` restores the frozen manifest, the latest committed controller state and `durable` data into fresh VMs. It never reruns old chunks, and ordinary globals are lost.
 
-Runs created before per-run approvals, or before shell outcomes recorded their approval source, use an older journal format; start a new run with this version.
+Runs created before per-run approvals, before shell outcomes recorded their approval source, or before journals were keyed (`~/.config/hx/journal.key`) use an older journal format; start a new run with this version.
 
-Interrupted local `write`/`edit` settle themselves from the evidence. Interrupted shell commands require owner reconciliation. Model requests whose response was lost are charged their reserved tokens. Other uncertain effects wait for `hx recover`.
+Interrupted local `write`/`edit` settle themselves from the evidence when the file holds its content from before or after the write. Interrupted shell commands require owner reconciliation. An interrupted subagent leaves nothing to reconcile beyond its own effects. Model requests whose response was lost are charged their reserved tokens on resume or branch, including a revoked run's; they are not operations for `hx recover`. Other uncertain effects wait for `hx recover`.
 
 `--branch LOG` starts a new run with new settings and the inherited saved data.
 

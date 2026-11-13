@@ -69,11 +69,11 @@ Checkpoint blobs remain the only authoritative bodies. A disposable descriptor i
 
 ## Dispatch and uncertainty
 
-Every mutating effect records a synced intent before its executor runs. Outcomes include full argument hashes and result receipts; a shell command's outcome also names who approved it (`approval`), and `hx log verify` rejects one that does not. A global mutation permit serializes mutations; sealed read batches may run concurrently. Subagents and packages retain or reduce their caller's authority.
+Every mutating effect records a synced intent before its executor runs. Outcomes include full argument hashes and result receipts; a shell command's outcome also names who approved it (`approval`), and `hx log verify` rejects one that does not. A global mutation permit serializes mutations; sealed read batches may run concurrently. Subagents and packages retain or reduce their caller's authority. Starting a subagent (`agent`) is not itself a mutation: it needs `llm.agent` and the stage's permission, and records a `call` receipt, while every effect the subagent makes records its own intent and receipt. A crash during a subagent therefore leaves only the subagent's own uncertain effects, if any.
 
 There is at most one application-level dispatch attempt for an operation ID. A provider that answers without a generation is classified: a 4xx or 503 means nothing was generated, so its reservation is released; a 408, 5xx or malformed 200 body gets one new request under a new operation ID, and a 429 that generated nothing up to eight, backing off 2, 4, 8 … s when the provider names no delay (honouring `Retry-After`, capped at 30 s). A failed attempt that may have been billed (a lost response, a 500, 502 or 504) is charged its reserved tokens, recorded as a `billing` record with `"source": "hx"`; a lost response then gets one new request under a new operation ID. A reservation left open by a crash is charged the same way on resume or branch. Underlying services may have their own internal behavior; hx does not establish exactly-once remote execution.
 
-An intent without an outcome is uncertain. Local `write` and `edit` settle themselves on resume or branch: each journals the hash of the content it is about to produce (`expect`) and replaces the file atomically (temp file, fsync, rename), so the file holds either its old content or exactly that. hx records a `resolution` with `"by": "hx"` and its evidence: `complete` when the file's hash matches, `abandon` when no `expect` was journaled or the file holds its previous content. An unreadable file is left for the owner.
+An intent without an outcome is uncertain. Local `write` and `edit` settle themselves on resume or branch: each journals an `expect` record (the file's hash before, `null` when it does not exist, the hash of the content it is about to produce, and the name of its temporary file) and replaces the file atomically (temporary file, fsync, rename), so the file holds either its old content or exactly the new. hx records a `resolution` with `"by": "hx"` and its evidence: `complete` when the file's hash is the new one, `abandon` when no `expect` was journaled or the file's hash is still the one before. A file that holds anything else, or cannot be read, was changed by something other than this write and is left for the owner. A temporary file left by a crash before the rename is removed when the operation is resolved, by hx or by the owner.
 
 Shell commands and MCP calls can act outside the workspace. If interrupted, resume allows inspection but blocks new mutations until the owner reconciles them:
 
@@ -85,7 +85,15 @@ hx recover .harness/log/RUN.jsonl OP --decision abandon --yes
 
 Record a decision based on the actual external state; it dispatches nothing and is final. After `abandon`, the resumed agent sees the receipts and can issue the operation again if it is still needed.
 
-Journal or blob failure is fatal to effect admission, including when Luau catches the returned error. A separate OS lock allows only one writer/resumer. Hash chains and blob hashes detect corruption; they are not authentication against an owner who can rewrite the entire run store.
+Journal or blob failure is fatal to effect admission, including when Luau catches the returned error. A separate OS lock allows only one writer/resumer.
+
+Each record's `prev` is an HMAC-SHA256 of the previous line under a per-user journal key: 32 random bytes in `journal.key` beside the trust store (`$XDG_CONFIG_HOME/hx/` or `~/.config/hx/`), created with mode 0600 on first use. File tools cannot read or write the key, `search` skips it, and Landlock hides the whole directory from shell commands. The journal itself stays inside the workspace, where shell commands can write it; the key is what makes a forged or edited record detectable. `hx log verify` and every reopen (resume, branch, `hx recover`) verify the chain with the key, and a log that fails is refused; `hx log verify` also checks that every blob a record names exists and has the content its name hashes. What the key does not protect against:
+
+- Without Landlock, shell commands run unconfined and can read the key, so they can forge records.
+- Removing records from the end of a journal leaves a valid chain and is not detected. Removing a blob is detected by `hx log verify` and by the read that needs it.
+- Anyone who can read the key, such as the owner or another process of the same user outside hx, can rewrite a journal.
+
+Journals of earlier formats have an unkeyed chain and cannot be resumed or branched; a journal whose key was deleted or replaced cannot be verified.
 
 ## Resume and branch
 
@@ -106,7 +114,7 @@ hx run --workspace PROJECT --branch PROJECT/.harness/log/RUN.jsonl \
 
 A branch inherits committed durable data and the task unless a positional prompt or `--prompt-file` supplies a new task. It starts a new conversation and budget under a new manifest. Reconcile uncertain effects first. Previous receipts remain in the parent journal; branching does not undo the parent's workspace changes.
 
-The branch's parent identity and inherited data are committed in its manifest, so recovery before the first controller checkpoint retains the seed data. Revocation blocks execution while still permitting the owner to reconcile effect receipts, then branch.
+The branch's parent identity and inherited data are committed in its manifest, so recovery before the first controller checkpoint retains the seed data. Revocation blocks execution while still permitting the owner to reconcile effect receipts, then branch: branching opens the parent for reconciliation only, settles what the evidence settles and charges lost model responses their reserved tokens, even for a revoked run, and writes nothing else to it.
 
 ## Extensions and capabilities
 

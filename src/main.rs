@@ -199,7 +199,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "accept" => "hx accept NAME [--yes]\n\nReview something staged (every file, control characters escaped), then activate exactly that. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n",
         "reject" => "hx reject NAME\n\nDiscard something staged.\n",
         "rollback" => "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n",
-        "log" => "hx log verify FILE\n\nCheck the hash chain and list effects with an unknown outcome.\nExit codes: 0 ok, 1 corrupt chain or invalid recovery accounting, 3 unknown outcomes.\n",
+        "log" => "hx log verify FILE\n\nCheck the keyed hash chain, the blobs records reference and the recovery accounting, and list effects with\nan unknown outcome.\nExit codes: 0 ok, 1 broken chain, bad blob or invalid recovery accounting, 3 unknown outcomes.\n",
         _ => return None,
     })
 }
@@ -455,15 +455,19 @@ async fn cmd_run(args: &[String], workspace: PathBuf, policy: Arc<policy::Policy
         host::Host::resume(policy, trace)?
     } else {
         let inherited = arg(args, "--branch").map(|path| -> Result<_> {
-            let journal = eventlog::EventLog::reopen(Path::new(&path))?;
-            let manifest = supervisor::Manifest::inspect(Path::new(&path))?;
-            supervisor::reconcile(&journal, &eventlog::load(Path::new(&path))?)?;
-            let recovery = eventlog::verify(Path::new(&path))?;
-            anyhow::ensure!(recovery.unknown.is_empty() && recovery.unknown_models.is_empty(), "reconcile uncertain operations and model billing before branching");
-            let records = eventlog::load(Path::new(&path))?;
+            let path = Path::new(&path);
+            // The owner may branch a revoked run, so its parent is opened for reconciliation: hx can settle what the
+            // evidence settles and bill lost model responses, and nothing else is written to it.
+            let journal = eventlog::EventLog::reconcile(path)?;
+            let manifest = supervisor::Manifest::inspect(path)?;
+            let records = eventlog::load(path)?;
+            let (books, _) = supervisor::reconcile(&journal, &records)?;
+            anyhow::ensure!(books.open.is_empty() && books.reservations.is_empty(), "reconcile uncertain operations and model billing before branching");
             let state = records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
-                .map(|r| eventlog::read_blob(Path::new(&path).parent().unwrap(), r["blob"].as_str().unwrap())).transpose()?
-                .map(|b| supervisor::Checkpoint::load(&b)).transpose()?;
+                .map(|r| -> Result<_> {
+                    let blob = r["blob"].as_str().ok_or_else(|| anyhow::anyhow!("checkpoint record without a blob"))?;
+                    supervisor::Checkpoint::load(&eventlog::read_blob(journal.dir(), blob)?)
+                }).transpose()?;
             Ok((journal, manifest, state))
         }).transpose()?;
         let task = task_text(args)?.or_else(|| inherited.as_ref().map(|(_, m, _)| m.task.clone()))
@@ -528,16 +532,23 @@ async fn cmd_ar(args: &[String], workspace: &Path) -> Result<()> {
 fn cmd_recover(args: &[String]) -> Result<()> {
     let path = Path::new(args.get(1).ok_or_else(|| usage("usage: hx recover LOG OP --decision complete|abandon"))?);
     let id: u64 = args.get(2).ok_or_else(|| usage("missing operation ID"))?.parse()?;
-    let decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?;
-    anyhow::ensure!(matches!(decision.as_str(), "complete" | "abandon"), "decision must be complete or abandon");
+    let decision: supervisor::Decision = arg(args, "--decision").ok_or_else(|| usage("missing --decision"))?.parse()?;
     let log = eventlog::EventLog::reconcile(path)?;
     let records = eventlog::load(path)?;
-    let intent = records.iter().find(|r| r["seq"] == id && r["kind"] == "intent").ok_or_else(|| usage("not a mutating operation ID"))?;
-    anyhow::ensure!(!records.iter().any(|r| r["kind"] == "outcome" && r["of"] == id), "operation already has an outcome");
-    anyhow::ensure!(!records.iter().any(|r| r["kind"] == "resolution" && r["of"] == id), "operation already resolved");
-    if !has(args, "--yes") { confirm(&format!("Record {decision} for operation {id}? This is your assertion about its external state."))?; }
-    log.write("resolution", serde_json::json!({"of":id, "decision":decision, "tool":intent["tool"], "args_sha":intent["args_sha"]}), true)?;
-    println!("recorded {decision} for {id}; no operation was executed");
+    let mut books = supervisor::Books::of(&records)?;
+    if !books.open.contains_key(&id) {
+        let kind = records.iter().find(|r| r["seq"] == id).and_then(|r| r["kind"].as_str());
+        let settled_by = |kind: &str| records.iter().any(|r| r["kind"] == kind && r["of"] == id);
+        match kind {
+            Some("intent") if settled_by("resolution") => anyhow::bail!("operation already resolved"),
+            Some("intent") => anyhow::bail!("operation already has an outcome"),
+            Some("model_intent") => return Err(usage("a model request is not an operation: resume or branch charges a lost response its reserved tokens")),
+            _ => return Err(usage("not a mutating operation ID")),
+        }
+    }
+    if !has(args, "--yes") { confirm(&format!("Record {} for operation {id}? This is your assertion about its external state.", decision.name()))?; }
+    supervisor::resolve(&log, &mut books, &records, id, decision, None)?;
+    println!("recorded {} for {id}; no operation was executed", decision.name());
     Ok(())
 }
 
@@ -630,20 +641,37 @@ fn cmd_accept(args: &[String], workspace: &Path) -> Result<()> {
     rt.after()
 }
 
-/// hx log verify FILE : check the hash chain and list effects with an unknown outcome (exit 1 tampered, 3 unknown)
+/// hx log verify FILE : check the keyed chain, the referenced blobs and the accounting, and list effects with an unknown
+/// outcome (exit 1 damaged, 3 unknown)
 fn cmd_log_verify(args: &[String]) -> Result<()> {
     let f = PathBuf::from(args.get(2).ok_or_else(|| usage("usage: hx log verify FILE"))?);
     let r = eventlog::verify(&f)?;
-    println!("{} records, hash chain {}", r.records, if r.chain_ok { "intact".to_string() } else { format!("BROKEN at line {}", r.bad_line.unwrap_or(0)) });
-    for (seq, tool, summary) in &r.unknown {
-        println!("UNKNOWN OUTCOME: #{seq} {tool}: {summary}");
+    match &r.broken {
+        None => println!("{} records, hash chain intact", r.records),
+        Some((line, why)) => println!("{} records, hash chain BROKEN at line {line}: {why}", r.records),
     }
-    for seq in &r.unknown_models { println!("UNKNOWN BILLING: #{seq} model request (charged its reserved tokens on resume)"); }
-    if let Some(error) = &r.recovery_error { println!("INVALID RECOVERY ACCOUNTING: {error}"); }
-    if !r.chain_ok || r.recovery_error.is_some() {
+    for error in &r.blob_errors { println!("BAD BLOB: {error}"); }
+    let mut damaged = r.broken.is_some() || !r.blob_errors.is_empty();
+    let mut unknown = false;
+    if r.broken.is_none() {
+        match supervisor::Books::of(&eventlog::load(&f)?) {
+            Ok(books) => {
+                for (seq, intent) in &books.open {
+                    println!("UNKNOWN OUTCOME: #{seq} {}: {}", intent["tool"].as_str().unwrap_or("?"), intent["summary"].as_str().unwrap_or(""));
+                }
+                for seq in books.reservations.keys() { println!("UNKNOWN BILLING: #{seq} model request (charged its reserved tokens on resume)"); }
+                unknown = !books.open.is_empty() || !books.reservations.is_empty();
+            },
+            Err(error) => {
+                println!("INVALID RECOVERY ACCOUNTING: {error:#}");
+                damaged = true;
+            },
+        }
+    }
+    if damaged {
         std::process::exit(1);
     }
-    if !r.unknown.is_empty() || !r.unknown_models.is_empty() {
+    if unknown {
         std::process::exit(3);
     }
     Ok(())

@@ -1,12 +1,13 @@
 //! One owner for admission, immutable run configuration, receipts, and recovery.
-use crate::{eventlog::{self, Books, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
+use crate::{eventlog::{self, EventLog}, llm::{LlmCfg, Reply}, modules::Registry, policy::{Budget, Class, Policy, Snapshot}};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 
-// Approval policy and temporary grants are frozen under this format; shell outcomes carry their approval source.
-pub const FORMAT: u64 = 9;
+// Approval policy and temporary grants are frozen under this format; shell outcomes carry their approval source; the
+// journal chain is keyed; `expect` records carry the file's previous hash and the temporary name.
+pub const FORMAT: u64 = 10;
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,36 +88,199 @@ impl Manifest {
     }
 }
 
+/// What the journal says about spend and open effects. The live supervisor, resume, reconciliation, `hx log verify` and
+/// `hx recover` all build it with `Books::apply`, so they cannot disagree about what is open.
+#[derive(Default)]
+pub struct Books {
+    pub usage: Usage,
+    pub model_admissions: u64,
+    /// Model requests not yet settled by a receipt, a definite rejection or a billing decision: their reserved tokens, by
+    /// the `model_intent` record's seq.
+    pub reservations: BTreeMap<u64, u64>,
+    /// Mutating intents without an outcome or resolution; `uncertain` is the subset whose effect may or may not have acted.
+    pub open: BTreeMap<u64, Value>,
+    pub uncertain: std::collections::BTreeSet<u64>,
+}
+
+impl Books {
+    /// The books a journal's records add up to.
+    pub fn of(records: &[Value]) -> Result<Self> {
+        let mut books = Self::default();
+        for r in records {
+            let seq = r["seq"].as_u64().context("missing record sequence")?;
+            books.apply(seq, r["kind"].as_str().unwrap_or_default(), r).with_context(|| format!("record {seq}"))?;
+        }
+        Ok(books)
+    }
+
+    /// Check a record against the books before it changes them: its fields, and that it settles something open.
+    pub fn validate(&self, kind: &str, r: &Value) -> Result<()> {
+        let of = || r["of"].as_u64().filter(|id| *id > 0).with_context(|| format!("{kind} record missing operation ID"));
+        match kind {
+            "outcome" | "resolution" | "uncertain" => {
+                let id = of()?;
+                anyhow::ensure!(self.open.contains_key(&id), "{kind} record for #{id}, which is not an open intent");
+            },
+            "llm" | "billing" => {
+                let id = of()?;
+                anyhow::ensure!(self.reservations.contains_key(&id), "{kind} record for #{id}, which is not an open model request");
+            },
+            _ => {},
+        }
+        match kind {
+            "model_intent" => anyhow::ensure!(r["reserved_tokens"].as_u64().is_some(), "missing reservation tokens"),
+            "billing" => anyhow::ensure!(r["tokens"].as_u64().is_some(), "billing record missing tokens"),
+            // Every shell command that ran says who approved it.
+            "outcome" if r["ret"]["t"] == "sh" => anyhow::ensure!(
+                r["approval"].as_str().is_some_and(|a| crate::policy::APPROVAL_SOURCES.contains(&a)), "sh outcome record missing its approval source"),
+            _ => {},
+        }
+        Ok(())
+    }
+
+    /// Validate `r`, then apply it; an invalid record changes nothing.
+    pub fn apply(&mut self, seq: u64, kind: &str, r: &Value) -> Result<()> {
+        self.validate(kind, r)?;
+        let of = r["of"].as_u64().unwrap_or_default();
+        if kind == "llm" && r["status"] == 429 { self.usage.rate_limits += 1; }
+        match kind {
+            "intent" if r["class"] != "read" => { self.open.insert(seq, r.clone()); },
+            "outcome" | "resolution" => { self.open.remove(&of); self.uncertain.remove(&of); },
+            "uncertain" => { self.uncertain.insert(of); },
+            "model_intent" => {
+                self.model_admissions += 1;
+                self.reservations.insert(seq, r["reserved_tokens"].as_u64().unwrap_or_default());
+            },
+            "llm" if r.get("error").is_none() => {
+                self.reservations.remove(&of);
+                let u = &mut self.usage;
+                u.input += r["input"].as_u64().unwrap_or(0); u.cache_write += r["cache_write"].as_u64().unwrap_or(0);
+                u.cache_read += r["cache_read"].as_u64().unwrap_or(0); u.output += r["output"].as_u64().unwrap_or(0);
+                u.calls += 1;
+            },
+            // A failure that may have been billed stays reserved until its `billing` record.
+            "llm" if r["billing_uncertain"] == false => { self.reservations.remove(&of); },
+            "billing" => {
+                self.reservations.remove(&of);
+                self.usage.input += r["tokens"].as_u64().unwrap_or_default();
+                self.usage.calls += 1;
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+
+    /// After a crash nothing is running: every open effect is uncertain.
+    pub fn crashed(&mut self) {
+        self.uncertain.extend(self.open.keys().copied());
+    }
+
+    pub fn reserved(&self) -> u64 {
+        self.reservations.values().sum()
+    }
+}
+
+/// Append one ledger record (`eventlog::LEDGER_KINDS`) and apply it to `books`. Every ledger record goes through here,
+/// so books kept live and books folded from the journal agree. A record the books reject is never written, and stops
+/// the run.
+fn append(log: &EventLog, books: &mut Books, kind: &str, fields: Value, sync: bool) -> Result<u64> {
+    books.validate(kind, &fields).map_err(|e| log.fail(format!("invalid journal record: {e}")))?;
+    let seq = log.append_ledger(kind, fields.clone(), sync)?;
+    books.apply(seq, kind, &fields).map_err(|e| log.fail(format!("journal ledger update failed: {e}")))?;
+    Ok(seq)
+}
+
+/// How an uncertain operation ended, as the owner (`hx recover`) or the evidence (`reconcile`) decides it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Decision { Complete, Abandon }
+
+impl Decision {
+    pub fn name(self) -> &'static str {
+        match self { Self::Complete => "complete", Self::Abandon => "abandon" }
+    }
+}
+
+impl std::str::FromStr for Decision {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "complete" => Ok(Self::Complete),
+            "abandon" => Ok(Self::Abandon),
+            _ => bail!("decision must be complete or abandon"),
+        }
+    }
+}
+
+/// Record `decision` for the open intent `id` and remove the temporary file a local write may have left (its name is
+/// in the intent's `expect` record). `evidence` is hx's reason when hx decides; None means the owner decided.
+pub fn resolve(log: &EventLog, books: &mut Books, records: &[Value], id: u64, decision: Decision, evidence: Option<&str>) -> Result<()> {
+    let intent = books.open.get(&id).with_context(|| format!("#{id} is not an open intent"))?;
+    let mut fields = json!({"of": id, "decision": decision.name(), "tool": intent["tool"], "args_sha": intent["args_sha"]});
+    if let Some(evidence) = evidence {
+        fields["by"] = json!("hx");
+        fields["evidence"] = json!(evidence);
+    }
+    append(log, books, "resolution", fields, true)?;
+    if let Some(expect) = records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
+        remove_temp(expect)?;
+    }
+    Ok(())
+}
+
+/// The name a local write's temporary file has until it is renamed over its target: unique to the journal session and
+/// intent, and journaled before the file exists, so recovery can remove it.
+fn temp_name(session: &str, intent: u64) -> String {
+    format!(".hx-tmp-{session}-{intent}")
+}
+
+fn remove_temp(expect: &Value) -> Result<()> {
+    let (Some(path), Some(tmp)) = (expect["path"].as_str(), expect["tmp"].as_str()) else { return Ok(()) };
+    let path = Path::new(path).parent().context("expect record path has no parent")?.join(tmp);
+    match crate::atomic_file::Target::open(&path, false).and_then(|t| t.remove()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("remove {}", path.display())),
+        _ => Ok(()),
+    }
+}
+
 /// Settle what the evidence settles without the owner, after a crash:
-/// - `write`/`edit` replace their file atomically after journaling an `expect` record, so no record means the file was
-///   never touched; otherwise the file's hash says whether it landed. An unreadable file is left for the owner.
+/// - `write`/`edit` journal an `expect` record (the file's hash before and after) and replace the file atomically, so
+///   no record means the file was never touched; otherwise the file's hash says whether it landed. A file that holds
+///   neither, or cannot be read, is left for the owner.
 /// - A model request whose response was lost is charged its reserved tokens.
 ///
-/// Returns how many records were written.
-pub fn reconcile(log: &EventLog, records: &[Value]) -> Result<usize> {
-    let books = Books::of(records)?;
+/// Returns the books after settlement and how many records were written.
+pub fn reconcile(log: &EventLog, records: &[Value]) -> Result<(Books, usize)> {
+    let mut books = Books::of(records)?;
     let mut settled = 0;
-    for (&id, intent) in &books.open {
-        let (decision, evidence) = match intent["tool"].as_str() {
-            Some("write" | "edit") => match records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
-                None => ("abandon", "interrupted before the file was touched"),
-                Some(e) => match std::fs::read(e["path"].as_str().unwrap_or_default()) {
-                    Ok(bytes) if eventlog::sha_bytes(&bytes) == e["sha256"] => ("complete", "the file holds the intended content"),
-                    Ok(_) => ("abandon", "the file holds its previous content"),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => ("abandon", "the file was never created"),
+    let open: Vec<(u64, Option<String>)> = books.open.iter().map(|(&id, r)| (id, r["tool"].as_str().map(String::from))).collect();
+    for (id, tool) in open {
+        if !matches!(tool.as_deref(), Some("write" | "edit")) { continue; }
+        let (decision, evidence) = match records.iter().find(|r| r["kind"] == "expect" && r["of"] == id) {
+            None => (Decision::Abandon, "interrupted before the file was touched"),
+            Some(e) => {
+                let now = match std::fs::read(e["path"].as_str().unwrap_or_default()) {
+                    Ok(bytes) => Some(eventlog::sha_bytes(&bytes)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                     Err(_) => continue,
-                },
+                };
+                if now.is_some() && now.as_deref() == e["sha256"].as_str() {
+                    (Decision::Complete, "the file holds the intended content")
+                } else if now.as_deref() == e["before"].as_str() {
+                    (Decision::Abandon, if now.is_some() { "the file holds its previous content" } else { "the file was never created" })
+                } else {
+                    continue;
+                }
             },
-            _ => continue,
         };
-        log.write("resolution", json!({"of": id, "decision": decision, "tool": intent["tool"], "args_sha": intent["args_sha"], "by": "hx", "evidence": evidence}), true)?;
+        resolve(log, &mut books, records, id, decision, Some(evidence))?;
         settled += 1;
     }
-    for (&id, reservation) in &books.reservations {
-        log.write("billing", bound_billing(id, reservation.tokens), true)?;
+    let reservations: Vec<(u64, u64)> = books.reservations.iter().map(|(&id, &tokens)| (id, tokens)).collect();
+    for (id, tokens) in reservations {
+        append(log, &mut books, "billing", bound_billing(id, tokens), true)?;
         settled += 1;
     }
-    Ok(settled)
+    Ok((books, settled))
 }
 
 /// A lost response's usage, charged at its reservation's bound.
@@ -306,12 +470,13 @@ impl Supervisor {
         let path = policy.log.path.as_path();
         let manifest = Manifest::load(path)?;
         let mut records = eventlog::load(path)?;
-        if reconcile(&policy.log, &records)? > 0 { records = eventlog::load(path)?; }
-        let mut books = Books::of(&records)?;
+        let (mut books, settled) = reconcile(&policy.log, &records)?;
+        if settled > 0 { records = eventlog::load(path)?; }
         books.crashed();
         let (frontier, checkpoint) = match records.iter().rev().find(|r| r["kind"] == "checkpoint" && r["lane"] == "root") {
             Some(r) => (r["seq"].as_u64().context("missing record sequence")?,
-                Some(Checkpoint::load(&eventlog::read_blob(path.parent().unwrap(), r["blob"].as_str().context("missing checkpoint blob")?)?)?)),
+                Some(Checkpoint::load(&eventlog::read_blob(policy.log.dir(), r["blob"].as_str().context("missing checkpoint blob")?)?)
+                    .with_context(|| format!("checkpoint at record {}", r["seq"]))?)),
             None => (0, None),
         };
         let receipts: Vec<_> = records.iter().filter(|r| r["seq"].as_u64().unwrap_or(0) > frontier && matches!(r["kind"].as_str(), Some("chunk_begin" | "intent" | "outcome" | "call" | "llm" | "model_intent" | "resolution" | "uncertain" | "billing")))
@@ -376,11 +541,16 @@ impl Supervisor {
         self.record("intent", fields, true)
     }
 
-    /// Record the file content a local write is about to produce, before it touches the file. With atomic replacement
-    /// the file then holds either its old content or exactly this, so recovery can read the outcome off the disk.
-    pub fn expect(&self, intent: u64, path: &Path, sha: &str) -> Result<()> {
-        self.policy.log.write("expect", json!({"of": intent, "path": path, "sha256": sha}), true)?;
-        Ok(())
+    /// Replace the file `target` (at `path`) with `bytes` for the write intent `intent`. First journal an `expect`
+    /// record: the file's hash now (`before`, null when absent), the hash it is about to have, and the temporary file's
+    /// name. With atomic replacement the file then holds either `before` or `sha256`, so recovery reads the outcome off
+    /// the disk, and removes the temporary file if the rename never happened.
+    pub fn replace_file(&self, intent: Option<u64>, path: &Path, target: &crate::atomic_file::Target, bytes: &[u8]) -> Result<()> {
+        let Some(intent) = intent else { return target.replace(bytes) };
+        let before = target.sha256().with_context(|| format!("read {}", path.display()))?;
+        let tmp = temp_name(&self.policy.log.session, intent);
+        self.policy.log.write("expect", json!({"of": intent, "path": path, "before": before, "sha256": eventlog::sha_bytes(bytes), "tmp": tmp}), true)?;
+        target.replace_through(&tmp, bytes)
     }
 
     pub fn uncertain(&self, id: u64, tool: Tool, args: &Value, message: &str) -> Result<()> {
@@ -396,13 +566,12 @@ impl Supervisor {
     }
 
     fn record_in(&self, books: &mut Books, kind: &str, fields: Value, sync: bool) -> Result<u64> {
-        let seq = self.policy.log.write(kind, fields.clone(), sync)?;
-        books.apply(seq, kind, &fields).map_err(|e| self.policy.log.fail(format!("journal ledger update failed: {e}")))?;
-        Ok(seq)
+        append(&self.policy.log, books, kind, fields, sync)
     }
 
     /// Admit one model request. A request that only the reservations of running requests keep out waits for them to
-    /// settle instead of failing; uncertain reservations never settle by themselves, so they still stop admission.
+    /// settle instead of failing. (A reservation outlives its request only when its receipt could not be journaled,
+    /// which stops admission by itself, or across a crash, after which resume bills it before admitting anything.)
     pub async fn reserve_model(&self, cfg: &LlmCfg, req: &Value, depth: usize) -> Result<u64> {
         loop {
             let settled = self.settled.notified();
@@ -432,7 +601,7 @@ impl Supervisor {
         let max_output = req["max_tokens"].as_u64().unwrap_or(cfg.max_output).min(cfg.max_output);
         let tokens = bytes.saturating_add(max_output);
         let over_tokens = budget.max_tokens.is_some_and(|m| used.saturating_add(pending_tokens) >= m);
-        if over_tokens && books.reservations.values().any(|r| r.running) { return Ok(None); }
+        if over_tokens && !books.reservations.is_empty() { return Ok(None); }
         if over_tokens {
             self.policy.log.write("budget", json!({"reason":"budget_exceeded: token admission threshold reached","depth":depth}), true)?;
             bail!("budget_exceeded: token admission threshold reached");
@@ -446,10 +615,9 @@ impl Supervisor {
     /// tokens. Returns whether the reservation closed.
     pub fn fail_model(&self, op: u64, cfg: &LlmCfg, error: &str, status: Option<u16>, unbilled: bool, depth: usize) -> Result<bool> {
         let mut books = self.books.lock().unwrap();
-        let bound = books.reservations.get(&op).filter(|_| !unbilled).map(|r| r.tokens);
+        let bound = books.reservations.get(&op).filter(|_| !unbilled).copied();
         let result = self.record_in(&mut books, "llm", json!({"of": op, "depth": depth, "model": cfg.model, "error": error, "status": status, "billing_uncertain": !unbilled}), true)
             .and_then(|_| bound.map(|tokens| self.record_in(&mut books, "billing", bound_billing(op, tokens), true)).transpose());
-        Self::stop_running(&mut books, op);
         drop(books);
         self.settled.notify_waiters();
         result.map(|_| unbilled || bound.is_some())
@@ -460,16 +628,9 @@ impl Supervisor {
         let written = self.policy.log.blob(&serde_json::to_vec(reply)?).and_then(|blob| self.record_in(&mut books, "llm", json!({"of": op, "model": cfg.model,
             "depth": depth, "reply": blob, "input": reply.input, "cache_read": reply.cache_read, "cache_write": reply.cache_write,
             "output": reply.output, "finish": reply.finish}), true));
-        Self::stop_running(&mut books, op);
         drop(books);
         self.settled.notify_waiters();
         written.map(|_| ())
-    }
-
-    /// A request whose receipt could not be journaled is no longer running but stays reserved: the journal failure is
-    /// fatal to admission, and resume treats the reservation as uncertain.
-    fn stop_running(books: &mut Books, op: u64) {
-        if let Some(r) = books.reservations.get_mut(&op) { r.running = false; }
     }
 
     pub fn usage(&self) -> Usage { self.books.lock().unwrap().usage.clone() }
@@ -503,7 +664,7 @@ mod checkpoint_tests {
             let supervisor = Supervisor::start(policy, cfg.clone(), "test".into(), 1, vec![],
                 Budget { max_tokens: limit, ..Budget::default() }, None).unwrap();
             let op = supervisor.reserve_model(&cfg, &json!({}), 0).await.unwrap();
-            assert_eq!(supervisor.books.lock().unwrap().reservations[&op].tokens, 102);
+            assert_eq!(supervisor.books.lock().unwrap().reservations[&op], 102);
             assert!(supervisor.fail_model(op, &cfg, "lost response", None, false, 0).unwrap());
             let replay = Books::of(&eventlog::load(&supervisor.policy.log.path).unwrap()).unwrap();
             assert_eq!(supervisor.usage().total_tokens(), 102);
@@ -529,6 +690,117 @@ mod checkpoint_tests {
         assert!(queued.unwrap_err().to_string().contains("absolute run deadline"));
         assert!(supervisor.books.lock().unwrap().reservations.contains_key(&first));
         drop(supervisor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn token_reservations_are_validated() {
+        let mut books = Books::default();
+        for id in [1, 2] { books.apply(id, "model_intent", &json!({"reserved_tokens":10})).unwrap(); }
+        assert_eq!(books.reserved(), 20);
+        for invalid in [json!(null), json!(-1), json!(1.5), json!("10")] {
+            assert!(books.apply(3, "model_intent", &json!({"reserved_tokens":invalid})).is_err());
+        }
+        assert_eq!(books.reservations.len(), 2);
+    }
+
+    #[test]
+    fn malformed_accounting_does_not_partially_update_books() {
+        let mut books = Books::default();
+        books.apply(1, "model_intent", &json!({"reserved_tokens":10})).unwrap();
+        assert!(books.apply(2, "billing", &json!({"of": 1, "tokens": -8})).is_err());
+        assert_eq!(books.reserved(), 10);
+        assert_eq!(books.usage.input, 0);
+        assert_eq!(books.usage.calls, 0);
+    }
+
+    #[test]
+    fn receipts_must_settle_something_open() {
+        let mut books = Books::default();
+        books.apply(1, "intent", &json!({"class": "local_write", "tool": "write"})).unwrap();
+        books.apply(2, "model_intent", &json!({"reserved_tokens": 10})).unwrap();
+        for (kind, of) in [("outcome", 2), ("resolution", 7), ("uncertain", 2), ("llm", 1), ("billing", 1)] {
+            assert!(books.apply(3, kind, &json!({"of": of, "tokens": 1})).is_err(), "{kind} of #{of}");
+        }
+        books.apply(3, "outcome", &json!({"of": 1, "ret": {"t": "num"}})).unwrap();
+        assert!(books.apply(4, "resolution", &json!({"of": 1})).is_err(), "an intent settles once");
+    }
+
+    fn journal(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hx-ledger-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = Arc::new(Policy::new(&dir, false, None, None, None).unwrap());
+        (Supervisor::start(policy, model(), "test".into(), 1, vec![], Budget::default(), None).unwrap(), std::fs::canonicalize(dir).unwrap())
+    }
+
+    #[test]
+    fn invalid_accounting_is_rejected_before_append_and_stops_admission() {
+        let (supervisor, dir) = journal("invalid-append");
+        let path = supervisor.policy.log.path.clone();
+        let before = std::fs::read(&path).unwrap();
+        assert!(supervisor.record("billing", json!({"of": 1}), true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(supervisor.policy.log.check().is_err());
+        assert!(supervisor.policy.log.write("note", json!({}), false).is_err());
+        drop(supervisor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A write intent whose file was replaced (or not) before a crash: `before` and `after` are the content the
+    /// `expect` record names, `on_disk` what the file holds at recovery.
+    fn settle(tag: &str, before: Option<&str>, on_disk: Option<&str>) -> (Option<String>, bool) {
+        let (supervisor, dir) = journal(tag);
+        let file = dir.join("note.txt");
+        if let Some(text) = before { std::fs::write(&file, text).unwrap(); }
+        let id = supervisor.intent(Tool::Write, Class::LocalWrite, &json!({"path": "note.txt"}), "sha", 0, &Principal::Agent { read_only: false }).unwrap();
+        let target = crate::atomic_file::Target::open(&file, false).unwrap();
+        // Journal the expectation as replace_file does, then stop where a crash before the rename would.
+        let tmp = temp_name(&supervisor.policy.log.session, id);
+        supervisor.policy.log.write("expect", json!({"of": id, "path": file, "before": target.sha256().unwrap(),
+            "sha256": eventlog::sha_bytes(b"after"), "tmp": tmp}), true).unwrap();
+        std::fs::write(dir.join(&tmp), "after").unwrap();
+        match on_disk {
+            Some(text) => std::fs::write(&file, text).unwrap(),
+            None => { let _ = std::fs::remove_file(&file); },
+        }
+        // Reconcile through the run's own journal: a reopen could race a child forked by a concurrent test, which
+        // holds the writer lock until it execs.
+        let path = supervisor.policy.log.path.clone();
+        let log = supervisor.policy.log.clone();
+        drop(supervisor);
+        let (books, _) = reconcile(&log, &eventlog::load(&path).unwrap()).unwrap();
+        let decision = eventlog::load(&path).unwrap().iter().find(|r| r["kind"] == "resolution").map(|r| r["decision"].as_str().unwrap().to_string());
+        assert_eq!(books.open.is_empty(), decision.is_some());
+        let tmp_left = dir.join(&tmp).exists();
+        drop(log);
+        let _ = std::fs::remove_dir_all(dir);
+        (decision, tmp_left)
+    }
+
+    #[test]
+    fn interrupted_writes_settle_only_from_states_the_journal_names() {
+        assert_eq!(settle("old", Some("old"), Some("old")), (Some("abandon".into()), false));
+        assert_eq!(settle("new", Some("old"), Some("after")), (Some("complete".into()), false));
+        assert_eq!(settle("absent", None, None), (Some("abandon".into()), false));
+        // Anything else changed the file after hx journaled the write: only the owner can say what happened.
+        assert_eq!(settle("other", Some("old"), Some("other")), (None, true));
+        assert_eq!(settle("deleted", Some("old"), None), (None, true));
+    }
+
+    #[test]
+    fn owner_reconciliation_can_bill_a_revoked_run() {
+        let (supervisor, dir) = journal("revoked-billing");
+        let cfg = model();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let op = rt.block_on(supervisor.reserve_model(&cfg, &json!({}), 0)).unwrap();
+        let path = supervisor.policy.log.path.clone();
+        drop(supervisor);
+        std::fs::write(path.with_extension("revoked"), "").unwrap();
+        assert!(reconcile(&EventLog::reopen(&path).unwrap(), &eventlog::load(&path).unwrap()).is_err());
+        let (books, settled) = reconcile(&EventLog::reconcile(&path).unwrap(), &eventlog::load(&path).unwrap()).unwrap();
+        assert_eq!((settled, books.reservations.len(), books.usage.input), (1, 0, 102));
+        assert!(eventlog::load(&path).unwrap().iter().any(|r| r["kind"] == "billing" && r["of"] == op));
         let _ = std::fs::remove_dir_all(dir);
     }
 

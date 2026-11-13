@@ -70,6 +70,24 @@ import sys
 l=open(sys.argv[1]).read().splitlines(); del l[2]; open(sys.argv[2],"w").write("\n".join(l)+"\n")
 PY
 $H log verify $T/deleted.jsonl >/dev/null 2>&1; check "deleted record breaks the chain (exit 1)" "$?" "1"
+KEY=$XDG_CONFIG_HOME/hx/journal.key
+check "the journal key is private and outside the workspace" "$(stat -c %a $KEY)" "600"
+# A shell command can write the journal but cannot read the key: a record forged with a plain hash does not verify.
+python3 - "$L" "$T/forged.jsonl" <<'PY'
+import hashlib,json,sys
+lines=open(sys.argv[1]).read().splitlines()
+last=json.loads(lines[-1])
+grant={"seq":last["seq"]+1,"ts_ms":last["ts_ms"],"session":last["session"],"kind":"path_grant","prev":hashlib.sha256(lines[-1].encode()).hexdigest(),"grant":{"path":"/","write":True}}
+open(sys.argv[2],"w").write("\n".join(lines+[json.dumps(grant,separators=(",",":"))])+"\n")
+PY
+out=$($H log verify $T/forged.jsonl 2>&1); rc=$?
+check "a forged path_grant breaks the keyed chain (exit 1)" "$rc$(echo "$out" | grep -c 'BROKEN at line')" "11"
+printf '[fs]\nread = ["%s"]\n' "$XDG_CONFIG_HOME" > $W/.harness/policy.toml
+check "file tools cannot read the journal key, even inside a read root" "$($H exec --workspace $W "print(pcall(read, '$KEY'))" 2>/dev/null | head -1 | grep -c 'false.*sealed')" "1"
+if ! unconfined $W; then
+  check "confined shell commands cannot read the journal key" "$($H exec --workspace $W "print(sh('cat $KEY >/dev/null 2>&1; echo \$?').stdout)" 2>/dev/null | head -1)" "1"
+fi
+rm $W/.harness/policy.toml
 
 # --- 3. approval gate: external effects are refused without the user's approval, and do not run
 newws b; printf '[approval]\nask = ["./deploy.sh"]\n' > $W/.harness/policy.toml
@@ -116,5 +134,16 @@ rs=[json.loads(l) for l in open(sys.argv[1])]; c=collections.Counter((r["kind"],
 print("yes" if c[("llm",None)]==2 and c[("chunk_begin",None)]==1 and c[("checkpoint",None)]>=3 and c[("intent","write")]==1 and c[("session",None)]==1 else str(dict(c)))
 PY
 )$($H log verify $L | head -1 | grep -c intact)" "yes1"
+
+# --- 6. resume refuses a journal that fails verification
+python3 - "$L" <<'PY'
+import hashlib,json,sys
+lines=open(sys.argv[1]).read().splitlines()
+last=json.loads(lines[-1])
+grant={"seq":last["seq"]+1,"ts_ms":last["ts_ms"],"session":last["session"],"kind":"path_grant","prev":hashlib.sha256(lines[-1].encode()).hexdigest(),"grant":{"path":"/","write":True}}
+open(sys.argv[1],"a").write(json.dumps(grant,separators=(",",":"))+"\n")
+PY
+out=$(OPENROUTER_API_KEY=x $H run --workspace $W --resume $L 2>&1); rc=$?
+check "resume refuses a forged record" "$([ $rc -ne 0 ] && echo refused)$(echo "$out" | grep -c 'hash chain broken')" "refused1"
 
 finish

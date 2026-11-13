@@ -10,6 +10,7 @@ anyhow = "1.0.104"
 base64 = "0.23"
 futures = "0.3.34"
 grep = "0.4.1"
+hmac = "0.13.0"
 ignore = "0.4.34"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 landlock = "0.4.7"

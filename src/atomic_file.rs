@@ -135,18 +135,46 @@ impl Target {
         Ok(bytes)
     }
 
-    pub fn replace(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        let permissions = match self.existing() {
+    /// The SHA-256 of the file's current content, or None when there is no file. A link or non-regular file is an error.
+    pub fn sha256(&self) -> io::Result<Option<String>> {
+        use sha2::Digest;
+        let mut file = match self.existing() {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        let mut hasher = sha2::Sha256::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            match file.read(&mut chunk)? {
+                0 => break,
+                n => hasher.update(&chunk[..n]),
+            }
+        }
+        Ok(Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()))
+    }
+
+    /// The permissions a replacement keeps: the existing file's, or None when there is none.
+    fn permissions(&self) -> anyhow::Result<Option<std::fs::Permissions>> {
+        match self.existing() {
             Ok(file) => {
                 let meta = file.metadata()?;
                 anyhow::ensure!(meta.is_file(), "not a regular file");
-                Some(meta.permissions())
+                Ok(Some(meta.permissions()))
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace the file's content through a temporary file with a fresh name.
+    pub fn replace(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let permissions = self.permissions()?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let (tmp, mut file) = loop {
+        let (tmp, file) = loop {
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = CString::new(format!(".hx-tmp-{}-{n}", std::process::id())).unwrap();
             let result = create_temp(&self.dir, &tmp);
@@ -156,6 +184,19 @@ impl Target {
                 Err(e) => return Err(e.into()),
             }
         };
+        self.commit(&tmp, file, bytes, permissions)
+    }
+
+    /// Replace the file's content through a temporary file named `tmp` in the same directory, which must not exist.
+    /// The caller journals `tmp` first, so a crash before the rename leaves a file recovery knows to remove.
+    pub fn replace_through(&self, tmp: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        let permissions = self.permissions()?;
+        let tmp = cstr(std::ffi::OsStr::new(tmp))?;
+        let file = create_temp(&self.dir, &tmp)?;
+        self.commit(&tmp, file, bytes, permissions)
+    }
+
+    fn commit(&self, tmp: &CString, mut file: File, bytes: &[u8], permissions: Option<std::fs::Permissions>) -> anyhow::Result<()> {
         let result = (|| -> io::Result<()> {
             file.write_all(bytes)?;
             if let Some(permissions) = permissions {
