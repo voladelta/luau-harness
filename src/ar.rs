@@ -92,10 +92,15 @@ pub struct Spec {
     /// An eval improves on the best only by more than this (and more than the evaluator's reported `se`).
     #[serde(default)]
     pub min_delta: f64,
+    /// Wall-clock seconds an episode may take (`--max-wall` for the child). A round waits for its slowest worker, so
+    /// without it one worker's long benchmarks hold every other candidate back.
+    #[serde(default = "Spec::episode_secs")]
+    pub episode_secs: f64,
 }
 impl Spec {
     fn max() -> String { "max".into() }
     fn timeout() -> f64 { 600.0 }
+    fn episode_secs() -> f64 { 900.0 }
     pub fn load(workspace: &Path) -> Result<Spec> {
         let path = workspace.join(".harness/ar.toml");
         let text = std::fs::read_to_string(&path).with_context(|| format!("--ar needs {}", path.display()))?;
@@ -107,6 +112,7 @@ impl Spec {
     fn check(&self, workspace: &Path) -> Result<()> {
         let spec = self;
         ensure!(!spec.editable.is_empty(), "ar.toml: editable must name at least one path");
+        ensure!(spec.episode_secs.is_finite() && spec.episode_secs >= 60.0, "ar.toml: episode_secs must be at least 60");
         for p in &spec.editable {
             let parts: Vec<&str> = p.trim_end_matches('/').split('/').collect();
             ensure!(!p.is_empty() && !Path::new(p).is_absolute()
@@ -467,6 +473,7 @@ impl Orchestrator {
             .arg("run").arg("--workspace").arg(&ws).args(&self.launch.child_args)
             .arg("--prompt-file").arg(&task_path)
             .arg("--max-turns").arg(TURNS.to_string())
+            .arg("--max-wall").arg(self.spec().episode_secs.to_string())
             .env("HX_AR_EPISODE", &ep_path)
             .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .spawn()?;
@@ -545,7 +552,8 @@ your best scored state back into the editable paths.\n";
         if spec.select.is_some() {
             t += "- Results are judged on held-out data no agent sees: a change with a reason to generalize beats tuning to the reported numbers.\n";
         }
-        t + &format!("- You have {TURNS} steps (model turns). At the limit the run stops you, with or without a final answer.\n</tools>\n\n")
+        t + &format!("- You have {TURNS} steps (model turns) and {} minutes. At either limit the run stops you, with or without a final \
+answer, and a command still running is killed: keep each benchmark short.\n</tools>\n\n", (spec.episode_secs / 60.0).round())
     }
 
     fn task(&self, plan: &Plan, label: &str, state: &State) -> Result<String> {
@@ -985,6 +993,20 @@ fn chrono_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn episodes_get_a_wall_clock_cap() {
+        let ws = std::env::temp_dir().join(format!("hx-ar-wall-{}", std::process::id()));
+        std::fs::create_dir_all(ws.join(".harness")).unwrap();
+        let write = |extra: &str| std::fs::write(ws.join(".harness/ar.toml"), format!("editable = [\"a.txt\"]\neval = \"true\"\n{extra}")).unwrap();
+        write("");
+        assert_eq!(Spec::load(&ws).unwrap().episode_secs, 900.0);
+        write("episode_secs = 300\n");
+        assert_eq!(Spec::load(&ws).unwrap().episode_secs, 300.0);
+        write("episode_secs = 5\n");
+        assert!(Spec::load(&ws).is_err(), "an episode needs at least a minute");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hx-ar-test-{tag}-{}", std::process::id()));

@@ -72,6 +72,7 @@ select = "$HOME/grader/eval select --file ar/strategy.pine"  # held out: only th
 grader = ["~/grader/bin", "~/grader/search"]                 # read-only for both evaluators
 holdout = ["~/grader/select"]                                # read-only for select only
 min_delta = 0.05
+episode_secs = 900                                            # wall-clock cap per episode (default 15 min)
 ```
 
 `select` must reach the shift the result has to survive (other years, symbols or input ranges) and have enough cases to tell candidates apart.
