@@ -49,7 +49,7 @@ pub fn validate_request(request: &Json) -> Result<()> {
     anyhow::ensure!(!messages.is_empty(), "model request messages cannot be empty");
     for message in messages {
         anyhow::ensure!(matches!(message["role"].as_str(), Some("user" | "assistant" | "tool")), "model message has an invalid role");
-        anyhow::ensure!(message["content"].is_string() || message["content"].is_array() || (message["role"] == "assistant" && message["content"].is_null()), "model message content must be text or an array");
+        anyhow::ensure!(message["content"].is_string() || (message["role"] == "assistant" && message["content"].is_null()), "model message content must be text");
     }
     if let Some(tools) = request.get("tools") {
         // Empty Luau tables have no array identity at the copied-data boundary.
@@ -183,6 +183,15 @@ mod tests {
         let text = format!("return {{init = function(cfg) return {{}} end, step = function(state, event) {step} end}}");
         registry.sources.insert("t".into(), crate::modules::Source { text, origin: "t.luau".into(), is_override: false, pkg: None });
         Controller::new(Arc::new(registry), json!({}), String::new(), &[], None, "t").unwrap()
+    }
+
+    #[test]
+    fn model_message_content_must_be_text() {
+        let request = |content: Json| json!({"system": "s", "messages": [{"role": "user", "content": content}]});
+        assert!(validate_request(&request(json!("hi"))).is_ok());
+        assert!(validate_request(&request(json!([{"type": "text", "text": "hi"}]))).is_err());
+        let assistant = json!({"system": "s", "messages": [{"role": "assistant", "content": null}]});
+        assert!(validate_request(&assistant).is_ok());
     }
 
     #[test]
