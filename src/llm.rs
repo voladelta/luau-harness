@@ -24,10 +24,39 @@ pub struct LlmCfg {
 /// it unknown whether a billable generation happened.
 #[derive(Debug)]
 pub struct Answered {
+    /// the HTTP status; 200 for an error delivered in place of a response (an SSE `error` or `response.failed` event)
     pub status: u16,
+    /// for display and the journal: callers branch on `status` and `rejection`, never on this text
     pub message: String,
     /// seconds from a `Retry-After` header
     pub retry_after: Option<f64>,
+    /// a definite rejection a compaction can fix, read from the provider's error once, here
+    pub rejection: Option<Rejection>,
+}
+
+/// Why the provider refused a request outright, before any generation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Rejection {
+    /// over the model's context window
+    Context,
+    /// over the provider's image or request-size limit
+    Images,
+}
+
+/// Lowercase substrings of a provider error that mean "the request did not fit the context window". Providers differ
+/// in error codes and do not always set one, so the text is the evidence; `rejection` is the only reader.
+const CONTEXT_OVERFLOW: [&str; 9] = ["context_length_exceeded", "maximum context length", "context length", "context window",
+    "prompt is too long", "input is too long", "too many tokens", "exceeds the context", "reduce the length"];
+/// ... and "the request carried more image data than the provider takes"
+const IMAGE_OVERFLOW: [&str; 5] = ["too many images", "request_too_large", "request too large", "payload too large", "request entity too large"];
+
+/// A rejection is definite only where no generation can have started: a 400, 413 or 422 answer, or an error event in
+/// place of the response (status 200, which can carry any provider error). A 413 is a size rejection whatever it says.
+fn rejection(status: u16, message: &str) -> Option<Rejection> {
+    if !matches!(status, 200 | 400 | 413 | 422) { return None; }
+    let lower = message.to_lowercase();
+    if status == 413 || IMAGE_OVERFLOW.iter().any(|p| lower.contains(p)) { return Some(Rejection::Images); }
+    CONTEXT_OVERFLOW.iter().any(|p| lower.contains(p)).then_some(Rejection::Context)
 }
 
 impl std::fmt::Display for Answered {
@@ -37,11 +66,15 @@ impl std::fmt::Display for Answered {
 impl std::error::Error for Answered {}
 
 impl Answered {
-    /// A 4xx rejects the request and a 503 refuses it before any generation, so nothing was billed. Other 5xx can
-    /// follow a generation the upstream billed (a gateway timeout, say).
-    pub fn unbilled(&self) -> bool { (400..500).contains(&self.status) || self.status == 503 }
-    /// Worth one more attempt: rate limits, server errors and malformed 200 bodies. Other 4xx repeat identically.
-    pub fn retryable(&self) -> bool { matches!(self.status, 408 | 429 | 200) || self.status >= 500 }
+    pub fn new(status: u16, message: String, retry_after: Option<f64>) -> Self {
+        Self { rejection: rejection(status, &message), status, message, retry_after }
+    }
+    /// A 4xx rejects the request and a 503 refuses it before any generation, so nothing was billed; so does a rejection
+    /// inside a 200 stream. Other 5xx can follow a generation the upstream billed (a gateway timeout, say).
+    pub fn unbilled(&self) -> bool { (400..500).contains(&self.status) || self.status == 503 || self.rejection.is_some() }
+    /// Worth one more attempt: rate limits, server errors and malformed 200 bodies. Other 4xx and rejections would
+    /// repeat identically.
+    pub fn retryable(&self) -> bool { self.rejection.is_none() && (matches!(self.status, 408 | 429 | 200) || self.status >= 500) }
 }
 
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -59,6 +92,17 @@ pub struct Reply {
     pub output: u64,
 }
 
+/// Environment switches for the offline check suites (scripts/*_checks), which set them; no run should. They only
+/// shorten or redirect what a check would otherwise wait for, and every one the model client reads is listed here.
+/// (The journal's `HX_TEST_CRASH_AFTER_RECORD` and confinement's `HX_TEST_NO_LANDLOCK` are read where they act.)
+pub mod test_hooks {
+    /// Retry model requests without the backoff sleep: the checks exercise retries, not the clock.
+    pub const NO_BACKOFF: &str = "HX_TEST_NO_BACKOFF";
+    /// Treat any base URL as OpenRouter when reading the model's limits at launch, so the mock's `/models` answers.
+    pub const MODELS: &str = "HX_TEST_MODELS";
+    pub fn on(name: &str) -> bool { std::env::var_os(name).is_some() }
+}
+
 /// The provider hx calls without `--base-url`.
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -70,10 +114,10 @@ pub fn listed_limits(models: &Value, model: &str) -> Option<(u64, Option<u64>)> 
 }
 
 /// Ask an OpenRouter base URL for the model's limits, once at launch. Any failure keeps the defaults: it returns None
-/// and says so on stderr. (`HX_TEST_MODELS` treats any base URL as OpenRouter, for the check suites' mock.)
+/// and says so on stderr.
 pub async fn provider_limits(cfg: &LlmCfg) -> Option<(u64, Option<u64>)> {
     let base = cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.into());
-    let openrouter = reqwest::Url::parse(&base).is_ok_and(|u| u.host_str() == Some("openrouter.ai")) || std::env::var_os("HX_TEST_MODELS").is_some();
+    let openrouter = reqwest::Url::parse(&base).is_ok_and(|u| u.host_str() == Some("openrouter.ai")) || test_hooks::on(test_hooks::MODELS);
     if !openrouter { return None; }
     let fetched = async {
         let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
@@ -185,7 +229,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
     let mut response = http.post(&url).bearer_auth(key).json(&body).send().await?;
     let status = response.status();
     let retry_after = response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()?.trim().parse::<f64>().ok());
-    let answered = |message: String| Answered { status: status.as_u16(), message, retry_after };
+    let answered = |message: String| Answered::new(status.as_u16(), message, retry_after);
     let sse = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
     if !status.is_success() || !sse {
         let text = response.text().await?;
@@ -249,6 +293,48 @@ mod sse_tests {
         assert_eq!(sse.push(b"\n"), vec!["one\ntwo"]);
         assert!(sse.push(b"data: partial\r\n\r").is_empty());
         assert_eq!(sse.push(b"\n"), vec!["partial"]);
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::{Answered, Rejection};
+
+    #[test]
+    fn definite_rejections_are_classified_by_status_and_error() {
+        let kind = |status, text: &str| Answered::new(status, text.into(), None).rejection;
+        assert_eq!(kind(400, "API 400 Bad Request: maximum context length is 128000 tokens"), Some(Rejection::Context));
+        assert_eq!(kind(400, "API 400 Bad Request: Too many images in request. Maximum is 100"), Some(Rejection::Images));
+        assert_eq!(kind(413, "API 413 Payload Too Large: maximum context length"), Some(Rejection::Images));
+        assert_eq!(kind(400, "API 400 Bad Request: invalid model"), None);
+        // the same words in an answer that may follow a generation say nothing definite
+        assert_eq!(kind(500, "API 500: context length exceeded"), None);
+        assert_eq!(kind(429, "API 429: too many tokens per minute"), None);
+        let streamed = Answered::new(200, r#"API error: {"code":"context_length_exceeded","message":"Input is too long"}"#.into(), None);
+        assert_eq!(streamed.rejection, Some(Rejection::Context));
+        assert!(streamed.unbilled() && !streamed.retryable(), "an in-stream rejection is neither charged nor resent");
+        let malformed = Answered::new(200, "API returned a malformed body: EOF".into(), None);
+        assert!(!malformed.unbilled() && malformed.retryable());
+    }
+
+    #[tokio::test]
+    async fn an_error_event_in_a_200_stream_is_a_typed_rejection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 65536];
+            let _ = socket.read(&mut buf).await;
+            let body = "event: error\ndata: {\"type\":\"error\",\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the context window of this model.\"}\n\n";
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+            socket.write_all(format!("{head}{body}").as_bytes()).await.unwrap();
+        });
+        let cfg = super::LlmCfg { model: "m".into(), base_url: Some(format!("http://127.0.0.1:{port}")), key_env: None, reasoning: None,
+            max_output: 100, context_window: None, cache_key: None, provider_only: vec![] };
+        let error = super::chat(&reqwest::Client::new(), &cfg, "k", &serde_json::json!({"system": "", "messages": [{"role": "user", "content": "hi"}]})).await.unwrap_err();
+        let answered = error.downcast_ref::<Answered>().expect("an answer, not a lost response");
+        assert_eq!((answered.status, answered.rejection), (200, Some(Rejection::Context)));
     }
 }
 

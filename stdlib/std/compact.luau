@@ -4,15 +4,17 @@
 -- summarizer call dispatched by the Rust supervisor. That call replays the agent's own request prefix (system prompt, tools,
 -- the task message and the history to summarize) and appends one instruction, so the summarizer sees exact messages and
 -- the provider can reuse its cached prefix. A validated summary (M.accept) replaces the older messages; the task message
--- and the most recent messages stay verbatim; the Luau session (globals) is untouched. A context-overflow error from the
--- model bounds the window for one compaction that keeps as little as fits under that bound, then a retry.
+-- and the most recent messages stay verbatim; the Luau session (globals) is untouched. A provider rejection of the request
+-- as over the context window (the host classifies it: `error_kind = "context_rejected"`) bounds the window for one
+-- compaction that keeps as little as fits under that bound, then a retry.
 -- Below the trigger the pack adds nothing to the requests. It never writes files.
 -- Config (set in .harness/init.luau, which runs before packs install):
 --   require("std/compact").trigger_ratio = 0.5
 -- The window comes from --context-window or OpenRouter's model list, else M.context_window; give a smaller model's window, or
--- it overflows first (the OVERFLOW substrings below are the fallback).
+-- it overflows first (the rejection above is the fallback).
 -- The ratios are the DeepSeek harness defaults (compaction-basic), chosen by the DeepSeek team.
 local M = {}
+local vision = require("std/vision")
 
 M.enabled = true
 M.context_window = 1000000 -- used only when neither --context-window nor the provider gives the window
@@ -24,7 +26,16 @@ M.reserve_tokens = 65536 -- most headroom kept free for the summarizer's output,
 -- it compacts like token pressure does, and the kept tail carries at most half of it, so image compactions stay rare.
 M.max_images = 50
 -- base64 characters, as sent: twice what std/vision lets one turn add, so the half a compaction keeps always fits a turn
-M.max_image_bytes = 2 * require("std/vision").MAX_BYTES_PER_TURN
+M.max_image_bytes = 2 * vision.MAX_BYTES_PER_TURN
+
+-- The history, images included, is controller state, which the host copies at every transition and refuses above
+-- hx.limits.STATE_BYTES. A turn's images arrive before the budget is checked, so the budget in force leaves room for
+-- them and for the text within three quarters of that cap, whatever max_image_bytes is set to. (16 MiB: the test VM's
+-- hx.limits has no STATE_BYTES.)
+function M.image_byte_budget(): number
+	local state = if hx.limits and type(hx.limits.STATE_BYTES) == "number" then hx.limits.STATE_BYTES else 16 * 2 ^ 20
+	return math.min(M.max_image_bytes, state * 3 // 4 - vision.MAX_BYTES_PER_TURN)
+end
 
 local IMAGE_TOKENS = 1200 -- an image without dimensions
 
@@ -69,19 +80,6 @@ local IMAGE_RULE = "\n- Images above are not kept after this checkpoint: record 
 
 local SUMMARY_PREFIX = "[compaction-summary]\n\nThe conversation history before this point was compacted into the following summary.\nThe retained messages below are authoritative; this summary may lag behind them.\nFiles on disk are current; the file listing in the task above may be out of date.\n\n<summary>\n"
 local SUMMARY_SUFFIX = "\n</summary>\nLuau scope is unchanged: only globals remain accessible across calls. Check vars() before reusing uncertain names; retrieve or recompute past locals."
-
--- lowercase substrings of the error text that mean "the request did not fit the context window"
-local OVERFLOW = {
-	"context_length_exceeded",
-	"maximum context length",
-	"context length",
-	"context window",
-	"prompt is too long",
-	"input is too long",
-	"too many tokens",
-	"exceeds the context",
-	"reduce the length",
-}
 
 -- Headroom for the summarizer's output: an eighth of the window, from 16384 tokens up to M.reserve_tokens, so a
 -- reasoning summarizer is not cut off on a large window and a small window keeps room for history.
@@ -148,7 +146,7 @@ end
 
 function M.images_over(messages): boolean
 	local count, bytes = M.images(messages, 1)
-	return count > M.max_images or bytes > M.max_image_bytes
+	return count > M.max_images or bytes > M.image_byte_budget()
 end
 
 -- The first message a compaction may keep so that the tail carries at most half the image budget; never later than the
@@ -158,13 +156,13 @@ function M.image_floor(messages): number
 	for i = #messages, 1, -1 do
 		if messages[i].role == "assistant" then newest = i; break end
 	end
-	local count, bytes = 0, 0
+	local count, bytes, budget = 0, 0, M.image_byte_budget()
 	for i = #messages, 1, -1 do
 		for _, img in messages[i].images or {} do
 			count += 1
 			bytes += #(img.data or "")
 		end
-		if count > M.max_images / 2 or bytes > M.max_image_bytes / 2 then return math.min(i + 1, newest) end
+		if count > M.max_images / 2 or bytes > budget / 2 then return math.min(i + 1, newest) end
 	end
 	return 1
 end
@@ -279,29 +277,10 @@ function M.accept(reply, task: string, messages, cut: number, history: boolean):
 	return first, nil
 end
 
--- lowercase substrings of the error text that mean "the request carried more image data than the provider takes"
-local IMAGE_OVERFLOW = {
-	"api 413 ",
-	"too many images",
-	"request_too_large",
-	"request too large",
-	"payload too large",
-	"request entity too large",
-}
-
-local function matches(message: string, patterns): boolean
-	local lower = message:lower()
-	for _, pattern in patterns do if lower:find(pattern, 1, true) then return true end end
-	return false
-end
-
-function M.image_overflow(message): boolean
-	return matches(message, IMAGE_OVERFLOW)
-end
-
--- A rejection that a compaction can fix: the request was over the context window or over the image limit.
-function M.overflow(message): boolean
-	return matches(message, OVERFLOW) or matches(message, IMAGE_OVERFLOW)
+-- A model error a compaction can fix, by the host's classification (`error_kind`): the request was rejected as over the
+-- context window, or for its images.
+function M.rejected(kind: string?): boolean
+	return kind == "context_rejected" or kind == "images_rejected"
 end
 
 return M

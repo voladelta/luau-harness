@@ -32,7 +32,6 @@ function M.system(options): string
 	local sections = { M.runtime_access(M.fill(hx.asset("std/system.md"), hx.limits), #hx.mcp_servers() > 0, hx.autopilot, hx.confined) }
 	local recheck = require("std/recheck")
 	if recheck.enabled and (not options or options.recheck ~= false) then table.insert(sections, "# Finish review\n" .. recheck.headsup) end
-	if hx.prompt_contributions and hx.prompt_contributions ~= "" then table.insert(sections, hx.prompt_contributions) end
 	return table.concat(sections, "\n\n")
 end
 

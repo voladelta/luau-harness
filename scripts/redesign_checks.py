@@ -93,6 +93,9 @@ def provider(reply):
             if "status" in answer:
                 data = answer.get("error", "rejected").encode()
                 self.send_response(answer["status"])
+            elif "provider_error" in answer:  # a 200 that carries a provider error in place of the response
+                data = json.dumps({"error": answer["provider_error"], "output": []}).encode()
+                self.send_response(200)
             else:
                 calls = answer.get("calls", [tool(answer["code"])]) if "code" in answer else answer.get("calls", [])
                 text = answer.get("text", "")
@@ -398,6 +401,27 @@ def model_status_codes():
         failed = [r for r in saved if r["kind"] == "llm"]
         assert [r["billing_uncertain"] for r in failed] == [True, True], failed
         assert [r["of"] for r in saved if r["kind"] == "billing"] == [r["of"] for r in failed]
+    # Retry allowances are per failure class: a rate limit waited out leaves a server error its one new request.
+    path = workspace("status-429-then-502")
+    replies = [{"status": 429, "error": "slow down"}, {"status": 502, "error": "upstream"}, tool("print(1)"), "done"]
+    with provider(lambda body, i: replies[i]) as (url, calls):
+        report = json.loads(start(path, url).stdout)
+        assert report["finished"] and report["final_answer"] == "done" and len(calls) == 4, report
+    # A context rejection delivered as an error inside a 200 answer is a definite rejection: it releases its reservation,
+    # is not resent as is, and compacts before the retry, like a 400.
+    pad = " -- " + "p" * 40000
+    replies = [{"code": "x=1" + pad, "tokens": 12000}, {"code": "y=2" + pad, "tokens": 23000}, {"code": "z=3" + pad, "tokens": 34000},
+               {"provider_error": {"code": "context_length_exceeded", "message": "Your input exceeds the limit of this model."}},
+               "SUMMARY", "done"]
+    path = workspace("in-stream-context-rejection")
+    with provider(lambda body, i: replies[i]) as (url, calls):
+        report = json.loads(start(path, url, "--max-tokens", "10000000").stdout)
+        assert report["finished"] and report["final_answer"] == "done" and len(calls) == 6, report
+        assert "Write a context checkpoint" in body_text(calls[4]) and "SUMMARY" in body_text(calls[5]), body_text(calls[4])[-300:]
+        failed = [r for r in records(journal(path)) if r["kind"] == "llm" and "error" in r]
+        assert [(r["status"], r["billing_uncertain"]) for r in failed] == [(200, False)], failed
+        assert not [r for r in records(journal(path)) if r["kind"] == "billing"]
+        assert report["budget"]["reserved_tokens"] == 0, report
 
 
 def concurrent_children_under_token_cap():

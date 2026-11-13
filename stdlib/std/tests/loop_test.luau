@@ -61,7 +61,8 @@ test.case("an overflow bounds the window for its one compaction only", function(
 	for n = 1, 6 do s, command = turn(s, 10000 * n, n, string.rep("p", 40000)) end -- ~60k tokens
 	test.eq(command.purpose, "agent")
 	local measured = compact.measure(s.anchor, s.messages)
-	s, command = loop.step(s, { kind = "model_error", error = "API 400 : maximum context length exceeded", safe_context_rejection = true })
+	-- the host's classification decides, not the wording: an error event inside a 200 stream reads like this
+	s, command = loop.step(s, { kind = "model_error", error = 'API error: {"code":"x"}', error_kind = "context_rejected" })
 	test.eq(s.phase.bound, measured)
 	test.eq(command.kind, "next")
 	s, command = loop.step(s, { kind = "next" })
@@ -73,6 +74,57 @@ test.case("an overflow bounds the window for its one compaction only", function(
 	test.eq(s.phase.bound, nil)
 	test.eq(s.window_bound, nil) -- nothing persists: a false positive cannot shrink the window for the rest of the run
 	compact.context_window = 1000000
+end)
+
+test.case("model errors branch on the host's error_kind, not on the text", function()
+	local s, command = start()
+	s, command = turn(s, 1000, 1)
+	local ok, err = pcall(loop.step, s, { kind = "model_error", error = "API 400 : maximum context length exceeded", error_kind = "provider" })
+	test.ok(not ok and tostring(err):find("maximum context length", 1, true), "an error the host did not classify as a rejection ends the run")
+end)
+
+test.case("a budget stop finishes the run whatever its text", function()
+	local s, command = start()
+	s, command = loop.step(s, { kind = "model_error", error = "token admission threshold reached", error_kind = "budget_exceeded" })
+	test.eq(command.kind, "finish")
+	test.eq(s.report.stopped, "token admission threshold reached")
+end)
+
+test.case("failed summaries back off instead of disabling compaction; an overflow still compacts", function()
+	local s, command = start()
+	for n = 1, 6 do s, command = turn(s, 1000 * n, n) end
+	local n = 7
+	for failures = 1, 3 do
+		s, command = turn(s, 30000, n); n += 1 -- over the trigger every turn
+		test.eq(command.purpose, "compact")
+		s, command = loop.step(s, { kind = "model_error", error = "API 502", error_kind = "provider" }) -- a provider blip
+		test.eq(s.compact_failures, failures)
+		s, command = loop.step(s, { kind = "next" })
+		test.eq(command.purpose, "agent")
+		for _ = 2, 2 ^ (failures - 1) do -- backing off 1, 2, 4 turns
+			s, command = turn(s, 30000, n); n += 1
+			test.eq(command.purpose, "agent")
+		end
+	end
+	-- still backing off from the third failure, yet a context rejection forces its compaction
+	test.ok(s.report.turns < s.compact_after, "backing off")
+	s, command = loop.step(s, { kind = "model_error", error = "too long", error_kind = "context_rejected" })
+	s, command = loop.step(s, { kind = "next" })
+	test.eq(command.purpose, "compact")
+	s, command = summary(s, "SUMMARY")
+	test.eq(s.compact_failures, 0)
+	test.eq(s.compact_after, nil)
+end)
+
+test.case("a cut reply is kept on a character boundary", function()
+	local s, command = start()
+	s, command = turn(s, 1000, 1)
+	local text = "a" .. string.rep("é", 1000) -- byte 1500 is the first half of an é
+	s, command = loop.step(s, { kind = "model_reply", system_chars = SYSTEM, reply = { text = text, finish = "length", input = 1100, output = 10, calls = {} } })
+	local kept = s.messages[#s.messages - 1].content
+	test.eq(#kept, 1499)
+	test.ok(utf8.len(kept) == 750, "valid UTF-8")
+	test.eq(command.kind, "next")
 end)
 
 test.case("the anchor scale uses the system prompt as sent", function()

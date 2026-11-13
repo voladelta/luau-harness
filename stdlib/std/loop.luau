@@ -1,10 +1,12 @@
 -- Pure controller: all durable workflow state is passed in and returned. Rust dispatches commands.
 -- `s.phase` is a tagged table; each kind carries only the data that is valid in it:
---   { kind = "ready", compact = "auto" | "skip" | "force", overflow = error?, bound = tokens? }  overflow and bound only with "force"
+--   { kind = "ready", compact = "auto" | "skip" | "force", overflow = error?, bound = tokens?, images = true? }
+--                                            overflow, bound and images only with "force"; images: rejected for its images
 --   { kind = "model" }                       waiting for the agent's reply
 --   { kind = "compact", cut = n, size = tokens, overflow = error? }  waiting for a summary of messages before `cut` (`size`: its prefix)
 --   { kind = "run", calls = {...}, index = n }  working through one reply's tool calls
 --   { kind = "finished" }
+-- Compaction backs off after failed summaries: `s.compact_failures` in a row, none tried before turn `s.compact_after`.
 local hooks = require("std/hooks")
 local prompt = require("std/prompt")
 local compact = require("std/compact")
@@ -22,11 +24,26 @@ local function code_of(call)
 	return if type(call.input) == "table" and type(call.input.code) == "string" then call.input.code else nil
 end
 
-local function ready(s, compact, overflow, bound)
+local function ready(s, compact, overflow, bound, images)
 	for _, message in s.notifications or {} do table.insert(s.messages, message) end
 	s.notifications = nil
-	s.phase = { kind = "ready", compact = compact or "auto", overflow = overflow, bound = bound }
+	s.phase = { kind = "ready", compact = compact or "auto", overflow = overflow, bound = bound, images = images }
 	return s, { kind = "next" }
+end
+
+-- At most `bytes` of `text`, cut on a character boundary: model text is UTF-8, and a split character cannot cross the
+-- controller boundary.
+local function clip(text: string, bytes: number): string
+	if #text <= bytes then return text end
+	return text:sub(1, (utf8.offset(text, 0, bytes + 1) or bytes + 1) - 1)
+end
+
+-- A summary failed or was rejected: skip compaction for 1, 2, 4 … (at most 16) agent turns. A forced compaction after a
+-- context rejection ignores this, so a provider blip never makes the next overflow fatal.
+local function compact_failed(s)
+	s.compact_failures += 1
+	s.compact_after = s.report.turns + math.min(2 ^ (s.compact_failures - 1), 16)
+	return ready(s, "skip")
 end
 
 local function finish(s)
@@ -116,28 +133,28 @@ local function step(s, event, options)
 		end
 		return next_call(s)
 	elseif event.kind == "model_error" then
-		if event.error:find("budget_exceeded", 1, true) then
+		-- the host classifies the failure (`error_kind`); `error` is text for display and reports
+		if event.error_kind == "budget_exceeded" then
 			s.report.stopped = event.error
 			return finish(s)
 		end
 		if s.phase.kind == "compact" then
 			if s.phase.overflow then error("compaction failed after context overflow: " .. s.phase.overflow, 0) end
-			s.compact_failures += 1
-			return ready(s, "skip")
+			return compact_failed(s)
 		end
-		local recovery = hooks.emit("model_error", { error = event.error, messages = s.messages })
+		local recovery = hooks.emit("model_error", { error = event.error, kind = event.error_kind, messages = s.messages })
 		if recovery.retry and not s.retried then
 			s.retried = true
 			return ready(s)
 		end
-		if event.safe_context_rejection and compact.enabled and not s.retried and compact.overflow(event.error) then
+		if compact.rejected(event.error_kind) and compact.enabled and not s.retried then
 			s.retried = true
 			-- the rejected request bounds the window (in our measure) for this one compaction, which must fit under it; an
 			-- image rejection of a history with images says nothing about tokens, and its compaction sends the summarizer
 			-- no images
-			local images = compact.image_overflow(event.error) and compact.images(s.messages) > 0
+			local images = event.error_kind == "images_rejected" and compact.images(s.messages) > 0
 			local bound = if images then nil else compact.measure(s.anchor, s.messages)
-			return ready(s, "force", event.error, bound)
+			return ready(s, "force", event.error, bound, images or nil)
 		end
 		error(if s.retried then "the model call failed again after one compact-and-retry: " .. event.error else event.error, 0)
 	elseif event.kind == "model_reply" then
@@ -147,14 +164,13 @@ local function step(s, event, options)
 			local first, reason = compact.accept(event.reply, s.task_text, s.messages, cut, archive_enabled)
 			if not first then
 				if s.phase.overflow then error("compaction rejected (" .. reason .. ") after: " .. s.phase.overflow, 0) end
-				s.compact_failures += 1
-				return ready(s, "skip")
+				return compact_failed(s)
 			end
 			local kept = table.move(s.messages, cut, #s.messages, 2, { { role = "user", content = first } })
 			s.previous_summary = event.reply.text
 			s.messages = kept
 			s.anchor = compact.reanchor(s.anchor, system_chars(s, options), s.messages)
-			s.compact_failures = 0
+			s.compact_failures, s.compact_after = 0, nil
 			-- one compaction per agent reply: the kept tail is bounded, so a second pass could not shrink it further
 			local next_state, command = ready(s, "skip")
 			if archive_enabled then command.archive = {kind="compaction", cut=cut} end
@@ -182,14 +198,14 @@ local function step(s, event, options)
 			if text:match("^%s*$") or resp.finish == "length" or markup then
 				if options.submissions then
 					s.report.truncated_turns += 1
-					table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
+					table.insert(s.messages, { role = "assistant", content = clip(text, 1500) })
 					s.phase = { kind = "candidate" }
 					return s, { kind = "candidate", text = text }
 				end
 				s.bad += 1
 				s.report.truncated_turns += 1
 				if s.bad > 3 then s.report.stopped = "protocol: repeated empty or truncated replies"; return finish(s) end
-				table.insert(s.messages, { role = "assistant", content = text:sub(1, 1500) })
+				table.insert(s.messages, { role = "assistant", content = clip(text, 1500) })
 				table.insert(s.messages, { role = "user", content = if markup then prompt.nudge_markup else prompt.nudge_cut })
 				return ready(s)
 			end
@@ -241,7 +257,7 @@ local function step(s, event, options)
 	local window = math.min(if type(info.context_window) == "number" then info.context_window else compact.context_window, phase.bound or math.huge)
 	local max_output = assert(info.max_output, "hx.model_info() lacks max_output")
 	local force = phase.compact == "force"
-	if compact.enabled and s.compact_failures < 2 and phase.compact ~= "skip" then
+	if compact.enabled and phase.compact ~= "skip" and (force or s.report.turns >= (s.compact_after or 0)) then
 		local total, limit = compact.measure(s.anchor, s.messages), compact.trigger(window, max_output)
 		local images_over = compact.images_over(s.messages)
 		if force or images_over or (limit > 0 and total >= limit) then
@@ -255,8 +271,7 @@ local function step(s, event, options)
 			if cut and not force and not images_over and size - compact.fixed(s.anchor, system_chars(s, options), s.messages[1]) < limit / 4 then cut = nil end
 			if cut then
 				s.phase = { kind = "compact", cut = cut, size = size, overflow = phase.overflow }
-				local no_images = phase.overflow ~= nil and compact.image_overflow(phase.overflow)
-				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut, reserve, no_images), purpose = "compact" }
+				return s, { kind = "model", request = compact.request(req.system, req.tools, s.messages, cut, reserve, phase.images), purpose = "compact" }
 			end
 		end
 	end

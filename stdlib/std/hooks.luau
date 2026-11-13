@@ -20,15 +20,34 @@ end
 -- Events fired by std/loop:
 --   before_model { system, messages }  -> transformed request
 --   after_model  { text, finish, usage = { input, cache_read, cache_write, output } } -> transformed reply
---   model_error  { error, messages }   -> { retry = true } asks for the same turn again (once per turn; messages may be
---                                         changed in place first). Fired when the model call fails, except budget stops.
+--   model_error  { error, kind, messages } -> { retry = true } asks for the same turn again (once per turn; messages may
+--                                         be changed in place first). Fired when the model call fails, except budget stops.
+--                                         `kind`: "context_rejected", "images_rejected", "provider" or "unanswered";
+--                                         `error` is the text for display
 --   before_finish { action, text, turn } -> { action = "continue", message = "..." } turns the final answer back into a turn: the
 --                                         message is sent as the next user turn and the loop goes on
 --   before_run   { code }              -> transformed code, or { deny = "why" }
---   after_run    { output, values, error, ops } -> transformed result of the chunk
+--   after_run    { output, error, ops, feedback } -> transformed result of the chunk; `feedback` is the text the model
+--                                         gets as the tool result (in an RPI stage also `submission`, `submission_error`)
+-- In the agent VM, before_model fires once per model request, with the request as it will be sent.
 function M.on(event: string, fn: (any) -> any)
 	handlers[event] = handlers[event] or {}
 	table.insert(handlers[event], fn)
+end
+
+-- Notification sources (std/vision's queued images): each returns the messages it has for the conversation, once. The
+-- host drains them after every chunk, so the controller sees and budgets them before the next request.
+local sources: { () -> { any } } = {}
+function M.source(fn: () -> { any })
+	table.insert(sources, fn)
+end
+
+local function drain()
+	local out = {}
+	for _, fn in sources do
+		for _, message in fn() do table.insert(out, message) end
+	end
+	return out
 end
 
 function M.observe(event: string, fn: (any) -> ())
@@ -42,6 +61,7 @@ function M.clear(event: string?)
 	else
 		handlers = {}
 		observers = {}
+		sources = {}
 	end
 end
 
@@ -57,6 +77,11 @@ end
 
 -- Validate effective payloads, including in-place mutations with no returned replacement.
 function M.emit(event: string, payload: any): any
+	-- The host's drain after a chunk ({ drain = true }) reaches the agent VM the way requests do, but is no request: it
+	-- collects the notification sources and runs no hook.
+	if event == "before_model" and type(payload) == "table" and payload.drain == true then
+		return { system = "", messages = drain() }
+	end
 	for _, fn in handlers[event] or {} do
 		local ok, out = pcall(fn, payload)
 		if not ok then
