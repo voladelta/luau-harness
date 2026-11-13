@@ -13,23 +13,59 @@ pub(crate) const MAX_DEPTH: usize = 32;
 pub(super) type Files = BTreeMap<String, Vec<u8>>;
 
 /// Every regular file under the editable paths of `root`, within the snapshot limits. Symlinks and special files are
-/// skipped: they never leave an episode. Names must be UTF-8 so they are recreated exactly.
+/// skipped: they never leave an episode. Names must be UTF-8 so they are recreated exactly. Every entry is opened
+/// relative to its parent's descriptor without following a link and judged by what was opened (fstat), so a process
+/// that swaps a path for a symlink to grader or held-out data between the listing and the read gets nothing through.
 pub(super) fn capture(root: &Path, spec: &Spec) -> Result<Files> {
-    fn walk(path: &Path, rel: &str, depth: usize, out: &mut Files, total: &mut usize) -> Result<()> {
-        let Ok(meta) = std::fs::symlink_metadata(path) else { return Ok(()) };
+    use std::os::fd::{AsRawFd, FromRawFd};
+    /// `name` in `dir`, opened without following a link; None when it is gone, a symlink or not openable as a file.
+    fn open_at(dir: &std::fs::File, name: &str, directory: bool) -> Result<Option<std::fs::File>> {
+        let c = std::ffi::CString::new(name)?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | if directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if fd >= 0 { return Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) })); }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR | libc::ENXIO | libc::EOPNOTSUPP) => Ok(None),
+            _ => Err(e.into()),
+        }
+    }
+    /// The names in an open directory.
+    fn list(dir: &std::fs::File) -> Result<Vec<String>> {
+        let fd = unsafe { libc::dup(dir.as_raw_fd()) };
+        ensure!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            unsafe { libc::close(fd); }
+            bail!("{}", std::io::Error::last_os_error());
+        }
+        let mut names = vec![];
+        let result = (|| -> Result<()> {
+            loop {
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() { return Ok(()); }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                if matches!(name.to_bytes(), b"." | b"..") { continue; }
+                names.push(name.to_str().map_err(|_| anyhow::anyhow!("editable file name {name:?} is not UTF-8"))?.to_string());
+            }
+        })();
+        unsafe { libc::closedir(stream); }
+        result.map(|_| names)
+    }
+    fn walk(parent: &std::fs::File, name: &str, rel: &str, depth: usize, out: &mut Files, total: &mut usize) -> Result<()> {
+        let Some(file) = open_at(parent, name, false)? else { return Ok(()) };
+        let meta = file.metadata()?;
         if meta.is_dir() {
             ensure!(depth < MAX_DEPTH, "editable directories nest deeper than {MAX_DEPTH} levels");
-            for entry in std::fs::read_dir(path)? {
-                let entry = entry?;
-                let name = entry.file_name().into_string().map_err(|n| anyhow::anyhow!("editable file name {n:?} is not UTF-8"))?;
-                walk(&entry.path(), &format!("{rel}/{name}"), depth + 1, out, total)?;
+            for name in list(&file)? {
+                walk(&file, &name, &format!("{rel}/{name}"), depth + 1, out, total)?;
             }
         } else if meta.is_file() {
             ensure!(out.len() < MAX_FILES, "editable paths hold more than {MAX_FILES} files");
             // Read at most what is left of the limit, so a file that keeps growing cannot get past it.
             let left = MAX_SNAPSHOT - *total;
             let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(path)?, left as u64 + 1), &mut bytes)?;
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, left as u64 + 1), &mut bytes)?;
             ensure!(bytes.len() <= left, "editable files exceed {} MiB", MAX_SNAPSHOT >> 20);
             *total += bytes.len();
             out.insert(rel.to_string(), bytes);
@@ -37,13 +73,19 @@ pub(super) fn capture(root: &Path, spec: &Spec) -> Result<Files> {
         Ok(())
     }
     let (mut out, mut total) = (BTreeMap::new(), 0);
-    for e in &spec.editable {
+    let top = std::fs::File::open(root)?;
+    'paths: for e in &spec.editable {
         let e = e.trim_end_matches('/');
+        let parts: Vec<&str> = e.split('/').collect();
         // A symlinked parent directory is skipped like any symlink: nothing is read through it.
-        let linked = Path::new(e).ancestors().skip(1).filter(|a| !a.as_os_str().is_empty())
-            .any(|a| std::fs::symlink_metadata(root.join(a)).is_ok_and(|m| m.file_type().is_symlink()));
-        if linked { continue; }
-        walk(&root.join(e), e, 0, &mut out, &mut total)?;
+        let mut dir = top.try_clone()?;
+        for part in &parts[..parts.len() - 1] {
+            match open_at(&dir, part, true)? {
+                Some(next) => dir = next,
+                None => continue 'paths,
+            }
+        }
+        walk(&dir, parts[parts.len() - 1], e, 0, &mut out, &mut total)?;
     }
     Ok(out)
 }
@@ -83,9 +125,10 @@ pub(super) fn save_snap(dir: &Path, files: &Files) -> Result<String> {
     let bytes = serde_json::to_vec(&encoded)?;
     let id = crate::eventlog::sha_bytes(&bytes)[..16].to_string();
     let path = dir.join("snaps").join(format!("{id}.json"));
-    if !path.exists() {
+    // Written whole or not at all, so one that exists is complete (one torn by an older hx is shorter: rewritten).
+    if std::fs::metadata(&path).map_or(true, |m| m.len() != bytes.len() as u64) {
         std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(path, bytes)?;
+        crate::atomic_file::replace_trusted(&path, &bytes)?;
     }
     Ok(id)
 }
@@ -97,6 +140,19 @@ pub(super) fn load_snap(dir: &Path, id: &str) -> Result<Files> {
 
 /// A fresh private directory in the system temp dir; removed on drop.
 pub(super) struct Scratch(pub(super) PathBuf);
+
+/// A recorded scratch path is not authority to kill processes and delete files: only a direct, non-symlink child of
+/// the system temp directory with the name `Scratch::new("ws")` gives an episode's copy.
+pub(super) fn valid_scratch(path: &Path) -> bool {
+    let Ok(base) = std::fs::canonicalize(std::env::temp_dir()) else { return false };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let shaped = name.strip_prefix("hx-ar-ws-").and_then(|n| n.strip_suffix(".noindex")).is_some_and(|n| {
+        let parts: Vec<&str> = n.split('-').collect();
+        parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 20 && p.bytes().all(|b| b.is_ascii_digit()))
+    });
+    shaped && path.parent() == Some(base.as_path())
+        && std::fs::symlink_metadata(path).map_or(true, |m| m.is_dir() && !m.file_type().is_symlink())
+}
 impl Scratch {
     pub(super) fn new(kind: &str) -> Result<Scratch> {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -115,15 +171,42 @@ impl Drop for Scratch {
     }
 }
 
-/// Copy the tree `from` to the new path `to` (APFS clones when available).
+/// Copy the tree `from` to the new path `to`, as copy-on-write clones where the filesystem has them (APFS `cp -c`,
+/// Btrfs and XFS `--reflink=auto`). Whether this system's `cp` takes the flag is learned on the first copy, so later
+/// copies spawn `cp` once.
 pub(super) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    for flags in [&["-cR"][..], &["-R"][..]] {
-        let status = std::process::Command::new("cp").args(flags).arg(from).arg(to)
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0: not known yet, 1: clones work, 2: plain copies only.
+    static CLONES: AtomicU8 = AtomicU8::new(0);
+    let clone: &[&str] = if cfg!(target_os = "macos") { &["-cR"] } else { &["-R", "--reflink=auto"] };
+    let tries: &[&[&str]] = match CLONES.load(Ordering::Relaxed) { 1 => &[clone], 2 => &[&["-R"]], _ => &[clone, &["-R"]] };
+    for flags in tries {
+        let status = std::process::Command::new("cp").args(*flags).arg(from).arg(to)
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status()?;
-        if status.success() { return Ok(()); }
+        if status.success() {
+            let _ = CLONES.compare_exchange(0, if *flags == clone { 1 } else { 2 }, Ordering::Relaxed, Ordering::Relaxed);
+            return Ok(());
+        }
         let _ = std::fs::remove_dir_all(to);
     }
     bail!("could not copy {} to {}", from.display(), to.display())
+}
+
+/// Bytes of an evaluator's report as JSON kept whole; it goes into every ledger row and back to the agent.
+const STORED_REPORT: usize = 16 << 10;
+
+/// An evaluator's report, whole when its JSON is at most `STORED_REPORT` bytes; otherwise its scalar top-level fields
+/// (the scores and counts an agent compares) and the start of the whole.
+pub(super) fn cap_report(report: Value) -> Value {
+    let text = report.to_string();
+    if text.len() <= STORED_REPORT { return report; }
+    let mut out = serde_json::Map::new();
+    if let Value::Object(map) = &report {
+        let scalar = |v: &Value| matches!(v, Value::Number(_) | Value::Bool(_)) || v.as_str().is_some_and(|s| s.len() <= 200);
+        for (k, v) in map.iter().filter(|(k, v)| k.len() <= 100 && scalar(v)).take(100) { out.insert(k.clone(), v.clone()); }
+    }
+    out.insert("truncated".into(), json!(clip(&text, REPORT_CHARS)));
+    Value::Object(out)
 }
 
 /// Run an evaluator on `files` placed into a fresh copy of the frozen base. Returns (score, valid, se, report).
@@ -155,7 +238,7 @@ pub(super) async fn evaluate(spec: &Spec, run: &Path, files: &Files, cmd: &str, 
     let score = obj["score"].as_f64().filter(|s| s.is_finite());
     let valid = score.is_some() && obj["valid"].as_bool() != Some(false);
     let se = obj["se"].as_f64().filter(|s| s.is_finite() && *s >= 0.0);
-    Ok((score, valid, se, obj.get("report").cloned().unwrap_or(Value::Null)))
+    Ok((score, valid, se, cap_report(obj.get("report").cloned().unwrap_or(Value::Null))))
 }
 
 /// The evaluator's environment: no credentials, nothing inherited beyond what locates tools.
@@ -265,4 +348,78 @@ pub(super) fn rate_limited(logs: &Path) -> u64 {
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
         .filter_map(|j| crate::eventlog::Books::of(&crate::eventlog::load(&j).ok()?).ok())
         .map(|books| books.usage.rate_limits).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hx-ar-files-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    #[test]
+    fn capture_reads_files_and_never_follows_a_link() {
+        let dir = temp("capture");
+        let (ws, secret) = (dir.join("ws"), dir.join("holdout"));
+        std::fs::create_dir_all(ws.join("pkg/sub")).unwrap();
+        std::fs::create_dir_all(ws.join("other")).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("answers.txt"), "SECRET").unwrap();
+        std::fs::write(ws.join("pkg/a.txt"), "a").unwrap();
+        std::fs::write(ws.join("pkg/sub/b.bin"), [0u8, 255]).unwrap();
+        std::os::unix::fs::symlink(secret.join("answers.txt"), ws.join("pkg/link.txt")).unwrap();
+        std::os::unix::fs::symlink(&secret, ws.join("pkg/linkdir")).unwrap();
+        std::os::unix::fs::symlink(&secret, ws.join("linked")).unwrap();
+        let spec: Spec = toml::from_str("editable = [\"pkg/\", \"linked/answers.txt\", \"missing/x\", \"other/none\"]\neval = \"true\"").unwrap();
+        let files = capture(&ws, &spec).unwrap();
+        assert_eq!(files.keys().collect::<Vec<_>>(), vec!["pkg/a.txt", "pkg/sub/b.bin"]);
+        assert_eq!(files["pkg/sub/b.bin"], vec![0u8, 255]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshots_are_written_whole() {
+        let dir = temp("snaps");
+        let files = Files::from([("x.txt".to_string(), b"7\n".to_vec())]);
+        let id = save_snap(&dir, &files).unwrap();
+        // A snapshot torn by a killed writer is rewritten, not taken as stored.
+        let path = dir.join("snaps").join(format!("{id}.json"));
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+        assert_eq!(save_snap(&dir, &files).unwrap(), id);
+        assert_eq!(load_snap(&dir, &id).unwrap(), files);
+        assert_eq!(std::fs::read_dir(dir.join("snaps")).unwrap().count(), 1, "a temporary file was left behind");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_episode_scratch_copies_are_cleaned_up() {
+        let scratch = Scratch::new("ws").unwrap();
+        assert!(valid_scratch(&scratch.0));
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let link = base.join(format!("hx-ar-ws-{}-1-999.noindex", std::process::id()));
+        std::os::unix::fs::symlink(&scratch.0, &link).unwrap();
+        assert!(!valid_scratch(&link), "a symlinked scratch path");
+        let _ = std::fs::remove_file(&link);
+        for bad in ["/home", "/", "/tmp/../home/hx-ar-ws-1-2-3.noindex"] { assert!(!valid_scratch(Path::new(bad)), "{bad}"); }
+        assert!(!valid_scratch(&base.join("hx-ar-eval-1-2-3.noindex")));
+        assert!(!valid_scratch(&base.join("hx-ar-ws-1-2.noindex")));
+        assert!(!valid_scratch(&base.join("x").join("hx-ar-ws-1-2-3.noindex")));
+        assert!(valid_scratch(&base.join("hx-ar-ws-1-2-3.noindex")), "a scratch copy that is already gone");
+    }
+
+    #[test]
+    fn large_reports_keep_their_scores() {
+        let small = json!({"score": 1, "notes": "fine"});
+        assert_eq!(cap_report(small.clone()), small);
+        let big = cap_report(json!({"sharpe": 1.5, "valid": true, "name": "x", "trades": vec![0; 100_000]}));
+        assert!(big.to_string().len() < 2 * REPORT_CHARS, "{}", big.to_string().len());
+        assert_eq!((big["sharpe"].clone(), big["valid"].clone(), big["name"].clone()), (json!(1.5), json!(true), json!("x")));
+        assert!(big["trades"].is_null() && big["truncated"].as_str().unwrap().ends_with("(truncated)"));
+        assert!(cap_report(json!(vec!["y".repeat(100); 1000]))["truncated"].is_string());
+    }
 }

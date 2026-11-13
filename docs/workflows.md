@@ -82,7 +82,9 @@ min_delta = 0.05
 2. **Research.** A research episode writes a brief.
 3. **Workers.** Eight workers (six after a provider rate limit) run side by side. Each derives its own idea from a host seed with [String Seed of Thought](https://pub.sakana.ai/ssot/) and claims it with `ar.claim`, first come, first served, so no two pursue the same core approach. `ar.claims()` lists what is taken; a placeholder claim is refused. Workers implement and fix their idea, then return without tuning it; depth comes from rounds.
 4. **Gate.** The three most promising candidates pass to the next rounds, even raw ones below the seed. Candidates that beat the seed on search and are not worse on `select` are audited for evaluator holes; only those can become results.
-5. **Rounds.** Refinement continues while it moves the chosen candidates; exploring starts again when it doesn't. Two rounds in a row without progress (a new candidate, or a gain above `min_delta`) end the run.
+5. **Rounds.** Refinement continues while it moves the chosen candidates; exploring starts again when it doesn't. Two rounds in a row without progress (a new good candidate, or a gain above `min_delta` and the evaluator's `se`) end the run, and no run takes more than 20 rounds.
+
+A failed audit costs only the audited state: its candidate falls back to its best state that no audit failed, and a later refinement is audited in turn. An audit counts only with an explicit `VERDICT: PASS` or `VERDICT: FAIL`. Confined processes (evaluators and agent shell commands) cannot use `/dev/shm`, so Python multiprocessing locks, queues and pools fail inside them; use threads or plain subprocesses.
 
 Episodes are limited in model turns, not dollars. The result is a portfolio of distinct good candidates, best search score first.
 
