@@ -6,7 +6,7 @@ rejected header value), EXPIRE=file (if it exists: delete it, rotate the session
 delete it and close the connection without answering one tools/call), CLOSE_AFTER_LIST=1 (stop listening once
 tools/list is answered, so later connections are refused). Mode sse-split sends the
 stream in 3-byte chunks, ends without the final blank line, and precedes the response with a server request using id 1. POST /redir answers 302 to /elsewhere."""
-import json, os, sys, uuid
+import json, os, socket, sys, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp_demo_server import TOOLS, RpcError, call
@@ -51,8 +51,11 @@ class H(BaseHTTPRequestHandler):
         else: return self.reply(200, json.dumps({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "no such method"}}).encode(), extra=extra)
         out = json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r})
         if meth == "tools/list" and os.environ.get("CLOSE_AFTER_LIST"):
-            self.reply(200, out.encode(), extra=extra); self.wfile.flush()
-            server.socket.close()  # refuse every later connection
+            # Stop listening before answering, so every later connection is refused (a close alone leaves the socket
+            # listening while serve_forever waits on it), and keep the client from reusing this connection.
+            server.socket.shutdown(socket.SHUT_RDWR); server.socket.close()
+            self.reply(200, out.encode(), extra=extra + [("Connection", "close")]); self.wfile.flush()
+            self.close_connection = True
             return
         if MODE == "sse-split":
             req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
