@@ -612,6 +612,22 @@ pub(super) fn rate_limited(logs: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sweep` works on the shared temporary directory, so the tests that call it take turns: a root one test's sweep
+    /// is still removing looks held to another's.
+    static SWEEPING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sweep until `gone` no longer exists. A lock file descriptor is briefly shared with any child another test is
+    /// forking at that moment, which makes one sweep see the root as still in use.
+    fn sweep_until_gone(gone: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            sweep();
+            if !gone.exists() { return; }
+            assert!(std::time::Instant::now() < deadline, "{} was not swept", gone.display());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     use std::os::unix::fs::symlink;
 
     fn dir(tag: &str) -> PathBuf {
@@ -745,8 +761,9 @@ mod tests {
         }
         let then = std::time::SystemTime::now() - LOCKLESS_GRACE - std::time::Duration::from_secs(5);
         File::open(&old).unwrap().set_modified(then).unwrap();
-        sweep();
-        assert!(!old.exists() && fresh.exists());
+        let _turn = SWEEPING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sweep_until_gone(&old);
+        assert!(fresh.exists());
         std::fs::remove_dir_all(&fresh).unwrap();
     }
 
@@ -762,11 +779,11 @@ mod tests {
         let held = File::open(live.join("lock")).unwrap();
         assert!(flock(&held, false));
         let scratch = Scratch::new("ws").unwrap();
-        sweep();
-        assert!(!dead.exists() && live.exists() && scratch.0.exists());
+        let _turn = SWEEPING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sweep_until_gone(&dead);
+        assert!(live.exists() && scratch.0.exists());
         drop(held);
-        sweep();
-        assert!(!live.exists());
+        sweep_until_gone(&live);
         let path = scratch.0.clone();
         drop(scratch);
         assert!(!path.exists());
