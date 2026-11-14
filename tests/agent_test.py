@@ -402,6 +402,48 @@ class AgentTest(unittest.TestCase):
         self.assertIn("[timed out and was killed]", self.tool_results()[0])
         self.assert_gone(int(read(self.project, "child.pid")))
 
+    def frozen_cgroup(self):
+        """A cgroup v1 freezer group, frozen once a process is put in it. A frozen process ignores SIGKILL until it
+        is thawed, as one stuck in uninterruptible I/O does until the I/O returns."""
+        group = os.path.join("/sys/fs/cgroup/freezer", os.path.basename(self.root))
+        try:
+            os.mkdir(group)
+        except OSError as e:
+            self.skipTest(f"no cgroup v1 freezer to make a process unkillable: {e}")
+
+        def remove():
+            with open(os.path.join(group, "freezer.state"), "w") as f:
+                f.write("THAWED")
+            for _ in range(100):
+                if not read(group, "cgroup.procs").strip():
+                    break
+                time.sleep(0.05)
+            os.rmdir(group)
+
+        self.addCleanup(remove)
+        return group
+
+    def test_a_command_stuck_past_its_kill_holds_up_neither_the_call_nor_the_exit(self):
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("local r = host.sh('echo $$ > sh.pid; exec sleep 300', {timeout = 3})\n"
+                    "print(r.timed_out, r.signal, r.code)\n")
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(kill_quietly, process.pid)
+        pid = self.wait_for_pid_file("sh.pid")
+        group = self.frozen_cgroup()  # its cleanup runs first, so a binary that hangs here is let go
+        with open(os.path.join(group, "cgroup.procs"), "w") as f:
+            f.write(str(pid))
+        with open(os.path.join(group, "freezer.state"), "w") as f:
+            f.write("FROZEN")
+        started = time.monotonic()
+        out, err = process.communicate(timeout=20)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual((process.returncode, out), (0, "true\t9\tnil\n"), err)
+        with open(os.path.join(group, "freezer.state"), "w") as f:
+            f.write("THAWED")
+        self.assert_gone(pid)
+
     def test_a_background_process_lives_until_hx_exits(self):
         done = self.run_hx("go", script=[
             call("bash", {"command": "sleep 300 > /dev/null 2>&1 & echo $! > bg.pid"}, "c1"),

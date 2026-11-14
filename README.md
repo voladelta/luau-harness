@@ -129,7 +129,8 @@ Know these before you rely on it.
 - **A process outlives `hx` when `hx` itself is killed with SIGKILL, or crashes.** Every other way out kills
   what the model started, leaving at once on a second Ctrl-C included. Such a process stays confined, but it is
   not killed. A process stuck in uninterruptible I/O (a dead network mount) is sent SIGKILL but dies only when
-  the I/O returns; `hx` waits a second for it, then leaves without it.
+  the I/O returns; `hx` waits a second for it, then leaves without it. A command that times out is treated the
+  same way: `host.sh` returns after that second, with `signal` 9.
 - **The model can edit `.hx/loop.luau` and its extensions.** That is the point, and it shows in `git diff`.
   If the loop no longer loads and returns a `main` function, the built-in one runs instead.
 - **Nothing asks before a file in the project is changed or deleted.** Git is the undo.

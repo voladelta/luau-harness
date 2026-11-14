@@ -49,7 +49,7 @@ constexpr std::size_t kBufferSize = 65536;
 constexpr int kPollMs = 50;
 constexpr int kKillRounds = 100;          // at exit, so that a fork storm cannot hold hx up forever
 constexpr std::size_t kMaxKilled = 4096;  // processes remembered at exit; past that, more rounds find the rest
-constexpr double kReapSeconds = 1.0;      // at exit, how long hx waits for what it killed to be gone
+constexpr double kReapSeconds = 1.0;      // how long hx waits for a process it killed to be gone
 constexpr double kLongest = 1e9;          // seconds, about 30 years: the longest duration a call can ask for
 
 // Signal handlers cannot be given context, so this state is global. It is the only mutable global state here.
@@ -350,6 +350,24 @@ void kill_group(pid_t group) {
     // Until the child has called setsid() its group does not exist yet; then the child itself is the target.
     if (kill(-group, SIGKILL) != 0) {
         kill(group, SIGKILL);
+    }
+}
+
+// Waits for a killed child for at most seconds. SIGKILL cannot end a process stuck in uninterruptible I/O (a dead
+// network mount) until the I/O returns, so it may take longer; it is then left a zombie for a later reap, by the
+// next host.sh or by kill_descendants.
+bool reap_within(pid_t pid, int& status, double seconds) {
+    const double deadline = now() + seconds;
+    for (;;) {
+        const pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid) {
+            return true;
+        }
+        if ((done < 0 && errno != EINTR) || now() >= deadline) {
+            return false;
+        }
+        const timespec nap{0, 10'000'000};
+        nanosleep(&nap, nullptr);
     }
 }
 
@@ -859,6 +877,7 @@ int Host::sh(lua_State* L) {
     enum class Ending : std::uint8_t { Exited, TimedOut, Signaled };
     const double deadline = now() + timeout;
     int status = 0;
+    bool reaped = true;  // false: killed, but stuck in uninterruptible I/O and not yet dead
     Ending ending = Ending::Exited;
     for (;;) {
         drain();
@@ -868,15 +887,15 @@ int Host::sh(lua_State* L) {
         if (g_signal != 0 || now() >= deadline) {
             ending = g_signal != 0 ? Ending::Signaled : Ending::TimedOut;
             kill_group(pid);
-            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-            }
+            reaped = reap_within(pid, status, kReapSeconds);
             break;
         }
         // Wake on output, or after a short wait to notice the exit of a shell whose background job holds the pipe.
         pollfd waiter{output.get(), POLLIN, 0};
         poll(&waiter, at_end ? 0 : 1, kPollMs);
     }
-    // bash is gone. Whatever it left running keeps running, so do not wait for the pipe to close.
+    // bash is gone, or killed and left for a later reap. Whatever it left running keeps running, so do not wait
+    // for the pipe to close.
     drain();
     if (ending == Ending::Signaled) {
         raise_if_signaled(L);
@@ -886,7 +905,10 @@ int Host::sh(lua_State* L) {
     lua_createtable(L, 0, 4);
     lua_pushlstring(L, text.data(), text.size());
     lua_setfield(L, -2, "out");
-    if (WIFEXITED(status)) {
+    if (!reaped) {
+        lua_pushnumber(L, SIGKILL);  // what it was sent and will die of once its I/O returns
+        lua_setfield(L, -2, "signal");
+    } else if (WIFEXITED(status)) {
         lua_pushnumber(L, WEXITSTATUS(status));
         lua_setfield(L, -2, "code");
     } else if (WIFSIGNALED(status)) {
