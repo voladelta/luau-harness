@@ -89,6 +89,12 @@ check("a time limit ends a command", select(2, host.timed(0.2, function() return
 check("an inner limit cannot outlast the outer one", select(2, host.timed(0.2, function() return host.timed(30, function() host.sleep(30) end) end)), "timeout")
 check("none of that waited", os.time() - started < 5, true)
 check("a limit that is not reached changes nothing", select(2, host.timed(5, function() return host.sh("echo ok").out end)), "ok\n")
+-- A negative duration is an empty one, inside a limit or not.
+check("a negative sleep", select(2, host.timed(5, function() host.sleep(-1) return "slept" end)), "slept")
+check("a negative timeout", select(2, host.timed(5, function() return host.sh("sleep 30", { timeout = -1 }).timed_out end)), true)
+check("a negative timeout outside a limit", host.sh("sleep 30", { timeout = -1 }).timed_out, true)
+check("a negative limit", select(2, host.timed(-1, function() while true do end end)), "timeout")
+check("nan is no time at all", select(2, host.timed(5, function() return host.sh("sleep 30", { timeout = 0 / 0 }).timed_out end)), true)
 raises("a command with a NUL byte", host.sh, "echo a\0b", "contains a NUL byte")
 raises("a path with a NUL byte", host.read, "a\0b", "contains a NUL byte")
 local hog_ok, hog_err = pcall(function()

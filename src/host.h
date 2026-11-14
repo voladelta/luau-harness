@@ -63,7 +63,7 @@ class Host {
     static int timed(lua_State* L);
     static int sleep(lua_State* L);
 
-    // Shortens a wait so that it ends no later than the host.timed limit in force.
+    // Shortens a wait so that it ends no later than the host.timed limit in force. A negative wait is an empty one.
     [[nodiscard]] double within_limit(double seconds) const;
 
     HostConfig config_;

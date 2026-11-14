@@ -41,6 +41,7 @@ constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm aborts
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;
 constexpr int kPollMs = 50;
+constexpr double kLongest = 1e9;  // seconds, about 30 years: the longest duration a call can ask for
 
 // Signal handlers cannot be given context, so this state is global. It is the only mutable global state here.
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
@@ -86,6 +87,12 @@ double option(lua_State* L, int idx, const char* name, double fallback) {
     const double value = lua_isnil(L, -1) ? fallback : luaL_checknumber(L, -1);
     lua_pop(L, 1);
     return value;
+}
+
+// A duration from Luau in seconds. A negative one (or nan) is empty, and a huge one is cut to kLongest, so every
+// conversion to milliseconds or nanoseconds stays defined.
+double duration(double seconds) {
+    return seconds > 0 ? std::min(seconds, kLongest) : 0.0;
 }
 
 // Turns a pending signal into its Luau error. This is the only place a signal is consumed, so each one surfaces
@@ -577,6 +584,7 @@ int Host::sh(lua_State* L) {
 }
 
 double Host::within_limit(double seconds) const {
+    seconds = duration(seconds);
     if (deadline_ <= 0) {
         return seconds;
     }
@@ -602,7 +610,7 @@ int Host::sleep(lua_State* L) {
 // Limits nest: an inner call cannot outlast the outer one. llm, sh and sleep give up when the limit passes, and
 // the error is raised as soon as Luau code runs again.
 int Host::timed(lua_State* L) {
-    const double seconds = luaL_checknumber(L, 1);
+    const double seconds = duration(luaL_checknumber(L, 1));
     luaL_checktype(L, 2, LUA_TFUNCTION);
     int status = 0;
     {
