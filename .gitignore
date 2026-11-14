@@ -1,8 +1,3 @@
-/target
+/build/
 __pycache__/
-*.pyc
-# runtime state written by hx itself (event logs and blobs contain file contents and command output)
-.harness/
-.agents/
-.openrouter/
-/target-dev
+/.worktrees/

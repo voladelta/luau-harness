@@ -1,205 +1,160 @@
-<p align="center">
-  <img src="docs/banner.png" alt="hx, the moon imp mascot, tries to fly a git push paper plane out of a sandbox while a crossing guard stops it" width="100%">
-</p>
-
 # hx
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Rust 1.100+](https://img.shields.io/badge/rust-1.100%2B-orange.svg)
-![Linux only](https://img.shields.io/badge/platform-linux-lightgrey.svg)
+A small coding-agent host for one project at a time: a Luau VM, five tools, and one kernel-enforced wall.
 
-A headless coding-agent harness in which the model writes Luau instead of calling tools one at a time. Rust owns effects and recovery; Luau supplies composition and workflow decisions.
+The host is about 1,500 lines of C++. The agent loop is one Luau file that your project owns and edits. The
+model can extend the harness by writing Luau modules into the project.
 
-```bash
-cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(#search("fn main", {glob = "*.rs"}))'
+```
+cd my-project
+export DEEPSEEK_API_KEY=...
+hx "add a --json flag to the export command and test it"
 ```
 
-## TL;DR
+## The idea
 
-**The problem:** tool-calling agents spend one model turn per action. A turn re-sends the conversation, so a task that needs 12 searches, reads and edits costs 12 round trips.
+- **The host is a kernel, not a framework.** It gives Luau a model call, a shell, file access and JSON. That is
+  all. There is no plugin system, package format, permission prompt or configuration file.
+- **The loop belongs to the project.** `hx init` copies the built-in loop to `.hx/loop.luau`. From then on
+  that file is the harness for this project: the prompt, the tools, the retry and compaction rules. Change it by
+  editing it.
+- **One wall, built by the kernel.** Before anything runs, the process confines itself with Landlock. The VM,
+  the file tools and every command the model starts inherit the same rules, so no tool needs a path check and
+  no command needs to be judged by its text.
+- **Extensions have no more power than the model.** An extension is Luau running in the same confined process.
+  It can do nothing the model's own shell could not, so nothing needs to be approved, staged or trusted.
 
-**The solution:** hx gives the model one tool, `luau(code)`. The code runs in a persistent live VM, so one turn can search, read the hits, edit two files and run the tests. A Rust supervisor owns authorization, the journal, budgets and recovery. A separate pure Luau controller returns workflow commands. Modules and approved packages are frozen for each run.
+## Build
 
-| Feature | What it does |
+Needs Linux 5.13 or later (Landlock), a C++20 compiler, CMake 3.28, libcurl headers, and `bash` at run time.
+
+```
+cmake -S . -B build -G Ninja
+cmake --build build
+ctest --test-dir build        # needs python3 and a kernel with Landlock
+cmake --install build         # optional
+```
+
+The first build downloads Luau 0.747 and compiles its VM and compiler (about 20 seconds).
+
+## Use
+
+```
+hx [options] [TASK...]            run the agent; without a task, read it from stdin or start a prompt
+hx [options] run FILE [ARGS...]   run a Luau script with the host primitives
+hx init                           make this project own its loop
+```
+
+| Option | Meaning |
 |---|---|
-| Code mode | One `luau` tool; globals persist across turns; `read`, `write`, `edit`, `sh`, `search` (ripgrep engine, embedded) |
-| Process execution | `sh`, local MCP servers and evaluators are confined by Landlock to the file policy; network isolation is up to your sandbox or container |
-| Approvals | Workspace file tools run freely; outside paths and recognized external actions ask for approval. `--yes` approves ordinary requests automatically, never irreversible ones |
-| [RPI workflow](docs/workflows.md#rpi-research-design-implement-verify) | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds owner review gates |
-| [Autoresearch](docs/workflows.md#autoresearch) | `hx-ar`, a second program built on hx, improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
-| [Recovery](docs/cli.md#checkpoints-and-resume) | `--resume` restores saved data and controller state into a fresh VM; old effectful chunks are never replayed |
-| [Budgets](docs/configuration.md#policytoml) | Token and wall-clock admission thresholds; each request reserves its upper bound in tokens |
-| [Compaction](docs/configuration.md#initluau-compaction-and-recheck) | On by default: at 80% of the context window (1M unless `--context-window` or the provider says otherwise), older history becomes a structured summary; Luau globals stay |
-| [Extensions](docs/extending.md) | Override any `std` module; add single-file tools, packages, skills and MCP servers, all covered by workspace trust |
-| Any provider | Responses API; any compatible base URL (OpenRouter by default) |
+| `--ro PATH` | also allow reading `PATH` |
+| `--rw PATH` | also allow writing `PATH` |
+| `--keep-env NAME` | keep a secret-looking variable in the environment of commands |
+| `--no-sandbox` | run without Landlock |
 
-## Quick example
+| Variable | Meaning | Default |
+|---|---|---|
+| `HX_API_URL` | Anthropic Messages endpoint | `https://api.deepseek.com/anthropic/v1/messages` |
+| `HX_KEY_ENV` | name of the variable holding the API key | `DEEPSEEK_API_KEY` |
+| `HX_MODEL` | model name | `deepseek-flash` |
 
-`hx exec` runs Luau in one session without a model or API key, so you can see what the model sees:
+The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
+At the prompt, Ctrl-C stops the current turn and Ctrl-D leaves.
 
-```bash
-hx exec 'hits = search("fn main", {glob = "*.rs"})' 'print(#hits, hits[1].file)'
-```
+## The wall
 
-```text
-(no output)
--- ops=1 error=false
-1	src/main.rs
--- ops=0 error=false
-```
-
-A real turn from the model looks like this, and does in one round trip what a tool-calling agent does in four:
-
-```luau
-print(edit("src/config.py", "timeout = 5", "timeout = 30"))
-write("tests/test_config.py", [==[
-from src.config import load
-
-def test_timeout():
-    assert load()["timeout"] == 30
-]==])
-print(sh("python -m pytest -q 2>&1 | tail -15").stdout)
-```
-
-## Installation
-
-hx runs on Linux only. It requires Rust 1.100 or newer (edition 2024; the toolchain is pinned in `rust-toolchain.toml`) and Bash. It needs Landlock (Linux 5.13 or newer, enabled in the kernel's `lsm=` list and not filtered by a container's seccomp profile) to confine shell commands, MCP servers and evaluators to the file policy; without it hx refuses to start a run unless you pass `--unconfined`, which runs them unconfined. Run it inside your own sandbox or container to isolate network access.
-
-```bash
-cargo install --git https://github.com/voladelta/luau-harness
-```
-
-Either installs two programs: `hx`, and `hx-ar` ([autoresearch](docs/workflows.md#autoresearch)), which runs its episodes with the `hx` beside it. Or from a clone; `cargo build --release` builds both without installing (`target/release/hx` and `target/release/hx-ar`):
-
-```bash
-git clone https://github.com/voladelta/luau-harness
-cd luau-harness
-cargo install --path .
-```
-
-## Quick start
-
-1. Set an API key. By default hx calls OpenRouter and reads `OPENROUTER_API_KEY`.
-
-   ```bash
-   export OPENROUTER_API_KEY=...
-   ```
-
-2. Write the task to a file:
-
-   ```bash
-   echo "Fix the failing test in tests/test_tax.py" > task.md
-   ```
-
-3. Run it in the project directory:
-
-   ```bash
-   hx run --workspace . --prompt-file task.md --model anthropic/claude-sonnet-5.5 --max-tokens 2000000
-   ```
-
-For a one-off task, pass the prompt directly. Add `--yes` for autopilot:
-
-```bash
-hx run "Fix the failing tests" --model MODEL
-hx run "Fix the failing tests" --model MODEL --yes
-```
-
-Workspace and configured file-tool paths are allowed without asking. Other file-tool paths and recognized external actions ask on the controlling terminal; without one they are refused. `--yes` automatically approves ordinary requests for that run without changing `policy.toml`: commands, and single files outside the roots. A whole directory, and irreversible commands such as a force push, still need your answer on the terminal (or, for a command, an exact `allow` entry). Protected harness files, sealed state, credential reads and capability checks still apply. Shell commands get the same file roots as the file tools.
-
-hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens, and `log`, the event log's path). Event logs, `hx-ar`'s runs and the workspace's credentials live outside the workspace, in hx's own directories (`~/.local/state/hx/` and `~/.config/hx/`); `hx paths` prints where.
-
-hx uses the Responses API for every model. For another provider with a compatible `/responses` endpoint, pass its base URL and key variable:
-
-```bash
-hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1 --key-env EXAMPLE_API_KEY
-```
-
-## Commands
-
-| Command | What it does |
+| | Allowed |
 |---|---|
-| `hx run` | Run an agent task (`--rpi`, `--resume LOG`, `--branch LOG`) |
-| `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
-| `hx review` / `hx recover` / `hx revoke` | Record an RPI review decision, settle an uncertain operation, stop a run |
-| `hx trust` | Review this workspace's `.harness` config, packages and skills, then trust them |
-| `hx skills` / `hx test` | List skills and their state, run a package's tests |
-| `hx log verify LOG` | Check a log's hash chain and recovery accounting |
-| `hx paths` | Print where this workspace's logs, state and secrets are kept, and the trust store |
+| Write | the project directory (where you start `hx`), a private `$TMPDIR` that is removed on exit, `--rw` paths |
+| Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /dev /nix/store`, your git configuration, `--ro` paths |
+| Everything else | cannot be opened, including the rest of your home directory |
 
-Every flag and exit code is in the [command reference](docs/cli.md).
+Toolchains installed in your home directory need a flag, for example
+`hx --ro ~/.rustup --ro ~/.cargo --rw ~/.cargo/registry "..."`. The flags are on the command line on purpose:
+nothing inside the project, which the model can write, can widen the wall.
 
-## How it works
+Also in force:
 
-```text
-            model ── one tool: luau(code) ──┐
-                                            ▼
- ┌──────────────────────────────────────────────────────────────┐
- │ Persistent live agent VM · isolated package invocations     │
- │ Pure Luau controller: step(saved state, event) → commands   │
- │ Frozen modules and grants · copied data at VM boundaries    │
- └──────────────────────────────┬───────────────────────────────┘
-                                │ read write edit sh search agent
- ┌──────────────────────────────▼───────────────────────────────┐
- │ Rust supervisor, trusted, not modifiable by the model        │
- │   principals · policy · approvals · reservations             │
- │   single-writer journal · receipts · checkpoints · adapters  │
- └──────────────────────────────────────────────────────────────┘
+- `hx` refuses to start in `/` or in your home directory, where the wall would protect nothing.
+- No setuid program can raise privileges (`no_new_privs`), so `sudo` does not work inside.
+- On Linux 6.12 or later, confined processes cannot signal processes outside the sandbox.
+- The API key is read once and removed from the environment, together with every variable whose name ends in
+  `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS`. Luau code never sees the key: the host adds
+  it to requests for the configured endpoint only.
+- Every process group a command started is killed when `hx` exits.
+
+### What the wall does not do
+
+- **The network is open.** The model can fetch and send anything it can read. The wall limits what it can read.
+- **Secrets stored in the project are readable**, as are secrets in variables with unusual names. Use
+  `env -i` or a clean shell if you need certainty.
+- **A process that calls `setsid` outlives `hx`.** It stays confined, but it is not killed.
+- **The model can edit `.hx/loop.luau` and its extensions.** That is the point, and it shows in `git diff`.
+  If the loop no longer compiles, the built-in one runs instead.
+- **Git is the undo.** Nothing asks before the model changes or deletes a file in the project.
+
+## The loop
+
+`lua/loop.luau` is the whole agent: about 550 lines. It speaks the Anthropic Messages format, asks for adaptive
+thinking, and sends thinking blocks back exactly as they came. The five tools it defines:
+
+| Tool | Does |
+|---|---|
+| `bash` | runs a command, returns its output and exit status, kills it after a timeout |
+| `read` | returns a range of lines of a file |
+| `write` | creates or overwrites a file |
+| `edit` | replaces an exact piece of text that occurs once |
+| `lua` | runs Luau inside the harness; this is how extensions are called |
+
+To add a project tool, add an entry to `M.tools` in your `.hx/loop.luau`. To change the prompt, edit
+`system_prompt()`, or put notes for the model in `.hx/prompt.md`.
+
+When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON.
+
+## Extensions
+
+An extension is a Luau module at `.hx/ext/NAME.luau`. Its first line is a comment that says what it does, and
+it returns a table of functions:
+
+```lua
+-- counts TODO comments per file
+return {
+	count = function(dir)
+		return host.sh(("grep -rc TODO %s | grep -v ':0$'"):format(dir)).out
+	end,
+}
 ```
 
-Every admitted effect passes a Rust capability check and lands in the journal. Control hooks can deny or transform commands; they cannot grant authority.
+The model writes extensions with the ordinary `write` tool and calls them through the `lua` tool as
+`ext("NAME").count("src")`. A changed file is loaded again on its next use. Each session starts with a list of
+the project's extensions in the system prompt. The tool list itself never changes, so prompt caching keeps
+working. Commit `.hx/ext/` and the harness grows with the project.
 
-Inside the VM the model also has `agent(task)`, `batch{...}` for independent reads/searches/read-only subagents, `durable.get/set` for saved data, and `vars()` to list live variables. The full API is in [prompts/system.md](prompts/system.md); ownership, guarantees and recovery rules are in [Runtime v2](docs/runtime-v2.md).
+## Host primitives
 
-## Security model
+Everything Luau can do to the machine:
 
-- hx keeps everything it treats as authority or as a secret outside the workspace, in its own configuration (`$XDG_CONFIG_HOME/hx`: trust store, credentials) and state (`$XDG_STATE_HOME/hx`: journals, `hx-ar`'s runs) directories. No root may contain them: a workspace, `[fs]` root or path grant that would is refused.
-- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools refuse hx's own directories, protect `.harness/`, `.agents/skills/` (the workspace's and your own in `~/.agents/skills`), `.git/config` and `.git/hooks`, refuse credential files by name (`id_rsa`, `.netrc`, `secrets.toml`, ...), and writes refuse symlinks. Every file they read or write is opened from `/` without following a link in any component, so a directory swapped for a symlink after the check fails the open rather than redirecting it.
-- With Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and so cannot reach hx's journals, autoresearch runs, credentials or trust store, nor an episode's grader and held-out roots. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Confined children hold no capability, even when hx runs as root (hx is meant to run as your own user), so none can read hx's own `/proc` entries such as its environment, where the API key is. Without Landlock hx and `hx-ar` refuse to run, unless you launch them with `--unconfined`: then children run unconfined and hx says so once per run. No workspace configuration can make that choice.
-- Network and GPU isolation belong to the environment running hx; configure them in your sandbox or container.
-- By default, `sh` and local MCP servers receive a minimal environment without inherited API keys. Shell commands run in their own session, and nothing a command starts outlives it: hx is the reaper of every process it starts, so a process that detaches (`setsid`, a double fork, `nohup`) is re-parented to hx and killed when its command ends (when commands overlap, when the last of them ends), and everything hx started is killed when hx exits, also on a signal.
-- `hx run` refuses workspace config, packages and skills until you [trust](docs/configuration.md#workspace-trust) them (or pass `--ignore-config`); a package gets only the capabilities its trusted `hx.toml` declares, and any later edit, including one by the agent's shell commands, needs `hx trust` again. Shell commands are classed read / local write / external / irreversible to decide when to ask; obvious external commands such as `git push` ask for approval unless pre-approved or launched with `--yes`, and irreversible ones always need an exact `allow` entry or your answer. The classifier is approval UX, not a guard: a command can reach the network without naming any known program.
-
-## Documentation
-
-| Page | Covers |
+| Primitive | Returns |
 |---|---|
-| [Command reference](docs/cli.md) | Every command and flag, the run report, resume and branch |
-| [Workflows](docs/workflows.md) | `--rpi` stages and review gates; `hx-ar` setup and how a search runs |
-| [Configuration](docs/configuration.md) | `policy.toml`, `mcp.toml`, compaction and recheck, workspace trust |
-| [Extending](docs/extending.md) | Module overrides, single-file and HTTP tools, packages, skills, credentials, the bundled example tools |
-| [Runtime v2](docs/runtime-v2.md) | State ownership, dispatch and uncertainty, durable data, recovery guarantees |
+| `host.llm(body, {timeout=600})` | `status, text`, or `nil, error` |
+| `host.sh(command, {timeout=120})` | `{out, code, signal, timed_out}` |
+| `host.read(path)` | the contents, or `nil, error` |
+| `host.write(path, data)` | `true`, or `nil, error`; creates parent directories |
+| `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
+| `host.load(source, name, env)` | a function, or `nil, error` |
+| `host.timed(seconds, fn, ...)` | `true, ...`, or `false, error`; the error is `"timeout"` when the limit passed |
+| `host.input(prompt)` | a line from stdin, or `nil` at the end |
+| `host.log(text)`, `host.sleep(seconds)`, `host.env(name)` | |
+| `host.args`, `host.cwd`, `host.interactive`, `host.default_loop` | |
+| `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | |
 
-## Development
+`json.encode` writes object keys in sorted order, so equal values always produce the same bytes.
 
-Every check uses `target/release/hx` (the autoresearch suite also `target/release/hx-ar`), and none needs an API key (model runs use a scripted mock). `cargo test` drives whole runs in-process against a scripted model (`src/tests/`): turns and nudges, hooks, compaction, budgets, and how each failed model request is billed and retried. The suites under `scripts/` cover the binary's edge: flags, exit codes, the HTTP client, crashes and resume across processes.
+## Limits
 
-```bash
-scripts/all_checks.sh            # builds, then runs rustfmt, clippy and every offline suite; five-minute deadline
-scripts/all_checks.sh --jobs 2   # fewer concurrent suites (default: 4)
-hx test stdlib/std               # Luau unit tests
-cargo test --release
-```
-
-The code is formatted with `cargo fmt` and kept free of clippy warnings (`cargo clippy --release --all-targets -- -D warnings`); the runner fails on either. Suites run concurrently (mock servers bind free ports); the policy suite and the autoresearch suite run alone. Stalled suites fail with a diagnostic, and reaching the five-minute budget fails the run rather than skipping checks. Live provider calls stay outside this runner.
-
-| Path | Contents |
-|---|---|
-| `src/` | Rust supervisor, pure controller boundary, VMs, isolated packages, batches, policy, journal/checkpoints, MCP, model adapters and CLI |
-| `stdlib/std/` | The built-in `std` package (loop, prompt, printer, hooks, feedback, MCP binding), embedded in the binary |
-| `prompts/system.md` | System prompt |
-| `examples/tools/` | Example single-file tools (TinyFish, OpenRouter, SSoT) |
-| `scripts/` | Check suites and mock servers |
-
-## Limitations
-
-- **Confinement covers files only.** There is no network isolation. Shell commands can still write protected configuration inside the workspace (Landlock cannot carve a hole in a writable tree), though edited config becomes untrusted, including `.git/config` and `.git/hooks`, which run code on your next `git` command; and they can read credential files (`id_rsa`, `.netrc`, ...) that sit inside a read root, which file tools refuse by name. Pathname Unix sockets (user D-Bus, systemd, `docker.sock`) stay reachable before Landlock ABI 9 (Linux 7.1).
-- **Shell commands are bounded in time only.** hx caps neither processes nor memory; set such limits in the environment running hx (cgroups, a container). A process started on a command's behalf by a service outside hx (`systemd-run --user` over the user's D-Bus socket, `at`) is not hx's descendant and is not stopped.
-- The Responses API is tested against a mock.
-- **Compaction and finish review are heuristics.** Summary and review quality depend on the model. Context size comes from `--context-window` or, on OpenRouter, the provider's model list; other providers need the flag. Resume restores it. Disabling compaction is in [configuration](docs/configuration.md#initluau-compaction-and-recheck).
-- **No benchmark.** hx ships without an eval suite; its checks cover behavior, not task success or token efficiency.
-- **Recovery is explicit.** Arbitrary globals, closures and scratch files are not durable. A killed command's unrecorded output is lost; its external effect may already have happened. There is no exactly-once remote execution or rollback guarantee.
-- **Budgets are admission thresholds.** Request-byte allowances are not exact token counts, hx tracks no dollar cost, and cancellation cannot stop remote billing already accepted. Runtime v2 has scripted validation, not new live-provider or performance measurements.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- One endpoint, which must accept the Anthropic Messages format and an `x-api-key` header. The default is
+  DeepSeek's; `HX_API_URL=https://api.anthropic.com/v1/messages` with `HX_KEY_ENV=ANTHROPIC_API_KEY` and a
+  Claude model in `HX_MODEL` has not been tried.
+- No streaming: a reply appears when it is complete.
+- Linux only.
+- Numbers are doubles, so integers above 2^53 in JSON lose precision.

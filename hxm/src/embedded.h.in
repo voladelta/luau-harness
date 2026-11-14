@@ -1,8 +1,0 @@
-#pragma once
-
-namespace hxm {
-
-// lua/loop.luau, embedded at configure time.
-inline constexpr char kDefaultLoop[] = R"HXMLUAU(@HXM_LOOP_SOURCE@)HXMLUAU";
-
-} // namespace hxm
