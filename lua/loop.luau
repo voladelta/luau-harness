@@ -215,22 +215,23 @@ M.tools = {
 	},
 	{
 		name = "edit",
-		description = "Replace the exact text `old` with `new` in a file. `old` must occur exactly once, unless "
-			.. "`all` is true, which replaces every occurrence.",
+		description = "Replace the exact text `old_string` with `new_string` in a file. `old_string` must occur "
+			.. "exactly once, unless `replace_all` is true, which replaces every occurrence.",
 		parameters = {
 			type = "object",
 			properties = {
 				path = { type = "string" },
-				old = { type = "string" },
-				new = { type = "string" },
-				all = { type = "boolean" },
+				old_string = { type = "string" },
+				new_string = { type = "string" },
+				replace_all = { type = "boolean" },
 			},
-			required = { "path", "old", "new" },
+			required = { "path", "old_string", "new_string" },
 		},
 		run = function(args)
-			local path, old, new = need(args, "path", "string"), need(args, "old", "string"), need(args, "new", "string")
+			local path, old, new = need(args, "path", "string"), need(args, "old_string", "string"),
+				need(args, "new_string", "string")
 			if old == "" then
-				error("old must not be empty", 0)
+				error("old_string must not be empty", 0)
 			end
 			local text, err = host.read(path)
 			if not text then
@@ -250,8 +251,8 @@ M.tools = {
 			if count == 0 then
 				error("old text not found in " .. path, 0)
 			end
-			if count > 1 and not args.all then
-				error(("old text occurs %d times in %s: add surrounding lines to make it unique, or pass all"):format(count, path), 0)
+			if count > 1 and not args.replace_all then
+				error(("old text occurs %d times in %s: add surrounding lines to make it unique, or pass replace_all"):format(count, path), 0)
 			end
 			table.insert(pieces, text:sub(at))
 			local ok, write_err = host.write(path, table.concat(pieces))
@@ -297,6 +298,34 @@ M.tools = {
 	},
 }
 
+-- Checks a call's argument names against the tool's own schema. The message names what was sent and what the
+-- tool takes, so a model that reached for another harness's names can see its mistake. Returns nil or it. A
+-- schema without `properties` names no arguments, so then any name is accepted.
+local function argument_problem(tool, args)
+	local schema = tool.parameters or {}
+	local properties, required = schema.properties, schema.required or {}
+	local takes, optional = table.clone(required), {}
+	for name in properties or {} do
+		if not table.find(required, name) then
+			table.insert(optional, name)
+		end
+	end
+	table.sort(optional)
+	table.move(optional, 1, #optional, #takes + 1, takes)
+	local listing = ("%s takes %s"):format(tool.name, table.concat(takes, ", "))
+	for name in args do
+		if properties and properties[name] == nil then
+			return ("unknown argument %q: %s"):format(tostring(name), listing)
+		end
+	end
+	for _, name in required do
+		if args[name] == nil then
+			return ("missing argument %q: %s"):format(name, listing)
+		end
+	end
+	return nil
+end
+
 local function find_tool(name)
 	for _, tool in M.tools do
 		if tool.name == name then
@@ -319,6 +348,10 @@ local function run_tool(call)
 	end
 	local what = M.printable(tostring(args.command or args.path or args.code or ""):sub(1, 100):gsub("\n", " "))
 	host.log(("  %s %s"):format(tool.name, what))
+	local problem = argument_problem(tool, args)
+	if problem then
+		return "error: " .. problem, true
+	end
 	local ok, result = pcall(tool.run, args)
 	if ok then
 		return result, false

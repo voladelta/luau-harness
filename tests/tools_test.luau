@@ -65,14 +65,14 @@ check("a file within the limits comes back whole", tools.read({ path = dir .. "s
 
 -- edit
 tools.write({ path = dir .. "e.txt", content = "alpha beta\nalpha gamma\n" })
-check("edit", tools.edit({ path = dir .. "e.txt", old = "beta", new = "BETA" }), ("replaced 1 occurrence in %se.txt"):format(dir))
+check("edit", tools.edit({ path = dir .. "e.txt", old_string = "beta", new_string = "BETA" }), ("replaced 1 occurrence in %se.txt"):format(dir))
 check("edit result", host.read(dir .. "e.txt"), "alpha BETA\nalpha gamma\n")
-raises("edit an ambiguous match", tools.edit, { path = dir .. "e.txt", old = "alpha", new = "x" }, "occurs 2 times")
+raises("edit an ambiguous match", tools.edit, { path = dir .. "e.txt", old_string = "alpha", new_string = "x" }, "occurs 2 times")
 check("an ambiguous edit changes nothing", host.read(dir .. "e.txt"), "alpha BETA\nalpha gamma\n")
-check("edit all", tools.edit({ path = dir .. "e.txt", old = "alpha", new = "%1", all = true }), ("replaced 2 occurrences in %se.txt"):format(dir))
+check("edit all", tools.edit({ path = dir .. "e.txt", old_string = "alpha", new_string = "%1", replace_all = true }), ("replaced 2 occurrences in %se.txt"):format(dir))
 check("edit is literal, not a pattern", host.read(dir .. "e.txt"), "%1 BETA\n%1 gamma\n")
-raises("edit a missing text", tools.edit, { path = dir .. "e.txt", old = "zzz", new = "x" }, "not found")
-raises("edit with an empty old", tools.edit, { path = dir .. "e.txt", old = "", new = "x" }, "must not be empty")
+raises("edit a missing text", tools.edit, { path = dir .. "e.txt", old_string = "zzz", new_string = "x" }, "not found")
+raises("edit with an empty old", tools.edit, { path = dir .. "e.txt", old_string = "", new_string = "x" }, "must not be empty")
 
 -- bash
 check("bash", tools.bash({ command = "echo out; echo err >&2; exit 3" }), "out\nerr\n[exit 3]")

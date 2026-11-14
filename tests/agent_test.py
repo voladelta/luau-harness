@@ -172,7 +172,7 @@ class AgentTest(unittest.TestCase):
         results = self.tool_results()
         self.assertIn("not an object", results[0])
         self.assertIn("no tool named nope", results[1])
-        self.assertIn('argument "path" must be a string', results[2])
+        self.assertIn('missing argument "path": read takes path, limit, offset', results[2])
         failed = self.model.requests[1]["messages"][-1]["content"][0]
         self.assertIs(failed["is_error"], True)
 
@@ -622,6 +622,21 @@ class AgentTest(unittest.TestCase):
         self.assertIn("hx: main broke", done.stderr)
         self.assertNotIn("built-in", done.stderr)
         self.assertEqual(self.model.requests, [])
+
+    def test_a_wrong_argument_name_is_named_with_the_right_ones(self):
+        with open(os.path.join(self.project, "f.txt"), "w") as f:
+            f.write("one two\n")
+        done = self.run_hx("go", script=[
+            call("edit", {"path": "f.txt", "old": "one", "new_string": "1"}, "c1"),
+            call("edit", {"path": "f.txt", "old_string": "one"}, "c2"),
+            call("edit", {"path": "f.txt", "old_string": "one", "new_string": "1"}, "c3"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results(), [
+            'error: unknown argument "old": edit takes path, old_string, new_string, replace_all',
+            'error: missing argument "new_string": edit takes path, old_string, new_string, replace_all',
+            "replaced 1 occurrence in f.txt"])
+        self.assertEqual(read(self.project, "f.txt"), "1 two\n")
 
     def test_control_characters_reach_a_terminal_only_as_text(self):
         words = "\x1b]52;c;aGk=\x07red\x1b[31m!"
