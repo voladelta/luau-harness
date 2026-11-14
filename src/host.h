@@ -35,6 +35,7 @@ struct HostConfig {
 //   host.log(text)                                    one line on stderr
 //   host.sleep(seconds), host.env(name)
 //   host.args, host.cwd, host.interactive, host.sandboxed, host.default_loop
+//   host.tty                                          stdout is a terminal
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
 // SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input)

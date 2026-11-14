@@ -757,6 +757,8 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "sandboxed");
     lua_pushlstring(L, config_.default_loop.data(), config_.default_loop.size());
     lua_setfield(L, -2, "default_loop");
+    lua_pushboolean(L, isatty(STDOUT_FILENO) != 0 ? 1 : 0);
+    lua_setfield(L, -2, "tty");
     lua_pop(L, 1);
 }
 

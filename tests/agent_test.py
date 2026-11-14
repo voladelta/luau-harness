@@ -623,6 +623,37 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("built-in", done.stderr)
         self.assertEqual(self.model.requests, [])
 
+    def test_control_characters_reach_a_terminal_only_as_text(self):
+        words = "\x1b]52;c;aGk=\x07red\x1b[31m!"
+        script = [call("bash", {"command": "true # \x1b]0;title\x07"}), say(words)]
+        # Into a pipe, the model's words are passed on unchanged; the progress line never carries the escapes.
+        done = self.run_hx("go", script=script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, words + "\n")
+        self.assertIn("bash true # ]0;title", done.stderr)
+        self.assertNotIn("\x1b", done.stderr)
+        # On a terminal they are stripped.
+        self.model.script = list(script)
+        master, slave = pty.openpty()
+        process = subprocess.Popen([HX, "go"], cwd=self.project, env=self.env(), stdin=subprocess.DEVNULL, stdout=slave,
+                                   stderr=subprocess.DEVNULL)
+        os.close(slave)
+        out = b""
+        try:
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO once the child has closed the terminal
+                    break
+                if not chunk:
+                    break
+                out += chunk
+            self.assertEqual(process.wait(timeout=20), 0)
+        finally:
+            process.kill()
+            os.close(master)
+        self.assertEqual(out, b"]52;c;aGk=red[31m!\r\n")
+
     def test_run_executes_a_script(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("print(json.encode(host.args), host.sh('echo hi').out)\n")

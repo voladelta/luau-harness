@@ -11,6 +11,7 @@
 --   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit
 --   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
 --   host.args, host.cwd, host.interactive, host.sandboxed, host.default_loop
+--   host.tty                                          stdout is a terminal
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
 -- host.timed returns; a plain pcall cannot swallow them.
@@ -33,6 +34,12 @@ local function clip(text)
 	end
 	local half = M.output_limit // 2
 	return text:sub(1, half) .. ("\n[... %d bytes omitted ...]\n"):format(#text - 2 * half) .. text:sub(-half)
+end
+
+-- Removes control characters but newline and tab. Escape sequences in text from the model would otherwise
+-- reach the terminal, which they can retitle, scramble or (OSC 52) use to write the clipboard.
+function M.printable(text)
+	return (text:gsub("[\0-\8\11-\31\127]", ""))
 end
 
 local function need(args, name, kind)
@@ -310,7 +317,7 @@ local function run_tool(call)
 	if type(args) ~= "table" then
 		return "error: the tool input is not an object", true
 	end
-	local what = tostring(args.command or args.path or args.code or ""):sub(1, 100):gsub("\n", " ")
+	local what = M.printable(tostring(args.command or args.path or args.code or ""):sub(1, 100):gsub("\n", " "))
 	host.log(("  %s %s"):format(tool.name, what))
 	local ok, result = pcall(tool.run, args)
 	if ok then
@@ -605,7 +612,7 @@ function M.turn(system, talk)
 		local cut_off = reply.stop_reason == "max_tokens"
 		for _, block in reply.content do
 			if block.type == "text" and block.text ~= "" then
-				print(block.text)
+				print(host.tty and M.printable(block.text) or block.text)
 			end
 		end
 		local calls = talk:reply(reply.content)

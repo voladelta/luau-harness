@@ -192,6 +192,7 @@ Everything Luau can do to the machine:
 | `host.input(prompt)` | a line from stdin, or `nil` at the end |
 | `host.log(text)`, `host.sleep(seconds)`, `host.env(name)` | |
 | `host.args`, `host.cwd`, `host.interactive`, `host.sandboxed`, `host.default_loop` | |
+| `host.tty` | `true` when stdout is a terminal |
 | `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | |
 
 Two rules hold across all of them:

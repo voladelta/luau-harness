@@ -89,6 +89,10 @@ check("long output keeps its end", clipped:find("1000\n[exit 0]", 1, true) ~= ni
 check("long output says what is missing", clipped:find("bytes omitted", 1, true) ~= nil, true)
 loop.output_limit = 30000
 
+-- printable
+check("printable keeps text, newlines and tabs", loop.printable("a\tb\nc é"), "a\tb\nc é")
+check("printable drops escape sequences' control bytes", loop.printable("\27]52;c;aGk=\7x\27[2Jy\r\0\127z"), "]52;c;aGk=x[2Jyz")
+
 -- lua
 check("lua returns", tools.lua({ code = "return 1 + 1, 'x', {a = 1}" }), '2\nx\n{"a":1}')
 check("lua prints", tools.lua({ code = "print('a', 1) print('b')" }), "a\t1\nb")
