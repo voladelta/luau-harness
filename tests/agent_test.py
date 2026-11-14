@@ -389,6 +389,34 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(self.model.requests[1]["messages"], [
             {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "again"}]}])
 
+    def test_a_failed_turn_returns_to_the_prompt(self):
+        self.model.script = [call("bash", {"command": "echo ran"}), (400, {"error": {"message": "no such model"}}),
+                             say("after the failure")]
+        master, slave = pty.openpty()
+        with open(os.path.join(self.root, "stderr"), "w+") as errors:
+            process = subprocess.Popen([HX], cwd=self.project, env=self.env(), stdin=slave, stdout=subprocess.PIPE,
+                                       stderr=errors, text=True)
+            os.close(slave)
+            try:
+                os.write(master, b"hello\n")
+                os.write(master, b"again\n")  # read once the failed turn is over
+                self.assertEqual(process.stdout.readline(), "after the failure\n")
+                os.write(master, b"\x04")
+                process.stdout.close()
+                self.assertEqual(process.wait(timeout=20), 0)
+            finally:
+                process.kill()
+                os.close(master)
+            errors.seek(0)
+            self.assertIn("no such model", errors.read())
+        self.assertEqual(len(self.model.requests), 3)
+        messages = self.model.requests[2]["messages"]
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
+        self.assertEqual(messages[2]["content"], [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "ran\n[exit 0]"},
+            {"type": "text", "text": "again"},
+        ])
+
     def test_a_tool_cannot_swallow_an_interrupt(self):
         code = "local ok, err = pcall(host.sh, 'echo $$ > cmd.pid; sleep 300') return 'swallowed: ' .. tostring(err)"
         self.model.script = [call("lua", {"code": code}), say("after the interrupt")]

@@ -660,12 +660,18 @@ function M.main()
 			talk:say(line)
 			local ok, err = host.try(turn, system, talk)
 			if not ok then
-				if err ~= "interrupted" then
+				if err == "terminated" then
 					save(system, talk.messages)
 					error(err, 0)
 				end
-				talk:abandon("interrupted by the user")
-				host.log("[interrupted]")
+				-- Any other failure ends the turn, not the session: what is owed is answered and the prompt comes back.
+				if err == "interrupted" then
+					talk:abandon("interrupted by the user")
+					host.log("[interrupted]")
+				else
+					talk:abandon("the turn failed: " .. tostring(err))
+					host.log("[the turn failed: " .. tostring(err) .. "]")
+				end
 			end
 			save(system, talk.messages)
 		end
