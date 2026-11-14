@@ -97,8 +97,9 @@ Also in force:
   abstract unix sockets.
 - Unix sockets by path are walled off too. From Landlock ABI 9 the kernel refuses a connection to a socket whose
   path the rules above do not make readable. Before ABI 9 Landlock cannot, so on x86-64 and aarch64 a seccomp
-  filter refuses to create unix sockets at all (`socketpair` still works, and `hx` itself falls back where it
-  would use one, such as for name resolution). The filter also refuses `io_uring`, which can create sockets
+  filter refuses to create unix sockets (a stream `socketpair` still works, a datagram one does not, because
+  it could still send to any path; `hx` itself falls back where it would use a unix socket, such as for name
+  resolution). The filter also refuses `io_uring`, which can create sockets
   without the socket call, and every call from 32-bit code. That breaks tools that open unix sockets by path:
   the docker CLI, tmux, some test suites; and 32-bit programs. `--unix-sockets` leaves the filter out, and `hx`
   then prints a note at startup.

@@ -357,6 +357,20 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(paired, "pair\n[exit 0]")
         self.assertNotIn("unix sockets", done.stderr)  # the wall is whole, so there is no note
 
+    def test_a_datagram_pair_cannot_reach_a_socket_outside(self):
+        # A datagram socket is never tied to its peer: one end of a pair could send to any path.
+        path = os.path.join(self.root, "outside-datagram.sock")
+        send = (f"import socket; a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM); "
+                f"a.sendto(b'leak', '{path}'); print('sent')")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
+            listener.bind(path)
+            done = self.run_hx("go", script=[call("bash", {"command": f'python3 -c "{send}"'}), say("ok")])
+            listener.setblocking(False)
+            with self.assertRaises(BlockingIOError):  # nothing arrived
+                listener.recv(16)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("PermissionError", self.tool_results()[0])
+
     def test_unix_sockets_opens_sockets_inside_the_project(self):
         script = ("import socket; s = socket.socket(socket.AF_UNIX); s.bind('in.sock'); s.listen(); "
                   "c = socket.socket(socket.AF_UNIX); c.connect('in.sock'); a, _ = s.accept(); c.send(b'local'); "

@@ -37,7 +37,7 @@ class Sandbox {
     // processes outside the sandbox and from their abstract unix sockets. Network access is not restricted.
     //
     // Below kUnixSocketAbi, Landlock cannot refuse a connection to a unix socket by path. Unless unix_sockets is
-    // true, a seccomp filter then refuses to create unix sockets at all (socketpair still works), on x86-64 and
+    // true, a seccomp filter then refuses to create unix sockets (stream socketpairs still work), on x86-64 and
     // aarch64; elsewhere nothing closes the gap and blocks_unix_sockets() says so.
     //
     // Call it while the process is single-threaded: Landlock binds the calling thread and its descendants only.
