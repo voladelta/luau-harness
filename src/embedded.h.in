@@ -5,6 +5,9 @@
 
 namespace hx {
 
+// The version in CMakeLists.txt, for --version.
+inline constexpr std::string_view kVersion = "@PROJECT_VERSION@";
+
 // lua/loop.luau, embedded at configure time.
 inline constexpr std::string_view kDefaultLoop = R"HXLUAU(@HX_LOOP_SOURCE@)HXLUAU";
 

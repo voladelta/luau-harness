@@ -5,8 +5,9 @@
 
 local M = host.load(host.default_loop, "=loop")()
 
--- The model, and the other settings at the top of the built-in loop:
--- M.model = "deepseek-v4-pro"
+-- The model, and the other settings at the top of the built-in loop. Reading HX_MODEL first keeps
+-- `hx --model NAME` and the variable in charge:
+-- M.model = host.env("HX_MODEL") or "deepseek-v4-pro"
 
 -- A tool of this project's own. run(args) returns the text the model sees; raising reports an error to it.
 -- table.insert(M.tools, {

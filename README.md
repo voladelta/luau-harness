@@ -45,20 +45,27 @@ header-only).
 
 ```
 hx [options] [TASK...]              run the agent; without a task, read it from stdin or start a prompt
-hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives
+hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives (FILE - reads stdin)
 hx --init [--full]                  write .hx/loop.luau, which starts from the built-in loop (--full: a copy)
+hx --help | --version
 ```
 
-A task is any words at all: `hx run the tests` asks the model. After `--run FILE`, every word goes to the
-script, even one that starts with `-`.
+A task is any words at all: `hx run the tests` asks the model. Options go before the task; from the first
+word that is not an option on, everything is the task, and `--` ends the options early. After `--run FILE`,
+every word goes to the script, even one that starts with `-`. A value can follow its option as the next word or
+after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not expand `~` after `=`).
 
 | Option | Meaning |
 |---|---|
+| `--model NAME` | the model to ask; overrides `HX_MODEL` |
 | `--ro PATH` | also allow reading `PATH` |
 | `--rw PATH` | also allow writing `PATH` |
 | `--keep-env NAME` | keep a secret-looking variable in the environment of commands |
 | `--unix-sockets` | before Landlock ABI 9, let commands create unix sockets (see "The wall") |
 | `--no-sandbox` | run without Landlock; the model is told it is not confined |
+| `-q`, `--quiet` | leave out progress lines; the answer, warnings and errors still show |
+| `--no-input` | never prompt: with no task and stdin a terminal, fail instead of waiting |
+| `-h`, `--help` / `--version` | print help or the version to stdout |
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -67,6 +74,9 @@ script, even one that starts with `-`.
 | `HX_MODEL` | model name | `deepseek-flash` |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
+Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143
+terminated. A misspelt option is refused with the closest real one suggested; nothing is sent to the model.
+
 At the prompt, each line is a message and a pasted message of many lines is one message (in a terminal that
 supports bracketed paste); Ctrl-C stops the current turn and Ctrl-D leaves.
 
@@ -152,7 +162,7 @@ thinking, and sends thinking blocks back exactly as they came. The five tools it
 
 ```lua
 local M = host.load(host.default_loop, "=loop")()
-M.model = "deepseek-v4-pro"
+M.model = host.env("HX_MODEL") or "deepseek-v4-pro"  -- --model and HX_MODEL still win
 table.insert(M.tools, { name = "check", description = "...", parameters = {...}, run = function(args) ... end })
 return M
 ```
@@ -217,6 +227,7 @@ Everything Luau can do to the machine:
 | `host.input(prompt)` | a line from stdin, or `nil` at the end |
 | `host.log(text)`, `host.sleep(seconds)`, `host.env(name)` | |
 | `host.args`, `host.cwd`, `host.interactive`, `host.sandboxed`, `host.default_loop` | |
+| `host.quiet` | `true` with `--quiet`: leave out progress lines |
 | `host.tty` | `true` when stdout is a terminal |
 | `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | |
 

@@ -16,6 +16,7 @@ struct HostConfig {
     std::string ca_bundle;          // a file of trust roots to use instead of libcurl's own; empty for those
     std::vector<std::string> args;  // host.args
     bool interactive = false;       // host.interactive: stdin is a terminal and no task was given
+    bool quiet = false;             // host.quiet: --quiet, so the loop leaves out progress lines
     std::string default_loop;       // host.default_loop: the built-in loop's source
 };
 
@@ -35,7 +36,7 @@ struct HostConfig {
 //   host.input(prompt?) -> line | nil at end of input
 //   host.log(text)                                    one line on stderr
 //   host.sleep(seconds), host.env(name)
-//   host.args, host.cwd, host.interactive, host.sandboxed, host.default_loop
+//   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 //   host.tty                                          stdout is a terminal
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",

@@ -195,6 +195,49 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("no task", done.stderr)
 
+    # --- the command line ---
+
+    def test_help_and_version_go_to_stdout(self):
+        done = self.run_hx("--help")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("examples:", done.stdout)
+        self.assertEqual(done.stderr, "")
+        done = self.run_hx("--version")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stdout, r"^hx \d+\.\d+\.\d+\n$")
+
+    def test_a_misspelt_option_gets_a_suggestion(self):
+        done = self.run_hx("--no-sandbx", "go")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("unknown option --no-sandbx; did you mean --no-sandbox?", done.stderr)
+        self.assertIn("hx --help", done.stderr)
+        self.assertEqual(self.model.requests, [])
+        done = self.run_hx("--ro")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--ro needs a value", done.stderr)
+        done = self.run_hx("--quiet=yes", "go")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--quiet takes no value", done.stderr)
+
+    def test_model_flag_and_equals_form(self):
+        done = self.run_hx("--model=from-flag", "go", script=[say("ok")], HX_MODEL="from-env")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[0]["model"], "from-flag")
+        done = self.run_hx("--model", "second", "go", script=[say("ok")])
+        self.assertEqual(self.model.requests[1]["model"], "second")
+
+    def test_quiet_leaves_out_progress_but_not_the_answer(self):
+        done = self.run_hx("-q", "go", script=[call("bash", {"command": "true"}), say("the answer")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "the answer\n")
+        self.assertEqual(done.stderr, "")
+        loud = self.run_hx("go", script=[call("bash", {"command": "true"}), say("the answer")])
+        self.assertIn("bash true", loud.stderr)
+
+    def test_a_script_can_come_from_stdin(self):
+        done = self.run_hx("--run", "-", "a", "-b", stdin="print(table.concat(host.args, ' '))")
+        self.assertEqual((done.returncode, done.stdout), (0, "a -b\n"), done.stderr)
+
     def test_a_cut_off_reply_is_continued(self):
         done = self.run_hx("go", script=[say("part one", stop="max_tokens"), say("part two")])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -919,7 +962,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
         # A setting changed in it, and a function replaced in it, change what is sent.
         with open(loop, "w") as f:
-            f.write(source.replace('-- M.model = "deepseek-v4-pro"', 'M.model = "project-model"')
+            f.write(source.replace('-- M.model = host.env("HX_MODEL") or "deepseek-v4-pro"', 'M.model = "project-model"')
                     .replace("-- local built_in_prompt", "local built_in_prompt")
                     .replace("-- function M.system_prompt()", "function M.system_prompt()")
                     .replace("-- \treturn built_in_prompt()", "\treturn built_in_prompt()")

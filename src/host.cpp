@@ -1012,6 +1012,8 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "cwd");
     lua_pushboolean(L, config_.interactive ? 1 : 0);
     lua_setfield(L, -2, "interactive");
+    lua_pushboolean(L, config_.quiet ? 1 : 0);
+    lua_setfield(L, -2, "quiet");
     lua_pushboolean(L, sandboxed_ ? 1 : 0);
     lua_setfield(L, -2, "sandboxed");
     lua_pushlstring(L, config_.default_loop.data(), config_.default_loop.size());

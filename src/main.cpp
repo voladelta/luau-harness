@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -44,27 +46,51 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::string_view kUsage = R"(usage:
-  hx [options] [TASK...]             run the agent on TASK; with no task, read it from stdin or start a prompt
-  hx [options] --run FILE [ARGS...]  run a Luau script with the host primitives; every word after FILE is
-                                     passed to the script, even one that starts with -
-  hx --init [--full]                 write .hx/loop.luau, a loop that starts from the built-in one; with
-                                     --full, a copy of the whole built-in loop
+constexpr std::string_view kUsage = R"(hx: a coding agent for the project in the current directory, confined by Landlock
+
+usage:
+  hx [options] [TASK...]              run the agent on TASK; with no task, read it from stdin, or
+                                      start a prompt when stdin is a terminal
+  hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives (FILE - reads stdin);
+                                      every word after FILE goes to the script, even one starting with -
+  hx --init [--full]                  write .hx/loop.luau, a loop that starts from the built-in one;
+                                      with --full, a copy of the whole built-in loop
+
+examples:
+  hx "add a --json flag to the export command and test it"
+  git diff | hx review this change
+  hx --ro ~/.rustup --ro ~/.cargo --rw ~/.cargo/registry "fix the failing test"
+  hx -q "summarise the README" > summary.txt
 
 options:
-  --ro PATH        also allow reading PATH (a toolchain in your home directory, for example)
-  --rw PATH        also allow writing PATH
-  --keep-env NAME  keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET, PASSWORD
-                   or CREDENTIALS) in the environment of commands
-  --unix-sockets   before Landlock ABI 9, let commands create unix sockets; they can then connect to any
-                   socket by path, the D-Bus session bus and ssh-agent included
-  --no-sandbox     run without Landlock (the model can then touch anything you can)
-  -h, --help       show this text
+  --model NAME      model to ask (overrides HX_MODEL)
+  --ro PATH         also allow reading PATH (a toolchain in your home directory, for example)
+  --rw PATH         also allow writing PATH
+  --keep-env NAME   keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET,
+                    PASSWORD, PASSWD or CREDENTIALS) in the environment of commands
+  --unix-sockets    before Landlock ABI 9, let commands create unix sockets; they can then connect to
+                    any socket by path, the D-Bus session bus and ssh-agent included
+  --no-sandbox      run without Landlock (the model can then touch anything you can)
+  -q, --quiet       leave out progress lines on stderr; the answer and errors still show
+  --no-input        never prompt; with no task and stdin a terminal, fail instead
+  -h, --help        show this text
+  --version         show the version
+
+  Options go before the task: every word from the first one that is not an option on is the task.
+  A value can follow its option as the next word or after =, as in --ro=PATH.
 
 environment:
-  HX_API_URL       Anthropic Messages endpoint (default https://api.deepseek.com/anthropic/v1/messages)
-  HX_KEY_ENV       name of the variable that holds the API key (default DEEPSEEK_API_KEY)
-  HX_MODEL         model name (default deepseek-flash)
+  HX_API_URL        Anthropic Messages endpoint (default https://api.deepseek.com/anthropic/v1/messages)
+  HX_KEY_ENV        name of the variable that holds the API key (default DEEPSEEK_API_KEY)
+  HX_MODEL          model name (default deepseek-flash)
+
+output:
+  The model's words go to stdout; progress, warnings and errors go to stderr.
+
+exit status:
+  0 done, 1 the run failed, 2 bad usage or hx cannot start here, 130 interrupted, 143 terminated
+
+docs: https://github.com/voladelta/luau-harness
 )";
 
 constexpr const char* kDefaultUrl = "https://api.deepseek.com/anthropic/v1/messages";
@@ -82,63 +108,139 @@ class UsageError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-enum class Mode : std::uint8_t { Agent, Script, Init, Help };
+enum class Mode : std::uint8_t { Agent, Script, Init, Help, Version };
 
 struct Options {
     Mode mode = Mode::Agent;
-    std::string script;
+    std::string script;  // --run FILE; "-" is stdin
     std::vector<std::string> args;
     std::vector<std::string> read_paths;
     std::vector<std::string> write_paths;
     std::vector<std::string> keep_env;
+    std::optional<std::string> model;
     bool sandbox = true;
     bool unix_sockets = false;
     bool full = false;  // --init --full: copy the whole built-in loop, not the overlay
+    bool quiet = false;
+    bool no_input = false;
 };
+
+// Every option hx knows, for the suggestion after a misspelt one.
+constexpr std::string_view kOptionNames[] = {
+    "--model",    "--ro",   "--rw",   "--keep-env", "--unix-sockets", "--no-sandbox", "--quiet",
+    "--no-input", "--init", "--full", "--run",      "--help",         "--version",
+};
+
+// Edit distance, for "did you mean".
+std::size_t distance(std::string_view a, std::string_view b) {
+    std::vector<std::size_t> row(b.size() + 1);
+    for (std::size_t j = 0; j <= b.size(); ++j) {
+        row[j] = j;
+    }
+    for (std::size_t i = 1; i <= a.size(); ++i) {
+        std::size_t diagonal = row[0];
+        row[0] = i;
+        for (std::size_t j = 1; j <= b.size(); ++j) {
+            const std::size_t above = row[j];
+            row[j] = std::min({row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] == b[j - 1] ? 0 : 1)});
+            diagonal = above;
+        }
+    }
+    return row[b.size()];
+}
+
+UsageError unknown_option(std::string_view arg) {
+    std::string_view best;
+    std::size_t best_distance = 3;  // further than two edits away is not a typo
+    for (const std::string_view name : kOptionNames) {
+        if (const std::size_t d = distance(arg, name); d < best_distance) {
+            best = name;
+            best_distance = d;
+        }
+    }
+    std::string message = fmt::format("unknown option {}", arg);
+    if (!best.empty()) {
+        message += fmt::format("; did you mean {}?", best);
+    }
+    message += "\nRun 'hx --help' for the options. To give a task that starts with -, put -- before it.";
+    return UsageError{message};
+}
 
 Options parse_args(const std::vector<std::string_view>& argv) {
     Options options;
     std::size_t i = 0;
-    const auto operand = [&](std::string_view flag) {
-        if (i + 1 >= argv.size()) {
-            throw UsageError(fmt::format("{} needs a value", flag));
-        }
-        return std::string(argv[++i]);
-    };
     for (; i < argv.size(); ++i) {
-        const std::string_view arg = argv[i];
+        const std::string_view word = argv[i];
+        if (word == "--") {
+            ++i;
+            break;
+        }
+        if (word.size() < 2 || !word.starts_with('-')) {
+            break;  // the task starts here
+        }
+        // --name=value is the same as --name value.
+        std::string_view arg = word;
+        std::optional<std::string_view> inline_value;
+        if (const std::size_t equals = word.find('='); word.starts_with("--") && equals != std::string_view::npos) {
+            arg = word.substr(0, equals);
+            inline_value = word.substr(equals + 1);
+        }
+        const auto value = [&](std::string_view metavar) {
+            if (inline_value ? inline_value->empty() : i + 1 >= argv.size()) {
+                throw UsageError(fmt::format("{} needs a value: {} {}", arg, arg, metavar));
+            }
+            return std::string(inline_value ? *inline_value : argv[++i]);
+        };
+        const auto flag = [&] {
+            if (inline_value) {
+                throw UsageError(fmt::format("{} takes no value", arg));
+            }
+        };
         if (arg == "--ro") {
-            options.read_paths.push_back(operand(arg));
+            options.read_paths.push_back(value("PATH"));
         } else if (arg == "--rw") {
-            options.write_paths.push_back(operand(arg));
+            options.write_paths.push_back(value("PATH"));
         } else if (arg == "--keep-env") {
-            options.keep_env.push_back(operand(arg));
+            options.keep_env.push_back(value("NAME"));
+        } else if (arg == "--model") {
+            options.model = value("NAME");
         } else if (arg == "--unix-sockets") {
+            flag();
             options.unix_sockets = true;
         } else if (arg == "--no-sandbox") {
+            flag();
             options.sandbox = false;
+        } else if (arg == "-q" || arg == "--quiet") {
+            flag();
+            options.quiet = true;
+        } else if (arg == "--no-input") {
+            flag();
+            options.no_input = true;
         } else if (arg == "-h" || arg == "--help") {
             options.mode = Mode::Help;
             return options;
+        } else if (arg == "--version") {
+            options.mode = Mode::Version;
+            return options;
         } else if (arg == "--init") {
+            flag();
+            if (options.mode == Mode::Script) {
+                throw UsageError("--run and --init do not go together");
+            }
             options.mode = Mode::Init;
         } else if (arg == "--full") {
+            flag();
             options.full = true;
         } else if (arg == "--run") {
             if (options.mode == Mode::Init) {
                 throw UsageError("--run and --init do not go together");
             }
             options.mode = Mode::Script;
-            options.script = operand(arg);
+            options.script = value("FILE");
             ++i;
             break;  // the rest belongs to the script
-        } else if (arg == "--") {
-            ++i;
-            break;
-        } else if (arg.size() > 1 && arg.starts_with('-')) {
-            throw UsageError(fmt::format("unknown option {} (see --help)", arg));
         } else {
-            break;
+            throw unknown_option(arg);
         }
     }
     options.args.assign(argv.begin() + static_cast<std::ptrdiff_t>(i), argv.end());
@@ -479,15 +581,28 @@ int run(const std::vector<std::string_view>& argv) {
         fmt::print("{}", kUsage);
         return 0;
     }
+    if (options.mode == Mode::Version) {
+        fmt::print("hx {}\n", hx::kVersion);
+        return 0;
+    }
     if (options.mode == Mode::Init) {
         return init_project(options.full);
+    }
+
+    if (options.model) {
+        setenv("HX_MODEL", options.model->c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+    }
+    const bool stdin_tty = isatty(STDIN_FILENO) != 0;
+    if (options.no_input && options.mode == Mode::Agent && options.args.empty() && stdin_tty) {
+        throw UsageError("no task, and --no-input forbids the prompt: give the task as arguments or on stdin");
     }
 
     hx::HostConfig config;
     config.api_url = env_or("HX_API_URL", kDefaultUrl);
     config.api_key = take_secrets(env_or("HX_KEY_ENV", kDefaultKeyEnv), options.keep_env);
     config.args = options.args;
-    config.interactive = options.mode == Mode::Agent && options.args.empty() && isatty(STDIN_FILENO) != 0;
+    config.interactive = options.mode == Mode::Agent && options.args.empty() && stdin_tty && !options.no_input;
+    config.quiet = options.quiet;
     config.default_loop = hx::kDefaultLoop;
     // libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules).
     config.ca_bundle = env_or("SSL_CERT_FILE", env_or("CURL_CA_BUNDLE", ""));
@@ -497,9 +612,18 @@ int run(const std::vector<std::string_view>& argv) {
 
     std::optional<std::string> script;
     if (options.mode == Mode::Script) {
-        script = read_file(options.script);
-        if (!script) {
-            throw UsageError(fmt::format("cannot read {}", options.script));
+        if (options.script == "-") {
+            if (isatty(STDIN_FILENO) != 0) {
+                throw UsageError("--run - reads the script from stdin, which is a terminal; pipe the script in");
+            }
+            script = std::string(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+        } else {
+            errno = 0;
+            script = read_file(options.script);
+            if (!script) {
+                throw UsageError(
+                    fmt::format("cannot read {}: {}", options.script, errno != 0 ? hx::error_text() : "unknown error"));
+            }
         }
     }
 

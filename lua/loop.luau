@@ -10,7 +10,7 @@
 --   host.try(fn, ...) -> true, ... | false, error     a pcall that is also where a stop ends
 --   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit
 --   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
---   host.args, host.cwd, host.interactive, host.sandboxed, host.default_loop
+--   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 --   host.tty                                          stdout is a terminal
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
@@ -26,6 +26,13 @@ M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
 M.output_limit = 30000 -- bytes of a tool result shown to the model
 M.lua_seconds = 60 -- time limit of one `lua` tool call
+
+-- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
+local function progress(text)
+	if not host.quiet then
+		host.log(text)
+	end
+end
 
 -- Keeps the start and the end of a long text: the start says what ran, the end says how it went.
 local function clip(text)
@@ -348,7 +355,7 @@ local function run_tool(call)
 		return "error: the tool input is not an object", true
 	end
 	local what = M.printable(tostring(args.command or args.path or args.code or ""):sub(1, 100):gsub("\n", " "))
-	host.log(("  %s %s"):format(tool.name, what))
+	progress(("  %s %s"):format(tool.name, what))
 	local problem = argument_problem(tool, args)
 	if problem then
 		return "error: " .. problem, true
@@ -412,7 +419,7 @@ function M.request(system, messages)
 			error(("the model request failed (%s): %s"):format(tostring(status or "no response"), tostring(text):sub(1, 500)), 0)
 		end
 		local wait = 2 ^ attempt
-		host.log(("model request failed (%s), retrying in %d s"):format(tostring(status or text), wait))
+		progress(("model request failed (%s), retrying in %d s"):format(tostring(status or text), wait))
 		host.sleep(wait)
 	end
 	error("unreachable")
@@ -624,7 +631,7 @@ end
 
 -- Replaces the conversation with the model's own summary of what happened.
 function M.compact(system, talk)
-	host.log("  compacting the conversation")
+	progress("  compacting the conversation")
 	local asking = talk:fork()
 	asking:say(
 		"The conversation is about to be replaced by a summary, and you will continue from that summary alone. "
@@ -633,7 +640,7 @@ function M.compact(system, talk)
 	)
 	local summary = text_of(ask(system, asking))
 	if summary == "" then
-		host.log("  no summary came back; keeping the conversation as it is")
+		progress("  no summary came back; keeping the conversation as it is")
 		return
 	end
 	talk:restart("Earlier turns were replaced by this summary, written by you:\n\n" .. summary .. "\n\nContinue.")
@@ -685,7 +692,7 @@ local function save(system, messages)
 end
 
 local function report()
-	host.log(("[%d replies, %d tokens in (%d cached), %d out]"):format(usage.replies, usage.input, usage.cached, usage.output))
+	progress(("[%d replies, %d tokens in (%d cached), %d out]"):format(usage.replies, usage.input, usage.cached, usage.output))
 end
 
 -- Bracketed paste. While it is on, the terminal wraps pasted text in the two markers, so a pasted message of many
@@ -728,7 +735,7 @@ function M.main()
 			task = table.concat(lines, "\n")
 		end
 		if task:match("^%s*$") then
-			error("no task: pass it as arguments or on stdin", 0)
+			error('no task: give it as arguments, as in hx "fix the tests", or on stdin', 0)
 		end
 		talk:say(task)
 		local ok, err = host.try(M.turn, system, talk)
@@ -740,7 +747,7 @@ function M.main()
 		return 0
 	end
 
-	host.log(("hx: %s in %s. Ctrl-C stops a turn, Ctrl-D leaves."):format(M.model, host.cwd))
+	progress(("hx: %s in %s. Ctrl-C stops a turn, Ctrl-D leaves."):format(M.model, host.cwd))
 	while true do
 		-- Paste is turned on with every prompt, in case a command the model ran turned it off. Only the first
 		-- line of a message gets a prompt. The read is its own host.try so that a stop there can turn paste off
