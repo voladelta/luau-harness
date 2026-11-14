@@ -43,8 +43,10 @@
 namespace hx {
 namespace {
 
-constexpr std::size_t kMaxFile = std::size_t{64} << 20;       // host.read refuses larger files
-constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm aborts a larger reply
+constexpr std::size_t kMaxFile = std::size_t{64} << 20;                // host.read refuses larger files
+constexpr std::size_t kMaxResponse = std::size_t{256} << 20;           // host.llm and host.tool abort a larger reply
+constexpr std::size_t kMaxUpload = std::size_t{100} << 20;             // the largest file DeepSeek's OCR takes
+constexpr std::string_view kToolNames[] = {"search", "fetch", "ocr"};  // host.tool's endpoints
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;
 constexpr int kPollMs = 50;
@@ -333,6 +335,45 @@ class Headers {
   private:
     curl_slist* list_ = nullptr;
 };
+
+struct CurlMimeDeleter {
+    void operator()(curl_mime* mime) const noexcept { curl_mime_free(mime); }
+};
+using CurlMime = std::unique_ptr<curl_mime, CurlMimeDeleter>;
+
+// Sends a POST whose body is already set on curl, and returns status, text | nil, error. Redirects are not
+// followed: a key goes to the URL it was meant for and nowhere else.
+int post(lua_State* L, CURL* curl, const std::string& url, const Headers& headers, double timeout,
+         const std::string& ca_bundle) {
+    std::string response;
+    std::array<char, CURL_ERROR_SIZE> error_buffer{};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_progress);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    // Zero would mean "no limit" to libcurl, so an exhausted limit becomes the shortest one.
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, std::max(1L, static_cast<long>(timeout * 1000)));
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
+    if (!ca_bundle.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str());
+    }
+
+    const CURLcode code = curl_easy_perform(curl);
+    if (code != CURLE_OK) {
+        raise_if_signaled(L);
+        return fail(L, error_buffer.front() != '\0' ? error_buffer.data() : curl_easy_strerror(code));
+    }
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    lua_pushnumber(L, static_cast<double>(status));
+    lua_pushlstring(L, response.data(), response.size());
+    return 2;
+}
 
 // --- host.sh ----------------------------------------------------------------------------------------------
 
@@ -805,10 +846,10 @@ void Host::on_interrupt(lua_State* L, int gc) {
 int Host::llm(lua_State* L) {
     std::size_t length = 0;
     const char* body = luaL_checklstring(L, 1, &length);
-    Host& host = of(L);
+    const Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 600));
     raise_if_signaled(L);  // a stop in progress starts no request
-    HostConfig& config = host.config_;
+    const HostConfig& config = host.config_;
 
     const CurlEasy curl(curl_easy_init());
     if (!curl) {
@@ -824,38 +865,93 @@ int Host::llm(lua_State* L) {
     if (!config.api_key.empty()) {
         headers.add(fmt::format("x-api-key: {}", config.api_key));
     }
-
-    std::string response;
-    std::array<char, CURL_ERROR_SIZE> error_buffer{};
-    curl_easy_setopt(curl.get(), CURLOPT_URL, config.api_url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "http,https");
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
     curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(length));
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, on_body);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, on_progress);
-    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 30L);
-    // Zero would mean "no limit" to libcurl, so an exhausted limit becomes the shortest one.
-    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, std::max(1L, static_cast<long>(timeout * 1000)));
-    curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, error_buffer.data());
-    // Redirects are not followed: the key goes to the configured endpoint and nowhere else.
-    if (!config.ca_bundle.empty()) {
-        curl_easy_setopt(curl.get(), CURLOPT_CAINFO, config.ca_bundle.c_str());
+    return post(L, curl.get(), config.api_url, headers, timeout, config.ca_bundle);
+}
+
+// host.tool(name, request, {timeout=300}): a request to one of DeepSeek's tool endpoints, HX_TOOLS_URL/NAME, with
+// DEEPSEEK_API_KEY as a bearer token. Only the names in kToolNames are taken, so the key reaches those endpoints
+// and nothing else. A string request is sent as JSON; a table is sent as a multipart form, in which `file` names
+// a file to upload and every other field is a text field.
+int Host::tool(lua_State* L) {
+    const std::string_view name = check_cstring(L, 1);
+    if (std::ranges::find(kToolNames, name) == std::end(kToolNames)) {
+        luaL_error(L, "host.tool: no tool %s; the tools are search, fetch and ocr", std::string(name).c_str());
+    }
+    const bool form = lua_istable(L, 2);
+    if (!form) {
+        luaL_checktype(L, 2, LUA_TSTRING);
+    }
+    const Host& host = of(L);
+    const double timeout = host.within_limit(option(L, 3, "timeout", 300));
+    raise_if_signaled(L);
+    const HostConfig& config = host.config_;
+    if (config.tools_key.empty()) {
+        return fail(L, "no DEEPSEEK_API_KEY: hx was started without one, so the DeepSeek tools cannot be used");
     }
 
-    const CURLcode code = curl_easy_perform(curl.get());
-    if (code != CURLE_OK) {
-        raise_if_signaled(L);
-        return fail(L, error_buffer.front() != '\0' ? error_buffer.data() : curl_easy_strerror(code));
+    const CurlEasy curl(curl_easy_init());
+    if (!curl) {
+        return fail(L, "cannot start an HTTP request");
     }
-    long status = 0;
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
-    lua_pushnumber(L, static_cast<double>(status));
-    lua_pushlstring(L, response.data(), response.size());
-    return 2;
+    Headers headers;
+    headers.add(fmt::format("Authorization: Bearer {}", config.tools_key));
+    const CurlMime mime(form ? curl_mime_init(curl.get()) : nullptr);
+    if (form) {
+        if (!mime) {
+            return fail(L, "cannot start an HTTP request");
+        }
+        // Fields go in sorted order, so a request is the same whatever order the table was built in.
+        std::vector<std::pair<std::string, std::string>> fields;
+        lua_pushnil(L);
+        while (lua_next(L, 2) != 0) {
+            if (lua_type(L, -2) != LUA_TSTRING || lua_type(L, -1) != LUA_TSTRING) {
+                luaL_error(L, "host.tool: a form is a table of strings by name");
+            }
+            std::size_t key_length = 0;
+            std::size_t value_length = 0;
+            const char* key = lua_tolstring(L, -2, &key_length);
+            const char* value = lua_tolstring(L, -1, &value_length);
+            fields.emplace_back(std::string(key, key_length), std::string(value, value_length));
+            lua_pop(L, 1);
+        }
+        std::ranges::sort(fields);
+        for (const auto& [key, value] : fields) {
+            curl_mimepart* part = curl_mime_addpart(mime.get());
+            curl_mime_name(part, key.c_str());
+            if (key != "file") {
+                curl_mime_data(part, value.data(), value.size());
+                continue;
+            }
+            // Checked here, so a file that cannot be sent is reported as such rather than as a failed transfer.
+            if (value.find('\0') != std::string::npos) {
+                return fail(L, "host.tool: the file name contains a NUL byte");
+            }
+            const UniqueFd file(::open(value.c_str(), O_RDONLY | O_CLOEXEC));
+            struct stat st {};
+            if (!file.valid() || fstat(file.get(), &st) != 0) {
+                return fail_errno(L, value);
+            }
+            if (!S_ISREG(st.st_mode)) {
+                return fail(L, fmt::format("{}: not a regular file", value));
+            }
+            if (static_cast<std::size_t>(st.st_size) > kMaxUpload) {
+                return fail(L, fmt::format("{}: larger than 100 MiB", value));
+            }
+            if (curl_mime_filedata(part, value.c_str()) != CURLE_OK) {
+                return fail(L, fmt::format("{}: cannot be attached", value));
+            }
+        }
+        curl_easy_setopt(curl.get(), CURLOPT_MIMEPOST, mime.get());
+    } else {
+        std::size_t length = 0;
+        const char* body = lua_tolstring(L, 2, &length);
+        headers.add("Content-Type: application/json");
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(length));
+    }
+    return post(L, curl.get(), fmt::format("{}/{}", config.tools_url, name), headers, timeout, config.ca_bundle);
 }
 
 int Host::sh(lua_State* L) {
@@ -1020,9 +1116,9 @@ void Host::open(lua_State* L) {
     callbacks->interrupt = on_interrupt;
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"llm", llm},       {"sh", sh},       {"try", try_},      {"timed", timed},   {"read", l_read},
-        {"write", l_write}, {"list", l_list}, {"load", l_load},   {"input", l_input}, {"log", l_log},
-        {"sleep", sleep},   {"env", l_env},   {nullptr, nullptr},
+        {"llm", llm},     {"tool", tool},     {"sh", sh},       {"try", try_},      {"timed", timed},
+        {"read", l_read}, {"write", l_write}, {"list", l_list}, {"load", l_load},   {"input", l_input},
+        {"log", l_log},   {"sleep", sleep},   {"env", l_env},   {nullptr, nullptr},
     };
     luaL_register(L, "host", kFunctions);
 
@@ -1048,6 +1144,14 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "default_loop");
     lua_pushboolean(L, isatty(STDOUT_FILENO) != 0 ? 1 : 0);
     lua_setfield(L, -2, "tty");
+    lua_pushboolean(L, config_.tools_key.empty() ? 0 : 1);
+    lua_setfield(L, -2, "tools");
+    lua_createtable(L, 0, static_cast<int>(config_.extensions.size()));
+    for (const auto& [name, source] : config_.extensions) {
+        lua_pushlstring(L, source.data(), source.size());
+        lua_setfield(L, -2, name.c_str());
+    }
+    lua_setfield(L, -2, "extensions");
     lua_pop(L, 1);
 }
 

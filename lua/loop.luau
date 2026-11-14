@@ -13,6 +13,10 @@
 --   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
 --   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 --   host.tty                                          stdout is a terminal
+--   host.tool(name, request, {timeout=}) -> status, text | nil, error     DeepSeek's search, fetch or ocr endpoint;
+--                                                     the host adds DEEPSEEK_API_KEY
+--   host.tools                                        that key is there
+--   host.extensions                                   the built-in extensions' sources, by name
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
 -- host.timed returns; a plain pcall cannot swallow them.
@@ -64,7 +68,8 @@ end
 --
 -- An extension is a Luau module in .hx/ext/NAME.luau that returns a table of functions. The model writes them
 -- with write() and calls them from its code, so the tool never changes. A module is loaded again whenever its
--- file has changed. Extensions see the same functions the model's code does.
+-- file has changed. Extensions see the same functions the model's code does. hx has some built in
+-- (host.extensions: web and ocr); a project's file of the same name takes the place of one.
 
 local ext_dir = ".hx/ext/"
 local ext_cache = {}
@@ -119,14 +124,17 @@ function M.ext(name)
 		error("an extension name is letters, digits, _ and -", 0)
 	end
 	local source, err = host.read(ext_dir .. name .. ".luau")
-	if not source then
+	local built_in = not source and host.extensions[name]
+	if built_in then
+		source = built_in
+	elseif not source then
 		error("no extension " .. name .. ": " .. err, 0)
 	end
 	local cached = ext_cache[name]
 	if cached and cached.source == source then
 		return cached.value
 	end
-	local chunk, load_err = host.load(source, "=ext/" .. name, ext_env)
+	local chunk, load_err = host.load(source, (built_in and "=hx/ext/" or "=ext/") .. name, ext_env)
 	if not chunk then
 		error(load_err, 0)
 	end
@@ -135,14 +143,30 @@ function M.ext(name)
 	return value
 end
 
--- One line per extension: its name and the comment on its first line.
+-- One line per extension: its name and the comment on its first line. The built-in ones are listed when the
+-- DeepSeek key they need is there, unless the project has its own of that name.
 local function extension_index()
-	local lines = {}
+	local lines, own = {}, {}
+	local function add(name, source, mark)
+		table.insert(lines, ("- %s%s: %s"):format(name, mark, source:match("^%-%-%s*([^\n]*)") or "(no description)"))
+	end
 	for _, file in host.list(ext_dir) or {} do
 		local name = file:match("^([%w_%-]+)%.luau$")
 		if name then
-			local source = host.read(ext_dir .. file) or ""
-			table.insert(lines, ("- %s: %s"):format(name, source:match("^%-%-%s*([^\n]*)") or "(no description)"))
+			own[name] = true
+			add(name, host.read(ext_dir .. file) or "", "")
+		end
+	end
+	if host.tools then
+		local names = {}
+		for name in host.extensions do
+			table.insert(names, name)
+		end
+		table.sort(names)
+		for _, name in names do
+			if not own[name] then
+				add(name, host.extensions[name], " (built in)")
+			end
 		end
 	end
 	return lines
@@ -349,6 +373,10 @@ M.functions = {
 local scratch = setmetatable({}, { __index = lookup }) -- globals of `lua` code live here, across calls
 
 local function show(value)
+	local meta = getmetatable(value)
+	if type(meta) == "table" and meta.__tostring then -- a value that says how it reads, as search results do
+		return tostring(value)
+	end
 	if type(value) == "table" then
 		local ok, text = pcall(json.encode, value)
 		if ok then
@@ -369,7 +397,7 @@ local function lua_description()
 	for _, fn in M.functions do
 		table.insert(lines, "- " .. fn.usage)
 	end
-	table.insert(lines, "- ext(name) -> table: the extension .hx/ext/NAME.luau.")
+	table.insert(lines, "- ext(name) -> table: the extension .hx/ext/NAME.luau, or one built into hx.")
 	table.insert(lines, "- host.sh(command) -> {out, code}, host.read(path) -> text, host.write(path, text), "
 		.. "host.list(dir), json.encode, json.decode: the plain primitives, for working on data.")
 	table.insert(lines, "")
@@ -649,7 +677,7 @@ function M.system_prompt()
 	}
 	local extensions = extension_index()
 	if #extensions > 0 then
-		table.insert(parts, "Extensions in this project:\n" .. table.concat(extensions, "\n"))
+		table.insert(parts, "Extensions:\n" .. table.concat(extensions, "\n"))
 	end
 	local notes = host.read(".hx/prompt.md")
 	if notes and notes ~= "" then

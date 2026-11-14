@@ -78,6 +78,7 @@ after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not 
 | `HX_API_URL` | Anthropic Messages endpoint | `https://api.anthropic.com/v1/messages` for a `claude-*` model, `https://api.deepseek.com/anthropic/v1/messages` otherwise |
 | `HX_KEY_ENV` | name of the variable holding the API key | `ANTHROPIC_API_KEY` for a `claude-*` model, `DEEPSEEK_API_KEY` otherwise |
 | `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort` | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
+| `HX_TOOLS_URL` | base of DeepSeek's Search, Fetch and OCR endpoints, which the built-in `web` and `ocr` extensions call with `DEEPSEEK_API_KEY`, whatever the model | `https://api.deepseek.com/v1/tools` |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
 Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143
@@ -123,6 +124,8 @@ Also in force:
 - The API key is read once and removed from the environment, together with every variable whose name ends in
   `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS`. Luau code never sees the key: the host adds
   it to requests for the configured endpoint only, and commands cannot read it out of the host's memory.
+  `DEEPSEEK_API_KEY` is kept the same way for DeepSeek's tool endpoints, and is sent only to
+  `HX_TOOLS_URL/search`, `/fetch` and `/ocr`.
 - The VM has a memory ceiling of 1 GiB, and every process a command started is killed when `hx` exits, a
   daemon that called `setsid` included: `hx` is a child subreaper, so all of them stay its descendants.
 
@@ -246,6 +249,23 @@ extension can call the same functions the model's code can. A changed file is lo
 session starts with a list of the project's extensions in the system prompt. The tool itself never changes, so
 prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the project.
 
+### Built in: web and ocr
+
+Two extensions come with hx, in `lua/ext/`. They call DeepSeek's [Search, Fetch](https://api-docs.deepseek.com/guides/search)
+and [OCR](https://api-docs.deepseek.com/guides/ocr) APIs with `DEEPSEEK_API_KEY`, whichever model the loop talks
+to, so a session on Claude can use them too when that key is set. The system prompt lists them only then. A
+project's own `.hx/ext/web.luau` or `.hx/ext/ocr.luau` takes the place of the built-in one.
+
+| Call | Returns |
+|---|---|
+| `ext("web").search(query, {count?, content?, question?})` | results, best first: `{title, url, snippet, summary, content?, site_name?, date?, rerank_score, authority}`. Printed or returned from `lua`, they read as a numbered list. `query` takes `site:`, `-site:`, `lang:`, `after:`, `before:` and `"phrases"`, up to 128 characters; `count` is 1 to 50 (default 10); `content = true` asks for each page's text |
+| `ext("web").fetch(url)` | the page as Markdown, its title first as a heading when the page does not show it |
+| `ext("ocr").read(path, purpose?)` | the text of a PDF, Word, PowerPoint or image file, up to 100 MiB and 1,000 pages. A PDF is read with `rich_layout_recognition`, which keeps tables and layout and leaves box tokens in the text; anything else with `text_recognition`. A document of several pages has a `[page N]` line before each |
+
+Requests that fail with 408, 429 or 5xx, or get no answer, are tried three times. The file for OCR is read by the
+host inside the wall, so a file the model cannot read cannot be sent. Search and Fetch cost $0.75 per 1,000
+requests, OCR $0.225 per 1,000 pages.
+
 ## Host primitives
 
 Everything Luau can do to the machine:
@@ -253,6 +273,7 @@ Everything Luau can do to the machine:
 | Primitive | Returns |
 |---|---|
 | `host.llm(body, {timeout=600, beta=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header |
+| `host.tool(name, request, {timeout=300})` | `status, text`, or `nil, error`: a POST to DeepSeek's `search`, `fetch` or `ocr` endpoint with `DEEPSEEK_API_KEY`. A string `request` is sent as JSON; a table is sent as a form, whose `file` field is the path of a file to upload |
 | `host.sh(command, {timeout=120})` | `{out, code, signal, timed_out}` |
 | `host.read(path)` | the contents, or `nil, error` |
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed or killed write leaves the old content; its owner, mode, extended attributes and ACLs stay, and a link stays a link. A device, a FIFO, a file with other hard links, one whose attributes cannot be copied, or one in a directory that refuses a new file is written in place |
@@ -265,6 +286,8 @@ Everything Luau can do to the machine:
 | `host.args`, `host.cwd`, `host.interactive`, `host.sandboxed`, `host.default_loop` | |
 | `host.quiet` | `true` with `--quiet`: leave out progress lines |
 | `host.tty` | `true` when stdout is a terminal |
+| `host.tools` | `true` when hx has a `DEEPSEEK_API_KEY` for `host.tool` |
+| `host.extensions` | the built-in extensions' sources, by name |
 | `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | |
 
 Two rules hold across all of them:
@@ -287,6 +310,7 @@ Two rules hold across all of them:
 | `src/host.cpp` | the `host` primitives, signals, time limits |
 | `src/json.cpp` | JSON between Lua values and text, on RapidJSON's streaming reader and writer |
 | `lua/loop.luau` | the agent |
+| `lua/ext/*.luau` | the built-in extensions |
 
 Development build, with AddressSanitizer, UBSan and warnings as errors:
 
@@ -304,7 +328,7 @@ leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set
 
 ## Limits
 
-- One endpoint per run, which must accept the Anthropic Messages format and an `x-api-key` header: the Claude
+- One model endpoint per run, which must accept the Anthropic Messages format and an `x-api-key` header: the Claude
   API for a `claude-*` model, DeepSeek's otherwise. The model is fixed at start: a project loop that changes
   `M.model` to a Claude model still talks to the endpoint `--model` or `HX_MODEL` chose. The Claude settings have
   been checked against a stand-in server, not yet against the live API.

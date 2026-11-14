@@ -2,6 +2,7 @@
 #define HX_HOST_H_
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sandbox.h"
@@ -13,17 +14,22 @@ namespace hx {
 struct HostConfig {
     std::string api_url;            // the one endpoint host.llm posts to
     std::string api_key;            // sent as x-api-key; Luau code never sees it
+    std::string tools_url;          // where host.tool posts: NAME is appended as /NAME
+    std::string tools_key;          // DEEPSEEK_API_KEY, sent as a bearer token by host.tool; empty for none
     std::string ca_bundle;          // a file of trust roots to use instead of libcurl's own; empty for those
     std::vector<std::string> args;  // host.args
     bool interactive = false;       // host.interactive: stdin is a terminal and no task was given
     bool quiet = false;             // host.quiet: --quiet, so the loop leaves out progress lines
     std::string default_loop;       // host.default_loop: the built-in loop's source
+    std::vector<std::pair<std::string, std::string>> extensions;  // host.extensions: built-in ones, name and source
 };
 
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
 // the VM and the system:
 //
 //   host.llm(body, {timeout=600, beta=}) -> status, text | nil, error     beta: the anthropic-beta header
+//   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr;
+//                                                     request is JSON text, or a form table whose `file` is a path
 //   host.sh(command, {timeout=120}) -> {out=, code=, signal=, timed_out=}
 //   host.read(path) -> string | nil, error
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a file by
@@ -38,6 +44,8 @@ struct HostConfig {
 //   host.sleep(seconds), host.env(name)
 //   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 //   host.tty                                          stdout is a terminal
+//   host.tools                                        a DeepSeek key is there for host.tool
+//   host.extensions                                   the built-in extensions' sources, by name
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
 // SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input)
@@ -66,6 +74,7 @@ class Host {
     static Host& of(lua_State* L);
     static void on_interrupt(lua_State* L, int gc);
     static int llm(lua_State* L);
+    static int tool(lua_State* L);
     static int sh(lua_State* L);
     static int try_(lua_State* L);
     static int timed(lua_State* L);

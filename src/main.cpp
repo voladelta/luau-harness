@@ -88,6 +88,9 @@ environment:
                     claude-* model, DEEPSEEK_API_KEY otherwise)
   HX_EFFORT         how hard the model thinks: low, medium, high, xhigh or max (default: medium on
                     the Claude models hx knows, the endpoint's own otherwise)
+  HX_TOOLS_URL      base of DeepSeek's search, fetch and OCR endpoints, which the built-in web and ocr
+                    extensions use with DEEPSEEK_API_KEY, whatever the model (default
+                    https://api.deepseek.com/v1/tools)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.
@@ -101,6 +104,7 @@ docs: https://github.com/voladelta/luau-harness
 constexpr const char* kDeepSeekUrl = "https://api.deepseek.com/anthropic/v1/messages";
 constexpr const char* kDeepSeekKeyEnv = "DEEPSEEK_API_KEY";
 constexpr const char* kDeepSeekModel = "deepseek-flash";
+constexpr const char* kDeepSeekToolsUrl = "https://api.deepseek.com/v1/tools";
 constexpr const char* kAnthropicUrl = "https://api.anthropic.com/v1/messages";
 constexpr const char* kAnthropicKeyEnv = "ANTHROPIC_API_KEY";
 constexpr const char* kAnthropicModel = "claude-opus-5-5";
@@ -313,11 +317,17 @@ bool looks_secret(std::string name) {
     return false;
 }
 
-// Returns the API key and removes it, and every other variable that looks like a secret, from the environment.
-// Commands the model runs inherit the environment, and with the network open an inherited secret is a leaked
-// one. The entries are also wiped where they sit, because /proc/PID/environ shows the original memory.
-std::string take_secrets(std::string_view key_env, const std::vector<std::string>& keep) {
-    std::string key;
+struct Secrets {
+    std::string key;        // the model endpoint's
+    std::string tools_key;  // DEEPSEEK_API_KEY, for DeepSeek's tool endpoints whatever the model
+};
+
+// Returns the API key and the DeepSeek key, and removes both, and every other variable that looks like a secret,
+// from the environment. Commands the model runs inherit the environment, and with the network open an inherited
+// secret is a leaked one. The entries are also wiped where they sit, because /proc/PID/environ shows the original
+// memory.
+Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& keep) {
+    Secrets secrets;
     std::vector<std::pair<std::string, char*>> doomed;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic): environ is a null-terminated C array
     for (char** entry = environ; *entry != nullptr; ++entry) {
@@ -329,10 +339,14 @@ std::string take_secrets(std::string_view key_env, const std::vector<std::string
         const std::string name(text.substr(0, equals));
         const bool is_key = name == key_env;
         if (is_key) {
-            key = text.substr(equals + 1);
+            secrets.key = text.substr(equals + 1);
+        }
+        const bool is_tools_key = name == kDeepSeekKeyEnv;
+        if (is_tools_key) {
+            secrets.tools_key = text.substr(equals + 1);
         }
         const bool kept = std::find(keep.begin(), keep.end(), name) != keep.end();
-        if (is_key || (looks_secret(name) && !kept)) {
+        if (is_key || is_tools_key || (looks_secret(name) && !kept)) {
             doomed.emplace_back(name, *entry);
         }
     }
@@ -340,7 +354,7 @@ std::string take_secrets(std::string_view key_env, const std::vector<std::string
         unsetenv(name.c_str());  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
         std::memset(entry, 0, std::strlen(entry));
     }
-    return key;
+    return secrets;
 }
 
 std::string env_or(const char* name, std::string_view fallback) {
@@ -643,11 +657,20 @@ int run(const std::vector<std::string_view>& argv) {
 
     hx::HostConfig config;
     config.api_url = endpoint.url;
-    config.api_key = take_secrets(endpoint.key_env, options.keep_env);
+    config.tools_url = env_or("HX_TOOLS_URL", kDeepSeekToolsUrl);
+    while (config.tools_url.ends_with('/')) {
+        config.tools_url.pop_back();
+    }
+    Secrets secrets = take_secrets(endpoint.key_env, options.keep_env);
+    config.api_key = std::move(secrets.key);
+    config.tools_key = std::move(secrets.tools_key);
     config.args = options.args;
     config.interactive = options.mode == Mode::Agent && options.args.empty() && stdin_tty && !options.no_input;
     config.quiet = options.quiet;
     config.default_loop = hx::kDefaultLoop;
+    for (const auto& [name, source] : hx::kExtensions) {
+        config.extensions.emplace_back(name, source);
+    }
     // libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules).
     config.ca_bundle = env_or("SSL_CERT_FILE", env_or("CURL_CA_BUNDLE", ""));
     if (access(config.ca_bundle.c_str(), R_OK) != 0) {

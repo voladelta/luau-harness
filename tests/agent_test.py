@@ -64,6 +64,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class Tools(http.server.ThreadingHTTPServer):
+    """A stand-in for DeepSeek's tool endpoints: answers by path and records each request, body as bytes."""
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), ToolsHandler)
+        self.requests = []
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server_address[1]}/v1/tools"
+
+
+class ToolsHandler(http.server.BaseHTTPRequestHandler):
+    ANSWERS = {
+        "/v1/tools/search": {"results": [{"rerank_score": 2.1, "title": "Luau", "url": "https://luau.org",
+                                          "snippet": "s", "summary": "A small fast language.", "content": "",
+                                          "site_name": None, "site_icon": None, "date": None, "authority": 3}]},
+        "/v1/tools/fetch": {"title": "Luau", "content": "# Luau\n\nA small fast language."},
+        "/v1/tools/ocr": {"id": "ocr-1", "object": "ocr.result", "created": 0, "purpose": "x", "page_count": 1,
+                          "pages": [{"index": 0, "text": "Recognized words", "finish_reason": "stop"}],
+                          "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
+    }
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.server.requests.append({"path": self.path, "body": body,
+                                     "headers": {k.lower(): v for k, v in self.headers.items()}})
+        answer = self.ANSWERS.get(self.path)
+        data = (b"\n\n" if self.path.endswith("/ocr") else b"") + json.dumps(answer or {"error": "no such tool"}).encode()
+        self.send_response(200 if answer else 404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
 def read(*path):
     with open(os.path.join(*path)) as f:
         return f.read()
@@ -148,7 +188,7 @@ class AgentTest(unittest.TestCase):
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
         env.update(HOME=self.home, HX_API_URL=self.model.url, HX_KEY_ENV="HX_TEST_KEY", HX_TEST_KEY=KEY,
-                   NO_PROXY="127.0.0.1")
+                   NO_PROXY="127.0.0.1", DEEPSEEK_API_KEY="")
         env.update(extra)
         return env
 
@@ -1098,7 +1138,7 @@ class AgentTest(unittest.TestCase):
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results()[1], "HEY!")
-        self.assertNotIn("Extensions in this project", self.model.requests[0]["system"])
+        self.assertNotIn("Extensions:", self.model.requests[0]["system"])
         # It is told what runs it, not that a file which may not exist does.
         self.assertIn("the loop built into hx", self.model.requests[0]["system"])
         self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system"])
@@ -1117,6 +1157,81 @@ class AgentTest(unittest.TestCase):
         subprocess.run(["git", "init", "-q"], **git)
         subprocess.run(["git", "add", "-A"], **git)
         self.assertEqual(subprocess.run(["git", "ls-files"], **git).stdout, ".hx/ext/shout.luau\n")
+
+    def test_web_and_ocr_go_to_deepseek_with_its_key_alone(self):
+        tools = Tools()
+        self.addCleanup(tools.server_close)
+        self.addCleanup(tools.shutdown)
+        with open(os.path.join(self.project, "scan.pdf"), "wb") as f:
+            f.write(b"%PDF-1.7 not really\x00\xff")
+        with open(os.path.join(self.project, "photo.png"), "wb") as f:
+            f.write(b"\x89PNG fake")
+        ds_key = "ds-tools-key-42"
+        code = ("local web, ocr = ext('web'), ext('ocr') "
+                "print(web.search('luau language', {count = 3})) print(web.fetch('https://luau.org')) "
+                "print(ocr.read('scan.pdf')) return ocr.read('photo.png')")
+        done = self.run_hx("go", HX_TOOLS_URL=tools.url + "/", DEEPSEEK_API_KEY=ds_key, script=[
+            call("lua", {"code": code}, "c1"),
+            call("bash", {"command": "env"}, "c2"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = self.tool_results()[0]
+        self.assertIn("1. Luau\n   https://luau.org\n   A small fast language.", result)
+        self.assertIn("# Luau\n\nA small fast language.", result)
+        self.assertEqual(result.count("Recognized words"), 2)
+        # Each call went to its endpoint, with the DeepSeek key as a bearer token.
+        self.assertEqual([r["path"] for r in tools.requests],
+                         ["/v1/tools/search", "/v1/tools/fetch", "/v1/tools/ocr", "/v1/tools/ocr"])
+        for r in tools.requests:
+            self.assertEqual(r["headers"]["authorization"], f"Bearer {ds_key}")
+            self.assertNotIn("x-api-key", r["headers"])
+        self.assertEqual(json.loads(tools.requests[0]["body"]), {"query": "luau language", "count": 3})
+        self.assertEqual(json.loads(tools.requests[1]["body"]), {"url": "https://luau.org"})
+        # OCR uploads the file as a form, with the purpose the file's kind calls for.
+        pdf, png = tools.requests[2], tools.requests[3]
+        self.assertTrue(pdf["headers"]["content-type"].startswith("multipart/form-data; boundary="))
+        self.assertIn(b'name="file"; filename="scan.pdf"', pdf["body"])
+        self.assertIn(b"%PDF-1.7 not really\x00\xff", pdf["body"])
+        self.assertIn(b'name="purpose"\r\n\r\nrich_layout_recognition', pdf["body"])
+        self.assertIn(b'name="purpose"\r\n\r\ntext_recognition', png["body"])
+        # The model's endpoint gets its own key, and neither key reaches the model or the commands.
+        self.assertEqual(self.model.headers[0]["x-api-key"], KEY)
+        self.assertNotIn(ds_key, json.dumps(self.model.requests))
+        self.assertNotIn(ds_key, self.tool_results()[1])
+        # The built-in extensions are listed, since the key is there.
+        self.assertIn("- web (built in): searches the web", self.model.requests[0]["system"])
+        self.assertIn("- ocr (built in): reads the text", self.model.requests[0]["system"])
+
+    def test_without_a_deepseek_key_the_tools_say_so(self):
+        done = self.run_hx("go", script=[
+            call("lua", {"code": "return ext('web').search('luau')"}, "c1"),
+            call("lua", {"code": "return host.tool('search', '{}')"}, "c2"),
+            call("lua", {"code": "return host.tool('chat', '{}')"}, "c3"),
+            call("lua", {"code": "return ext('ocr').read('nope.pdf')"}, "c4"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        results = self.tool_results()
+        self.assertIn("without DEEPSEEK_API_KEY", results[0])
+        self.assertIn("no DEEPSEEK_API_KEY", results[1])
+        self.assertIn("no tool chat", results[2])
+        self.assertIn("without DEEPSEEK_API_KEY", results[3])
+        self.assertNotIn("(built in)", self.model.requests[0]["system"])
+
+    def test_ocr_of_a_file_outside_the_wall_is_refused_before_sending(self):
+        tools = Tools()
+        self.addCleanup(tools.server_close)
+        self.addCleanup(tools.shutdown)
+        secret = os.path.join(self.home, "secret.pdf")
+        with open(secret, "w") as f:
+            f.write("private")
+        done = self.run_hx("go", HX_TOOLS_URL=tools.url, DEEPSEEK_API_KEY="k", script=[
+            call("lua", {"code": f"return ext('ocr').read({lua_literal(secret)})"}, "c1"),
+            call("lua", {"code": "return ext('ocr').read('.')"}, "c2"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Permission denied", self.tool_results()[0])
+        self.assertIn("not a regular file", self.tool_results()[1])
+        self.assertEqual(tools.requests, [])
 
     def test_project_notes_reach_the_system_prompt(self):
         os.makedirs(os.path.join(self.project, ".hx"))
