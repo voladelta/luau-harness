@@ -1,5 +1,5 @@
 -- The hx loop, built into hx. A project changes it in .hx/loop.luau, which loads this module, replaces some of
--- its fields and returns it (`hx init` writes such a file), or owns all of it as a copy (`hx init --full`). The
+-- its fields and returns it (`hx --init` writes such a file), or owns all of it as a copy (`hx --init --full`). The
 -- parts meant to be replaced are fields of M and are always called through M.
 --
 -- The host supplies a small kernel and nothing else:

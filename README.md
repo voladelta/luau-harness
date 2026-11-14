@@ -15,9 +15,9 @@ hx "add a --json flag to the export command and test it"
 
 - **The host is a kernel, not a framework.** It gives Luau a model call, a shell, file access and JSON. That is
   all. There is no plugin system, package format, permission prompt or configuration file.
-- **The loop belongs to the project.** `hx init` writes `.hx/loop.luau`, a short file that loads the loop built
+- **The loop belongs to the project.** `hx --init` writes `.hx/loop.luau`, a short file that loads the loop built
   into hx and changes what this project needs: the model, the prompt, the tools, the retry and compaction
-  rules. What it leaves alone keeps up with hx. `hx init --full` copies the whole built-in loop instead, and
+  rules. What it leaves alone keeps up with hx. `hx --init --full` copies the whole built-in loop instead, and
   the project owns all of it.
 - **One wall, built by the kernel.** Before anything runs, the process confines itself with Landlock. The VM,
   the file tools and every command the model starts inherit the same rules, so no tool needs a path check and
@@ -46,7 +46,7 @@ header-only).
 ```
 hx [options] [TASK...]              run the agent; without a task, read it from stdin or start a prompt
 hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives
-hx --init [--full]                  make this project own its loop
+hx --init [--full]                  write .hx/loop.luau, which starts from the built-in loop (--full: a copy)
 ```
 
 A task is any words at all: `hx run the tests` asks the model. After `--run FILE`, every word goes to the
@@ -141,7 +141,7 @@ thinking, and sends thinking blocks back exactly as they came. The five tools it
 | `edit` | replaces an exact piece of text that occurs once |
 | `lua` | runs Luau inside the harness; this is how extensions are called |
 
-`hx init` writes `.hx/loop.luau` from `lua/overlay.luau`:
+`hx --init` writes `.hx/loop.luau` from `lua/overlay.luau`:
 
 ```lua
 local M = host.load(host.default_loop, "=loop")()

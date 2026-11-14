@@ -68,7 +68,7 @@ find_package(CURL REQUIRED)
 # --- hx ------------------------------------------------------------------------------------------------------
 
 # The default loop is compiled into the binary, so hx works in a directory that has no .hx/ yet and still
-# starts when a project's own loop is broken. The overlay, which `hx init` writes, is embedded the same way.
+# starts when a project's own loop is broken. The overlay, which `hx --init` writes, is embedded the same way.
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/loop.luau HX_LOOP_SOURCE)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/overlay.luau HX_OVERLAY_SOURCE)
 configure_file(src/embedded.h.in embedded.h @ONLY)

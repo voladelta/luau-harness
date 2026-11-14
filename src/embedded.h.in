@@ -8,7 +8,7 @@ namespace hx {
 // lua/loop.luau, embedded at configure time.
 inline constexpr std::string_view kDefaultLoop = R"HXLUAU(@HX_LOOP_SOURCE@)HXLUAU";
 
-// lua/overlay.luau: what `hx init` writes to .hx/loop.luau, a loop that loads the one above and changes parts.
+// lua/overlay.luau: what `hx --init` writes to .hx/loop.luau, a loop that loads the one above and changes parts.
 inline constexpr std::string_view kLoopOverlay = R"HXLUAU(@HX_OVERLAY_SOURCE@)HXLUAU";
 
 }  // namespace hx
