@@ -73,13 +73,19 @@ At the prompt, Ctrl-C stops the current turn and Ctrl-D leaves.
 | | Allowed |
 |---|---|
 | Write | the project directory (where you start `hx`), a private `$TMPDIR` that is removed on exit, `--rw` paths |
-| Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /nix/store`, your git configuration, `--ro` paths |
+| Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /nix/store`, your git configuration, trust roots (below), `--ro` paths |
 | Devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom` |
 | Everything else | cannot be opened: the rest of your home directory, other terminals, other projects |
 
 Toolchains installed in your home directory need a flag, for example
 `hx --ro ~/.rustup --ro ~/.cargo --rw ~/.cargo/registry "..."`. The flags are on the command line on purpose:
 nothing inside the project, which the model can write, can widen the wall.
+
+Behind a TLS-intercepting proxy the trust roots often live in your home directory. The file or directory named
+by each of `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
+`GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, `AWS_CA_BUNDLE` and `NIX_SSL_CERT_FILE`, when it is an absolute path, is
+readable inside, so `curl`, `git`, `pip` and `npm` started by the model trust what you trust. These come from your
+environment, which the model cannot change. `hx`'s own request uses `SSL_CERT_FILE`, or else `CURL_CA_BUNDLE`.
 
 Also in force:
 

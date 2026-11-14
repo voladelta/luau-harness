@@ -560,11 +560,7 @@ int Host::llm(lua_State* L) {
     curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, error_buffer.data());
     // Redirects are not followed: the key goes to the configured endpoint and nowhere else.
     if (!config.ca_bundle.empty()) {
-        curl_blob blob{};
-        blob.data = config.ca_bundle.data();
-        blob.len = config.ca_bundle.size();
-        blob.flags = CURL_BLOB_NOCOPY;  // the bundle lives as long as the Host
-        curl_easy_setopt(curl.get(), CURLOPT_CAINFO_BLOB, &blob);
+        curl_easy_setopt(curl.get(), CURLOPT_CAINFO, config.ca_bundle.c_str());
     }
 
     const CURLcode code = curl_easy_perform(curl.get());

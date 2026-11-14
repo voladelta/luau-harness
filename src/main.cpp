@@ -286,6 +286,16 @@ std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& proj
         rules.push_back({home + "/.gitconfig", Access::Read, false});
         rules.push_back({home + "/.config/git", Access::Read, false});
     }
+    // Trust roots, often a proxy's and often in the home directory, so that hx's own requests and the curl, git,
+    // pip or npm the model runs can verify TLS. These variables are the user's statement of where the roots live,
+    // and nothing inside the wall can change them.
+    for (const char* name :
+         {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+          "GIT_SSL_CAINFO", "CARGO_HTTP_CAINFO", "AWS_CA_BUNDLE", "NIX_SSL_CERT_FILE"}) {
+        if (std::string path = env_or(name, ""); path.starts_with('/')) {
+            rules.push_back({std::move(path), Access::Read, false});
+        }
+    }
     rules.push_back({project.string(), Access::Write, true});
     rules.push_back({tmp.string(), Access::Write, true});
     for (const std::string& path : options.read_paths) {
@@ -474,12 +484,8 @@ int run(const std::vector<std::string_view>& argv) {
     config.args = options.args;
     config.interactive = options.mode == Mode::Agent && options.args.empty() && isatty(STDIN_FILENO) != 0;
     config.default_loop = hx::kDefaultLoop;
-    // A proxy's trust root usually lives in the home directory, which is about to become unreadable.
-    for (const char* name : {"SSL_CERT_FILE", "CURL_CA_BUNDLE"}) {
-        if (const std::string path = env_or(name, ""); !path.empty() && config.ca_bundle.empty()) {
-            config.ca_bundle = read_file(path).value_or("");
-        }
-    }
+    // libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules).
+    config.ca_bundle = env_or("SSL_CERT_FILE", env_or("CURL_CA_BUNDLE", ""));
 
     std::optional<std::string> script;
     if (options.mode == Mode::Script) {

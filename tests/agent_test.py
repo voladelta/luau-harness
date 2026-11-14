@@ -275,6 +275,20 @@ class AgentTest(unittest.TestCase):
         self.run_hx("go", script=[call("bash", {"command": "git config user.name"}), say("ok")])
         self.assertEqual(self.tool_results(), ["Test Owner\n[exit 0]"])
 
+    def test_trust_roots_named_in_the_environment_are_readable(self):
+        bundle = os.path.join(self.home, "ca.pem")
+        with open(bundle, "w") as f:
+            f.write("TRUST-ROOT")
+        with open(os.path.join(self.home, "beside.pem"), "w") as f:
+            f.write("NOT-THIS")
+        done = self.run_hx("go", REQUESTS_CA_BUNDLE=bundle, script=[
+            call("bash", {"command": f"cat $REQUESTS_CA_BUNDLE; cat {self.home}/beside.pem"}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = self.tool_results()[0]
+        self.assertIn("TRUST-ROOT", result)
+        self.assertIn("beside.pem: Permission denied", result)
+        self.assertNotIn("NOT-THIS", result)
+
     def test_the_home_directory_is_not_a_project(self):
         done = subprocess.run([HX, "go"], cwd=self.home, env=self.env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 2)

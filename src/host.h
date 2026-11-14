@@ -13,7 +13,7 @@ namespace hx {
 struct HostConfig {
     std::string api_url;            // the one endpoint host.llm posts to
     std::string api_key;            // sent as x-api-key; Luau code never sees it
-    std::string ca_bundle;          // PEM text of extra trust roots, read before the sandbox closed the file off
+    std::string ca_bundle;          // a file of trust roots to use instead of libcurl's own; empty for those
     std::vector<std::string> args;  // host.args
     bool interactive = false;       // host.interactive: stdin is a terminal and no task was given
     std::string default_loop;       // host.default_loop: the built-in loop's source
