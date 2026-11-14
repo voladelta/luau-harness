@@ -27,6 +27,8 @@ if(HX_SANITIZE)
 endif()
 
 # --- Dependencies, each pinned to an exact revision ---------------------------------------------------------
+#
+# A tag can be moved, so each is pinned by commit. A shallow clone cannot fetch a commit, so these are full clones.
 
 include(FetchContent)
 
@@ -36,8 +38,7 @@ set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   luau
   GIT_REPOSITORY https://github.com/luau-lang/luau.git
-  GIT_TAG 0.747
-  GIT_SHALLOW TRUE
+  GIT_TAG c87565b8b0db5d5d5bfd2b8b00ad6573e5d06d9f # 0.747
   EXCLUDE_FROM_ALL SYSTEM)
 
 # RapidJSON: header-only streaming JSON reader and writer. Its last tagged release is from 2016 while master is
@@ -54,8 +55,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   fmt
   GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-  GIT_TAG 12.2.1
-  GIT_SHALLOW TRUE
+  GIT_TAG 208219daff58f2a7438f6931cc2ddc358acf33ef # 12.2.1
   EXCLUDE_FROM_ALL SYSTEM)
 
 FetchContent_MakeAvailable(luau rapidjson fmt)
