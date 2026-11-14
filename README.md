@@ -168,6 +168,7 @@ call to the next. The code acts through these functions:
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too |
+| `skill(name)` | a skill's instructions, by name; other words search the skills (see "Skills") |
 | `ext(name)` | an extension's table of functions |
 
 `host.*` and `json.*` are there too, for working on raw data. A function that fails raises, and the error goes
@@ -185,7 +186,7 @@ return M
 ```
 
 Every setting at the top of the loop is a field of `M`, and so are the parts a project may want to replace:
-`M.functions`, `M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until
+`M.functions`, `M.skill_dirs`, `M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until
 the model is done), `M.compact`, `M.compact_prompt` and `M.resume_prompt`. The loop always calls them through `M`, so a replacement
 takes effect everywhere.
 
@@ -294,6 +295,39 @@ Every request asks for highlights, Exa's excerpts of each page that answer the q
 notices go to the model with the answer; its warnings go to stderr. Deep Search costs $12 per 1,000 requests up to
 10 results, and takes 4 to 15 seconds.
 
+## Skills
+
+A skill is instructions for one kind of task, in the [Agent Skills](https://agentskills.io) format: a directory
+with a `SKILL.md` whose front matter gives a `name` and a `description` of when to use it, plus whatever scripts
+and references the text points to. Extensions are code the model calls; skills are text the model reads.
+
+```
+---
+name: release-notes
+description: Write release notes from the git log. Use when asked for release notes or a changelog entry.
+---
+Group commits by area, newest first. Run scripts/authors.sh for the credits line.
+```
+
+hx looks in `.hx/skills/`, `.agents/skills/` and `.claude/skills/` in the project, then `~/.agents/skills/` and
+`~/.claude/skills/`, and the first skill of a name wins. The two in your home directory are outside the wall, so
+they are found only when you open them: `hx --ro ~/.claude/skills "..."`. A skill with
+`disable-model-invocation: true` is left out of the prompt and of searches, but still loads by its name. Other
+fields, such as `allowed-tools`, `model` and `hooks`, are ignored: there is one tool, and the wall is the same for
+everything.
+
+The system prompt lists each skill with its description, up to `M.skill_index_full` (30) of them; up to
+`M.skill_index_names` (150) it lists their names only, and past that only how many there are. The list is made once
+per run, so it does not upset the prompt cache. The model loads a skill from its code:
+
+| Call | Returns |
+|---|---|
+| `skill("release-notes")` | the text after the front matter, headed by the skill's directory and its other files by their paths from the project (up to `M.skill_files_shown`, 30), so a script the skill names can be run as it is listed; the work itself stays in the project directory. Case, `-`, `_`, `.` and spaces in the name do not matter, so `skill("Release_Notes")` is the same call; when two skills differ only in those, both are listed with their paths instead |
+| `skill("changelog from git")` | when no skill has that name: the closest skills by name and description, as `name: description` lines. The name close to the words, or near it by up to two typos, counts most, then words of the name, then words of the description, where `spreadsheet` also matches `spreadsheets` |
+
+Scripts in a skill run through `bash`, inside the wall like any other command. A skill in the project can be
+written by the model, and a skill in a repository you cloned is text from whoever wrote it, like its README.
+
 ## Host primitives
 
 Everything Luau can do to the machine:
@@ -351,7 +385,8 @@ clang-tidy -p build-dev --quiet src/*.cpp
 
 `tests/live_test.py` runs the agent against the real endpoint: making and editing files, reading a line range,
 noticing a failed command, following a long output to its file, compacting a Vietnamese conversation into English
-checkpoints that keep a fact, giving up a status polled between sleeps, and reporting when out of replies. It costs tokens, so ctest
+checkpoints that keep a fact, giving up a status polled between sleeps, reporting when out of replies, and
+following a skill, one listed in the prompt and one found by searching. It costs tokens, so ctest
 leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set, or with `ANTHROPIC_API_KEY` and `HX_MODEL=sonnet`
 (or `opus`, `haiku`).
 

@@ -173,6 +173,333 @@ local function extension_index()
 	return lines
 end
 
+-- Skills ----------------------------------------------------------------------------------------------------
+--
+-- A skill is instructions for one kind of task, in the Agent Skills format: a directory with a SKILL.md, whose
+-- YAML front matter has a name and a description, and whatever scripts and references the text points to. The
+-- system prompt lists them; skill(name) returns one's text, and any other words search names and descriptions.
+-- Only name, description and disable-model-invocation are read: hx has one tool and one wall, so allowed-tools,
+-- model and hooks mean nothing here. Directories are searched in this order, and the first skill of a name wins.
+-- A directory in the home directory is outside the wall unless hx was started with --ro for it; then it is
+-- simply not found.
+
+local home = host.env("HOME")
+M.skill_dirs = { ".hx/skills/", ".agents/skills/", ".claude/skills/" }
+if home and home:sub(1, 1) == "/" then
+	home = home:gsub("/+$", "")
+	table.insert(M.skill_dirs, home .. "/.agents/skills/")
+	table.insert(M.skill_dirs, home .. "/.claude/skills/")
+end
+M.skill_index_full = 30 -- up to this many skills, the system prompt lists each with its description
+M.skill_index_names = 150 -- up to this many, it lists their names; past it, only how many there are
+M.skill_description_limit = 250 -- characters of a description in the system prompt and in search results
+M.skill_matches = 8 -- search results returned
+
+local function trim(text)
+	return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- The fields of a SKILL.md's front matter that are plain or block scalars, and the text after it. Enough YAML for
+-- what skills put there: `key: value`, quoted values, values continued on indented lines, and | and > blocks.
+-- Nested maps are read as text and ignored.
+function M.skill_front_matter(text)
+	text = text:gsub("^\239\187\191", ""):gsub("\r\n", "\n")
+	local head, body = text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*\n(.*)$")
+	if not head then
+		head = text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*$")
+		body = ""
+	end
+	if not head then
+		return {}, text
+	end
+	local fields, lines, i = {}, head:split("\n"), 1
+	while i <= #lines do
+		local key, value = lines[i]:match("^([%w_%-]+):%s*(.-)%s*$")
+		i += 1
+		if key then
+			if value:match("^[|>][-+]?%d*$") then
+				local folded, block = value:sub(1, 1) == ">", {}
+				while i <= #lines and (lines[i]:match("^%s") or lines[i] == "") do
+					table.insert(block, trim(lines[i]))
+					i += 1
+				end
+				value = trim(table.concat(block, folded and " " or "\n"))
+				if folded then
+					value = value:gsub("  +", " ")
+				end
+			else
+				while i <= #lines and lines[i]:match("^%s+%S") do
+					value ..= " " .. trim(lines[i])
+					i += 1
+				end
+				if value:match('^".*"$') then
+					value = value:sub(2, -2):gsub('\\"', '"'):gsub("\\n", "\n"):gsub("\\\\", "\\")
+				elseif value:match("^'.*'$") then
+					value = value:sub(2, -2):gsub("''", "'")
+				end
+			end
+			fields[key] = value
+		end
+	end
+	return fields, body
+end
+
+-- Lower case, without - _ . and spaces: pdf-tools, PDF_Tools and pdftools are one name.
+local function skill_key(name)
+	return (name:lower():gsub("[%-_%.%s]", ""))
+end
+
+-- Every skill that can be found now: {name, description, dir, path, hidden}, in the order of M.skill_dirs and then
+-- by directory name. Found anew on each call, so a skill written in this session is found too.
+function M.skills()
+	local skills, seen = {}, {}
+	for _, dir in M.skill_dirs do
+		for _, entry in host.list(dir) or {} do
+			local dir_name = entry:match("^(.+)/$")
+			local path = dir_name and dir .. dir_name .. "/SKILL.md"
+			local text = path and host.read(path)
+			if text then
+				local fields = M.skill_front_matter(text)
+				local name = trim(fields.name or "")
+				name = name ~= "" and name or dir_name
+				if not seen[name] then
+					seen[name] = true
+					table.insert(skills, {
+						name = name,
+						description = trim(M.printable(fields.description or "")),
+						dir = dir .. dir_name .. "/",
+						path = path,
+						hidden = fields["disable-model-invocation"] == "true",
+					})
+				end
+			end
+		end
+	end
+	return skills
+end
+
+local function cut(text, limit)
+	text = text:gsub("%s+", " ")
+	if utf8.len(text) and utf8.len(text) > limit then
+		text = text:sub(1, utf8.offset(text, limit + 1) - 1) .. " ..."
+	end
+	return text
+end
+
+local function skill_line(skill)
+	local description = skill.description ~= "" and cut(skill.description, M.skill_description_limit)
+		or "(no description)"
+	return ("- %s: %s"):format(skill.name, description)
+end
+
+-- Edit distance between two strings, by bytes.
+local function distance(a, b)
+	local row = {}
+	for j = 0, #b do
+		row[j] = j
+	end
+	for i = 1, #a do
+		local diagonal = row[0]
+		row[0] = i
+		for j = 1, #b do
+			local above = row[j]
+			row[j] = math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a:byte(i) == b:byte(j) and 0 or 1))
+			diagonal = above
+		end
+	end
+	return row[#b]
+end
+
+local stop_words = {}
+for _, word in ("a an and the of for to in on with by or is it this that use using how what when do does skill"):split(" ") do
+	stop_words[word] = true
+end
+
+local function words(text)
+	local list = {}
+	for word in text:lower():gsub("[%-_]", " "):gmatch("[^%s%p]+") do
+		if #word > 1 and not stop_words[word] then
+			table.insert(list, word)
+		end
+	end
+	return list
+end
+
+-- Whether a word of the query matches one of a list: the same word, or one starts with the other (spreadsheet,
+-- spreadsheets) when both are at least 3 bytes long.
+local function word_score(word, list)
+	local best = 0
+	for _, other in list do
+		if other == word then
+			return 1
+		elseif #word >= 3 and #other >= 3 and (other:sub(1, #word) == word or word:sub(1, #other) == other) then
+			best = 0.6
+		end
+	end
+	return best
+end
+
+-- How well a skill matches a query: the whole name close to the query, then the query's words in the name and in
+-- the description. 0 is no match.
+local function skill_score(skill, query)
+	local q, n = skill_key(query), skill_key(skill.name)
+	local score = 0
+	if #q >= 3 and (n:find(q, 1, true) or q:find(n, 1, true)) then
+		score += 6
+	elseif #q >= 4 and #n >= 4 then
+		local d = distance(q, n)
+		if d <= 2 then
+			score += 5 - d
+		end
+	end
+	local name_words, description_words = words(skill.name), words(skill.description)
+	for _, word in words(query) do
+		score += 3 * word_score(word, name_words) + word_score(word, description_words)
+	end
+	return score
+end
+
+M.skill_files_shown = 30 -- files of a loaded skill named, with their paths, in its heading
+
+-- The files of a skill other than SKILL.md, as paths from the project directory, so that the model can use them as
+-- they are: up to M.skill_files_shown, three directories deep.
+local function skill_files(dir)
+	local files = {}
+	local function walk(path, depth)
+		for _, entry in host.list(path) or {} do
+			if #files >= M.skill_files_shown then
+				return
+			end
+			if entry:sub(-1) == "/" then
+				if depth < 3 then
+					walk(path .. entry, depth + 1)
+				end
+			elseif path .. entry ~= dir .. "SKILL.md" then
+				table.insert(files, path .. entry)
+			end
+		end
+	end
+	walk(dir, 1)
+	return files
+end
+
+-- What skill(text) returns: the skill named text, or else the skills that match it best.
+function M.skill(text)
+	local skills = M.skills()
+	if #skills == 0 then
+		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
+			.. table.concat(M.skill_dirs, ", ") .. "."
+	end
+	local found
+	for _, skill in skills do
+		if skill.name == text then
+			found = { skill }
+			break
+		end
+	end
+	if not found then
+		found = {}
+		for _, skill in skills do
+			if skill_key(skill.name) == skill_key(text) then
+				table.insert(found, skill)
+			end
+		end
+	end
+	if #found == 1 then
+		local skill = found[1]
+		local source, err = host.read(skill.path)
+		if not source then
+			error(("skill: %s: %s"):format(skill.path, err), 0)
+		end
+		local _, body = M.skill_front_matter(source)
+		progress("  skill " .. skill.name)
+		local files = skill_files(skill.dir)
+		local head = ("[skill %s, in %s. A path in it that names one of the skill's own files is relative to that "
+			.. "directory; everything else is the project's."):format(skill.name, skill.dir)
+		if #files > 0 then
+			head ..= " Its files: " .. table.concat(files, ", ")
+		end
+		return head .. "]\n\n" .. trim(body)
+	elseif #found > 1 then
+		local lines = { ("Several skills have a name like %q; load one by its exact name:"):format(text) }
+		for _, skill in found do
+			table.insert(lines, skill_line(skill) .. " (" .. skill.path .. ")")
+		end
+		return table.concat(lines, "\n")
+	end
+
+	local ranked = {}
+	for _, skill in skills do
+		local score = not skill.hidden and skill_score(skill, text) or 0
+		if score > 0 then
+			table.insert(ranked, { skill = skill, score = score })
+		end
+	end
+	table.sort(ranked, function(a, b)
+		if a.score ~= b.score then
+			return a.score > b.score
+		end
+		return a.skill.name < b.skill.name
+	end)
+	local lines = {}
+	if #ranked == 0 then
+		table.insert(lines, ("No skill is named %q or matches it."):format(text))
+		local shown = {}
+		for _, skill in skills do
+			if not skill.hidden then
+				table.insert(shown, skill)
+			end
+		end
+		if #shown > 0 and #shown <= 20 then
+			table.insert(lines, "The skills are:")
+			for _, skill in shown do
+				table.insert(lines, skill_line(skill))
+			end
+		else
+			table.insert(lines, ("There are %d skills; try other words."):format(#shown))
+		end
+		return table.concat(lines, "\n")
+	end
+	table.insert(lines, ("No skill is named %q. The closest by name and description:"):format(text))
+	for i = 1, math.min(#ranked, M.skill_matches) do
+		table.insert(lines, skill_line(ranked[i].skill))
+	end
+	table.insert(lines, "Load one with skill(name).")
+	return table.concat(lines, "\n")
+end
+
+-- The system prompt's part on skills: each with its description, or only their names, or only how many there are.
+local function skill_index()
+	local shown = {}
+	for _, skill in M.skills() do
+		if not skill.hidden then
+			table.insert(shown, skill)
+		end
+	end
+	if #shown == 0 then
+		return nil
+	end
+	local head = "Skills are instructions for particular kinds of task. When the task matches one, load it with "
+		.. "skill(name) before you start, and follow it."
+	if #shown <= M.skill_index_full then
+		local lines = { head }
+		for _, skill in shown do
+			table.insert(lines, skill_line(skill))
+		end
+		return table.concat(lines, "\n")
+	end
+	if #shown <= M.skill_index_names then
+		local names = {}
+		for _, skill in shown do
+			table.insert(names, skill.name)
+		end
+		return ("%s There are %d: %s. skill(words) searches their names and descriptions."):format(head, #shown,
+			table.concat(names, ", "))
+	end
+	return ("%s There are %d; skill(words) searches their names and descriptions, so search when a task may have "
+		.. "one."):format(head, #shown)
+end
+
 -- Functions -------------------------------------------------------------------------------------------------
 --
 -- The model has one tool, `lua`, and acts by calling functions from the code it sends. Each function is
@@ -362,6 +689,19 @@ M.functions = {
 				error(write_err, 0)
 			end
 			return ("replaced %d occurrence%s in %s"):format(count, count == 1 and "" or "s", path)
+		end,
+	},
+	{
+		name = "skill",
+		usage = "skill(name) -> text: the instructions of the skill of that name (case, - and _ do not matter), "
+			.. "headed by its directory; any other words search the skills' names and descriptions and return the "
+			.. "closest.",
+		run = function(text)
+			check("skill", text, 1, "name", "string")
+			if trim(text) == "" then
+				error("skill: give a skill's name, or words to search for", 0)
+			end
+			return M.skill(trim(text))
 		end,
 	},
 }
@@ -709,7 +1049,9 @@ function M.system_prompt()
 			.. "are Luau modules in .hx/ext/NAME.luau: the first line is a `--` comment saying what the module does, "
 			.. "and it returns "
 			.. "a table of functions. Call one from your code as ext(\"NAME\").fn(...); write it with write(). Extensions stay with "
-			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore.",
+			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore. "
+			.. "A procedure you will follow again, rather than code, is a skill: .hx/skills/NAME/SKILL.md, with front "
+			.. "matter giving its name and a description of when to use it.",
 		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
 			.. "range of lines or go on through a large file. Read a file before you edit it, unless "
 			.. "you wrote or edited it yourself in this session.",
@@ -718,6 +1060,10 @@ function M.system_prompt()
 	local extensions = extension_index()
 	if #extensions > 0 then
 		table.insert(parts, "Extensions:\n" .. table.concat(extensions, "\n"))
+	end
+	local skills = skill_index()
+	if skills then
+		table.insert(parts, skills)
 	end
 	local notes = host.read(".hx/prompt.md")
 	if notes and notes ~= "" then

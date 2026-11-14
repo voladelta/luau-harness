@@ -186,6 +186,41 @@ class LiveTest(unittest.TestCase):
         self.assertIn("not", answer.lower())
         self.assertFalse(re.search(r"\.hx|debug\.", self.all_code()), "the model tried to change what it checks")
 
+    def skill(self, directory, name, description, body):
+        self.write_path(f"{directory}/{name}/SKILL.md", f"---\nname: {name}\ndescription: {description}\n---\n{body}")
+
+    def write_path(self, name, data):
+        os.makedirs(os.path.dirname(os.path.join(self.project, name)), exist_ok=True)
+        self.write(name, data)
+
+    def test_a_skill_listed_in_the_prompt_is_loaded_and_followed(self):
+        self.skill(".claude/skills", "greeting-files", "How greeting files are written in this project. Use whenever "
+                   "asked to write a greeting.", "Write the greeting to greetings/NAME.txt, NAME in lower case. The "
+                   "greeting is one line in capital letters, and the file's last line is what scripts/footer.sh "
+                   "prints.\n")
+        # The script is found next to the skill, and the greeting still goes into the project.
+        self.write_path(".claude/skills/greeting-files/scripts/footer.sh", "#!/bin/sh\necho '-- hx'\n")
+        self.run_hx("write a greeting for Ana")
+        self.assertTrue(any("skill(" in code for code in self.code()), "the skill was not loaded")
+        text = self.read("greetings/ana.txt")
+        self.assertEqual(text.strip().splitlines()[-1], "-- hx")
+        self.assertEqual(text.strip().splitlines()[0], text.strip().splitlines()[0].upper())
+
+    def test_a_skill_not_listed_is_found_by_search(self):
+        # Past M.skill_index_names the prompt gives only how many skills there are, so the model has to search.
+        self.overlay("M.skill_index_full = 0\nM.skill_index_names = 0")
+        self.skill(".agents/skills", "ship-it", "Deploy a release of this project to production.",
+                   "In this project, deploying means writing the single word DEPLOYED to the file deploy.log. Do "
+                   "nothing else.\n")
+        for name, about in (("pdf-tools", "Read and merge PDF files."), ("xlsx", "Edit Excel spreadsheets."),
+                            ("changelog", "Write the changelog from git history.")):
+            self.skill(".agents/skills", name, about, "Not this one.\n")
+        self.run_hx("deploy the release")
+        code = "\n".join(self.code())
+        self.assertIn("skill(", code)
+        self.assertNotIn("ship-it", self.code()[0], "the name was not in the prompt, so it cannot be known up front")
+        self.assertEqual(self.read("deploy.log").strip(), "DEPLOYED")
+
     def test_running_out_of_replies_ends_with_a_report(self):
         self.overlay("M.max_replies = 2")
         for name in ("a", "b", "c", "d"):
