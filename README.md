@@ -30,7 +30,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | [Recovery](docs/cli.md#checkpoints-and-resume) | `--resume` restores saved data and controller state into a fresh VM; old effectful chunks are never replayed |
 | [Budgets](docs/configuration.md#policytoml) | Token and wall-clock admission thresholds; each request reserves its upper bound in tokens |
 | [Compaction](docs/configuration.md#initluau-compaction-and-recheck) | On by default: at 80% of the context window (1M unless `--context-window` or the provider says otherwise), older history becomes a structured summary; Luau globals stay |
-| [Extensions](docs/extending.md) | Override any `std` module; add single-file tools, approved packages, skills and MCP servers |
+| [Extensions](docs/extending.md) | Override any `std` module; add single-file tools, packages, skills and MCP servers, all covered by workspace trust |
 | Any provider | Responses API; any compatible base URL (OpenRouter by default) |
 
 ## Quick example
@@ -121,8 +121,8 @@ hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1
 | `hx run` | Run an agent task (`--rpi`, `--resume LOG`, `--branch LOG`) |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
 | `hx review` / `hx recover` / `hx revoke` | Record an RPI review decision, settle an uncertain operation, stop a run |
-| `hx trust` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
-| `hx approve` / `hx skills` / `hx test` | Approve packages and skills, list skills, run a package's tests |
+| `hx trust` | Review this workspace's `.harness` config, packages and skills, then trust them |
+| `hx skills` / `hx test` | List skills and their state, run a package's tests |
 | `hx log verify LOG` | Check a log's hash chain and recovery accounting |
 | `hx paths` | Print where this workspace's logs, state and secrets are kept, and the trust store |
 
@@ -153,11 +153,11 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 ## Security model
 
 - hx keeps everything it treats as authority or as a secret outside the workspace, in its own configuration (`$XDG_CONFIG_HOME/hx`: trust store, credentials) and state (`$XDG_STATE_HOME/hx`: journals, `hx-ar`'s runs) directories. No root may contain them: a workspace, `[fs]` root or path grant that would is refused.
-- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools refuse hx's own directories, protect `.harness/`, `hx.lock`, `.git/config` and `.git/hooks`, refuse credential files by name (`id_rsa`, `.netrc`, `secrets.toml`, ...), and writes refuse symlinks.
+- `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools refuse hx's own directories, protect `.harness/`, `.agents/skills/` (the workspace's and your own in `~/.agents/skills`), `.git/config` and `.git/hooks`, refuse credential files by name (`id_rsa`, `.netrc`, `secrets.toml`, ...), and writes refuse symlinks.
 - With Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and so cannot reach hx's journals, autoresearch runs, credentials or trust store, nor an episode's grader and held-out roots. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Without Landlock hx says so once per run and children run unconfined.
 - Network and GPU isolation belong to the environment running hx; configure them in your sandbox or container.
 - By default, `sh` and local MCP servers receive a minimal environment without inherited API keys. Shell commands run in their own process group, killed when the command ends. A process that detaches into its own session (`setsid`, a daemon) leaves that group and is not killed, even when hx exits.
-- `hx run` refuses workspace config until you [trust](docs/configuration.md#workspace-trust) it (or pass `--ignore-config`). Shell commands are classed read / local write / external / irreversible to decide when to ask; obvious external commands such as `git push` ask for approval unless pre-approved or launched with `--yes`, and irreversible ones always need an exact `allow` entry or your answer. The classifier is approval UX, not a guard: a command can reach the network without naming any known program.
+- `hx run` refuses workspace config, packages and skills until you [trust](docs/configuration.md#workspace-trust) them (or pass `--ignore-config`); a package gets only the capabilities its trusted `hx.toml` declares, and any later edit, including one by the agent's shell commands, needs `hx trust` again. Shell commands are classed read / local write / external / irreversible to decide when to ask; obvious external commands such as `git push` ask for approval unless pre-approved or launched with `--yes`, and irreversible ones always need an exact `allow` entry or your answer. The classifier is approval UX, not a guard: a command can reach the network without naming any known program.
 
 ## Documentation
 
@@ -165,7 +165,7 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 |---|---|
 | [Command reference](docs/cli.md) | Every command and flag, the run report, resume and branch |
 | [Workflows](docs/workflows.md) | `--rpi` stages and review gates; `hx-ar` setup and how a search runs |
-| [Configuration](docs/configuration.md) | `policy.toml`, `mcp.toml`, compaction and recheck, workspace trust, `hx.lock` |
+| [Configuration](docs/configuration.md) | `policy.toml`, `mcp.toml`, compaction and recheck, workspace trust |
 | [Extending](docs/extending.md) | Module overrides, single-file and HTTP tools, packages, skills, credentials, the bundled example tools |
 | [Runtime v2](docs/runtime-v2.md) | State ownership, dispatch and uncertainty, durable data, recovery guarantees |
 

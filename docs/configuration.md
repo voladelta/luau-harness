@@ -1,6 +1,6 @@
 # Configuration
 
-Workspace configuration lives in `.harness/` in the workspace. File tools can read it but refuse writes; shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
+Workspace configuration lives in `.harness/` in the workspace, with the workspace's agent skills in `.agents/skills/`. File tools can read both but refuse writes; shell commands and MCP servers are [confined](#shell-confinement) to the same file roots. Workspace config is used only after you trust it with `hx trust` (see [Workspace trust](#workspace-trust)).
 
 | File | Purpose |
 |---|---|
@@ -9,7 +9,7 @@ Workspace configuration lives in `.harness/` in the workspace. File tools can re
 | `.harness/init.luau` | Toggles for `std` modules such as compaction and recheck |
 | `.harness/ar.toml` | `hx-ar`'s autoresearch setup (see [workflows](workflows.md#harnessartoml)); trust covers every `.harness/*.toml` |
 | `.harness/override/`, `.harness/tools/`, `.harness/pkgs/` | Extensions (see [Extending](extending.md)) |
-| `hx.lock` | Approved packages and their content hashes |
+| `.agents/skills/` | The workspace's agent skills |
 
 What hx treats as authority or as a secret is kept outside the workspace, in its own directories, which no root of the model's may contain:
 
@@ -85,7 +85,7 @@ Nothing else is reachable: in particular not hx's configuration and state direct
 What stays open:
 
 - Network and GPU access: use your container or sandbox.
-- Protected configuration inside a write root (`.harness/`, `hx.lock`) is still writable by shell commands; Landlock cannot remove write access from part of a writable tree without breaking file creation in it. Edited config is no longer trusted.
+- Protected configuration inside a write root (`.harness/`, `.agents/skills/`) is still writable by shell commands; Landlock cannot remove write access from part of a writable tree without breaking file creation in it. Edited config is no longer trusted.
 - Pathname Unix sockets (the user's D-Bus or systemd socket, `docker.sock`) are reachable before Landlock ABI 9 (Linux 7.1); Landlock cannot confine them on older kernels.
 - `.git/config` and `.git/hooks` are refused to file tools but writable by shell commands, like the rest of the workspace.
 - Credential files that sit inside a read root (`id_rsa`, `.netrc` and the rest that file tools refuse by name) are readable by shell commands. `--yes` grants single files only: it never grants a directory, for reading or writing, so it cannot put one such as `~/.ssh` in a command's reach, and it does not grant writing a hidden file or anything under a hidden directory (`~/.bashrc`, `~/.ssh/authorized_keys`, `~/.config/...`, another repository's `.git/hooks`), where a write becomes code that runs later. Only your answer on the terminal can grant those.
@@ -108,25 +108,23 @@ require("std/recheck").enabled = true
 
 ## Workspace trust
 
-Every `.harness/*.toml` (hx's `policy.toml` and `mcp.toml`, and the config of programs built on hx, such as `ar.toml`), `.harness/init.luau`, `.harness/override/`, `.harness/tools/` and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in the trust store (`trust.toml` in hx's configuration directory, outside the repo and every root of the model's), `hx run` and `hx exec` refuse to start:
+Every `.harness/*.toml` (hx's `policy.toml` and `mcp.toml`, and the config of programs built on hx, such as `ar.toml`), `.harness/init.luau`, `.harness/override/`, `.harness/tools/`, the packages in `.harness/pkgs/` and the agent skills in `.agents/skills/` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or install a package with capabilities. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in the trust store (`trust.toml` in hx's configuration directory, outside the repo and every root of the model's), `hx run` and `hx exec` refuse to start:
 
 ```text
-Error: this workspace's config is not trusted (.harness/policy.toml); review it and run `hx trust`, or pass --ignore-config to run without it
+Error: this workspace's config is not trusted (.agents/skills/deploy, .harness/policy.toml); review it and run `hx trust`, or pass --ignore-config to run without it
 ```
 
+`hx trust` prints every config file (control characters escaped), then one line per package and skill with what it is granted: its name, kind, the capabilities its `hx.toml` declares and its file count. An agent skill is listed as having no Luau and no capabilities. Then it prints the hash and asks.
+
+- A package gets exactly the capabilities its trusted `hx.toml` declares; there is no separate approval. A package or skill that cannot be read (a symlink inside it, an invalid name, a broken `hx.toml`) is listed with the reason and never loads.
+- Any edit makes the workspace untrusted again, whoever made it: you, or the agent's shell commands, which can write `.harness/` and `.agents/skills/` (file tools cannot). The refusal names what changed since you trusted it, for example `.harness/pkgs/slug (changed), .agents/skills/notes (new)`, and `hx trust` repeats it before asking.
 - `--ignore-config` runs without any of this workspace's config, trusted or not.
-- Any edit makes the workspace untrusted again.
 - `hx run --resume` is never refused: a resumed run uses only its frozen manifest.
-- `hx approve` keeps an already trusted workspace trusted.
 - A workspace without such files needs nothing.
 - `HX_TRUST=HASH` in hx's environment trusts exactly that config for one launch (throwaway copies, scripts); `hx trust` prints the hash.
 
-## Approvals and `hx.lock`
+The hash is SHA-256 over every config file, and every file of every package and skill (entries starting with `.` excluded, so a skill's `.git` is not part of it), each as its length-prefixed workspace-relative path followed by its length-prefixed content, in path order. A run builds its policy and extensions from the bytes trust checked, never from a second read of the files.
 
-`hx.lock` is the single approval record: per package, the approved version, what it was approved as (`kind = "package"` for `.harness/pkgs/NAME`, `"agent-skill"` for a skill under `.agents/skills`) and its content hash. The hash covers the package's `hx.toml`, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval. An approval holds only where it was made: a skill approved under `.agents/skills` (no Luau, no capabilities) that is copied into `.harness/pkgs` is not approved there, whatever its `hx.toml` says.
+Your own skills in `~/.agents/skills` are not part of any workspace and need no approval: they load in every workspace (a workspace package or skill of the same name shadows one). What keeps the model from changing them: they lie outside every root it can write, file tools refuse writes under `~/.agents/skills` in every mode, and no grant can reach them (`--yes` grants single files, but never a protected path nor a write under a hidden directory, and a directory grant needs your answer on the terminal). Shell commands cannot write them unless your own `policy.toml` adds a write root that contains them.
 
-The hash is SHA-256 over a tag naming the kind, then every file of the package (entries starting with `.` excluded), each as its length-prefixed relative path followed by its length-prefixed content, in path order. `hx approve`, `hx skills` and a run's launch read a package through the same function, so they agree on what was approved. Locks written by hx versions before this encoding no longer match: run `hx approve NAME` again for each package and skill.
-
-A run builds its extensions from the config bytes trust checked, `hx.lock` included, never from a second read of the files. `hx.lock` is replaced atomically.
-
-Older lock files may still carry `[package.grants]` tables or a `.harness/grants.toml`; hx ignores both.
+A `hx.lock` left by an older version is ignored, with one note on stderr; trust covers what it used to approve.

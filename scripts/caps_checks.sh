@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runtime capability enforcement: a project package only gets the primitives it requested AND the user granted.
+# Runtime capability enforcement: a project package only gets the primitives its trusted hx.toml declares.
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
 W=$T/ws; mkdir -p $W/.harness/pkgs/reader/tests $W/.harness/pkgs/runner/tests; echo hello > $W/a.txt
@@ -53,18 +53,16 @@ local m = require("runner")
 test.case("proc.sh granted: sh works (direct shell)", function() test.eq(m.sh(), "done\n") end)
 test.case("fs.write still denied", function() local ok, e = pcall(m.write) test.ok(not ok and tostring(e):find("capability_denied", 1, true)) end)
 LUA
-check "unapproved packages are refused" "$($H test $W/.harness/pkgs/reader --workspace $W 2>&1 | grep -c 'is not locked')" "1"
-$H approve reader --workspace $W >/dev/null; $H approve runner --workspace $W >/dev/null
 out=$($H test $W/.harness/pkgs/reader --workspace $W 2>&1); check "reader package: all capability and escape tests pass" "$(echo "$out" | tail -1)" "6 passed, 0 failed"; echo "$out" | grep FAIL
 out=$($H test $W/.harness/pkgs/runner --workspace $W 2>&1); check "runner package: proc.sh granted, fs.write denied" "$(echo "$out" | tail -1)" "2 passed, 0 failed"; echo "$out" | grep FAIL
 
-# a package that asks for more than was granted is refused at load
-printf '[package]\nname = "greedy"\nversion = "0.1.0"\n[capabilities]\nfs = ["read", "write"]\nproc = ["sh"]\n' > /dev/null
+# a package that asks for more after the owner trusted it is not loaded until trusted again
 mkdir -p $W/.harness/pkgs/greedy/tests; cp $W/.harness/pkgs/reader/init.luau $W/.harness/pkgs/greedy/init.luau
 printf '[package]\nname = "greedy"\nversion = "0.1.0"\n[capabilities]\nfs = ["read"]\n' > $W/.harness/pkgs/greedy/hx.toml; echo 'test.case("x", function() require("greedy") end)' > $W/.harness/pkgs/greedy/tests/t.luau
-$H approve greedy --workspace $W >/dev/null
+HX_TRUST= $H trust --workspace $W --yes >/dev/null
 printf '[package]\nname = "greedy"\nversion = "0.1.0"\n[capabilities]\nfs = ["read", "write"]\nproc = ["sh"]\n' > $W/.harness/pkgs/greedy/hx.toml
-check "widening capabilities after approval is refused (hash changed)" "$($H test $W/.harness/pkgs/greedy --workspace $W 2>&1 | grep -c 'changed since it was approved')" "1"
+check "widening capabilities after trust untrusts the workspace" "$(HX_TRUST= $H exec --workspace $W 'print(1)' 2>&1 | grep -c 'changed since you trusted it: .harness/pkgs/greedy (changed)')" "1"
+check "...and the trust review shows the wider capabilities" "$(HX_TRUST= $H trust --workspace $W </dev/null 2>&1 | grep -c '^greedy .*capabilities fs=read+write proc=sh, 3 files')" "1"
 
 # the model's own session has none of the escape hatches either
 out=$($H exec --workspace $W 'print(getfenv, setfenv, loadstring, require)' | head -1)

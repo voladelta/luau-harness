@@ -9,7 +9,7 @@ cleanup() { rm -rf "$W" "$OUT"; pkill -f "sleep 987" 2>/dev/null; }
 run() { $H exec --workspace "$W" "$@" 2>&1; }
 
 echo SECRET > $S1; echo ORIGINAL > $W/inside.txt
-mkdir -p $W/.harness/override/std; echo 'return 1' > $W/.harness/override/std/marker.luau; echo '[grant.x]' > $W/.harness/grants.toml; echo lock > $W/hx.lock; echo 'return 1' > $W/.harness/init.luau
+mkdir -p $W/.harness/override/std; echo 'return 1' > $W/.harness/override/std/marker.luau; echo '[grant.x]' > $W/.harness/grants.toml; mkdir -p $W/.agents/skills/s; echo x > $W/.agents/skills/s/SKILL.md; echo 'return 1' > $W/.harness/init.luau
 
 # --- normal work still works
 out=$(run 'write("sub/dir/new.txt", "hello")
@@ -59,7 +59,7 @@ out=$(run 'local r = search("SECRET", {path = "link-dir"}) print(#r)' 2>&1 | hea
 check "search through symlinked dir finds nothing" "$(echo "$out" | grep -c '^0$\|outside')" "1"
 
 # --- protected harness configuration
-for f in .harness/grants.toml hx.lock .harness/init.luau .harness/override/std/marker.luau; do
+for f in .harness/grants.toml .agents/skills/s/SKILL.md .agents/skills/new/SKILL.md .harness/init.luau .harness/override/std/marker.luau; do
   out=$(run "print(pcall(write, \"$f\", \"x\"))" | head -1)
   check "write() cannot modify $f" "$(echo "$out" | grep -c 'protected')" "1"
 done

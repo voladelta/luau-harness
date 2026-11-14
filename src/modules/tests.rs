@@ -1,8 +1,8 @@
-use super::approval::{Kind, Location, Lockfile, Snapshot, digest, snapshot};
 use super::frontmatter_description as d;
 use super::*;
+use crate::dirs::TestDirs;
+use crate::trust::{self, Config};
 use anyhow::Result;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A fresh, empty workspace under the temp dir.
@@ -39,13 +39,6 @@ fn trusted_registry(root: &Path) -> Registry {
     .unwrap()
 }
 
-/// The lock's verdict on a package directory.
-fn verdict(root: &Path, name: &str, dir: &Path) -> Result<Snapshot> {
-    Lockfile::read(&root.join("hx.lock"))
-        .unwrap()
-        .approved(name, Location::Package(dir.to_path_buf()))
-}
-
 fn err(r: Result<impl Sized>) -> String {
     match r {
         Ok(_) => panic!("expected an error"),
@@ -66,71 +59,6 @@ fn frontmatter_description_forms() {
     );
     assert_eq!(d("---\ndescription: |\n  block\n---\n"), "block");
     assert_eq!(d("no frontmatter"), "");
-}
-
-#[test]
-fn package_must_be_locked_and_unchanged() {
-    let root = ws("lock");
-    let dir = install_pkg(&root, "foo");
-    let r = Resolver::new(root.clone());
-    assert!(err(verdict(&root, "foo", &dir)).contains("not locked"));
-    // Approval records the exact content, manifest (and so capabilities) included.
-    let msg = r.approve("foo").unwrap();
-    assert!(msg.starts_with("approved foo 1.0"), "{msg}");
-    let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
-    assert!(
-        lock.contains("name = \"foo\"") && lock.contains("version = \"1.0\""),
-        "{lock}"
-    );
-    assert!(!lock.contains("grants"), "{lock}");
-    assert!(verdict(&root, "foo", &dir).is_ok());
-    // any content change invalidates the lock
-    std::fs::write(dir.join("init.luau"), "return { x = 2 }\n").unwrap();
-    assert!(err(verdict(&root, "foo", &dir)).contains("changed since it was approved"));
-    // so does a version that differs from the locked one
-    std::fs::write(
-        dir.join("hx.toml"),
-        "[package]\nversion = \"2.0\"\n\n[capabilities]\nfs = [\"read\"]\n",
-    )
-    .unwrap();
-    // lock the new content under the old version: only the version differs
-    let digest = snapshot(Location::Package(dir.clone())).unwrap().digest;
-    std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"1.0\"\nkind = \"package\"\nhash = {digest:?}\n")).unwrap();
-    assert!(err(verdict(&root, "foo", &dir)).contains("changed since it was approved"));
-    // an entry that does not say what it approved (written before entries recorded it) matches nothing
-    std::fs::write(
-        root.join("hx.lock"),
-        format!("[[package]]\nname = \"foo\"\nversion = \"2.0\"\nhash = {digest:?}\n"),
-    )
-    .unwrap();
-    assert!(err(verdict(&root, "foo", &dir)).contains("changed since it was approved"));
-    std::fs::write(root.join("hx.lock"), format!("[[package]]\nname = \"foo\"\nversion = \"2.0\"\nkind = \"package\"\nhash = {digest:?}\n")).unwrap();
-    assert!(verdict(&root, "foo", &dir).is_ok());
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn capabilities_come_from_the_locked_manifest() {
-    let root = ws("grants");
-    let dir = install_pkg(&root, "foo");
-    let r = Resolver::new(root.clone());
-    r.approve("foo").unwrap();
-    // A lock written before grants were dropped still parses; its extra table is ignored.
-    let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
-    std::fs::write(
-        root.join("hx.lock"),
-        format!("{lock}\n[package.grants]\nfs = [\"read\"]\n"),
-    )
-    .unwrap();
-    assert!(verdict(&root, "foo", &dir).is_ok());
-    // Requesting more is a manifest edit, so it changes the digest and needs a new approval.
-    std::fs::write(
-        dir.join("hx.toml"),
-        "[package]\nversion = \"1.0\"\n\n[capabilities]\nfs = [\"read\", \"write\"]\n",
-    )
-    .unwrap();
-    assert!(err(verdict(&root, "foo", &dir)).contains("changed since it was approved"));
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -158,40 +86,15 @@ fn a_misspelt_capability_or_table_is_a_load_error() {
 }
 
 #[test]
-fn approve_keeps_other_entries_and_rejects_unknown_names() {
-    let root = ws("approve");
-    install_pkg(&root, "foo");
-    install_pkg(&root, "bar");
-    let r = Resolver::new(root.clone());
-    r.approve("foo").unwrap();
-    r.approve("bar").unwrap();
-    r.approve("foo").unwrap();
-    let lock = std::fs::read_to_string(root.join("hx.lock")).unwrap();
-    assert_eq!(lock.matches("[[package]]").count(), 2);
-    assert!(
-        lock.find("\"bar\"").unwrap() < lock.find("\"foo\"").unwrap(),
-        "sorted by name: {lock}"
-    );
-    assert!(err(r.approve("nope")).contains("no package or skill named nope"));
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
 fn names_are_validated_and_std_cannot_be_shadowed() {
     let root = ws("names");
     for bad in ["std", "project", "my.pkg", "a:b", "Upper", "-x", ""] {
         assert!(!valid_package_name(bad), "{bad}");
     }
     assert!(valid_package_name("video-craft") && valid_package_name("tool_2"));
-    let r = Resolver::new(root.clone());
     for bad in ["std", "my.pkg", "a:b"] {
         install_pkg(&root, bad);
-        assert!(
-            err(r.approve(bad)).contains("not a valid package name"),
-            "{bad}"
-        );
     }
-    std::fs::write(root.join("hx.lock"), "").unwrap();
     // an installed package named std neither replaces nor breaks the built-in package
     let registry = trusted_registry(&root);
     assert_eq!(registry.resolve("std").unwrap().origin, "std/init.luau");
@@ -240,7 +143,6 @@ fn only_the_built_in_std_package_is_tested_as_the_built_in_suite() {
 #[test]
 fn frozen_registry_resolves_overrides_packages_and_builtins() {
     let root = ws("resolve");
-    let r = Resolver::new(root.clone());
     let registry = trusted_registry(&root);
     let source = registry.resolve("std/printer").unwrap();
     assert_eq!(
@@ -260,8 +162,6 @@ fn frozen_registry_resolves_overrides_packages_and_builtins() {
         "return {}\n",
     );
     install_pkg(&root, "foo");
-    assert!(err(trusted_registry(&root).resolve("foo")).contains("not locked"));
-    r.approve("foo").unwrap();
     let registry = trusted_registry(&root);
     assert_eq!(registry.resolve("project/init").unwrap().text, "-- init\n");
     let source = registry.resolve("std/printer").unwrap();
@@ -298,7 +198,6 @@ fn overrides_replace_built_in_files_only() {
     );
     write(root.join(".harness/override/foo/init.luau"), "return {}\n");
     install_pkg(&root, "foo");
-    Resolver::new(root.clone()).approve("foo").unwrap();
     let registry = trusted_registry(&root);
     assert_eq!(
         registry.asset("std/system.md").unwrap(),
@@ -314,37 +213,23 @@ fn overrides_replace_built_in_files_only() {
 #[test]
 fn the_registry_is_built_from_the_bytes_trust_read() {
     let root = ws("trustbytes");
-    install_pkg(&root, "foo");
-    Resolver::new(root.clone()).approve("foo").unwrap();
-    let config = crate::trust::Config::read(&root).unwrap();
-    // hx.lock changes after trust read it: the registry still follows the bytes that were judged
-    std::fs::write(root.join("hx.lock"), "").unwrap();
-    let registry = Registry::build(&root, Some(config), &crate::dirs::TestDirs::new()).unwrap();
-    assert!(registry.resolve("foo").is_ok());
-    assert!(trusted_registry(&root).resolve("foo").is_err());
+    let dir = install_pkg(&root, "foo");
+    let config = Config::read(&root).unwrap();
+    // the package changes after trust read it: the registry still loads the bytes that were judged
+    std::fs::write(dir.join("init.luau"), "return { x = 2 }\n").unwrap();
+    std::fs::write(
+        dir.join("hx.toml"),
+        "[package]\nversion = \"1.0\"\n[capabilities]\nproc = [\"sh\"]\n",
+    )
+    .unwrap();
+    let registry = Registry::build(&root, Some(config), &TestDirs::new()).unwrap();
+    let foo = registry.resolve("foo").unwrap();
+    assert_eq!(foo.text, "return { x = 1 }\n");
+    assert_eq!(
+        foo.pkg.unwrap().1,
+        crate::supervisor::Capabilities::from([crate::supervisor::Capability::FsRead])
+    );
     let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn the_digest_frames_paths_and_contents() {
-    // Without length framing, `a\0x\0b\0y\0` is both one file a = "x\0b\0y" and two files a = "x", b = "y".
-    let one = BTreeMap::from([("a".to_string(), b"x\0b\0y".to_vec())]);
-    let two = BTreeMap::from([
-        ("a".to_string(), b"x".to_vec()),
-        ("b".to_string(), b"y".to_vec()),
-    ]);
-    assert_ne!(digest(Kind::Package, &one), digest(Kind::Package, &two));
-    let moved = BTreeMap::from([
-        ("a".to_string(), b"xb".to_vec()),
-        ("b".to_string(), b"".to_vec()),
-    ]);
-    let kept = BTreeMap::from([
-        ("a".to_string(), b"x".to_vec()),
-        ("b".to_string(), b"b".to_vec()),
-    ]);
-    assert_ne!(digest(Kind::Package, &moved), digest(Kind::Package, &kept));
-    // the same files approved as a skill and as a package are different approvals
-    assert_ne!(digest(Kind::Package, &one), digest(Kind::AgentSkill, &one));
 }
 
 #[test]
@@ -363,12 +248,12 @@ fn an_agent_skill_has_no_luau_and_no_capabilities() {
         dir.join("init.luau"),
         "return { run = function() return sh('id') end }\n",
     );
-    let msg = Resolver::new(root.clone()).approve("foo").unwrap();
+    let review = Config::read(&root).unwrap().review();
     assert!(
-        msg.contains("no Luau and no capabilities") && msg.contains("hx.toml is an ordinary file"),
-        "{msg}"
+        review.contains("no Luau and no capabilities (its hx.toml is an ordinary file), 3 files"),
+        "{review}"
     );
-    assert!(!msg.contains(".harness/pkgs"), "{msg}");
+    assert!(!review.contains("proc=sh"), "{review}");
     let registry = trusted_registry(&root);
     assert!(registry.capabilities["foo"].0.is_empty());
     assert!(registry.resolve("foo").is_err());
@@ -386,45 +271,6 @@ fn an_agent_skill_has_no_luau_and_no_capabilities() {
 }
 
 #[test]
-fn a_skill_approval_does_not_approve_the_same_files_as_a_package() {
-    let root = ws("skillaspkg");
-    let skill = root.join(".agents/skills/foo");
-    write(
-        skill.join("SKILL.md"),
-        "---\ndescription: inert\n---\nbody\n",
-    );
-    // the manifest claims the version every agent skill gets, so only the kind tells the two approvals apart
-    write(
-        skill.join("hx.toml"),
-        "[package]\nversion = \"agent-skill\"\nkind = \"tool\"\n[capabilities]\nproc = [\"sh\"]\n",
-    );
-    write(
-        skill.join("init.luau"),
-        "return { run = function() return sh('id') end }\n",
-    );
-    Resolver::new(root.clone()).approve("foo").unwrap();
-    // a shell command copies the approved skill into .harness/pkgs (which it can write)
-    let pkg = root.join(".harness/pkgs/foo");
-    for file in ["SKILL.md", "hx.toml", "init.luau"] {
-        write(
-            pkg.join(file),
-            &std::fs::read_to_string(skill.join(file)).unwrap(),
-        );
-    }
-    assert!(
-        err(verdict(&root, "foo", &pkg)).contains("approved as an agent skill, not as a package")
-    );
-    let registry = trusted_registry(&root);
-    assert!(registry.resolve("foo").is_err() && !registry.capabilities.contains_key("foo"));
-    assert!(
-        registry.rejected["foo"].contains("hx approve foo"),
-        "{:?}",
-        registry.rejected
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
 fn one_walker_skips_dot_entries_follows_a_linked_root_and_refuses_inner_links() {
     let root = ws("walker");
     let real = root.join("elsewhere/g");
@@ -433,8 +279,9 @@ fn one_walker_skips_dot_entries_follows_a_linked_root_and_refuses_inner_links() 
     std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
     std::os::unix::fs::symlink(&real, root.join(".agents/skills/g")).unwrap();
     let r = Resolver::new(root.clone());
-    assert!(r.approve("g").unwrap().contains("a link to"));
-    // what approve locked is what a run loads
+    let dirs = TestDirs::new();
+    trust::record(&root, &dirs).unwrap();
+    // what trust hashed is what a run loads
     let registry = trusted_registry(&root);
     assert_eq!(
         registry
@@ -446,25 +293,168 @@ fn one_walker_skips_dot_entries_follows_a_linked_root_and_refuses_inner_links() 
         ["SKILL.md"]
     );
     assert!(
-        r.skills_status(&crate::dirs::TestDirs::new())
+        r.skills_status(&dirs)
             .unwrap()
             .lines()
-            .any(|l| l.split_whitespace().take(2).eq(["g", "approved"]))
+            .any(|l| l.split_whitespace().take(2).eq(["g", "trusted"]))
     );
-    // .git churn (git gc) does not un-approve it
+    // .git churn (git gc) does not untrust it
     write(real.join(".git/objects/pack/p1"), "pack");
-    assert!(
-        trusted_registry(&root)
-            .packages
-            .iter()
-            .any(|p| p.name == "g")
-    );
-    // a link inside is refused by approve and by the run alike
+    assert!(trust::is_trusted(&root, &dirs));
+    // a link inside is never loaded, and trust no longer holds
     std::os::unix::fs::symlink("/etc/hostname", real.join("leak.md")).unwrap();
-    assert!(err(r.approve("g")).contains("may not contain symlinks"));
+    assert!(!trust::is_trusted(&root, &dirs));
+    assert!(
+        Config::read(&root)
+            .unwrap()
+            .review()
+            .contains("may not contain symlinks")
+    );
     let registry = trusted_registry(&root);
     assert!(
-        registry.packages.is_empty() && registry.rejected["g"].contains("may not contain symlinks")
+        !registry.packages.iter().any(|p| p.name == "g")
+            && registry.rejected["g"].contains("may not contain symlinks")
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Trust the workspace as it is now, in `dirs`.
+fn trust_now(root: &Path, dirs: &TestDirs) {
+    trust::record(root, dirs).unwrap();
+    assert!(trust::is_trusted(root, dirs));
+}
+
+#[test]
+fn an_untrusted_or_edited_package_or_skill_is_never_loaded() {
+    let root = ws("untrusted");
+    let dirs = TestDirs::new();
+    let dir = install_pkg(&root, "foo");
+    write(
+        root.join(".agents/skills/bar/SKILL.md"),
+        "---\ndescription: bar\n---\nbar\n",
+    );
+    // a workspace that only has a package or a skill still needs trust, and an untrusted one loads neither
+    assert!(trust::trusted(&root, &dirs).unwrap().is_none());
+    let refusal = err(trust::require_trusted(&root, &dirs));
+    assert!(
+        refusal.contains("not trusted (.agents/skills/bar, .harness/pkgs/foo)"),
+        "{refusal}"
+    );
+    let registry = Registry::capture(&root, &dirs).unwrap();
+    assert!(registry.resolve("foo").is_err());
+    assert!(!registry.packages.iter().any(|p| p.name == "bar"));
+    trust_now(&root, &dirs);
+    let registry = Registry::capture(&root, &dirs).unwrap();
+    assert!(registry.resolve("foo").is_ok());
+    assert!(registry.packages.iter().any(|p| p.name == "bar"));
+    // edits by anyone (the agent's shell commands can write both) untrust the workspace, and the refusal names them
+    std::fs::write(
+        dir.join("hx.toml"),
+        "[package]\nversion = \"1.0\"\n[capabilities]\nproc = [\"sh\"]\n",
+    )
+    .unwrap();
+    write(root.join(".agents/skills/bar/notes.md"), "more\n");
+    write(
+        root.join(".agents/skills/baz/SKILL.md"),
+        "---\ndescription: baz\n---\nbaz\n",
+    );
+    assert!(trust::trusted(&root, &dirs).unwrap().is_none());
+    let refusal = err(trust::require_trusted(&root, &dirs));
+    assert!(
+        refusal.contains(
+            "changed since you trusted it: .agents/skills/bar (changed), .agents/skills/baz (new), .harness/pkgs/foo (changed)"
+        ),
+        "{refusal}"
+    );
+    let status = Resolver::new(root.clone()).skills_status(&dirs).unwrap();
+    assert!(
+        status.contains("bar                          changed since trust")
+            && status.contains("baz                          not trusted"),
+        "{status}"
+    );
+    std::fs::remove_dir_all(root.join(".agents/skills/baz")).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(err(trust::require_trusted(&root, &dirs)).contains(".harness/pkgs/foo (removed)"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_skill_copied_into_the_packages_is_a_new_package_to_trust() {
+    let root = ws("skillaspkg");
+    let dirs = TestDirs::new();
+    let skill = root.join(".agents/skills/foo");
+    write(
+        skill.join("SKILL.md"),
+        "---\ndescription: inert\n---\nbody\n",
+    );
+    write(
+        skill.join("hx.toml"),
+        "[package]\nversion = \"1\"\nkind = \"tool\"\n[capabilities]\nproc = [\"sh\"]\n",
+    );
+    write(
+        skill.join("init.luau"),
+        "return { run = function() return sh('id') end }\n",
+    );
+    trust_now(&root, &dirs);
+    // the trusted skill's hx.toml grants nothing and its Luau is not a module
+    let registry = Registry::capture(&root, &dirs).unwrap();
+    assert!(registry.capabilities["foo"].0.is_empty() && registry.resolve("foo").is_err());
+    // a shell command copies it into .harness/pkgs: that is a new package, and nothing loads until the owner trusts it
+    for file in ["SKILL.md", "hx.toml", "init.luau"] {
+        write(
+            root.join(".harness/pkgs/foo").join(file),
+            &std::fs::read_to_string(skill.join(file)).unwrap(),
+        );
+    }
+    assert!(err(trust::require_trusted(&root, &dirs)).contains(".harness/pkgs/foo (new)"));
+    let review = Config::read(&root).unwrap().review();
+    assert!(
+        review.contains(
+            "package, kind tool, version 1, capabilities proc=sh, 3 files (.harness/pkgs/foo)"
+        ),
+        "{review}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_trust_review_lists_packages_and_skills_escaped() {
+    let root = ws("review");
+    write(root.join(".harness/policy.toml"), "# policy \x1b[2J\n");
+    write(
+        root.join(".harness/pkgs/tool-a/hx.toml"),
+        "[package]\nversion = \"2.0\\u001b]0;t\\u0007\"\nkind = \"tool\"\n[capabilities]\nfs = [\"read\", \"write\"]\nllm = [\"chat\"]\n",
+    );
+    write(root.join(".harness/pkgs/tool-a/init.luau"), "return {}\n");
+    write(
+        root.join(".harness/pkgs/bad.name/hx.toml"),
+        "[package]\nversion = \"1\"\n",
+    );
+    write(
+        root.join(".harness/pkgs/nomanifest/init.luau"),
+        "return {}\n",
+    );
+    write(
+        root.join(".agents/skills/s\u{202e}kill/SKILL.md"),
+        "---\ndescription: x\n---\n",
+    );
+    write(
+        root.join(".agents/skills/plain/SKILL.md"),
+        "---\ndescription: x\n---\n",
+    );
+    let review = Config::read(&root).unwrap().review();
+    for want in [
+        "===== .harness/policy.toml\n# policy \\u{1b}[2J\n",
+        "===== packages and skills\n",
+        "tool-a                   package, kind tool, version 2.0\\u{1b}]0;t\\u{7}, capabilities fs=read+write llm=chat, 2 files (.harness/pkgs/tool-a)",
+        "bad.name                 not loaded: \"bad.name\" is not a valid package name",
+        "nomanifest               not loaded: ",
+        "missing hx.toml",
+        "plain                    agent skill, no Luau and no capabilities, 1 file (.agents/skills/plain)",
+        "s\\u{202e}kill",
+    ] {
+        assert!(review.contains(want), "{want:?} in\n{review}");
+    }
+    assert!(!review.chars().any(|c| c.is_control() && c != '\n'));
     let _ = std::fs::remove_dir_all(&root);
 }

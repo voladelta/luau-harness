@@ -16,13 +16,13 @@ check "admin commands open no log session" "$(ls "$(logdir $W)"/*.jsonl | wc -l 
 check "the log lives in hx's state directory, not the workspace" "$(logdir $W | grep -c "^$XDG_STATE_HOME/hx/workspaces/n-[0-9a-f]\{16\}/log$")$([ -e $W/.harness/log ] && echo IN-TREE)" "1"
 check "hx paths names the log, state, secrets and trust locations" "$($H paths --workspace $W | cut -d: -f1 | tr '\n' ' ')" "log state secrets trust "
 
-# --- 0b. --yes automatically grants ordinary paths and commands, but .harness/ and hx.lock stay read-only (through file tools)
+# --- 0b. --yes automatically grants ordinary paths and commands, but .harness/ and .agents/skills stay read-only (through file tools)
 newws y
 O=$T/autopilot-outside.txt
 check "--yes writes outside the workspace" "$($H exec --workspace $W --yes "write('$O', 'x')" >/dev/null 2>&1; cat $O 2>/dev/null)" "x"
 check "--yes automatically approves external commands" "$($H exec --workspace $W --yes 'sh("./deploy.sh # git push")' >/dev/null 2>&1; cat $W/deployed.txt 2>/dev/null)" "deployed"
 check "--yes write() to .harness refused" "$($H exec --workspace $W --yes 'print((pcall(write, ".harness/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
-check "--yes write() to hx.lock refused" "$($H exec --workspace $W --yes 'print((pcall(write, "hx.lock", "x")))' 2>/dev/null | head -1)" "false"
+check "--yes write() to .agents/skills refused" "$($H exec --workspace $W --yes 'print((pcall(write, ".agents/skills/x/SKILL.md", "x")))' 2>/dev/null | head -1)" "false"
 ln -s .harness $W/link
 check "--yes write() via symlink into .harness refused" "$($H exec --workspace $W --yes 'print((pcall(write, "link/policy.toml", "x")))' 2>/dev/null | head -1)" "false"
 # --- 1. the log records effects write-ahead and the chain verifies

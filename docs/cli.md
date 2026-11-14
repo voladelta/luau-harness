@@ -8,15 +8,14 @@ Every command takes `--help`.
 |---|---|
 | `hx run "TASK" [--yes]` | Run an agent task; prints a JSON report |
 | `hx run --resume LOG` | Restore the saved manifest and latest checkpoint; no repeated launch flags |
-| `hx run --branch LOG --model M` | Start a new run using current approved configuration and inherited saved data |
+| `hx run --branch LOG --model M` | Start a new run using current trusted configuration and inherited saved data |
 | `hx review LOG --gate ID --decision approve` | Record an RPI review decision; resume separately to continue |
 | `hx recover LOG OP --decision complete\|abandon --yes` | Record an owner's decision about an uncertain mutation; never executes it |
 | `hx revoke LOG` | Stop admitting further operations for a run |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
 | `hx test PKG_DIR` | Run a package's `tests/*.luau` inside its boundary, with only the capabilities its `hx.toml` requests; exits 1 on failure |
-| `hx approve PKG` | Lock a project package's or skill's hash and grant the capabilities it requests |
-| `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and whether each is approved |
-| `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, print its hash, then trust it; runs refuse untrusted config |
+| `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and the state of each (trusted, changed since trust, a user skill, shadowed, or why it cannot load) |
+| `hx trust [--yes]` | Review this workspace's `.harness` config, packages and skills (each with its kind, declared capabilities and file count) and what changed since the last trust, print its hash, then trust it; runs refuse untrusted config |
 | `hx log verify LOG` | Check a log's hash chain and the session its records name, the blobs it references and its recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
 | `hx paths` | Print where hx keeps this workspace's files, one `name: path` per line: `log`, `state` (the workspace's state directory, which holds `log` and the files of programs built on hx), `secrets`, and the `trust` store |
 
@@ -33,7 +32,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | Flag | Default | Meaning |
 |---|---|---|
 | `--prompt-file F` | | Read the task from a file instead of a positional prompt |
-| `--ignore-config` | off | Run without this workspace's `.harness` config and `hx.lock`; without it, untrusted config makes `hx run` and `hx exec` exit with an error (see [workspace trust](configuration.md#workspace-trust)). Also accepted by `hx exec` |
+| `--ignore-config` | off | Run without this workspace's `.harness` config, packages and skills; without it, untrusted config makes `hx run` and `hx exec` exit with an error (see [workspace trust](configuration.md#workspace-trust)). Also accepted by `hx exec` |
 | `--approval prompt\|deny` | `policy.toml`, else `prompt` | Override the configured approval mode; cannot combine with `--yes`. Also accepted by `hx exec` and `hx test` |
 | `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run; irreversible commands still need an exact `allow` entry or a terminal answer |
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |

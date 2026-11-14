@@ -1,8 +1,8 @@
-//! Module resolution, package manifests, the lockfile (approvals) and agent skills.
+//! Module resolution, package manifests and agent skills.
 //!
 //! `require("pkg")` loads `init.luau`; `require("pkg/mod")` loads `mod.luau`. Lookup order:
 //!   1. `<ws>/.harness/override/std/<file>`   user override of a built-in file (e.g. the printer), no rebuild needed
-//!   2. `<ws>/.harness/pkgs/<pkg>/<mod>.luau` project package (needs a lockfile entry for its exact content)
+//!   2. `<ws>/.harness/pkgs/<pkg>/<mod>.luau` project package, with the capabilities its `hx.toml` declares
 //!   3. the built-in `std` package embedded in the binary
 //!
 //! An override replaces a file of the built-in `std` package and nothing else, and no package may be named `std`, so
@@ -10,22 +10,24 @@
 //!
 //! Agent skills (the `.agents/skills` convention): `<ws>/.agents/skills/<name>/SKILL.md`, then `~/.agents/skills/<name>/SKILL.md`.
 //! Their manifest comes from SKILL.md frontmatter; they carry no Luau and no capabilities (an `hx.toml` or `.luau` file
-//! in one is an ordinary file), and are locked by `hx approve NAME` like any package. `.harness/pkgs/<name>` shadows them.
+//! in one is an ordinary file). `.harness/pkgs/<name>` shadows them, and the workspace's shadow the user's.
 //!
-//! Every package and skill is read by one function, `snapshot`: approval, `hx skills` and the run's registry all see
-//! the same files and the same digest.
+//! Every package and skill is read by one function, `snapshot`: workspace trust, `hx skills`, `hx test` and the run's
+//! registry all see the same files.
 //!
-//! Everything under (1), (2), `project/init` and the agent skills is used only when the workspace config is trusted
-//! (see trust.rs); otherwise only the built-in package resolves.
+//! Everything under (1), (2), `project/init` and the workspace's agent skills is part of the workspace config and is
+//! used only when that config is trusted (see trust.rs), from the bytes trust hashed; otherwise only the built-in
+//! package and the user's own skills resolve.
 //!
 //! `require("base:std/printer")` skips (1), so an override can wrap the module it replaces.
 //! `require("project/init")` is `<ws>/.harness/init.luau`, run before the loop starts (hook registration etc.).
-mod approval;
 mod registry;
+mod snapshot;
 #[cfg(test)]
 mod tests;
 
 pub use registry::{Registry, Source, TestTarget, test_files};
+pub use snapshot::Extension;
 
 use crate::supervisor::Capabilities;
 use serde::Deserialize;
@@ -184,7 +186,7 @@ pub struct ToolInfo {
     pub doc: Option<String>,
 }
 
-/// An installed, locked and granted package, as shown to the model.
+/// A loaded package or skill, as shown to the model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PkgInfo {
     pub name: String,

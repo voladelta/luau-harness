@@ -228,7 +228,7 @@ class Tools(unittest.TestCase):
             file.write("\n-- edited\n")
         refused = subprocess.run([str(HX), "exec", "--workspace", str(self.ws), "print(probe)"], env=env, text=True, capture_output=True)
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("not trusted (.harness/tools/probe.lua)", refused.stderr)
+        self.assertIn("changed since you trusted it: .harness/tools/probe.lua (changed)", refused.stderr)
         self.command("trust", "--yes", env=env)
         (self.dir / "link.lua").symlink_to(self.dir / "probe.lua")
         result = subprocess.run([str(HX), "trust", "--yes", "--workspace", str(self.ws)], env=env, text=True, capture_output=True)
@@ -237,7 +237,7 @@ class Tools(unittest.TestCase):
         # No consent trusts a config with symlinks: the launch is refused.
         refused = subprocess.run([str(HX), "exec", "--workspace", str(self.ws), "print(link)"], env=env, text=True, capture_output=True)
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("not trusted", refused.stderr)
+        self.assertIn("cannot be trusted", refused.stderr)
 
     def test_effect_capabilities_and_endpoint_grants(self):
         (self.ws / "a.txt").write_text("hello")

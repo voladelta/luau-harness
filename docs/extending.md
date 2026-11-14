@@ -1,6 +1,6 @@
 # Extending hx
 
-The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/std/); you can override them, and add tools, packages, skills and MCP servers. You extend hx by editing files under `.harness/` (`override/`, `pkgs/`, `tools/`) and running `hx trust`; nothing the model can call approves or installs anything, and changes apply to new runs only (no hot reload).
+The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/std/); you can override them, and add tools, packages, skills and MCP servers. You extend hx by editing files under `.harness/` (`override/`, `pkgs/`, `tools/`) and `.agents/skills/`, and running `hx trust`; nothing the model can call approves or installs anything, and changes apply to new runs only (no hot reload).
 
 ## Extension kinds
 
@@ -8,20 +8,20 @@ The controller, prompt, printer and hooks are Luau in [`stdlib/std/`](../stdlib/
 |---|---|---|
 | Module override | `.harness/override/std/<file>`, replacing a file of the built-in package (`<mod>.luau`, `system.md`) | On a new run; `require("base:std/<mod>")` wraps the original. Invalid controller code stops the run. Other files under `.harness/override` are not used |
 | Local tool | `.harness/tools/NAME.lua` or `NAME.luau` | `hx trust`; loads on a new run as `NAME.method(...)` after validation and credential checks |
-| Tool package | `.harness/pkgs/NAME/` with `hx.toml`, `kind = "tool"` | `hx approve NAME`; model calls `tools.NAME.fn(...)` |
-| Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx approve NAME`; model calls `skill("NAME")` (or finds it with `skills("words")`; skills are not listed in the prompt) |
-| Agent skill | `.agents/skills/NAME/SKILL.md` or `~/.agents/skills/NAME/SKILL.md` (project shadows global). It carries no Luau and no capabilities: an `hx.toml` or `.luau` file in it is an ordinary file | `hx approve NAME` (`hx skills` lists them); the run reads its files from a frozen copy at `skill("NAME").dir` |
-| MCP server | `.harness/mcp.toml` | On the next run (see [configuration](configuration.md#mcptoml)) |
+| Tool package | `.harness/pkgs/NAME/` with `hx.toml`, `kind = "tool"` | `hx trust`, which lists the capabilities its `hx.toml` declares; model calls `tools.NAME.fn(...)` |
+| Skill | `.harness/pkgs/NAME/` with `SKILL.md`, `kind = "skill"` | `hx trust`; model calls `skill("NAME")` (or finds it with `skills("words")`; skills are not listed in the prompt) |
+| Agent skill | `.agents/skills/NAME/SKILL.md` in the workspace, or your own `~/.agents/skills/NAME/SKILL.md` (the workspace's shadows yours). It carries no Luau and no capabilities: an `hx.toml` or `.luau` file in it is an ordinary file | A workspace skill: `hx trust`. Yours: nothing, they are your own files (see [workspace trust](configuration.md#workspace-trust) for what protects them). `hx skills` lists both; the run reads a skill's files from a frozen copy at `skill("NAME").dir` |
+| MCP server | `.harness/mcp.toml` | `hx trust`; on the next run (see [configuration](configuration.md#mcptoml)) |
 
 To have the agent help write an extension, let it write a draft anywhere in the workspace, review the draft, and move it under `.harness/` yourself.
 
 Package and skill names are lowercase letters, digits, `_` and `-`, starting with a letter, at most 64 bytes; `std` and `project` are reserved. A package or skill with another name is not loaded.
 
-A package is the files of its directory except entries whose name starts with `.` (so a skill's `.git` is not part of it). The directory itself may be a symlink, as skill installers create in `~/.agents/skills`: its target's content is what is approved and loaded. A symlink or special file inside it is refused by `hx approve` and by the run alike.
+A package is the files of its directory except entries whose name starts with `.` (so a skill's `.git` is not part of it). The directory itself may be a symlink, as skill installers create in `~/.agents/skills`: its target's content is what is trusted and loaded. A package or skill with a symlink or special file inside it is listed by `hx trust` with the reason and never loads.
 
-`hx test DIR` runs a package's `tests/*.luau` inside its boundary: in a package VM with exactly the capabilities its `hx.toml` requests, with `test` (the test library) as a global and imports restricted to the package. A package in `.harness/pkgs` must be approved and unchanged; any other directory with an `hx.toml` (a draft) is loaded as it is, unapproved, for that test only. A directory without `hx.toml` is not a package: its tests run with the agent's authority, like `hx exec`, and `hx test` says so (refused under `.harness/`). `hx test stdlib/std` runs the built-in package's own suite that way; any other directory whose `hx.toml` names it `std` is refused unless its files are exactly the built-in package's.
+`hx test DIR` runs a package's `tests/*.luau` inside its boundary: in a package VM with exactly the capabilities its `hx.toml` requests, with `test` (the test library) as a global and imports restricted to the package. Any directory with an `hx.toml`, in `.harness/pkgs` or not, is loaded as it is on disk, trusted or not, for that test only. A directory without `hx.toml` is not a package: its tests run with the agent's authority, like `hx exec`, and `hx test` says so (refused under `.harness/`). `hx test stdlib/std` runs the built-in package's own suite that way; any other directory whose `hx.toml` names it `std` is refused unless its files are exactly the built-in package's.
 
-A package that is unapproved, or changed since approval, is invisible to a new run. Each approved package call uses a fresh VM and dispatch-time capability checks. Imports are restricted to that package; function references and host handles cannot cross its boundary.
+A run refuses to start while a package or skill is untrusted or changed since you trusted it (or, with `--ignore-config`, loads none of the workspace's). Each package call uses a fresh VM and dispatch-time capability checks. Imports are restricted to that package; function references and host handles cannot cross its boundary.
 
 Control hooks can deny or transform commands; they cannot grant authority. A controller-hook failure stops its transition; observer failures are diagnostic.
 

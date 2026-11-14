@@ -76,7 +76,6 @@ fn operand_count(command: &str) -> Option<(usize, &'static str)> {
         ),
         "revoke" => (1, "usage: hx revoke LOG"),
         "test" => (1, "usage: hx test PKG_DIR"),
-        "approve" => (1, "usage: hx approve PKG"),
         "skills" => (0, "usage: hx skills"),
         "trust" => (0, "usage: hx trust [--yes]"),
         "log" => (2, "usage: hx log verify LOG"),
@@ -116,9 +115,8 @@ COMMANDS:
     recover      record an owner's decision about an uncertain operation
     revoke       stop admitting operations for a run
     test         run a package's tests/*.luau
-    approve      lock a project package or skill and grant the capabilities it requests
-    skills       list skills in .agents/skills and ~/.agents/skills and whether each is approved
-    trust        review this workspace's .harness config and hx.lock, then trust it (runs refuse untrusted config)
+    skills       list skills in .agents/skills and ~/.agents/skills and whether each is visible
+    trust        review this workspace's config, packages and skills, then trust them (runs refuse untrusted config)
     log verify   check an event log's hash chain and list unknown-outcome effects
     paths        print where hx keeps this workspace's logs, state and secrets, and the trust store
 ";
@@ -208,7 +206,7 @@ const FLAGS: &[Flag] = {
             "--ignore-config",
             Switch,
             "",
-            "run without this workspace's .harness config and hx.lock (instead of refusing untrusted config)",
+            "run without this workspace's config, packages and skills (instead of refusing untrusted config)",
         ),
         flag(
             &["run", "exec"],
@@ -229,7 +227,7 @@ const FLAGS: &[Flag] = {
             "--branch",
             Text,
             "LOG",
-            "start a new run with current approved configuration and inherited durable data",
+            "start a new run with current trusted configuration and inherited durable data",
         ),
         flag(RUN, "--prompt-file", Text, "F", "task text"),
         flag(RUN, "--model", Text, "M", "model id (default: HX_MODEL)"),
@@ -395,16 +393,13 @@ fn help_for(cmd: &str) -> Option<&'static str> {
             "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\nLOG is a run name (its journal in this workspace's log directory, see `hx paths`) or a path to the journal.\n"
         }
         "test" => {
-            "hx test PKG_DIR\n\nRun the package's tests/*.luau inside its boundary, with only the capabilities its hx.toml requests.\nA package in .harness/pkgs must be approved; a directory without hx.toml runs with the agent's authority.\nExits 1 if any test fails.\n"
-        }
-        "approve" => {
-            "hx approve PKG\n\nLock a project package's hash and grant exactly the capabilities its manifest requests.\nPKG may also be a skill in .agents/skills or ~/.agents/skills (no Luau, no capabilities; an hx.toml there is ignored).\n"
+            "hx test PKG_DIR\n\nRun the package's tests/*.luau inside its boundary, with only the capabilities its hx.toml requests.\nThe package is loaded as it is on disk, trusted or not, for this test only; a directory without hx.toml\nruns with the agent's authority.\nExits 1 if any test fails.\n"
         }
         "skills" => {
-            "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n"
+            "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and their state.\nThe workspace's skills are part of its config: visible once you trust it with `hx trust`. Your own skills in\n~/.agents/skills need no approval.\n"
         }
         "trust" => {
-            "hx trust [--yes]\n\nShow this workspace's config (.harness/*.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in hx's trust store (see `hx paths`).\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n"
+            "hx trust [--yes]\n\nShow this workspace's config (.harness/*.toml, .harness/init.luau, .harness/override/,\n.harness/tools/) and its packages (.harness/pkgs/) and agent skills (.agents/skills/), each with its kind, declared\ncapabilities and file count, then trust that exact content. Until then `hx run` and `hx exec` refuse to start (pass\n--ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or install packages\nwith capabilities. Any later edit, by you or by the agent's shell commands, makes it untrusted again. The record lives\nin hx's trust store (see `hx paths`).\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n"
         }
         "log" => {
             "hx log verify LOG\n\nCheck the hash chain and the session every record names, the blobs records reference and the recovery\naccounting, and list effects with an unknown outcome.\nLOG is a run name (its journal in this workspace's log directory, see `hx paths`) or a path to the journal.\nExit codes: 0 ok, 1 broken chain, bad blob or invalid recovery accounting, 3 unknown outcomes.\n"
@@ -677,9 +672,8 @@ async fn real_main() -> Result<std::process::ExitCode> {
             outln!("revoked {}", path.display())
         }
         "test" => return cmd_test(&args, &workspace, &dirs, mk_policy()?).await,
-        "approve" => cmd_approve(&args, &workspace, &dirs),
         "trust" => cmd_trust(&args, &workspace, &dirs),
-        // hx skills : agent skills on disk and their approval state
+        // hx skills : agent skills on disk and their state
         "skills" => {
             out!(
                 "{}",
@@ -920,15 +914,9 @@ async fn cmd_test(
                 .run_tests(&tests)
                 .await?
         }
-        modules::TestTarget::Package { name, mount } => {
+        modules::TestTarget::Package { name, snapshot } => {
             let mut registry = modules::Registry::capture(workspace, dirs)?;
-            match mount {
-                Some(snapshot) => registry.mount(&name, &snapshot)?,
-                // an installed package is tested as a run would load it: approved and unchanged
-                None => {
-                    registry.resolve(&name)?;
-                }
-            }
+            registry.mount(&name, &snapshot)?;
             let tests = registry.tests(&name)?;
             packages::run_tests(
                 supervisor::Supervisor::ephemeral(policy, Arc::new(registry)),
@@ -947,50 +935,38 @@ async fn cmd_test(
     })
 }
 
-/// hx approve PKG : lock a project package's hash and grant exactly the capabilities its manifest requests
-fn cmd_approve(args: &[String], workspace: &Path, dirs: &dirs::Dirs) -> Result<()> {
-    let pkg = operands(args)?[0];
-    let rt = trust::Retrust::before(workspace, dirs);
-    outln!(
-        "{}",
-        modules::Resolver::new(workspace.to_path_buf()).approve(pkg)?
-    )?;
-    rt.after()
-}
-
 /// hx trust [--yes] : review the workspace config and record its hash as trusted (outside the repo)
 fn cmd_trust(args: &[String], workspace: &Path, dirs: &dirs::Dirs) -> Result<()> {
-    let files = trust::config_files(workspace);
-    if files.is_empty() {
-        return outln!("nothing to trust: this workspace has no .harness config or hx.lock");
-    }
-    let links = trust::symlinks(workspace);
+    let config = trust::Config::read(workspace)?;
+    let Some(hash) = config.hash() else {
+        return outln!(
+            "nothing to trust: this workspace has no .harness config, packages or .agents/skills"
+        );
+    };
+    let links = config.symlinks();
     if !links.is_empty() {
         bail!(
             "cannot trust this config: it has symlinks ({}), whose targets the trust hash does not cover; replace them with real files",
             links.join(", ")
         );
     }
-    for f in &files {
-        outln!("===== {f}")?;
-        match std::fs::read_to_string(workspace.join(f)) {
-            Ok(t) => out!("{t}{}", if t.ends_with('\n') { "" } else { "\n" })?,
-            Err(_) => outln!("(binary or unreadable)")?,
-        }
-    }
+    out!("{}", config.review())?;
     if trust::is_trusted(workspace, dirs) && std::env::var("HX_TRUST").is_err() {
         return outln!("already trusted");
     }
-    outln!(
-        "config hash: {} (HX_TRUST={0} trusts exactly this config for one launch)",
-        trust::config_hash(workspace).unwrap_or_default()
-    )?;
-    if !has(args, "--yes") {
-        confirm(
-            "trust this config? hx will apply it (file-tool policy, MCP servers, packages, skills, overrides)",
+    if let Some(changed) = trust::changes(workspace, dirs, &config) {
+        outln!(
+            "changed since you last trusted it: {}",
+            trust::terminal_safe(&changed.join(", "))
         )?;
     }
-    let h = trust::record(workspace, dirs)?.unwrap_or_default();
+    outln!("config hash: {hash} (HX_TRUST={hash} trusts exactly this config for one launch)")?;
+    if !has(args, "--yes") {
+        confirm(
+            "trust this config? hx will apply it (file-tool policy, MCP servers, packages with the capabilities above, skills, overrides)",
+        )?;
+    }
+    let h = trust::record_config(workspace, dirs, &config)?.unwrap_or_default();
     outln!("trusted {} ({h})", workspace.display())
 }
 
@@ -1069,7 +1045,6 @@ mod tests {
             ("recover", &["LOG", "7"], "--decision complete"),
             ("revoke", &["LOG"], ""),
             ("test", &["DIR"], ""),
-            ("approve", &["PKG"], ""),
             ("skills", &[], ""),
             ("trust", &[], ""),
             ("log", &["verify", "FILE"], ""),

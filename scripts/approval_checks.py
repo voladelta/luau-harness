@@ -206,7 +206,7 @@ class Approvals(unittest.TestCase):
     def test_yes_preserves_protected_paths_secrets_and_symlinks(self):
         (self.ws / "secrets.toml").write_text("do-not-read")
         (self.ws / "linked").symlink_to(self.ws / "secrets.toml")
-        code = ('print(pcall(write,".harness/new.toml","no")); print(pcall(write,"hx.lock","no")); '
+        code = ('print(pcall(write,".harness/new.toml","no")); print(pcall(write,".agents/skills/x/SKILL.md","no")); '
                 'print(pcall(read,"secrets.toml")); print(pcall(edit,"secrets.toml","do","no")); '
                 'print(pcall(write,"linked","no")); print(#search("do-not-read"))')
         status, out = terminal(self.command(code, "--yes"))
@@ -214,7 +214,7 @@ class Approvals(unittest.TestCase):
         self.assertEqual(sum(line.startswith("false\t") for line in out.splitlines()), 5, out)
         self.assertNotIn("[approval needed]", out)
         self.assertNotIn("do-not-read", out)
-        self.assertFalse((self.ws / "hx.lock").exists())
+        self.assertFalse((self.ws / ".agents").exists())
         self.assertEqual(self.grant_records(), [])
 
     def test_search_through_an_alias_cannot_expose_hx_state(self):

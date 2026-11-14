@@ -1008,10 +1008,14 @@ impl Policy {
         // Git runs hooks and configured commands unconfined on the owner's next `git` in this workspace.
         p.protected.extend([
             workspace.join(".harness"),
-            workspace.join("hx.lock"),
+            workspace.join(".agents/skills"),
             workspace.join(".git/config"),
             workspace.join(".git/hooks"),
         ]);
+        // The owner's own skills load in every workspace without review, so no grant may reach them either.
+        if let Some(home) = std::env::var_os("HOME") {
+            p.protected.push(PathBuf::from(home).join(".agents/skills"));
+        }
         for r in SYSTEM_READ {
             if let Some(c) = canon(r) {
                 p.read_roots.push(c);
@@ -1019,7 +1023,7 @@ impl Policy {
         }
         p.read_roots.extend(toolchain_roots());
         // check_write resolves aliases before comparing. Protect the resolved configuration too, including an
-        // untrusted workspace's symlinked .harness or hx.lock.
+        // untrusted workspace's symlinked .harness or .agents/skills.
         let canonical_protected: Vec<_> = p.protected.iter().filter_map(canon).collect();
         p.protected.extend(canonical_protected);
         // The policy is parsed from the bytes the trust decision covered, never from a second read of the file.
@@ -1761,7 +1765,7 @@ mod tests {
         // writes: inside the workspace ok, protected and escaping paths refused
         assert!(p.check_write("src/new.txt").is_ok());
         assert!(p.check_write(".harness/policy.toml").is_err());
-        assert!(p.check_write("hx.lock").is_err());
+        assert!(p.check_write(".agents/skills/x/SKILL.md").is_err());
         assert!(p.check_write("../escape.txt").is_err());
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2496,6 +2500,29 @@ mod tests {
             .unwrap();
         drop(p);
         let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn autopilot_never_grants_a_write_to_the_owners_skills() {
+        let (p, dir, _dirs) = test_policy("user-skills", true, &[]);
+        let home = std::env::var("HOME").expect("HOME is set");
+        let skill = format!("{home}/.agents/skills/planted/SKILL.md");
+        let err = p
+            .authorize_path(&skill, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("protected"), "{err}");
+        assert!(
+            !p.confinement()
+                .write
+                .iter()
+                .any(|r| r.starts_with(format!("{home}/.agents"))),
+            "a skill file was granted"
+        );
+        assert!(p.check_write(".agents/skills/x/SKILL.md").is_err());
+        drop(p);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

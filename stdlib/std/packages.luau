@@ -1,8 +1,8 @@
--- Surfaces what the USER installed (approved tool and skill packages) to the model; costs nothing when there are none.
+-- Surfaces what the USER installed (trusted tool and skill packages, and their own skills) to the model; costs nothing when there are none.
 --   tools.NAME.fn(...)     tool packages (kind = "tool"), loaded on first use
 --   skill("NAME")          -> { name, text, module, dir, files }: a skill's SKILL.md (frontmatter stripped), its Luau module
 --                          if any, and where its other files are (agent skills from .agents/skills or ~/.agents/skills too)
---   skills(query?)         -> { {name, description} }: search approved skills by name and description (best first).
+--   skills(query?)         -> { {name, description} }: search loaded skills by name and description (best first).
 --                          Skills are NOT listed in the prompt: the model searches or loads one when the user names it.
 local M = {}
 
@@ -12,7 +12,7 @@ local function strip_frontmatter(text: string): string
 end
 
 local function find(name: string)
-	for _, p in hx.packages() do -- the approved package list is frozen for this run
+	for _, p in hx.packages() do -- the package list is frozen for this run
 		if p.name == name then
 			return p
 		end
@@ -21,7 +21,7 @@ local function find(name: string)
 end
 
 -- Approved skills matching `query` (words in name and description; a name hit counts more), best first.
--- An empty query lists every approved skill by name.
+-- An empty query lists every loaded skill by name.
 local function search_skills(query: string, limit: number)
 	local words = {}
 	for w in query:lower():gmatch("[%w]+") do

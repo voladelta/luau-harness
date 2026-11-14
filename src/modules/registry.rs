@@ -1,9 +1,10 @@
 //! The frozen registry a run loads from (capture and resolve), and what `hx test` runs.
-use super::approval::{Location, Lockfile, Snapshot, snapshot};
+use super::snapshot::{Location, Snapshot, snapshot};
 use super::{EMBEDDED, PkgInfo, Resolver, valid_package_name};
 use crate::supervisor::Capabilities;
 use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -16,7 +17,8 @@ pub struct Source {
     pub pkg: Option<(String, Capabilities)>,
 }
 
-/// An immutable, approved byte snapshot. Runtime resolution never goes back to mutable workspace files.
+/// An immutable byte snapshot of everything a run may load. Runtime resolution never goes back to mutable workspace
+/// files.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Registry {
     #[serde(default)]
@@ -52,9 +54,9 @@ impl Registry {
         .map_err(Into::into)
     }
 
-    /// Freeze everything a run may load: the built-in package, and, when the workspace config is trusted, the
-    /// overrides, project init, MCP servers and local tools from the bytes trust covered, plus every package and agent
-    /// skill whose snapshot the lock in those bytes approves.
+    /// Freeze everything a run may load: the built-in package; when the workspace config is trusted, the overrides,
+    /// project init, packages, agent skills, MCP servers and local tools from the bytes trust covered; and the user's
+    /// own agent skills that no workspace package or skill shadows.
     pub fn capture(root: &Path, dirs: &crate::dirs::Dirs) -> Result<Self> {
         Self::build(root, crate::trust::trusted(root, dirs)?, dirs)
     }
@@ -89,9 +91,33 @@ impl Registry {
                 registry.sources.insert(name, base);
             }
         }
-        let Some(config) = config else {
-            return Ok(registry);
-        };
+        // names taken: a workspace package shadows a skill of its name, a workspace skill a user skill
+        let mut taken = BTreeSet::new();
+        if let Some(config) = config {
+            registry.add_workspace(root, &config, dirs, &mut taken)?;
+        }
+        for (name, dir) in Resolver::user_skills() {
+            if !taken.insert(name.clone()) {
+                continue;
+            }
+            let snap = if valid_package_name(&name) {
+                snapshot(Location::AgentSkill(dir))
+            } else {
+                Err(anyhow!("{name:?} is not a valid skill name"))
+            };
+            registry.load(&name, snap.map_err(|e| format!("{e:#}")).as_ref());
+        }
+        Ok(registry)
+    }
+
+    /// The trusted workspace config's part of `build`.
+    fn add_workspace(
+        &mut self,
+        root: &Path,
+        config: &crate::trust::Config,
+        dirs: &crate::dirs::Dirs,
+        taken: &mut BTreeSet<String>,
+    ) -> Result<()> {
         // Only files that replace a built-in file are overrides; anything else in the tree is not used.
         for (rel, bytes) in config.tree(".harness/override") {
             let Some(file) = rel.strip_prefix("std/") else {
@@ -100,7 +126,7 @@ impl Registry {
             if Resolver::embedded("std", file).is_none() {
                 continue;
             }
-            registry.assets.insert(rel.to_string(), bytes.to_vec());
+            self.assets.insert(rel.to_string(), bytes.to_vec());
             if let Some(module) = file.strip_suffix(".luau") {
                 let name = if module == "init" {
                     "std".to_string()
@@ -109,7 +135,7 @@ impl Registry {
                 };
                 let text = String::from_utf8(bytes.to_vec())
                     .with_context(|| format!(".harness/override/{rel} is not UTF-8"))?;
-                registry.sources.insert(
+                self.sources.insert(
                     name,
                     Source {
                         text,
@@ -123,7 +149,7 @@ impl Registry {
         if let Some(init) = config.file(".harness/init.luau") {
             let text =
                 String::from_utf8(init.to_vec()).context(".harness/init.luau is not UTF-8")?;
-            registry.sources.insert(
+            self.sources.insert(
                 "project/init".into(),
                 Source {
                     text,
@@ -133,25 +159,31 @@ impl Registry {
                 },
             );
         }
-        let lock = Lockfile::parse(config.file("hx.lock"));
-        for (name, location) in Resolver::new(root.to_path_buf()).installed() {
-            let approved = match &lock {
-                _ if !valid_package_name(&name) => Err(anyhow!(
-                    "{name:?} is not a valid package name (lowercase letters, digits, _ and -, starting with a letter; not std or project)"
-                )),
-                Ok(lock) => lock.approved(&name, location),
-                Err(e) => Err(anyhow!("{e:#}")),
-            };
-            match approved.and_then(|snap| registry.add(&name, &snap).map(|()| snap)) {
-                Ok(snap) => registry.packages.push(snap.info(&name)),
-                Err(error) => {
-                    registry.rejected.insert(name, error.to_string());
-                }
+        for ext in config.extensions() {
+            if taken.insert(ext.name.clone()) {
+                self.load(&ext.name, ext.snapshot.as_ref());
             }
         }
-        registry.mcp = crate::mcp::snapshot(config.file(".harness/mcp.toml"))?;
-        crate::tools::capture(dirs, root, config.tree(".harness/tools"), &mut registry)?;
-        Ok(registry)
+        self.mcp = crate::mcp::snapshot(config.file(".harness/mcp.toml"))?;
+        crate::tools::capture(dirs, root, config.tree(".harness/tools"), self)?;
+        Ok(())
+    }
+
+    /// Load one package or skill, or record why it is not loaded.
+    fn load(&mut self, name: &str, snap: std::result::Result<&Snapshot, &String>) {
+        let added = match snap {
+            Ok(snap) => self
+                .add(name, snap)
+                .map(|()| snap.info(name))
+                .map_err(|e| e.to_string()),
+            Err(error) => Err(error.clone()),
+        };
+        match added {
+            Ok(info) => self.packages.push(info),
+            Err(error) => {
+                self.rejected.insert(name.to_string(), error);
+            }
+        }
     }
 
     /// Add a package's modules, files and capabilities. Nothing is added when one of its modules is unusable.
@@ -177,8 +209,8 @@ impl Registry {
         Ok(())
     }
 
-    /// `hx test DIR`: make an unapproved package loadable for this one registry (never a run's), so its tests can
-    /// run inside its boundary.
+    /// `hx test DIR`: make a package loadable for this one registry (never a run's), so its tests can run inside its
+    /// boundary.
     pub fn mount(&mut self, name: &str, snap: &Snapshot) -> Result<()> {
         self.add(name, snap)
     }
@@ -253,11 +285,10 @@ pub fn test_files(dir: &Path) -> Result<Vec<(String, String)>> {
 
 /// What `hx test DIR` runs.
 pub enum TestTarget {
-    /// The tests of a project package, inside its boundary: `mount` is the unapproved snapshot to load, or None for an
-    /// installed package, which must be approved and unchanged.
+    /// The tests of a package, inside its boundary, loaded from this snapshot with its manifest's capabilities.
     Package {
         name: String,
-        mount: Option<Box<Snapshot>>,
+        snapshot: Box<Snapshot>,
     },
     /// Not a project package (the built-in std package's suite, or a directory without `hx.toml`): the tests run in
     /// the harness's module environment with the agent's authority, as `hx exec` would. `note` says so when the
@@ -298,25 +329,18 @@ impl Resolver {
             );
             return Ok(TestTarget::Harness { note: Some(note) });
         }
-        if dir.parent() == Some(self.harness().join("pkgs").as_path()) {
-            let name = dir
-                .file_name()
-                .expect("a package directory has a name")
-                .to_string_lossy()
-                .to_string();
-            anyhow::ensure!(
-                valid_package_name(&name),
-                "{name:?} is not a valid package name"
-            );
-            return Ok(TestTarget::Package { name, mount: None });
-        }
         let snap = snapshot(Location::Package(dir.to_path_buf()))?;
-        let name = match &snap.manifest.package.name {
-            Some(name) => name.clone(),
-            None => dir
-                .file_name()
+        let dir_name = || {
+            dir.file_name()
                 .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+        };
+        // installed packages go by their directory's name, as a run loads them
+        let name = match &snap.manifest.package.name {
+            Some(name) if dir.parent() != Some(self.harness().join("pkgs").as_path()) => {
+                name.clone()
+            }
+            _ => dir_name(),
         };
         if name == "std" {
             // The name alone proves nothing: any directory can claim it, and the built-in suite runs with the agent's
@@ -334,7 +358,7 @@ impl Resolver {
         );
         Ok(TestTarget::Package {
             name,
-            mount: Some(Box::new(snap)),
+            snapshot: Box::new(snap),
         })
     }
 }

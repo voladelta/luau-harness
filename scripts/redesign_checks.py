@@ -246,7 +246,6 @@ return {
  closure=function() return function() end end,
  read=function() return read("task.md") end,
 }''')
-    run(path, "approve", "probe")
     code = '''assert(tools.probe.count()==1 and tools.probe.count()==1)
 assert(tools.probe.data[1]==10 and tools.probe.data[2]==20 and tools.probe.data["1"]==nil)
 local t={n=1}; assert(tools.probe.echo(t).n==8 and t.n==1)
@@ -302,7 +301,6 @@ def readonly_descendants_and_budget():
     directory.mkdir(parents=True)
     (directory / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nfs=["write"]\n')
     (directory / "init.luau").write_text('return {run=function() return write("escape.txt","bad") end}')
-    run(path, "approve", "writer")
     # A batch agent's value is agent()'s {answer, finished, turns}; the child answers "child done" only when its
     # read-only assertions all held.
     parent_code = '''local r=batch({{op="agent",args={"CHILD ONE"}},{op="agent",args={"CHILD TWO"}}})
@@ -714,7 +712,6 @@ assert(#durable.get("1")==#s); print("BOUNDED_OK")'''
     directory.mkdir(parents=True)
     (directory / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nllm=["agent"]\n')
     (directory / "init.luau").write_text('return {run=function() return agent("PACKAGE CHILD",{model="mock",effort="medium",max_turns=2}) end}')
-    run(path, "approve", "child")
     def answer(body, index):
         if task_text(body).startswith("PACKAGE CHILD"):
             return "child done" if has_assistant(body) else tool('print("CHILD")')
@@ -943,7 +940,6 @@ def agent_option_validation():
     package.mkdir(parents=True)
     (package / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nllm=["agent"]\n')
     (package / "init.luau").write_text('return {run=function(opts) return agent("child",opts) end}')
-    run(path, "approve", "child")
     code = '''for _, opts in {{effort="turbo"}, {model=7}, {max_turns="many"}, {max_turns=-1}} do
     assert(not pcall(agent,"child",opts))
     assert(not pcall(tools.child.run,opts))

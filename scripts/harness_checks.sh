@@ -78,18 +78,17 @@ for _ in $(seq 100); do grep -q ready "$U/ready" 2>/dev/null && break; sleep 0.0
 check "sh forks for a user who owns hundreds of threads" "$(HOME=$U/config XDG_CONFIG_HOME=$U/config XDG_STATE_HOME=$U/state "${as_user[@]}" timeout 60 $H exec --workspace "$U/ws" 'local r = sh("echo a | cat"); print(r.stdout == "a\n", r.code)' 2>&1 | head -1)" "true	0"
 kill $THREADS; rm -rf "$U"
 
-# 5. package lock gate
+# 5. packages: declared capabilities, trust
 P=$W/.harness/pkgs/mypkg; mkdir -p $P/tests
 printf '[package]\nname = "mypkg"\nversion = "0.1.0"\n[capabilities]\nnet = ["example.com"]\n' > $P/hx.toml
 echo 'return { hello = function() return "hi" end }' > $P/init.luau
 echo 'test.case("loads", function() test.eq(require("mypkg").hello(), "hi") end)' > $P/tests/t.luau
-check "an unknown capability is a load error, not a silent grant of nothing" "$($H approve mypkg --workspace $W 2>&1 | grep -c 'unknown capability net.example.com')" "1"
+check "an unknown capability is a load error, not a silent grant of nothing" "$($H test $P --workspace $W 2>&1 | grep -c 'unknown capability net.example.com')" "1"
 printf '[package]\nname = "mypkg"\nversion = "0.1.0"\n[capabilities]\nfs = ["read"]\n' > $P/hx.toml
-check "unlocked package refused" "$($H test $P --workspace $W 2>&1 | grep -c 'is not locked')" "1"
-$H approve mypkg --workspace $W >/dev/null
-check "approved package loads" "$($H test $P --workspace $W | tail -1)" "1 passed, 0 failed"
+check "hx test loads the package as it is on disk" "$($H test $P --workspace $W | tail -1)" "1 passed, 0 failed"
+HX_TRUST= $H trust --workspace $W --yes >/dev/null
 echo 'return { hello = function() return "evil" end }' > $P/init.luau
-check "tampered package refused" "$($H test $P --workspace $W 2>&1 | grep -c 'changed since it was approved')" "1"
+check "a tampered package untrusts the workspace" "$(HX_TRUST= $H exec --workspace $W 'print(1)' 2>&1 | grep -c '.harness/pkgs/mypkg (changed)')" "1"
 # a failed lock check must fail on EVERY require, not just the first
 mkdir -p $W/probe/tests
 cat > $W/probe/tests/t.luau <<'LUA'
@@ -98,7 +97,7 @@ test.case("failed require never enters a cache",function()
  test.ok(not a and not b)
 end)
 LUA
-check "tampered package refused on second require" "$($H test $W/probe --workspace $W | tail -1)" "1 passed, 0 failed"
+check "tampered package refused on second require" "$(HX_TRUST= $H test $W/probe --workspace $W 2>/dev/null | tail -1)" "1 passed, 0 failed"
 
 # 6. hooks can deny, subagents run, usage aggregates (scripted model)
 W2=$T/ws2; mkdir -p $W2/.harness; echo hi > $W2/readme.txt
