@@ -9,13 +9,13 @@ local M = host.load(host.default_loop, "=loop")()
 -- `hx --model NAME` and the variable in charge:
 -- M.model = host.env("HX_MODEL") or "deepseek-v4-pro"
 
--- A tool of this project's own. run(args) returns the text the model sees; raising reports an error to it.
--- table.insert(M.tools, {
+-- A function of this project's own, which the model's code can call. `usage` is what the model reads about it;
+-- run returns what the code gets back, and raising reports an error to the model.
+-- table.insert(M.functions, {
 -- 	name = "check",
--- 	description = "Run the project's tests. Returns their output and exit status.",
--- 	parameters = { type = "object", properties = { timeout = { type = "number", description = "seconds" } } },
--- 	run = function(args)
--- 		local result = host.sh("make check", { timeout = args.timeout or 600 })
+-- 	usage = "check() -> text: runs the project's tests and returns their output, then [exit N].",
+-- 	run = function()
+-- 		local result = host.sh("make check", { timeout = 600 })
 -- 		return result.out .. "[exit " .. tostring(result.code) .. "]"
 -- 	end,
 -- })

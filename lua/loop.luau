@@ -25,9 +25,9 @@ M.max_output = 16000 -- tokens per model reply
 M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
 M.output_limit = 30000 -- bytes of a tool result shown to the model
-M.lua_seconds = 60 -- time limit of one `lua` tool call
+M.call_seconds = 600 -- time limit of one `lua` tool call, commands and all
 M.effort = host.env("HX_EFFORT") -- low, high or max: how hard the model thinks; nil leaves it to the endpoint
-M.repeat_reminders = { 3, 5, 8 } -- the same call with the same result this many times in a task gets a reminder
+M.repeat_reminders = { 3, 5, 8 } -- a function call with the same result this many times in a task gets a reminder
 
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
 local function progress(text)
@@ -36,7 +36,8 @@ local function progress(text)
 	end
 end
 
--- Keeps the start and the end of a long text: the start says what ran, the end says how it went. The whole text
+-- Keeps the start and the end of a long result: the start says what ran, the end says how it went. Only the result
+-- the model is sent is clipped, once; the functions return everything, so code can work on all of it. The whole text
 -- goes to a file in $TMPDIR (hx makes one for every run, inside the wall), so what was left out can still be read
 -- or searched.
 local spills = 0
@@ -57,23 +58,59 @@ function M.printable(text)
 	return (text:gsub("[\0-\8\11-\31\127]", ""))
 end
 
-local function need(args, name, kind)
-	local value = args[name]
-	if type(value) ~= kind then
-		error(("argument %q must be a %s"):format(name, kind), 0)
-	end
-	return value
-end
-
 -- Extensions ------------------------------------------------------------------------------------------------
 --
 -- An extension is a Luau module in .hx/ext/NAME.luau that returns a table of functions. The model writes them
--- with the ordinary write tool and calls them from the `lua` tool, so the tool list never changes. A module is
--- loaded again whenever its file has changed.
+-- with write() and calls them from its code, so the tool never changes. A module is loaded again whenever its
+-- file has changed. Extensions see the same functions the model's code does.
 
 local ext_dir = ".hx/ext/"
 local ext_cache = {}
-local ext_env = setmetatable({}, { __index = _G })
+-- What code from the model and from extensions sees: the functions of M.functions (looked up when used, so a
+-- project's changes to the list count at once), ext, and the Luau globals.
+--
+-- Every function call is counted by what it was asked and what it returned. A call that returns what it returned
+-- before is going nowhere, whatever ran in between and whether the model repeats it across tool calls or in a loop
+-- inside one: that is the unit the repeat reminder counts, not the tool call, whose code may print a counter or a
+-- clock and so never repeat exactly. A command rerun after a fix returns something new, so it does not count.
+local repeats = { counts = {}, worst = nil } -- this turn's counts, and the call repeated most
+
+-- A value as text: JSON where it has a JSON form, and nil as null.
+local function as_text(value)
+	local ok, text = pcall(json.encode, value == nil and json.null or value)
+	return ok and text or tostring(value)
+end
+
+local function counted(fn)
+	return function(...)
+		local result = fn.run(...)
+		local args = {}
+		for i = 1, select("#", ...) do
+			args[i] = as_text((select(i, ...)))
+		end
+		local call = ("%s(%s)"):format(fn.name, table.concat(args, ", "))
+		local key = call .. "\0" .. as_text(result)
+		local count = (repeats.counts[key] or 0) + 1
+		repeats.counts[key] = count
+		if not repeats.worst or count > repeats.worst.count then
+			repeats.worst = { call = call, count = count }
+		end
+		return result
+	end
+end
+
+local function lookup(_, name)
+	if name == "ext" then
+		return M.ext
+	end
+	for _, fn in M.functions do
+		if fn.name == name then
+			return counted(fn)
+		end
+	end
+	return _G[name]
+end
+local ext_env = setmetatable({}, { __index = lookup })
 
 function M.ext(name)
 	if type(name) ~= "string" or not name:match("^[%w_%-]+$") then
@@ -95,7 +132,6 @@ function M.ext(name)
 	ext_cache[name] = { source = source, value = value }
 	return value
 end
-ext_env.ext = M.ext
 
 -- One line per extension: its name and the comment on its first line.
 local function extension_index()
@@ -110,41 +146,41 @@ local function extension_index()
 	return lines
 end
 
--- Tools -----------------------------------------------------------------------------------------------------
+-- Functions -------------------------------------------------------------------------------------------------
 --
--- Each tool is {name, description, parameters (a JSON schema), run(args) -> string}, and may have `aliases`, a
--- map from an argument name models often send to the tool's own name for it. A tool reports failure by raising;
--- the message goes back to the model. Add project tools to this list.
+-- The model has one tool, `lua`, and acts by calling functions from the code it sends. Each function is
+-- {name, usage, run}: `usage` is the line the model reads about it, `run` takes the arguments and returns a value,
+-- usually the text the model is meant to see, and reports failure by raising. The same functions are there for
+-- extensions. Add project functions to this list; the order is the order the model reads them in.
 
-local scratch = setmetatable({}, { __index = _G }) -- globals of `lua` snippets live here, across calls
-
-local function show(value)
-	if type(value) == "table" then
-		local ok, text = pcall(json.encode, value)
-		if ok then
-			return text
+-- Checks one argument, and names the call's whole shape when it is wrong: a model used to JSON tools may pass a
+-- table of named arguments where a string belongs.
+local function check(fname, value, position, name, kind, optional)
+	if type(value) == kind or value == nil and optional then
+		return
+	end
+	local usage = fname
+	for _, fn in M.functions do
+		if fn.name == fname then
+			usage = fn.usage:match("^[^>]*%)") or fn.name
 		end
 	end
-	return tostring(value)
+	error(("%s: argument %d (%s) must be a %s, not %s; usage: %s"):format(fname, position, name, kind, type(value),
+		usage), 0)
 end
 
-M.tools = {
+M.functions = {
 	{
 		name = "bash",
-		description = "Run a bash command in the project directory. Returns stdout and stderr together, then the "
-			.. "exit status. Every call is a new shell. The command is killed after `timeout` seconds (default 120). "
-			.. "A process left in the background must send its output to a file, and is killed when this session "
-			.. "ends, daemons included: nothing you start outlives it.",
-		parameters = {
-			type = "object",
-			properties = {
-				command = { type = "string" },
-				timeout = { type = "number", description = "seconds" },
-			},
-			required = { "command" },
-		},
-		run = function(args)
-			local result = host.sh(need(args, "command", "string"), { timeout = args.timeout })
+		usage = "bash(command, timeout?) -> text: runs a bash command in the project directory, a new shell each "
+			.. "time, and returns stdout and stderr together, then [exit N]. The command is killed after timeout "
+			.. "seconds (default 120). A process left in the background must send its output to a file, and is "
+			.. "killed when this session ends, daemons included: nothing you start outlives it.",
+		run = function(command, timeout)
+			check("bash", command, 1, "command", "string")
+			check("bash", timeout, 2, "timeout", "number", true)
+			progress("  bash " .. M.printable(command:sub(1, 100):gsub("\n", " ")))
+			local result = host.sh(command, { timeout = timeout })
 			local status
 			if result.timed_out then
 				status = "timed out and was killed"
@@ -153,7 +189,7 @@ M.tools = {
 			else
 				status = "exit " .. result.code
 			end
-			local out = clip(result.out)
+			local out = result.out
 			if out ~= "" and out:sub(-1) ~= "\n" then
 				out ..= "\n"
 			end
@@ -162,21 +198,16 @@ M.tools = {
 	},
 	{
 		name = "read",
-		description = "Read a text file. Returns whole lines from line `offset` (default 1), up to `limit` lines "
-			.. "(default 2000) or the output limit, each as `NUMBER: text`; the numbers are not part of the file. "
-			.. "When that is not the whole file, it ends with the range it returned and the offset to go on from.",
-		parameters = {
-			type = "object",
-			properties = {
-				file_path = { type = "string" },
-				offset = { type = "number", description = "first line, from 1" },
-				limit = { type = "number", description = "most lines to return" },
-			},
-			required = { "file_path" },
-		},
-		aliases = { path = "file_path" },
-		run = function(args)
-			local text, err = host.read(need(args, "file_path", "string"))
+		usage = "read(path, offset?, limit?) -> text: whole lines of a text file from line offset (default 1), up "
+			.. "to limit lines (default 2000) or the output limit, each as `NUMBER: text`; the numbers are not part "
+			.. "of the file. When that is not the whole file, it ends with the range and the offset to go on from. "
+			.. "For the file's exact contents, as data, use host.read(path).",
+		run = function(path, offset, limit)
+			check("read", path, 1, "path", "string")
+			check("read", offset, 2, "offset", "number", true)
+			check("read", limit, 3, "limit", "number", true)
+			progress("  read " .. M.printable(path))
+			local text, err = host.read(path)
 			if not text then
 				error(err, 0)
 			end
@@ -188,18 +219,20 @@ M.tools = {
 				table.remove(lines)
 			end
 			-- A \r\n line end is shown as a plain one. Shown, the \r reaches the model as the text \r, which it then
-			-- types into old_string as a backslash and an r; edit finds plain \n text in a \r\n file anyway.
+			-- types into an edit as a backslash and an r; edit finds plain \n text in a \r\n file anyway.
 			for i, line in lines do
 				if line:sub(-1) == "\r" then
 					lines[i] = line:sub(1, -2)
 				end
 			end
-			local first = math.max(1, args.offset or 1)
-			local last = math.min(#lines, first + (args.limit or 2000) - 1)
+			local first = math.max(1, offset or 1)
+			local last = math.min(#lines, first + (limit or 2000) - 1)
 			if first > #lines then
 				error(("offset %d is past the end: the file has %d lines"):format(first, #lines), 0)
 			end
-			-- Whole lines up to the byte limit, never head and tail, so the range says exactly what was left out.
+			-- Whole lines up to the byte limit, never head and tail, so the range says exactly what was left out. The
+			-- limit leaves room for the range line, so that a read on its own is never cut when the result is.
+			local budget = M.output_limit - 200
 			local function numbered(i)
 				return ("%d: %s"):format(i, lines[i])
 			end
@@ -208,18 +241,18 @@ M.tools = {
 			for i = first + 1, last do
 				local line = numbered(i)
 				size += 1 + #line
-				if size > M.output_limit then
+				if size > budget then
 					last = i - 1
 					break
 				end
 				table.insert(shown, line)
 			end
 			local body
-			if #lines[first] > M.output_limit then
+			if #lines[first] > budget then
 				-- A line longer than the limit still counts as read, so the next offset moves past it.
 				last = first
-				body = ("%d: %s"):format(first, lines[first]:sub(1, M.output_limit))
-					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], M.output_limit)
+				body = ("%d: %s"):format(first, lines[first]:sub(1, budget))
+					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], budget)
 			else
 				body = table.concat(shown, "\n")
 			end
@@ -233,16 +266,12 @@ M.tools = {
 	},
 	{
 		name = "write",
-		description = "Create or overwrite a file with `content`. Missing directories are created. For a change to "
-			.. "part of an existing file, edit is cheaper and safer.",
-		parameters = {
-			type = "object",
-			properties = { file_path = { type = "string" }, content = { type = "string" } },
-			required = { "file_path", "content" },
-		},
-		aliases = { path = "file_path" },
-		run = function(args)
-			local path, content = need(args, "file_path", "string"), need(args, "content", "string")
+		usage = "write(path, content) -> text: creates or overwrites a file. Missing directories are created. For a "
+			.. "change to part of an existing file, edit is cheaper and safer.",
+		run = function(path, content)
+			check("write", path, 1, "path", "string")
+			check("write", content, 2, "content", "string")
+			progress("  write " .. M.printable(path))
 			local ok, err = host.write(path, content)
 			if not ok then
 				error(err, 0)
@@ -252,28 +281,20 @@ M.tools = {
 	},
 	{
 		name = "edit",
-		description = "Replace the exact text `old_string` with `new_string` in a file. `old_string` must occur "
-			.. "exactly once, unless `replace_all` is true, which replaces every occurrence. Copy it from the file "
-			.. "without the line numbers read puts in front.",
-		parameters = {
-			type = "object",
-			properties = {
-				file_path = { type = "string" },
-				old_string = { type = "string" },
-				new_string = { type = "string" },
-				replace_all = { type = "boolean" },
-			},
-			required = { "file_path", "old_string", "new_string" },
-		},
-		aliases = { path = "file_path" },
-		run = function(args)
-			local path, old, new = need(args, "file_path", "string"), need(args, "old_string", "string"),
-				need(args, "new_string", "string")
+		usage = "edit(path, old, new, all?) -> text: replaces the exact text old with new in a file. old must occur "
+			.. "exactly once, unless all is true, which replaces every occurrence. Copy old from the file without "
+			.. "the line numbers read puts in front.",
+		run = function(path, old, new, all)
+			check("edit", path, 1, "path", "string")
+			check("edit", old, 2, "old", "string")
+			check("edit", new, 3, "new", "string")
+			check("edit", all, 4, "all", "boolean", true)
+			progress("  edit " .. M.printable(path))
 			if old == "" then
-				error("old_string must not be empty", 0)
+				error("edit: old must not be empty", 0)
 			end
 			if old == new then
-				error("old_string and new_string are the same, so this edit would change nothing", 0)
+				error("edit: old and new are the same, so this edit would change nothing", 0)
 			end
 			local text, err = host.read(path)
 			if not text then
@@ -304,10 +325,10 @@ M.tools = {
 			end
 			if count == 0 then
 				local hint = old:match("^%s*%d+: ") and " without the line numbers read adds" or ""
-				error(("old text not found in %s: read the file again and copy the text exactly%s"):format(path, hint), 0)
+				error(("edit: old text not found in %s: read the file again and copy the text exactly%s"):format(path, hint), 0)
 			end
-			if count > 1 and not args.replace_all then
-				error(("old text occurs %d times in %s: add surrounding lines to make it unique, or pass replace_all"):format(count, path), 0)
+			if count > 1 and not all then
+				error(("edit: old text occurs %d times in %s: add surrounding lines to make it unique, or pass all = true"):format(count, path), 0)
 			end
 			local ok, write_err = host.write(path, table.concat(pieces))
 			if not ok then
@@ -316,19 +337,61 @@ M.tools = {
 			return ("replaced %d occurrence%s in %s"):format(count, count == 1 and "" or "s", path)
 		end,
 	},
+}
+
+-- Tools -----------------------------------------------------------------------------------------------------
+--
+-- Each tool is {name, description, parameters (a JSON schema), run(args) -> text, failed?}. A tool may also report
+-- failure by raising; the message goes back to the model. The built-in loop has one tool.
+
+local scratch = setmetatable({}, { __index = lookup }) -- globals of `lua` code live here, across calls
+
+local function show(value)
+	if type(value) == "table" then
+		local ok, text = pcall(json.encode, value)
+		if ok then
+			return text
+		end
+	end
+	return tostring(value)
+end
+
+local function lua_description()
+	local lines = {
+		"Run Luau code in the project directory. This is how you act: the code calls the functions below. The "
+			.. "result is what the code prints and then what it returns; a function's value shows only when you "
+			.. "print or return it. Globals persist between calls. A call is stopped after "
+			.. M.call_seconds .. " seconds.",
+		"",
+	}
+	for _, fn in M.functions do
+		table.insert(lines, "- " .. fn.usage)
+	end
+	table.insert(lines, "- ext(name) -> table: the extension .hx/ext/NAME.luau.")
+	table.insert(lines, "- host.sh(command) -> {out, code}, host.read(path) -> text, host.write(path, text), "
+		.. "host.list(dir), json.encode, json.decode: the plain primitives, for working on data.")
+	table.insert(lines, "")
+	table.insert(lines, "A function that fails raises an error, which stops the code there: what ran before it "
+		.. "has happened, and what it printed is shown with the error. Put text with quotes, backslashes or "
+		.. "several lines in long brackets, [==[like this]==], which need no escaping; a newline right after the "
+		.. "opening bracket is dropped.")
+	return table.concat(lines, "\n")
+end
+
+M.tools = {
 	{
 		name = "lua",
-		description = "Run Luau code inside the harness. Returns what the code prints and returns. Globals persist "
-			.. "between calls. Available: ext(name) loads the extension .hx/ext/NAME.luau, host.sh / host.read / "
-			.. "host.write / host.list, json.encode / json.decode.",
+		description = lua_description,
 		parameters = {
 			type = "object",
 			properties = { code = { type = "string" } },
 			required = { "code" },
 		},
 		run = function(args)
+			if type(args.code) ~= "string" then
+				error('argument "code" must be a string', 0)
+			end
 			local lines = {}
-			scratch.ext = M.ext
 			scratch.print = function(...)
 				local parts = table.pack(...)
 				for i = 1, parts.n do
@@ -336,18 +399,20 @@ M.tools = {
 				end
 				table.insert(lines, table.concat(parts, "\t"))
 			end
-			local chunk, err = host.load(need(args, "code", "string"), "=lua", scratch)
+			local chunk, err = host.load(args.code, "=lua", scratch)
 			if not chunk then
-				error(err, 0)
+				return "error: " .. err, true
 			end
-			local results = table.pack(host.timed(M.lua_seconds, chunk))
-			if not results[1] then
-				error(results[2], 0)
+			local results = table.pack(host.timed(M.call_seconds, chunk))
+			local failed = not results[1]
+			if failed then
+				table.insert(lines, "error: " .. tostring(results[2]))
+			else
+				for i = 2, results.n do
+					table.insert(lines, show(results[i]))
+				end
 			end
-			for i = 2, results.n do
-				table.insert(lines, show(results[i]))
-			end
-			return #lines > 0 and clip(table.concat(lines, "\n")) or "[no output]"
+			return #lines > 0 and clip(table.concat(lines, "\n")) or "[no output]", failed
 		end,
 	},
 }
@@ -396,25 +461,20 @@ local function run_tool(call)
 	if not tool then
 		return "error: there is no tool named " .. tostring(call.name), true
 	end
-	if type(call.input) ~= "table" then
+	local args = call.input
+	if type(args) ~= "table" then
 		return "error: the tool input is not an object", true
 	end
-	-- A copy, so that renaming an alias leaves the call in the history as the model sent it.
-	local args = table.clone(call.input)
-	for alias, name in tool.aliases or {} do
-		if args[alias] ~= nil and args[name] == nil then
-			args[name], args[alias] = args[alias], nil
-		end
+	if tool.name ~= "lua" then -- the functions the code calls say what they do
+		progress("  " .. tool.name)
 	end
-	local what = M.printable(tostring(args.command or args.file_path or args.code or ""):sub(1, 100):gsub("\n", " "))
-	progress(("  %s %s"):format(tool.name, what))
 	local problem = argument_problem(tool, args)
 	if problem then
 		return "error: " .. problem, true
 	end
-	local ok, result = pcall(tool.run, args)
+	local ok, result, failed = pcall(tool.run, args)
 	if ok then
-		return result, false
+		return result, failed == true
 	end
 	return "error: " .. tostring(result), true
 end
@@ -430,7 +490,8 @@ local usage = { replies = 0, input = 0, cached = 0, output = 0 }
 local function tool_specs()
 	local specs = json.array({}) -- a list even when a project has taken every tool away
 	for _, tool in M.tools do
-		table.insert(specs, { name = tool.name, description = tool.description, input_schema = tool.parameters })
+		local description = type(tool.description) == "function" and tool.description() or tool.description
+		table.insert(specs, { name = tool.name, description = description, input_schema = tool.parameters })
 	end
 	return specs
 end
@@ -500,7 +561,9 @@ end
 
 function M.system_prompt()
 	local parts = {
-		("You are a coding agent working in %s through the tools you are given."):format(host.cwd),
+		("You are a coding agent working in %s. You act by running Luau code with the lua tool; the code calls "
+			.. "the functions the tool lists. Put several steps in one call when you know what each will do, and take "
+			.. "one step at a time when the next depends on what the last returned."):format(host.cwd),
 		host.sandboxed
 				and "The kernel confines you: you can write inside this project directory and $TMPDIR, and read those "
 					.. "plus the system directories. \"Permission denied\" anywhere else is that wall. Do not refuse "
@@ -509,13 +572,13 @@ function M.system_prompt()
 			or "Nothing confines you in this session: you act with the user's full access to this machine. Stay "
 				.. "inside this project directory unless the task says otherwise.",
 		"You can extend yourself. You run on the loop built into hx; .hx/loop.luau, if the project has one, starts "
-			.. "from it and changes parts. The lua tool can read the built-in source as host.default_loop. Extensions "
+			.. "from it and changes parts. Your code can read the built-in source as host.default_loop. Extensions "
 			.. "are Luau modules in .hx/ext/NAME.luau: the first line is a `--` comment saying what the module does, "
 			.. "and it returns "
-			.. "a table of functions. Call one from the lua tool as ext(\"NAME\").fn(...). Extensions stay with "
+			.. "a table of functions. Call one from your code as ext(\"NAME\").fn(...); write it with write(). Extensions stay with "
 			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore.",
-		"Use the read tool, not shell commands like cat, sed, head or tail, to look at text files; its offset and "
-			.. "limit read a range of lines or go on through a large file. Read a file before you edit it, unless "
+		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
+			.. "range of lines or go on through a large file. Read a file before you edit it, unless "
 			.. "you wrote or edited it yourself in this session.",
 		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
 	}
@@ -752,23 +815,20 @@ function M.compact(system, talk)
 	)
 end
 
--- What the model is told when it makes a call it has made before, and gets the same result again. That is a
--- loop whatever ran in between: a status polled between sleeps, a command rerun without a change. A command
--- rerun after a fix gets a new result, so it does not count.
+-- What the model is told when a function call has returned the same result `count` times in this task (see
+-- `counted`), as `call`, the call written out. `first` is the first reminder of the turn.
 function M.repeat_reminder(call, count, first)
+	if #call > 500 then
+		call = call:sub(1, 500) .. ("... (%d more bytes)"):format(#call - 500)
+	end
 	if first then
-		return ("You have now made the exact same tool call %d times and got the same result each time. If it is "
-			.. "not going to change, stop and report what you found; otherwise try a different approach. Do not "
-			.. "change what you are checking to make it give another answer."):format(count)
+		return ("%s has now returned the same result %d times. If it is not going to change, stop and report what "
+			.. "you found; otherwise try a different approach. Do not change what you are checking to make it give "
+			.. "another answer."):format(call, count)
 	end
-	local args = json.encode(call.input)
-	if #args > 500 then
-		args = args:sub(1, 500) .. ("... (%d more bytes)"):format(#args - 500)
-	end
-	return ("You have made the same %s call %d times in this task, with these arguments: %s\nEvery time it "
-		.. "returned the same result, so repeating it is not making progress. Do not make this call again, and do "
-		.. "not change what it checks to make it give another answer. Choose a different action, or finish the "
-		.. "task and say what you found."):format(call.name, count, args)
+	return ("%s has returned the same result %d times in this task, so asking again is not making progress. Do not "
+		.. "call it again, and do not change what it checks to make it give another answer. Choose a different "
+		.. "action, or finish the task and say what you found."):format(call, count)
 end
 
 -- Prints the text of a reply: the model's words are the answer, on stdout.
@@ -782,29 +842,31 @@ end
 
 -- Runs the model until it answers without asking for a tool.
 function M.turn(system, talk)
-	local seen = {} -- how often each call has had each result in this turn
+	repeats.counts, repeats.worst = {}, nil
+	local reminded = 0 -- the highest count already reminded of
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
 		local cut_off = reply.stop_reason == "max_tokens"
 		show_text(reply)
 		local calls = talk:reply(reply.content)
 		if #calls > 0 then
-			local reminder = nil
 			talk:answer(function(call)
 				if cut_off then
 					return "error: this call was cut off by the output limit and did not run. Send it again, smaller.", true
 				end
-				local result, failed = run_tool(call)
-				local key = json.encode({ call.name, call.input or json.null, result })
-				seen[key] = (seen[key] or 0) + 1
-				local at = table.find(M.repeat_reminders, seen[key])
-				if at then
-					reminder = M.repeat_reminder(call, seen[key], at == 1)
-				end
-				return result, failed
+				return run_tool(call)
 			end)
-			if reminder then
-				talk:say(reminder)
+			-- One reminder for the highest threshold the worst call has passed since the last one, however many
+			-- times a loop inside one call passed.
+			local worst, due = repeats.worst, nil
+			for i, at in M.repeat_reminders do
+				if worst and worst.count >= at and at > reminded then
+					due = i
+				end
+			end
+			if due then
+				reminded = M.repeat_reminders[due]
+				talk:say(M.repeat_reminder(worst.call, worst.count, due == 1))
 			end
 			if prompt_size(reply) > M.compact_at then
 				M.compact(system, talk)

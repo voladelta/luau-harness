@@ -1,6 +1,7 @@
 # hx
 
-A small coding-agent host for one project at a time: a Luau VM, five tools, and one kernel-enforced wall.
+A small coding-agent host for one project at a time: a Luau VM, one tool that runs Luau, and one kernel-enforced
+wall.
 
 The host is about 2,000 lines of C++. The agent loop is one Luau file, and your project can change any part of
 it. The model can extend the harness by writing Luau modules into the project.
@@ -16,12 +17,15 @@ hx "add a --json flag to the export command and test it"
 - **The host is a kernel, not a framework.** It gives Luau a model call, a shell, file access and JSON. That is
   all. There is no plugin system, package format, permission prompt or configuration file.
 - **The loop belongs to the project.** `hx --init` writes `.hx/loop.luau`, a short file that loads the loop built
-  into hx and changes what this project needs: the model, the prompt, the tools, the retry and compaction
+  into hx and changes what this project needs: the model, the prompt, the functions, the retry and compaction
   rules. What it leaves alone keeps up with hx. `hx --init --full` copies the whole built-in loop instead, and
   the project owns all of it.
+- **One tool, and it is code.** The model acts by sending Luau to its one tool, `lua`. `bash`, `read`, `write`
+  and `edit` are functions that code calls, next to the project's own functions and extensions, so a step that
+  takes ten calls elsewhere can be one loop here.
 - **One wall, built by the kernel.** Before anything runs, the process confines itself with Landlock. The VM,
-  the file tools and every command the model starts inherit the same rules, so no tool needs a path check and
-  no command needs to be judged by its text.
+  the file functions and every command the model starts inherit the same rules, so no function needs a path
+  check and no command needs to be judged by its text.
 - **Extensions have no more power than the model.** An extension is Luau running in the same confined process.
   It can do nothing the model's own shell could not, so nothing needs to be approved, staged or trusted.
 
@@ -148,36 +152,42 @@ Know these before you rely on it.
 
 ## The loop
 
-`lua/loop.luau` is the whole agent: about 950 lines. It speaks the Anthropic Messages format, asks for adaptive
-thinking, and sends thinking blocks back exactly as they came. The five tools it defines:
+`lua/loop.luau` is the whole agent: about 1,000 lines. It speaks the Anthropic Messages format, asks for adaptive
+thinking, and sends thinking blocks back exactly as they came. It gives the model one tool, `lua`, which runs the
+code it is sent in the project directory and returns what the code prints and returns. Globals persist from one
+call to the next. The code acts through these functions:
 
-| Tool | Does |
+| Function | Does |
 |---|---|
-| `bash` | runs a command, returns its output and exit status, kills it after a timeout; a long output is cut in the middle and kept whole in a file in `$TMPDIR` |
-| `read` | returns a range of lines of a file, numbered; `\r\n` line ends are shown as plain ones |
-| `write` | creates or overwrites a file |
-| `edit` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too |
-| `lua` | runs Luau inside the harness; this is how extensions are called |
+| `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout |
+| `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
+| `write(path, content)` | creates or overwrites a file |
+| `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too |
+| `ext(name)` | an extension's table of functions |
+
+`host.*` and `json.*` are there too, for working on raw data. A function that fails raises, and the error goes
+back to the model with what the code printed before it. Only the result is clipped, once: past `M.output_limit`
+it keeps the start and the end, and the whole of it goes to a file in `$TMPDIR` whose path it names. A function
+returns everything, so code can work on an output of any size.
 
 `hx --init` writes `.hx/loop.luau` from `lua/overlay.luau`:
 
 ```lua
 local M = host.load(host.default_loop, "=loop")()
 M.model = host.env("HX_MODEL") or "deepseek-v4-pro"  -- --model and HX_MODEL still win
-table.insert(M.tools, { name = "check", description = "...", parameters = {...}, run = function(args) ... end })
+table.insert(M.functions, { name = "check", usage = "check() -> text: runs the tests", run = function() ... end })
 return M
 ```
 
 Every setting at the top of the loop is a field of `M`, and so are the parts a project may want to replace:
-`M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until the model
-is done), `M.compact` and `M.compact_prompt`. The loop always calls them through `M`, so a replacement takes
-effect everywhere.
+`M.functions`, `M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until
+the model is done), `M.compact` and `M.compact_prompt`. The loop always calls them through `M`, so a replacement
+takes effect everywhere.
 
-The file tools take `file_path`, the name most models are trained on, and accept `path` for it. Some habits of
-the model are handled in the loop rather than left to the prompt: a call that gets the same result for the 3rd, 5th
-and 8th time in a task, whatever ran in between, gets a reminder to stop or try something else; a reply with
-nothing in it is retried like a busy server; and a task that runs out of replies gets one more, to report where it
-stands.
+Some habits of the model are handled in the loop rather than left to the prompt: a call that gets the same result
+for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop or try something else; a
+reply with nothing in it is retried like a busy server; and a task that runs out of replies gets one more, to
+report where it stands.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON. The logs hold
@@ -213,10 +223,10 @@ return {
 }
 ```
 
-The model writes extensions with the ordinary `write` tool and calls them through the `lua` tool as
-`ext("NAME").count("src")`. A changed file is loaded again on its next use. Each session starts with a list of
-the project's extensions in the system prompt. The tool list itself never changes, so prompt caching keeps
-working. Commit `.hx/ext/` and the harness grows with the project.
+The model writes extensions with `write` and calls them from its code as `ext("NAME").count("src")`. An
+extension can call the same functions the model's code can. A changed file is loaded again on its next use. Each
+session starts with a list of the project's extensions in the system prompt. The tool itself never changes, so
+prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the project.
 
 ## Host primitives
 

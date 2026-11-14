@@ -86,7 +86,40 @@ def text(words):
     return {"type": "text", "text": words}
 
 
+# The model has one tool, lua, and calls the functions from its code. A scripted bash, read, write or edit call
+# becomes the code a model would send for it: `return bash("...")`.
+FUNCTIONS = {"bash": ["command", "timeout"], "read": ["path", "offset", "limit"], "write": ["path", "content"],
+             "edit": ["path", "old", "new", "all"]}
+
+
+def lua_literal(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    out = []
+    for c in value:
+        if c in '"\\':
+            out.append("\\" + c)
+        elif c == "\n":
+            out.append("\\n")
+        elif c.isprintable() or c == "\t":
+            out.append(c)
+        else:
+            out.extend(f"\\{b:03d}" for b in c.encode())
+    return '"' + "".join(out) + '"'
+
+
+def code(name, args):
+    values = [args.get(key) for key in FUNCTIONS[name]]
+    while values and values[-1] is None:
+        values.pop()
+    return f"return {name}({', '.join('nil' if v is None else lua_literal(v) for v in values)})"
+
+
 def use(name, args, call_id="call_1"):
+    if name in FUNCTIONS:
+        name, args = "lua", {"code": code(name, args)}
     return {"type": "tool_use", "id": call_id, "name": name, "input": args}
 
 
@@ -148,7 +181,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("coding agent", first["system"])
         self.assertIn("The kernel confines you", first["system"])
         self.assertEqual(first["messages"], [{"role": "user", "content": "make a file"}])
-        self.assertEqual([t["name"] for t in first["tools"]], ["bash", "read", "write", "edit", "lua"])
+        self.assertEqual([t["name"] for t in first["tools"]], ["lua"])
         self.assertEqual(set(first["tools"][0]), {"name", "description", "input_schema"})
         self.assertEqual(first["thinking"], {"type": "adaptive"})
         self.assertEqual(second["messages"][1:], [
@@ -175,13 +208,21 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(self.tool_results(), ["0\n[exit 0]", "1\n[exit 0]", "2\n[exit 0]"])
 
     def test_a_bad_tool_call_is_reported_to_the_model_not_fatal(self):
-        done = self.run_hx("go", script=[call("bash", "not an object", "c1"), call("nope", {}, "c2"), call("read", {}, "c3"),
-                                         say("ok")])
+        done = self.run_hx("go", script=[call("lua", "not an object", "c1"),
+                                         reply([{"type": "tool_use", "id": "c2", "name": "bash", "input": {"command": "true"}}],
+                                               stop="tool_use"),
+                                         call("nope", {}, "c3"), call("lua", {}, "c4"),
+                                         call("lua", {"code": "return read({file_path = 'f.txt'})"}, "c5"),
+                                         call("lua", {"code": "return +"}, "c6"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
         self.assertIn("not an object", results[0])
-        self.assertIn("no tool named nope", results[1])
-        self.assertIn('missing argument "file_path": read takes file_path, limit, offset', results[2])
+        # A model used to the old tools may still call one by name.
+        self.assertEqual(results[1], "error: there is no tool named bash")
+        self.assertEqual(results[2], "error: there is no tool named nope")
+        self.assertEqual(results[3], 'error: missing argument "code": lua takes code')
+        self.assertEqual(results[4], "error: read: argument 1 (path) must be a string, not table; usage: read(path, offset?, limit?)")
+        self.assertIn("error: lua:1:", results[5])
         failed = self.model.requests[1]["messages"][-1]["content"][0]
         self.assertIs(failed["is_error"], True)
 
@@ -209,14 +250,21 @@ class AgentTest(unittest.TestCase):
 
     def test_a_repeated_call_gets_a_reminder(self):
         same = [call("bash", {"command": "true", "timeout": 5}, f"c{i}") for i in range(5)]
-        same[1] = call("bash", {"timeout": 5, "command": "true"}, "c1")  # the order of the keys does not matter
         done = self.run_hx("go", script=[*same, say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         reminders = self.reminders()
         self.assertEqual([len(r) for r in reminders], [0, 0, 1, 0, 1])
-        self.assertIn("exact same tool call 3 times", reminders[2][0])
-        self.assertIn('same bash call 5 times in this task, with these arguments: {"command":"true","timeout":5}',
-                      reminders[4][0])
+        self.assertIn('bash("true", 5) has now returned the same result 3 times', reminders[2][0])
+        self.assertIn('bash("true", 5) has returned the same result 5 times in this task', reminders[4][0])
+
+    def test_a_loop_inside_one_call_is_counted_too(self):
+        # The model's code prints a counter, so no two tool results are alike; the function results are.
+        loop = "for i = 1, 6 do print(i, bash('echo not ready')) end"
+        done = self.run_hx("go", script=[call("lua", {"code": loop}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        reminders = self.reminders()
+        self.assertEqual([len(r) for r in reminders], [1])  # one reminder, for the highest count passed: 5
+        self.assertIn('bash("echo not ready") has returned the same result 6 times', reminders[0][0])
 
     def test_a_call_polled_between_other_calls_still_counts(self):
         poll = lambda i: call("bash", {"command": "echo not ready"}, f"p{i}")
@@ -1094,23 +1142,38 @@ class AgentTest(unittest.TestCase):
         with open(os.path.join(self.project, "f.txt"), "w") as f:
             f.write("one two\n")
         done = self.run_hx("go", script=[
-            call("edit", {"path": "f.txt", "old": "one", "new_string": "1"}, "c1"),
-            call("edit", {"path": "f.txt", "old_string": "one"}, "c2"),
-            call("edit", {"path": "f.txt", "old_string": "one", "new_string": "1"}, "c3"),
+            call("lua", {"command": "return 1"}, "c1"),
+            call("lua", {"code": "return edit('f.txt', 'one')"}, "c2"),
+            call("lua", {"code": "return edit('f.txt', 'one', '1')"}, "c3"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results(), [
-            'error: unknown argument "old": edit takes file_path, old_string, new_string, replace_all',
-            'error: missing argument "new_string": edit takes file_path, old_string, new_string, replace_all',
+            'error: unknown argument "command": lua takes code',
+            "error: edit: argument 3 (new) must be a string, not nil; usage: edit(path, old, new, all?)",
             "replaced 1 occurrence in f.txt"])
         self.assertEqual(read(self.project, "f.txt"), "1 two\n")
 
+    def test_one_call_can_do_several_things_and_a_failure_keeps_what_came_before(self):
+        with open(os.path.join(self.project, "f.txt"), "w") as f:
+            f.write("a\nb\n")
+        batch = ("for _, name in {'x', 'y'} do write(name .. '.txt', name) end "
+                 "print(edit('f.txt', 'a', 'A')) print(edit('f.txt', 'zzz', 'Z')) print('never')")
+        done = self.run_hx("go", script=[call("lua", {"code": batch}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results(), [
+            "replaced 1 occurrence in f.txt\n"
+            "error: edit: old text not found in f.txt: read the file again and copy the text exactly"])
+        self.assertIs(self.model.requests[1]["messages"][-1]["content"][0]["is_error"], True)
+        self.assertEqual((read(self.project, "x.txt"), read(self.project, "y.txt")), ("x", "y"))
+        self.assertEqual(read(self.project, "f.txt"), "A\nb\n")
+        self.assertIn("  write x.txt\n  write y.txt\n  edit f.txt\n  edit f.txt\n", done.stderr)
+
     def test_a_long_output_is_kept_whole_in_a_file_with_or_without_the_sandbox(self):
         script = ("local loop = host.load(host.default_loop, '=loop')() loop.output_limit = 100 "
-                  "local out = loop.tools[1].run({ command = 'seq 1 5000' }) "
+                  "local out = loop.tools[1].run({ code = 'return bash(\\'seq 1 5000\\')' }) "
                   "local path = out:match('the whole output is in (%S+)') "
                   "print(path ~= nil and path:sub(1, #host.env('TMPDIR')) == host.env('TMPDIR'), "
-                  "path and host.read(path) == host.sh('seq 1 5000').out)")
+                  "path and host.read(path) == host.sh('seq 1 5000').out .. '[exit 0]')")
         for flags in ([], ["--no-sandbox"]):
             done = self.run_hx(*flags, "--run", "-", stdin=script)
             self.assertEqual((done.returncode, done.stdout), (0, "true\ttrue\n"), (flags, done.stderr))
@@ -1122,15 +1185,6 @@ class AgentTest(unittest.TestCase):
         done = self.run_hx("go", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.model.requests[0]["tools"], [])
-
-    def test_path_is_taken_for_file_path(self):
-        with open(os.path.join(self.project, "f.txt"), "w") as f:
-            f.write("one\n")
-        done = self.run_hx("go", script=[call("read", {"path": "f.txt"}), say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.tool_results(), ["1: one"])
-        # The call stays in the history as the model sent it.
-        self.assertEqual(self.model.requests[1]["messages"][1]["content"][0]["input"], {"path": "f.txt"})
 
     def test_control_characters_reach_a_terminal_only_as_text(self):
         words = "\x1b]52;c;aGk=\x07red\x1b[31m!"
