@@ -47,7 +47,8 @@ namespace fs = std::filesystem;
 constexpr std::string_view kUsage = R"(usage:
   hx [options] [TASK...]             run the agent on TASK; with no task, read it from stdin or start a prompt
   hx [options] run FILE [ARGS...]    run a Luau script with the host primitives
-  hx init                            copy the built-in loop to .hx/loop.luau so this project owns its harness
+  hx init [--full]                   write .hx/loop.luau, a loop that starts from the built-in one; with
+                                     --full, a copy of the whole built-in loop
 
 options:
   --ro PATH        also allow reading PATH (a toolchain in your home directory, for example)
@@ -88,6 +89,7 @@ struct Options {
     std::vector<std::string> write_paths;
     std::vector<std::string> keep_env;
     bool sandbox = true;
+    bool full = false;  // init: copy the whole built-in loop, not the overlay
 };
 
 Options parse_args(const std::vector<std::string_view>& argv) {
@@ -121,8 +123,10 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             break;
         }
     }
-    if (i + 1 == argv.size() && argv[i] == "init") {
+    if (i < argv.size() && argv[i] == "init" &&
+        (i + 1 == argv.size() || (i + 2 == argv.size() && argv[i + 1] == "--full"))) {
         options.mode = Mode::Init;
+        options.full = i + 2 == argv.size();
         return options;
     }
     if (i < argv.size() && argv[i] == "run") {
@@ -145,7 +149,9 @@ std::optional<std::string> read_file(const fs::path& path) {
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
-int init_project() {
+// Writes .hx/loop.luau: by default the overlay, which loads the built-in loop and changes parts of it, so fixes
+// to hx still reach the project; with `full`, a copy of the whole built-in loop, which the project then owns.
+int init_project(bool full) {
     std::error_code ec;
     fs::create_directories(".hx/ext", ec);
     if (ec) {
@@ -154,9 +160,13 @@ int init_project() {
     if (fs::exists(kProjectLoop)) {
         throw UsageError(fmt::format("{} already exists; it is yours, so it stays", kProjectLoop));
     }
-    std::ofstream(kProjectLoop, std::ios::binary) << hx::kDefaultLoop;
+    std::ofstream(kProjectLoop, std::ios::binary) << (full ? hx::kDefaultLoop : hx::kLoopOverlay);
     std::ofstream(".hx/.gitignore") << "log/\n";
-    fmt::print("wrote {}: that file is this project's harness now, edit it freely\n", kProjectLoop);
+    if (full) {
+        fmt::print("wrote {}: a copy of the whole built-in loop, which is this project's harness now\n", kProjectLoop);
+    } else {
+        fmt::print("wrote {}: it starts from the built-in loop; change there what this project needs\n", kProjectLoop);
+    }
     return 0;
 }
 
@@ -407,7 +417,7 @@ int run(const std::vector<std::string_view>& argv) {
         return 0;
     }
     if (options.mode == Mode::Init) {
-        return init_project();
+        return init_project(options.full);
     }
 
     hx::HostConfig config;

@@ -21,6 +21,7 @@ import time
 import unittest
 
 HX = None
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY = "sk-test-0123456789"
 
 
@@ -537,13 +538,36 @@ class AgentTest(unittest.TestCase):
         self.run_hx("go", script=[say("ok")])
         self.assertIn("Run the tests with make check.", self.model.requests[0]["system"])
 
-    def test_init_makes_the_project_own_its_loop(self):
+    def test_init_writes_an_overlay_on_the_built_in_loop(self):
         done = self.run_hx("init")
         self.assertEqual(done.returncode, 0, done.stderr)
         loop = os.path.join(self.project, ".hx", "loop.luau")
         source = read(loop)
-        self.assertIn("function M.main()", source)
+        self.assertEqual(source, read(REPO, "lua", "overlay.luau"))
+        self.assertIn("host.load(host.default_loop", source)
         self.assertEqual(self.run_hx("init").returncode, 2)  # never overwrites
+        # Unchanged, it behaves as the built-in loop does.
+        done = self.run_hx("go", script=[say("ok")])
+        self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
+        # A setting changed in it, and a function replaced in it, change what is sent.
+        with open(loop, "w") as f:
+            f.write(source.replace('-- M.model = "deepseek-pro"', 'M.model = "project-model"')
+                    .replace("-- local built_in_prompt", "local built_in_prompt")
+                    .replace("-- function M.system_prompt()", "function M.system_prompt()")
+                    .replace("-- \treturn built_in_prompt()", "\treturn built_in_prompt()")
+                    .replace("-- end", "end"))
+        self.run_hx("go", script=[say("ok")])
+        sent = self.model.requests[-1]
+        self.assertEqual(sent["model"], "project-model")
+        self.assertTrue(sent["system"].startswith("You are a coding agent"))
+        self.assertTrue(sent["system"].endswith("Run `make check` before you report."))
+
+    def test_init_full_copies_the_whole_loop(self):
+        done = self.run_hx("init", "--full")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        loop = os.path.join(self.project, ".hx", "loop.luau")
+        source = read(loop)
+        self.assertEqual(source, read(REPO, "lua", "loop.luau"))
         # The copy is what runs: change it and the behaviour changes.
         with open(loop, "w") as f:
             f.write(source.replace('M.model = host.env("HX_MODEL") or "deepseek-flash"', 'M.model = "project-model"'))

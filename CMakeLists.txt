@@ -68,10 +68,11 @@ find_package(CURL REQUIRED)
 # --- hx ------------------------------------------------------------------------------------------------------
 
 # The default loop is compiled into the binary, so hx works in a directory that has no .hx/ yet and still
-# starts when a project's own loop is broken.
+# starts when a project's own loop is broken. The overlay, which `hx init` writes, is embedded the same way.
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/loop.luau HX_LOOP_SOURCE)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/overlay.luau HX_OVERLAY_SOURCE)
 configure_file(src/embedded.h.in embedded.h @ONLY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS lua/loop.luau)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS lua/loop.luau lua/overlay.luau)
 
 add_executable(hx src/main.cpp src/host.cpp src/json.cpp src/sandbox.cpp)
 target_include_directories(hx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})

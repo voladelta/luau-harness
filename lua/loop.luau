@@ -1,5 +1,6 @@
--- The hx loop. `hx init` copies this file to .hx/loop.luau; from then on that copy is the project's harness,
--- and editing it is how the harness is changed.
+-- The hx loop, built into hx. A project changes it in .hx/loop.luau, which loads this module, replaces some of
+-- its fields and returns it (`hx init` writes such a file), or owns all of it as a copy (`hx init --full`). The
+-- parts meant to be replaced are fields of M and are always called through M.
 --
 -- The host supplies a small kernel and nothing else:
 --   host.llm(body) -> status, text | nil, error      POST to the configured endpoint; the host adds the API key
@@ -306,7 +307,7 @@ end
 --
 -- This speaks the Anthropic Messages format: a `system` string, messages whose content is a list of blocks
 -- (text, thinking, tool_use, tool_result), and tools given as {name, description, input_schema}. To use another
--- wire format, change request() and turn().
+-- wire format, replace M.request and M.turn.
 
 local usage = { replies = 0, input = 0, cached = 0, output = 0 }
 
@@ -325,7 +326,7 @@ local function prompt_size(reply)
 end
 
 -- Sends the conversation and returns the decoded reply. Retries what is worth retrying, then raises.
-local function request(system, messages)
+function M.request(system, messages)
 	local body = json.encode({
 		model = M.model,
 		max_tokens = M.max_output,
@@ -360,7 +361,7 @@ local function request(system, messages)
 	error("unreachable")
 end
 
-local function system_prompt()
+function M.system_prompt()
 	local parts = {
 		("You are a coding agent working in %s through the tools you are given."):format(host.cwd),
 		host.sandboxed
@@ -559,11 +560,11 @@ local function ask(system, talk)
 	if problem then
 		error("this conversation cannot be sent: " .. problem, 0)
 	end
-	return request(system, talk.messages)
+	return M.request(system, talk.messages)
 end
 
 -- Replaces the conversation with the model's own summary of what happened.
-local function compact(system, talk)
+function M.compact(system, talk)
 	host.log("  compacting the conversation")
 	local asking = talk:fork()
 	asking:say(
@@ -580,7 +581,7 @@ local function compact(system, talk)
 end
 
 -- Runs the model until it answers without asking for a tool.
-local function turn(system, talk)
+function M.turn(system, talk)
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
 		local cut_off = reply.stop_reason == "max_tokens"
@@ -598,7 +599,7 @@ local function turn(system, talk)
 				return run_tool(call)
 			end)
 			if prompt_size(reply) > M.compact_at then
-				compact(system, talk)
+				M.compact(system, talk)
 			end
 		elseif cut_off then
 			talk:say("Your reply was cut off by the output limit. Continue.")
@@ -625,7 +626,7 @@ local function report()
 end
 
 function M.main()
-	local system = system_prompt()
+	local system = M.system_prompt()
 	local talk = Conversation.new()
 	local task = table.concat(host.args, " ")
 
@@ -641,7 +642,7 @@ function M.main()
 			error("no task: pass it as arguments or on stdin", 0)
 		end
 		talk:say(task)
-		local ok, err = host.try(turn, system, talk)
+		local ok, err = host.try(M.turn, system, talk)
 		save(system, talk.messages)
 		report()
 		if not ok then
@@ -658,7 +659,7 @@ function M.main()
 		end
 		if not line:match("^%s*$") then
 			talk:say(line)
-			local ok, err = host.try(turn, system, talk)
+			local ok, err = host.try(M.turn, system, talk)
 			if not ok then
 				if err == "terminated" then
 					save(system, talk.messages)

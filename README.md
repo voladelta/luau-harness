@@ -2,8 +2,8 @@
 
 A small coding-agent host for one project at a time: a Luau VM, five tools, and one kernel-enforced wall.
 
-The host is about 2,000 lines of C++. The agent loop is one Luau file that your project owns and edits. The
-model can extend the harness by writing Luau modules into the project.
+The host is about 2,000 lines of C++. The agent loop is one Luau file, and your project can change any part of
+it. The model can extend the harness by writing Luau modules into the project.
 
 ```
 cd my-project
@@ -15,9 +15,10 @@ hx "add a --json flag to the export command and test it"
 
 - **The host is a kernel, not a framework.** It gives Luau a model call, a shell, file access and JSON. That is
   all. There is no plugin system, package format, permission prompt or configuration file.
-- **The loop belongs to the project.** `hx init` copies the built-in loop to `.hx/loop.luau`. From then on that
-  file is the harness for this project: the prompt, the tools, the retry and compaction rules. Change it by
-  editing it.
+- **The loop belongs to the project.** `hx init` writes `.hx/loop.luau`, a short file that loads the loop built
+  into hx and changes what this project needs: the model, the prompt, the tools, the retry and compaction
+  rules. What it leaves alone keeps up with hx. `hx init --full` copies the whole built-in loop instead, and
+  the project owns all of it.
 - **One wall, built by the kernel.** Before anything runs, the process confines itself with Landlock. The VM,
   the file tools and every command the model starts inherit the same rules, so no tool needs a path check and
   no command needs to be judged by its text.
@@ -122,8 +123,19 @@ thinking, and sends thinking blocks back exactly as they came. The five tools it
 | `edit` | replaces an exact piece of text that occurs once |
 | `lua` | runs Luau inside the harness; this is how extensions are called |
 
-To add a project tool, add an entry to `M.tools` in your `.hx/loop.luau`. To change the prompt, edit
-`system_prompt()`, or put notes for the model in `.hx/prompt.md`.
+`hx init` writes `.hx/loop.luau` from `lua/overlay.luau`:
+
+```lua
+local M = host.load(host.default_loop, "=loop")()
+M.model = "deepseek-pro"
+table.insert(M.tools, { name = "check", description = "...", parameters = {...}, run = function(args) ... end })
+return M
+```
+
+Every setting at the top of the loop is a field of `M`, and so are the parts a project may want to replace:
+`M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until the model
+is done) and `M.compact`. The loop always calls them through `M`, so a replacement takes effect everywhere.
+For notes to the model that need no code, write `.hx/prompt.md`.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON.
 
