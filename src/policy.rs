@@ -136,6 +136,10 @@ pub struct Snapshot {
     pub mode: ApprovalMode,
     pub budget: Budget,
     pub packs: Vec<String>,
+    /// The owner launched the run with `--unconfined`: where Landlock is unavailable, its children run without file
+    /// confinement rather than not at all. Never set by workspace configuration.
+    #[serde(default)]
+    pub unconfined: bool,
 }
 
 /// Who approved a request. Journaled by `name` with each shell command's outcome and each path grant; `hx log verify`
@@ -916,7 +920,9 @@ impl std::fmt::Display for Call<'_> {
 const PROMPT_ARGS_CHARS: usize = 2000;
 
 impl Policy {
-    /// `autopilot` is the launching user's `--yes`: automatically approve ordinary requests.
+    /// `autopilot` is the launching user's `--yes`: automatically approve ordinary requests. A new run records whether
+    /// the owner allowed unconfined children (`confine::allow_unconfined`, the `--unconfined` flag); a run whose
+    /// children could not be confined, and were not allowed to run unconfined, is refused.
     /// Canonical paths, credentials, sealed state, hx's own directories and protected configuration are checked in
     /// every mode. `resume` is the journal of the run to continue, which must be in this workspace's log directory.
     pub fn new(
@@ -946,6 +952,10 @@ impl Policy {
                 "resume workspace differs from the saved run"
             );
             let p = manifest.policy;
+            if p.unconfined {
+                crate::confine::allow_unconfined();
+            }
+            crate::confine::require()?;
             validate_scratch(&p.tmp)?;
             std::fs::create_dir_all(&p.tmp)?;
             log.check()?;
@@ -978,6 +988,7 @@ impl Policy {
             }
             .live());
         }
+        crate::confine::require()?;
         let modules_sha =
             crate::eventlog::sha_bytes(&serde_json::to_vec(crate::modules::EMBEDDED)?);
         let tmp = std::env::temp_dir().join(format!(
@@ -1002,6 +1013,7 @@ impl Policy {
             mode: ApprovalMode::Prompt,
             budget: Budget::default(),
             packs: vec![],
+            unconfined: crate::confine::unconfined_allowed(),
         };
         p.read_roots.extend([workspace.clone(), tmp.clone()]);
         p.write_roots.extend([workspace.clone(), tmp.clone()]);

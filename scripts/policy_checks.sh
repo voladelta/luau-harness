@@ -70,50 +70,43 @@ out=$(run 'print(sh("env").stdout)')
 check "no API keys in sh env" "$(echo "$out" | grep -ci 'API_KEY\|TOKEN\|SECRET_')" "0"
 check "HOME is the run's temp dir, not the real home" "$(echo "$out" | grep '^HOME=' | grep -c "$HOME\$")" "0"
 
-# --- shell confinement: Landlock applies the file policy to shell commands when the kernel offers it
-run 'print(1)' >/dev/null
-if unconfined "$W"; then
-  echo "skip Landlock is unavailable here: shell commands run unconfined, so only that is checked"
-  out=$(run "print(sh('cat $S1; echo written > $ESC').stdout)" | head -1)
-  check "unconfined shell reads and writes beyond file-tool roots" "$out$(cat "$ESC")" "SECRETwritten"
-else
-  # hx's own files (the workspace's secrets, its journals and autoresearch runs) are outside the workspace and every root.
-  SEC=$($H paths --workspace "$W" | sed -n 's/^secrets: //p'); AR=$($H paths --workspace "$W" | sed -n 's/^state: //p')/tool-run
-  mkdir -p "$(dirname "$SEC")" "$AR/run"; echo 'K = "CREDENTIAL"' > "$SEC"; echo SEALED-MARK > "$AR/run/held.txt"; echo PUBLIC > $W/README.md
-  out=$(run "local s, r = sh('cat $SEC'), sh('cat README.md') print(s.code ~= 0, s.stdout == '', r.stdout)" | head -1)
-  check "confined shell cannot read the workspace secrets but reads README.md" "$(echo "$out" | tr '\t' '|')" "true|true|PUBLIC"
-  out=$(run 'local r = sh("echo hi > new.txt; cat new.txt; mkdir -p venv/bin && echo ok > venv/bin/x && cat venv/bin/x; git init -q fresh && echo git-ok") print(r.stdout:gsub("\n", " "))' | head -1)
-  check "a command reads the files it creates in a workspace that has secrets" "$out" "hi ok git-ok 	3"
-  out=$(run "print(sh('mv $SEC leak.txt').code ~= 0, sh('echo forged > $SEC').code ~= 0, sh('echo x > $AR/run/held.txt; mv $AR/run/held.txt out.txt').code ~= 0)" | head -1)
-  check "confined shell cannot move or overwrite the secrets or autoresearch state" "$(echo "$out" | tr '\t' '|')$(cat "$SEC" "$AR/run/held.txt" | tr '\n' '|')" "true|true|true"'K = "CREDENTIAL"|SEALED-MARK|'
-  out=$(run 'local a = pcall(read, "leak.txt") local b = pcall(read, "out.txt") print(a, b, #search("CREDENTIAL", {literal = true}), sh("cat leak.txt out.txt 2>/dev/null").stdout == "")' | head -1)
-  check "nothing of it is reachable in the next run" "$(echo "$out" | tr '\t' '|')" "false|false|0|true"
-  out=$($H exec --workspace "$W" --yes "print(pcall(read, '$SEC'), pcall(read, '$AR/run/held.txt'), pcall(write, '$AR/run/held.txt', 'x'))" 2>&1 | head -1)
-  check "file tools refuse hx's own files, even with --yes" "$(echo "$out" | cut -f1-3 | tr '\t' '|')" "false|false|false"
-  rm -rf "$W/leak.txt" "$W/out.txt" "$W/new.txt" "$W/venv" "$W/fresh" "$AR"
-  KEYS=$OUT/home/.ssh; mkdir -p $KEYS; echo PRIVATE-KEY > $KEYS/id_rsa
-  out=$($H exec --workspace "$W" --yes "print(pcall(sh, 'cat id_rsa', {cwd = '$KEYS'}))" 2>&1 </dev/null | head -1)
-  check "--yes never grants a directory: no shell command in ~/.ssh" "$(echo "$out" | grep -c PRIVATE-KEY)$(echo "$out" | grep -c 'approval_required')" "01"
-  out=$(run 'print(pcall(read, "/dev/tty"), sh("echo x > /dev/tty; ls /dev/pts").code ~= 0, sh("head -c1 /dev/urandom >/dev/null").code)' | head -1)
-  check "no terminal access for file tools or confined commands" "$(echo "$out" | tr '\t' '|')" "false|true|0"
-  REALHOME=$(mktemp -d); mkdir -p $REALHOME/.config/hx; echo ORIG > $REALHOME/.config/hx/trust.toml
-  HOME=$REALHOME $H exec --workspace "$W" --yes "write('$REALHOME/notes.txt', 'n\\n') sh('echo PWNED > $REALHOME/.config/hx/trust.toml; echo PWNED > $REALHOME/other.txt')" >/dev/null 2>&1
-  check "--yes write grant covers the file, not its parent tree" "$(cat $REALHOME/notes.txt $REALHOME/.config/hx/trust.toml; [ -e $REALHOME/other.txt ] && echo WROTE)" "n
+# --- shell confinement: Landlock applies the file policy to shell commands
+# hx's own files (the workspace's secrets, its journals and autoresearch runs) are outside the workspace and every root.
+SEC=$($H paths --workspace "$W" | sed -n 's/^secrets: //p'); AR=$($H paths --workspace "$W" | sed -n 's/^state: //p')/tool-run
+mkdir -p "$(dirname "$SEC")" "$AR/run"; echo 'K = "CREDENTIAL"' > "$SEC"; echo SEALED-MARK > "$AR/run/held.txt"; echo PUBLIC > $W/README.md
+out=$(run "local s, r = sh('cat $SEC'), sh('cat README.md') print(s.code ~= 0, s.stdout == '', r.stdout)" | head -1)
+check "confined shell cannot read the workspace secrets but reads README.md" "$(echo "$out" | tr '\t' '|')" "true|true|PUBLIC"
+out=$(run 'local r = sh("echo hi > new.txt; cat new.txt; mkdir -p venv/bin && echo ok > venv/bin/x && cat venv/bin/x; git init -q fresh && echo git-ok") print(r.stdout:gsub("\n", " "))' | head -1)
+check "a command reads the files it creates in a workspace that has secrets" "$out" "hi ok git-ok 	3"
+out=$(run "print(sh('mv $SEC leak.txt').code ~= 0, sh('echo forged > $SEC').code ~= 0, sh('echo x > $AR/run/held.txt; mv $AR/run/held.txt out.txt').code ~= 0)" | head -1)
+check "confined shell cannot move or overwrite the secrets or autoresearch state" "$(echo "$out" | tr '\t' '|')$(cat "$SEC" "$AR/run/held.txt" | tr '\n' '|')" "true|true|true"'K = "CREDENTIAL"|SEALED-MARK|'
+out=$(run 'local a = pcall(read, "leak.txt") local b = pcall(read, "out.txt") print(a, b, #search("CREDENTIAL", {literal = true}), sh("cat leak.txt out.txt 2>/dev/null").stdout == "")' | head -1)
+check "nothing of it is reachable in the next run" "$(echo "$out" | tr '\t' '|')" "false|false|0|true"
+out=$($H exec --workspace "$W" --yes "print(pcall(read, '$SEC'), pcall(read, '$AR/run/held.txt'), pcall(write, '$AR/run/held.txt', 'x'))" 2>&1 | head -1)
+check "file tools refuse hx's own files, even with --yes" "$(echo "$out" | cut -f1-3 | tr '\t' '|')" "false|false|false"
+rm -rf "$W/leak.txt" "$W/out.txt" "$W/new.txt" "$W/venv" "$W/fresh" "$AR"
+KEYS=$OUT/home/.ssh; mkdir -p $KEYS; echo PRIVATE-KEY > $KEYS/id_rsa
+out=$($H exec --workspace "$W" --yes "print(pcall(sh, 'cat id_rsa', {cwd = '$KEYS'}))" 2>&1 </dev/null | head -1)
+check "--yes never grants a directory: no shell command in ~/.ssh" "$(echo "$out" | grep -c PRIVATE-KEY)$(echo "$out" | grep -c 'approval_required')" "01"
+out=$(run 'print(pcall(read, "/dev/tty"), sh("echo x > /dev/tty; ls /dev/pts").code ~= 0, sh("head -c1 /dev/urandom >/dev/null").code)' | head -1)
+check "no terminal access for file tools or confined commands" "$(echo "$out" | tr '\t' '|')" "false|true|0"
+REALHOME=$(mktemp -d); mkdir -p $REALHOME/.config/hx; echo ORIG > $REALHOME/.config/hx/trust.toml
+HOME=$REALHOME $H exec --workspace "$W" --yes "write('$REALHOME/notes.txt', 'n\\n') sh('echo PWNED > $REALHOME/.config/hx/trust.toml; echo PWNED > $REALHOME/other.txt')" >/dev/null 2>&1
+check "--yes write grant covers the file, not its parent tree" "$(cat $REALHOME/notes.txt $REALHOME/.config/hx/trust.toml; [ -e $REALHOME/other.txt ] && echo WROTE)" "n
 ORIG"
-  # A write that names a directory is no single file: it must not become a tree a later command can write.
-  for target in / "$REALHOME"; do
-    HOME=$REALHOME $H exec --workspace "$W" --yes "pcall(write, '$target', 'x') sh('echo PWNED > $REALHOME/.config/hx/trust.toml; echo PWNED > $REALHOME/other.txt')" >/dev/null 2>&1
-  done
-  check "--yes write on a directory grants nothing" "$(cat $REALHOME/.config/hx/trust.toml; [ -e $REALHOME/other.txt ] && echo WROTE)" "ORIG"
-  out=$(HOME=$REALHOME $H exec --workspace "$W" --yes "print(pcall(write, '$REALHOME/.bashrc', 'x'), pcall(write, '$REALHOME/.config/systemd/user/x.service', 'x'))" 2>&1 </dev/null | head -1)
-  check "--yes does not write hidden files outside the roots" "$(echo "$out" | cut -f1,2 | tr '\t' '|')$(echo "$out" | grep -c 'does not grant')$([ -e $REALHOME/.bashrc ] && echo WROTE)" "false|false1"
-  rm -rf $REALHOME
-  out=$(run "local r = sh('cat $S1; echo written > $ESC') print(r.code ~= 0, r.stdout == '')" | head -1)
-  check "confined shell cannot read or write beyond the roots" "$(echo "$out" | tr '\t' '|')$([ -e $ESC ] && echo WROTE)" "true|true"
-  out=$($H exec --workspace "$W" --yes "read(\"$S1\") print(sh('cat $S1').stdout)" 2>&1 | head -1)
-  check "a path grant approved mid-run applies to later shell commands" "$out" "SECRET"
-  rm -f "$SEC"
-fi
+# A write that names a directory is no single file: it must not become a tree a later command can write.
+for target in / "$REALHOME"; do
+  HOME=$REALHOME $H exec --workspace "$W" --yes "pcall(write, '$target', 'x') sh('echo PWNED > $REALHOME/.config/hx/trust.toml; echo PWNED > $REALHOME/other.txt')" >/dev/null 2>&1
+done
+check "--yes write on a directory grants nothing" "$(cat $REALHOME/.config/hx/trust.toml; [ -e $REALHOME/other.txt ] && echo WROTE)" "ORIG"
+out=$(HOME=$REALHOME $H exec --workspace "$W" --yes "print(pcall(write, '$REALHOME/.bashrc', 'x'), pcall(write, '$REALHOME/.config/systemd/user/x.service', 'x'))" 2>&1 </dev/null | head -1)
+check "--yes does not write hidden files outside the roots" "$(echo "$out" | cut -f1,2 | tr '\t' '|')$(echo "$out" | grep -c 'does not grant')$([ -e $REALHOME/.bashrc ] && echo WROTE)" "false|false1"
+rm -rf $REALHOME
+out=$(run "local r = sh('cat $S1; echo written > $ESC') print(r.code ~= 0, r.stdout == '')" | head -1)
+check "confined shell cannot read or write beyond the roots" "$(echo "$out" | tr '\t' '|')$([ -e $ESC ] && echo WROTE)" "true|true"
+out=$($H exec --workspace "$W" --yes "read(\"$S1\") print(sh('cat $S1').stdout)" 2>&1 | head -1)
+check "a path grant approved mid-run applies to later shell commands" "$out" "SECRET"
+rm -f "$SEC"
 
 # --- approval classes: a program the classifier cannot read needs approval; everyday commands do not
 pad=$(printf -- '-u A %.0s' $(seq 40))
@@ -134,5 +127,25 @@ check "command -v, wrapped and looping commands run unasked" "$(echo "$out" | tr
 # --- timeout kills the whole process group
 out=$(run 'local r = sh("sleep 987 & sleep 987", {timeout = 1}) print(r.timed_out)')
 check "timeout kills the whole process group" "$(echo "$out" | head -1)$(sleep 1; pgrep -f 'sleep 987' | wc -l | tr -d ' ')" "true0"
+
+# --- without Landlock nothing that could start a child runs, unless the owner launches it with --unconfined
+nolandlock() { HX_TEST_NO_LANDLOCK=1 "$@" 2>&1; }
+journals() { ls "$(logdir "$W")"/*.jsonl 2>/dev/null | wc -l; }
+before=$(journals)
+out=$(nolandlock $H exec --workspace "$W" "write('ran.txt', 'x')"); rc=$?
+check "without Landlock hx exec is refused before anything runs" "$rc $(echo "$out" | grep -c 'Landlock is unavailable.*pass --unconfined') $([ -e $W/ran.txt ] && echo RAN) $(journals)" "1 1  $before"
+mkdir -p $W/pk/tests; echo 'test.case("t", function() end)' > $W/pk/tests/t_test.luau
+out=$(cd $W && nolandlock $H test pk); rc=$?
+check "...and so is hx test" "$rc $(echo "$out" | grep -c 'Landlock is unavailable')" "1 1"
+out=$(cd $W && nolandlock $H test pk --unconfined | tail -1)
+check "hx test --unconfined runs" "$out" "1 passed, 0 failed"
+out=$(nolandlock $H exec --workspace "$W" --unconfined "print(sh('cat $S1; echo written > $ESC').stdout)" | head -1)
+check "hx exec --unconfined runs shell commands unconfined" "$out$(cat "$ESC")" "SECRETwritten"
+check "...and the journal says so" "$(grep -h '"kind":"session"' "$(ls -t "$(logdir "$W")"/*.jsonl | head -1)" | grep -c '"confinement":"off: disabled by HX_TEST_NO_LANDLOCK"')" "1"
+rm -rf "$ESC" $W/pk
+printf 'unconfined = true\n' > $W/.harness/policy.toml
+out=$(nolandlock $H exec --workspace "$W" 'print(1)'); rc=$?
+check "policy.toml cannot turn confinement off" "$rc $(echo "$out" | grep -c 'Landlock is unavailable') $($H exec --workspace "$W" 'print(1)' 2>&1 | grep -c 'bad .harness/policy.toml')" "1 1 1"
+rm $W/.harness/policy.toml
 
 finish

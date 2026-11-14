@@ -945,6 +945,25 @@ def scenario_orphans():
     check("an orphan of an episode's command is gone when sh returns, and an evaluator's when hx-ar is done")
 
 
+def scenario_unconfined():
+    # 17b. Without Landlock hx-ar starts nothing unless the owner passes --unconfined, which reaches the episodes and
+    # the evaluators and is recorded in launch.json for resume.
+    path = workspace("unconfined")
+    nolandlock = {"HX_TEST_NO_LANDLOCK": "1"}
+    with harness.provider(once('return mcp.ar.eval{note = "u"}')) as (url, requests):
+        refused = ar(path, url, ok=False, env=nolandlock)
+        assert refused.returncode == 1 and "Landlock is unavailable" in refused.stderr and "--unconfined" in refused.stderr, refused.stderr
+        assert not requests and not (ardir(path).exists() and any(ardir(path).iterdir())), (len(requests), list(ardir(path).iterdir()))
+        report = report_of(ar(path, url, env=nolandlock, extra=("--unconfined",)))
+    run = ardir(path) / report["run"]
+    launch = json.loads((run / "launch.json").read_text())
+    assert "--unconfined" in launch["child_args"] and ledger(path, report), launch
+    again = subprocess.run([str(HX_AR), "--resume", report["run"], "--workspace", str(path), "--unconfined"],
+                           env={**harness.ENV, **nolandlock}, capture_output=True, text=True)
+    assert again.returncode == 2 and "keeps the flags it was launched with" in again.stderr, again.stderr
+    check("without Landlock hx-ar is refused before any work, runs with --unconfined, and records it for resume")
+
+
 # Scenarios are independent (own workspace, own mock provider), so a few run side by side; more would load the machine.
 # Arguments name scenarios to run (`scenario_21`); none runs them all.
 import sys

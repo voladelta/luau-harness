@@ -44,7 +44,3 @@ PY
 # logdir DIR: the log directory of workspace DIR (journals, blobs), from `hx paths`.
 logdir() { "$R/target/release/hx" paths --workspace "$1" | sed -n 's/^log: //p'; }
 
-# unconfined DIR: did hx runs in workspace DIR record that Landlock is unavailable (children run unconfined)?
-unconfined() {
-  grep -qh '"confinement":"off' "$(logdir "$1")"/*.jsonl 2>/dev/null
-}

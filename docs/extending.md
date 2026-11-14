@@ -104,7 +104,7 @@ Credential lookup checks, in order:
 
 Secrets files contain top-level string assignments, for example `TINYFISH_API_KEY = "your-key"`. Blank values fall through to the next source. Without a usable key, the tool's whole registration fails and its methods stay unavailable.
 
-Both secrets files live outside every workspace and every root the model can reach: file tools refuse them, and shell commands and MCP servers cannot read or write them ([shell confinement](configuration.md#shell-confinement)); without Landlock, your sandbox must restrict shell access. A `.harness/secrets.toml` left in a workspace by an earlier version is not read. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
+Both secrets files live outside every workspace and every root the model can reach: file tools refuse them, and shell commands and MCP servers cannot read or write them ([shell confinement](configuration.md#shell-confinement)); in a run launched with `--unconfined` on a machine without Landlock, your sandbox must restrict shell access. A `.harness/secrets.toml` left in a workspace by an earlier version is not read. Keys can rotate without changing workspace trust; they are resolved again at registration and request time, including on resume.
 
 ## Included example tools
 

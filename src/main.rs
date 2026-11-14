@@ -202,6 +202,13 @@ const FLAGS: &[Flag] = {
             "autopilot: approve ordinary path and tool requests for this run without asking (never irreversible commands)",
         ),
         flag(
+            &["run", "exec", "test"],
+            "--unconfined",
+            Switch,
+            "",
+            "where Landlock is unavailable, run shell commands, MCP servers and evaluators without file confinement (refused otherwise)",
+        ),
+        flag(
             &["run", "exec"],
             "--ignore-config",
             Switch,
@@ -647,6 +654,9 @@ async fn real_main() -> Result<std::process::ExitCode> {
     };
     if has(&args, "--ignore-config") {
         trust::ignore_config();
+    }
+    if has(&args, "--unconfined") {
+        confine::allow_unconfined();
     }
     // A resumed run uses only its frozen manifest, so workspace config edited since launch neither changes nor blocks it.
     if matches!(args[0].as_str(), "exec" | "run") && !has(&args, "--resume") {

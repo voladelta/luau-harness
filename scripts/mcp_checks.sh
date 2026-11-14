@@ -52,13 +52,11 @@ for _ in $(seq 100); do [ -s $W/spawned.pid ] && break; sleep 0.1; done
 kill -TERM $HX; wait $HX 2>/dev/null
 check "...and when hx is stopped by a signal" "$(alive)" "gone"
 
-# --- local servers get the run's file policy through Landlock when the kernel offers it, else run unconfined
-if unconfined "$W"; then
-  echo "skip Landlock is unavailable here: the server runs unconfined"
-  check "unconfined server writes beyond the workspace" "$(x 'print(mcp.demo.write_file{path = "'$T'/outside.txt", text = "x"})' | head -1)" "wrote $T/outside.txt"
-else
-  check "confined server cannot write beyond the workspace" "$(x 'print(pcall(mcp.demo.write_file, {path = "'$T'/outside.txt", text = "x"}))' | head -1 | grep -c 'Permission denied')$([ -e $T/outside.txt ] && echo WROTE)" "1"
-fi
+# --- local servers get the run's file policy through Landlock; without Landlock they start only with --unconfined
+check "confined server cannot write beyond the workspace" "$(x 'print(pcall(mcp.demo.write_file, {path = "'$T'/outside.txt", text = "x"}))' | head -1 | grep -c 'Permission denied')$([ -e $T/outside.txt ] && echo WROTE)" "1"
+check "without Landlock the run is refused" "$(HX_TEST_NO_LANDLOCK=1 x 'print(mcp.demo.write_file{path = "'$T'/outside.txt", text = "x"})' | grep -c 'Landlock is unavailable')$([ -e $T/outside.txt ] && echo WROTE)" "1"
+check "...and with --unconfined the server runs unconfined" "$(HX_TEST_NO_LANDLOCK=1 x --unconfined 'print(mcp.demo.write_file{path = "'$T'/outside.txt", text = "x"})' | head -1)" "wrote $T/outside.txt"
+rm -f $T/outside.txt
 check "server can write inside the project" "$(x 'print(mcp.demo.write_file{path = "ok.txt", text = "x"}) ' | head -1)" "wrote ok.txt"
 python3 -c "
 import os,socket,time

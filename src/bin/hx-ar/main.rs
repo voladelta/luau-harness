@@ -27,7 +27,9 @@ episode gets. RUN is a run directory, or a bare run name in the workspace's auto
 
 RUN FLAGS (passed to every episode's `hx run`):
     --model M, --base-url U, --key-env E, --reasoning R, --max-output N, --context-window N, --provider-only A,B,
-    --pack A,B, --approval MODE, --yes
+    --pack A,B, --approval MODE, --yes, --unconfined
+--unconfined is the owner's choice to run episodes' shell commands and the evaluators without file confinement where
+Landlock is unavailable; without Landlock and without it, hx-ar refuses to start. A resumed run keeps it.
 Episodes are limited in model turns by hx-ar itself, so --max-turns, --max-tokens, --max-wall, --rpi, --branch,
 --trace and --ignore-config are refused.
 
@@ -48,6 +50,7 @@ const PASSED: &[(&str, bool)] = &[
     ("--pack", true),
     ("--approval", true),
     ("--yes", false),
+    ("--unconfined", false),
 ];
 
 /// The command line, parsed.
@@ -159,7 +162,6 @@ async fn real_main() -> Result<()> {
         .context("--workspace")?;
     let dirs = hx::dirs::Dirs::from_env()?;
     let runs = run::runs_dir(&dirs, &workspace);
-    hx::confine::note();
     let report = match (&cli.resume, &cli.prompt_file) {
         (Some(name), _) => {
             // A bare run name is a run in this workspace's autoresearch directory.
@@ -171,6 +173,8 @@ async fn real_main() -> Result<()> {
             run::resume(&workspace, &dirs, &dir).await?
         }
         (None, Some(file)) => {
+            // Before anything is spent: the provider query, the frozen tree, the first episode.
+            run::require_confinement(&cli.child)?;
             let program =
                 std::fs::read_to_string(file).with_context(|| format!("--prompt-file {file}"))?;
             run::start(

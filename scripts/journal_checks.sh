@@ -78,15 +78,13 @@ cp $L $T/substituted/other-run.jsonl; out=$($H log verify $T/substituted/other-r
 check "a journal under another run's name is refused (exit 1)" "$rc$(echo "$out" | grep -c 'belongs to session')" "11"
 check "hx log verify takes a bare run name" "$($H log verify --workspace $W ${N%.jsonl} | head -1 | grep -c intact)" "1"
 # The journal is outside every root: a shell command can neither truncate it, nor put another run's journal in its place.
-if ! unconfined $W; then
-  OTHER=$(ls "$(logdir $W)"/*.jsonl | grep -v "$N" | head -1)
-  [ -n "$OTHER" ] || { $H exec --workspace $W 'print(1)' >/dev/null; OTHER=$(ls -t "$(logdir $W)"/*.jsonl | head -1); }
-  before=$(wc -l < $L)
-  out=$($H exec --workspace $W "local a = sh('head -n 1 $L > t && mv t $L'); local b = sh('cp $OTHER $L'); local c = sh('rm -f ${L%.jsonl}.lock; touch ${L%.jsonl}.revoked'); print(a.code ~= 0, b.code ~= 0, c.code ~= 0)" 2>/dev/null | head -1)
-  check "confined shell cannot truncate, replace or unlock a journal" "$(echo "$out" | tr '\t' ' ')" "true true true"
-  check "...and the journal is whole and still its own" "$(wc -l < $L)$($H log verify $L | head -1 | grep -c intact)$([ -e ${L%.jsonl}.revoked ] && echo REVOKED)" "${before}1"
-  check "file tools cannot read or write the journal" "$($H exec --workspace $W --yes "print(pcall(read, '$L'), pcall(write, '$L', 'x'))" 2>/dev/null | head -1 | cut -f1,2 | tr '\t' ' ')" "false false"
-fi
+OTHER=$(ls "$(logdir $W)"/*.jsonl | grep -v "$N" | head -1)
+[ -n "$OTHER" ] || { $H exec --workspace $W 'print(1)' >/dev/null; OTHER=$(ls -t "$(logdir $W)"/*.jsonl | head -1); }
+before=$(wc -l < $L)
+out=$($H exec --workspace $W "local a = sh('head -n 1 $L > t && mv t $L'); local b = sh('cp $OTHER $L'); local c = sh('rm -f ${L%.jsonl}.lock; touch ${L%.jsonl}.revoked'); print(a.code ~= 0, b.code ~= 0, c.code ~= 0)" 2>/dev/null | head -1)
+check "confined shell cannot truncate, replace or unlock a journal" "$(echo "$out" | tr '\t' ' ')" "true true true"
+check "...and the journal is whole and still its own" "$(wc -l < $L)$($H log verify $L | head -1 | grep -c intact)$([ -e ${L%.jsonl}.revoked ] && echo REVOKED)" "${before}1"
+check "file tools cannot read or write the journal" "$($H exec --workspace $W --yes "print(pcall(read, '$L'), pcall(write, '$L', 'x'))" 2>/dev/null | head -1 | cut -f1,2 | tr '\t' ' ')" "false false"
 printf '[fs]\nread = ["%s"]\n' "$XDG_STATE_HOME" > $W/.harness/policy.toml
 check "a read root that holds hx's state is refused" "$($H exec --workspace $W 'print(1)' 2>&1 | grep -c "overlaps hx's state directory")" "1"
 rm $W/.harness/policy.toml
@@ -150,5 +148,25 @@ open(sys.argv[1],"a").write(json.dumps(grant,separators=(",",":"))+"\n")
 PY
 out=$(OPENROUTER_API_KEY=x $H run --workspace $W --resume $(basename $L .jsonl) 2>&1); rc=$?
 check "resume (by run name) refuses a forged record" "$([ $rc -ne 0 ] && echo refused)$(echo "$out" | grep -c 'hash chain broken')" "refused1"
+
+# --- 7. Without Landlock a run starts only with the owner's --unconfined, which its manifest keeps for resume.
+kill $MOCK 2>/dev/null
+MOCK_REPLIES='["```luau\nprint(sh(\"echo ran\").stdout)\n```","done"]' MOCK_BY_LEN=1 serve MP python3 scripts/mock_llm.py 0 || exit 1; MOCK=$SERVED
+urun() { OPENROUTER_API_KEY=x $H run --workspace $W --model m --base-url http://127.0.0.1:$MP --key-env OPENROUTER_API_KEY "$@" 2>&1; }
+uresume() { OPENROUTER_API_KEY=x $H run --workspace $W --resume "$@" 2>&1; }
+newws u
+out=$(HX_TEST_NO_LANDLOCK=1 urun --prompt-file $T/p.txt); rc=$?
+check "without Landlock a run is refused before it starts" "$rc $(echo "$out" | grep -c 'Landlock is unavailable.*pass --unconfined') $(ls "$(logdir $W)"/*.jsonl 2>/dev/null | wc -l)" "1 1 0"
+out=$(HX_TEST_NO_LANDLOCK=1 urun --prompt-file $T/p.txt --unconfined); rc=$?
+check "with --unconfined it runs, and says once that children are unconfined" "$rc $(echo "$out" | grep -c 'run unconfined')" "0 1"
+N=$(basename "$(lastlog)" .jsonl)
+out=$(HX_TEST_NO_LANDLOCK=1 uresume $N); rc=$?
+check "resume keeps --unconfined from the manifest" "$rc $(echo "$out" | grep -c 'Landlock is unavailable')" "0 0"
+out=$(HX_TEST_NO_LANDLOCK=1 uresume $N --unconfined); rc=$?
+check "...and repeating it on resume is an error" "$rc $(echo "$out" | grep -c -- '--unconfined cannot override a resumed manifest')" "2 1"
+newws u2
+urun --prompt-file $T/p.txt >/dev/null; N=$(basename "$(lastlog)" .jsonl)
+out=$(HX_TEST_NO_LANDLOCK=1 uresume $N); rc=$?
+check "a run launched confined is not resumed without Landlock" "$rc $(echo "$out" | grep -c 'Landlock is unavailable')" "1 1"
 
 finish

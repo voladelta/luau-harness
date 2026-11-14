@@ -1,9 +1,11 @@
 //! Kernel confinement for the processes hx starts (`sh`, local MCP servers, commands of tools built on hx): a
 //! Landlock ruleset built from the run's policy limits which files a child may read and write and, where the kernel offers
 //! scopes, keeps it from signalling processes or reaching abstract Unix sockets outside its own domain. Network access
-//! is left to the environment. Without Landlock (an old kernel, or a container that filters the syscalls) children run
-//! unconfined, and the run says so once.
+//! is left to the environment. Without Landlock (an old kernel, or a container that filters the syscalls) hx starts no
+//! child unless the owner launched the run with `--unconfined` (`allow_unconfined`); then children run unconfined, and
+//! the run says so once.
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What a child may touch: everything beneath each read root (read-only) and each write root (write only; a path a
 /// child should read and write is in both lists).
@@ -64,6 +66,38 @@ fn probe() -> Result<i32, &'static str> {
     }
 }
 
+/// Set once the owner has allowed this process's children to run unconfined where Landlock is unavailable.
+static UNCONFINED: AtomicBool = AtomicBool::new(false);
+
+/// The owner's `--unconfined`, given at launch or frozen into the resumed run's manifest: where Landlock is
+/// unavailable, children run without file confinement instead of not at all. Only the owner's launch flag calls this;
+/// no workspace configuration can.
+pub fn allow_unconfined() {
+    UNCONFINED.store(true, Ordering::SeqCst);
+}
+
+/// Whether the owner allowed unconfined children (`allow_unconfined`).
+pub fn unconfined_allowed() -> bool {
+    UNCONFINED.load(Ordering::SeqCst)
+}
+
+/// Refuse to start anything that runs children when they could not be confined and the owner has not allowed that.
+pub fn require() -> anyhow::Result<()> {
+    refusal(status(), unconfined_allowed()).map_or(Ok(()), |why| Err(anyhow::anyhow!(why)))
+}
+
+/// Why a run must not start, given the Landlock probe and the owner's choice; None when it may.
+fn refusal(status: Result<i32, &'static str>, allowed: bool) -> Option<String> {
+    let why = status.err().filter(|_| !allowed)?;
+    Some(format!(
+        "Landlock is unavailable ({why}), so shell commands, MCP servers and evaluators could read and write \
+         everything you can; hx starts none of them unconfined unless you say so. Run hx on Linux 5.13 or newer with \
+         Landlock enabled (it must be in the kernel's `lsm=` list, and a container's seccomp profile must allow the \
+         landlock_* system calls), or pass --unconfined to run them without file confinement inside a sandbox of \
+         your own"
+    ))
+}
+
 /// A one-line description of confinement for the session record and the run's stderr note.
 pub fn describe() -> String {
     match status() {
@@ -93,14 +127,21 @@ impl Rules {
         self
     }
 
-    /// Build the ruleset now, in the parent. None when Landlock is unavailable; then the child runs unconfined.
+    /// Build the ruleset now, in the parent. None when Landlock is unavailable and the owner allowed unconfined
+    /// children (`allow_unconfined`); then the child runs unconfined. An error when it is unavailable otherwise.
     pub fn prepare(&self) -> std::io::Result<Option<Ruleset>> {
         use landlock::{
             ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset as Builder, RulesetAttr,
             RulesetCreatedAttr, Scope,
         };
-        let Ok(version) = status() else {
-            return Ok(None);
+        let version = match status() {
+            Ok(version) => version,
+            Err(_) if unconfined_allowed() => return Ok(None),
+            Err(why) => {
+                return Err(std::io::Error::other(format!(
+                    "Landlock is unavailable ({why}) and the run was not launched with --unconfined"
+                )));
+            }
         };
         // Everything the running kernel can restrict: truncation (ABI 3), device ioctls (5), signals and abstract Unix
         // sockets to processes outside the child's domain (6), pathname Unix sockets (9). The crate drops what an
@@ -174,6 +215,18 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    #[test]
+    fn without_landlock_only_the_owner_can_allow_unconfined_children() {
+        assert_eq!(refusal(Ok(1), false), None);
+        assert_eq!(refusal(Ok(1), true), None);
+        assert_eq!(refusal(Err("no landlock"), true), None);
+        let why = refusal(Err("no landlock"), false).expect("refused");
+        assert!(
+            why.contains("(no landlock)") && why.contains("--unconfined"),
+            "{why}"
+        );
     }
 
     #[test]

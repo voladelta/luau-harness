@@ -1774,6 +1774,7 @@ pub(crate) async fn resume(workspace: &Path, dirs: &Dirs, dir: &Path) -> Result<
     );
     let launch: Launch =
         serde_json::from_slice(&std::fs::read(dir.join("launch.json"))?).context("launch.json")?;
+    require_confinement(&launch.child_args)?;
     let journal = Journal::open(&dir)?;
     ensure!(
         seed(&journal.records()).is_some(),
@@ -1906,6 +1907,18 @@ fn stop_with_this_process(command: &mut tokio::process::Command) {
             Ok(())
         });
     }
+}
+
+/// Refuse to start (or resume) a run whose evaluators and episodes could not be confined, unless the owner passed
+/// `--unconfined` (`child_args` are the flags every episode gets, recorded in `launch.json`); with it, say once that
+/// they run unconfined. The episodes' `hx run` gets the same flag.
+pub fn require_confinement(child_args: &[String]) -> Result<()> {
+    if child_args.iter().any(|a| a == "--unconfined") {
+        hx::confine::allow_unconfined();
+    }
+    hx::confine::require()?;
+    hx::confine::note();
+    Ok(())
 }
 
 fn chrono_stamp() -> String {
