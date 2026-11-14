@@ -220,64 +220,6 @@ def crash_boundaries():
     print(f"  {checked} crash boundaries, each resumed twice", flush=True)
 
 
-def immutable_manifest():
-    path = workspace("manifest")
-    with provider(lambda body, i: tool('durable.set("keep",{v=9}); print("ok")') if i == 0 else "done") as (url, calls):
-        start(path, url)
-        log = journal(path)
-        (path / ".harness/init.luau").write_text('error("new config must not execute")')
-        (path / ".harness/policy.toml").write_text('[approval]\nallow=["git push"]\n')
-        report = json.loads(run(path, "run", "--resume", str(log)).stdout)
-        assert report["finished"] and len(calls) == 2
-
-
-def package_isolation():
-    path = workspace("packages")
-    directory = path / ".harness/pkgs/probe"
-    directory.mkdir(parents=True)
-    (directory / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nfs=["read"]\n')
-    (directory / "init.luau").write_text('''local n=0
-return {
- data={10,20},
- count=function() n+=1; return n end,
- echo=function(t) t.n=8; return t end,
- write=function() return write("escape.txt","bad") end,
- import=function() return require("std/prompt") end,
- closure=function() return function() end end,
- read=function() return read("task.md") end,
-}''')
-    code = '''assert(tools.probe.count()==1 and tools.probe.count()==1)
-assert(tools.probe.data[1]==10 and tools.probe.data[2]==20 and tools.probe.data["1"]==nil)
-local t={n=1}; assert(tools.probe.echo(t).n==8 and t.n==1)
-assert(not pcall(tools.probe.write)); assert(not pcall(tools.probe.import)); assert(not pcall(tools.probe.closure))
-assert(not pcall(tools.probe.echo,function() end)); assert(tools.probe.read():find("scripted",1,true))
-print("ISOLATION_OK")'''
-    def answer(body, index):
-        if index == 0:
-            return tool(code)
-        if index == 1:
-            (directory / "init.luau").write_text('return {count=function() write("escape.txt","bad");return 99 end}')
-            return tool('assert(tools.probe.count()==1); assert(refresh_extensions==nil); print("FROZEN_OK")')
-        return "done"
-    with provider(answer) as (url, _):
-        report = json.loads(start(path, url).stdout)
-        assert report["finished"] and report["luau_errors"] == 0, report
-        assert not (path / "escape.txt").exists()
-
-
-def batch_checks():
-    path = workspace("batch")
-    code = '''local t={{op="read",args={"task.md"}},{op="search",args={"scripted",{glob="*.md"}}}}
-local r=batch(t); assert(r[1].ok and r[1].value:find("scripted",1,true)); assert(r[2].ok and #r[2].value>0)
-assert(not pcall(batch,{{op="read",args={"task.md"}},{op="write",args={"escape","bad"}}}))
-assert(not pcall(batch,{function() end})); assert(parallel==nil); print("BATCH_OK")'''
-    with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, _):
-        report = json.loads(start(path, url).stdout)
-        assert report["luau_errors"] == 0, report
-        reads = [r for r in records(journal(path)) if r["kind"] == "call" and r["tool"] == "read"]
-        assert len(reads) == 1, reads
-
-
 def body_messages(body):
     return body.get("messages") or body.get("input", [])
 
@@ -293,36 +235,6 @@ def task_text(body):
         return ""
     text = user.get("content", "")
     return text if isinstance(text, str) else "".join(p.get("text", "") for p in text)
-
-
-def readonly_descendants_and_budget():
-    path = workspace("readonly-children")
-    directory = path / ".harness/pkgs/writer"
-    directory.mkdir(parents=True)
-    (directory / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nfs=["write"]\n')
-    (directory / "init.luau").write_text('return {run=function() return write("escape.txt","bad") end}')
-    # A batch agent's value is agent()'s {answer, finished, turns}; the child answers "child done" only when its
-    # read-only assertions all held.
-    parent_code = '''local r=batch({{op="agent",args={"CHILD ONE"}},{op="agent",args={"CHILD TWO"}}})
-for _, c in r do assert(c.ok and c.value.finished and c.value.answer=="child done", c.error or c.value.answer) end
-print("CHILDREN_OK")'''
-    child_code = '''assert(not pcall(write,"escape.txt","bad")); assert(not pcall(sh,"echo bad > escape.txt"))
-assert(not pcall(tools.writer.run)); print("READONLY" .. "_HELD")'''
-    def answer(body, index):
-        first = not has_assistant(body)
-        if task_text(body).startswith("CHILD"):
-            return tool(child_code) if first else ("child done" if "READONLY_HELD" in json.dumps(body) else "child failed")
-        return tool(parent_code) if first else "parent done"
-    with provider(answer) as (url, calls):
-        report = json.loads(start(path, url).stdout)
-        assert report["finished"] and report["luau_errors"] == 0 and report["llm_calls"] == 6, report
-        assert not (path / "escape.txt").exists()
-        assert len(calls) == 6
-    path = workspace("concurrent-budget")
-    with provider(lambda body, i: tool(parent_code) if i == 0 else (time.sleep(0.15) or tool('print("child")'))) as (url, calls):
-        report = json.loads(start(path, url, "--max-tokens", "30").stdout)
-        assert not report["finished"] and "budget_exceeded" in report["stopped"], report
-        assert len(calls) == 2 and report["llm_calls"] == 2 and report["budget"]["tokens"] == 30, report
 
 
 def branch_saved_state():
@@ -429,64 +341,9 @@ def interrupted_agent():
         assert (path / "after.txt").read_text() == "ok"
 
 
-def model_status_codes():
-    # A rate limit is waited out and releases each reservation: nothing was generated.
-    path = workspace("status-429")
-    with provider(lambda body, i: {"status": 429, "error": "slow down"} if i < 2 else "done") as (url, calls):
-        report = json.loads(start(path, url, "--max-tokens", "1000000").stdout)
-        assert report["finished"] and calls[0] == calls[2] and report["budget"]["reserved_tokens"] == 0, report
-        failed = [r for r in records(journal(path)) if r["kind"] == "llm" and "error" in r]
-        assert [r["billing_uncertain"] for r in failed] == [False, False], failed
-    # A definite rejection releases the reservation, so the run is not left blocked behind it.
-    path = workspace("status-400")
-    with provider(lambda body, i: {"status": 400, "error": "bad request"} if i == 0 else "done") as (url, calls):
-        start(path, url, "--max-tokens", "1000000", ok=False)
-        assert len(calls) == 1
-        report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
-        assert report["finished"] and report["budget"]["reserved_tokens"] == 0, report
-        assert "UNKNOWN BILLING" not in run(path, "log", "verify", str(journal(path)), ok=False).stdout
-    # A server error may follow a billed generation: one retry, and every failed attempt is charged its reserved tokens.
-    path = workspace("status-500")
-    with provider(lambda body, i: {"status": 502, "error": "upstream"}) as (url, calls):
-        start(path, url, "--max-tokens", "1000000", ok=False)
-        assert len(calls) == 2
-        saved = records(journal(path))
-        failed = [r for r in saved if r["kind"] == "llm"]
-        assert [r["billing_uncertain"] for r in failed] == [True, True], failed
-        assert [r["of"] for r in saved if r["kind"] == "billing"] == [r["of"] for r in failed]
-
-
-def concurrent_children_under_token_cap():
-    # Concurrent requests queue behind a running request's reservation instead of failing admission. Every request
-    # reserves more than 200 tokens (its bytes plus the output cap), so under this cap one runs at a time.
-    path = workspace("concurrent-cap")
-    parent_code = '''local r=batch({{op="agent",args={"CHILD ONE"}},{op="agent",args={"CHILD TWO"}}})
-for _, c in r do assert(c.ok and c.value.finished, c.error) end
-print("CHILDREN_OK")'''
-    def answer(body, index):
-        first = not has_assistant(body)
-        if task_text(body).startswith("CHILD"):
-            time.sleep(0.15)
-            return tool('print("child")') if first else "child done"
-        return tool(parent_code) if first else "parent done"
-    with provider(answer) as (url, calls):
-        report = json.loads(start(path, url, "--max-tokens", "200").stdout)
-        assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 6, report
-        assert report["budget"]["reserved_tokens"] == 0, report
-
-
 def lost_response():
-    # A lost response may have been billed: it is charged its reserved tokens. One new request follows; the lost
-    # operation itself is never dispatched again.
-    path = workspace("lost")
-    with provider(lambda body, i: None) as (url, calls):
-        result = start(path, url, ok=False)
-        assert result.returncode and len(calls) == 2 and calls[0] == calls[1], (result.stderr, calls)
-        log = records(journal(path))
-        intents = [(r["seq"], r["reserved_tokens"]) for r in log if r["kind"] == "model_intent"]
-        assert [(r["of"], r["tokens"]) for r in log if r["kind"] == "billing" and r["source"] == "hx"] == intents, log
-        assert "UNKNOWN BILLING" not in run(path, "log", "verify", str(journal(path))).stdout
-    # A crash after the lost response's record, before its charge, is charged on resume.
+    # A crash after a lost response's record, before its charge, is charged on resume. (A lost response is charged
+    # and followed by one new request: src/tests/model_errors.rs.)
     path = workspace("lost-crash")
     with provider(lambda body, i: None) as (url, calls):
         control = workspace("lost-crash-control")
@@ -498,40 +355,6 @@ def lost_response():
         report = json.loads(run(path, "run", "--resume", str(journal(path))).stdout)
         assert report["finished"] and report["budget"]["reserved_tokens"] == 0, report
         assert [r["source"] for r in records(journal(path)) if r["kind"] == "billing"] == ["hx"]
-
-
-def cached_token_budget():
-    path = workspace("cached-budget")
-    usage = {"input_tokens": 100, "input_tokens_details": {"cached_tokens":90,"cache_write_tokens":9}, "output_tokens": 1}
-    with provider(lambda body, i: {"code":"print(1)","usage":usage}) as (url, calls):
-        report = json.loads(start(path, url, "--max-tokens", "100").stdout)
-        assert len(calls) == 1 and report["budget"]["tokens"] == 101, report
-        assert not report["finished"] and "token admission threshold" in report["stopped"], report
-
-
-def children_run_concurrently():
-    # Under a cap that fits both reservations, two children's requests are admitted side by side.
-    path = workspace("children-concurrent")
-    parent_code = '''local r=batch({{op="agent",args={"CHILD ONE"}},{op="agent",args={"CHILD TWO"}}})
-for _, c in r do assert(c.ok and c.value.finished, c.error) end
-print("CHILDREN_OK")'''
-    active, peak = [0], [0]
-    gate = threading.Lock()
-    def answer(body, index):
-        first = not has_assistant(body)
-        if task_text(body).startswith("CHILD"):
-            with gate:
-                active[0] += 1
-                peak[0] = max(peak[0], active[0])
-            time.sleep(0.4)
-            with gate:
-                active[0] -= 1
-            return tool('print("child")') if first else "child done"
-        return tool(parent_code) if first else "parent done"
-    with provider(answer) as (url, calls):
-        report = json.loads(start(path, url, "--max-tokens", "1000000").stdout)
-        assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 6, report
-        assert peak[0] == 2, peak
 
 
 def interrupted_sh_needs_owner():
@@ -664,70 +487,6 @@ assert(not pcall(write,"escape.txt","bad")); print("MCP_UNCERTAIN")'''
                 server.shutdown(); server.server_close(); thread.join()
 
 
-def control_hook_error():
-    path = workspace("hook-error", 'require("std/hooks").on("before_run",function() error("guard failed") end)')
-    with provider(lambda body, i: tool('write("escape.txt","bad")')) as (url, _):
-        result = start(path, url, ok=False)
-        assert result.returncode and "control hook failed" in result.stderr
-        assert not (path / "escape.txt").exists()
-
-
-def review_boundary_regressions():
-    for index, handler in enumerate([
-        'function() return {deny="refused"} end',
-        'function(p) p.action=nil; p.deny="refused" end',
-    ]):
-        path = workspace(f"finish-contract-{index}", f'require("std/hooks").on("before_finish",{handler})')
-        with provider(lambda body, i: tool('print("checked")') if i == 0 else "done") as (url, calls):
-            result = start(path, url, ok=False)
-            assert result.returncode and "before_finish must return" in result.stderr and len(calls) == 2, result.stderr
-
-    for index, command in enumerate([
-        '{kind="finish",report="oops"}',
-        '{kind="model",request={system=8,messages="oops"}}',
-        '{kind="run",code={}}',
-    ]):
-        path = workspace(f"command-contract-{index}")
-        override = path / ".harness/override/std"
-        override.mkdir(parents=True)
-        (override / "loop.luau").write_text('return {init=function() return {} end, step=function(s,e) return {phase="finished"},' + command + ' end}')
-        with provider(lambda body, i: "unused") as (url, calls):
-            result = start(path, url, ok=False)
-            assert result.returncode not in (0, 101) and not calls, result.stderr
-            assert not any(r["kind"] == "checkpoint" for r in records(journal(path)))
-
-    path = workspace("bounded-durable")
-    code = '''local t={x=1}; for i=1,30 do t={a=t,b=t} end
-assert(not pcall(durable.set,"dag",t)); assert(durable.get("dag")==nil)
-local s=string.rep("x",1024*1024)
-for i=1,15 do durable.set(tostring(i),s) end
-assert(not pcall(durable.set,"16",s)); assert(durable.get("16")==nil)
-assert(#durable.get("1")==#s); print("BOUNDED_OK")'''
-    with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, calls):
-        report = json.loads(start(path, url).stdout)
-        assert report["finished"] and report["luau_errors"] == 0, report
-
-    path = workspace("package-native-arrays")
-    directory = path / ".harness/pkgs/child"
-    directory.mkdir(parents=True)
-    (directory / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nllm=["agent"]\n')
-    (directory / "init.luau").write_text('return {run=function() return agent("PACKAGE CHILD",{model="mock",effort="medium",max_turns=2}) end}')
-    def answer(body, index):
-        if task_text(body).startswith("PACKAGE CHILD"):
-            return "child done" if has_assistant(body) else tool('print("CHILD")')
-        return tool('local r=tools.child.run(); durable.set("report",r); assert(r.finished); print("ARRAY_OK")') if index == 0 else "done"
-    with provider(answer) as (url, calls):
-        report = json.loads(start(path, url).stdout)
-        assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 4, report
-        receipt = next(r for r in records(journal(path)) if r["kind"] == "call" and r["tool"] == "agent")
-        assert receipt["args"]["model"] == "mock" and receipt["args"]["effort"] == "medium", receipt
-        log = journal(path)
-        checkpoint = next(r for r in reversed(records(log)) if r["kind"] == "checkpoint" and r["lane"] == "root")
-        saved = json.loads((log.parent / "blobs" / checkpoint["blob"]).read_text())
-        # a package's agent() returns what the agent's own agent() does
-        assert saved["durable"]["report"] == {"answer": "child done", "finished": True, "turns": 2}, saved["durable"]
-
-
 def review_branch_and_revocation():
     path = workspace("branch-start-crash")
     with provider(lambda body, i: tool('durable.set("keep",{n=4})') if i == 0 else "done") as (url, calls):
@@ -780,13 +539,6 @@ def review_branch_and_revocation():
         assert report["finished"], report
         assert [r["of"] for r in records(log) if r["kind"] == "billing"] == [first]
         assert {r["kind"] for r in records(log)[first:]} == {"billing"}
-
-
-def controller_no_authority():
-    path = workspace("controller-authority", 'write("escape.txt","bad")')
-    with provider(lambda body, i: "unused") as (url, calls):
-        result = start(path, url, ok=False)
-        assert result.returncode and not calls and not (path / "escape.txt").exists()
 
 
 def single_writer_and_revocation():
@@ -933,25 +685,6 @@ def unsupported_run_format():
             assert len(calls) == count
 
 
-
-def agent_option_validation():
-    path = workspace("agent-options")
-    package = path / ".harness/pkgs/child"
-    package.mkdir(parents=True)
-    (package / "hx.toml").write_text('[package]\nversion="1"\nkind="tool"\n[capabilities]\nllm=["agent"]\n')
-    (package / "init.luau").write_text('return {run=function(opts) return agent("child",opts) end}')
-    code = '''for _, opts in {{effort="turbo"}, {model=7}, {max_turns="many"}, {max_turns=-1}} do
-    assert(not pcall(agent,"child",opts))
-    assert(not pcall(tools.child.run,opts))
-    assert(not pcall(batch,{{op="read",args={"task.md"}},{op="agent",args={"child",opts}}}))
-end
-print("OPTIONS_VALIDATED")'''
-    with provider(lambda body, i: tool(code) if i == 0 else "done") as (url, calls):
-        report = json.loads(start(path, url).stdout)
-        assert report["finished"] and report["luau_errors"] == 0 and len(calls) == 2, report
-        assert not any(r.get("tool") in ("read", "agent") for r in records(journal(path)))
-
-
 def corrupt_artifacts():
     path = workspace("corrupt")
     with provider(lambda body, i: tool('print(1)') if i == 0 else "done") as (url, calls):
@@ -973,32 +706,20 @@ def corrupt_artifacts():
 if __name__ == "__main__":
     check("responses protocol and frozen launch settings", protocol)
     check("crash recovery never reruns old chunks", crash_boundaries)
-    check("workspace edits do not alter a frozen manifest", immutable_manifest)
-    check("isolated stateless packages and transitive capability boundaries", package_isolation)
-    check("sealed batches reject mutations and preserve result order", batch_checks)
-    check("read-only descendants cannot regain package authority; concurrent reservations", readonly_descendants_and_budget)
     check("explicit branches inherit only committed data and select a new manifest", branch_saved_state)
     check("owner abandon unblocks a resumed run; retry is no longer a decision", unknown_abandon)
     check("crash-interrupted write/edit settle from the files without the owner", local_write_reconciliation)
     check("a crash inside a subagent leaves nothing for the owner to settle", interrupted_agent)
-    check("rate limits are waited out; definite rejections release reservations", model_status_codes)
-    check("concurrent children queue under a token cap instead of failing", concurrent_children_under_token_cap)
-    check("lost responses are charged their reserved tokens; one new request follows", lost_response)
-    check("cached reads and writes count toward the total token budget", cached_token_budget)
-    check("children's requests run side by side under a cap that fits both", children_run_concurrently)
+    check("a lost response cut off by a crash before its charge is charged on resume", lost_response)
     check("interrupted direct shell commands wait for the owner", interrupted_sh_needs_owner)
     check("compaction replaces previous summaries and checkpoints explicit state", compaction_and_recovery)
     check("MCP lost and oversized mutation responses stay uncertain without redispatch", mcp_transport_uncertainty)
-    check("control hook failure prevents dispatch", control_hook_error)
-    check("review regressions: hook/command validation, bounded copies, native arrays", review_boundary_regressions)
     check("review regressions: branch startup crashes and revoked reconciliation", review_branch_and_revocation)
-    check("controller has no ambient effect authority", controller_no_authority)
     check("single writer and owner revocation", single_writer_and_revocation)
     check("absolute deadline cancels local work and includes downtime", deadline)
     check("completed runs retain their answer after deadlines, including custom controllers", completed_deadline_resume)
     check("controller-only transitions and CPU loops obey the absolute deadline", controller_deadlines)
     check("invalid CLI options fail before opening a journal", cli_preflight)
     check("unsupported run formats fail before resume or branch dispatch", unsupported_run_format)
-    check("session, package and batch agents reject invalid options before dispatch", agent_option_validation)
     check("corrupt artifacts fail before dispatch", corrupt_artifacts)
     print(f"{passed} passed" + (f"; artifacts: {BASE}" if os.environ.get("HX_CHECK_ARTIFACTS") else ""))

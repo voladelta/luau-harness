@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Responses successes include "error": null, as real providers do.
-# LLM client checks (also: loop nudge on garbled tool-call markup): the Responses API completes a run against a scripted
-# server, and an openrouter-looking URL does not restrict the upstream provider. No API key needed.
+# LLM client checks: the Responses API completes a run against a scripted server (request shape, streaming, caching,
+# provider pins, the provider's model list, proxies). No API key needed. The loop's handling of replies and failures
+# is tested in-process: src/tests/.
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
 cleanup() { kill $M 2>/dev/null; }
@@ -12,6 +13,9 @@ echo 'require("std/recheck").enabled = false' > $W/.harness/init.luau
 out=$(K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --base-url http://127.0.0.1:$MP/openrouter --key-env K 2>&1 | tail -1)
 check "responses: run finishes with the model's answer" "$(python3 -c "import sys,json;r=json.loads(sys.argv[1]);print(r['finished'], r['final_answer'], r['turns'])" "$out" 2>/dev/null)" "True all done 2"
 check "responses: request carries no provider restriction" "$(grep -c '"provider"' $T/req.log | tr -d ' ')" "0"
+check "responses: the luau tool is declared in the request" "$(grep -c '"name": "luau"' $T/req.log | tr -d ' ')" "2"
+check "responses: the chunk's result goes back in the native tool-result shape" "$(grep -o '"type": "function_call_output"' $T/req.log | wc -l | tr -d ' ')" "1"
+check "responses: requests ask for a streamed response" "$(grep -c '"stream": true' $T/req.log | tr -d ' ')" "2"
 # --- automatic caching, cache key, provider pin
 runq() { # model extra... -> request log of one run
   local model=$1; shift; W=$T/c-$RANDOM; mkdir -p $W/.harness; : > $T/req.log
@@ -39,7 +43,7 @@ models '{"data":[]}'
 check "an unlisted model keeps the defaults, with a note" "$(has '"max_output_tokens": 65536')$(grep -c 'context window of any/model is unknown' $T/models.err)" "yes1"
 K=x $H run --workspace $W --prompt-file $T/p.txt --model any/model --base-url http://127.0.0.1:$MP --key-env K >/dev/null 2>$T/other.err
 check "another provider: hx says once that the window is unknown" "$(grep -c 'is not OpenRouter.*context window of any/model is unknown' $T/other.err)" "1"
-# --- native tool calling: the loop answers every call id; bad calls get an error result, not a crash
+# --- streaming and transport (the loop's handling of each reply and failure: src/tests/)
 mockrun() { # replies-json -> "finished|final_answer|turns|code_turns|truncated_turns"
   MOCK_REPLIES="$1" MOCK_BY_LEN=${BYLEN:-1} MOCK_LOG=$T/tool.log serve TP python3 scripts/mock_llm.py 0 || return 1; local m=$SERVED; : > $T/tool.log
   W=$T/m-$RANDOM; mkdir -p $W/.harness
@@ -48,23 +52,8 @@ mockrun() { # replies-json -> "finished|final_answer|turns|code_turns|truncated_
   kill $m 2>/dev/null; wait $m 2>/dev/null
   python3 -c "import sys,json;r=json.loads(sys.argv[1]);print('|'.join(str(r[k]) for k in ('finished','final_answer','turns','code_turns','truncated_turns')))" "$o" 2>/dev/null
 }
-TWO='[{"text":"","calls":[{"code":"print(1)"},{"code":"print(2)"}]},"all done"]'
-check "responses: two parallel calls both run, run finishes" "$(mockrun "$TWO")" "True|all done|2|2|0"
-want='function_call_output'
-check "responses: results go back in the native tool-result shape (one per call)" "$(grep -o "$want" $T/tool.log | wc -l | tr -d ' ')" "2"
-check "invalid tool arguments: error result, run continues" "$(mockrun '[{"calls":[{"name":"luau","arguments":"{\"code\": \"print(1"}]},"```luau\nprint(2)\n```","all done"]')" "True|all done|3|1|1"
-check "unknown tool name: error result, run continues" "$(mockrun '[{"calls":[{"name":"bash","arguments":"{}"}]},"```luau\nprint(2)\n```","all done"]')" "True|all done|3|1|0"
-check "plain prose after a code turn finishes (no nudge)" "$(mockrun '["```luau\nprint(7)\n```","The fix is in place."]')" "True|The fix is in place.|2|1|0"
-check "tool-call markup leaked into the text is nudged, not taken as the answer" "$(mockrun '["```luau\nprint(7)\n```","part07: SECRET=614</｜DSML｜ parameter>","```luau\nprint(2)\n```","all done"]')" "True|all done|4|2|1"
-check "the markup nudge reaches the model" "$(grep -c 'arrived as plain text' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
-check "prose before any code is nudged to start" "$(mockrun '["I will look.","```luau\nprint(7)\n```","done"]')" "True|done|3|1|1"
-check "the luau tool is declared in the request" "$(grep -c '"luau"' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
-# --- streaming: every request asks for a stream; a stream that ends before the response completes is a lost response
-check "requests ask for a streamed response" "$(grep -c '"stream": true' $T/tool.log | tr -d ' ' | sed 's/^[1-9][0-9]*$/yes/')" "yes"
+# a stream that ends before the response completes is a lost response
 check "a dropped stream is a lost response: one new request, run finishes" "$(BYLEN=0 mockrun '[{"text":"","calls":[{"code":"print(1)"}],"drop":true},"```luau\nprint(2)\n```","all done"]')" "True|all done|2|1|0"
-check "an empty reply is resent unchanged, not nudged" "$(BYLEN=0 mockrun '["```luau\nprint(7)\n```","","all done"]')|$(grep -c 'cut off or empty' $T/tool.log | tr -d ' ')" "True|all done|3|1|1|0"
-# --- transport: a Retry-After that is not a finite delay is ignored (2 s default backoff), never a crash; a loopback
-# provider is reached directly even with a proxy configured
-check "Retry-After: NaN falls back to the default backoff" "$(BYLEN=0 mockrun '[{"status":429,"error":"slow down","retry_after":"NaN"},"```luau\nprint(7)\n```","all done"]')" "True|all done|2|1|0"
+# a loopback provider is reached directly even with a proxy configured
 check "a loopback base URL bypasses HTTP_PROXY" "$(HTTP_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 NO_PROXY= no_proxy= mockrun '["```luau\nprint(7)\n```","all done"]')" "True|all done|2|1|0"
 finish

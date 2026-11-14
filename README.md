@@ -171,7 +171,7 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 
 ## Development
 
-Every check uses `target/release/hx` (the autoresearch suite also `target/release/hx-ar`), and none needs an API key (model runs use a scripted mock).
+Every check uses `target/release/hx` (the autoresearch suite also `target/release/hx-ar`), and none needs an API key (model runs use a scripted mock). `cargo test` drives whole runs in-process against a scripted model (`src/tests/`): turns and nudges, hooks, compaction, budgets, and how each failed model request is billed and retried. The suites under `scripts/` cover the binary's edge: flags, exit codes, the HTTP client, crashes and resume across processes.
 
 ```bash
 scripts/all_checks.sh            # builds, then runs rustfmt, clippy and every offline suite; five-minute deadline
