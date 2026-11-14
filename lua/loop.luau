@@ -117,7 +117,8 @@ M.tools = {
 		name = "bash",
 		description = "Run a bash command in the project directory. Returns stdout and stderr together, then the "
 			.. "exit status. Every call is a new shell. The command is killed after `timeout` seconds (default 120). "
-			.. "A process left in the background must send its output to a file.",
+			.. "A process left in the background must send its output to a file, and is killed when this session "
+			.. "ends, daemons included: nothing you start outlives it.",
 		parameters = {
 			type = "object",
 			properties = {

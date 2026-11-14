@@ -329,6 +329,8 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             sessions = self.tool_results()[1].split()[:2]
             self.assertNotEqual(sessions[0], sessions[1], "the daemon left the command's session")
+            # The model is told, so it does not report a server as left running.
+            self.assertIn("nothing you start outlives it", self.model.requests[0]["tools"][0]["description"])
             self.assert_gone(int(read(self.project, "daemon.pid")))
             os.remove(os.path.join(self.project, "daemon.pid"))
 
