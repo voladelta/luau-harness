@@ -635,6 +635,10 @@ end
 local log_path = host.list(".hx") and (".hx/log/%s.json"):format(os.date("%Y%m%d-%H%M%S")) or nil
 local function save(system, messages)
 	if log_path then
+		-- Logs hold file contents, so the directory keeps itself out of git, however .hx/ came to exist.
+		if not host.read(".hx/log/.gitignore") then
+			host.write(".hx/log/.gitignore", "*\n")
+		end
 		host.write(log_path, json.encode({ system = system, messages = messages }))
 	end
 end

@@ -161,7 +161,6 @@ int init_project(bool full) {
         throw UsageError(fmt::format("{} already exists; it is yours, so it stays", kProjectLoop));
     }
     std::ofstream(kProjectLoop, std::ios::binary) << (full ? hx::kDefaultLoop : hx::kLoopOverlay);
-    std::ofstream(".hx/.gitignore") << "log/\n";
     if (full) {
         fmt::print("wrote {}: a copy of the whole built-in loop, which is this project's harness now\n", kProjectLoop);
     } else {

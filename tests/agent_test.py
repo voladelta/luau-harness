@@ -528,11 +528,17 @@ class AgentTest(unittest.TestCase):
         self.run_hx("again", script=[say("ok")])
         self.assertIn("- shout: shouts a word", self.model.requests[-1]["system"])
         # With a .hx directory, the conversation was saved.
-        logs = sorted(os.listdir(os.path.join(self.project, ".hx", "log")))
+        logs = sorted(name for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json"))
         self.assertTrue(logs)
         saved = json.loads(read(self.project, ".hx", "log", logs[0]))
         self.assertEqual(saved["messages"][0]["role"], "user")
         self.assertEqual(saved["system"], self.model.requests[-1]["system"])
+        # The logs hold file contents, so git does not see them, though nothing but the model made .hx/.
+        self.assertEqual(read(self.project, ".hx", "log", ".gitignore"), "*\n")
+        git = dict(cwd=self.project, env=self.env(), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "init", "-q"], **git)
+        subprocess.run(["git", "add", "-A"], **git)
+        self.assertEqual(subprocess.run(["git", "ls-files"], **git).stdout, ".hx/ext/shout.luau\n")
 
     def test_project_notes_reach_the_system_prompt(self):
         os.makedirs(os.path.join(self.project, ".hx"))

@@ -137,7 +137,8 @@ Every setting at the top of the loop is a field of `M`, and so are the parts a p
 is done) and `M.compact`. The loop always calls them through `M`, so a replacement takes effect everywhere.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
-When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON.
+When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON. The logs hold
+file contents, so that directory carries a `.gitignore` that keeps all of it out of git.
 
 ### The conversation is a state machine
 
