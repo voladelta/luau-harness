@@ -295,6 +295,21 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("hunter2-token", sent)
         self.assertIn("GIT_CONFIG_KEY_0=not-a-secret", self.tool_results()[0])  # only secrets are removed
 
+    def test_an_inherited_descriptor_does_not_pass_the_wall(self):
+        outside = os.path.join(self.root, "outside.txt")
+        with open(outside, "w") as f:
+            f.write("FROM-OUTSIDE")
+        fd = os.open(outside, os.O_RDONLY)
+        try:
+            self.model.script = [call("bash", {"command": f"cat <&{fd}"}), say("ok")]
+            done = subprocess.run([HX, "go"], cwd=self.project, env=self.env(), pass_fds=(fd,), capture_output=True,
+                                  text=True, timeout=60)
+        finally:
+            os.close(fd)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Bad file descriptor", self.tool_results()[0])
+        self.assertNotIn("FROM-OUTSIDE", json.dumps(self.model.requests))
+
     def test_keep_env_keeps_a_variable(self):
         self.run_hx("--keep-env", "KEPT_TOKEN", "go", KEPT_TOKEN="kept-value", script=[
             call("bash", {"command": "echo $KEPT_TOKEN"}), say("ok")])

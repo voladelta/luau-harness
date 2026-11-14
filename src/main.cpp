@@ -435,7 +435,21 @@ int run_loop(lua_State* L) {
     return run_module(L, hx::kDefaultLoop, "=loop");
 }
 
+// A descriptor inherited from whoever started hx was opened outside the wall and would pass through it to every
+// command. Marking them close-on-exec keeps them from commands; hx itself never uses them.
+void close_inherited_fds() {
+#ifdef CLOSE_RANGE_CLOEXEC  // glibc 2.34 declares the wrapper and the flag together
+    const int done = close_range(3, ~0U, CLOSE_RANGE_CLOEXEC);
+#else  // the system call is Linux 5.11, the same number on every architecture
+    const long done = syscall(436, 3U, ~0U, 4U);
+#endif
+    if (done != 0) {
+        throw std::runtime_error(fmt::format("cannot mark inherited descriptors close-on-exec: {}", hx::error_text()));
+    }
+}
+
 int run(const std::vector<std::string_view>& argv) {
+    close_inherited_fds();
     const Options options = parse_args(argv);
     if (options.mode == Mode::Help) {
         fmt::print("{}", kUsage);
