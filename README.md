@@ -83,7 +83,8 @@ nothing inside the project, which the model can write, can widen the wall.
 
 Also in force:
 
-- `hx` refuses to start in `/` or in your home directory, where the wall would protect nothing.
+- `hx` refuses to start in `/`, in your home directory or in any directory that contains it, such as `/home`,
+  where the wall would leave your home directory open.
 - No setuid program can raise privileges (`no_new_privs`), so `sudo` does not work inside.
 - On Linux 6.12 or later, confined processes cannot signal processes outside the sandbox or reach their
   abstract unix sockets.

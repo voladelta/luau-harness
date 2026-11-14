@@ -297,12 +297,21 @@ std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& proj
     return rules;
 }
 
-hx::Sandbox confine(const Options& options, const fs::path& project, const fs::path& tmp) {
+// True when the project is the home directory or contains it: the model could then write anywhere in home.
+bool holds_home(const fs::path& project) {
     std::error_code ec;
-    const std::string home = env_or("HOME", "");
-    if (project == "/" || (!home.empty() && fs::equivalent(project, home, ec))) {
+    const fs::path home = fs::canonical(env_or("HOME", ""), ec);
+    if (ec || home.empty()) {
+        return false;
+    }
+    const fs::path inside = home.lexically_relative(project);
+    return !inside.empty() && *inside.begin() != "..";
+}
+
+hx::Sandbox confine(const Options& options, const fs::path& project, const fs::path& tmp) {
+    if (project == "/" || holds_home(project)) {
         throw UsageError(
-            fmt::format("refusing to treat {} as a project: the sandbox would wall nothing off. "
+            fmt::format("refusing to treat {} as a project: the sandbox would leave your home directory open. "
                         "Run hx inside a project directory.",
                         project.string()));
     }

@@ -281,6 +281,18 @@ class AgentTest(unittest.TestCase):
         self.assertIn("refusing to treat", done.stderr)
         self.assertEqual(self.model.requests, [])
 
+    def test_a_directory_that_holds_the_home_directory_is_not_a_project(self):
+        done = subprocess.run([HX, "go"], cwd=self.root, env=self.env(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("refusing to treat", done.stderr)
+        self.assertEqual(self.model.requests, [])
+        # A sibling of the home directory is an ordinary project.
+        sibling = os.path.join(self.root, "home2")
+        os.makedirs(sibling)
+        self.model.script = [say("ok")]
+        done = subprocess.run([HX, "go"], cwd=sibling, env=self.env(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_the_api_key_reaches_the_endpoint_and_nothing_else(self):
         done = self.run_hx("go", OTHER_SECRET_TOKEN="hunter2-token", GIT_CONFIG_KEY_0="not-a-secret", script=[
             call("bash", {"command": "env; tr '\\0' '\\n' < /proc/$PPID/environ; cat /proc/$PPID/cmdline"}, "c1"),
