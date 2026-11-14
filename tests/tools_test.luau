@@ -109,6 +109,7 @@ raises("line numbers from read are named", tools.edit, { file_path = dir .. "e.t
 tools.write({ file_path = dir .. "crlf.txt", content = "one\r\ntwo\r\nthree\n" })
 check("edit across \\r\\n ends", tools.edit({ file_path = dir .. "crlf.txt", old_string = "one\ntwo", new_string = "1\n2" }), ("replaced 1 occurrence in %scrlf.txt"):format(dir))
 check("keeps the file's ends", host.read(dir .. "crlf.txt"), "1\r\n2\r\nthree\n")
+check("read shows \\r\\n ends as plain ones", tools.read({ file_path = dir .. "crlf.txt" }), "1: 1\n2: 2\n3: three")
 
 -- bash
 check("bash", tools.bash({ command = "echo out; echo err >&2; exit 3" }), "out\nerr\n[exit 3]")

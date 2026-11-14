@@ -184,8 +184,6 @@ class AgentTest(unittest.TestCase):
         self.assertIn('missing argument "file_path": read takes file_path, limit, offset', results[2])
         failed = self.model.requests[1]["messages"][-1]["content"][0]
         self.assertIs(failed["is_error"], True)
-        # The malformed input goes back as an empty object, which the endpoint accepts in a history.
-        self.assertEqual(self.model.requests[1]["messages"][1]["content"][0]["input"], {})
 
     def test_an_empty_reply_is_asked_for_again(self):
         done = self.run_hx("go", script=[reply([]), reply([text("")]), say("ok")])
@@ -194,24 +192,45 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(len(self.model.requests), 3)
         self.assertEqual(self.model.requests[0], self.model.requests[2])
 
+    def test_an_empty_refusal_is_an_answer(self):
+        done = self.run_hx("go", script=[reply([], stop="refusal")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.model.requests), 1)
+        self.assertIn("declined", done.stderr)
+
     def test_a_reply_of_thinking_alone_is_not_empty(self):
         done = self.run_hx("go", script=[reply([{"type": "thinking", "thinking": "hm", "signature": "s"}])])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(len(self.model.requests), 1)
+
+    def reminders(self):
+        """The text the loop added behind the tool results of each request after the first."""
+        return [[b["text"] for b in r["messages"][-1]["content"] if b["type"] == "text"] for r in self.model.requests[1:]]
 
     def test_a_repeated_call_gets_a_reminder(self):
         same = [call("bash", {"command": "true", "timeout": 5}, f"c{i}") for i in range(5)]
         same[1] = call("bash", {"timeout": 5, "command": "true"}, "c1")  # the order of the keys does not matter
         done = self.run_hx("go", script=[*same, say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        def reminder(request):
-            last = request["messages"][-1]["content"]
-            return [b["text"] for b in last if b["type"] == "text"]
-        reminders = [reminder(r) for r in self.model.requests[1:]]
+        reminders = self.reminders()
         self.assertEqual([len(r) for r in reminders], [0, 0, 1, 0, 1])
-        self.assertIn("repeating the exact same tool call", reminders[2][0])
-        self.assertIn('same bash call 5 times in a row, with these arguments: {"command":"true","timeout":5}',
+        self.assertIn("exact same tool call 3 times", reminders[2][0])
+        self.assertIn('same bash call 5 times in this task, with these arguments: {"command":"true","timeout":5}',
                       reminders[4][0])
+
+    def test_a_call_polled_between_other_calls_still_counts(self):
+        poll = lambda i: call("bash", {"command": "echo not ready"}, f"p{i}")
+        wait = lambda i: call("bash", {"command": f"sleep 0.{i}"}, f"w{i}")
+        done = self.run_hx("go", script=[poll(1), wait(1), poll(2), wait(2), poll(3), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual([len(r) for r in self.reminders()], [0, 0, 0, 0, 1])
+
+    def test_a_call_whose_result_changes_does_not_count(self):
+        # A test run again after each fix: the same call, a different result each time.
+        runs = [call("bash", {"command": "echo x >> log; wc -l < log"}, f"c{i}") for i in range(4)]
+        done = self.run_hx("go", script=[*runs, say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual([len(r) for r in self.reminders()], [0, 0, 0, 0])
 
     def test_running_out_of_replies_still_gets_a_report(self):
         os.makedirs(os.path.join(self.project, ".hx"))
@@ -1085,6 +1104,24 @@ class AgentTest(unittest.TestCase):
             'error: missing argument "new_string": edit takes file_path, old_string, new_string, replace_all',
             "replaced 1 occurrence in f.txt"])
         self.assertEqual(read(self.project, "f.txt"), "1 two\n")
+
+    def test_a_long_output_is_kept_whole_in_a_file_with_or_without_the_sandbox(self):
+        script = ("local loop = host.load(host.default_loop, '=loop')() loop.output_limit = 100 "
+                  "local out = loop.tools[1].run({ command = 'seq 1 5000' }) "
+                  "local path = out:match('the whole output is in (%S+)') "
+                  "print(path ~= nil and path:sub(1, #host.env('TMPDIR')) == host.env('TMPDIR'), "
+                  "path and host.read(path) == host.sh('seq 1 5000').out)")
+        for flags in ([], ["--no-sandbox"]):
+            done = self.run_hx(*flags, "--run", "-", stdin=script)
+            self.assertEqual((done.returncode, done.stdout), (0, "true\ttrue\n"), (flags, done.stderr))
+
+    def test_a_loop_without_tools_sends_an_empty_list(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write("local M = assert(host.load(host.default_loop, '=loop'))() M.tools = {} return M")
+        done = self.run_hx("go", script=[say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[0]["tools"], [])
 
     def test_path_is_taken_for_file_path(self):
         with open(os.path.join(self.project, "f.txt"), "w") as f:

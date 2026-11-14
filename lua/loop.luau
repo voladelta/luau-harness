@@ -26,9 +26,8 @@ M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
 M.output_limit = 30000 -- bytes of a tool result shown to the model
 M.lua_seconds = 60 -- time limit of one `lua` tool call
-M.effort = host.env("HX_EFFORT") -- how hard the model thinks, as output_config.effort; nil leaves it to the endpoint
-M.repeat_reminders = { 3, 5, 8 } -- the same call made this many times in a row gets a reminder
-M.empty_retries = 2 -- a reply with nothing in it is asked for again this many times
+M.effort = host.env("HX_EFFORT") -- low, high or max: how hard the model thinks; nil leaves it to the endpoint
+M.repeat_reminders = { 3, 5, 8 } -- the same call with the same result this many times in a task gets a reminder
 
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
 local function progress(text)
@@ -38,22 +37,17 @@ local function progress(text)
 end
 
 -- Keeps the start and the end of a long text: the start says what ran, the end says how it went. The whole text
--- goes to a file in $TMPDIR, so what was left out can still be read or searched.
+-- goes to a file in $TMPDIR (hx makes one for every run, inside the wall), so what was left out can still be read
+-- or searched.
 local spills = 0
 local function clip(text)
 	if #text <= M.output_limit then
 		return text
 	end
 	local half = M.output_limit // 2
-	local where = ""
-	local tmp = host.env("TMPDIR")
-	if tmp then
-		spills += 1
-		local path = ("%s/hx-output-%d.txt"):format(tmp, spills)
-		if host.write(path, text) then
-			where = "; the whole output is in " .. path
-		end
-	end
+	spills += 1
+	local path = ("%s/hx-output-%d.txt"):format(host.env("TMPDIR"), spills)
+	local where = host.write(path, text) and "; the whole output is in " .. path or ""
 	return text:sub(1, half) .. ("\n[... %d bytes omitted%s ...]\n"):format(#text - 2 * half, where) .. text:sub(-half)
 end
 
@@ -192,6 +186,13 @@ M.tools = {
 			local lines = text:split("\n")
 			if text:sub(-1) == "\n" then
 				table.remove(lines)
+			end
+			-- A \r\n line end is shown as a plain one. Shown, the \r reaches the model as the text \r, which it then
+			-- types into old_string as a backslash and an r; edit finds plain \n text in a \r\n file anyway.
+			for i, line in lines do
+				if line:sub(-1) == "\r" then
+					lines[i] = line:sub(1, -2)
+				end
 			end
 			local first = math.max(1, args.offset or 1)
 			local last = math.min(#lines, first + (args.limit or 2000) - 1)
@@ -427,7 +428,7 @@ end
 local usage = { replies = 0, input = 0, cached = 0, output = 0 }
 
 local function tool_specs()
-	local specs = {}
+	local specs = json.array({}) -- a list even when a project has taken every tool away
 	for _, tool in M.tools do
 		table.insert(specs, { name = tool.name, description = tool.description, input_schema = tool.parameters })
 	end
@@ -440,7 +441,23 @@ local function prompt_size(reply)
 	return (counts.input_tokens or 0) + (counts.cache_read_input_tokens or 0) + (counts.cache_creation_input_tokens or 0)
 end
 
--- Sends the conversation and returns the decoded reply. Retries what is worth retrying, then raises.
+-- Whether a reply has anything in it. Thinking alone counts; an empty text block does not. A reply cut off by
+-- the output limit (the loop asks it to go on) or refused (that is the answer) counts however empty it is.
+local function has_content(reply)
+	if reply.stop_reason == "max_tokens" or reply.stop_reason == "refusal" then
+		return true
+	end
+	for _, block in reply.content do
+		if block.type ~= "text" or block.text ~= "" then
+			return true
+		end
+	end
+	return false
+end
+
+-- Sends the conversation and returns the decoded reply. Retries what is worth retrying, then raises. The endpoint
+-- sometimes answers 200 with nothing in it; that is retried like a busy server, since the same request may well
+-- get a real reply.
 function M.request(system, messages)
 	local body = json.encode({
 		model = M.model,
@@ -462,11 +479,15 @@ function M.request(system, messages)
 				usage.input += prompt_size(reply)
 				usage.cached += (reply.usage or {}).cache_read_input_tokens or 0
 				usage.output += (reply.usage or {}).output_tokens or 0
-				return reply
+				if has_content(reply) then
+					return reply
+				end
+				status, text = "empty reply", "the model sent a reply with nothing in it"
+			else
+				error("the model endpoint sent a reply this loop cannot read: " .. (err or text:sub(1, 300)), 0)
 			end
-			error("the model endpoint sent a reply this loop cannot read: " .. (err or text:sub(1, 300)), 0)
 		end
-		local transient = status == nil or status == 408 or status == 409 or status == 429 or status >= 500
+		local transient = type(status) ~= "number" or status == 408 or status == 409 or status == 429 or status >= 500
 		if not transient or attempt == attempts then
 			error(("the model request failed (%s): %s"):format(tostring(status or "no response"), tostring(text):sub(1, 500)), 0)
 		end
@@ -495,8 +516,7 @@ function M.system_prompt()
 			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore.",
 		"Use the read tool, not shell commands like cat, sed, head or tail, to look at text files; its offset and "
 			.. "limit read a range of lines or go on through a large file. Read a file before you edit it, unless "
-			.. "you wrote or edited it yourself in this session. Check the [exit N] status at the end of every bash "
-			.. "result, and look into a failure before moving on.",
+			.. "you wrote or edited it yourself in this session.",
 		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
 	}
 	local extensions = extension_index()
@@ -686,24 +706,6 @@ local function ask(system, talk)
 	return M.request(system, talk.messages)
 end
 
--- Replaces the conversation with the model's own summary of what happened.
-function M.compact(system, talk)
-	progress("  compacting the conversation")
-	local asking = talk:fork()
-	asking:say(M.compact_prompt)
-	local summary = text_of(ask(system, asking))
-	if summary == "" then
-		progress("  no summary came back; keeping the conversation as it is")
-		return
-	end
-	talk:restart(
-		"Earlier turns were replaced by this checkpoint, written by you:\n\n"
-			.. summary
-			.. "\n\nTreat it as established and continue the work from it directly, without restating or "
-			.. "acknowledging it."
-	)
-end
-
 -- The request for the summary. It goes behind the whole conversation, as the last user message, so the request
 -- reuses the cached prefix. The summary is in English whatever the conversation's language: it becomes the start
 -- of everything after it, and a summary in another language pulls the model's own reasoning into that language.
@@ -732,53 +734,41 @@ M.compact_prompt = table.concat({
 		.. "true, drop what is not, and do not copy it over unchanged.",
 }, "\n")
 
--- A JSON text of a value with the keys of every object in order, so that two equal calls give the same text.
-local function canonical(value)
-	if type(value) ~= "table" then
-		return json.encode(value)
+-- Replaces the conversation with the model's own summary of what happened.
+function M.compact(system, talk)
+	progress("  compacting the conversation")
+	local asking = talk:fork()
+	asking:say(M.compact_prompt)
+	local summary = text_of(ask(system, asking))
+	if summary == "" then
+		progress("  no summary came back; keeping the conversation as it is")
+		return
 	end
-	if #value > 0 or next(value) == nil then
-		local items = {}
-		for _, item in value do
-			table.insert(items, canonical(item))
-		end
-		return "[" .. table.concat(items, ",") .. "]"
-	end
-	local keys = {}
-	for key in value do
-		table.insert(keys, tostring(key))
-	end
-	table.sort(keys)
-	local members = {}
-	for _, key in keys do
-		table.insert(members, json.encode(key) .. ":" .. canonical(value[key]))
-	end
-	return "{" .. table.concat(members, ",") .. "}"
+	talk:restart(
+		"Earlier turns were replaced by this checkpoint, written by you:\n\n"
+			.. summary
+			.. "\n\nTreat it as established and continue the work from it directly, without restating or "
+			.. "acknowledging it."
+	)
 end
 
--- What the model is told when it makes the same call again and again.
+-- What the model is told when it makes a call it has made before, and gets the same result again. That is a
+-- loop whatever ran in between: a status polled between sleeps, a command rerun without a change. A command
+-- rerun after a fix gets a new result, so it does not count.
 function M.repeat_reminder(call, count, first)
 	if first then
-		return "You are repeating the exact same tool call with the same arguments. Look at what it returned "
-			.. "before calling it again: if the task is not done, try a different approach or different arguments."
+		return ("You have now made the exact same tool call %d times and got the same result each time. If it is "
+			.. "not going to change, stop and report what you found; otherwise try a different approach. Do not "
+			.. "change what you are checking to make it give another answer."):format(count)
 	end
-	local args = canonical(call.input)
+	local args = json.encode(call.input)
 	if #args > 500 then
 		args = args:sub(1, 500) .. ("... (%d more bytes)"):format(#args - 500)
 	end
-	return ("You have made the same %s call %d times in a row, with these arguments: %s\nThe calls are not "
-		.. "making progress. Do not make this call again. Look at the last result and choose a different action "
-		.. "or different arguments, or finish the task if you have what you need."):format(call.name, count, args)
-end
-
--- Whether a reply has anything in it. Thinking alone counts; an empty text block does not.
-local function has_content(content)
-	for _, block in content do
-		if block.type ~= "text" or block.text ~= "" then
-			return true
-		end
-	end
-	return false
+	return ("You have made the same %s call %d times in this task, with these arguments: %s\nEvery time it "
+		.. "returned the same result, so repeating it is not making progress. Do not make this call again, and do "
+		.. "not change what it checks to make it give another answer. Choose a different action, or finish the "
+		.. "task and say what you found."):format(call.name, count, args)
 end
 
 -- Prints the text of a reply: the model's words are the answer, on stdout.
@@ -792,27 +782,11 @@ end
 
 -- Runs the model until it answers without asking for a tool.
 function M.turn(system, talk)
-	local last_call, repeats = nil, 0 -- the run of identical calls, which ends with this turn
+	local seen = {} -- how often each call has had each result in this turn
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
-		for _ = 1, M.empty_retries do
-			if has_content(reply.content) or reply.stop_reason == "max_tokens" then
-				break
-			end
-			progress("  the model sent an empty reply; asking again")
-			reply = ask(system, talk)
-		end
 		local cut_off = reply.stop_reason == "max_tokens"
 		show_text(reply)
-		-- A call whose input is not an object is kept as an empty one: the endpoint refuses a history that has
-		-- one, and would refuse every request after it. The model still hears that the call was malformed.
-		local malformed = {}
-		for _, block in reply.content do
-			if block.type == "tool_use" and type(block.input) ~= "table" then
-				malformed[block.id] = true
-				block.input = {}
-			end
-		end
 		local calls = talk:reply(reply.content)
 		if #calls > 0 then
 			local reminder = nil
@@ -820,17 +794,14 @@ function M.turn(system, talk)
 				if cut_off then
 					return "error: this call was cut off by the output limit and did not run. Send it again, smaller.", true
 				end
-				if malformed[call.id] then
-					return "error: the tool input is not an object", true
-				end
-				local key = call.name .. canonical(call.input)
-				repeats = key == last_call and repeats + 1 or 1
-				last_call = key
-				local at = table.find(M.repeat_reminders, repeats)
+				local result, failed = run_tool(call)
+				local key = json.encode({ call.name, call.input or json.null, result })
+				seen[key] = (seen[key] or 0) + 1
+				local at = table.find(M.repeat_reminders, seen[key])
 				if at then
-					reminder = M.repeat_reminder(call, repeats, at == 1)
+					reminder = M.repeat_reminder(call, seen[key], at == 1)
 				end
-				return run_tool(call)
+				return result, failed
 			end)
 			if reminder then
 				talk:say(reminder)
