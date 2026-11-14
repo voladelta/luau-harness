@@ -246,6 +246,17 @@ impl Budget {
             if now < self.deadline.0.load(Ordering::Relaxed).min(run_end) {
                 return Ok(VmState::Continue);
             }
+            // A thread awaiting an effect runs no Luau of its own: mlua only polls it. Raising here would drop the
+            // effect's future between its intent and its outcome, so neither deadline applies; the effect's own
+            // timeout ends it at the run deadline and records what happened.
+            if let Some(waiting) = &self.waiting
+                && waiting
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(lua.current_thread().to_pointer() as usize))
+            {
+                return Ok(VmState::Continue);
+            }
             // The run deadline is judged on its own clock, as the supervisor judges it: the budget clock may be a
             // tick ahead of it.
             if self
@@ -257,14 +268,6 @@ impl Budget {
                 ));
             }
             if now < self.deadline.0.load(Ordering::Relaxed) {
-                return Ok(VmState::Continue);
-            }
-            if let Some(waiting) = &self.waiting
-                && waiting
-                    .lock()
-                    .unwrap()
-                    .contains_key(&(lua.current_thread().to_pointer() as usize))
-            {
                 return Ok(VmState::Continue);
             }
             Err(mlua::Error::runtime(self.exceeded))

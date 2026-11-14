@@ -2,11 +2,13 @@
 # Budget checks (scripted model: every call costs 10+5 tokens). No API key needed.
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
-cleanup() { kill $M1 $M2 2>/dev/null; }
+cleanup() { kill $M1 $M2 $M3 2>/dev/null; }
 CHUNKS='["```luau\nprint(1)\n```","```luau\nprint(2)\n```","```luau\nprint(3)\n```","```luau\nprint(4)\n```","```luau\nprint(5)\n```","done"]'
 MOCK_REPLIES="$CHUNKS" MOCK_BY_LEN=1 serve P1 python3 scripts/mock_llm.py 0 || exit 1; M1=$SERVED
 SUB='["```luau\nlocal r = agent(\"sub\")\nprint(r.answer)\n```","```luau\nprint(1)\n```","```luau\nprint(2)\n```","```luau\nprint(3)\n```","done","done"]'
 MOCK_REPLIES="$SUB" serve P2 python3 scripts/mock_llm.py 0 || exit 1; M2=$SERVED
+SLOW='["```luau\nlocal r = sh(\"sleep 5; echo hi\")\nreturn r.stdout\n```","done"]'
+MOCK_REPLIES="$SLOW" MOCK_BY_LEN=1 serve P3 python3 scripts/mock_llm.py 0 || exit 1; M3=$SERVED
 echo go > $T/p.txt
 run() { # port, workspace, extra flags...
   local port=$1 ws=$2; shift 2
@@ -38,6 +40,16 @@ check "subagent shares the parent's budget (3 calls total, then both stop)" "$(e
 
 ws g; out=$(run $P1 $W)
 check "no budget: run completes normally" "$(echo "$out" | field finished)$(echo "$out" | field stopped)" "TrueNone"
+
+# The run deadline falls while a shell command is still running: the command must end up recorded as uncertain every
+# time, never dropped between its intent and its outcome.
+lost=0
+for i in 1 2 3 4 5 6; do
+  ws h$i; out=$(run $P3 $W --max-wall 1.5)
+  recorded=$(grep -h -c '"kind":"uncertain"' "$(logdir $W)"/*.jsonl)
+  [ "$(echo "$out" | field uncertain_operations | tr -dc , | wc -c)$recorded" = "01" ] || lost=$((lost+1))
+done
+check "an effect cut off by the run deadline is always recorded and reported as uncertain" "$lost" "0"
 
 # CPU/wait accounting has a fast Rust regression; arbitrary coroutine scheduling is unavailable.
 check "model cannot create arbitrary coroutines" "$($H exec --workspace $W 'print(type(coroutine))' | head -1)" "nil"
