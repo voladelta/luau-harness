@@ -690,6 +690,7 @@ fn search_files(
         .binary_detection(BinaryDetection::quit(0))
         .build();
     let mut rows: Rows = Vec::new();
+    let mut opener = crate::atomic_file::NoFollow::default();
     for entry in wb.build().flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -709,8 +710,12 @@ fn search_files(
             cap,
             over: false,
         };
-        // An unreadable file is skipped like a binary one.
-        let _ = searcher.search_path(&matcher, path, &mut sink);
+        // The walker opens directories by path, so a directory swapped for a link while it runs can show it files
+        // outside the roots. Each file is read through descriptors opened without following a link from `/` to the
+        // checked path; a file that cannot be opened that way, or read, is skipped like a binary one.
+        if let Ok(file) = opener.open(path) {
+            let _ = searcher.search_file(&matcher, &file, &mut sink);
+        }
         if sink.over {
             return Ok(Hits {
                 rows,
@@ -1289,40 +1294,48 @@ mod file_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn a_read_never_follows_a_directory_swapped_for_a_symlink() {
-        let dir = workspace("swap");
-        let outside = workspace("swap-outside");
+    /// Exchange `a` and `b` (a directory and a symlink) with `renameat2(RENAME_EXCHANGE)` until `stop` is set.
+    fn swapper(
+        a: &Path,
+        b: &Path,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        let (a, b) = (c(a), c(b));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // SAFETY: both arguments are NUL-terminated paths that outlive the call.
+                unsafe {
+                    libc::renameat2(
+                        libc::AT_FDCWD,
+                        a.as_ptr(),
+                        libc::AT_FDCWD,
+                        b.as_ptr(),
+                        libc::RENAME_EXCHANGE,
+                    )
+                };
+            }
+        })
+    }
+
+    /// A workspace with `d/f` ("inside") and a symlink `l` to a directory outside it whose `f` says "OUTSIDE".
+    fn swappable(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = workspace(tag);
+        let outside = workspace(&format!("{tag}-outside"));
         std::fs::create_dir_all(dir.join("d")).unwrap();
         std::fs::write(dir.join("d/f"), "inside").unwrap();
         std::fs::write(outside.join("f"), "OUTSIDE").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("l")).unwrap();
+        (dir, outside)
+    }
+
+    #[test]
+    fn a_read_never_follows_a_directory_swapped_for_a_symlink() {
+        let (dir, outside) = swappable("swap");
         let dirs = crate::dirs::TestDirs::new();
         let pol = crate::policy::Policy::new(&dirs, &dir, false, None, None).unwrap();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let swapper = {
-            let (d, l, stop) = (
-                std::ffi::CString::new(dir.join("d").into_os_string().into_encoded_bytes())
-                    .unwrap(),
-                std::ffi::CString::new(dir.join("l").into_os_string().into_encoded_bytes())
-                    .unwrap(),
-                stop.clone(),
-            );
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    // SAFETY: both arguments are NUL-terminated paths that outlive the call.
-                    unsafe {
-                        libc::renameat2(
-                            libc::AT_FDCWD,
-                            d.as_ptr(),
-                            libc::AT_FDCWD,
-                            l.as_ptr(),
-                            libc::RENAME_EXCHANGE,
-                        )
-                    };
-                }
-            })
-        };
+        let swapper = swapper(&dir.join("d"), &dir.join("l"), stop.clone());
         let leaked = (0..3000)
             .filter(|_| {
                 read_file(&pol, "d/f", &ReadOptions::default()).is_ok_and(|b| b == b"OUTSIDE")
@@ -1331,6 +1344,36 @@ mod file_tests {
         stop.store(true, Ordering::Relaxed);
         swapper.join().unwrap();
         assert_eq!(leaked, 0);
+        let _ = (
+            std::fs::remove_dir_all(dir),
+            std::fs::remove_dir_all(outside),
+        );
+    }
+
+    #[test]
+    fn a_search_never_follows_a_directory_swapped_for_a_symlink() {
+        let (dir, outside) = swappable("search-swap");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = swapper(&dir.join("d"), &dir.join("l"), stop.clone());
+        let (mut leaked, mut found) = (0, 0);
+        for _ in 0..3000 {
+            let hits = search_files(
+                &dir,
+                &dir,
+                "inside|OUTSIDE",
+                &SearchOptions::default(),
+                10,
+                false,
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("{}", e.message));
+            leaked += hits.rows.iter().filter(|r| r.2.contains("OUTSIDE")).count();
+            found += hits.rows.len();
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert_eq!(leaked, 0);
+        assert!(found > 0, "the search never saw the file it may read");
         let _ = (
             std::fs::remove_dir_all(dir),
             std::fs::remove_dir_all(outside),

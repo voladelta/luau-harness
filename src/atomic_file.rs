@@ -243,6 +243,18 @@ struct Dir(File);
 const DIR_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
+/// One entry name of any bytes: a single path component, never `.`, `..` or empty.
+fn os_entry(name: &std::ffi::OsStr) -> io::Result<CString> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name:?} is not a single file name"),
+        ));
+    }
+    cstr(name)
+}
+
 impl Dir {
     /// Open the absolute, normalized `path`, every component without following a link; with `create`, missing
     /// directories are made on the way.
@@ -283,6 +295,83 @@ impl Dir {
             next = opened(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), DIR_FLAGS) });
         }
         Ok(Dir(next?))
+    }
+
+    /// The existing subdirectory `name` (one component, any bytes). A link there is an error.
+    fn subdir(&self, name: &std::ffi::OsStr) -> io::Result<Dir> {
+        self.child(&os_entry(name)?, false)
+    }
+
+    /// The regular file `name` (one component, any bytes), opened for reading without following a link. Anything else
+    /// there (a link, a directory, a FIFO, a device) is an error.
+    fn open_regular(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        let name = os_entry(name)?;
+        // SAFETY: `self.0` is an open directory descriptor and `name` a NUL-terminated string; both outlive the call.
+        // O_NONBLOCK keeps a FIFO from blocking the open; it is refused below.
+        let file = opened(unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+}
+
+/// Opens files for reading without following a link in any component (`Dir`). It keeps the chain of
+/// directories that led to the last file, so a walk that visits a directory's files together opens each directory
+/// once.
+#[derive(Default)]
+pub struct NoFollow {
+    chain: Vec<(std::path::PathBuf, Dir)>,
+}
+
+impl NoFollow {
+    /// The regular file at the absolute, normalized `path`.
+    pub fn open(&mut self, path: &Path) -> io::Result<File> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an absolute file path",
+            ));
+        };
+        while self
+            .chain
+            .last()
+            .is_some_and(|(dir, _)| !parent.starts_with(dir))
+        {
+            self.chain.pop();
+        }
+        if self.chain.is_empty() {
+            let root = std::path::PathBuf::from("/");
+            let dir = Dir::open(&root, false)?;
+            self.chain.push((root, dir));
+        }
+        let (reached, _) = self.chain.last().expect("the chain holds at least /");
+        let rest = parent
+            .strip_prefix(reached)
+            .map_err(io::Error::other)?
+            .to_path_buf();
+        for component in rest.components() {
+            let std::path::Component::Normal(part) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected a normalized path",
+                ));
+            };
+            let (above, dir) = self.chain.last().expect("the chain holds at least /");
+            let next = (above.join(part), dir.subdir(part)?);
+            self.chain.push(next);
+        }
+        let (_, dir) = self.chain.last().expect("the chain holds at least /");
+        dir.open_regular(name)
     }
 }
 
