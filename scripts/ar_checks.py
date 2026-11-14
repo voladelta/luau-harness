@@ -339,7 +339,12 @@ def scenario_00():
     assert any(c["scope"] != "explore" for c in claims)
     judged = [text_of(b) for b in requests if role_of(b)[0] == "judge"]
     assert any("same refinement" in j for j in judged) and any("same core approach" in j for j in judged), len(judged)
-    check("exploit rounds split workers across the chosen candidates, each claiming a distinct refinement")
+    spent = [r for r in records if r["kind"] == "judged"]
+    assert spent and all(r["model"] == "mock" and r["calls"] == 2 and r["worker"] and r["idea"] for r in spent), spent[:2]
+    assert any(r["verdict"].startswith("same as #") for r in spent), [r["verdict"] for r in spent]
+    total = report["judge"]
+    assert total["calls"] == 2 * len(spent) == len(judged) and total["input_tokens"] == sum(r["input_tokens"] for r in spent) > 0, total
+    check("exploit rounds split workers across the chosen candidates, each claiming a distinct refinement; the judge's spend is journaled and reported")
 
     # Round 3 finds no refinement left, so round 4 explores again; its workers see every earlier idea and claim new ones.
     # Round 4's new ideas don't move the chosen candidates either, so the run stops.

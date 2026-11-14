@@ -416,6 +416,43 @@ impl Journal {
     }
 }
 
+/// What the two judge calls of one claim spent, as the provider reported it. These calls are made by hx-ar, outside
+/// every episode's run and budget, so the run's journal is their only record. A call that failed reported nothing;
+/// one whose answer was lost may still have been billed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct JudgeSpend {
+    /// The worker whose claim was judged, and the claim.
+    pub(crate) worker: String,
+    pub(crate) idea: String,
+    /// `new`, `same as #N` or `placeholder`.
+    pub(crate) verdict: String,
+    pub(crate) model: String,
+    pub(crate) calls: u32,
+    pub(crate) failed: u32,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) cache_write_tokens: u64,
+}
+
+/// The judge's spend over the whole run, for the report.
+fn judge_totals(records: &[Record]) -> Value {
+    let mut total = JudgeSpend::default();
+    for r in records {
+        if let Record::Judged(s) = r {
+            total.calls += s.calls;
+            total.failed += s.failed;
+            total.input_tokens += s.input_tokens;
+            total.output_tokens += s.output_tokens;
+            total.cache_read_tokens += s.cache_read_tokens;
+            total.cache_write_tokens += s.cache_write_tokens;
+        }
+    }
+    json!({"calls": total.calls, "failed": total.failed, "input_tokens": total.input_tokens,
+        "output_tokens": total.output_tokens, "cache_read_tokens": total.cache_read_tokens,
+        "cache_write_tokens": total.cache_write_tokens})
+}
+
 /// Launch settings, frozen at the start and reused on resume.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Launch {
@@ -494,6 +531,8 @@ pub(crate) enum Record {
     Evaluated(Row),
     /// A claim accepted for a worker.
     Claimed(Claim),
+    /// What the judge calls of one claim spent.
+    Judged(JudgeSpend),
     Planned {
         batch: String,
         episodes: Vec<Plan>,
@@ -1533,6 +1572,7 @@ comes from a hole or a rule violation). Without that line the audit counts for n
             "snap": snap, "search": search, "select": select, "portfolio": portfolio, "candidates": candidates,
             "rounds": self.records()?.iter().filter(|r| matches!(r, Record::Gate { .. })).count(),
             "evals": state.rows.len(),
+            "judge": judge_totals(&state.records),
         });
         std::fs::write(
             self.dir.join("report.json"),

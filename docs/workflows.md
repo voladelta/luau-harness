@@ -91,7 +91,7 @@ min_delta = 0.05
 4. **Gate.** The three most promising candidates pass to the next rounds, even raw ones below the seed. Candidates that beat the seed on search and are not worse on `select` are audited for evaluator holes; only those can become results. With a noisy evaluator (one that reports `se`), a state's score is the mean of its evaluations, and both comparisons allow for the combined standard error.
 5. **Rounds.** Refinement continues while it moves the chosen candidates; exploring starts again when it doesn't. Two rounds in a row without progress (a new candidate, or a gain above both `min_delta` and the evaluator's standard error) end the run.
 
-Episodes are limited in model turns, not dollars. The result is a portfolio of distinct good candidates, best search score first.
+Episodes are limited in model turns, not dollars. The result is a portfolio of distinct good candidates, best search score first. `hx-ar` itself also calls the model: twice per claim, to judge it against earlier claims. Those calls belong to no episode, so `hx-ar` journals each pair (the worker, the claim, the verdict, the model, and the input, output and cache tokens the provider reported) as a `judged` record, and the run's `report.json` totals them under `judge`. A judge call that failed reported no tokens and is counted under `failed`. Each episode's own spend is in its report and journals under `episodes/`.
 
 The held-out score is only a veto. Ranking on it too would select on it every round until it is as optimistic as the search score.
 

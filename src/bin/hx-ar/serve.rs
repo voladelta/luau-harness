@@ -10,8 +10,8 @@
 //! improvement.
 use crate::files::{self, capture, evaluate, load_snap, restore, save_snap};
 use crate::run::{
-    Claim, JUDGE_TOKENS, Journal, Record, Role, Row, Spec, claims, estimate, estimate_of, noisy,
-    rows,
+    Claim, JUDGE_TOKENS, Journal, JudgeSpend, Record, Role, Row, Spec, claims, estimate,
+    estimate_of, noisy, rows,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -570,14 +570,27 @@ of this worker claimed this idea before it was interrupted. Continue with it: {}
     } else {
         "core approach"
     };
-    match judge(
+    let (judged, spend) = judge(
         shared.judge.as_ref(),
         &earlier,
         &idea,
         ep.role == Role::Exploit,
     )
-    .await
-    {
+    .await;
+    // The judge's model calls are spent outside every episode, so this journal is the only record of them.
+    if let Some(mut spend) = spend {
+        spend.worker = ep.label.clone();
+        spend.idea = idea.clone();
+        spend.verdict = match judged {
+            Judged::New => "new".into(),
+            Judged::Same(i) => format!("same as #{}", earlier[i].n),
+            Judged::Placeholder => "placeholder".into(),
+        };
+        shared
+            .append_with(move |_| Ok((Record::Judged(spend), ())))
+            .await?;
+    }
+    match judged {
         Judged::New => {}
         Judged::Same(i) => {
             return Ok(
@@ -625,9 +638,15 @@ pub(crate) enum Judged {
 }
 
 /// Judge a new claim against the earlier ones. Only an answer both calls agree on rejects it; anything else accepts.
-async fn judge(judge: Option<&Judge>, earlier: &[Claim], idea: &str, refinement: bool) -> Judged {
+/// Also returns what the calls spent (its claim fields left for the caller), or None without a judge.
+async fn judge(
+    judge: Option<&Judge>,
+    earlier: &[Claim],
+    idea: &str,
+    refinement: bool,
+) -> (Judged, Option<JudgeSpend>) {
     let Some(judge) = judge else {
-        return Judged::New;
+        return (Judged::New, None);
     };
     let listed: String = if earlier.is_empty() {
         "(none)\n".into()
@@ -663,12 +682,31 @@ tool), end with 'Answer: none' instead."
         "messages": [{"role": "user", "content": prompt}], "max_tokens": JUDGE_TOKENS});
     let ask = || hx::llm::chat(&judge.http, &judge.cfg, &judge.key, &request);
     let (a, b) = tokio::join!(ask(), ask());
-    let pick = |reply: Result<hx::llm::Reply>| reply.ok().and_then(|r| answer_number(&r.text));
-    match (pick(a), pick(b)) {
+    let mut spend = JudgeSpend {
+        model: judge.cfg.model.clone(),
+        calls: 2,
+        ..JudgeSpend::default()
+    };
+    let mut pick = |reply: Result<hx::llm::Reply>| match reply {
+        Ok(r) => {
+            spend.input_tokens += r.input;
+            spend.output_tokens += r.output;
+            spend.cache_read_tokens += r.cache_read;
+            spend.cache_write_tokens += r.cache_write;
+            answer_number(&r.text)
+        }
+        Err(_) => {
+            spend.failed += 1;
+            None
+        }
+    };
+    let picks = (pick(a), pick(b));
+    let judged = match picks {
         (Some(a), Some(b)) if a == b && a == usize::MAX => Judged::Placeholder,
         (Some(a), Some(b)) if a == b && (1..=earlier.len()).contains(&a) => Judged::Same(a - 1),
         _ => Judged::New,
-    }
+    };
+    (judged, Some(spend))
 }
 
 /// N from the last `Answer: N` in a judge's reply, tolerating markdown such as `**Answer:** #2`; `Answer: none` is
