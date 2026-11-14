@@ -487,8 +487,10 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(process.stdout.readline(), "ready\n")
         time.sleep(0.3)  # let it block in the read
         process.send_signal(signal.SIGINT)
+        # Wait for the stop to end before writing: a line that arrives before hx wakes is read and then dropped.
+        self.assertEqual(process.stdout.readline(), "false\tinterrupted\n")
         out, _ = process.communicate("a line\n", timeout=20)
-        self.assertEqual((process.returncode, out), (0, "false\tinterrupted\na line\n"))
+        self.assertEqual((process.returncode, out), (0, "a line\n"))
 
     def test_an_inner_scope_does_not_end_an_interrupt(self):
         code, out = self.run_interrupted(
