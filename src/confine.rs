@@ -16,9 +16,11 @@ pub struct Rules {
 }
 
 /// Read-only for every child, in addition to the policy's read roots: shared libraries, process and system
-/// information, the resolver configuration and the harmless character devices. A confined child cannot reach hx's own
-/// `/proc` entries (Landlock refuses ptrace-style access to a process outside its domain), so `/proc` does not expose
-/// hx's environment. No terminal is listed: children run in their own session with stdin closed, and access to
+/// information, the resolver configuration and the harmless character devices. Landlock refuses a child ptrace-style
+/// access to a process outside its domain, which covers hx's own `/proc/PID/environ`, `mem` and the like, but a child
+/// holding some of root's capabilities (CAP_SYS_ADMIN or CAP_PERFMON, on the kernels tested) gets past that check: only
+/// because a confined child holds no capability (`drop_capabilities`) is hx's environment out of its reach when hx runs
+/// as root. No terminal is listed: children run in their own session with stdin closed, and access to
 /// `/dev/tty` or `/dev/pts` would let one paint over an approval prompt or read the owner's keystrokes.
 const CHILD_READ: &[&str] = &[
     "/lib",
@@ -179,9 +181,11 @@ impl Rules {
 }
 
 impl Ruleset {
-    /// Restrict the calling process. Async-signal-safe: call it in `pre_exec`, between fork and exec.
+    /// Restrict the calling process: give up every capability (`drop_capabilities`), then enter the ruleset.
+    /// Async-signal-safe: call it in `pre_exec`, between fork and exec.
     pub fn apply(&self) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
+        drop_capabilities()?;
         // SAFETY: both calls take only integer arguments; the ruleset fd stays open for as long as `self` lives.
         unsafe {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -193,6 +197,70 @@ impl Ruleset {
         }
         Ok(())
     }
+}
+
+/// Give up every capability: the bounding set (where this process may, which takes CAP_SETPCAP), the ambient set, and
+/// the effective, permitted and inheritable sets. A child of a root-run hx is then in an unprivileged user's position:
+/// Landlock's ptrace restriction keeps it from hx's `/proc` files (`environ` holds the API key hx was launched with),
+/// which some of root's capabilities would otherwise let it read, and file permissions apply to it. `apply` sets no_new_privs right
+/// after, so exec (a setuid program, file capabilities, root's implicit ones) cannot hand any back. Async-signal-safe:
+/// only system calls on values on the stack.
+fn drop_capabilities() -> std::io::Result<()> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let errno = || std::io::Error::last_os_error().raw_os_error();
+    // Capability numbers run from 0 to the kernel's last one; the first number past it is EINVAL. Without CAP_SETPCAP
+    // the bounding set cannot be changed (EPERM): then this process holds no capability to drop there, and
+    // no_new_privs keeps exec from using what the bounding set allows.
+    for cap in 0..64 {
+        // SAFETY: prctl(2) with PR_CAPBSET_DROP takes only integer arguments.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
+            match errno() {
+                Some(libc::EINVAL | libc::EPERM) => break,
+                _ => return Err(std::io::Error::last_os_error()),
+            }
+        }
+    }
+    // SAFETY: as above. A kernel before 4.3 has no ambient set (EINVAL), so there is nothing to clear.
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+        && errno() != Some(libc::EINVAL)
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let header = Header {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let none = [Data {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capset(2) reads one header and, for version 3, two data structs; both are live, correctly laid out
+    // (`repr(C)`, matching `struct __user_cap_header_struct` and `struct __user_cap_data_struct`) values on the stack.
+    if unsafe { libc::syscall(libc::SYS_capset, &header, none.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -265,6 +333,27 @@ mod tests {
             write: vec![],
         }
         .with_system()
+    }
+
+    #[test]
+    fn a_confined_child_holds_no_capability_and_cannot_read_its_parents_environment() {
+        if status().is_err() {
+            eprintln!("skipped: Landlock unavailable");
+            return;
+        }
+        let (code, out, err) = confined(
+            system(),
+            "grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb)' /proc/self/status",
+        );
+        assert_eq!(code, Some(0), "{err}");
+        let sets: Vec<_> = out.lines().map(|l| l.split_whitespace().nth(1)).collect();
+        assert_eq!(sets, vec![Some("0000000000000000"); 5], "{out}");
+        // Run as root too: root's capabilities would get past Landlock's ptrace restriction.
+        let (code, out, err) = confined(system(), "cat /proc/$PPID/environ | wc -c");
+        assert!(
+            out.trim() == "0" && err.contains("Permission denied"),
+            "{code:?} {out} {err}"
+        );
     }
 
     #[test]

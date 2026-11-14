@@ -64,9 +64,9 @@ pub(crate) fn confine_command(
     ruleset: Option<Arc<crate::confine::Ruleset>>,
 ) {
     // SAFETY: the closure runs in the forked child before exec, where only async-signal-safe calls are allowed. It
-    // calls setsid(2) and `Ruleset::apply` (prctl(2) and landlock_restrict_self(2)), and on failure reads errno into
-    // an `io::Error`, which does not allocate. It takes no lock and does not allocate: the Arc was moved in by the
-    // parent and is only borrowed here.
+    // calls setsid(2) and `Ruleset::apply` (prctl(2), capset(2) with stack values, landlock_restrict_self(2)), and on
+    // failure reads errno into an `io::Error`, which does not allocate. It takes no lock and does not allocate: the
+    // Arc was moved in by the parent and is only borrowed here.
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() == -1 {

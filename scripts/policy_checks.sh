@@ -128,6 +128,20 @@ check "command -v, wrapped and looping commands run unasked" "$(echo "$out" | tr
 out=$(run 'local r = sh("sleep 987 & sleep 987", {timeout = 1}) print(r.timed_out)')
 check "timeout kills the whole process group" "$(echo "$out" | head -1)$(sleep 1; pgrep -f 'sleep 987' | wc -l | tr -d ' ')" "true0"
 
+# --- a confined command holds no capability, so it cannot read hx's environment (the API key hx was launched with), even
+# when hx runs as root; as nobody, Landlock alone refuses it. Ordinary work still runs as root.
+environ='local r = sh([==[grep -a -c "MY_API_KEY=sk" /proc/$PPID/environ; grep CapEff /proc/self/status]==]) print((r.stdout:gsub("%s+", " ")), r.stderr:find("Permission denied") ~= nil)'
+out=$(MY_API_KEY=sk-marker-123 run "$environ" | head -1)
+check "a command cannot read hx's environment as $(id -un)" "$out" "CapEff: 0000000000000000 	true"
+if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null; then
+  U=$T/nobody; mkdir -p $U/ws $U/tmp; chmod 755 $T; chmod -R 777 $U
+  out=$(cd $U && MY_API_KEY=sk-marker-123 setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=$U TMPDIR=$U/tmp XDG_CONFIG_HOME=$U/config XDG_STATE_HOME=$U/state $R/target/release/hx exec --ignore-config --workspace $U/ws "$environ" 2>&1 | head -1)
+  check "...nor as nobody" "$out" "CapEff: 0000000000000000 	true"
+  out=$(run 'local r = sh("printf \"int main(void){return 0;}\" > a.c && cc a.c -o a.out && ./a.out && echo built; printf \"all:\\n\\t@echo made\\n\" > Makefile && make; git init -q caps && echo git-ok; echo x > caps/f && cat caps/f") print((r.stdout:gsub("\n", " ")))' | head -1)
+  check "as root, building, writing and git still work" "$out" "built made git-ok x "
+  rm -rf $W/a.c $W/a.out $W/Makefile $W/caps
+fi
+
 # --- without Landlock nothing that could start a child runs, unless the owner launches it with --unconfined
 nolandlock() { HX_TEST_NO_LANDLOCK=1 "$@" 2>&1; }
 journals() { ls "$(logdir "$W")"/*.jsonl 2>/dev/null | wc -l; }
