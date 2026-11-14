@@ -14,6 +14,7 @@ import pty
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -721,6 +722,50 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "nil\tf.txt: File too large\nf.txt s.luau\n")
         self.assertEqual(read(self.project, "f.txt"), "old\n")
+
+    def test_a_replaced_file_keeps_its_extended_attributes_and_acl(self):
+        target = os.path.join(self.project, "f.txt")
+        with open(target, "w") as f:
+            f.write("old")
+        # An access ACL that also lets user 12345 read: version 2, then (tag, permissions, id) entries.
+        acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", tag, perm, uid) for tag, perm, uid in (
+            (0x01, 6, 0xFFFFFFFF), (0x02, 4, 12345), (0x04, 4, 0xFFFFFFFF), (0x10, 4, 0xFFFFFFFF),
+            (0x20, 4, 0xFFFFFFFF)))
+        try:
+            os.setxattr(target, "user.note", b"kept")
+            os.setxattr(target, "system.posix_acl_access", acl)
+        except OSError as e:
+            self.skipTest(f"this file system takes no extended attributes or ACLs: {e}")
+        before = os.stat(target)
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("print(host.write('f.txt', 'new'))\n")
+        done = subprocess.run([HX, "--run", "s.luau"], cwd=self.project, env=self.env(), capture_output=True,
+                              text=True, timeout=60)
+        self.assertEqual((done.returncode, done.stdout), (0, "true\n"), done.stderr)
+        after = os.stat(target)
+        self.assertNotEqual(after.st_ino, before.st_ino, "the file was written in place, not replaced")
+        self.assertEqual(read(target), "new")
+        self.assertEqual(os.getxattr(target, "user.note"), b"kept")
+        self.assertEqual(os.getxattr(target, "system.posix_acl_access"), acl)
+        self.assertEqual(after.st_mode, before.st_mode)
+
+    def test_a_write_killed_part_way_leaves_no_temporary_file(self):
+        # Each write takes long enough that a kill lands inside one, where a named temporary file would be left.
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("local big = string.rep('x', 32 * 1024 * 1024)\n"
+                    "while true do host.write('f.txt', big) end\n")
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(kill_quietly, process.pid)
+        for _ in range(200):
+            if os.path.exists(os.path.join(self.project, "f.txt")):
+                break
+            time.sleep(0.05)
+        time.sleep(0.5)
+        process.kill()
+        process.wait(timeout=20)
+        self.assertEqual(sorted(os.listdir(self.project)), ["f.txt", "s.luau"])
+        self.assertEqual(os.path.getsize(os.path.join(self.project, "f.txt")), 32 * 1024 * 1024)
 
     def test_a_lone_rw_file_is_written_in_place(self):
         # Its directory is outside the wall, so no temporary file can be made beside it.

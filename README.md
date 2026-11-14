@@ -128,7 +128,8 @@ Know these before you rely on it.
 - **Secrets stored in the project are readable**, as are secrets in variables with unusual names.
 - **A process outlives `hx` when `hx` itself is killed with SIGKILL, or crashes.** Every other way out kills
   what the model started, leaving at once on a second Ctrl-C included. Such a process stays confined, but it is
-  not killed.
+  not killed. A process stuck in uninterruptible I/O (a dead network mount) is sent SIGKILL but dies only when
+  the I/O returns; `hx` waits a second for it, then leaves without it.
 - **The model can edit `.hx/loop.luau` and its extensions.** That is the point, and it shows in `git diff`.
   If the loop no longer loads and returns a `main` function, the built-in one runs instead.
 - **Nothing asks before a file in the project is changed or deleted.** Git is the undo.
@@ -207,7 +208,7 @@ Everything Luau can do to the machine:
 | `host.llm(body, {timeout=600})` | `status, text`, or `nil, error` |
 | `host.sh(command, {timeout=120})` | `{out, code, signal, timed_out}` |
 | `host.read(path)` | the contents, or `nil, error` |
-| `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed write leaves the old content; its mode stays, and a link stays a link. A device, a FIFO, a file with other hard links, or one in a directory that refuses a new file is written in place |
+| `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed or killed write leaves the old content; its owner, mode, extended attributes and ACLs stay, and a link stays a link. A device, a FIFO, a file with other hard links, one whose attributes cannot be copied, or one in a directory that refuses a new file is written in place |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
 | `host.load(source, name, env)` | a function, or `nil, error` |
 | `host.try(fn, ...)` | `true, ...`, or `false, error`: a `pcall` that is also where a stop ends |

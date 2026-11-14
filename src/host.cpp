@@ -5,8 +5,10 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/prctl.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -45,8 +47,10 @@ constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm aborts
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;
 constexpr int kPollMs = 50;
-constexpr int kKillRounds = 100;  // at exit, so that a fork storm cannot hold hx up forever
-constexpr double kLongest = 1e9;  // seconds, about 30 years: the longest duration a call can ask for
+constexpr int kKillRounds = 100;          // at exit, so that a fork storm cannot hold hx up forever
+constexpr std::size_t kMaxKilled = 4096;  // processes remembered at exit; past that, more rounds find the rest
+constexpr double kReapSeconds = 1.0;      // at exit, how long hx waits for what it killed to be gone
+constexpr double kLongest = 1e9;          // seconds, about 30 years: the longest duration a call can ask for
 
 // Signal handlers cannot be given context, so this state is global. It is the only mutable global state here.
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
@@ -176,14 +180,23 @@ pid_t parent_of(int proc, std::string_view pid) {
     return parent;
 }
 
-// Kills and reaps every descendant of hx. Killing a child orphans its children, which then become children of hx,
-// a subreaper, so each round reaches one level further down the tree.
+// Kills every descendant of hx, then waits a moment for them to be gone. A descendant is a child of hx or of a
+// process killed here, so the whole tree is killed without waiting for any part of it to die: SIGKILL cannot end a
+// process stuck in uninterruptible I/O (a dead NFS server) until the I/O returns, and hx does not wait on one
+// longer than kReapSeconds. Nothing is reaped until every process is killed, so the zombies hold their PIDs and
+// none can be reused by a process that is not a descendant.
 void kill_descendants() noexcept {
     const pid_t self = getpid();
+    std::array<pid_t, kMaxKilled> killed{};
+    std::size_t count = 0;
+    const auto was_killed = [&](pid_t pid) {
+        return std::find(killed.begin(), killed.begin() + static_cast<std::ptrdiff_t>(count), pid) !=
+               killed.begin() + static_cast<std::ptrdiff_t>(count);
+    };
     for (int round = 0; round < kKillRounds; ++round) {
         const UniqueFd proc(open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         if (!proc.valid()) {
-            return;
+            break;
         }
         bool found = false;
         alignas(dirent64) std::array<char, 4096> entries{};
@@ -200,19 +213,40 @@ void kill_descendants() noexcept {
                 at += size;
                 pid_t pid = 0;
                 const auto [stop, error] = std::from_chars(name.data(), name.data() + name.size(), pid);
-                if (error != std::errc() || stop != name.data() + name.size() || parent_of(proc.get(), name) != self) {
+                if (error != std::errc() || stop != name.data() + name.size() || was_killed(pid)) {
                     continue;
                 }
-                // Waiting for each one before going on means its children are already hx's when they are listed.
+                const pid_t parent = parent_of(proc.get(), name);
+                if (parent != self && !was_killed(parent)) {
+                    continue;
+                }
+                // Once kill returns, a fork in that process either has finished, so its child is listed by a
+                // later scan, or fails.
                 found = true;
                 kill(pid, SIGKILL);
-                while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+                if (count < killed.size()) {
+                    killed.at(count) = pid;
+                    ++count;
                 }
             }
         }
         if (!found) {
-            return;
+            break;
         }
+    }
+    // A killed process whose children were killed too passes them to hx as it dies, so waiting for any child
+    // reaps the whole tree.
+    const double deadline = now() + kReapSeconds;
+    for (;;) {
+        const pid_t pid = waitpid(-1, nullptr, WNOHANG);
+        if (pid > 0 || (pid < 0 && errno == EINTR)) {
+            continue;
+        }
+        if (pid < 0 || now() >= deadline) {
+            return;  // ECHILD: none left
+        }
+        const timespec nap{0, 10'000'000};
+        nanosleep(&nap, nullptr);
     }
 }
 
@@ -400,13 +434,165 @@ mode_t new_file_mode() {
     return 0666 & ~mask;
 }
 
-// A file is written by writing a temporary file beside it and renaming that over it, so a full disk or a killed hx
-// leaves the old content or the new, never a file cut short. Nothing is synced: a power loss can still lose both,
-// and that is not what this guards against. Where a new file could not stand in for the old one, the file is
-// written in place instead: something other than a regular file (/dev/null, a FIFO), a file with other names that
-// must go on seeing it, a dangling link, a directory that refuses a new file (a lone --rw file), a file whose
-// owner and group the new one cannot be given, or a file that may not be written (a rename would not ask it, so
-// the open is left to refuse).
+// Reads a list or a value whose size is not known: asks for the size, then reads, and again if it grew meanwhile.
+template <typename Get>
+bool read_sized(const Get& get, std::string& out) {
+    for (;;) {
+        ssize_t n = get(nullptr, 0);
+        if (n < 0) {
+            return false;
+        }
+        out.resize(static_cast<std::size_t>(n));
+        n = get(out.data(), out.size());
+        if (n >= 0) {
+            out.resize(static_cast<std::size_t>(n));
+            return true;
+        }
+        if (errno != ERANGE) {
+            return false;
+        }
+    }
+}
+
+// The extended attribute names in a list from listxattr, which ends each one with a NUL.
+std::vector<std::string_view> attribute_names(std::string_view list) {
+    std::vector<std::string_view> names;
+    while (!list.empty()) {
+        const std::size_t end = std::min(list.find('\0'), list.size());
+        names.push_back(list.substr(0, end));
+        list.remove_prefix(std::min(end + 1, list.size()));
+    }
+    return names;
+}
+
+// Gives the new file at `to` the extended attributes of the file at `from`, ACLs included, and none it has of its
+// own. A file system without them has none to copy. False when one cannot be read or set (an SELinux label this
+// user may not give, a trusted.* attribute): the new file could not stand in for the old one.
+bool copy_attributes(const char* from, int to) {
+    std::string list;
+    std::string own;
+    if (!read_sized([&](char* b, std::size_t s) { return listxattr(from, b, s); }, list)) {
+        if (errno != ENOTSUP) {
+            return false;
+        }
+        list.clear();
+    }
+    if (!read_sized([&](char* b, std::size_t s) { return flistxattr(to, b, s); }, own)) {
+        if (errno != ENOTSUP) {
+            return false;
+        }
+        own.clear();
+    }
+    const std::vector<std::string_view> names = attribute_names(list);
+    std::string value;
+    std::string current;
+    for (const std::string_view view : names) {
+        const std::string name(view);
+        // Writing to a file drops its capabilities, so a new file does not take them over.
+        if (name == "security.capability") {
+            continue;
+        }
+        if (!read_sized([&](char* b, std::size_t s) { return getxattr(from, name.c_str(), b, s); }, value)) {
+            return false;
+        }
+        if (read_sized([&](char* b, std::size_t s) { return fgetxattr(to, name.c_str(), b, s); }, current) &&
+            current == value) {
+            continue;  // the label or default ACL the new file was born with is already the same
+        }
+        if (fsetxattr(to, name.c_str(), value.data(), value.size(), 0) != 0) {
+            return false;
+        }
+    }
+    // Whatever the new file has that the old one did not, such as an ACL from its directory's default, goes.
+    return std::ranges::all_of(attribute_names(own), [&](std::string_view view) {
+        return std::ranges::find(names, view) != names.end() || fremovexattr(to, std::string(view).c_str()) == 0;
+    });
+}
+
+// Gives an unnamed file (O_TMPFILE) the name `temp`, a free name of the form .NAME.hx-XXXXXX beside target, and
+// stores that name in temp. False when the file cannot be linked: no /proc, or a sandbox that refuses it.
+bool link_unnamed(int file, const std::filesystem::path& target, std::string& temp) {
+    constexpr std::string_view kLetters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const std::string source = fmt::format("/proc/self/fd/{}", file);
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::array<unsigned char, 6> random{};
+        if (getrandom(random.data(), random.size(), 0) != static_cast<ssize_t>(random.size())) {
+            return false;
+        }
+        std::string suffix;
+        for (const unsigned char byte : random) {
+            suffix.push_back(kLetters[byte % kLetters.size()]);
+        }
+        temp = (target.parent_path() / fmt::format(".{}.hx-{}", target.filename().string(), suffix)).string();
+        if (linkat(AT_FDCWD, source.c_str(), AT_FDCWD, temp.c_str(), AT_SYMLINK_FOLLOW) == 0) {
+            return true;
+        }
+        if (errno != EEXIST) {
+            return false;
+        }
+    }
+    return false;
+}
+
+enum class Replaced : std::uint8_t {
+    Yes,
+    Unable,  // this way cannot replace the file; nothing was changed
+    Failed,  // errno says why
+};
+
+// Replaces target with a new file holding data, which gets old's owner, group, mode and extended attributes when
+// old is given. An unnamed file (O_TMPFILE) has no name until it is complete, so a killed hx leaves nothing
+// behind; a named one (mkostemp) serves where the file system or the sandbox refuses an unnamed one, and is left
+// behind by a hx killed while writing it.
+Replaced replace_file(const std::filesystem::path& target, const struct stat* old, std::string_view data,
+                      bool unnamed) {
+    const std::filesystem::path parent = target.parent_path().empty() ? "." : target.parent_path();
+    std::string temp = (target.parent_path() / fmt::format(".{}.hx-XXXXXX", target.filename().string())).string();
+    // A new file is created as open would create it, umask and default ACL alike.
+    const UniqueFd file(unnamed ? open(parent.c_str(), O_TMPFILE | O_WRONLY | O_CLOEXEC, old != nullptr ? 0600 : 0666)
+                                : mkostemp(temp.data(), O_CLOEXEC));
+    if (!file.valid()) {
+        return Replaced::Unable;
+    }
+    bool named = !unnamed;  // a name to remove on every way out but the rename
+    const auto discard = [&](Replaced result) {
+        const int error = errno;
+        if (named) {
+            unlink(temp.c_str());
+        }
+        errno = error;
+        return result;
+    };
+    if (old != nullptr) {
+        if (fchown(file.get(), old->st_uid, old->st_gid) != 0 || fchmod(file.get(), old->st_mode & 07777) != 0 ||
+            !copy_attributes(target.c_str(), file.get())) {
+            return discard(Replaced::Unable);
+        }
+    } else if (!unnamed && fchmod(file.get(), new_file_mode()) != 0) {
+        return discard(Replaced::Unable);
+    }
+    if (!write_all(file.get(), data)) {
+        return discard(Replaced::Failed);
+    }
+    if (unnamed) {
+        if (!link_unnamed(file.get(), target, temp)) {
+            return Replaced::Unable;
+        }
+        named = true;
+    }
+    if (rename(temp.c_str(), target.c_str()) != 0) {
+        return discard(Replaced::Failed);
+    }
+    return Replaced::Yes;
+}
+
+// A file is written by writing a new file beside it and renaming that over it, so a full disk or a killed hx leaves
+// the old content or the new, never a file cut short. Nothing is synced: a power loss can still lose both, and
+// that is not what this guards against. Where a new file could not stand in for the old one, the file is written
+// in place instead: something other than a regular file (/dev/null, a FIFO), a file with other names that must go
+// on seeing it, a dangling link, a directory that refuses a new file (a lone --rw file), a file whose owner,
+// group or extended attributes the new one cannot be given, or a file that may not be written (a rename would not
+// ask it, so the open is left to refuse).
 int l_write(lua_State* L) {
     const char* path = check_cstring(L, 1);
     std::size_t length = 0;
@@ -429,22 +615,18 @@ int l_write(lua_State* L) {
     if ((exists && S_ISREG(st.st_mode) && st.st_nlink == 1 && access(path, W_OK) == 0) || missing) {
         // A link is followed, so the file it names is replaced and the link stays.
         const std::filesystem::path target = exists ? std::filesystem::canonical(path, ec) : path;
-        std::string temp = (target.parent_path() / fmt::format(".{}.hx-XXXXXX", target.filename().string())).string();
-        UniqueFd file(ec ? -1 : mkostemp(temp.data(), O_CLOEXEC));
-        if (file.valid() && exists && fchown(file.get(), st.st_uid, st.st_gid) != 0) {
-            unlink(temp.c_str());
-            file.reset();
-        }
-        if (file.valid()) {
-            const mode_t mode = exists ? st.st_mode & 07777 : new_file_mode();
-            if (!write_all(file.get(), data) || fchmod(file.get(), mode) != 0 ||
-                rename(temp.c_str(), target.c_str()) != 0) {
-                const int error = errno;
-                unlink(temp.c_str());
-                return fail(L, fmt::format("{}: {}", path, error_text(error)));
+        for (const bool unnamed : {true, false}) {
+            if (ec) {
+                break;
             }
-            lua_pushboolean(L, 1);
-            return 1;
+            const Replaced result = replace_file(target, exists ? &st : nullptr, data, unnamed);
+            if (result == Replaced::Yes) {
+                lua_pushboolean(L, 1);
+                return 1;
+            }
+            if (result == Replaced::Failed) {
+                return fail(L, fmt::format("{}: {}", path, error_text(errno)));
+            }
         }
     }
 
