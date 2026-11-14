@@ -61,9 +61,9 @@ class LiveTest(unittest.TestCase):
         """Runs the built-in loop with `code` applied to it, as a project's .hx/loop.luau would."""
         self.write(".hx/loop.luau", f"local M = assert(host.load(host.default_loop, '=loop'))()\n{code}\nreturn M\n")
 
-    def run_hx(self, task, status=0, **env):
-        done = subprocess.run([HX, "-q", task], cwd=self.project, env={**os.environ, **env}, capture_output=True,
-                              text=True, timeout=900)
+    def run_hx(self, task, status=0, args=(), **env):
+        done = subprocess.run([HX, "-q", *args, task], cwd=self.project, env={**os.environ, **env},
+                              capture_output=True, text=True, timeout=300)
         self.assertEqual(done.returncode, status, done.stderr)
         logs = sorted(glob.glob(os.path.join(self.project, ".hx", "log", "*.json")))
         self.log = json.loads(self.read(logs[-1])) if logs else {"messages": []}
@@ -217,9 +217,40 @@ class LiveTest(unittest.TestCase):
             self.skill(".agents/skills", name, about, "Not this one.\n")
         self.run_hx("deploy the release")
         code = "\n".join(self.code())
-        self.assertIn("skill(", code)
+        # Searching with skill() or reading the skill files directly both find it.
+        self.assertRegex(code, r"skill\(|SKILL\.md", "the skill was not looked for")
         self.assertNotIn("ship-it", self.code()[0], "the name was not in the prompt, so it cannot be known up front")
         self.assertEqual(self.read("deploy.log").strip(), "DEPLOYED")
+
+    def test_a_skill_listed_by_name_only_is_loaded(self):
+        # Between M.skill_index_full and M.skill_index_names the prompt lists names without descriptions.
+        self.overlay("M.skill_index_full = 1")
+        self.skill(".hx/skills", "tag-version", "Tag a version of this project.",
+                   "Tagging a version here means writing the version, and nothing else, to the file VERSION.\n")
+        self.skill(".hx/skills", "lint", "Lint the code.", "Not this one.\n")
+        self.run_hx("tag version 1.4.2")
+        self.assertIn("skill(", "\n".join(self.code()))
+        self.assertEqual(self.read("VERSION").strip(), "1.4.2")
+
+    def test_a_skill_in_the_home_directory_needs_ro(self):
+        home = tempfile.mkdtemp(prefix="hx-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        skills = os.path.join(home, ".claude", "skills")
+        os.makedirs(os.path.join(skills, "sign-off"))
+        with open(os.path.join(skills, "sign-off", "SKILL.md"), "w") as f:
+            f.write("---\nname: sign-off\ndescription: How to sign off a piece of work. Use when asked to sign off."
+                    "\n---\nSigning off means writing the word SIGNED to the file signoff.txt in the project.\n")
+        count = ("local M = assert(host.load(host.default_loop, '=loop'))()\n"
+                 "local n = 0 for _, s in M.skills() do if s.name == 'sign-off' then n += 1 end end print(n)\n")
+        self.write("count.luau", count)
+        # The wall hides the home directory: without --ro the skill is not there, with it it is.
+        for args, want in (((), "0"), (("--ro", skills), "1")):
+            done = subprocess.run([HX, "-q", *args, "--run", "count.luau"], cwd=self.project, capture_output=True,
+                                  text=True, timeout=60, env={**os.environ, "HOME": home})
+            self.assertEqual(done.stdout.strip(), want, done.stderr)
+        self.run_hx("sign off the work", args=("--ro", skills), HOME=home)
+        self.assertIn("skill(", "\n".join(self.code()))
+        self.assertEqual(self.read("signoff.txt").strip(), "SIGNED")
 
     def test_running_out_of_replies_ends_with_a_report(self):
         self.overlay("M.max_replies = 2")

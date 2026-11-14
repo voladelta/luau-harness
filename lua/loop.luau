@@ -527,7 +527,9 @@ M.functions = {
 	{
 		name = "bash",
 		usage = "bash(command, timeout?) -> text: runs a bash command in the project directory, a new shell each "
-			.. "time, and returns stdout and stderr together, then [exit N]. The command is killed after timeout "
+			.. "time, and returns stdout and stderr together, then [exit N]. That last line is hx's, not the "
+			.. "command's: to use the output as data, as in a file or a string you build, take host.sh(command).out "
+			.. "instead. The command is killed after timeout "
 			.. "seconds (default 120). A process left in the background must send its output to a file, and is "
 			.. "killed when this session ends, daemons included: nothing you start outlives it.",
 		run = function(command, timeout)

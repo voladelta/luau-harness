@@ -164,7 +164,7 @@ call to the next. The code acts through these functions:
 
 | Function | Does |
 |---|---|
-| `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout |
+| `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout. The status line is for reading: output used as data comes from `host.sh(command).out` |
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too |
@@ -386,7 +386,8 @@ clang-tidy -p build-dev --quiet src/*.cpp
 `tests/live_test.py` runs the agent against the real endpoint: making and editing files, reading a line range,
 noticing a failed command, following a long output to its file, compacting a Vietnamese conversation into English
 checkpoints that keep a fact, giving up a status polled between sleeps, reporting when out of replies, and
-following a skill, one listed in the prompt and one found by searching. It costs tokens, so ctest
+following a skill: one listed in the prompt, one listed by name only, one found by searching, and one in the home
+directory that only `--ro` makes reachable. It costs tokens, so ctest
 leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set, or with `ANTHROPIC_API_KEY` and `HX_MODEL=sonnet`
 (or `opus`, `haiku`).
 
