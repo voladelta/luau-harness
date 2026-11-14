@@ -1,5 +1,6 @@
 //! Workspace trust (like `direnv allow`). Everything hx treats as user-owned config lives inside the workspace:
-//! `.harness/{policy,mcp}.toml`, `.harness/init.luau`, `.harness/{override,tools}/` and `hx.lock`. The model cannot
+//! every `.harness/*.toml` (hx's own `policy.toml` and `mcp.toml`, and those of tools built on hx), `.harness/init.luau`,
+//! `.harness/{override,tools}/` and `hx.lock`. The model cannot
 //! write them, but whoever wrote the repo can, so a cloned repo could widen file-tool access, start MCP commands or
 //! pre-approve its own packages and skills. hx therefore uses that config only when the user has trusted its exact
 //! content: `hx trust` records a hash per workspace in the trust store (`Dirs::trust_store`, outside every repo and
@@ -11,14 +12,13 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Config files whose content trust covers (paths relative to the workspace), plus whole trees: module overrides and
-/// the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
+/// Config files whose content trust covers (paths relative to the workspace), besides every other `.harness/*.toml`,
+/// plus whole trees: module overrides and the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
 /// asks, and the agent stages there itself.)
-const FILES: [&str; 5] = [
+const FILES: [&str; 4] = [
     ".harness/policy.toml",
     ".harness/mcp.toml",
     ".harness/init.luau",
-    ".harness/ar.toml",
     "hx.lock",
 ];
 const TREES: [&str; 3] = [".harness/override", ".harness/versions", ".harness/tools"];
@@ -102,6 +102,19 @@ impl Config {
             };
             if !misplaced {
                 add(&mut entries, ws, f.to_string())?;
+            }
+        }
+        // Tools built on hx keep their own config beside hx's, as `.harness/NAME.toml`: trust covers those too.
+        if !harness_link && kind(".harness").is_some_and(|t| t.is_dir()) {
+            for entry in std::fs::read_dir(ws.join(".harness")).context("cannot read .harness")? {
+                let name = entry?.file_name();
+                let rel = match name.to_str() {
+                    Some(n) if n.ends_with(".toml") => format!(".harness/{n}"),
+                    _ => continue,
+                };
+                if !entries.contains_key(&rel) && !kind(&rel).is_some_and(|t| t.is_dir()) {
+                    add(&mut entries, ws, rel)?;
+                }
             }
         }
         Ok(Config { entries })
@@ -309,5 +322,28 @@ impl<'a> Retrust<'a> {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_toml_file_in_harness_is_config() {
+        let ws = std::env::temp_dir().join(format!("hx-trust-toml-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".harness/notes.toml")).unwrap();
+        std::fs::write(ws.join(".harness/tool.toml"), "a = 1\n").unwrap();
+        std::fs::write(ws.join(".harness/readme.md"), "not config").unwrap();
+        assert_eq!(config_files(&ws), vec![".harness/tool.toml".to_string()]);
+        let before = config_hash(&ws);
+        std::fs::write(ws.join(".harness/tool.toml"), "a = 2\n").unwrap();
+        assert_ne!(
+            config_hash(&ws),
+            before,
+            "a tool's config is covered by trust"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

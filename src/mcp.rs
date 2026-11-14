@@ -15,6 +15,8 @@
 //!   headers_env = { "x-api-key" = "SOME_VAR" }   # header name -> env var holding the value (never written in the file)
 //!   bearer_env = "SOME_VAR"            # shorthand for Authorization: Bearer $SOME_VAR
 //!   read_only_tools = [...]            # args/env do not apply to a remote server and are rejected
+//!
+//!   Either kind: timeout_secs = 60     # how long one request may wait for its response (default 60)
 //!   For remote servers, the approval gate and recorded effects are the controls. No OAuth.
 use crate::net::{self, BodyError, Delivery, ResponseBudget, Sse};
 use crate::policy::Policy;
@@ -46,6 +48,17 @@ pub struct ServerCfg {
     pub env: Vec<String>,
     #[serde(default)]
     pub read_only_tools: Vec<String>,
+    /// How long one request may wait for its response, in seconds (`REQUEST_TIMEOUT` when not given).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+impl ServerCfg {
+    /// How long one request to this server may wait for its response.
+    fn deadline(&self) -> Duration {
+        self.timeout_secs
+            .map_or(REQUEST_TIMEOUT, Duration::from_secs)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -69,7 +82,7 @@ pub fn snapshot(text: Option<&[u8]>) -> Result<BTreeMap<String, ServerCfg>> {
 
 /// The largest response hx reads for one request, across stdio frames, HTTP bodies, SSE events and error bodies.
 const MAX_BODY: usize = 16 << 20;
-/// How long one request may wait for its response.
+/// How long one request may wait for its response, unless the server's `timeout_secs` says otherwise.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The most `tools/list` pages read from one server.
 const MAX_LIST_PAGES: usize = 64;
@@ -183,7 +196,7 @@ struct Stdio {
     stdin: ChildStdin,
     out: BufReader<ChildStdout>,
     next_id: u64,
-    /// How long one request may take, from the first byte written to its response (`REQUEST_TIMEOUT`).
+    /// How long one request may take, from the first byte written to its response (`ServerCfg::deadline`).
     deadline: Duration,
 }
 
@@ -275,6 +288,7 @@ struct Http {
     session: Option<String>,             // Mcp-Session-Id
     version: Option<String>, // negotiated protocol version, sent on every request after initialize
     next_id: u64,
+    deadline: Duration, // how long one exchange may take (`ServerCfg::deadline`)
 }
 
 impl Http {
@@ -321,6 +335,7 @@ impl Http {
     /// POST one JSON-RPC message. With `want` = the request id, returns the matching response (from a JSON body or an
     /// SSE stream, answering server requests on the way); without it (a notification or an answer) returns None.
     async fn exchange(&mut self, msg: &Value, want: Option<u64>) -> McpResult<Option<Value>> {
+        let deadline = self.deadline;
         let work = async {
             let mut resp = self.post(msg).send().await.map_err(|e| {
                 let mut error = McpError::from_net(net::Error::send("MCP http request failed", e));
@@ -412,14 +427,12 @@ impl Http {
                 _ => Err(McpError::lost("MCP server answered a different request id")),
             }
         };
-        tokio::time::timeout(REQUEST_TIMEOUT, work)
-            .await
-            .map_err(|_| {
-                McpError::lost(format!(
-                    "MCP server did not answer within {}s",
-                    REQUEST_TIMEOUT.as_secs()
-                ))
-            })?
+        tokio::time::timeout(deadline, work).await.map_err(|_| {
+            McpError::lost(format!(
+                "MCP server did not answer within {}s",
+                deadline.as_secs()
+            ))
+        })?
     }
 
     /// Answer a server request made inside a response stream. Our own request is already out, so a failure here
@@ -463,6 +476,9 @@ impl Conn {
 }
 
 fn validate(name: &str, c: &ServerCfg) -> Result<()> {
+    if c.timeout_secs == Some(0) {
+        bail!("MCP server {name}: timeout_secs must be at least 1");
+    }
     let Some(u) = &c.url else {
         if c.command.is_empty() {
             bail!("MCP server {name}: set `command` (stdio) or `url` (HTTP)");
@@ -612,7 +628,7 @@ impl Mcp {
             stdin,
             out,
             next_id: 1,
-            deadline: REQUEST_TIMEOUT,
+            deadline: cfg.deadline(),
         }))
     }
 
@@ -667,6 +683,7 @@ impl Mcp {
             session: None,
             version: None,
             next_id: 1,
+            deadline: cfg.deadline(),
         }))
     }
 
@@ -796,6 +813,7 @@ mod tests {
             session: None,
             version: None,
             next_id: 1,
+            deadline: REQUEST_TIMEOUT,
         };
         let result = http.request("tools/list", json!({})).await;
         tokio::time::timeout(Duration::from_secs(5), server)
@@ -966,6 +984,46 @@ mod tests {
         assert_eq!(
             answer(json!(4), "sampling/createMessage")["error"]["code"],
             -32601
+        );
+    }
+
+    #[test]
+    fn a_server_sets_its_own_call_deadline() {
+        let servers = snapshot(Some(
+            b"[server.slow]\nurl = \"http://127.0.0.1:9/mcp\"\ntimeout_secs = 300\n[server.plain]\ncommand = \"x\"\n",
+        ))
+        .unwrap();
+        assert_eq!(servers["slow"].deadline(), Duration::from_secs(300));
+        assert_eq!(servers["plain"].deadline(), REQUEST_TIMEOUT);
+        let zero = snapshot(Some(b"[server.s]\ncommand = \"x\"\ntimeout_secs = 0\n"));
+        assert!(zero.unwrap_err().to_string().contains("timeout_secs"));
+    }
+
+    #[tokio::test]
+    async fn an_http_call_is_lost_at_the_server_deadline() {
+        // A server that reads the request and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let _server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(socket);
+        });
+        let cfg = ServerCfg {
+            url: Some(url),
+            timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let Conn::Http(mut http) = Mcp::connect_http("slow", &cfg).unwrap() else {
+            panic!("a url server is an HTTP connection");
+        };
+        let started = std::time::Instant::now();
+        let error = http.request("tools/list", json!({})).await.unwrap_err();
+        assert_eq!(error.delivery, Delivery::Lost, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
         );
     }
 

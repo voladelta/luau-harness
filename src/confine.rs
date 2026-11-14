@@ -1,5 +1,5 @@
-//! Kernel confinement for the processes hx starts (`sh`, local MCP servers, autoresearch evaluators): a Landlock
-//! ruleset built from the run's policy limits which files a child may read and write and, where the kernel offers
+//! Kernel confinement for the processes hx starts (`sh`, local MCP servers, commands of tools built on hx): a
+//! Landlock ruleset built from the run's policy limits which files a child may read and write and, where the kernel offers
 //! scopes, keeps it from signalling processes or reaching abstract Unix sockets outside its own domain. Network access
 //! is left to the environment. Without Landlock (an old kernel, or a container that filters the syscalls) children run
 //! unconfined, and the run says so once.

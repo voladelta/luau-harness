@@ -4,19 +4,23 @@
 //! The editable files of an episode's workspace are agent-controlled and can change while they are read, so every
 //! file and directory under them is opened relative to an already opened directory, never through a symlink: no path
 //! is checked and then resolved again.
-use super::*;
+use crate::run::Spec;
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 /// Limits on the editable files of one snapshot: total bytes, file count and directory depth.
-pub const MAX_SNAPSHOT: usize = 16 << 20;
-pub const MAX_FILES: usize = 10_000;
-pub const MAX_DEPTH: usize = 32;
+pub(crate) const MAX_SNAPSHOT: usize = 16 << 20;
+pub(crate) const MAX_FILES: usize = 10_000;
+pub(crate) const MAX_DEPTH: usize = 32;
 
 /// One editable file: its bytes and whether it is executable.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -252,24 +256,17 @@ pub(super) fn apply(root: &Path, spec: &Spec, before: &Files, result: &Files) ->
     Ok(())
 }
 
-/// `ar.reset()`'s write: make the editable paths of the agent's workspace `root` hold `files`, through no symlink.
-/// `check` vets each relative path first (the policy's write check).
-pub(super) fn restore(
-    root: &Path,
-    spec: &Spec,
-    files: &Files,
-    check: impl Fn(&str) -> Result<()>,
-) -> Result<()> {
+/// `reset`'s write: make the editable paths of the agent's workspace `root` hold `files`, through no symlink. The
+/// editable paths are inside the workspace and outside `.harness` and `.git` (`Spec::load`), so nothing else changes.
+pub(super) fn restore(root: &Path, spec: &Spec, files: &Files) -> Result<()> {
     let top = File::open(root)?;
     for rel in capture(root, spec)?
         .keys()
         .filter(|rel| !files.contains_key(*rel))
     {
-        check(rel)?;
         remove_in(&top, rel)?;
     }
     for (rel, content) in files {
-        check(rel)?;
         write_in(&top, rel, content)?;
     }
     Ok(())
@@ -292,7 +289,7 @@ pub(super) fn save_snap(dir: &Path, files: &Files) -> Result<String> {
         })
         .collect();
     let bytes = serde_json::to_vec(&encoded)?;
-    let id = crate::eventlog::sha_bytes(&bytes)[..16].to_string();
+    let id = hx::eventlog::sha_bytes(&bytes)[..16].to_string();
     let path = dir.join("snaps").join(format!("{id}.json"));
     if !path.exists() {
         std::fs::create_dir_all(dir.join("snaps"))?;
@@ -434,7 +431,7 @@ fn release(path: &Path) {
     reap(path);
     if let Err(error) = remove_tree(path) {
         eprintln!(
-            "hx ar: could not remove scratch directory {}: {error}; a later run removes it",
+            "hx-ar: could not remove scratch directory {}: {error}; a later run removes it",
             path.display()
         );
     }
@@ -565,9 +562,9 @@ pub(super) struct Scored {
 /// Read roots the search evaluator gets: the system and toolchain directories every child reads, and `grader`. A
 /// `holdout` root inside one of them would be readable by it, so that is refused.
 pub(super) fn search_read_roots(spec: &Spec) -> Result<Vec<PathBuf>> {
-    let mut read = crate::policy::system_read_roots();
+    let mut read = hx::policy::system_read_roots();
     read.extend(spec.roots(false)?);
-    let read = crate::confine::Rules {
+    let read = hx::confine::Rules {
         read,
         write: vec![],
     }
@@ -598,7 +595,7 @@ pub(super) async fn evaluate(
     let (spec_, run, files_) = (spec.clone(), run.to_path_buf(), files.clone());
     let (scratch, rules) = tokio::task::spawn_blocking(move || -> Result<_> {
         let mut read = if holdout {
-            let mut read = crate::policy::system_read_roots();
+            let mut read = hx::policy::system_read_roots();
             read.extend(spec_.roots(true)?);
             read
         } else {
@@ -609,7 +606,7 @@ pub(super) async fn evaluate(
         place(&scratch.0.join("tree"), &spec_, &files_)?;
         std::fs::create_dir(scratch.0.join("tmp"))?;
         read.push(scratch.0.clone());
-        let rules = crate::confine::Rules {
+        let rules = hx::confine::Rules {
             read,
             write: vec![scratch.0.clone()],
         }
@@ -617,12 +614,12 @@ pub(super) async fn evaluate(
         Ok((scratch, rules.prepare()?.map(std::sync::Arc::new)))
     })
     .await??;
-    let env = crate::prims::ShellEnv {
+    let env = hx::prims::ShellEnv {
         env: Some(evaluator_env(&scratch.0.join("tmp"))),
         confine: rules,
     };
     let (stdout, stderr, code, timed_out, _) =
-        crate::prims::shell(&env, cmd, scratch.0.join("tree"), spec.timeout)
+        hx::prims::shell(&env, cmd, scratch.0.join("tree"), spec.timeout)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     drop(scratch);
@@ -861,7 +858,7 @@ pub(super) fn rate_limited(logs: &Path) -> u64 {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-        .filter_map(|j| crate::supervisor::Books::of(&crate::eventlog::load(&j).ok()?).ok())
+        .filter_map(|j| hx::supervisor::Books::of(&hx::eventlog::load(&j).ok()?).ok())
         .map(|books| books.usage.rate_limits)
         .sum()
 }
@@ -908,10 +905,24 @@ mod tests {
             select: None,
             grader: vec![],
             holdout: vec![],
-            direction: super::Direction::Max,
+            direction: crate::run::Direction::Max,
             timeout: 1.0,
             min_delta: 0.0,
         }
+    }
+
+    #[test]
+    fn the_documented_snapshot_limits_are_the_ones_in_force() {
+        let files = MAX_FILES.to_string();
+        let (thousands, rest) = files.split_at(files.len() - 3);
+        let phrase = format!(
+            "at most {} MiB, {thousands},{rest} files and {MAX_DEPTH} levels",
+            MAX_SNAPSHOT >> 20
+        );
+        assert!(
+            include_str!("../../../docs/runtime-v2.md").contains(&phrase),
+            "docs/runtime-v2.md should say {phrase:?}"
+        );
     }
 
     #[test]

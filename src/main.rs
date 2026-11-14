@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 // Every library module under the name it had when it was declared here, so code in this file refers to it unchanged.
 #[allow(unused_imports)]
 use hx::{
-    CLOSED_STDOUT_STATUS, ClosedStdout, ar, atomic_file, batch, confine, controller, dirs, effects,
+    CLOSED_STDOUT_STATUS, ClosedStdout, atomic_file, batch, confine, controller, dirs, effects,
     eventlog, history, host, llm, mcp, modules, net, out, outln, packages, policy, prims,
     supervisor, tools, trust, values, vm, workflow, workflow_runtime,
 };
@@ -128,7 +128,7 @@ COMMANDS:
     reject       discard something staged
     rollback     undo the last accepted replacement of a harness module
     log verify   check an event log's hash chain and list unknown-outcome effects
-    paths        print where hx keeps this workspace's logs, autoresearch runs and secrets, and the trust store
+    paths        print where hx keeps this workspace's logs, state and secrets, and the trust store
 ";
 
 const TOP_HELP_TAIL: &str = "    -h, --help            show help (also `hx <command> --help`)
@@ -315,13 +315,6 @@ const FLAGS: &[Flag] = {
             "",
             "require RPI artifact review (requires --rpi)",
         ),
-        flag(
-            RUN,
-            "--ar",
-            Switch,
-            "",
-            "autoresearch over .harness/ar.toml until progress stops (--ar --resume RUN continues one)",
-        ),
         flag(&["review"], "--gate", Text, "ID", "the gate to decide"),
         flag(
             &["review"],
@@ -424,7 +417,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
             "hx staged\n\nList what the agent staged: packages (NAME) and harness-module replacements (std/MODULE).\n"
         }
         "trust" => {
-            "hx trust [--yes]\n\nShow this workspace's config (.harness/{policy,mcp,ar}.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, .harness/versions/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in hx's trust store (see `hx paths`).\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n"
+            "hx trust [--yes]\n\nShow this workspace's config (.harness/*.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, .harness/versions/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in hx's trust store (see `hx paths`).\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n"
         }
         "accept" => {
             "hx accept NAME [--yes]\n\nReview something staged (every file, control characters escaped), then activate exactly that. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n"
@@ -437,7 +430,8 @@ fn help_for(cmd: &str) -> Option<&'static str> {
             "hx log verify LOG\n\nCheck the hash chain and the session every record names, the blobs records reference and the recovery\naccounting, and list effects with an unknown outcome.\nLOG is a run name (its journal in this workspace's log directory, see `hx paths`) or a path to the journal.\nExit codes: 0 ok, 1 broken chain, bad blob or invalid recovery accounting, 3 unknown outcomes.\n"
         }
         "paths" => {
-            "hx paths\n\nPrint where hx keeps this workspace's files, one `name: path` per line: log (journals, blobs, lock files,\nrevocation markers), ar (autoresearch runs), secrets (the workspace's credentials for local tools) and trust\n(the trust store). They live under $XDG_STATE_HOME/hx and $XDG_CONFIG_HOME/hx (default ~/.local/state/hx and\n~/.config/hx), outside every root the model can reach.\n"
+            "hx paths\n\nPrint where hx keeps this workspace's files, one `name: path` per line: log (journals, blobs, lock files,\nrevocation markers), state (the workspace's state directory, which holds log and the files of tools built on
+hx), secrets (the workspace's credentials for local tools) and trust\n(the trust store). They live under $XDG_STATE_HOME/hx and $XDG_CONFIG_HOME/hx (default ~/.local/state/hx and\n~/.config/hx), outside every root the model can reach.\n"
         }
         _ => return None,
     })
@@ -571,7 +565,7 @@ fn validate_args(args: &[String]) -> Result<()> {
     if seen.contains("--resume")
         && let Some(flag) = seen
             .iter()
-            .find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace" | "--ar"))
+            .find(|flag| !matches!(**flag, "--resume" | "--workspace" | "--trace"))
     {
         return Err(usage(&format!(
             "{flag} cannot override a resumed manifest; use --branch LOG for a new configuration"
@@ -579,16 +573,6 @@ fn validate_args(args: &[String]) -> Result<()> {
     }
     if seen.contains("--manual") && !seen.contains("--rpi") {
         return Err(usage("--manual requires --rpi"));
-    }
-    if seen.contains("--ar")
-        && let Some(flag) = seen.iter().find(|f| {
-            matches!(
-                **f,
-                "--rpi" | "--branch" | "--trace" | "--max-tokens" | "--max-wall" | "--max-turns"
-            )
-        })
-    {
-        return Err(usage(&format!("{flag} cannot be combined with --ar")));
     }
     if command == "run" {
         let prompts = positionals(args);
@@ -611,9 +595,7 @@ fn validate_args(args: &[String]) -> Result<()> {
             && !seen.contains("--resume")
             && !seen.contains("--branch")
         {
-            return Err(usage(
-                "a new run requires a prompt or --prompt-file (the program with --ar)",
-            ));
+            return Err(usage("a new run requires a prompt or --prompt-file"));
         }
     }
     if seen.contains("--yes") && seen.contains("--approval") {
@@ -673,14 +655,13 @@ async fn real_main() -> Result<std::process::ExitCode> {
     dirs::note_leftovers(&workspace, &own);
     let resume = arg(&args, "--resume").map(|r| run_log(&own, &r));
     // Only commands that run code need a policy (and with it a temp dir and a log session); admin commands do not.
-    let mk_policy = |episode| -> Result<Arc<policy::Policy>> {
+    let mk_policy = || -> Result<Arc<policy::Policy>> {
         Ok(Arc::new(policy::Policy::new(
             &dirs,
             &workspace,
             has(&args, "--yes"),
             arg(&args, "--approval").map(|m| m.parse()).transpose()?,
             resume.as_deref(),
-            episode,
         )?))
     };
     if has(&args, "--ignore-config") {
@@ -691,15 +672,10 @@ async fn real_main() -> Result<std::process::ExitCode> {
         trust::require_trusted(&workspace, &dirs)?;
     }
     let done = match args[0].as_str() {
-        "exec" => cmd_exec(&args, mk_policy(None)?).await,
-        "run" if has(&args, "--ar") => {
-            confine::note();
-            cmd_ar(&args, &workspace, &dirs).await
-        }
+        "exec" => cmd_exec(&args, mk_policy()?).await,
         "run" => {
             confine::note();
-            // A child run of an autoresearch episode: the episode becomes part of its frozen policy.
-            cmd_run(&args, &own, mk_policy(ar::load_episode()?)?).await
+            cmd_run(&args, &own, mk_policy()?).await
         }
         "recover" => cmd_recover(&args, &own),
         "review" => {
@@ -720,7 +696,7 @@ async fn real_main() -> Result<std::process::ExitCode> {
             std::fs::write(path.with_extension("revoked"), "revoked by owner\n")?;
             outln!("revoked {}", path.display())
         }
-        "test" => return cmd_test(&args, &workspace, &dirs, mk_policy(None)?).await,
+        "test" => return cmd_test(&args, &workspace, &dirs, mk_policy()?).await,
         "approve" => cmd_approve(&args, &workspace, &dirs),
         "trust" => cmd_trust(&args, &workspace, &dirs),
         // hx skills : agent skills on disk and their approval state
@@ -752,9 +728,9 @@ async fn real_main() -> Result<std::process::ExitCode> {
         "log" => return cmd_log_verify(&args, &own),
         "paths" => {
             outln!(
-                "log: {}\nar: {}\nsecrets: {}\ntrust: {}",
+                "log: {}\nstate: {}\nsecrets: {}\ntrust: {}",
                 own.log.display(),
-                own.ar.display(),
+                own.state.display(),
                 own.secrets.display(),
                 dirs.trust_store().display()
             )
@@ -915,45 +891,6 @@ async fn cmd_run(
     let max_turns = host.max_turns;
     let report = host.run_task(task, max_turns).await?;
     outln!("{}", serde_json::to_string(&report)?)
-}
-
-/// hx run --ar: every flag except the program passes through to the episodes' child runs.
-async fn cmd_ar(args: &[String], workspace: &Path, dirs: &dirs::Dirs) -> Result<()> {
-    if let Some(run) = arg(args, "--resume") {
-        // A bare run name is a run in this workspace's autoresearch directory.
-        let dir = if run.contains('/') {
-            PathBuf::from(run)
-        } else {
-            dirs.workspace(workspace).ar.join(run)
-        };
-        return ar::orchestrate(workspace, dirs, None, Some(dir)).await;
-    }
-    let mut child = vec![];
-    for argument in cli_args(args) {
-        let CliArg::Flag(name, value) = argument else {
-            continue;
-        };
-        if matches!(name, "--ar" | "--prompt-file" | "--workspace") {
-            continue;
-        }
-        child.push(name.to_string());
-        child.extend(value.map(String::from));
-    }
-    let program =
-        task_text(args)?.ok_or_else(|| usage("--ar requires a prompt or --prompt-file"))?;
-    // Ask the provider once here rather than in every episode's child run.
-    if let Ok(cfg) = llm_cfg(args, String::new()).map(|c| c.context_window.is_none().then_some(c))
-        && let Some(cfg) = cfg
-    {
-        let limited = with_provider_limits(cfg.clone(), args).await;
-        if let Some(window) = limited.context_window {
-            child.extend(["--context-window".into(), window.to_string()]);
-            if arg(args, "--max-output").is_none() {
-                child.extend(["--max-output".into(), limited.max_output.to_string()]);
-            }
-        }
-    }
-    ar::orchestrate(workspace, dirs, Some((child, program)), None).await
 }
 
 fn cmd_recover(args: &[String], own: &dirs::WorkspaceDirs) -> Result<()> {
@@ -1265,7 +1202,7 @@ mod tests {
         }
         let own = dirs::WorkspaceDirs {
             log: "/l".into(),
-            ar: "/a".into(),
+            state: "/st".into(),
             secrets: "/s".into(),
         };
         assert!(
@@ -1443,14 +1380,6 @@ mod tests {
                 }
             })
         };
-        let thousands = |n: usize| {
-            let s = n.to_string();
-            if s.len() > 3 {
-                format!("{},{}", &s[..s.len() - 3], &s[s.len() - 3..])
-            } else {
-                s
-            }
-        };
         let compact = modules::Resolver::embedded("std", "compact.luau").unwrap();
         let window = luau_number(compact, "M.context_window = ") as usize;
         let trigger = format!(
@@ -1557,16 +1486,6 @@ mod tests {
                 ),
             ),
             (
-                "docs/runtime-v2.md",
-                runtime,
-                format!(
-                    "at most {}, {} files and {} levels",
-                    mib(ar::files::MAX_SNAPSHOT),
-                    thousands(ar::files::MAX_FILES),
-                    ar::files::MAX_DEPTH
-                ),
-            ),
-            (
                 "docs/workflows.md",
                 workflows,
                 format!(
@@ -1595,7 +1514,7 @@ mod tests {
     fn a_bare_run_name_is_a_journal_in_the_log_directory() {
         let own = dirs::WorkspaceDirs {
             log: "/state/log".into(),
-            ar: "/state/ar".into(),
+            state: "/state".into(),
             secrets: "/cfg/s".into(),
         };
         assert_eq!(

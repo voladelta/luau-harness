@@ -1304,7 +1304,7 @@ mod checkpoint_tests {
             let dir = std::env::temp_dir().join(format!("hx-billing-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let dirs = crate::dirs::TestDirs::new();
-            let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+            let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None).unwrap());
             let cfg = model();
             let supervisor = Supervisor::start(
                 policy,
@@ -1339,7 +1339,7 @@ mod checkpoint_tests {
             std::env::temp_dir().join(format!("hx-admission-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None).unwrap());
         let cfg = model();
         let supervisor = Supervisor::start(
             policy,
@@ -1450,7 +1450,7 @@ mod checkpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None).unwrap());
         (
             Supervisor::start(policy, launch(Budget::default())).unwrap(),
             std::fs::canonicalize(dir).unwrap(),
@@ -1764,7 +1764,7 @@ mod checkpoint_tests {
         );
         drop(supervisor);
         drop(log);
-        let policy = Arc::new(Policy::new(&_dirs, &dir, false, None, Some(&path), None).unwrap());
+        let policy = Arc::new(Policy::new(&_dirs, &dir, false, None, Some(&path)).unwrap());
         let resumed = Supervisor::resume(policy).unwrap();
         assert!(
             matches!(&resumed.restored, Some(RunState::Running { controller }) if controller["messages"] == json!([{"role": "user", "content": "task"}]))
@@ -1808,8 +1808,7 @@ mod checkpoint_tests {
             );
             drop(supervisor);
             drop(log);
-            let policy =
-                Arc::new(Policy::new(&_dirs, &dir, false, None, Some(&path), None).unwrap());
+            let policy = Arc::new(Policy::new(&_dirs, &dir, false, None, Some(&path)).unwrap());
             let error = format!(
                 "{:#}",
                 Supervisor::resume(policy).err().expect("resume must fail")

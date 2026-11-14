@@ -1,11 +1,11 @@
 # Workflows: RPI and autoresearch
 
-hx ships two bundled Luau workflows on top of the plain agent loop.
+hx ships a bundled Luau workflow on top of the plain agent loop, and a second program, `hx-ar`, built on hx and installed beside it.
 
-| Workflow | Flag | Use it when |
+| Workflow | Command | Use it when |
 |---|---|---|
-| RPI | `--rpi` | A task benefits from separate research, design, implementation and verification, optionally with owner review gates |
-| Autoresearch | `--ar` | A score must stay out of the agent's hands: a private evaluator, held-out data, or a metric an agent could game |
+| RPI | `hx run --rpi` | A task benefits from separate research, design, implementation and verification, optionally with owner review gates |
+| Autoresearch | `hx-ar` | A score must stay out of the agent's hands: a private evaluator, held-out data, or a metric an agent could game |
 
 ## RPI: research, design, implement, verify
 
@@ -58,16 +58,19 @@ Verification checks exact planned commands, successful receipts and a bounded so
 
 ## Autoresearch
 
-`--ar` improves a score over the editable paths in `.harness/ar.toml`. Use it when the score must stay out of the agent's hands. When the agent can check its work from files in the workspace, a plain run with the same budget did as well in our tests.
+`hx-ar` improves a score over the editable paths in `.harness/ar.toml`. Use it when the score must stay out of the agent's hands. When the agent can check its work from files in the workspace, a plain run with the same budget did as well in our tests.
 
 ```bash
-hx run --ar --prompt-file program.md --model MODEL
-hx run --ar --resume RUN                   # continue an interrupted search (RUN: its name, see `hx paths`)
+hx-ar --prompt-file program.md --model MODEL
+hx-ar --resume RUN                          # continue an interrupted search (RUN: its name, in `ar/` of the
+                                            # `state` directory `hx paths` prints)
 ```
+
+`hx-ar` is not part of the harness core: each episode is an ordinary `hx run`, and the agent there reaches `hx-ar` only through an MCP server that `hx-ar` serves on loopback for the run. `hx-ar` alone takes snapshots, runs the evaluators, judges claims and writes the run's journal.
 
 ### `.harness/ar.toml`
 
-`.harness/ar.toml` names the editable paths, the evaluator commands and the read-only roots they need. Each evaluator prints a JSON line with `score` (and optionally `valid`, `se`, `report`):
+`.harness/ar.toml` names the editable paths, the evaluator commands and the read-only roots they need. Like the rest of `.harness/`, it is covered by `hx trust`, and `hx-ar` refuses to start until it is trusted. Each evaluator prints a JSON line with `score` (and optionally `valid`, `se`, `report`):
 
 ```toml
 editable = ["ar/strategy.pine"]
@@ -78,13 +81,13 @@ holdout = ["~/grader/select"]                                # read-only for sel
 min_delta = 0.05
 ```
 
-`select` must reach the shift the result has to survive (other years, symbols or input ranges) and have enough cases to tell candidates apart.
+`select` must reach the shift the result has to survive (other years, symbols or input ranges) and have enough cases to tell candidates apart. No `grader` or `holdout` root may overlap the workspace or hx's own configuration and state directories (`hx paths`; `~` itself contains them), since model-edited code runs in the evaluators that read those roots.
 
 ### How a search runs
 
-1. **Freeze.** The committed tree is frozen at launch. Every episode is a fresh child run in a throwaway copy of it. `ar.eval("hypothesis")` scores a snapshot of the editable files in another throwaway copy, with a scrubbed environment, confined by Landlock to its copy and the `grader` roots; network confinement must be supplied externally. Only the editable paths carry between episodes.
+1. **Freeze.** The committed tree is frozen at launch. Every episode is a fresh child `hx run` in a throwaway copy of it. `mcp.ar.eval{note = "hypothesis"}` asks `hx-ar` to score a snapshot of the editable files in another throwaway copy, with a scrubbed environment, confined by Landlock to its copy and the `grader` roots; network confinement must be supplied externally. Only the editable paths carry between episodes.
 2. **Research.** A research episode writes a brief.
-3. **Workers.** Eight workers (six after a provider rate limit) run side by side. Each derives its own idea from a host seed with [String Seed of Thought](https://pub.sakana.ai/ssot/) and claims it with `ar.claim`, first come, first served, so no two pursue the same core approach. `ar.claims()` lists what is taken; a placeholder claim is refused. Workers implement and fix their idea, then return without tuning it; depth comes from rounds.
+3. **Workers.** Eight workers (six after a provider rate limit) run side by side. Each derives its own idea from a host seed with [String Seed of Thought](https://pub.sakana.ai/ssot/) and claims it with `mcp.ar.claim`, first come, first served, so no two pursue the same core approach. `mcp.ar.claims{}` lists what is taken; a placeholder claim is refused. Workers implement and fix their idea, then return without tuning it; depth comes from rounds.
 4. **Gate.** The three most promising candidates pass to the next rounds, even raw ones below the seed. Candidates that beat the seed on search and are not worse on `select` are audited for evaluator holes; only those can become results. With a noisy evaluator (one that reports `se`), a state's score is the mean of its evaluations, and both comparisons allow for the combined standard error.
 5. **Rounds.** Refinement continues while it moves the chosen candidates; exploring starts again when it doesn't. Two rounds in a row without progress (a new candidate, or a gain above both `min_delta` and the evaluator's standard error) end the run.
 

@@ -4,7 +4,8 @@
 //! - configuration, `$XDG_CONFIG_HOME/hx/` (default `~/.config/hx/`): the trust store, the user's `secrets.toml`, and
 //!   per workspace `workspaces/<name>-<id>/secrets.toml`;
 //! - state, `$XDG_STATE_HOME/hx/` (default `~/.local/state/hx/`): per workspace `workspaces/<name>-<id>/log/` (journals,
-//!   blobs, lock files, revocation markers, materialized skills) and `.../ar/` (autoresearch runs).
+//!   blobs, lock files, revocation markers, materialized skills); tools built on hx keep their own per-workspace files
+//!   beside it, in that workspace directory.
 //!
 //! `<name>` is the workspace directory's name made safe for a path, `<id>` the first 16 hex digits of the SHA-256 of its
 //! canonical path. The environment is read once, at startup (`Dirs::from_env`), and the result passed down.
@@ -24,8 +25,8 @@ pub struct Dirs {
 pub struct WorkspaceDirs {
     /// Journals, blobs, lock files, revocation markers and the per-run `registry/` of materialized skills.
     pub log: PathBuf,
-    /// Autoresearch runs.
-    pub ar: PathBuf,
+    /// The workspace's state directory, which holds `log`: tools built on hx keep their per-workspace files in it.
+    pub state: PathBuf,
     /// The workspace's credentials for local tools.
     pub secrets: PathBuf,
 }
@@ -89,7 +90,7 @@ impl Dirs {
         let state = self.state.join("workspaces").join(&name);
         WorkspaceDirs {
             log: state.join("log"),
-            ar: state.join("ar"),
+            state: state.clone(),
             secrets: self
                 .config
                 .join("workspaces")
@@ -167,13 +168,11 @@ pub fn note_leftovers(workspace: &Path, dirs: &WorkspaceDirs) {
             dirs.secrets.display()
         );
     }
-    for (old, new) in [(".harness/log", &dirs.log), (".harness/ar", &dirs.ar)] {
-        if left(old) {
-            eprintln!(
-                "hx: note: {old} is left from an earlier version of hx and is not read; new runs are kept in {}",
-                new.display()
-            );
-        }
+    if left(".harness/log") {
+        eprintln!(
+            "hx: note: .harness/log is left from an earlier version of hx and is not read; new runs are kept in {}",
+            dirs.log.display()
+        );
     }
 }
 
@@ -238,7 +237,7 @@ mod tests {
         );
         assert!(
             a.log.starts_with(dirs.state())
-                && a.ar.starts_with(dirs.state())
+                && a.state.starts_with(dirs.state())
                 && a.secrets.starts_with(dirs.config())
         );
         // another spelling of the same directory is the same workspace; another directory is not

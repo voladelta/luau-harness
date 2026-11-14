@@ -494,7 +494,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let pol = Policy::new(&dirs, &dir, false, None, None, None).unwrap();
+        let pol = Policy::new(&dirs, &dir, false, None, None).unwrap();
         (Effects::new(Arc::new(pol), 0, Arc::default()), dir, dirs)
     }
 

@@ -76,6 +76,9 @@ struct FsSection {
     read: Vec<String>,
     #[serde(default)]
     write: Vec<String>,
+    /// Paths no file tool may read or write in any mode, and no grant may cover.
+    #[serde(default)]
+    sealed: Vec<String>,
 }
 /// What happens to a command that needs approval and is not pre-approved in `policy.toml`.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, Deserialize)]
@@ -106,8 +109,6 @@ pub struct Policy {
     /// hx's own directories: never inside a root, refused to file tools.
     pub dirs: Dirs,
     prompt: tokio::sync::Mutex<()>,
-    /// An autoresearch worker's claim and best score, when `episode` is set.
-    pub ar_progress: std::sync::Mutex<crate::ar::Progress>,
 }
 
 impl std::ops::Deref for Policy {
@@ -126,13 +127,10 @@ pub struct Snapshot {
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
     pub protected: Vec<PathBuf>,
-    /// Owner files under a read root that the model may neither read nor write in any mode: an autoresearch episode's
-    /// grader and holdout roots.
+    /// Paths the model may neither read nor write in any mode, `--yes` included (`[fs] sealed` in `policy.toml`). None
+    /// lies inside a read root, so shell commands cannot reach them either.
     #[serde(default)]
     pub sealed: Vec<PathBuf>,
-    /// The autoresearch episode this run serves (`ar.*`), recorded with the rest of the frozen policy.
-    #[serde(default)]
-    pub episode: Option<crate::ar::Episode>,
     pub ask: Vec<String>,
     pub allow: Vec<String>,
     pub mode: ApprovalMode,
@@ -927,7 +925,6 @@ impl Policy {
         autopilot: bool,
         approval_mode: Option<ApprovalMode>,
         resume: Option<&Path>,
-        episode: Option<crate::ar::Episode>,
     ) -> Result<Policy> {
         let workspace = std::fs::canonicalize(workspace)?;
         let own = dirs.workspace(&workspace);
@@ -951,11 +948,6 @@ impl Policy {
             let p = manifest.policy;
             validate_scratch(&p.tmp)?;
             std::fs::create_dir_all(&p.tmp)?;
-            // The orchestrator retries an episode as a new child and never resumes one; a stale episode must not get `ar`.
-            anyhow::ensure!(
-                p.episode.is_none(),
-                "this run was an autoresearch episode; continue the search with `hx run --ar --resume RUN`"
-            );
             log.check()?;
             if crate::confine::status().is_err() {
                 log.write(
@@ -983,7 +975,6 @@ impl Policy {
                 grants: grants.into(),
                 dirs: dirs.clone(),
                 prompt: Default::default(),
-                ar_progress: Default::default(),
             }
             .live());
         }
@@ -1006,7 +997,6 @@ impl Policy {
             write_roots: vec![],
             protected: vec![],
             sealed: vec![],
-            episode: None,
             ask: vec![],
             allow: vec![],
             mode: ApprovalMode::Prompt,
@@ -1022,10 +1012,6 @@ impl Policy {
             workspace.join(".git/config"),
             workspace.join(".git/hooks"),
         ]);
-        if let Some(e) = &episode {
-            p.sealed.extend(crate::ar::sealed(e));
-        }
-        p.episode = episode;
         for r in SYSTEM_READ {
             if let Some(c) = canon(r) {
                 p.read_roots.push(c);
@@ -1036,8 +1022,6 @@ impl Policy {
         // untrusted workspace's symlinked .harness or hx.lock.
         let canonical_protected: Vec<_> = p.protected.iter().filter_map(canon).collect();
         p.protected.extend(canonical_protected);
-        let canonical_sealed: Vec<_> = p.sealed.iter().filter_map(canon).collect();
-        p.sealed.extend(canonical_sealed);
         // The policy is parsed from the bytes the trust decision covered, never from a second read of the file.
         let config = crate::trust::trusted(&workspace, dirs)?;
         if let Some(text) = config.as_ref().and_then(|c| c.file(".harness/policy.toml")) {
@@ -1058,6 +1042,12 @@ impl Policy {
                     .collect::<Result<Vec<_>>>()?;
             p.read_roots.extend(w.clone());
             p.write_roots.extend(w);
+            p.sealed.extend(
+                f.fs.sealed
+                    .iter()
+                    .map(|r| fs_root(&workspace, r))
+                    .collect::<Result<Vec<_>>>()?,
+            );
             p.budget = Budget {
                 max_tokens: f.budget.max_tokens,
                 max_wall_secs: f.budget.max_wall_secs,
@@ -1084,7 +1074,7 @@ impl Policy {
                 .map(|r| (s, r))
         }) {
             bail!(
-                "autoresearch: {} lies inside {}, which the agent's shell commands may read; move it outside",
+                "bad .harness/policy.toml: [fs] sealed path {} lies inside the read root {}, which shell commands may read",
                 s.display(),
                 r.display()
             );
@@ -1098,14 +1088,12 @@ impl Policy {
         log.write("session", json!({"workspace": workspace.to_string_lossy(), "tmp": p.tmp.to_string_lossy(), "autopilot": autopilot,
             "approval_mode": p.mode, "config_sha": config_sha, "trusted": config.is_some(), "modules_sha": modules_sha,
             "confinement": crate::confine::describe()}), true)?;
-        let ar_progress = crate::ar::Progress::start(p.episode.as_ref()).into();
         Ok(Policy {
             cfg: p,
             log,
             grants: Default::default(),
             dirs: dirs.clone(),
             prompt: Default::default(),
-            ar_progress,
         }
         .live())
     }
@@ -1548,7 +1536,8 @@ impl Policy {
     }
 }
 
-/// The system and toolchain directories every child may read (autoresearch evaluators, which have no run policy).
+/// The system and toolchain directories every child may read, also a child confined by rules of its own rather than
+/// by a run's policy.
 pub fn system_read_roots() -> Vec<PathBuf> {
     SYSTEM_READ
         .iter()
@@ -1713,7 +1702,7 @@ mod tests {
             .unwrap();
         let path = log.path.clone();
         drop(log);
-        let result = Policy::new(&dirs, &dir, false, None, Some(&path), None);
+        let result = Policy::new(&dirs, &dir, false, None, Some(&path));
         let accepted = result.is_ok();
         drop(result);
         assert!(
@@ -1762,7 +1751,7 @@ mod tests {
         let dirs = TestDirs::new();
         let dir = std::env::temp_dir().join(format!("hx-policy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = Policy::new(&dirs, &dir, false, None, None, None).unwrap();
+        let p = Policy::new(&dirs, &dir, false, None, None).unwrap();
         assert_eq!(
             p.classify_sh("git push --force origin main"),
             Class::Irreversible
@@ -1786,8 +1775,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(dir).unwrap();
-        let mut p =
-            Policy::new(&dirs, &dir, autopilot, Some(ApprovalMode::Deny), None, None).unwrap();
+        let mut p = Policy::new(&dirs, &dir, autopilot, Some(ApprovalMode::Deny), None).unwrap();
         p.cfg.allow = allow.iter().map(|s| s.to_string()).collect();
         (p, dir, dirs)
     }
@@ -2229,7 +2217,7 @@ mod tests {
         // A workspace that holds hx's directories, or lies inside one, is refused.
         for ws in [base.clone(), dirs.state().join("ws")] {
             std::fs::create_dir_all(&ws).unwrap();
-            let err = Policy::new(&dirs, &ws, false, None, None, None)
+            let err = Policy::new(&dirs, &ws, false, None, None)
                 .err()
                 .expect("refused")
                 .to_string();
@@ -2249,7 +2237,7 @@ mod tests {
             )
             .unwrap();
             crate::trust::record(&ws, &dirs).unwrap();
-            let err = Policy::new(&dirs, &ws, false, None, None, None)
+            let err = Policy::new(&dirs, &ws, false, None, None)
                 .err()
                 .expect("refused")
                 .to_string();
@@ -2259,7 +2247,7 @@ mod tests {
             );
         }
         std::fs::remove_file(ws.join(".harness/policy.toml")).unwrap();
-        let p = Policy::new(&dirs, &ws, true, Some(ApprovalMode::Deny), None, None).unwrap();
+        let p = Policy::new(&dirs, &ws, true, Some(ApprovalMode::Deny), None).unwrap();
         let rules = p.confinement();
         assert!(
             rules
@@ -2271,13 +2259,13 @@ mod tests {
         );
         // File tools refuse the trust store, the secrets, the journal and its directory, whatever the spelling.
         let own = dirs.workspace(&ws);
-        std::fs::create_dir_all(&own.ar).unwrap();
+        std::fs::create_dir_all(own.state.join("tool")).unwrap();
         let journal = p.log.path.to_string_lossy().into_owned();
         for path in [
             dirs.trust_store(),
             own.secrets.clone(),
             own.log.clone(),
-            own.ar.clone(),
+            own.state.join("tool"),
             p.log.path.clone(),
             own.log.join("x/../y"),
         ] {
@@ -2323,11 +2311,11 @@ mod tests {
         let ws =
             std::env::temp_dir().join(format!("hx-policy-resume-elsewhere-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
-        let p = Policy::new(&dirs, &ws, false, None, None, None).unwrap();
+        let p = Policy::new(&dirs, &ws, false, None, None).unwrap();
         let (journal, copy) = (p.log.path.clone(), ws.join(p.log.path.file_name().unwrap()));
         drop(p);
         std::fs::copy(&journal, &copy).unwrap();
-        let err = Policy::new(&dirs, &ws, false, None, Some(&copy), None)
+        let err = Policy::new(&dirs, &ws, false, None, Some(&copy))
             .err()
             .expect("refused")
             .to_string();
@@ -2351,7 +2339,7 @@ mod tests {
         .unwrap();
         crate::trust::record(&ws, &dirs).unwrap();
         assert_eq!(
-            Policy::new(&dirs, &ws, false, None, None, None)
+            Policy::new(&dirs, &ws, false, None, None)
                 .unwrap()
                 .budget
                 .max_tokens,
@@ -2364,13 +2352,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            Policy::new(&dirs, &ws, false, None, None, None)
+            Policy::new(&dirs, &ws, false, None, None)
                 .unwrap()
                 .budget
                 .max_tokens,
             None
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn sealed_paths_are_refused_in_every_mode_and_may_not_lie_in_a_read_root() {
+        let dirs = TestDirs::new();
+        let base = std::env::temp_dir().join(format!("hx-policy-sealed-{}", std::process::id()));
+        let (ws, held) = (base.join("ws"), base.join("held"));
+        std::fs::create_dir_all(ws.join(".harness")).unwrap();
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("answers.txt"), "secret").unwrap();
+        let config = |sealed: &Path| {
+            std::fs::write(
+                ws.join(".harness/policy.toml"),
+                format!("[fs]\nsealed = [{:?}]\n", sealed.display().to_string()),
+            )
+            .unwrap();
+            crate::trust::record(&ws, &dirs).unwrap();
+        };
+        config(&held);
+        let p = Policy::new(&dirs, &ws, true, None, None).unwrap();
+        let file = held.join("answers.txt").to_string_lossy().into_owned();
+        assert!(
+            p.check_read(&file)
+                .unwrap_err()
+                .to_string()
+                .contains("sealed")
+        );
+        assert!(
+            p.check_write(&file)
+                .unwrap_err()
+                .to_string()
+                .contains("sealed")
+        );
+        // `--yes` approves a single file outside the roots, but never a sealed one.
+        assert!(p.authorize_path(&file, false).await.is_err());
+        drop(p);
+        std::fs::create_dir_all(ws.join("data")).unwrap();
+        config(&ws.join("data"));
+        let error = Policy::new(&dirs, &ws, false, None, None)
+            .err()
+            .expect("a sealed path inside the workspace")
+            .to_string();
+        assert!(error.contains("lies inside the read root"), "{error}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

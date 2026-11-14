@@ -763,8 +763,8 @@ pub struct ShellEnv {
     pub confine: Option<Arc<crate::confine::Ruleset>>,
 }
 impl ShellEnv {
-    /// The agent's `sh`: scrub credentials by default and in every autoresearch episode, and confine it to the run's
-    /// current file policy (grants approved so far included).
+    /// The agent's `sh`: scrub credentials, and confine it to the run's current file policy (grants approved so far
+    /// included).
     pub async fn agent(pol: &Arc<crate::policy::Policy>) -> mlua::Result<ShellEnv> {
         let confine = pol
             .ruleset()
@@ -1107,8 +1107,7 @@ mod receipt_tests {
         let dir = std::env::temp_dir().join(format!("hx-long-command-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let pol =
-            Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None).unwrap());
         let path = pol.log.path.clone();
         let prefix = format!(": #{}\n", "x".repeat(2100));
         let original = format!("print(sh({:?}).code)", format!("{prefix}echo original"));
@@ -1157,8 +1156,7 @@ mod file_tests {
 
     fn vm(dir: &Path) -> (crate::vm::Vm, crate::dirs::TestDirs) {
         let dirs = crate::dirs::TestDirs::new();
-        let pol =
-            Arc::new(crate::policy::Policy::new(&dirs, dir, false, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, dir, false, None, None).unwrap());
         (
             crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap(),
             dirs,
@@ -1344,8 +1342,7 @@ mod file_tests {
     async fn an_effect_where_luau_cannot_yield_fails_before_it_exists() {
         let dir = workspace("yield");
         let dirs = crate::dirs::TestDirs::new();
-        let pol =
-            Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None).unwrap());
         let log = pol.log.path.clone();
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(10), 32 << 20, None).unwrap();
         let r = vm.session.run(r#"local yield = "attempt to yield across metamethod/C-call boundary"
@@ -1398,7 +1395,7 @@ mod file_tests {
         std::fs::write(outside.join("f"), "OUTSIDE").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("l")).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let pol = crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap();
+        let pol = crate::policy::Policy::new(&dirs, &dir, false, None, None).unwrap();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = {
             let (d, l, stop) = (
@@ -1505,8 +1502,7 @@ mod shell_tests {
         }
         assert!(!dir.join("ran").exists(), "the command must not run");
         let dirs = crate::dirs::TestDirs::new();
-        let pol =
-            Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None).unwrap());
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(5), 32 << 20, None).unwrap();
         let r = vm
             .session
@@ -1526,8 +1522,7 @@ mod shell_tests {
     async fn options_with_a_metatable_are_refused_without_running_it() {
         let dir = scratch("index");
         let dirs = crate::dirs::TestDirs::new();
-        let pol =
-            Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let pol = Arc::new(crate::policy::Policy::new(&dirs, &dir, false, None, None).unwrap());
         let vm = crate::vm::Vm::new(pol, Duration::from_secs(5), 32 << 20, None).unwrap();
         let code = "sh('touch ran', setmetatable({}, {__index = function() while true do end end, __pairs = function() while true do end end}))";
         let t0 = std::time::Instant::now();

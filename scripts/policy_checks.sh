@@ -78,7 +78,7 @@ if unconfined "$W"; then
   check "unconfined shell reads and writes beyond file-tool roots" "$out$(cat "$ESC")" "SECRETwritten"
 else
   # hx's own files (the workspace's secrets, its journals and autoresearch runs) are outside the workspace and every root.
-  SEC=$($H paths --workspace "$W" | sed -n 's/^secrets: //p'); AR=$($H paths --workspace "$W" | sed -n 's/^ar: //p')
+  SEC=$($H paths --workspace "$W" | sed -n 's/^secrets: //p'); AR=$($H paths --workspace "$W" | sed -n 's/^state: //p')/tool-run
   mkdir -p "$(dirname "$SEC")" "$AR/run"; echo 'K = "CREDENTIAL"' > "$SEC"; echo SEALED-MARK > "$AR/run/held.txt"; echo PUBLIC > $W/README.md
   out=$(run "local s, r = sh('cat $SEC'), sh('cat README.md') print(s.code ~= 0, s.stdout == '', r.stdout)" | head -1)
   check "confined shell cannot read the workspace secrets but reads README.md" "$(echo "$out" | tr '\t' '|')" "true|true|PUBLIC"

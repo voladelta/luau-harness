@@ -83,7 +83,8 @@ def main():
                 print(output, flush=True)
         return ok
 
-    if not run("release build", ["cargo", "build", "--release", "--quiet"], cap=150):
+    # Builds both binaries, hx and hx-ar.
+    if not run("build hx, hx-ar", ["cargo", "build", "--release", "--quiet"], cap=150):
         return 1
     results = [run("policy_checks", ["bash", "scripts/policy_checks.sh"], cap=60)]
     # Mock servers bind free ports and every suite uses its own workspaces, so the rest run independently.
@@ -99,8 +100,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for future in as_completed([pool.submit(run, *suite) for suite in suites]):
             results.append(future.result())
-    # ar runs four scenarios at a time on its own; beside other suites it starves them past their caps.
-    results.append(run("ar", ["python3", "scripts/ar_checks.py"], cap=280))
+    # hx-ar's suite runs four scenarios at a time on its own; beside other suites it starves them past their caps.
+    results.append(run("ar_checks (hx-ar)", ["python3", "scripts/ar_checks.py"], cap=280))
     elapsed = time.monotonic() - started
     print(f"\n{sum(results)}/{len(results)} suites passed in {elapsed:.1f}s (limit: 5 minutes)", flush=True)
     return 0 if all(results) and elapsed < 300 else 1

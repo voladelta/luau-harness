@@ -218,7 +218,7 @@ class Approvals(unittest.TestCase):
         self.assertEqual(self.grant_records(), [])
 
     def test_search_through_an_alias_cannot_expose_hx_state(self):
-        sealed = harness.hx_path(self.ws, "ar") / "run"
+        sealed = harness.hx_path(self.ws, "state") / "run"
         sealed.mkdir(parents=True)
         (sealed / "ledger.txt").write_text("sealed-result-marker")
         (self.ws / "ar-alias").symlink_to(sealed.parent, target_is_directory=True)

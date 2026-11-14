@@ -7,7 +7,7 @@ Workspace configuration lives in `.harness/` in the workspace. File tools can re
 | `.harness/policy.toml` | File-tool roots, approval gate, budgets, packs |
 | `.harness/mcp.toml` | MCP servers |
 | `.harness/init.luau` | Toggles for `std` modules such as compaction and recheck |
-| `.harness/ar.toml` | Autoresearch setup (see [workflows](workflows.md#harnessartoml)) |
+| `.harness/ar.toml` | `hx-ar`'s autoresearch setup (see [workflows](workflows.md#harnessartoml)); trust covers every `.harness/*.toml` |
 | `.harness/override/`, `.harness/tools/`, `.harness/pkgs/` | Extensions (see [Extending](extending.md)) |
 | `hx.lock` | Approved packages and their content hashes |
 
@@ -16,9 +16,9 @@ What hx treats as authority or as a secret is kept outside the workspace, in its
 | Location | Holds |
 |---|---|
 | `$XDG_CONFIG_HOME/hx/` (default `~/.config/hx/`) | `trust.toml` (the trust store), `secrets.toml` (your credentials for tools), and per workspace `workspaces/NAME-ID/secrets.toml` (that workspace's credentials, see [credentials](extending.md#credentials)) |
-| `$XDG_STATE_HOME/hx/` (default `~/.local/state/hx/`) | Per workspace `workspaces/NAME-ID/log/` (event logs, blobs, lock files, revocation markers, each run's materialized skills) and `workspaces/NAME-ID/ar/` (autoresearch runs) |
+| `$XDG_STATE_HOME/hx/` (default `~/.local/state/hx/`) | Per workspace, the state directory `workspaces/NAME-ID/`: `log/` (event logs, blobs, lock files, revocation markers, each run's materialized skills), and the files of programs built on hx, such as `ar/` (`hx-ar`'s runs) |
 
-`NAME` is the workspace directory's name with unusual characters replaced, `ID` the first 16 hex digits of the SHA-256 of its canonical path. `hx paths` prints the four that matter (`log`, `ar`, `secrets`, `trust`). hx refuses a workspace, an `[fs]` root or a path grant that contains either directory or lies inside one (`[fs] write = ["~"]` with the default locations, for example): Landlock grants whole trees, so such a root would hand the model the trust store, your credentials and the journals. A `.harness/secrets.toml`, `.harness/log` or `.harness/ar` left by an earlier version is not read; hx says so on stderr at each launch with the new location, and moving the file is up to you. Until a leftover `.harness/secrets.toml` is moved, shell commands can still read it where it is.
+`NAME` is the workspace directory's name with unusual characters replaced, `ID` the first 16 hex digits of the SHA-256 of its canonical path. `hx paths` prints the four that matter (`log`, `state`, `secrets`, `trust`). hx refuses a workspace, an `[fs]` root or a path grant that contains either directory or lies inside one (`[fs] write = ["~"]` with the default locations, for example): Landlock grants whole trees, so such a root would hand the model the trust store, your credentials and the journals. A `.harness/secrets.toml` or `.harness/log` left by an earlier version is not read; hx says so on stderr at each launch with the new location, and moving the file is up to you. Until a leftover `.harness/secrets.toml` is moved, shell commands can still read it where it is.
 
 ## `policy.toml`
 
@@ -26,6 +26,7 @@ What hx treats as authority or as a secret is kept outside the workspace, in its
 [fs]
 read = ["/extra/read/root"]     # extra read roots for file tools (relative to the workspace; ~ is your home)
 write = ["/extra/write/root"]   # extra write roots; a root that does not exist is an error
+sealed = ["~/grader/holdout"]   # never readable or writable by file tools, in any mode, --yes included
 
 [approval]
 mode = "prompt"                 # default; "deny" refuses missing permissions without asking
@@ -40,7 +41,7 @@ max_wall_secs = 900
 enable = []                     # std/authoring, std/vision (as --pack); any other name is an error
 ```
 
-The workspace, private temp directory and `[fs]` roots are standing file-tool permissions. With `mode = "prompt"`, other file-tool paths ask on the owner's controlling terminal. A write grant covers the requested file only, with read access (shell commands may then change that file, not create its siblings); a read grant covers the requested file, or the subtree when a directory is requested. A directory that is `/`, contains your home directory, or contains protected configuration, credentials or sealed state is never granted, in any mode: add a narrower `[fs]` root instead. Home has no implicit grant. Refusal or a missing terminal leaves the operation unexecuted. Grants are shared by descendants and journaled for resume, and a new run starts with fresh grants.
+The workspace, private temp directory and `[fs]` roots are standing file-tool permissions. With `mode = "prompt"`, other file-tool paths ask on the owner's controlling terminal. A write grant covers the requested file only, with read access (shell commands may then change that file, not create its siblings); a read grant covers the requested file, or the subtree when a directory is requested. A directory that is `/`, contains your home directory, or contains protected configuration, credentials or sealed state is never granted, in any mode: add a narrower `[fs]` root instead. Home has no implicit grant. A `sealed` path is refused to file tools in every mode and is never granted; it may not lie inside a read root (that would put it within shell commands' reach), so a policy that seals one there is refused. Refusal or a missing terminal leaves the operation unexecuted. Grants are shared by descendants and journaled for resume, and a new run starts with fresh grants.
 
 Shell commands are classed on their shell words, not substrings: each simple command of a pipeline or list (and the body of `$(...)`, backticks and `bash -c`) is classed read / local write / external / irreversible, and the command takes the highest class. A `git push` with `--force`, `--force-with-lease`, `-f`, `--delete`, `--mirror` or a `+`/`:` refspec anywhere in its arguments, `rm -r` of `/`, `~` or `$HOME`, `mkfs` and `dd` are irreversible. Shell reserved words (`if`, `then`, `do`, `{`, `!`, ...) are skipped, and after a wrapper (`sudo`, `env`, `timeout`, `nice`, `xargs`, `find -exec`, ...) or among `git`'s global options every word up to the one that can be the program is tried as the program, so `for b in a; do git push --force; done`, `timeout 5s git push --force` and `git --git-dir .git push --force` are irreversible like the bare command; `command -v` and `command -V` run nothing. Where the classifier cannot tell what will run, the command is external: a program (or `git` subcommand) the shell substitutes (`$x`, `"$(...)"`, a backtick, `$'...'` quoting). A wrapper whose program may start more than 32 words after it could hide anything, so it is irreversible. `time -p CMD` is classed as `CMD`, `env -S 'CMD'` and `env --split-string='CMD'` as the command in the string, and `find` by the command after each `-exec`, `-execdir`, `-ok` and `-okdir`, however long the expression before it. An `allow` entry covers a simple command when the command's words start with the entry's words, and it must cover each external command in a chain: `allow = ["git push origin"]` approves `git push origin main` but not `sudo git push origin main`, `echo x "git push origin"; ssh host` or `git push origin main && curl -X POST ...`. The classifier decides when to ask; it is approval UX, not a guard (see [shell confinement](#shell-confinement)). The journal records who approved each shell command (`approval` on its outcome: `not-required`, `policy-allow`, `auto` or `prompt`).
 
@@ -60,17 +61,18 @@ env = ["NOTES_DIR"]             # the only env vars passed through
 [server.remote]                 # remote Streamable HTTP server (https, or http on localhost)
 url = "https://mcp.example.com/mcp"
 bearer_env = "REMOTE_TOKEN"     # or headers_env = {"x-api-key" = "VAR"}
+timeout_secs = 300              # either kind: how long one call may wait for its answer (default 60)
 ```
 
 A local server is [confined](#shell-confinement) like a shell command, to the file policy at its start, and runs in its own process group: when hx drops the connection (the server stopped answering, the run ended, hx was stopped by a signal) it kills the whole group, so the real server behind a wrapper such as `npx` or `uvx` ends too. A process that detaches into its own session is not killed. Network and GPU access are controlled by the environment running hx; hx has no network switches.
 
-An unknown key (a typo such as `bearer-env`) is an error. A server that exits is started again on the next call.
+An unknown key (a typo such as `bearer-env`) is an error. A server that exits is started again on the next call. A call whose answer does not arrive within `timeout_secs` (60 seconds unless the server sets it) is abandoned; when the tool is not read-only, its outcome is unknown and the run's later effects wait until you settle it (`hx recover`), so give a server whose tools take longer a longer deadline.
 
 MCP tools bind as `mcp.SERVER.tool{...}`; a name that is not a Luau identifier also gets an alias with `_` for each other character (`a.b` as `a_b`) unless another tool already has that name. Approve a non-read-only tool with `allow = ["mcp notes.add"]` in `policy.toml`, or every tool of a server with `"mcp notes.*"` (a server whose name contains a dot cannot be pre-approved). Approval is decided on the server and tool name alone: the prompt shows the call's arguments, escaped, but they are never matched against `allow`. HTTP tool endpoints work the same way with `http NAMESPACE.ENDPOINT`.
 
 ## Shell confinement
 
-On Linux 5.13 or newer (Landlock), every shell command, local MCP server and autoresearch evaluator starts under a Landlock ruleset built from the run's policy at that moment:
+On Linux 5.13 or newer (Landlock), every shell command and local MCP server starts under a Landlock ruleset built from the run's policy at that moment, and every `hx-ar` evaluator under one of its own:
 
 | | Shell commands and MCP servers | Evaluators |
 |---|---|---|
@@ -78,7 +80,7 @@ On Linux 5.13 or newer (Landlock), every shell command, local MCP server and aut
 | Write | Write roots (workspace, private temp dir, `[fs] write`, approved write grants), `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/shm` | Their scratch copy |
 | Also readable | The run's materialized skills (in its log directory), so a skill's supporting files are there | |
 
-Nothing else is reachable: in particular not hx's configuration and state directories (trust store, credentials, journals, autoresearch runs), which lie outside every root, nor an autoresearch episode's `grader` and `holdout` roots, which may not lie inside one. A grant approved mid-run applies to the next command. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. It has no terminal (`/dev/tty`, `/dev/pts`), so it cannot draw over an approval prompt or read your keystrokes. On Linux 6.12 or newer (Landlock ABI 6) it also cannot signal processes or connect to abstract Unix sockets outside its own command.
+Nothing else is reachable: in particular not hx's configuration and state directories (trust store, credentials, journals, `hx-ar`'s runs), which lie outside every root, nor `sealed` paths (such as an autoresearch episode's `grader` and `holdout` roots), which may not lie inside one. A grant approved mid-run applies to the next command. A confined process cannot reach hx's own `/proc` entries, so it cannot read hx's environment. It has no terminal (`/dev/tty`, `/dev/pts`), so it cannot draw over an approval prompt or read your keystrokes. On Linux 6.12 or newer (Landlock ABI 6) it also cannot signal processes or connect to abstract Unix sockets outside its own command.
 
 What stays open:
 
@@ -106,7 +108,7 @@ require("std/recheck").enabled = true
 
 ## Workspace trust
 
-`.harness/{policy,mcp,ar}.toml`, `.harness/init.luau`, `.harness/override/`, `.harness/tools/`, `.harness/versions/` (what `hx rollback` restores) and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in the trust store (`trust.toml` in hx's configuration directory, outside the repo and every root of the model's), `hx run` and `hx exec` refuse to start:
+Every `.harness/*.toml` (hx's `policy.toml` and `mcp.toml`, and the config of programs built on hx, such as `ar.toml`), `.harness/init.luau`, `.harness/override/`, `.harness/tools/`, `.harness/versions/` (what `hx rollback` restores) and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in the trust store (`trust.toml` in hx's configuration directory, outside the repo and every root of the model's), `hx run` and `hx exec` refuse to start:
 
 ```text
 Error: this workspace's config is not trusted (.harness/policy.toml); review it and run `hx trust`, or pass --ignore-config to run without it

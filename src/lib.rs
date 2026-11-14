@@ -17,7 +17,6 @@ macro_rules! outln {
     ($($arg:tt)*) => { $crate::write_stdout(format_args!("{}\n", format_args!($($arg)*))) };
 }
 
-pub mod ar;
 pub mod atomic_file;
 pub mod batch;
 pub mod confine;

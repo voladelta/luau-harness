@@ -26,7 +26,7 @@ cargo install --git https://github.com/voladelta/luau-harness && hx exec 'print(
 | Process execution | `sh`, local MCP servers and evaluators are confined by Landlock to the file policy; network isolation is up to your sandbox or container |
 | Approvals | Workspace file tools run freely; outside paths and recognized external actions ask for approval. `--yes` approves ordinary requests automatically, never irreversible ones |
 | [RPI workflow](docs/workflows.md#rpi-research-design-implement-verify) | `--rpi` runs research → design → implementation → verification with up to three repair cycles; `--manual` adds owner review gates |
-| [Autoresearch](docs/workflows.md#autoresearch) | `--ar` improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
+| [Autoresearch](docs/workflows.md#autoresearch) | `hx-ar`, a second program built on hx, improves a score from a held-out evaluator over the paths you allow, with parallel workers and audited gates |
 | [Recovery](docs/cli.md#checkpoints-and-resume) | `--resume` restores saved data and controller state into a fresh VM; old effectful chunks are never replayed |
 | [Budgets](docs/configuration.md#policytoml) | Token and wall-clock admission thresholds; each request reserves its upper bound in tokens |
 | [Compaction](docs/configuration.md#initluau-compaction-and-recheck) | On by default: at 80% of the context window (1M unless `--context-window` or the provider says otherwise), older history becomes a structured summary; Luau globals stay |
@@ -69,7 +69,7 @@ hx runs on Linux only. It requires Rust 1.100 or newer (edition 2024; the toolch
 cargo install --git https://github.com/voladelta/luau-harness
 ```
 
-Or from a clone; `cargo build --release` builds without installing (the binary is `target/release/hx`):
+Either installs two programs: `hx`, and `hx-ar` ([autoresearch](docs/workflows.md#autoresearch)), which runs its episodes with the `hx` beside it. Or from a clone; `cargo build --release` builds both without installing (`target/release/hx` and `target/release/hx-ar`):
 
 ```bash
 git clone https://github.com/voladelta/luau-harness
@@ -106,7 +106,7 @@ hx run "Fix the failing tests" --model MODEL --yes
 
 Workspace and configured file-tool paths are allowed without asking. Other file-tool paths and recognized external actions ask on the controlling terminal; without one they are refused. `--yes` automatically approves ordinary requests for that run without changing `policy.toml`: commands, and single files outside the roots. A whole directory, and irreversible commands such as a force push, still need your answer on the terminal (or, for a command, an exact `allow` entry). Protected harness files, sealed state, credential reads and capability checks still apply. Shell commands get the same file roots as the file tools.
 
-hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens, and `log`, the event log's path). Event logs, autoresearch runs and the workspace's credentials live outside the workspace, in hx's own directories (`~/.local/state/hx/` and `~/.config/hx/`); `hx paths` prints where.
+hx prints a JSON report on stdout (turns, Luau errors, `finished`, `final_answer`, tokens, and `log`, the event log's path). Event logs, `hx-ar`'s runs and the workspace's credentials live outside the workspace, in hx's own directories (`~/.local/state/hx/` and `~/.config/hx/`); `hx paths` prints where.
 
 hx uses the Responses API for every model. For another provider with a compatible `/responses` endpoint, pass its base URL and key variable:
 
@@ -118,14 +118,14 @@ hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1
 
 | Command | What it does |
 |---|---|
-| `hx run` | Run an agent task (`--rpi`, `--ar`, `--resume LOG`, `--branch LOG`) |
+| `hx run` | Run an agent task (`--rpi`, `--resume LOG`, `--branch LOG`) |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
 | `hx review` / `hx recover` / `hx revoke` | Record an RPI review decision, settle an uncertain operation, stop a run |
 | `hx trust` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
 | `hx approve` / `hx skills` / `hx test` | Approve packages and skills, list skills, run a package's tests |
 | `hx staged` / `hx accept` / `hx reject` / `hx rollback` | Review and activate what the agent staged; undo a module replacement |
 | `hx log verify LOG` | Check a log's hash chain and recovery accounting |
-| `hx paths` | Print where this workspace's logs, autoresearch runs and secrets are kept, and the trust store |
+| `hx paths` | Print where this workspace's logs, state and secrets are kept, and the trust store |
 
 Every flag and exit code is in the [command reference](docs/cli.md).
 
@@ -153,7 +153,7 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 
 ## Security model
 
-- hx keeps everything it treats as authority or as a secret outside the workspace, in its own configuration (`$XDG_CONFIG_HOME/hx`: trust store, credentials) and state (`$XDG_STATE_HOME/hx`: journals, autoresearch runs) directories. No root may contain them: a workspace, `[fs]` root or path grant that would is refused.
+- hx keeps everything it treats as authority or as a secret outside the workspace, in its own configuration (`$XDG_CONFIG_HOME/hx`: trust store, credentials) and state (`$XDG_STATE_HOME/hx`: journals, `hx-ar`'s runs) directories. No root may contain them: a workspace, `[fs]` root or path grant that would is refused.
 - `read`, `write`, `edit` and `search` check canonical paths against allowed roots and temporary owner grants. File tools refuse hx's own directories, protect `.harness/`, `hx.lock`, `.git/config` and `.git/hooks`, refuse credential files by name (`id_rsa`, `.netrc`, `secrets.toml`, ...), and writes refuse symlinks.
 - With Landlock, `sh` and local MCP servers are [confined by the kernel](docs/configuration.md#shell-confinement) to the same roots: they read only the read roots and system directories, write only the write roots, and so cannot reach hx's journals, autoresearch runs, credentials or trust store, nor an episode's grader and held-out roots. Grants approved mid-run apply to later commands. Evaluators read only their copy, the system and their `grader` roots (plus `holdout` for `select`). Without Landlock hx says so once per run and children run unconfined.
 - Network and GPU isolation belong to the environment running hx; configure them in your sandbox or container.
@@ -165,14 +165,14 @@ Inside the VM the model also has `agent(task)`, `batch{...}` for independent rea
 | Page | Covers |
 |---|---|
 | [Command reference](docs/cli.md) | Every command and flag, the run report, resume and branch |
-| [Workflows](docs/workflows.md) | `--rpi` stages and review gates; `--ar` setup and how a search runs |
+| [Workflows](docs/workflows.md) | `--rpi` stages and review gates; `hx-ar` setup and how a search runs |
 | [Configuration](docs/configuration.md) | `policy.toml`, `mcp.toml`, compaction and recheck, workspace trust, `hx.lock` |
 | [Extending](docs/extending.md) | Module overrides, single-file and HTTP tools, packages, skills, credentials, the bundled example tools |
 | [Runtime v2](docs/runtime-v2.md) | State ownership, dispatch and uncertainty, durable data, recovery guarantees |
 
 ## Development
 
-Every check uses `target/release/hx`, and none needs an API key (model runs use a scripted mock).
+Every check uses `target/release/hx` (the autoresearch suite also `target/release/hx-ar`), and none needs an API key (model runs use a scripted mock).
 
 ```bash
 scripts/all_checks.sh            # builds, then runs rustfmt, clippy and every offline suite; five-minute deadline

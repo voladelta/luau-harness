@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline autoresearch (`hx run --ar`) checks with the real CLI, a scripted provider and a toy evaluator.
+"""Offline autoresearch (`hx-ar`) checks with the real CLIs, a scripted provider and a toy evaluator.
 
 The toy task: x.txt holds an integer; the search evaluator scores -(x-7)^2 and the held-out one -(x-5)^2. Candidates
 rank by search; the held-out score only vetoes those worse than the seed on it (x of 10 and beyond). Scripted runs exercise the manager loop:
@@ -52,13 +52,28 @@ def workspace(name, files=None, spec=None):
     return path
 
 
+HX_AR = harness.HX_BIN.with_name("hx-ar")
+
+
+def trusted(path):
+    """The environment that trusts `path`'s config as it is now, as an owner would with `hx trust`."""
+    out = subprocess.run([str(harness.HX_BIN), "trust", "--workspace", str(path)], env=harness.ENV, stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True).stdout
+    return {**harness.ENV, "HX_TRUST": re.search(r"config hash: ([0-9a-f]+)", out)[1]}
+
+
+def resume(run, path, env=None):
+    return subprocess.run([str(HX_AR), "--resume", str(run), "--workspace", str(path)], env=env or harness.ENV,
+                          capture_output=True, text=True, timeout=600)
+
+
 def command(path, url, key="HX_TEST_KEY"):
-    return [str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"),
+    return [str(HX_AR), "--workspace", str(path), "--prompt-file", str(path / "program.md"),
             "--model", "mock", "--base-url", url, "--key-env", key]
 
 
 def ar(path, url, ok=True, env=None, key="HX_TEST_KEY", extra=()):
-    result = subprocess.run(command(path, url, key) + list(extra), env={**harness.ENV, **(env or {})},
+    result = subprocess.run(command(path, url, key) + list(extra), env={**trusted(path), **(env or {})},
                             capture_output=True, text=True, timeout=600)
     (BASE / f"{path.name}.stderr").write_text(result.stderr)
     if ok:
@@ -71,12 +86,18 @@ def report_of(result):
 
 
 def ardir(path):
-    """The workspace's autoresearch directory (its runs), in the suite's state directory."""
-    return harness.hx_path(path, "ar")
+    """The workspace's autoresearch directory (its runs): `ar/` in its state directory."""
+    return harness.hx_path(path, "state") / "ar"
+
+
+def journal_of(run, kind=None):
+    records = [json.loads(line) for line in (run / "journal.jsonl").read_text().splitlines()]
+    return [r for r in records if kind is None or r["kind"] == kind]
 
 
 def ledger(path, report):
-    return [json.loads(line) for line in (ardir(path) / report["run"] / "ledger.jsonl").read_text().splitlines()]
+    """The run's evaluations, in order."""
+    return journal_of(ardir(path) / report["run"], "evaluated")
 
 
 def answered(body):
@@ -120,7 +141,7 @@ def once(code, where=("research",)):
         role, label = role_of(body)
         if role == "judge": return "Answer: 0"
         if answered(body) or (role not in where and label not in where): return "done"
-        return {"code": (f'pcall(ar.claim, "a probe idea from worker {label} used only by the isolation checks")\n' if role in ("explore", "exploit") else "") + code}
+        return {"code": (f'pcall(mcp.ar.claim, {{idea = "a probe idea from worker {label} used only by the isolation checks"}})\n' if role in ("explore", "exploit") else "") + code}
     return reply
 
 
@@ -148,7 +169,7 @@ def held_out_roots():
 TARGETS = {1: 3, 2: 6, 3: 20, 4: 6, 5: 9, 6: 1, 7: 12, 8: 13}  # workers 2 and 4 want the same idea: one of them must be turned away
 UP, DOWN = "step up by adding one to the current value of x", "step down by subtracting one from the current value of x"
 def go(x):
-    """A claim's text: at least eight words, as ar.claim requires."""
+    """A claim's text: at least eight words, as claim requires."""
     return f"go to {x} by writing that one value into x.txt"
 
 
@@ -165,16 +186,16 @@ def scripted(body, index):
     if role == "explore":
         w = int(label.split("-w")[1].split(".")[0])
         t, alt = TARGETS[w], 40 + w
-        # A retry gets its earlier attempt's claim back from its first ar.claim call, so only first attempts probe.
-        placeholder = 'print("PLACEHOLDER", ar.claim("a short probe sentence that is long enough to be accepted here").message)\n' if "." not in label else ""
-        return {"code": f'print("PROBE", pcall(ar.claim, "x"))\nprint("CLAIMS", ar.claims().message)\n{placeholder}'
-                        f'local r = ar.claim("{go(t)}")\nlocal x = {t}\nif not r.ok then r = ar.claim("{go(alt)}"); x = {alt} end\n'
-                        f'print("CLAIM", r.ok, r.n)\nwrite("x.txt", tostring(x) .. "\\n")\nprint(ar.eval("go " .. x))\n'
-                        f'write("x.txt", "{100 + index}\\n")\nprint(ar.eval("probe"))\nar.reset()\nreturn "RESET " .. x .. " " .. read("x.txt")'}
+        # A retry gets its earlier attempt's claim back from its first claim call, so only first attempts probe.
+        placeholder = 'print("PLACEHOLDER", mcp.ar.claim{idea = "a short probe sentence that is long enough to be accepted here"}.message)\n' if "." not in label else ""
+        return {"code": f'print("PROBE", pcall(mcp.ar.claim, {{idea = "x"}}))\nprint("CLAIMS", mcp.ar.claims{{}}.message)\n{placeholder}'
+                        f'local r = mcp.ar.claim{{idea = "{go(t)}"}}\nlocal x = {t}\nif not r.ok then r = mcp.ar.claim{{idea = "{go(alt)}"}}; x = {alt} end\n'
+                        f'print("CLAIM", r.ok, r.n)\nwrite("x.txt", tostring(x) .. "\\n")\nprint(mcp.ar.eval{{note = "go " .. x}})\n'
+                        f'write("x.txt", "{100 + index}\\n")\nprint(mcp.ar.eval{{note = "probe"}})\nmcp.ar.reset{{}}\nreturn "RESET " .. x .. " " .. read("x.txt")'}
     if role == "exploit":
-        return {"code": f'local x = tonumber(read("x.txt"))\nlocal r = ar.claim("{UP}")\nlocal d = 1\n'
-                        f'if not r.ok then r = ar.claim("{DOWN}"); d = -1 end\n'
-                        'if r.ok then write("x.txt", tostring(x + d) .. "\\n"); print(ar.eval("step " .. d)) end\nreturn "STEP " .. d'}
+        return {"code": f'local x = tonumber(read("x.txt"))\nlocal r = mcp.ar.claim{{idea = "{UP}"}}\nlocal d = 1\n'
+                        f'if not r.ok then r = mcp.ar.claim{{idea = "{DOWN}"}}; d = -1 end\n'
+                        'if r.ok then write("x.txt", tostring(x + d) .. "\\n"); print(mcp.ar.eval{note = "step " .. d}) end\nreturn "STEP " .. d'}
     return "done"
 
 
@@ -191,10 +212,10 @@ def climbing(body, index):
     if role == "audit": return "Checked.\nVERDICT: PASS"
     if role == "explore":
         w = int(label.split("-w")[1].split(".")[0])
-        return {"code": f'ar.claim("{go(w)}")\nwrite("x.txt", "{w}\\n")\nreturn ar.eval("go {w}")'}
+        return {"code": f'mcp.ar.claim{{idea = "{go(w)}"}}\nwrite("x.txt", "{w}\\n")\nreturn mcp.ar.eval{{note = "go {w}"}}'}
     if role == "exploit":
-        return {"code": f'ar.claim("raise x by one more step, the refinement tried by worker {label}")\n'
-                        'write("x.txt", tostring(tonumber(read("x.txt")) + 1) .. "\\n")\nreturn ar.eval("up")'}
+        return {"code": f'mcp.ar.claim{{idea = "raise x by one more step, the refinement tried by worker {label}"}}\n'
+                        'write("x.txt", tostring(tonumber(read("x.txt")) + 1) .. "\\n")\nreturn mcp.ar.eval{note = "up"}'}
     return "done"
 
 
@@ -206,7 +227,7 @@ def hopeless(body, index, x=None):
     if answered(body) or role != "explore": return "done"
     w = int(label.split("-w")[1].split(".")[0])
     value = x or ("00" if w == 1 else 30 + w)  # worker 1 rebuilds the seed in other bytes
-    return {"code": f'ar.claim("{go(30 + w)}")\nwrite("x.txt", "{value}\\n")\nreturn ar.eval("far")'}
+    return {"code": f'mcp.ar.claim{{idea = "{go(30 + w)}"}}\nwrite("x.txt", "{value}\\n")\nreturn mcp.ar.eval{{note = "far"}}'}
 
 
 # 2c. An auditor that gives no verdict leaves its candidate unaudited: nothing becomes a result without a passing audit.
@@ -228,7 +249,7 @@ def hopeless(body, index, x=None):
 def slow(body, index):
     role, label = role_of(body)
     if role == "explore" and label == "r1-w6" and not answered(body):
-        return {"code": f'print(ar.claim("{go(1)}"))\nsh("sleep 20")\nreturn "late"'}
+        return {"code": f'print(mcp.ar.claim{{idea = "{go(1)}"}})\nsh("sleep 20")\nreturn "late"'}
     return scripted(body, index)
 
 
@@ -252,7 +273,7 @@ def limited(body, index):
     if role_of(body)[0] == "research" and not answered(body):
         agent_calls[0] += 1
         if agent_calls[0] < 3: return {"status": 503, "error": "unavailable"}
-    return once('return ar.eval("b")')(body, index)
+    return once('return mcp.ar.eval{note = "b"}')(body, index)
 
 
 # 12. Search and select invoke their configured evaluator commands.
@@ -265,9 +286,9 @@ def limited(body, index):
 
 # 16. The frozen base is the committed tree byte for byte: export attributes do not apply.
 
-# 16b. A deterministic evaluator scores each state once; ar.reset() restores the best state.
+# 16b. A deterministic evaluator scores each state once; reset restores the best state.
 
-# 16c. ar.reset never writes or deletes through a symlink the agent planted in an editable path's parent.
+# 16c. reset never writes or deletes through a symlink the agent planted in an editable path's parent.
 
 # 17. Launch validation.
 
@@ -281,7 +302,7 @@ def scenario_00():
     report = report_of(result)
     run = ardir(path) / report["run"]
     rows = ledger(path, report)
-    claims = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines()]
+    claims = journal_of(run, "claimed")
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
     explore = [c for c in claims if c["scope"] == "explore" and c["worker"].startswith("r1-")]
     assert [c["n"] for c in explore] == list(range(1, 9)), explore
@@ -336,8 +357,7 @@ def scenario_00():
     (run / "report.json").unlink()
     before = (run / "journal.jsonl").read_text()
     with harness.provider(scripted) as (url, replayed):
-        replay = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)],
-                                env=harness.ENV, capture_output=True, text=True, timeout=600)
+        replay = resume(run, path)
     assert replay.returncode == 0 and not replayed, replay.stderr[-2000:]
     assert (run / "journal.jsonl").read_text() == before, "the replay journaled something"
     again = report_of(replay)
@@ -360,7 +380,7 @@ def scenario_00():
         assert r["score"] == -(int(base64.b64decode(snap["x.txt"])) - 7) ** 2, r
     resets = [o for o in outputs(requests) if o.startswith("RESET ") or "RESET " in o]
     assert len(resets) >= 8 and all(o.split("RESET ")[1].split()[0] == o.split("RESET ")[1].split()[1] for o in resets), resets
-    check("ledger rows stay numbered under concurrency, every score matches its snapshot, and ar.reset is per worker")
+    check("ledger rows stay numbered under concurrency, every score matches its snapshot, and reset is per worker")
 
 
 def scenario_01():
@@ -440,7 +460,7 @@ def scenario_05():
     tamper = (f'sh("git init -q; git config core.fsmonitor $PWD/hook.sh; printf \'#!/bin/sh\\\\ntouch {BASE}/pwned\\\\n\' > hook.sh; chmod +x hook.sh; echo json.py >> .git/info/exclude")\n'
               'write("search.py", "print(\'{\\"score\\": 1000}\')")\n'
               'write("json.py", "def dumps(o): return \'{\\"score\\": 999}\'\\n")\n'
-              'return ar.eval("tamper")')
+              'return mcp.ar.eval{note = "tamper"}')
     for mode in ("default", "autopilot"):
         path = workspace(f"tamper-{mode}")
         with harness.provider(once(tamper)) as (url, _):
@@ -459,8 +479,8 @@ def scenario_06():
     files = {"cand.py": "value = 0\n",
              "search.py": 'import json, cand; print(json.dumps({"score": 0, "report": {"leak": repr(cand.value)}}))'}
     path = workspace("envleak", files, 'editable = ["cand.py"]\neval = "python3 search.py"\ntimeout = 30\n')
-    snoop = ('write("cand.py", "import os\\nvalue = [os.environ.get(\'HX_TEST_KEY\'), os.environ.get(\'HX_AR_EPISODE\')]\\n")\n'
-             'return ar.eval("snoop")')
+    snoop = ('write("cand.py", "import os\\nvalue = [os.environ.get(\'HX_TEST_KEY\'), os.environ.get(\'HX_AR_TOKEN\')]\\n")\n'
+             'return mcp.ar.eval{note = "snoop"}')
     with harness.provider(once(snoop)) as (url, requests):
         ar(path, url)
     leak = [o for o in outputs(requests) if "leak" in o]
@@ -476,7 +496,7 @@ def scenario_07():
         runs = ardir(path)
         look = (f'local r = sh("ls {runs} >/dev/null 2>&1; echo $?; ls -a .harness 2>/dev/null | grep -c log")\n'
                 f'local ok, e = pcall(read, "{runs}")\n'
-                'print(ar.eval("baseline"))\n'
+                'print(mcp.ar.eval{note = "baseline"})\n'
                 'return "OUT " .. r.stdout:gsub("\\n", " ") .. " READ " .. tostring(e)')
         with harness.provider(once(look, ("research", "r1-w1"))) as (url, requests):
             result = ar(path, url, extra=["--yes"] if mode == "autopilot" else [])
@@ -493,7 +513,7 @@ def scenario_07():
 def scenario_08():
     # 5. A late writer cannot change what is scored: the evaluator reads a private copy of the snapshot.
     race = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    time.sleep(0.3)\\n    open(\'x.txt\',\'w\').write(\'7\\\\n\')\\n    os._exit(0)\\n")\n'
-            'sh("python3 d.py >/dev/null 2>&1 </dev/null")\nreturn ar.eval("honest x=0")')
+            'sh("python3 d.py >/dev/null 2>&1 </dev/null")\nreturn mcp.ar.eval{note = "honest x=0"}')
     path = workspace("race", spec='editable = ["x.txt"]\neval = "sleep 1; python3 search.py"\ntimeout = 30\n')
     with harness.provider(once(race)) as (url, _):
         report = report_of(ar(path, url))
@@ -507,7 +527,7 @@ def scenario_09():
     # 6. Binary files and symlinks in an editable directory are carried or skipped, never fatal.
     files = {"pkg/a.txt": "0\n", "search.py": 'import json, os; print(json.dumps({"score": int(os.path.exists("pkg/blob.bin"))}))'}
     path = workspace("binary", files, 'editable = ["pkg"]\neval = "python3 search.py"\ntimeout = 30\n')
-    junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn ar.eval("junk")'
+    junk = 'sh("printf \'\\\\377\\\\376\' > pkg/blob.bin; ln -s /etc/hosts pkg/link")\nreturn mcp.ar.eval{note = "junk"}'
     with harness.provider(once(junk)) as (url, _):
         report = report_of(ar(path, url))
     snap = json.loads((ardir(path) / report["run"] / "snaps" / f"{ledger(path, report)[0]['snap']}.json").read_text())
@@ -520,7 +540,7 @@ def scenario_10():
     # of the plan continues.
     path = workspace("resume")
     with harness.provider(slow) as (url, _):
-        process = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        process = subprocess.Popen(command(path, url), env=trusted(path), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
         deadline, journal = time.time() + 180, None
         while time.time() < deadline:
@@ -535,14 +555,12 @@ def scenario_10():
         assert journal, "never caught round 1 with a worker in flight"
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
-        for torn in (journal, journal.parent / "ledger.jsonl"):
-            with open(torn, "a") as f:
-                f.write('{"kind": "fini')
+        with open(journal, "a") as f:
+            f.write('{"kind": "fini')
         (path / ".harness/ar.toml").write_text((path / ".harness/ar.toml").read_text() + "# edited after launch\n")
         untrusted = {k: v for k, v in harness.ENV.items() if k != "HX_TRUST"}
         untrusted["XDG_CONFIG_HOME"] = str(BASE / "empty-trust-store")
-        result = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(journal.parent), "--workspace", str(path)],
-                                env=untrusted, capture_output=True, text=True, timeout=600)
+        result = resume(journal.parent, path, untrusted)
         assert result.returncode == 0, result.stderr[-3000:]
     report = report_of(result)
     records = [json.loads(l) for l in journal.read_text().splitlines()]
@@ -552,7 +570,7 @@ def scenario_10():
     assert not Path(killed["scratch"]).exists(), "killed episode's scratch copy left behind"
     assert any(r["kind"] == "started" and r["label"] == "r1-w6.2" for r in records), "the interrupted worker was not retried"
     run = journal.parent
-    mine = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines() if json.loads(l)["worker"].startswith("r1-w6")]
+    mine = [c for c in journal_of(run, "claimed") if c["worker"].startswith("r1-w6")]
     assert [c["worker"] for c in mine] == ["r1-w6"], mine
     assert any(r["episode"] == "r1-w6.2" and r["idea"] == mine[0]["n"] for r in ledger(path, report)), "the retry did not keep its claim"
     assert sum(r["kind"] == "planned" and r["batch"] == "round1" for r in records) == 1 and report["rounds"] >= 3
@@ -564,7 +582,7 @@ def scenario_11():
     # 7b. A run killed during an audit re-runs that audit on resume; no candidate passes unaudited.
     path = workspace("resume-audit")
     with harness.provider(slow_audit) as (url, _):
-        process = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        process = subprocess.Popen(command(path, url), env=trusted(path), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
         deadline, journal = time.time() + 180, None
         while time.time() < deadline:
@@ -579,8 +597,7 @@ def scenario_11():
         time.sleep(1)
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
-        result = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(journal.parent), "--workspace", str(path)],
-                                env=harness.ENV, capture_output=True, text=True, timeout=600)
+        result = resume(journal.parent, path)
         assert result.returncode == 0, result.stderr[-3000:]
     records = [json.loads(l) for l in journal.read_text().splitlines()]
     audited = [r for r in records if r["kind"] == "audited"]
@@ -592,22 +609,52 @@ def scenario_11():
 
 
 def scenario_12():
-    # 7c. Stopping the orchestrator stops everything it started: episode children and the commands they run.
-    path = workspace("stop")
-    marker = f"sleep 47{os.getpid() % 100}"
-    with harness.provider(once(f'sh("{marker}")\nreturn "late"')) as (url, _):
-        process = subprocess.Popen(command(path, url), env=harness.ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        deadline = time.time() + 60
-        while time.time() < deadline and marker not in subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True).stdout:
-            time.sleep(0.1)
-        assert time.time() < deadline, "the research episode never started its command"
-        process.terminate()  # SIGTERM to the orchestrator alone, as a stop button sends
-        process.wait(timeout=30)
-        time.sleep(2)
-        left = [l for l in subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True).stdout.splitlines()
-                if marker in l or (str(path) in l and "hx" in l)]
-    assert not left, left
-    check("stopping the orchestrator stops its episode children and the commands they run")
+    # 7c. Stopping the orchestrator stops everything it started: episode children and the commands they run. So does
+    # killing it outright, which leaves it no chance to clean up: its children stop when it dies.
+    for name, sig in (("stop", signal.SIGTERM), ("orphan", signal.SIGKILL)):
+        path = workspace(name)
+        marker = f"sleep 4{sig}{os.getpid() % 100}"
+        with harness.provider(once(f'sh("{marker}")\nreturn "late"')) as (url, _):
+            process = subprocess.Popen(command(path, url), env=trusted(path), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            deadline = time.time() + 60
+            while time.time() < deadline and marker not in subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True).stdout:
+                time.sleep(0.1)
+            assert time.time() < deadline, "the research episode never started its command"
+            process.send_signal(sig)  # to the orchestrator alone: a stop button, or the OOM killer
+            process.wait(timeout=30)
+            time.sleep(2)
+            runs = str(ardir(path))
+            left = [l for l in subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True).stdout.splitlines()
+                    if marker in l or (str(path) in l and "hx" in l) or runs in l]
+        assert not left, (name, left)
+    check("stopping or killing the orchestrator stops its episode children and the commands they run")
+
+
+def scenario_token():
+    # An episode reaches the orchestrator only through its own token: a request without one, or with a made-up one, is
+    # refused, and a repeated claim (its first answer lost, say) gets the first answer again.
+    path = workspace("token")
+    probe = ('import json, re, sys, urllib.request\n'
+             'url = re.search(r\'url = "([^"]+)"\', open(".harness/mcp.toml").read())[1]\n'
+             'for token in (None, "made-up"):\n'
+             '    req = urllib.request.Request(url, data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(),\n'
+             '                                 headers={"content-type": "application/json", **({"authorization": "Bearer " + token} if token else {})})\n'
+             '    try:\n'
+             '        urllib.request.urlopen(req, timeout=10); print("ANSWERED")\n'
+             '    except urllib.error.HTTPError as e:\n'
+             '        print("HTTP", e.code)\n')
+    idea = "a probe idea from worker r1-w1 used only by the isolation checks"  # what `once` claims first
+    code = (f'write("probe.py", {json.dumps(probe)})\nlocal r = sh("python3 probe.py")\n'
+            f'local a = mcp.ar.claim{{idea = "{idea}"}}\nlocal b = mcp.ar.claim{{idea = "{idea}"}}\n'
+            'local ok, e = pcall(mcp.ar.claim, {idea = "a different idea that this same worker would like to claim as well"})\n'
+            'mcp.ar.eval{note = "probe"}\n'
+            'return "TOKEN " .. r.stdout:gsub("\\n", " ") .. " SAME " .. tostring(a.n == b.n and b.ok) .. " OTHER " .. tostring(e)')
+    with harness.provider(once(code, ("r1-w1",))) as (url, requests):
+        ar(path, url)
+    out = [o for o in outputs(requests) if "TOKEN " in o][0]
+    assert "HTTP 401 HTTP 401" in out and "ANSWERED" not in out, out
+    assert "SAME true" in out and "already claimed" in out, out
+    check("an episode's calls need its own token; a repeated claim gets the same answer, a second idea is refused")
 
 
 def scenario_13():
@@ -644,7 +691,7 @@ def scenario_16():
     spec = (f'editable = ["x.txt"]\neval = "python3 search.py"\nselect = "sh {grader}/score.sh {holdout}"\n'
             f'grader = ["{grader}"]\nholdout = ["{holdout}"]\ntimeout = 30\n')
     path = workspace("holdout", spec=spec)
-    with harness.provider(once('return ar.eval("baseline")')) as (url, _):
+    with harness.provider(once('return mcp.ar.eval{note = "baseline"}')) as (url, _):
         report = report_of(ar(path, url))
     assert all(r["score"] == -49 for r in ledger(path, report)) and report["select"] == 1, (ledger(path, report), report["select"])
     check("search and select invoke their configured evaluator commands")
@@ -657,11 +704,11 @@ def scenario_17():
     path = workspace("autopilot-seal", spec=spec)
     (ardir(path) / "old-run").mkdir(parents=True)
     (ardir(path) / "old-run/ledger.jsonl").write_text("secret ledger")
-    look = ('local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_EPISODE\'")\n'
+    look = ('local r = sh("env | grep -c -E \'HX_TEST_KEY|HX_AR_TOKEN\'")\n'
             f'local a, ae = pcall(read, "{ardir(path)}/old-run/ledger.jsonl")\n'
             f'local b, be = pcall(read, "{holdout}/secret.txt")\n'
             f'local c, ce = pcall(write, "{grader}/score.sh", "x")\n'
-            'print(ar.eval("b"))\nreturn "OUT " .. r.stdout .. tostring(ae) .. tostring(be) .. tostring(ce)')
+            'print(mcp.ar.eval{note = "b"})\nreturn "OUT " .. r.stdout .. tostring(ae) .. tostring(be) .. tostring(ce)')
     with harness.provider(once(look)) as (url, requests):
         ar(path, url, extra=["--yes"])
     outs = [o for o in outputs(requests) if "OUT " in o]
@@ -676,7 +723,7 @@ def scenario_18():
     files = {"x.txt": "0\n", "pid.txt": "", "search.py": 'import json, subprocess, os\np = subprocess.Popen(["python3", "-c", "import os, time; os.setsid(); time.sleep(300)"], start_new_session=True)\nprint(json.dumps({"score": 0, "report": {"evaluator_daemon": p.pid}}))'}
     path = workspace("reap", files, spec)
     daemon = ('write("d.py", "import os, time\\nif os.fork() == 0:\\n    os.setsid()\\n    open(\'pid.txt\', \'w\').write(str(os.getpid()))\\n    time.sleep(300)\\nos._exit(0)\\n")\n'
-              'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn ar.eval("daemon")')
+              'sh("python3 d.py >/dev/null 2>&1 </dev/null; sleep 0.5")\nreturn mcp.ar.eval{note = "daemon"}')
     with harness.provider(once(daemon)) as (url, requests):
         report = report_of(ar(path, url))
     snap = ledger(path, report)[0]["snap"]
@@ -699,9 +746,9 @@ def scenario_19():
     # 15. Snapshot limits: too many files or too deep a tree is refused per eval, never fatal to the run.
     files = {"pkg/a.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'}
     path = workspace("limits", files, 'editable = ["pkg"]\neval = "python3 search.py"\ntimeout = 30\n')
-    code = ('sh("mkdir -p pkg/many && cd pkg/many && seq 1 10001 | xargs touch")\nlocal ok1, e1 = pcall(ar.eval, "many")\n'
-            'sh("rm -rf pkg/many; mkdir -p pkg/$(printf \'d/%.0s\' $(seq 1 40))")\nlocal ok2, e2 = pcall(ar.eval, "deep")\n'
-            'sh("rm -rf pkg/d")\nprint(ar.eval("fine"))\nreturn "E1 " .. tostring(e1) .. " E2 " .. tostring(e2)')
+    code = ('sh("mkdir -p pkg/many && cd pkg/many && seq 1 10001 | xargs touch")\nlocal ok1, e1 = pcall(mcp.ar.eval, {note = "many"})\n'
+            'sh("rm -rf pkg/many; mkdir -p pkg/$(printf \'d/%.0s\' $(seq 1 40))")\nlocal ok2, e2 = pcall(mcp.ar.eval, {note = "deep"})\n'
+            'sh("rm -rf pkg/d")\nprint(mcp.ar.eval{note = "fine"})\nreturn "E1 " .. tostring(e1) .. " E2 " .. tostring(e2)')
     with harness.provider(once(code)) as (url, requests):
         report = report_of(ar(path, url))
     outs = " ".join(outputs(requests))
@@ -715,17 +762,17 @@ def scenario_20():
              "subst.txt": "$Format:%H$\n",
              "search.py": 'import json\nok = open("hidden.txt").read() == "here\\n" and open("subst.txt").read() == "$Format:%H$\\n"\nprint(json.dumps({"score": 1 if ok else 0}))'}
     path = workspace("attributes", files, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
-    with harness.provider(once('return ar.eval("b")')) as (url, _):
+    with harness.provider(once('return mcp.ar.eval{note = "b"}')) as (url, _):
         report = report_of(ar(path, url))
     assert ledger(path, report)[0]["score"] == 1, ledger(path, report)
     check("the frozen base ignores export attributes")
 
 
 def scenario_21():
-    # 16b. A deterministic evaluator scores each state once; ar.reset() restores the best state.
-    code = ('print("A", ar.eval("baseline").cached)\nwrite("x.txt", "6\\n")\nprint("B", ar.eval("six").improved)\n'
-            'write("x.txt", "1\\n")\nprint("C", ar.eval("one").improved)\nprint("R", ar.reset().best)\n'
-            'print("X", read("x.txt"))\nlocal r = ar.eval("six again")\nreturn "D " .. tostring(r.cached) .. " " .. r.n')
+    # 16b. A deterministic evaluator scores each state once; reset restores the best state.
+    code = ('print("A", mcp.ar.eval{note = "baseline"}.cached)\nwrite("x.txt", "6\\n")\nprint("B", mcp.ar.eval{note = "six"}.improved)\n'
+            'write("x.txt", "1\\n")\nprint("C", mcp.ar.eval{note = "one"}.improved)\nprint("R", mcp.ar.reset{}.best)\n'
+            'print("X", read("x.txt"))\nlocal r = mcp.ar.eval{note = "six again"}\nreturn "D " .. tostring(r.cached) .. " " .. r.n')
     path = workspace("reset")
     with harness.provider(once(code, ("r1-w1",))) as (url, requests):
         report = report_of(ar(path, url))
@@ -733,41 +780,43 @@ def scenario_21():
     assert "A nil" in out and "B true" in out and "C false" in out and "R -1" in out and "X 6" in out and "D true 2" in out, out
     rows = ledger(path, report)
     assert [r["note"] for r in rows[:3]] == ["baseline", "six", "one"] and not any(r["note"] == "six again" for r in rows), rows
-    check("re-scoring a scored state returns the stored result without a ledger row, and ar.reset restores the best")
+    check("re-scoring a scored state returns the stored result without a ledger row, and reset restores the best")
 
 
 def scenario_22():
-    # 16c. ar.reset never writes or deletes through a symlink the agent planted in an editable path's parent.
+    # 16c. reset never writes or deletes through a symlink the agent planted in an editable path's parent.
     outside = BASE / "outside"
     outside.mkdir()
     (outside / "x.txt").write_text("keep\n")
-    code = (f'print(ar.eval("baseline"))\nsh("rm -rf pkg && ln -s {outside} pkg")\n'
-            'local ok, e = pcall(ar.reset)\nreturn "RESET " .. tostring(ok) .. " " .. tostring(e)')
+    code = (f'print(mcp.ar.eval{{note = "baseline"}})\nsh("rm -rf pkg && ln -s {outside} pkg")\n'
+            'local ok, e = pcall(mcp.ar.reset)\nreturn "RESET " .. tostring(ok) .. " " .. tostring(e)')
     path = workspace("reset-link", {"pkg/x.txt": "0\n", "search.py": 'import json; print(json.dumps({"score": 1}))'},
                      'editable = ["pkg/x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
     with harness.provider(once(code, ("r1-w1",))) as (url, requests):
         ar(path, url)
     out = [o for o in outputs(requests) if "RESET " in o][0]
     assert "RESET false" in out and (outside / "x.txt").read_text() == "keep\n", (out, list(outside.iterdir()))
-    check("ar.reset refuses a symlinked parent and leaves the link target untouched")
+    check("reset refuses a symlinked parent and leaves the link target untouched")
 
 
 def scenario_23():
     # 17. Launch validation.
     path = workspace("flags")
-    base_cmd = [str(harness.HX), "run", "--ar", "--workspace", str(path), "--prompt-file", str(path / "program.md"), "--model", "mock"]
-    result = subprocess.run(base_cmd[:-4] + ["--model", "mock"], env=harness.ENV, capture_output=True, text=True)
-    assert result.returncode != 0 and "--prompt-file" in result.stderr, result.stderr
-    result = subprocess.run(base_cmd + ["--max-turns", "5"], env=harness.ENV, capture_output=True, text=True)
-    assert result.returncode != 0 and "--max-turns cannot be combined with --ar" in result.stderr, result.stderr
-    (path / "notes.txt").write_text("uncommitted")
+    base_cmd = [str(HX_AR), "--workspace", str(path), "--prompt-file", str(path / "program.md"), "--model", "mock"]
+    result = subprocess.run(base_cmd[:-4] + ["--model", "mock"], env=trusted(path), capture_output=True, text=True)
+    assert result.returncode == 2 and "--prompt-file" in result.stderr, result.stderr
+    result = subprocess.run(base_cmd + ["--max-turns", "5"], env=trusted(path), capture_output=True, text=True)
+    assert result.returncode == 2 and "--max-turns cannot be passed to hx-ar" in result.stderr, result.stderr
     result = subprocess.run(base_cmd, env=harness.ENV, capture_output=True, text=True)
+    assert result.returncode != 0 and "hx trust" in result.stderr, result.stderr
+    (path / "notes.txt").write_text("uncommitted")
+    result = subprocess.run(base_cmd, env=trusted(path), capture_output=True, text=True)
     assert result.returncode != 0 and "notes.txt" in result.stderr, result.stderr
     (path / "notes.txt").unlink()
     (path / ".harness/ar.toml").write_text('editable = ["."]\neval = "true"\n')
-    result = subprocess.run(base_cmd, env=harness.ENV, capture_output=True, text=True)
+    result = subprocess.run(base_cmd, env=trusted(path), capture_output=True, text=True)
     assert result.returncode != 0 and "editable path" in result.stderr, result.stderr
-    check("launch requires a program, a clean scope and sane editable paths; episodes are limited in turns, not by flags")
+    check("launch requires a program, trusted config, a clean scope and sane editable paths; episodes are limited in turns, not by flags")
 
 
 def scenario_fallback():
@@ -783,7 +832,7 @@ def scenario_fallback():
         report = report_of(ar(path, url))
     run = ardir(path) / report["run"]
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
-    claims = [json.loads(l) for l in (run / "claims.jsonl").read_text().splitlines()]
+    claims = journal_of(run, "claimed")
     six = next(c["n"] for c in claims if c["scope"] == "explore" and c["idea"] == go(6))
     assert any(r["kind"] == "audited" and r["idea"] == six and not r["pass"] for r in records), "the x = 7 state was never failed"
     kept = next(p for p in report["portfolio"] if p["idea"] == six)
@@ -809,8 +858,7 @@ def scenario_stall():
         assert [r["batch"] for r in records if r["kind"] == "stalled"] == ["round2"], records[-3:]
         assert not any(r["kind"] == "gate" and r["round"] == 2 for r in records)
         down[0] = False
-        resumed = subprocess.run([str(harness.HX), "run", "--ar", "--resume", str(run), "--workspace", str(path)],
-                                 env=harness.ENV, capture_output=True, text=True, timeout=600)
+        resumed = resume(run, path)
     assert resumed.returncode == 0 and (run / "report.json").exists(), resumed.stderr[-3000:]
     records = [json.loads(l) for l in (run / "journal.jsonl").read_text().splitlines()]
     assert any(r["kind"] == "started" and r["label"] == "r2-w1.4" for r in records), [r.get("label") for r in records]
@@ -826,7 +874,7 @@ def scenario_modes():
     os.chmod(path / "tool/run.sh", 0o750)
     subprocess.run(["git", "commit", "-qam", "exec"], cwd=path, check=True)
     os.symlink("run.sh", path / "tool/link.sh")
-    with harness.provider(once('return ar.eval("probe")')) as (url, _):
+    with harness.provider(once('return mcp.ar.eval{note = "probe"}')) as (url, _):
         report = report_of(ar(path, url))
     assert all(r["valid"] and r["score"] == 1 for r in ledger(path, report)), ledger(path, report)
     assert os.stat(path / "tool/run.sh").st_mode & 0o777 == 0o750 and (path / "tool/link.sh").is_symlink()
@@ -837,7 +885,7 @@ def scenario_noisy():
     # With a noisy evaluator, scoring the same files again refines their mean; it is never a new improvement.
     noisy = 'import json, random; x = int(open("x.txt").read()); print(json.dumps({"score": x + random.gauss(0, 0.5), "se": 0.5}))'
     path = workspace("noisy", {"x.txt": "0\n", "search.py": noisy}, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
-    code = 'write("x.txt", "1\\n")\nlocal n = 0\nfor i = 1, 20 do if ar.eval("same").improved then n = n + 1 end end\nreturn "IMPROVED " .. n'
+    code = 'write("x.txt", "1\\n")\nlocal n = 0\nfor i = 1, 20 do if mcp.ar.eval{note = "same"}.improved then n = n + 1 end end\nreturn "IMPROVED " .. n'
     with harness.provider(once(code, ("r1-w1",))) as (url, requests):
         report = report_of(ar(path, url))
     mine = [r for r in ledger(path, report) if r["episode"] == "r1-w1"]
@@ -854,7 +902,7 @@ def scenario_partly_noisy():
     partly = ('import json, random; x = int(open("x.txt").read())\n'
               'print(json.dumps({"score": x + random.gauss(0, 0.5), "se": 0.5} if x == 0 else {"score": x + random.random()}))')
     path = workspace("partly-noisy", {"x.txt": "0\n", "search.py": partly}, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
-    code = 'write("x.txt", "2\\n")\nlocal a, b = ar.eval("two"), ar.eval("two again")\nreturn "CACHED " .. tostring(b.cached)'
+    code = 'write("x.txt", "2\\n")\nlocal a, b = mcp.ar.eval{note = "two"}, mcp.ar.eval{note = "two again"}\nreturn "CACHED " .. tostring(b.cached)'
     with harness.provider(once(code, ("r1-w1",))) as (url, requests):
         report = report_of(ar(path, url))
     out = [o for o in outputs(requests) if "CACHED " in o][0]
@@ -864,7 +912,10 @@ def scenario_partly_noisy():
 
 
 # Scenarios are independent (own workspace, own mock provider), so a few run side by side; more would load the machine.
+# Arguments name scenarios to run (`scenario_21`); none runs them all.
+import sys
+chosen = [v for k, v in sorted(globals().items()) if k.startswith("scenario_") and (len(sys.argv) < 2 or k in sys.argv[1:])]
 with ThreadPoolExecutor(max_workers=4) as pool:
-    for future in [pool.submit(f) for f in [v for k, v in sorted(globals().items()) if k.startswith("scenario_")]]:
+    for future in [pool.submit(f) for f in chosen]:
         future.result()
 print(f"{passed}/{passed} ar checks passed")

@@ -20,9 +20,9 @@ Every command takes `--help`.
 | `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
 | `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
 | `hx log verify LOG` | Check a log's hash chain and the session its records name, the blobs it references and its recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
-| `hx paths` | Print where hx keeps this workspace's files, one `name: path` per line: `log`, `ar` (autoresearch runs), `secrets`, and the `trust` store |
+| `hx paths` | Print where hx keeps this workspace's files, one `name: path` per line: `log`, `state` (the workspace's state directory, which holds `log` and the files of programs built on hx), `secrets`, and the `trust` store |
 
-`LOG` is a run name, such as `1794591703-21202`, for that run's journal in the workspace's log directory, or a path to a journal (`./NAME.jsonl` for one in the current directory). `hx run --ar --resume RUN` takes a run name in the workspace's autoresearch directory, or a path.
+`LOG` is a run name, such as `1794591703-21202`, for that run's journal in the workspace's log directory, or a path to a journal (`./NAME.jsonl` for one in the current directory).
 
 ## `hx run` flags
 
@@ -40,7 +40,6 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--yes` | off | Autopilot: automatically approve ordinary missing file-tool permissions and external actions for this run; irreversible commands still need an exact `allow` entry or a terminal answer |
 | `--rpi` | off | Activate the bundled [RPI workflow](workflows.md#rpi-research-design-implement-verify) in automatic mode |
 | `--manual` | off | With `--rpi`, pause for research/design reviews and final acceptance |
-| `--ar` | off | [Autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`; needs a prompt or `--prompt-file` (the program); runs until progress stops |
 | `--model M` | `HX_MODEL` | Model id |
 | `--base-url U` | `HX_BASE_URL` | Responses API base URL; defaults to OpenRouter |
 | `--key-env E` | `OPENROUTER_API_KEY` | Env var holding the API key |
@@ -85,7 +84,7 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 ## Report and logs
 
-`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer`, tokens and `log`, the path of the run's event log. Event logs live outside the workspace, in hx's state directory: `$XDG_STATE_HOME/hx/workspaces/NAME-ID/log/` (default `~/.local/state/hx/...`; `NAME` is the workspace directory's name, `ID` 16 hex digits of the SHA-256 of its canonical path). `hx paths` prints the directory. The log stores file contents and command output as blobs in its `blobs/` directory, so treat it as sensitive. A `.harness/log`, `.harness/ar` or `.harness/secrets.toml` left in a workspace by an earlier version is not read; hx says so at each launch and names the new location.
+`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer`, tokens and `log`, the path of the run's event log. Event logs live outside the workspace, in hx's state directory: `$XDG_STATE_HOME/hx/workspaces/NAME-ID/log/` (default `~/.local/state/hx/...`; `NAME` is the workspace directory's name, `ID` 16 hex digits of the SHA-256 of its canonical path). `hx paths` prints the directory. The log stores file contents and command output as blobs in its `blobs/` directory, so treat it as sensitive. A `.harness/log` or `.harness/secrets.toml` left in a workspace by an earlier version is not read; hx says so at each launch and names the new location.
 
 ## Checkpoints and resume
 
@@ -98,3 +97,14 @@ Interrupted local `write`/`edit` settle themselves from the evidence when the fi
 `--branch LOG` starts a new run with new settings and the inherited saved data.
 
 The full rules are in [Runtime v2](runtime-v2.md#resume-and-branch).
+
+## `hx-ar`
+
+`hx-ar`, built and installed beside `hx`, runs [autoresearch](workflows.md#autoresearch) over `.harness/ar.toml`. It runs its episodes with the `hx` binary in the same directory.
+
+| Command | What it does |
+|---|---|
+| `hx-ar --prompt-file PROGRAM [run flags]` | Start a run; `PROGRAM` is the task text every episode gets. Runs until progress stops and prints a JSON report |
+| `hx-ar --resume RUN` | Continue a stopped run with its frozen launch settings; `RUN` is a run name in the workspace's autoresearch directory (`ar/` in the `state` directory `hx paths` prints), or a path |
+
+Both take `--workspace DIR` (default `.`). The run flags `--model`, `--base-url`, `--key-env`, `--reasoning`, `--max-output`, `--context-window`, `--provider-only`, `--pack`, `--approval` and `--yes` pass through to every episode's `hx run`; any other flag is a usage error (exit 2). `HX_AR_RETRY_SECS` sets the base pause before a batch whose every episode crashed is tried again (default 60). Exit status: 0 with a report, 1 on an error (a batch that keeps failing, a run without evaluations), 2 on a usage error, and 129, 130 or 143 when stopped by a signal, which stops its episodes and evaluators too.

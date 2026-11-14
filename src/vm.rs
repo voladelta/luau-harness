@@ -304,7 +304,7 @@ mod session_budget_tests {
         let dir = std::env::temp_dir().join(format!("hx-chunk-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None).unwrap());
         let vm = Vm::new(policy, Duration::from_millis(30), 32 << 20, None).unwrap();
         let waited = vm
             .session
@@ -326,7 +326,7 @@ mod session_budget_tests {
         let dir = std::env::temp_dir().join(format!("hx-slow-native-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None).unwrap());
         let vm = Vm::new(policy, Duration::from_millis(300), 64 << 20, None).unwrap();
         // Each iteration is one interrupt and a sort of tens of milliseconds.
         let code = "local t = table.create(1e6, 0); for i = 1, 1e6 do t[i] = i end; while true do table.sort(t) end";
@@ -378,7 +378,7 @@ mod session_budget_tests {
         let dir = std::env::temp_dir().join(format!("hx-package-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None).unwrap());
         let vm = Vm::new(policy.clone(), Duration::from_millis(30), 32 << 20, None).unwrap();
         let mut registry = crate::modules::Registry::capture(&dir, &dirs).unwrap();
         let caps = crate::supervisor::Capabilities::from([crate::supervisor::Capability::ProcSh]);
@@ -428,7 +428,7 @@ mod boundary_tests {
         let dir = std::env::temp_dir().join(format!("hx-boundary-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dirs = crate::dirs::TestDirs::new();
-        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None, None).unwrap());
+        let policy = Arc::new(Policy::new(&dirs, &dir, false, None, None).unwrap());
         (Vm::new(policy, budget, mem_limit, None).unwrap(), dir, dirs)
     }
 
@@ -1162,97 +1162,6 @@ impl Vm {
             )?;
             stage.set_readonly(true);
             g.set("stage", stage)?;
-        }
-        if policy.episode.is_some() && host.as_ref().is_some_and(|h| h.depth == 0) {
-            // ar.eval(note) is the only way an autoresearch episode scores a state, ar.claim(idea) claims what a worker tests,
-            // and ar.reset() restores the worker's best state (see ar.rs).
-            let ar = lua.create_table()?;
-            let afx = fx.clone();
-            ar.set(
-                "eval",
-                lua.create_async_function(move |lua, note: Option<String>| {
-                    let fx = afx.clone();
-                    async move {
-                        let note = note.unwrap_or_default();
-                        let result = fx
-                            .run(
-                                &lua,
-                                crate::supervisor::Tool::Sh,
-                                Class::LocalWrite,
-                                json!({"ar_eval": &note}),
-                                || async {
-                                    crate::ar::eval(&fx.pol, note.clone())
-                                        .await
-                                        .map(Ret::Json)
-                                        .map_err(|e| crate::effects::rt(format!("ar.eval: {e}")))
-                                },
-                            )
-                            .await?;
-                        prims::json_value(&lua, result)
-                    }
-                })?,
-            )?;
-            let afx = fx.clone();
-            let ahost = host
-                .clone()
-                .expect("autoresearch episodes run at depth 0 with a host");
-            ar.set(
-                "claim",
-                lua.create_async_function(move |lua, idea: String| {
-                    let (fx, host) = (afx.clone(), ahost.clone());
-                    async move {
-                        let result = fx
-                            .run(
-                                &lua,
-                                crate::supervisor::Tool::Sh,
-                                Class::LocalWrite,
-                                json!({"ar_claim": &idea}),
-                                || async {
-                                    crate::ar::claim(&host, idea.clone())
-                                        .await
-                                        .map(Ret::Json)
-                                        .map_err(|e| crate::effects::rt(format!("ar.claim: {e}")))
-                                },
-                            )
-                            .await?;
-                        prims::json_value(&lua, result)
-                    }
-                })?,
-            )?;
-            let afx = fx.clone();
-            let cpol = policy.clone();
-            ar.set(
-                "claims",
-                lua.create_function(move |lua, ()| {
-                    let listed = crate::ar::claims(&cpol)
-                        .map_err(|e| crate::effects::rt(format!("ar.claims: {e}")))?;
-                    prims::json_value(lua, Ret::Json(listed))
-                })?,
-            )?;
-            ar.set(
-                "reset",
-                lua.create_async_function(move |lua, ()| {
-                    let fx = afx.clone();
-                    async move {
-                        let result = fx
-                            .run(
-                                &lua,
-                                crate::supervisor::Tool::Sh,
-                                Class::LocalWrite,
-                                json!({"ar_reset": true}),
-                                || async {
-                                    crate::ar::reset(&fx.pol)
-                                        .map(Ret::Json)
-                                        .map_err(|e| crate::effects::rt(format!("ar.reset: {e}")))
-                                },
-                            )
-                            .await?;
-                        prims::json_value(&lua, result)
-                    }
-                })?,
-            )?;
-            ar.set_readonly(true);
-            g.set("ar", ar)?;
         }
         let saved = host
             .as_ref()

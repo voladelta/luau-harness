@@ -14,7 +14,7 @@ check "--yes still writes a log" "$(ls "$(logdir $W)"/*.jsonl 2>/dev/null | wc -
 $H staged --workspace $W >/dev/null
 check "admin commands open no log session" "$(ls "$(logdir $W)"/*.jsonl | wc -l | tr -d ' ')" "1"
 check "the log lives in hx's state directory, not the workspace" "$(logdir $W | grep -c "^$XDG_STATE_HOME/hx/workspaces/n-[0-9a-f]\{16\}/log$")$([ -e $W/.harness/log ] && echo IN-TREE)" "1"
-check "hx paths names the log, ar, secrets and trust locations" "$($H paths --workspace $W | cut -d: -f1 | tr '\n' ' ')" "log ar secrets trust "
+check "hx paths names the log, state, secrets and trust locations" "$($H paths --workspace $W | cut -d: -f1 | tr '\n' ' ')" "log state secrets trust "
 
 # --- 0b. --yes automatically grants ordinary paths and commands, but .harness/ and hx.lock stay read-only (through file tools)
 newws y

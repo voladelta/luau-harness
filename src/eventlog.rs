@@ -869,8 +869,7 @@ mod open_tests {
         let path = three_records("write-failure");
         let dirs = crate::dirs::TestDirs::new();
         let mut pol =
-            crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None)
-                .unwrap();
+            crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None).unwrap();
         pol.log = Arc::new(EventLog {
             inner: Mutex::new(Inner {
                 file: std::fs::File::open(&path).unwrap(),
@@ -915,8 +914,7 @@ mod open_tests {
         let path = three_records("blob-failure");
         let dirs = crate::dirs::TestDirs::new();
         let pol =
-            crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None, None)
-                .unwrap();
+            crate::policy::Policy::new(&dirs, path.parent().unwrap(), false, None, None).unwrap();
         let log_path = pol.log.path.clone();
         std::fs::write(log_path.parent().unwrap().join("blobs"), "not a directory").unwrap();
         let fx = crate::effects::Effects::new(Arc::new(pol), 0, Arc::default());
