@@ -3,7 +3,8 @@
 Over stdio, tools/list answers in pages of three (nextCursor); `exit` answers, closes its input, creates `exited` and
 then exits, so a check can wait for `exited` and know the next write finds no reader; `ask_ping` sends the
 client a ping request and answers only once the client has replied to it. `rpc_error` answers with a JSON-RPC error.
-`read_spawn` starts a long-lived child (as a wrapper like npx would) and writes its pid to spawned.pid."""
+`read_spawn` starts a long-lived child (as a wrapper like npx would; in its own session with `detach`) and writes its
+pid to spawned.pid."""
 import json, os, socket, subprocess, sys
 
 def schema(**props):
@@ -60,7 +61,8 @@ def call(name, a):
     if name == "exit":
         return text("bye")
     if name == "read_spawn":
-        child = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=bool(a.get("detach")))
         with open("spawned.pid", "w") as f:
             f.write(str(child.pid))
         return text("spawned")

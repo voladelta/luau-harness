@@ -773,35 +773,12 @@ impl ShellEnv {
     }
 }
 
-/// Make `command` start its child in a new session, so the child leads its own process group and `GroupKill` can take
-/// down everything it starts (except processes that leave the group themselves), and, when `ruleset` is given, under
-/// that Landlock ruleset. The ruleset is applied last, after `setsid`.
-pub(crate) fn confine_command(
-    command: &mut tokio::process::Command,
-    ruleset: Option<Arc<crate::confine::Ruleset>>,
-) {
-    // SAFETY: the closure runs in the forked child before exec, where only async-signal-safe calls are allowed. It
-    // calls setsid(2) and `Ruleset::apply` (prctl(2) and landlock_restrict_self(2)), and on failure reads errno into
-    // an `io::Error`, which does not allocate. It takes no lock and does not allocate: the Arc was moved in by the
-    // parent and is only borrowed here.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if let Some(ruleset) = &ruleset {
-                ruleset.apply()?;
-            }
-            Ok(())
-        });
-    }
-}
-
 /// How long the output readers keep reading after the command ends (and its group is killed) before they give up on
 /// a pipe that a process outside the group still holds open.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Run `cmd` with bash: own process group, Landlock ruleset when given, capped output, killed at `secs`.
+/// Run `cmd` with bash: own session, Landlock ruleset when given, capped output, killed at `secs`. When it ends,
+/// everything it started is killed (`procs`).
 /// -> (stdout, stderr, exit code, timed out, either stream cut to its first and last MAX_CAPTURE / 2 bytes)
 ///
 /// The exit code is the command's status, or 128 + the signal number when a signal killed it (bash's convention);
@@ -825,11 +802,11 @@ pub async fn shell(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    confine_command(&mut command, env.confine.clone());
-    let mut child = command
-        .spawn()
-        .map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
-    let group = GroupKill::new(&child); // killpg on drop: also covers cancellation
+    crate::procs::confine_command(&mut command, env.confine.clone());
+    // killpg on drop: also covers cancellation
+    let (mut child, group) =
+        crate::procs::GroupKill::spawn(&mut command, crate::procs::Kind::Command)
+            .map_err(|e| rt(format!("sh: spawn failed: {e}")))?;
     let out = child.stdout.take().expect("stdout is piped");
     let err = child.stderr.take().expect("stderr is piped");
     /// The whole stream, or its first and last MAX_CAPTURE / 2 bytes around a marker (the end is where a failing
@@ -886,14 +863,25 @@ pub async fn shell(
     let (cutoff, until) = tokio::sync::watch::channel(None);
     let wait = async move {
         let status = tokio::time::timeout(limit, child.wait()).await;
-        // The command is over: kill stragglers and background jobs now. That also closes the pipes they held, so the
-        // readers finish; a process that left the group may still hold one, so the readers stop at a shared cutoff.
+        if status.is_err() {
+            // Reap the leader here, so that it is never an unregistered child of hx that someone else reaps.
+            let _ = child.kill().await;
+        }
+        // The command is over: kill stragglers and background jobs now, then whatever left the group. That also
+        // closes the pipes they held, so the readers finish; a process the sweep spares (another command is still
+        // running) may still hold one, so the readers stop at a shared cutoff.
         drop(group);
+        let swept = crate::procs::sweep_after_command().await;
         cutoff.send_replace(Some(tokio::time::Instant::now() + DRAIN_GRACE));
-        status
+        (status, swept)
     };
-    let (status, (so, cut_out), (se, cut_err)) =
+    let ((status, swept), (so, cut_out), (se, cut_err)) =
         tokio::join!(wait, drain(out, until.clone()), drain(err, until));
+    swept.map_err(|e| {
+        rt(format!(
+            "sh: cannot stop what the command left running: {e}"
+        ))
+    })?;
     let (code, timed_out) = match status {
         Ok(status) => (
             Some(exit_code(status.map_err(|e| {
@@ -914,87 +902,6 @@ fn exit_code(status: std::process::ExitStatus) -> i64 {
         (None, Some(signal)) => 128 + i64::from(signal),
         (None, None) => unreachable!("a reaped child either exited or was killed by a signal"),
     }
-}
-
-/// Kills a child's whole process group with SIGKILL when dropped (which also covers a cancelled future), and until
-/// then lists the group so `stop` kills it when hx is told to stop.
-///
-/// Contract: the child was started through `confine_command`, so it leads its own process group. Create the guard
-/// right after spawning and drop it before reaping the child or promptly after: once the leader is reaped and every
-/// member has exited, the kernel may reuse the group id. A process that leaves the group (`setsid`, `setpgid`) is
-/// not killed.
-pub(crate) struct GroupKill(i32);
-
-impl GroupKill {
-    /// None when the child has already been reaped (it has no id any more).
-    pub(crate) fn new(child: &tokio::process::Child) -> Option<Self> {
-        let group = i32::try_from(child.id()?).expect("a pid fits in pid_t");
-        GROUPS.lock().unwrap().insert(group);
-        Some(GroupKill(group))
-    }
-}
-
-impl Drop for GroupKill {
-    fn drop(&mut self) {
-        GROUPS.lock().unwrap().remove(&self.0);
-        // SAFETY: killpg(2) takes plain integers and has no memory-safety preconditions.
-        unsafe { libc::killpg(self.0, libc::SIGKILL) };
-    }
-}
-
-/// The process groups of this process's running commands and the child runs it started. A process that is told to stop
-/// runs no destructors, so `stop` takes them down itself; otherwise they would outlive it.
-static GROUPS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-static CHILDREN: std::sync::Mutex<std::collections::BTreeSet<i32>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-/// A child run, asked to stop (and so to stop its own commands) when this process stops.
-pub struct Child(i32);
-
-impl Child {
-    pub fn track(pid: u32) -> Self {
-        CHILDREN.lock().unwrap().insert(pid as i32);
-        Child(pid as i32)
-    }
-}
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        CHILDREN.lock().unwrap().remove(&self.0);
-    }
-}
-
-/// Kill every running command's process group, ask every child run to stop, end the live policies' sessions (journal
-/// record, private temp directory) and exit. Exiting here runs no destructors, so everything that must not outlive
-/// hx is registered where this can reach it.
-pub fn stop(code: i32) -> ! {
-    // SAFETY: killpg(2) and kill(2) take plain integers and have no memory-safety preconditions.
-    for group in GROUPS.lock().unwrap().iter() {
-        unsafe { libc::killpg(*group, libc::SIGKILL) };
-    }
-    for child in CHILDREN.lock().unwrap().iter() {
-        unsafe { libc::kill(*child, libc::SIGTERM) };
-    }
-    crate::policy::end_live_sessions();
-    std::process::exit(code)
-}
-
-/// Stop on SIGINT, SIGTERM or SIGHUP, taking every process this one started down with it.
-pub fn stop_on_signals() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let watch = |kind: SignalKind, code: i32| {
-        if let Ok(mut s) = signal(kind) {
-            tokio::spawn(async move {
-                if s.recv().await.is_some() {
-                    stop(code)
-                }
-            });
-        }
-    };
-    watch(SignalKind::interrupt(), 130);
-    watch(SignalKind::terminate(), 143);
-    watch(SignalKind::hangup(), 129);
 }
 
 /// An image for the model: re-encoded so its long side is at most `max` px.

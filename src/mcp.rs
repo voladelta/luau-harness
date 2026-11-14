@@ -20,7 +20,7 @@
 //!   For remote servers, the approval gate and recorded effects are the controls. No OAuth.
 use crate::net::{self, BodyError, Delivery, ResponseBudget, Sse};
 use crate::policy::Policy;
-use crate::prims::GroupKill;
+use crate::procs::GroupKill;
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -615,15 +615,13 @@ impl Mcp {
             .kill_on_drop(true);
         // The server gets the run's file policy as it stands at its start, like a shell command, and its own process
         // group, so a wrapper (`npx`, `uvx`) cannot leave the real server running when the connection is dropped.
-        crate::prims::confine_command(&mut cmd, ruleset);
-        let mut child = cmd
-            .spawn()
+        crate::procs::confine_command(&mut cmd, ruleset);
+        let (mut child, group) = GroupKill::spawn(&mut cmd, crate::procs::Kind::Server)
             .map_err(|e| anyhow!("cannot start MCP server {server}: {e}"))?;
-        let group = GroupKill::new(&child);
         let stdin = child.stdin.take().expect("stdin is piped");
         let out = BufReader::new(child.stdout.take().expect("stdout is piped"));
         Ok(Conn::Stdio(Stdio {
-            _group: group,
+            _group: Some(group),
             child,
             stdin,
             out,

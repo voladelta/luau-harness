@@ -33,6 +33,7 @@ pub mod net;
 pub mod packages;
 pub mod policy;
 pub mod prims;
+pub mod procs;
 pub mod supervisor;
 pub mod tools;
 pub mod trust;

@@ -44,6 +44,13 @@ DEMO_PASS=1 $H exec --workspace $W 'print(mcp.demo.read_spawn{}); local t = os.c
 for _ in $(seq 100); do [ -s $W/spawned.pid ] && break; sleep 0.1; done
 kill -TERM $HX; wait $HX 2>/dev/null
 check "...and when hx is stopped by a signal" "$(alive)" "gone"
+rm -f $W/spawned.pid; x 'print(mcp.demo.read_spawn{detach = true})' >/dev/null
+check "a child the server detached into its own session ends with the run" "$(alive)" "gone"
+rm -f $W/spawned.pid
+DEMO_PASS=1 $H exec --workspace $W 'print(mcp.demo.read_spawn{detach = true}); local t = os.clock(); while os.clock() - t < 20 do end' >/dev/null 2>&1 & HX=$!
+for _ in $(seq 100); do [ -s $W/spawned.pid ] && break; sleep 0.1; done
+kill -TERM $HX; wait $HX 2>/dev/null
+check "...and when hx is stopped by a signal" "$(alive)" "gone"
 
 # --- local servers get the run's file policy through Landlock when the kernel offers it, else run unconfined
 if unconfined "$W"; then

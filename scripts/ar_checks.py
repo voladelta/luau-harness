@@ -918,6 +918,33 @@ def scenario_partly_noisy():
     check("an evaluator that reported se once in the run is noisy: its results are never reused")
 
 
+def gone(pid):
+    """Whether `pid` is gone: no process, or a zombie (dead; some container inits reap lazily)."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+def scenario_orphans():
+    # 14b. A process an episode command or an evaluator detaches outside its scratch copy (its own session, cwd /) is
+    # killed when its command ends: hx and hx-ar reap every orphan of the commands they run.
+    search = ('import json, subprocess\np = subprocess.Popen(["sleep", "300"], cwd="/", start_new_session=True)\n'
+              'print(json.dumps({"score": 0, "report": {"evaluator_orphan": p.pid}}))')
+    path = workspace("orphans", {"x.txt": "0\n", "search.py": search}, 'editable = ["x.txt"]\neval = "python3 search.py"\ntimeout = 30\n')
+    code = ('local r = sh("mkfifo f; setsid sh -c \'echo $$ > orphan.pid; cd /; echo > f; exec sleep 300\' & read < f")\n'
+            'local pid = read("orphan.pid"):gsub("%s", "")\nlocal alive = sh("[ -d /proc/" .. pid .. " ] && echo alive || echo gone").stdout\n'
+            'print(mcp.ar.eval{note = "orphans"})\nreturn "ORPHAN " .. pid .. " " .. alive')
+    with harness.provider(once(code)) as (url, requests):
+        report_of(ar(path, url))
+    out = " ".join(o for o in outputs(requests) if "ORPHAN " in o)
+    agent = re.search(r"ORPHAN (\d+) (\w+)", out)
+    evaluator = [int(m) for o in outputs(requests) for m in re.findall(r"evaluator_orphan=(\d+)", o)]
+    assert agent and agent[2] == "gone" and evaluator, (out[-2000:], evaluator)
+    assert gone(int(agent[1])) and all(gone(p) for p in evaluator), (agent[1], evaluator)
+    check("an orphan of an episode's command is gone when sh returns, and an evaluator's when hx-ar is done")
+
+
 # Scenarios are independent (own workspace, own mock provider), so a few run side by side; more would load the machine.
 # Arguments name scenarios to run (`scenario_21`); none runs them all.
 import sys

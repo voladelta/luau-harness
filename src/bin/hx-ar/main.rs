@@ -213,9 +213,13 @@ async fn main() -> std::process::ExitCode {
         report(info);
         std::process::abort();
     }));
+    if let Err(e) = hx::procs::init() {
+        eprintln!("Error: cannot become the reaper of the processes hx-ar starts: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
     // A signal stops the episode children (they stop their own commands) and the running evaluators.
-    hx::prims::stop_on_signals();
-    match real_main().await {
+    hx::procs::stop_on_signals();
+    let status = match real_main().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) if e.is::<hx::ClosedStdout>() => {
             std::process::ExitCode::from(hx::CLOSED_STDOUT_STATUS)
@@ -227,7 +231,9 @@ async fn main() -> std::process::ExitCode {
             }
             std::process::ExitCode::from(if e.is::<Usage>() { 2 } else { 1 })
         }
-    }
+    };
+    hx::procs::shutdown();
+    status
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use anyhow::{Result, bail};
 #[allow(unused_imports)]
 use hx::{
     CLOSED_STDOUT_STATUS, ClosedStdout, atomic_file, batch, confine, controller, dirs, effects,
-    eventlog, history, host, llm, mcp, modules, net, out, outln, packages, policy, prims,
+    eventlog, history, host, llm, mcp, modules, net, out, outln, packages, policy, prims, procs,
     supervisor, tools, trust, values, vm, workflow, workflow_runtime,
 };
 use std::io::IsTerminal;
@@ -450,15 +450,21 @@ async fn main() -> std::process::ExitCode {
         report(info);
         std::process::abort();
     }));
-    prims::stop_on_signals();
-    match real_main().await {
+    if let Err(e) = procs::init() {
+        eprintln!("Error: cannot become the reaper of the processes hx starts: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    procs::stop_on_signals();
+    let status = match real_main().await {
         Ok(status) => status,
         Err(e) if e.is::<ClosedStdout>() => std::process::ExitCode::from(CLOSED_STDOUT_STATUS),
         Err(e) => {
             report_error(&e);
             std::process::ExitCode::from(if e.is::<Usage>() { 2 } else { 1 })
         }
-    }
+    };
+    procs::shutdown();
+    status
 }
 
 /// Print an error for the owner: its message, then its causes (or the full chain with HX_DEBUG).

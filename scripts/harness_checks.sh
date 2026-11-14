@@ -185,4 +185,34 @@ rm -rf $W5/.harness
 out=$(TMPDIR=$T/tmp5 $H exec --workspace $W5 'print(1)' 'local t = os.clock(); while os.clock() - t < 1 do end; print(2)' 2>$T/err5 | head -1; echo " ${PIPESTATUS[0]}")
 check "a closed stdout is a quiet exit" "$(echo $out) $(wc -c < $T/err5) $(ended $W5) $(ls $T/tmp5 | wc -l)" "1 141 0 True 0"
 
+# 10. Nothing a command starts outlives it, and nothing hx starts outlives hx. escape.sh NAME leaves a process behind
+# outside the command's process group (detached, double-forked, nohup'd, with a scrubbed environment, renamed to
+# confuse a /proc parser, or ignoring SIGTERM) and writes its pid to NAME.pid once it is in place.
+W6=$T/ws6; mkdir -p $W6
+cat > $W6/escape.sh <<'SH'
+mkfifo $1.fifo
+in_place="echo \$\$ > $1.pid; echo > $1.fifo"
+case $1 in
+  setsid*) setsid sh -c "$in_place; exec sleep 300" & ;;
+  doublefork) (setsid sh -c "sh -c '$in_place; exec sleep 300' &" &) ;;
+  nohup) nohup setsid sh -c "$in_place; exec sleep 300" >/dev/null 2>&1 & ;;
+  envi) env -i /usr/bin/setsid /bin/sh -c "$in_place; exec sleep 300" & ;;
+  renamed) setsid sh -c "$in_place; exec python3 -c 'import ctypes, time; ctypes.CDLL(None).prctl(15, b\"x) S 1 1 1\", 0, 0, 0); time.sleep(300)'" & ;;
+  noterm) setsid sh -c "trap '' TERM HUP INT; $in_place; while :; do sleep 1; done" & ;;
+esac
+read < $1.fifo
+SH
+# alive PID: running (a zombie is not: after hx exits, this container's init may not reap it)
+alive() { case "$(ps -o stat= -p "$1" 2>/dev/null)" in ""|Z*) echo gone;; *) echo alive;; esac; }
+for m in setsid doublefork nohup envi renamed noterm; do
+  out=$($H exec --workspace $W6 "local _ = sh('bash escape.sh $m')" "print(sh('[ -d /proc/\$(cat $m.pid) ] && echo alive || echo gone').stdout)" 2>&1 | grep -xE 'alive|gone')
+  check "a $m process is gone when sh returns, and after hx exits" "$out $(alive "$(cat $W6/$m.pid)")" "gone gone"
+done
+out=$($H exec --workspace $W6 "print(sh('bash escape.sh setsid2; exec sleep 300', {timeout = 1}).timed_out)" "print(sh('[ -d /proc/\$(cat setsid2.pid) ] && echo alive || echo gone').stdout)" 2>&1 | grep -xE 'true|false|alive|gone' | tr '\n' ' ')
+check "...and after sh times out" "$out" "true gone "
+$H exec --workspace $W6 "sh('bash escape.sh setsid3; exec sleep 300')" >/dev/null 2>&1 & HX=$!
+for _ in $(seq 100); do [ -s $W6/setsid3.pid ] && break; sleep 0.1; done
+kill -TERM $HX; wait $HX
+check "...and when hx is stopped by a signal" "$? $(alive "$(cat $W6/setsid3.pid)")" "143 gone"
+
 finish

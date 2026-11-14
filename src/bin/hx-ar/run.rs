@@ -885,8 +885,8 @@ impl Orchestrator {
             .stderr(std::process::Stdio::piped());
         stop_with_this_process(&mut command);
         let child = command.spawn().context("cannot start hx")?;
-        // A signal to this process asks the child to stop (`hx::prims::stop`), and it stops its own commands.
-        let tracked = child.id().map(hx::prims::Child::track);
+        // A signal to this process asks the child to stop (`hx::procs::stop`), and it stops its own commands.
+        let tracked = child.id().map(hx::procs::Child::track);
         let out = child.wait_with_output().await?;
         drop(tracked);
         std::fs::write(ep_dir.join(format!("{label}.stderr")), &out.stderr)?;
