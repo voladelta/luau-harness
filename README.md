@@ -191,7 +191,8 @@ the model is done), `M.compact`, `M.compact_prompt` and `M.resume_prompt`. The l
 takes effect everywhere.
 
 Some habits of the model are handled in the loop rather than left to the prompt: a call that gets the same result
-for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop or try something else; a
+for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to try something else only when it knows an action that will change the
+result; a
 reply with nothing in it is retried like a busy server; and a task that runs out of replies gets one more, to
 report where it stands.
 For notes to the model that need no code, write `.hx/prompt.md`.

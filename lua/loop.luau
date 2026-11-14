@@ -1350,13 +1350,13 @@ function M.repeat_reminder(call, count, first)
 		call = call:sub(1, 500) .. ("... (%d more bytes)"):format(#call - 500)
 	end
 	if first then
-		return ("%s has now returned the same result %d times. If it is not going to change, stop and report what "
-			.. "you found; otherwise try a different approach. Do not change what you are checking to make it give "
-			.. "another answer."):format(call, count)
+		return ("%s has now returned the same result %d times. If it is something you are waiting on rather than "
+			.. "something your own work changes, stop now and report what you found, without looking further. "
+			.. "Otherwise change what you do, not what you check, before you run it again."):format(call, count)
 	end
 	return ("%s has returned the same result %d times in this task, so asking again is not making progress. Do not "
-		.. "call it again, and do not change what it checks to make it give another answer. Choose a different "
-		.. "action, or finish the task and say what you found."):format(call, count)
+		.. "call it again, and do not change what it checks to make it give another answer. Unless you know an "
+		.. "action that will change the result, finish now and say what you found."):format(call, count)
 end
 
 -- Prints the text of a reply: the model's words are the answer, on stdout. A model asked for progress updates
