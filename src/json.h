@@ -1,4 +1,5 @@
-#pragma once
+#ifndef HX_JSON_H_
+#define HX_JSON_H_
 
 struct lua_State;
 
@@ -16,4 +17,6 @@ namespace hx {
 // with U+FFFD in place of the bad bytes, because command output and file contents are not always text.
 void open_json(lua_State* L);
 
-} // namespace hx
+}  // namespace hx
+
+#endif  // HX_JSON_H_

@@ -8,7 +8,7 @@
 --   host.load(source, name, env) -> function | nil, error
 --   host.timed(seconds, fn, ...) -> true, ... | false, error
 --   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
---   host.args, host.cwd, host.interactive, host.default_loop
+--   host.args, host.cwd, host.interactive, host.sandboxed, host.default_loop
 --   json.encode, json.decode, json.array, json.null
 -- The whole process sits inside one Landlock ruleset, so nothing in this file can reach more of the machine
 -- than the model's own shell can.
@@ -354,9 +354,6 @@ local function request(system, messages)
 			end
 			error("the model endpoint sent a reply this loop cannot read: " .. (err or text:sub(1, 300)), 0)
 		end
-		if status == nil and is_stop(text) then
-			error(text, 0)
-		end
 		local transient = status == nil or status == 408 or status == 409 or status == 429 or status >= 500
 		if not transient or attempt == attempts then
 			error(("the model request failed (%s): %s"):format(tostring(status or "no response"), tostring(text):sub(1, 500)), 0)
@@ -371,9 +368,12 @@ end
 local function system_prompt()
 	local parts = {
 		("You are a coding agent working in %s through the tools you are given."):format(host.cwd),
-		"The kernel confines you: you can write inside this project directory and $TMPDIR, and read those plus "
-			.. "the system directories. \"Permission denied\" anywhere else is that wall. Say so and stop, rather "
-			.. "than looking for a way around it.",
+		host.sandboxed
+				and "The kernel confines you: you can write inside this project directory and $TMPDIR, and read those "
+					.. "plus the system directories. \"Permission denied\" anywhere else is that wall. Say so and "
+					.. "stop, rather than looking for a way around it."
+			or "Nothing confines you in this session: you act with the user's full access to this machine. Stay "
+				.. "inside this project directory unless the task says otherwise.",
 		"You can extend yourself. The harness running you is .hx/loop.luau, and extensions are Luau modules in "
 			.. ".hx/ext/NAME.luau: the first line is a `--` comment saying what the module does, and it returns "
 			.. "a table of functions. Call one from the lua tool as ext(\"NAME\").fn(...). Extensions stay with "
@@ -391,18 +391,161 @@ local function system_prompt()
 	return table.concat(parts, "\n\n")
 end
 
--- Adds text from the user. Two user messages in a row are folded into one, after any tool results, because
--- the API wants roles to alternate and tool results to come first.
-local function add_user(messages, text)
-	local last = messages[#messages]
+-- The conversation -------------------------------------------------------------------------------------------
+--
+-- The Messages API accepts one shape of history only: it starts with the user, roles alternate, and a reply
+-- that calls tools is answered by the very next message with exactly one result per call, results first. So a
+-- conversation is always in one of three states, read off its last message, and each operation is legal in
+-- some of them only:
+--
+--   state     the last message is                 legal operations
+--   "idle"    nothing, or a finished reply        say
+--   "ready"   the user's: the model may run       say (adds to that message), reply
+--   "owing"   a reply that called tools           answer, abandon
+--
+--   say:    idle -> ready, ready -> ready         reply:   ready -> owing, idle, or ready (an empty reply)
+--   answer: owing -> ready                        abandon: owing -> ready
+--
+-- Every change to the history goes through these functions. An operation that is illegal in the current state
+-- raises and changes nothing, so a history the API would reject cannot be built.
+
+local Conversation = {}
+Conversation.__index = Conversation
+M.Conversation = Conversation
+
+function Conversation.new()
+	return setmetatable({ messages = {} }, Conversation)
+end
+
+local function tool_calls(message)
+	local calls = {}
+	for _, block in message.content do
+		if block.type == "tool_use" then
+			table.insert(calls, block)
+		end
+	end
+	return calls
+end
+
+function Conversation:state()
+	local last = self.messages[#self.messages]
+	if not last then
+		return "idle"
+	elseif last.role == "user" then
+		return "ready"
+	end
+	return #tool_calls(last) > 0 and "owing" or "idle"
+end
+
+local function expect(self, operation, ...)
+	local state = self:state()
+	for _, allowed in { ... } do
+		if state == allowed then
+			return
+		end
+	end
+	error(("conversation: cannot %s while %s"):format(operation, state), 3)
+end
+
+-- Adds text from the user. After tool results or earlier text it joins that message, behind what is there.
+function Conversation:say(text)
+	expect(self, "say", "idle", "ready")
+	local last = self.messages[#self.messages]
 	if not last or last.role ~= "user" then
-		table.insert(messages, { role = "user", content = text })
+		table.insert(self.messages, { role = "user", content = text })
 		return
 	end
 	if type(last.content) == "string" then
 		last.content = { { type = "text", text = last.content } }
 	end
 	table.insert(last.content, { type = "text", text = text })
+end
+
+-- Records the model's reply exactly as it came (thinking blocks have to go back unchanged) and returns its
+-- tool calls. An empty reply records nothing: the user's message is still the last word.
+function Conversation:reply(content)
+	expect(self, "reply", "ready")
+	if #content == 0 then
+		return {}
+	end
+	local message = { role = "assistant", content = content }
+	table.insert(self.messages, message)
+	return tool_calls(message)
+end
+
+-- Answers every tool call of the last reply with what run(call) returns: the result text, and whether it is an
+-- error. If run raises, nothing is recorded and the calls are still owed.
+function Conversation:answer(run)
+	expect(self, "answer", "owing")
+	local results = {}
+	for _, call in tool_calls(self.messages[#self.messages]) do
+		local text, failed = run(call)
+		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = failed or nil })
+	end
+	table.insert(self.messages, { role = "user", content = results })
+end
+
+-- Answers whatever is owed with an error, so a turn stopped half-way leaves a history that can continue.
+function Conversation:abandon(reason)
+	if self:state() == "owing" then
+		self:answer(function()
+			return "error: " .. reason, true
+		end)
+	end
+end
+
+-- Forgets everything and starts again from one user message.
+function Conversation:restart(text)
+	expect(self, "restart", "idle", "ready")
+	table.clear(self.messages)
+	self:say(text)
+end
+
+-- A copy to try something on. It shares the old messages; the last one, which say() may extend, is its own.
+function Conversation:fork()
+	local copy = Conversation.new()
+	copy.messages = table.clone(self.messages)
+	local last = copy.messages[#copy.messages]
+	if last and type(last.content) == "table" then
+		copy.messages[#copy.messages] = { role = last.role, content = table.clone(last.content) }
+	end
+	return copy
+end
+
+-- Checks the whole history against the rules above. Returns nil, or what is wrong. The functions above keep it
+-- nil; this is the independent check, run before every request and by the tests.
+function Conversation:problem()
+	local owed = nil -- the calls the next message has to answer
+	for i, message in self.messages do
+		local expected = i % 2 == 1 and "user" or "assistant"
+		if message.role ~= expected then
+			return ("message %d is from the %s, where the %s should speak"):format(i, tostring(message.role), expected)
+		end
+		if message.role == "assistant" then
+			if type(message.content) ~= "table" or #message.content == 0 then
+				return ("message %d is an empty reply"):format(i)
+			end
+			owed = tool_calls(message)
+		else
+			local answered = 0
+			for j, block in type(message.content) == "table" and message.content or {} do
+				if block.type == "tool_result" then
+					answered += 1
+					if answered ~= j then
+						return ("message %d has a tool result behind other content"):format(i)
+					end
+					if not owed or not owed[answered] or owed[answered].id ~= block.tool_use_id then
+						return ("message %d answers a tool call that was not made"):format(i)
+					end
+				end
+			end
+			if owed and answered ~= #owed then
+				return ("message %d leaves a tool call unanswered"):format(i)
+			end
+			owed = nil
+		end
+	end
+	return nil
 end
 
 local function text_of(reply)
@@ -415,74 +558,55 @@ local function text_of(reply)
 	return table.concat(parts, "\n")
 end
 
+-- Sends the conversation to the model. Only a conversation that is ready, and sound, is ever sent.
+local function ask(system, talk)
+	local problem = talk:state() ~= "ready" and "it is " .. talk:state() .. ", not ready" or talk:problem()
+	if problem then
+		error("this conversation cannot be sent: " .. problem, 0)
+	end
+	return request(system, talk.messages)
+end
+
 -- Replaces the conversation with the model's own summary of what happened.
-local function compact(system, messages)
+local function compact(system, talk)
 	host.log("  compacting the conversation")
-	local asking = table.clone(messages)
-	local last = table.clone(asking[#asking])
-	last.content = type(last.content) == "table" and table.clone(last.content) or last.content
-	asking[#asking] = last
-	add_user(
-		asking,
+	local asking = talk:fork()
+	asking:say(
 		"The conversation is about to be replaced by a summary, and you will continue from that summary alone. "
 			.. "Write it now, as plain text, without calling tools: the task, what is done, what you learned "
 			.. "about this project that was costly to find out, and the exact next steps."
 	)
-	local summary = text_of(request(system, asking))
+	local summary = text_of(ask(system, asking))
 	if summary == "" then
 		host.log("  no summary came back; keeping the conversation as it is")
 		return
 	end
-	table.clear(messages)
-	add_user(messages, "Earlier turns were replaced by this summary, written by you:\n\n" .. summary .. "\n\nContinue.")
-end
-
--- A reply that asked for tools must be followed by one result per call. After an interrupt they are missing;
--- this adds them so the conversation stays valid.
-local function repair(messages)
-	local last = messages[#messages]
-	if not last or last.role ~= "assistant" then
-		return
-	end
-	local results = {}
-	for _, block in last.content do
-		if block.type == "tool_use" then
-			table.insert(results, { type = "tool_result", tool_use_id = block.id, content = "error: interrupted by the user", is_error = true })
-		end
-	end
-	if #results > 0 then
-		table.insert(messages, { role = "user", content = results })
-	end
+	talk:restart("Earlier turns were replaced by this summary, written by you:\n\n" .. summary .. "\n\nContinue.")
 end
 
 -- Runs the model until it answers without asking for a tool.
-local function turn(system, messages)
+local function turn(system, talk)
 	for _ = 1, M.max_replies do
-		local reply = request(system, messages)
+		local reply = ask(system, talk)
 		local cut_off = reply.stop_reason == "max_tokens"
-		if #reply.content > 0 then
-			-- As received: thinking blocks have to go back unchanged.
-			table.insert(messages, { role = "assistant", content = reply.content })
-		end
-		local results = {}
 		for _, block in reply.content do
 			if block.type == "text" and block.text ~= "" then
 				print(block.text)
-			elseif block.type == "tool_use" then
-				local text, failed = "error: this call was cut off by the output limit and did not run. Send it again, smaller.", true
-				if not cut_off then
-					text, failed = run_tool(block)
-				end
-				table.insert(results, { type = "tool_result", tool_use_id = block.id, content = text, is_error = failed or nil })
 			end
 		end
-		if #results > 0 then
-			table.insert(messages, { role = "user", content = results })
+		local calls = talk:reply(reply.content)
+		if #calls > 0 then
+			talk:answer(function(call)
+				if cut_off then
+					return "error: this call was cut off by the output limit and did not run. Send it again, smaller.", true
+				end
+				return run_tool(call)
+			end)
 			if prompt_size(reply) > M.compact_at then
-				compact(system, messages)
+				compact(system, talk)
 			end
 		elseif cut_off then
-			add_user(messages, "Your reply was cut off by the output limit. Continue.")
+			talk:say("Your reply was cut off by the output limit. Continue.")
 		else
 			if reply.stop_reason == "refusal" then
 				host.log("[the model declined to answer]")
@@ -507,7 +631,7 @@ end
 
 function M.main()
 	local system = system_prompt()
-	local messages = {}
+	local talk = Conversation.new()
 	local task = table.concat(host.args, " ")
 
 	if not host.interactive then
@@ -521,9 +645,9 @@ function M.main()
 		if task:match("^%s*$") then
 			error("no task: pass it as arguments or on stdin", 0)
 		end
-		add_user(messages, task)
-		local ok, err = pcall(turn, system, messages)
-		save(system, messages)
+		talk:say(task)
+		local ok, err = pcall(turn, system, talk)
+		save(system, talk.messages)
 		report()
 		if not ok then
 			error(err, 0)
@@ -538,17 +662,17 @@ function M.main()
 			break
 		end
 		if not line:match("^%s*$") then
-			add_user(messages, line)
-			local ok, err = pcall(turn, system, messages)
+			talk:say(line)
+			local ok, err = pcall(turn, system, talk)
 			if not ok then
 				if err ~= "interrupted" then
-					save(system, messages)
+					save(system, talk.messages)
 					error(err, 0)
 				end
-				repair(messages)
+				talk:abandon("interrupted by the user")
 				host.log("[interrupted]")
 			end
-			save(system, messages)
+			save(system, talk.messages)
 		end
 	end
 	report()

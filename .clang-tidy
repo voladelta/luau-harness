@@ -1,0 +1,48 @@
+# Checks follow the C++ Core Guidelines and the CERT rules. Each exclusion has its reason:
+#
+#   *-vararg, *-pointer-arithmetic, *-array-to-pointer-decay, *-union-access
+#       the Lua, libcurl and POSIX C interfaces are variadic and pointer-based
+#   *-magic-numbers, identifier-length, function-cognitive-complexity
+#       style preferences this code does not follow
+#   easily-swappable-parameters, use-trailing-return-type, use-ranges
+#       noise, or not available with the C++20 standard library in use
+#   misc-include-cleaner
+#       does not understand the Luau and RapidJSON umbrella headers
+#   misc-no-recursion
+#       the JSON encoder recurses to a bounded depth
+#   avoid-c-arrays
+#       luaL_Reg tables are C arrays by interface
+#   avoid-do-while, owning-memory
+#       triggered inside the Lua and libcurl macros
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-do-while,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-pro-type-vararg,
+  -hicpp-vararg,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -modernize-avoid-c-arrays,
+  -modernize-use-ranges,
+  -modernize-use-trailing-return-type,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-magic-numbers
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/src/[a-z_]+\.h$'

@@ -82,6 +82,25 @@ raises("lua time limit", tools.lua, { code = "while true do end" }, "timeout")
 raises("the limit holds inside pcall", tools.lua, { code = "while true do pcall(function() while true do end end) end" }, "timeout")
 loop.lua_seconds = 60
 
+-- the host's limits
+local started = os.time()
+check("a time limit ends a sleep", select(2, host.timed(0.2, function() host.sleep(30) end)), "timeout")
+check("a time limit ends a command", select(2, host.timed(0.2, function() return host.sh("sleep 30") end)), "timeout")
+check("an inner limit cannot outlast the outer one", select(2, host.timed(0.2, function() return host.timed(30, function() host.sleep(30) end) end)), "timeout")
+check("none of that waited", os.time() - started < 5, true)
+check("a limit that is not reached changes nothing", select(2, host.timed(5, function() return host.sh("echo ok").out end)), "ok\n")
+raises("a command with a NUL byte", host.sh, "echo a\0b", "contains a NUL byte")
+raises("a path with a NUL byte", host.read, "a\0b", "contains a NUL byte")
+local hog_ok, hog_err = pcall(function()
+	local hoard = {}
+	for i = 1, 1e7 do
+		hoard[i] = string.rep("x", 1e6) .. i
+	end
+end)
+check("a script that eats memory is stopped", hog_ok, false)
+check("with an ordinary error", tostring(hog_err):find("not enough memory", 1, true) ~= nil, true)
+check("and the harness lives on", json.encode({ 1 }), "[1]")
+
 -- extensions (relative to the working directory, like the real thing)
 check("this test runs where it can write", host.write(".hx/ext/greet.luau", "-- greets\nreturn { hello = function(n) return 'hello ' .. n end }\n"), true)
 check("ext", loop.ext("greet").hello("x"), "hello x")

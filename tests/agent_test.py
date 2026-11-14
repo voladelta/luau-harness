@@ -32,6 +32,7 @@ class Model(http.server.ThreadingHTTPServer):
         self.script = []
         self.requests = []
         self.headers = []
+        self.hanging = threading.Event()
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
     @property
@@ -45,6 +46,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.requests.append(json.loads(body))
         self.server.headers.append({name.lower(): value for name, value in self.headers.items()})
         status, reply = self.server.script.pop(0) if self.server.script else (500, {"error": "script ran out"})
+        if status == "hang":  # hold the request open until the client gives up
+            self.server.hanging.set()
+            time.sleep(reply)
+            return
         data = json.dumps(reply).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -131,6 +136,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(read(self.project, "out.txt"), "hi\n")
         first, second = self.model.requests
         self.assertIn("coding agent", first["system"])
+        self.assertIn("The kernel confines you", first["system"])
         self.assertEqual(first["messages"], [{"role": "user", "content": "make a file"}])
         self.assertEqual([t["name"] for t in first["tools"]], ["bash", "read", "write", "edit", "lua"])
         self.assertEqual(set(first["tools"][0]), {"name", "description", "input_schema"})
@@ -229,15 +235,20 @@ class AgentTest(unittest.TestCase):
             call("bash", {"command": f"echo x > {outside}; echo x > ~/planted; mkdir /etc/hx-test"}, "c3"),
             call("write", {"path": outside, "content": "x"}, "c4"),
             call("lua", {"code": f"return host.read('{self.home}/secret')"}, "c5"),
-            call("bash", {"command": "echo in > inside.txt && echo t > $TMPDIR/t && cat inside.txt $TMPDIR/t && ls /usr >/dev/null && echo fine"}, "c6"),
+            call("bash", {"command": "ls /dev/pts; cat /dev/pts/0 /dev/tty"}, "c6"),
+            call("bash", {"command": "echo in > inside.txt && echo t > $TMPDIR/t && cat inside.txt $TMPDIR/t && ls /usr >/dev/null && echo fine"}, "c7"),
+            call("bash", {"command": "echo out > /dev/stdout; echo err > /dev/stderr; cat <(echo sub); echo x > /dev/null; head -c 3 /dev/zero | wc -c"}, "c8"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
-        self.assertEqual(len(results), 6)
+        self.assertEqual(len(results), 8)
         self.assertNotIn("TOP-SECRET", json.dumps(self.model.requests))
         for i in range(5):
             self.assertIn("Permission denied", results[i], i)
-        self.assertEqual(results[5], "in\nt\nfine\n[exit 0]")
+        self.assertIn("/dev/pts': Permission denied", results[5])  # the user's terminals are out of reach
+        self.assertNotIn("\n[exit 0]", results[5])
+        self.assertEqual(results[6], "in\nt\nfine\n[exit 0]")
+        self.assertEqual(results[7], "out\nerr\nsub\n3\n[exit 0]")  # the ordinary plumbing still works
         self.assertFalse(os.path.exists(outside))
         self.assertFalse(os.path.exists(os.path.join(self.home, "planted")))
 
@@ -353,6 +364,38 @@ class AgentTest(unittest.TestCase):
             {"type": "tool_result", "tool_use_id": "call_1", "content": "error: interrupted by the user", "is_error": True},
             {"type": "text", "text": "go on"},
         ])
+
+    def test_an_interrupted_request_leaves_a_conversation_that_continues(self):
+        self.model.script = [("hang", 30), say("after the interrupt")]
+        master, slave = pty.openpty()
+        process = subprocess.Popen([HX], cwd=self.project, env=self.env(), stdin=slave, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+        os.close(slave)
+        try:
+            os.write(master, b"hello\n")
+            self.assertTrue(self.model.hanging.wait(timeout=20))
+            started = time.monotonic()
+            process.send_signal(signal.SIGINT)
+            os.write(master, b"again\n")
+            self.assertEqual(process.stdout.readline(), "after the interrupt\n")
+            self.assertLess(time.monotonic() - started, 10)  # the request was cut, not waited out
+            os.write(master, b"\x04")
+            process.stdout.close()
+            self.assertEqual(process.wait(timeout=20), 0)
+        finally:
+            process.kill()
+            os.close(master)
+        # The interrupted message was never answered, so the next one joins it: roles still alternate.
+        self.assertEqual(self.model.requests[1]["messages"], [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "again"}]}])
+
+    def test_without_the_sandbox_the_model_is_told_so(self):
+        outside = os.path.join(self.root, "outside.txt")
+        done = self.run_hx("--no-sandbox", "go", script=[call("bash", {"command": f"echo x > {outside} && echo wrote"}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results(), ["wrote\n[exit 0]"])
+        self.assertIn("Nothing confines you", self.model.requests[0]["system"])
+        self.assertNotIn("The kernel confines you", self.model.requests[0]["system"])
 
     def assert_gone(self, pid):
         for _ in range(100):
