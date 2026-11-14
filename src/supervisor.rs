@@ -140,18 +140,6 @@ impl CheckpointBody {
     pub(crate) fn controller(&self) -> Option<&Value> {
         self.checkpoint.run.controller()
     }
-
-    /// Where message `index` is listed: the chunk blob's hash, whether it is the last chunk, and the message's position
-    /// in it. `None` when the controller state has no `messages` array or it is shorter.
-    pub(crate) fn message_chunk(&self, index: usize) -> Option<(&str, bool, usize)> {
-        let chunks = self.message_chunks.as_ref()?;
-        let chunk = chunks.get(index / eventlog::CHUNK)?;
-        Some((
-            chunk,
-            index / eventlog::CHUNK + 1 == chunks.len(),
-            index % eventlog::CHUNK,
-        ))
-    }
 }
 
 impl Checkpoint {
@@ -1086,7 +1074,7 @@ impl Supervisor {
         let seq = self.policy.log.write("checkpoint", fields, true)?;
         if lane == "root" {
             self.history
-                .committed(crate::history::CheckpointRef { seq, blob }, archive)?;
+                .committed(crate::history::CheckpointRef { seq, blob });
         }
         Ok(())
     }
@@ -1709,18 +1697,13 @@ mod checkpoint_tests {
         )
         .unwrap();
         let chunk = eventlog::parse_chunk(
-            &eventlog::read_blob(log.dir(), body.message_chunk(0).unwrap().0).unwrap(),
+            &eventlog::read_blob(log.dir(), &body.message_chunks.as_ref().unwrap()[0]).unwrap(),
             true,
         )
         .unwrap();
         // Identical messages at different positions share one blob; the chunk keeps both positions.
         assert_eq!(chunk.len(), 4);
         assert_eq!(chunk[0], chunk[3]);
-        assert_eq!(
-            body.message_chunk(3).map(|(_, last, i)| (last, i)),
-            Some((true, 3))
-        );
-        assert!(body.message_chunk(eventlog::CHUNK).is_none());
         assert!(body.controller().unwrap().get("messages").is_none());
         assert_eq!(body.controller().unwrap()["turns"], 3);
         drop(supervisor);

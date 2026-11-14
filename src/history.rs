@@ -1,20 +1,16 @@
-//! Root-lane compacted context. Bodies stay in immutable checkpoints and their message blobs; only references are
-//! indexed.
-use crate::supervisor::CheckpointBody;
+//! Root-lane compaction history. A compaction's checkpoint record carries an `Archive` naming the root checkpoint
+//! before it, and the messages the compaction removed are that checkpoint's, up to the cut. Nothing else is stored:
+//! `history(...)` folds the journal's checkpoint records when it is called.
+use crate::{
+    eventlog::EventLog,
+    supervisor::{Checkpoint, CheckpointBody},
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::Path, rc::Rc, sync::Mutex};
+use std::{path::Path, sync::Mutex};
 
-/// The journal blob bytes one call may read, and the largest single blob it reads.
-pub(crate) const MAX_SOURCE: usize = 64 << 20;
-pub(crate) const MAX_RESPONSE: usize = 12 << 10;
-pub const MAX_TEXT: usize = 4096;
-pub(crate) const MAX_SCAN: usize = 128;
-/// Entries per page when `limit` is omitted, and the most a page may ask for.
-pub const DEFAULT_LIMIT: usize = 5;
-pub(crate) const MAX_LIMIT: usize = 20;
-
+/// The controller's request to record a compaction that replaced messages `1..cut-1` (0-based) with a summary.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Directive {
@@ -29,6 +25,7 @@ pub struct CheckpointRef {
     pub blob: String,
 }
 
+/// What a compaction's checkpoint record stores under `archive`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Archive {
@@ -38,117 +35,58 @@ pub struct Archive {
     pub stage_id: Option<String>,
 }
 
-#[derive(Clone)]
-struct Record {
-    seq: u64,
-    blob: String,
-    archive: Archive,
-}
-
-#[derive(Default)]
-struct Index {
-    latest: Option<CheckpointRef>,
-    records: Vec<Record>,
-}
-
+/// The latest root checkpoint: the source the next compaction cuts from.
 #[derive(Default)]
 pub struct History {
-    index: Mutex<Index>,
+    latest: Mutex<Option<CheckpointRef>>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `history(id, {from = i, to = j})`: with no id, the list of compactions; with one, messages `from..=to` of it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Query {
-    q: Option<String>,
-    before: Option<String>,
-    limit: Option<usize>,
-    id: Option<String>,
-    offset: Option<usize>,
-    bytes: Option<usize>,
+    #[serde(skip_deserializing)]
+    pub id: Option<usize>,
+    pub from: Option<usize>,
+    pub to: Option<usize>,
 }
 
 impl Query {
-    pub fn parse(value: Value) -> Result<Self> {
-        let q: Self = serde_json::from_value(if value.is_null() { json!({}) } else { value })?;
-        if q.id.is_some() {
-            ensure!(
-                q.q.is_none() && q.before.is_none() && q.limit.is_none(),
-                "history: mixed read/list options"
-            );
-            ensure!(
-                (1..=MAX_TEXT).contains(&q.bytes.unwrap_or(MAX_TEXT)),
-                "history: bytes must be 1..4096"
-            );
-        } else {
-            ensure!(
-                q.offset.is_none() && q.bytes.is_none(),
-                "history: offset/bytes require id"
-            );
-            ensure!(
-                (1..=MAX_LIMIT).contains(&q.limit.unwrap_or(DEFAULT_LIMIT)),
-                "history: limit must be 1..20"
-            );
-            if let Some(text) = &q.q {
-                ensure!(
-                    !text.is_empty() && text.len() <= 1024,
-                    "history: q must be 1..1024 bytes"
-                );
-            }
-        }
-        Ok(q)
+    pub fn parse(id: Option<Value>, range: Option<Value>) -> Result<Self> {
+        let mut query: Self = range
+            .map(serde_json::from_value)
+            .transpose()
+            .context("history: the range is {from = i, to = j}")?
+            .unwrap_or_default();
+        query.id = id
+            .map(serde_json::from_value)
+            .transpose()
+            .context("history: the id is a number from history()")?;
+        ensure!(
+            query.id.is_some() || query.from.is_none() && query.to.is_none(),
+            "history: a range needs a compaction id"
+        );
+        Ok(query)
     }
 }
 
 impl History {
     pub fn restore(records: &[Value]) -> Result<Self> {
-        let history = Self::default();
-        for r in records {
-            if r["kind"] != "checkpoint" || r["lane"] != "root" {
-                continue;
-            }
-            let reference = CheckpointRef {
-                seq: r["seq"]
-                    .as_u64()
-                    .context("history: checkpoint sequence missing")?,
-                blob: r["blob"]
-                    .as_str()
-                    .context("history: checkpoint blob missing")?
-                    .into(),
-            };
-            let archive = r
-                .get("archive")
-                .map(|a| serde_json::from_value(a.clone()))
-                .transpose()?;
-            history.committed(reference, archive)?;
+        let mut latest = None;
+        for checkpoint in root_checkpoints(records) {
+            latest = Some(checkpoint?.0);
         }
-        Ok(history)
+        Ok(Self {
+            latest: Mutex::new(latest),
+        })
     }
 
-    pub fn committed(&self, reference: CheckpointRef, archive: Option<Archive>) -> Result<()> {
-        let mut index = self.index.lock().unwrap();
-        if let Some(archive) = archive {
-            ensure!(
-                archive.version == 1 && archive.cut >= 3,
-                "history: unsupported archive descriptor"
-            );
-            let source = index
-                .latest
-                .as_ref()
-                .context("history: archive has no source checkpoint")?;
-            ensure!(
-                archive.source.seq == source.seq && archive.source.blob == source.blob,
-                "history: archive source is not the preceding root checkpoint"
-            );
-            index.records.push(Record {
-                seq: reference.seq,
-                blob: reference.blob.clone(),
-                archive,
-            });
-        }
-        index.latest = Some(reference);
-        Ok(())
+    pub fn committed(&self, reference: CheckpointRef) {
+        *self.latest.lock().unwrap() = Some(reference);
     }
 
+    /// Check that `after` replaces the first `directive.cut - 1` messages of `before`, the conversation of the latest
+    /// root checkpoint, with a summary and keeps the rest unchanged, and return the descriptor to commit with it.
     pub fn prepare(
         &self,
         directive: &Directive,
@@ -184,13 +122,12 @@ impl History {
             "history_archive_invalid: missing summary"
         );
         let source = self
-            .index
+            .latest
             .lock()
             .unwrap()
-            .latest
             .clone()
             .context("history_archive_invalid: no committed source")?;
-        let saved = crate::supervisor::Checkpoint::read(dir, &source.blob)
+        let saved = Checkpoint::read(dir, &source.blob)
             .context("history_archive_invalid: source unreadable")?;
         ensure!(
             saved
@@ -208,396 +145,180 @@ impl History {
             stage_id,
         })
     }
+}
 
-    pub fn query(
-        &self,
-        dir: &Path,
-        run: &str,
-        query: Query,
-        deadline: Option<f64>,
-    ) -> Result<Value> {
-        check_deadline(deadline)?;
-        let index = self.index.lock().unwrap();
-        let mut loader = Loader::new(dir, deadline);
-        if let Some(id) = &query.id {
-            let (seq, ordinal) = parse_id(id)?;
-            let pos = index
-                .records
-                .binary_search_by_key(&seq, |r| r.seq)
-                .map_err(|_| anyhow::anyhow!("history: unknown or out-of-scope id"))?;
-            let record = &index.records[pos];
-            ensure!(
-                ordinal == 0 || (2..record.archive.cut).contains(&ordinal),
-                "history: unknown id"
-            );
-            let (role, text) = loader
-                .entry(record, ordinal)?
-                .context("history: source read limit exceeded")?;
-            let offset = query.offset.unwrap_or(0);
-            ensure!(
-                offset <= text.len() && text.is_char_boundary(offset),
-                "history: invalid UTF-8 offset"
-            );
-            let mut end = floor_boundary(
-                &text,
-                offset
-                    .saturating_add(query.bytes.unwrap_or(MAX_TEXT))
-                    .min(text.len()),
-            );
-            ensure!(
-                end > offset || offset == text.len(),
-                "history: bytes too small for next character"
-            );
-            loop {
-                let mut out = json!({"run":run,"lane":"root","id":id,"kind":if ordinal==0 {"compaction"} else {"message"},
-                    "role":role,"representation":"public-transcript-v1","bytes":text.len(),"offset":offset,
-                    "text":&text[offset..end],"truncated":end<text.len()});
-                if end < text.len() {
-                    out["next_offset"] = json!(end);
-                }
-                if serde_json::to_vec(&out)?.len() <= MAX_RESPONSE {
-                    return Ok(out);
-                }
-                ensure!(end > offset, "history: response metadata too large");
-                end = floor_boundary(&text, offset + (end - offset) / 2);
-                ensure!(
-                    end > offset || offset == text.len(),
-                    "history: response cannot fit next character"
-                );
+/// Answer `query` from the journal `log`: blocking file work, for a worker thread.
+pub fn query(log: &EventLog, query: Query) -> Result<Value> {
+    let dir = log.dir();
+    let compactions = compactions(&crate::eventlog::load(&log.path)?)?;
+    let Some(id) = query.id else {
+        let list = compactions.iter().enumerate().map(|(i, (at, archive))| {
+            let body = CheckpointBody::parse(&crate::eventlog::read_blob(dir, &at.blob)?)?;
+            let text = body.controller().and_then(summary);
+            let mut entry = json!({"id": i + 1, "messages": archive.cut - 2,
+                "summary": text.context("history: compaction without a summary")?});
+            if let Some(stage) = &archive.stage_id {
+                entry["stage"] = json!(stage);
             }
-        }
-        let last = index.records.last().map_or(0, |r| r.seq);
-        let (frontier, mut seq, mut ordinal) = if let Some(cursor) = &query.before {
-            decode_cursor(cursor, run, query.q.as_deref())?
-        } else {
-            (last, last, 0)
-        };
-        ensure!(frontier <= last, "history: cursor is ahead of archive");
-        let mut out = json!({"run":run,"lane":"root","coverage":"recorded_compactions_only",
-            "status":if last==0 {"unavailable"} else {"ok"},"entries":[],"scan_complete":true});
-        if last == 0 {
-            out["reason"] = json!("no_supported_archive_records");
-            return Ok(out);
-        }
-        let mut entries = Vec::new();
-        let mut examined = 0;
-        while seq != 0
-            && entries.len() < query.limit.unwrap_or(DEFAULT_LIMIT)
-            && examined < MAX_SCAN
-        {
-            check_deadline(deadline)?;
-            let pos = index
-                .records
-                .binary_search_by_key(&seq, |r| r.seq)
-                .map_err(|_| anyhow::anyhow!("history: invalid cursor position"))?;
-            ensure!(seq <= frontier, "history: invalid cursor frontier");
-            let record = &index.records[pos];
+            Ok(entry)
+        });
+        return fit(list, |_| {
+            anyhow::anyhow!("history: the list of compactions is over hx.limits.DATA_BYTES")
+        });
+    };
+    let (_, archive) = id
+        .checked_sub(1)
+        .and_then(|i| compactions.get(i))
+        .with_context(|| {
+            format!(
+                "history: no compaction {id}; history() lists {}",
+                compactions.len()
+            )
+        })?;
+    let count = archive.cut - 2;
+    let (from, to) = (
+        query.from.unwrap_or(1),
+        query.to.unwrap_or(count).min(count),
+    );
+    ensure!(
+        (1..=to).contains(&from),
+        "history: compaction {id} removed messages 1..{count}; from = {from} is outside them"
+    );
+    let source = Checkpoint::read(dir, &archive.source.blob)?;
+    let messages = source
+        .run
+        .controller()
+        .and_then(|c| c["messages"].as_array())
+        .filter(|m| m.len() >= archive.cut)
+        .context("history: the source checkpoint is shorter than the cut")?;
+    fit(messages[from..=to].iter().map(render), |n| match n {
+        0 => anyhow::anyhow!(
+            "history: message {from} of compaction {id} alone is over hx.limits.DATA_BYTES"
+        ),
+        n => anyhow::anyhow!(
+            "history: messages {from}..{to} of compaction {id} are over hx.limits.DATA_BYTES; read them in ranges, starting with history({id}, {{from = {from}, to = {}}})",
+            from + n - 1
+        ),
+    })
+}
+
+/// The root checkpoint records of a journal, in order, with their archive descriptors.
+fn root_checkpoints(
+    records: &[Value],
+) -> impl Iterator<Item = Result<(CheckpointRef, Option<Archive>)>> {
+    records
+        .iter()
+        .filter(|r| r["kind"] == "checkpoint" && r["lane"] == "root")
+        .map(|r| {
+            let reference: CheckpointRef =
+                serde_json::from_value(json!({"seq": r["seq"], "blob": r["blob"]}))
+                    .context("history: malformed checkpoint record")?;
+            let archive = r
+                .get("archive")
+                .map(|a| serde_json::from_value(a.clone()))
+                .transpose()?;
+            Ok((reference, archive))
+        })
+}
+
+/// The recorded compactions, oldest first: each one's own checkpoint and its descriptor, which must name the root
+/// checkpoint just before it.
+fn compactions(records: &[Value]) -> Result<Vec<(CheckpointRef, Archive)>> {
+    let mut previous: Option<CheckpointRef> = None;
+    let mut out = vec![];
+    for checkpoint in root_checkpoints(records) {
+        let (reference, archive) = checkpoint?;
+        if let Some(archive) = archive {
             ensure!(
-                ordinal == 0 || (2..record.archive.cut).contains(&ordinal),
-                "history: invalid cursor ordinal"
+                archive.version == 1 && archive.cut >= 3,
+                "history: unsupported archive descriptor"
             );
-            // Never consume a candidate whose blobs would exceed this call's read budget.
-            let Some((role, text)) = loader.entry(record, ordinal)? else {
-                break;
-            };
-            let old_position = (seq, ordinal);
-            let current = ordinal;
-            if ordinal == 0 {
-                ordinal = record.archive.cut - 1;
-            } else if ordinal > 2 {
-                ordinal -= 1;
-            } else {
-                seq = if pos > 0 {
-                    index.records[pos - 1].seq
-                } else {
-                    0
-                };
-                ordinal = 0;
-            }
-            examined += 1;
-            let found = match &query.q {
-                Some(q) => text.find(q),
-                None => Some(0),
-            };
-            if let Some(at) = found {
-                let start = floor_boundary(&text, at.saturating_sub(80));
-                let end = floor_boundary(&text, (start + 200).min(text.len()));
-                let candidate = json!({"id":entry_id(record.seq,current),"kind":if current==0 {"compaction"} else {"message"},
-                    "role":role,"stage_id":record.archive.stage_id,"bytes":text.len(),"snippet":&text[start..end],
-                    "snippet_offset":start,"truncated":start>0 || end<text.len()});
-                if serde_json::to_vec(&entries)?.len() + serde_json::to_vec(&candidate)?.len()
-                    > MAX_RESPONSE - 1024
-                {
-                    (seq, ordinal) = old_position;
-                    break;
-                }
-                entries.push(candidate);
-            }
+            ensure!(
+                previous
+                    .as_ref()
+                    .is_some_and(|p| p.seq == archive.source.seq && p.blob == archive.source.blob),
+                "history: archive source is not the preceding root checkpoint"
+            );
+            out.push((reference.clone(), archive));
         }
-        entries.reverse();
-        out["entries"] = json!(entries);
-        if seq != 0 {
-            out["next"] = json!(encode_cursor(
-                frontier,
-                seq,
-                ordinal,
-                run,
-                query.q.as_deref()
-            ));
-            out["scan_complete"] = json!(false);
-        }
-        ensure!(
-            serde_json::to_vec(&out)?.len() <= MAX_RESPONSE,
-            "history: response exceeds limit; request fewer entries"
-        );
-        Ok(out)
+        previous = Some(reference);
     }
+    Ok(out)
+}
+
+/// `items` as one array, or `over(n)` when item `n` takes the array past the data boundary (`values::MAX_BYTES`).
+fn fit(
+    items: impl Iterator<Item = Result<Value>>,
+    over: impl FnOnce(usize) -> anyhow::Error,
+) -> Result<Value> {
+    let mut limit = crate::values::Limit::default();
+    let mut out = vec![];
+    for (n, item) in items.enumerate() {
+        let item = item?;
+        if crate::values::validate_with_limit(&item, 1, &mut limit).is_err() {
+            return Err(over(n));
+        }
+        out.push(item);
+    }
+    Ok(Value::Array(out))
 }
 
 pub(crate) fn summary(controller: &Value) -> Option<&str> {
     controller.get("worker").unwrap_or(controller)["previous_summary"].as_str()
 }
 
-fn check_deadline(deadline: Option<f64>) -> Result<()> {
-    ensure!(
-        deadline.is_none_or(|d| crate::supervisor::now() < d),
-        "history: run deadline reached"
-    );
-    Ok(())
-}
-
-impl Record {
-    /// The checkpoint holding entry `ordinal`: the summary is in the compaction's own checkpoint, the removed
-    /// messages in the checkpoint before it.
-    fn source(&self, ordinal: usize) -> &str {
-        if ordinal == 0 {
-            &self.blob
-        } else {
-            &self.archive.source.blob
-        }
-    }
-}
-
-/// One call's reads of journal blobs. Every blob read is charged to `budget`, except that a checkpoint body or a
-/// message chunk is read once per call: the entries of one archive share them.
-struct Loader<'a> {
-    dir: &'a Path,
-    deadline: Option<f64>,
-    budget: usize,
-    bodies: HashMap<String, Rc<CheckpointBody>>,
-    chunks: HashMap<String, Rc<Vec<String>>>,
-}
-
-impl<'a> Loader<'a> {
-    fn new(dir: &'a Path, deadline: Option<f64>) -> Self {
-        Self {
-            dir,
-            deadline,
-            budget: MAX_SOURCE,
-            bodies: HashMap::new(),
-            chunks: HashMap::new(),
-        }
-    }
-
-    /// The verified blob `hash`, or `None` when it does not fit what is left of this call's budget. A blob over the
-    /// per-blob limit is an error.
-    fn read(&mut self, hash: &str) -> Result<Option<Vec<u8>>> {
-        check_deadline(self.deadline)?;
-        ensure!(
-            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
-            "history: invalid blob hash"
-        );
-        let path = self.dir.join("blobs").join(hash);
-        let size = std::fs::metadata(&path)
-            .with_context(|| format!("history: journal blob {}", path.display()))?
-            .len() as usize;
-        ensure!(size <= MAX_SOURCE, "history: source read limit exceeded");
-        if size > self.budget {
-            return Ok(None);
-        }
-        self.budget -= size;
-        let deadline = self.deadline;
-        let data = crate::eventlog::read_blob_bounded(self.dir, hash, MAX_SOURCE, || {
-            check_deadline(deadline)
-        })
-        .map_err(|e| {
-            if e.to_string().starts_with("history:") {
-                e
-            } else {
-                anyhow::anyhow!("history: {e:#}")
-            }
-        })?;
-        check_deadline(self.deadline)?;
-        Ok(Some(data))
-    }
-
-    fn body(&mut self, hash: &str) -> Result<Option<Rc<CheckpointBody>>> {
-        if let Some(body) = self.bodies.get(hash) {
-            return Ok(Some(body.clone()));
-        }
-        let Some(data) = self.read(hash)? else {
-            return Ok(None);
-        };
-        let body = Rc::new(
-            CheckpointBody::parse(&data)
-                .map_err(|e| anyhow::anyhow!("history: checkpoint {hash}: {e:#}"))?,
-        );
-        self.bodies.insert(hash.into(), body.clone());
-        Ok(Some(body))
-    }
-
-    fn chunk(&mut self, hash: &str, last: bool) -> Result<Option<Rc<Vec<String>>>> {
-        if let Some(chunk) = self.chunks.get(hash) {
-            return Ok(Some(chunk.clone()));
-        }
-        let Some(data) = self.read(hash)? else {
-            return Ok(None);
-        };
-        let chunk = Rc::new(
-            crate::eventlog::parse_chunk(&data, last)
-                .map_err(|e| anyhow::anyhow!("history: message chunk {hash}: {e:#}"))?,
-        );
-        self.chunks.insert(hash.into(), chunk.clone());
-        Ok(Some(chunk))
-    }
-
-    /// The role and rendered text of entry `ordinal` of `record`, or `None` when its blobs do not fit the budget.
-    fn entry(&mut self, record: &Record, ordinal: usize) -> Result<Option<(String, String)>> {
-        let Some(body) = self.body(record.source(ordinal))? else {
-            return Ok(None);
-        };
-        let controller = body
-            .controller()
-            .context("history: source has no controller state")?;
-        if ordinal == 0 {
-            let summary = summary(controller).context("history: missing summary")?;
-            return Ok(Some(("summary".into(), summary.into())));
-        }
-        let (chunk, last, position) = body
-            .message_chunk(ordinal - 1)
-            .context("history: missing archived message")?;
-        let Some(hashes) = self.chunk(chunk, last)? else {
-            return Ok(None);
-        };
-        let hash = hashes
-            .get(position)
-            .context("history: missing archived message")?;
-        let Some(data) = self.read(hash)? else {
-            return Ok(None);
-        };
-        let message: Value =
-            serde_json::from_slice(&data).context("history: invalid message JSON")?;
-        let role = message["role"]
-            .as_str()
-            .context("history: invalid message role")?;
-        Ok(Some((role.into(), render(&message)?)))
-    }
-}
-
-fn render(message: &Value) -> Result<String> {
+/// A saved message as the model reads it back: role, text, and the code of its tool calls. Media payloads and
+/// provider replay or reasoning fields are left out.
+fn render(message: &Value) -> Result<Value> {
     let mut text = String::new();
     match &message["content"] {
         Value::String(s) => text.push_str(s),
         Value::Null => {}
         Value::Array(parts) => {
             for p in parts {
-                if let Some(s) = p["text"].as_str() {
-                    text.push_str(s);
-                } else {
-                    text.push_str("\n[media omitted]\n");
-                }
+                text.push_str(p["text"].as_str().unwrap_or("\n[media omitted]\n"));
             }
         }
-        _ => bail!("history: invalid public content"),
-    }
-    for call in message["calls"].as_array().into_iter().flatten() {
-        text.push_str(&format!(
-            "\n[tool call {} id={}]\n",
-            call["name"].as_str().unwrap_or("unknown"),
-            call["id"].as_str().unwrap_or("unknown")
-        ));
-        if let Some(code) = call["input"]["code"].as_str() {
-            if let Some(description) = call["input"]["description"].as_str() {
-                text.push_str(description);
-                text.push('\n');
-            }
-            text.push_str(code);
-        } else {
-            text.push_str(&serde_json::to_string(&call["input"])?);
-        }
+        _ => bail!("history: invalid message content"),
     }
     for image in message["images"].as_array().into_iter().flatten() {
         let dim = |k: &str| image[k].as_u64().map_or("?".to_string(), |n| n.to_string());
+        let path = image["path"].as_str().unwrap_or("?");
         text.push_str(&format!(
-            "\n[image {} {}x{} not kept; view() it again to look]\n",
-            image["path"].as_str().unwrap_or("?"),
+            "\n[image {path} {}x{} not kept; view() it again to look]\n",
             dim("width"),
             dim("height")
         ));
     }
-    Ok(text)
-}
-
-fn floor_boundary(text: &str, mut at: usize) -> usize {
-    while !text.is_char_boundary(at) {
-        at -= 1;
+    let mut out = json!({
+        "role": message["role"].as_str().context("history: message without a role")?,
+        "text": text,
+    });
+    if let Some(calls) = message["calls"].as_array().filter(|c| !c.is_empty()) {
+        let code: Vec<String> = calls
+            .iter()
+            .map(|call| match call["input"]["code"].as_str() {
+                Some(code) => code.to_string(),
+                None => call["input"].to_string(),
+            })
+            .collect();
+        out["code"] = json!(code.join("\n"));
     }
-    at
-}
-fn entry_id(seq: u64, ordinal: usize) -> String {
-    if ordinal == 0 {
-        format!("h:{seq}:c")
-    } else {
-        format!("h:{seq}:m:{ordinal}")
-    }
-}
-fn parse_id(id: &str) -> Result<(u64, usize)> {
-    let parts: Vec<_> = id.split(':').collect();
-    match parts.as_slice() {
-        ["h", seq, "c"] => Ok((seq.parse()?, 0)),
-        ["h", seq, "m", ordinal] => {
-            let n = ordinal.parse()?;
-            ensure!(n >= 2, "history: invalid message id");
-            Ok((seq.parse()?, n))
-        }
-        _ => bail!("history: invalid id"),
-    }
-}
-
-fn fingerprint(run: &str, q: Option<&str>) -> String {
-    crate::eventlog::sha_bytes(&serde_json::to_vec(&(run, "root", q)).unwrap())[..32].into()
-}
-fn encode_cursor(frontier: u64, seq: u64, ordinal: usize, run: &str, q: Option<&str>) -> String {
-    format!("1:{frontier:x}:{seq:x}:{ordinal:x}:{}", fingerprint(run, q))
-}
-fn decode_cursor(cursor: &str, run: &str, q: Option<&str>) -> Result<(u64, u64, usize)> {
-    ensure!(cursor.len() <= 96, "history: invalid cursor");
-    let parts: Vec<_> = cursor.split(':').collect();
-    let ["1", frontier, seq, ordinal, hash] = parts.as_slice() else {
-        bail!("history: invalid cursor")
-    };
-    ensure!(
-        *hash == fingerprint(run, q),
-        "history: cursor run/query mismatch; resend q"
-    );
-    Ok((
-        u64::from_str_radix(frontier, 16)?,
-        u64::from_str_radix(seq, 16)?,
-        usize::from_str_radix(ordinal, 16)?,
-    ))
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eventlog::EventLog;
     use std::sync::Arc;
+
     struct Fixture {
         dir: std::path::PathBuf,
         log: Arc<EventLog>,
         history: History,
         messages: Vec<Value>,
     }
+
     impl Fixture {
         fn new(messages: Vec<Value>) -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -613,68 +334,57 @@ mod tests {
                 history: History::default(),
                 messages,
             };
-            f.save(json!({"messages":f.messages}), None);
+            f.save(json!({"messages": f.messages}), None);
             f
         }
+
         fn save(&self, controller: Value, archive: Option<Archive>) {
-            let blob = crate::supervisor::Checkpoint {
+            let blob = Checkpoint {
                 run: crate::supervisor::RunState::Running { controller },
                 durable: json!({}),
                 workflow: None,
             }
             .write(&self.log)
             .unwrap();
-            let mut fields = json!({"lane":"root","blob":blob});
+            let mut fields = json!({"lane": "root", "blob": blob});
             if let Some(a) = &archive {
                 fields["archive"] = json!(a);
             }
             let seq = self.log.write("checkpoint", fields, true).unwrap();
-            self.history
-                .committed(CheckpointRef { seq, blob }, archive)
-                .unwrap();
+            self.history.committed(CheckpointRef { seq, blob });
         }
-        fn compact(&mut self, cut: usize, summary: &str) {
-            let mut next = vec![json!({"role":"user","content":format!("task + {summary}")})];
+
+        fn compact(&mut self, cut: usize, summary: &str) -> Result<()> {
+            let mut next = vec![json!({"role": "user", "content": format!("task + {summary}")})];
             next.extend_from_slice(&self.messages[cut - 1..]);
-            let state = json!({"messages":next,"previous_summary":summary});
-            let archive = self
-                .history
-                .prepare(
-                    &Directive {
-                        kind: "compaction".into(),
-                        cut,
-                    },
-                    &self.messages,
-                    &state,
-                    Some("implementation-1".into()),
-                    &self.dir,
-                )
-                .unwrap();
+            let state = json!({"messages": next, "previous_summary": summary});
+            let directive = Directive {
+                kind: "compaction".into(),
+                cut,
+            };
+            let archive =
+                self.history
+                    .prepare(&directive, &self.messages, &state, None, &self.dir)?;
             self.save(state, Some(archive));
             self.messages = next;
+            Ok(())
         }
-        fn archive_seq(&self) -> u64 {
-            crate::eventlog::load(&self.log.path)
-                .unwrap()
-                .iter()
-                .rev()
-                .find(|r| r.get("archive").is_some())
-                .unwrap()["seq"]
-                .as_u64()
-                .unwrap()
-        }
-        fn query(&self, q: Value) -> Result<Value> {
-            self.history.query(&self.dir, "run", Query::parse(q)?, None)
+
+        fn query(&self, id: Option<usize>, range: Value) -> Result<Value> {
+            query(&self.log, Query::parse(id.map(|i| json!(i)), Some(range))?)
         }
     }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+
     fn message(role: &str, text: &str) -> Value {
-        json!({"role":role,"content":text})
+        json!({"role": role, "content": text})
     }
+
     fn conversation(text: &str) -> Vec<Value> {
         vec![
             message("user", "task"),
@@ -686,232 +396,108 @@ mod tests {
     }
 
     #[test]
-    fn repeated_compactions_preserve_occurrences_and_restore_index() {
-        let mut f = Fixture::new(conversation("same exact text"));
-        assert_eq!(f.query(json!({})).unwrap()["status"], "unavailable");
-        f.compact(4, "summary one");
-        let pinned = f.query(json!({"limit":1})).unwrap();
-        f.messages[2]["content"] = json!("same exact text");
-        f.messages
-            .extend([message("assistant", "last"), message("tool", "done")]);
+    fn compactions_list_and_read_their_removed_messages_after_a_restore() {
+        let mut f = Fixture::new(conversation("first output"));
+        assert_eq!(f.query(None, json!({})).unwrap(), json!([]));
+        f.compact(4, "summary one").unwrap();
+        f.messages.extend([
+            message("assistant", "last"),
+            message("tool", "second output"),
+        ]);
         f.save(
-            json!({"messages":f.messages,"previous_summary":"summary one"}),
+            json!({"messages": f.messages, "previous_summary": "summary one"}),
             None,
         );
-        f.compact(4, "summary two");
-        let remaining = f
-            .query(json!({"before":pinned["next"],"limit":20}))
+        f.compact(4, "summary two").unwrap();
+        assert_eq!(
+            f.query(None, json!({})).unwrap(),
+            json!([
+                {"id": 1, "messages": 2, "summary": "summary one"},
+                {"id": 2, "messages": 2, "summary": "summary two"},
+            ])
+        );
+        assert_eq!(
+            f.query(Some(1), json!({})).unwrap(),
+            json!([{"role": "assistant", "text": "run test"}, {"role": "tool", "text": "first output"}])
+        );
+        // The second compaction cut after its wrapped first message, which belongs to the first compaction.
+        assert_eq!(
+            f.query(Some(2), json!({"from": 2})).unwrap(),
+            json!([{"role": "tool", "text": "ok"}])
+        );
+        let records = crate::eventlog::load(&f.log.path).unwrap();
+        let latest = History::restore(&records)
+            .unwrap()
+            .latest
+            .into_inner()
             .unwrap();
-        assert_eq!(remaining["entries"].as_array().unwrap().len(), 2);
-        assert!(remaining.get("next").is_none());
-        let hits = f.query(json!({"q":"same exact text"})).unwrap();
-        let entries = hits["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_ne!(entries[0]["id"], entries[1]["id"]);
-        let all = f.query(json!({"limit":20})).unwrap();
-        assert_eq!(all["entries"].as_array().unwrap().len(), 6);
-        let restored = History::restore(&crate::eventlog::load(&f.log.path).unwrap()).unwrap();
-        assert_eq!(
-            restored
-                .query(
-                    &f.dir,
-                    "run",
-                    Query::parse(json!({"q":"same exact text"})).unwrap(),
-                    None
-                )
-                .unwrap(),
-            hits
-        );
+        assert_eq!(latest.unwrap().seq, records.last().unwrap()["seq"]);
+        for (id, range) in [
+            (0, json!({})),
+            (3, json!({})),
+            (1, json!({"from": 3})),
+            (1, json!({"to": 0})),
+        ] {
+            assert!(f.query(Some(id), range).is_err());
+        }
+        assert!(f.query(None, json!({"from": 1})).is_err());
+        assert!(f.query(Some(1), json!({"bytes": 1})).is_err());
     }
 
     #[test]
-    fn large_utf8_and_escaped_entries_are_reconstructed_with_bounded_pages() {
-        let text = "é🙂\n\u{1}\"\\".repeat(3000);
-        let mut f = Fixture::new(conversation(&text));
-        f.compact(4, "brief");
-        let hits = f.query(json!({"q":"é🙂"})).unwrap();
-        let id = hits["entries"][0]["id"].as_str().unwrap();
-        let mut output = String::new();
-        let mut offset = 0;
-        loop {
-            let page = f.query(json!({"id":id,"offset":offset})).unwrap();
-            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_RESPONSE);
-            let part = page["text"].as_str().unwrap();
-            assert!(part.len() <= MAX_TEXT);
-            output.push_str(part);
-            if let Some(next) = page["next_offset"].as_u64() {
-                assert!(next as usize > offset);
-                offset = next as usize;
-            } else {
-                break;
-            }
-        }
-        assert_eq!(output, text);
-        assert!(f.query(json!({"id":id,"offset":1})).is_err());
-        assert!(f.query(json!({"id":id,"bytes":1})).is_err());
-        assert_eq!(
-            f.query(json!({"id":id,"offset":text.len()})).unwrap()["text"],
-            ""
-        );
-    }
-
-    #[test]
-    fn search_continuations_progress_and_bind_query_and_run() {
-        let mut messages = vec![message("user", "task")];
-        for i in 0..150 {
-            messages.push(message("assistant", "call"));
-            messages.push(message("tool", if i == 0 { "needle" } else { "ordinary" }));
-        }
-        messages.extend([message("assistant", "keep"), message("tool", "keep")]);
-        let cut = messages.len() - 1;
-        let mut f = Fixture::new(messages);
-        f.compact(cut, "summary");
-        let mut q = json!({"q":"needle"});
-        let mut found = 0;
-        let mut pages = 0;
-        loop {
-            let page = f.query(q.clone()).unwrap();
-            pages += 1;
-            found += page["entries"].as_array().unwrap().len();
-            if let Some(cursor) = page["next"].as_str() {
-                assert!(cursor.len() <= 96);
-                assert!(f.query(json!({"q":"other","before":cursor})).is_err());
-                q["before"] = json!(cursor);
-                let restored =
-                    History::restore(&crate::eventlog::load(&f.log.path).unwrap()).unwrap();
-                assert!(
-                    restored
-                        .query(
-                            &f.dir,
-                            "another-run",
-                            Query::parse(q.clone()).unwrap(),
-                            None
-                        )
-                        .is_err()
-                );
-                assert_eq!(
-                    restored
-                        .query(&f.dir, "run", Query::parse(q.clone()).unwrap(), None)
-                        .unwrap(),
-                    f.query(q.clone()).unwrap()
-                );
-            } else {
-                break;
-            }
-            assert!(pages < 5);
-        }
-        assert!(pages >= 3);
-        assert_eq!(found, 1);
-    }
-
-    #[test]
-    fn a_search_charges_message_blobs_and_continues_where_the_budget_ran_out() {
-        // Five compactions each archive the same 15 MiB message: one blob, but every read of it is charged, so the
-        // fifth does not fit one call's 64 MiB.
-        let big = "x".repeat(15 << 20);
-        let mut f = Fixture::new(vec![
+    fn a_range_over_the_data_boundary_names_the_range_that_fits() {
+        // A checkpoint's conversation is itself held to the data boundary, but rendering a non-code tool input as JSON
+        // escapes it again: two calls that fit in the conversation do not fit in one answer.
+        let quotes = "\"".repeat(3 << 20);
+        let call = json!({"role": "assistant", "content": "",
+            "calls": [{"name": "other", "id": "c", "input": {"s": quotes}}]});
+        let messages = vec![
             message("user", "task"),
-            message("assistant", "call"),
-            message("tool", &big),
+            call.clone(),
+            message("tool", "ok"),
+            call,
+            message("tool", "ok"),
             message("assistant", "keep"),
             message("tool", "keep"),
-        ]);
-        f.compact(4, "summary 0");
-        for round in 1..5 {
-            f.messages.extend([
-                message("assistant", "call"),
-                message("tool", &big),
-                message("assistant", "keep"),
-                message("tool", "keep"),
-            ]);
-            f.save(
-                json!({"messages":f.messages,"previous_summary":"summary"}),
-                None,
-            );
-            f.compact(f.messages.len() - 1, &format!("summary {round}"));
-        }
-        let first = f.query(json!({"q":"absent","limit":20})).unwrap();
-        assert_eq!(first["scan_complete"], false);
-        let rest = f
-            .query(json!({"q":"absent","limit":20,"before":first["next"]}))
-            .unwrap();
-        assert_eq!(rest["scan_complete"], true);
-    }
-
-    #[test]
-    fn identical_messages_in_one_archive_keep_distinct_ids() {
-        let mut messages = vec![message("user", "task")];
-        for _ in 0..80 {
-            messages.push(message("assistant", "same call"));
-            messages.push(message("tool", "same result"));
-        }
-        messages.extend([message("assistant", "keep"), message("tool", "keep")]);
-        let cut = messages.len() - 1;
+        ];
         let mut f = Fixture::new(messages);
-        f.compact(cut, "summary");
-        let mut ids = std::collections::BTreeSet::new();
-        let mut q = json!({"q":"same result","limit":20});
-        loop {
-            let page = f.query(q.clone()).unwrap();
-            for entry in page["entries"].as_array().unwrap() {
-                assert!(ids.insert(entry["id"].as_str().unwrap().to_string()));
-                assert_eq!(
-                    f.query(json!({"id":entry["id"]})).unwrap()["text"],
-                    "same result"
-                );
-            }
-            match page["next"].as_str() {
-                Some(next) => q["before"] = json!(next),
-                None => break,
-            }
-        }
-        // 80 occurrences across two chunks of the source's message list, each with its own position.
-        assert_eq!(ids.len(), 80);
-        assert!(ids.contains(&format!("h:{}:m:3", f.archive_seq())));
+        f.compact(6, "summary").unwrap();
+        let error = f.query(Some(1), json!({})).unwrap_err().to_string();
+        assert!(error.contains("history(1, {from = 1, to = 2})"), "{error}");
+        let rest = f.query(Some(1), json!({"from": 3})).unwrap();
+        assert_eq!(rest.as_array().map(Vec::len), Some(2));
+        assert!(rest[0]["code"].as_str().unwrap().len() > 2 * quotes.len());
     }
 
     #[test]
     fn validation_rejects_bad_transitions_and_private_fields_are_not_rendered() {
-        let f = Fixture::new(conversation("result"));
-        let state = json!({"messages":[message("user","summary"),message("assistant","wrong")],"previous_summary":"summary"});
+        let mut f = Fixture::new(conversation("result"));
+        let state = json!({"messages": [message("user", "summary"), message("assistant", "wrong")], "previous_summary": "summary"});
+        let directive = Directive {
+            kind: "compaction".into(),
+            cut: 4,
+        };
         assert!(
             f.history
-                .prepare(
-                    &Directive {
-                        kind: "compaction".into(),
-                        cut: 4
-                    },
-                    &f.messages,
-                    &state,
-                    None,
-                    &f.dir
-                )
+                .prepare(&directive, &f.messages, &state, None, &f.dir)
                 .is_err()
         );
-        let public=render(&json!({"content":[{"type":"text","text":"visible"},{"type":"image","data":"SECRET"}],
-            "raw":"PRIVATE","images":[{"data":"SECRET","path":"f.png","width":10,"height":5}],"calls":[{"name":"luau","id":"c","input":{"code":"print(42)"}}]})).unwrap();
-        assert!(
-            public.contains("visible")
-                && public.contains("print(42)")
-                && public.contains("[image f.png 10x5 not kept")
-        );
-        assert!(!public.contains("PRIVATE") && !public.contains("SECRET"));
-        for q in [
-            json!({"q":""}),
-            json!({"limit":0}),
-            json!({"id":"x","q":"q"}),
-            json!({"run":"other"}),
-        ] {
-            assert!(Query::parse(q).is_err());
-        }
+        assert!(f.compact(2, "summary").is_err());
+        let public = render(&json!({"role": "assistant",
+            "content": [{"type": "text", "text": "visible"}, {"type": "image", "data": "SECRET"}],
+            "raw": "PRIVATE", "images": [{"data": "SECRET", "path": "f.png", "width": 10, "height": 5}],
+            "calls": [{"name": "luau", "id": "c", "input": {"code": "print(42)"}}]}))
+        .unwrap();
+        assert_eq!(public["code"], "print(42)");
+        let text = public["text"].as_str().unwrap();
+        assert!(text.contains("visible") && text.contains("[image f.png 10x5 not kept"));
+        assert!(!public.to_string().contains("PRIVATE") && !public.to_string().contains("SECRET"));
     }
 
     #[test]
-    fn missing_corrupt_oversized_sources_and_expired_reads_fail_explicitly() {
+    fn a_missing_or_corrupt_source_fails_explicitly() {
         let mut f = Fixture::new(conversation("original"));
-        f.compact(4, "brief");
-        let page = f.query(json!({"q":"original"})).unwrap();
-        let id = page["entries"][0]["id"].as_str().unwrap();
+        f.compact(4, "brief").unwrap();
         let records = crate::eventlog::load(&f.log.path).unwrap();
         let source = records
             .iter()
@@ -919,41 +505,13 @@ mod tests {
             .unwrap();
         let path = f.dir.join("blobs").join(source);
         let saved = std::fs::read(&path).unwrap();
-        let read = || {
-            History::restore(&records).unwrap().query(
-                &f.dir,
-                "run",
-                Query::parse(json!({"id":id})).unwrap(),
-                None,
-            )
-        };
         std::fs::write(&path, b"corrupted").unwrap();
-        assert!(read().unwrap_err().to_string().contains("hash mismatch"));
+        assert!(
+            format!("{:#}", f.query(Some(1), json!({})).unwrap_err()).contains("hash mismatch")
+        );
         std::fs::remove_file(&path).unwrap();
-        assert!(read().is_err());
-        let sparse = std::fs::File::create(&path).unwrap();
-        sparse.set_len(MAX_SOURCE as u64 + 1).unwrap();
-        assert!(
-            read()
-                .unwrap_err()
-                .to_string()
-                .contains("source read limit")
-        );
-        drop(sparse);
+        assert!(f.query(Some(1), json!({})).is_err());
         std::fs::write(&path, saved).unwrap();
-        assert_eq!(read().unwrap()["text"], "original");
-        assert!(
-            f.history
-                .query(
-                    &f.dir,
-                    "run",
-                    Query::parse(json!({})).unwrap(),
-                    Some(crate::supervisor::now() - 1.0)
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("deadline")
-        );
-        assert!(f.query(json!({"id":"h:999999:m:2"})).is_err());
+        assert_eq!(f.query(Some(1), json!({})).unwrap()[1]["text"], "original");
     }
 }

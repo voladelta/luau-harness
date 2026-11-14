@@ -31,7 +31,7 @@ const SH_TIMEOUT_MAX: f64 = 600.0;
 pub fn prompt_limits() -> serde_json::Value {
     serde_json::json!({
         "MAX_READ_MB": MAX_READ >> 20, "MAX_CAPTURE_MB": MAX_CAPTURE >> 20, "CAPTURE_HALF_KB": (MAX_CAPTURE / 2) >> 10, "DEFAULT_HITS": DEFAULT_HITS, "MAX_HITS": MAX_HITS, "SH_TIMEOUT": SH_TIMEOUT, "SH_TIMEOUT_MAX": SH_TIMEOUT_MAX,
-        "CHUNK_SECS": crate::vm::CHUNK_SECS, "VIEW_MAX": crate::vm::VIEW_MAX.0, "VIEW_MAX_MIN": crate::vm::VIEW_MAX.1, "VIEW_MAX_LIMIT": crate::vm::VIEW_MAX.2, "HISTORY_ENTRIES": crate::history::DEFAULT_LIMIT, "HISTORY_BYTES": crate::history::MAX_TEXT, "DATA_BYTES": crate::values::MAX_BYTES,
+        "CHUNK_SECS": crate::vm::CHUNK_SECS, "VIEW_MAX": crate::vm::VIEW_MAX.0, "VIEW_MAX_MIN": crate::vm::VIEW_MAX.1, "VIEW_MAX_LIMIT": crate::vm::VIEW_MAX.2, "DATA_BYTES": crate::values::MAX_BYTES,
     })
 }
 

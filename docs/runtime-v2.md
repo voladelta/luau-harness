@@ -46,26 +46,22 @@ Copies stop during traversal at 64 levels, 262144 nodes or a conservative 16 MiB
 
 ## Compaction history
 
-Root agents can retrieve the public conversation removed by successful, recorded compactions. The system prompt does not describe `history`; each compaction summary of a root run ends with a notice that does, so the model learns of it once the archive has entries:
+Root agents can read back the public conversation removed by successful, recorded compactions, as plain Luau data. The system prompt does not describe `history`; each compaction summary of a root run ends with a notice that does, so the model learns of it once the archive has entries:
 
 ```luau
-local page = history({q="earlier failure", limit=5})
-for _, entry in page.entries do print(entry.id, entry.snippet) end
--- Continue searches with the same q and before=page.next, even on an empty page.
-local entry = history({id="h:428:m:17"})
-print(entry.text)
--- Continue long entries with offset=entry.next_offset.
+for _, c in history() do -- {id, messages, summary, stage?}, oldest first
+  for i, m in history(c.id) do -- {role, text, code?}, in order
+    if m.text:find("earlier failure", 1, true) then print(c.id, i, m.role, m.text:sub(1, 300)) end
+  end
+end
+local some = history(2, {from = 10, to = 20})
 ```
 
-Search is a case-sensitive literal match over complete rendered entries. Listing defaults to five entries (maximum twenty), examines newest entries first and presents each page chronologically. Summary entries are labeled `kind="compaction"` and contain the bare summarizer output. Message entries preserve saved content and tool-call inputs; provider replay/reasoning fields and media payloads are excluded. This is the saved public transcript, so output shortened before entering the conversation cannot be recovered.
+`history()` lists the compactions: an id from 1, how many messages each removed, the summary that replaced them and, in a workflow, the stage it ran in. `history(id)` returns that compaction's removed messages, and `history(id, {from = i, to = j})` messages `i..j` of them. A message keeps its role and text; the code of its tool calls (or their input as JSON, for a tool without code) is in `code`, and a tool result is a `tool` message whose text is the output. Provider replay/reasoning fields and media payloads are left out. This is the saved public transcript, so output shortened before entering the conversation cannot be recovered. A call returns at most the data boundary (`hx.limits.DATA_BYTES`); a longer answer is an error naming the range that fits.
 
-Reads return at most 4096 UTF-8-safe text bytes (`bytes` can lower this). Offsets are zero-based byte offsets; offsets inside a character fail. Serialized responses are capped at 12 KiB, including escaping. List snippets are at most 200 bytes. A search examines at most 128 entries and charges at most 64 MiB of checkpoint source bytes per call: each message blob it reads, and each checkpoint body and list of message hashes once. Follow `next` until absent; `scan_complete=false` means more candidates remain, even if the page has no matches. Cursors bind the run, query and initial archive frontier.
+The archive covers only recorded root compactions in this run, including earlier RPI stages and before resume. It excludes live messages, un-compacted remainders of retired stages, child lanes, branch-parent journals and native operation receipts. Children and isolated package VMs have no `history` global. A run without a compaction lists none.
 
-The archive covers only recorded root compactions in this run, including earlier RPI stages and before resume. It excludes live messages, un-compacted remainders of retired stages, child lanes, branch-parent journals and native operation receipts. Children and isolated package VMs have no `history` global. No supported archive records returns `status="unavailable"`; an available archive without matches returns `status="ok"` with empty entries.
-
-Successful compaction emits an internal `next` command with `archive={kind="compaction",cut=old_cut}`. Rust validates the source conversation, summary and retained suffix before commit. The same synced checkpoint record commits both the new state and a versioned archive descriptor referencing the preceding root checkpoint. Entry IDs derive from that record's sequence and source message ordinal, so identical messages remain distinct and IDs survive resume. Custom controllers that discard context without this directive do not create archive entries.
-
-Checkpoints and their message blobs remain the only authoritative bodies. A disposable descriptor index is rebuilt from the verified journal and grows with recorded compactions. Retrieval runs in a blocking worker with deadline checks, read authority and workflow admission. Missing, corrupt or individually oversized sources (over 64 MiB) fail explicitly. Lookup never replays historical chunks.
+Successful compaction emits an internal `next` command with `archive={kind="compaction",cut=old_cut}`. Rust validates the source conversation, summary and retained suffix before commit. The same synced checkpoint record commits both the new state and a versioned archive descriptor referencing the preceding root checkpoint, whose messages are the archive: nothing else is stored. `history` reads the verified journal's checkpoint records when it is called, in a blocking worker under the run deadline, with read authority and workflow admission; a missing or corrupt source fails explicitly. Custom controllers that discard context without this directive do not create archive entries.
 
 ## Dispatch and uncertainty
 

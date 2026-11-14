@@ -165,7 +165,7 @@ pub fn copy_out(value: Value) -> mlua::Result<serde_json::Value> {
     visit(value, &mut HashSet::new(), 0, &mut Limit::default())
 }
 
-fn validate_with_limit(
+pub(crate) fn validate_with_limit(
     value: &serde_json::Value,
     depth: usize,
     limit: &mut Limit,

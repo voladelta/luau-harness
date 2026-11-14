@@ -1079,43 +1079,37 @@ impl Vm {
             let hops = ops.clone();
             g.set(
                 "history",
-                lua.create_async_function(move |lua, input: Option<Value>| {
-                    let (h, fx, ops) = (h.clone(), hfx.clone(), hops.clone());
-                    async move {
-                        let args = input
-                            .map(crate::values::copy_out)
-                            .transpose()?
-                            .unwrap_or(json!({}));
-                        let query = crate::history::Query::parse(args.clone())
-                            .map_err(mlua::Error::external)?;
-                        ops.fetch_add(1, Ordering::Relaxed);
-                        let result = fx
-                            .run(
-                                &lua,
-                                crate::supervisor::Tool::History,
-                                Class::Read,
-                                args,
-                                || async move {
-                                    let deadline =
-                                        h.supervisor.manifest.as_ref().and_then(|m| m.deadline);
-                                    let value = tokio::task::spawn_blocking(move || {
-                                        h.supervisor.history.query(
-                                            h.policy.log.dir(),
-                                            &h.policy.log.session,
-                                            query,
-                                            deadline,
-                                        )
-                                    })
-                                    .await
-                                    .map_err(mlua::Error::external)?
-                                    .map_err(mlua::Error::external)?;
-                                    Ok(Ret::Json(value))
-                                },
-                            )
-                            .await?;
-                        prims::json_value(&lua, result)
-                    }
-                })?,
+                lua.create_async_function(
+                    move |lua, (id, range): (Option<Value>, Option<Value>)| {
+                        let (h, fx, ops) = (h.clone(), hfx.clone(), hops.clone());
+                        async move {
+                            let id = id.map(crate::values::copy_out).transpose()?;
+                            let range = range.map(crate::values::copy_out).transpose()?;
+                            let query = crate::history::Query::parse(id, range)
+                                .map_err(mlua::Error::external)?;
+                            let args = json!(query);
+                            ops.fetch_add(1, Ordering::Relaxed);
+                            let result = fx
+                                .run(
+                                    &lua,
+                                    crate::supervisor::Tool::History,
+                                    Class::Read,
+                                    args,
+                                    || async move {
+                                        let value = tokio::task::spawn_blocking(move || {
+                                            crate::history::query(&h.policy.log, query)
+                                        })
+                                        .await
+                                        .map_err(mlua::Error::external)?
+                                        .map_err(mlua::Error::external)?;
+                                        Ok(Ret::Json(value))
+                                    },
+                                )
+                                .await?;
+                            prims::json_value(&lua, result)
+                        }
+                    },
+                )?,
             )?;
         }
         let (bs, bh, bfx, bops) = (supervisor.clone(), host.clone(), fx.clone(), ops.clone());

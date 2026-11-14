@@ -1590,40 +1590,6 @@ mod tests {
                 "docs/runtime-v2.md",
                 runtime,
                 format!(
-                    "Listing defaults to {} entries (maximum {})",
-                    word(history::DEFAULT_LIMIT),
-                    word(history::MAX_LIMIT)
-                ),
-            ),
-            (
-                "docs/runtime-v2.md",
-                runtime,
-                format!(
-                    "Reads return at most {} UTF-8-safe text bytes",
-                    history::MAX_TEXT
-                ),
-            ),
-            (
-                "docs/runtime-v2.md",
-                runtime,
-                format!(
-                    "Serialized responses are capped at {} KiB",
-                    history::MAX_RESPONSE >> 10
-                ),
-            ),
-            (
-                "docs/runtime-v2.md",
-                runtime,
-                format!(
-                    "A search examines at most {} entries and charges at most {} of checkpoint source bytes",
-                    history::MAX_SCAN,
-                    mib(history::MAX_SOURCE)
-                ),
-            ),
-            (
-                "docs/runtime-v2.md",
-                runtime,
-                format!(
                     "under a {}-second CPU deadline and a {} memory limit",
                     word(tools::REGISTER_SECS as usize),
                     mib(tools::REGISTER_MEMORY)

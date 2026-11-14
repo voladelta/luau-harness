@@ -258,14 +258,15 @@ end
 
 -- How to reach the archive, shown only once it has something in it: the system prompt does not document history().
 local function history_notice(): string
-	local l = hx.limits
 	return string.format([==[
 
-The messages this and earlier compactions removed are archived; search them with the `history` function in Luau:
-- p = history({q = "literal text"}) searches case-sensitively, newest first, %d entries a page; print each p.entries[i].snippet. With no q it lists. While p.next is set, more remain: history({q = "literal text", before = p.next}).
-- e = history({id = p.entries[i].id}) reads one entry; print e.text (%d bytes a page). While e.next_offset is set, more remain: history({id = e.id, offset = e.next_offset}).
+The messages this and earlier compactions removed are archived; read them as Luau data with the `history` function:
+- history() lists the compactions, oldest first: {id, messages, summary} each, the number of messages it removed and the summary that replaced them.
+- history(id) returns that compaction's removed messages in order: {role, text, code}, code only on tool calls. history(id, {from = i, to = j}) returns messages i..j. A call returns at most %d MiB; the error names the range to read instead.
+Filter in Luau. For example, the messages that mention a string:
+for _, c in history() do for i, m in history(c.id) do if (m.text .. (m.code or "")):find("needle", 1, true) then print(c.id, i, m.role, m.text:sub(1, 300)) end end end
 Output cut short before it entered the conversation cannot be recovered. Live messages, other agents and un-compacted remainders of earlier workflow stages are not in the archive.
-]==], l.HISTORY_ENTRIES, l.HISTORY_BYTES)
+]==], hx.limits.DATA_BYTES // 2 ^ 20)
 end
 
 function M.wrap(task, summary, history)

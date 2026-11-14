@@ -6,19 +6,20 @@ import redesign_checks as h
 INIT = 'require("std/recheck").enabled=false\nrequire("std/compact").keep_ratio=0.001\n'
 MARKER = "HISTORY_NEEDLE=8bd7e395"
 FIRST = 'print(string.rep("x",2200).."HISTORY_".."NEEDLE=8bd7e395"..string.rep("y",2200))'
-GET = '''local p=history({q="HISTORY_NEEDLE",limit=20}); local found=false
-for _,e in p.entries do
- if e.role=="tool" then
-  local chunks={}; local offset=0
-  repeat
-   local page=history({id=e.id,offset=offset})
-   table.insert(chunks,page.text); offset=page.next_offset
-  until offset==nil
-  assert(table.concat(chunks):find("HISTORY_NEEDLE=8bd7e395",1,true))
-  durable.set("old_entry",e.id); found=true
- end
-end
-assert(found); print("ARCHIVE_OK")'''
+# Finds the needle by filtering in Luau, reads it back alone with a range, and checks the call's code came back too.
+GET = '''local cs=history(); assert(#cs==1 and cs[1].id==1 and cs[1].messages>=2, #cs)
+assert(cs[1].summary:find("Only routine work remains",1,true) or cs[1].summary:find("Research continues",1,true))
+local all=history(1); assert(#all==cs[1].messages)
+local found
+for i,m in all do if m.role=="tool" and m.text:find("HISTORY_NEEDLE=8bd7e395",1,true) then found=i end end
+assert(found and all[found-1].role=="assistant" and all[found-1].code:find("string.rep",1,true))
+local one=history(1,{from=found,to=found}); assert(#one==1 and one[1].text==all[found].text)
+assert(#history(1,{from=found})==#all-found+1)
+local ok,err=pcall(history,1,{from=#all+1}); assert(not ok and tostring(err):find("outside",1,true), err)
+ok,err=pcall(history,1,{bytes=1}); assert(not ok, "unknown range field")
+ok,err=pcall(history,2); assert(not ok and tostring(err):find("no compaction 2",1,true), err)
+durable.set("old_entry",found); print("ARCHIVE_OK")'''
+OLD = 'local m=history(1)[durable.get("old_entry")];assert(m.text:find("HISTORY_NEEDLE=8bd7e395",1,true))'
 
 
 def is_summary(body):
@@ -37,10 +38,10 @@ def script(repeat=False, empty=False):
         if n == 2:
             return {"code": 'print("tail")', "tokens": 23000}
         if n == 3:
-            return {"code": 'assert(history().status=="unavailable");print("NO_ARCHIVE")' if empty else GET,
+            return {"code": 'assert(#history()==0);print("NO_ARCHIVE")' if empty else GET,
                     "tokens": 23000 if repeat else 10}
         if n == 4 and repeat:
-            return h.tool('local p=history({id=durable.get("old_entry")});assert(p.text:find("HISTORY_NEEDLE=8bd7e395",1,true));print("OLD_ENTRY_SURVIVES")')
+            return h.tool('assert(#history()==2);' + OLD + ';print("OLD_ENTRY_SURVIVES")')
         return "done"
     return answer
 
@@ -89,8 +90,10 @@ def crash_boundaries(commit):
             if "Recovered into a fresh Luau VM" in h.body_text(body):
                 resumed += 1
                 if resumed == 1:
-                    status = "unavailable" if number < commit else "ok"
-                    return h.tool('assert(history().status=="' + status + '");print("RECOVERY_HISTORY_OK")')
+                    count = 0 if number < commit else 1
+                    read = ('local hit=false;for _,m in history(1) do hit=hit or m.text:find("HISTORY_NEEDLE=8bd7e395",1,true)~=nil end;assert(hit);'
+                            if count else '')
+                    return h.tool(f'assert(#history()=={count});{read}print("RECOVERY_HISTORY_OK")')
                 return "done"
             return normal(body, index)
         with h.provider(answer) as (url, calls):
@@ -133,7 +136,7 @@ def scope_and_branch():
         nonlocal root
         root += 1
         if root == 1:
-            return h.tool('assert(history().status=="unavailable");assert(agent("HISTORY_CHILD",{max_turns=3}).finished);print("ROOT_SCOPE_OK")')
+            return h.tool('assert(#history()==0);assert(agent("HISTORY_CHILD",{max_turns=3}).finished);print("ROOT_SCOPE_OK")')
         return "done"
     with h.provider(scoped) as (url, calls):
         report = json.loads(start(path, url).stdout)
@@ -143,7 +146,7 @@ def scope_and_branch():
         start(parent, url)
     branch = h.workspace("history-branch", INIT)
     def branch_reply(body, index):
-        return h.tool('assert(history().status=="unavailable");print("BRANCH_ISOLATED")') if index == 0 else "done"
+        return h.tool('assert(#history()==0);print("BRANCH_ISOLATED")') if index == 0 else "done"
     with h.provider(branch_reply) as (url, calls):
         report = json.loads(h.run(branch, "run", "--branch", str(h.journal(parent)),
             "--prompt-file", str(branch / "task.md"), "--model", "mock", "--base-url", url,
@@ -173,7 +176,7 @@ def rpi_compaction():
                 return h.tool(GET)
         if name == "research" and not carried:
             carried = True
-            return h.tool('local p=history({id=durable.get("old_entry")});assert(p.text:find("HISTORY_NEEDLE=8bd7e395",1,true));print("PRIOR_STAGE_HISTORY_OK")')
+            return h.tool('assert(history()[1].stage:find("^research_questions"));' + OLD + ';print("PRIOR_STAGE_HISTORY_OK")')
         return base(body, index)
     with h.provider(answer) as (url, calls):
         report = rpi.report(rpi.start(path, url, "--context-window", "40000", "--max-output", "1000"))
@@ -196,7 +199,7 @@ if __name__ == "__main__":
     failed_summary()
     print("PASS empty summaries create no archive", flush=True)
     crash_boundaries(commit)
-    print("PASS atomic archive recovery on both sides of commit", flush=True)
+    print("PASS atomic archive recovery on both sides of commit, read back after resume", flush=True)
     invalid_directive()
     print("PASS invalid directive rejected before commit", flush=True)
     scope_and_branch()

@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -568,40 +568,14 @@ fn crash_hook() -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+/// Read a blob and verify its content hash.
 pub fn read_blob(log_dir: &Path, sha: &str) -> Result<Vec<u8>> {
-    read_blob_bounded(log_dir, sha, usize::MAX, || Ok(()))
-}
-
-/// Read a blob of at most `max` bytes, calling `check` (a deadline) between chunks, and verify its content hash.
-pub fn read_blob_bounded(
-    log_dir: &Path,
-    sha: &str,
-    max: usize,
-    mut check: impl FnMut() -> Result<()>,
-) -> Result<Vec<u8>> {
     anyhow::ensure!(
         sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid blob hash {sha:?}"
     );
     let path = log_dir.join("blobs").join(sha);
-    let mut file =
-        std::fs::File::open(&path).with_context(|| format!("journal blob {}", path.display()))?;
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 65536];
-    loop {
-        check()?;
-        let n = file
-            .read(&mut chunk)
-            .with_context(|| format!("journal blob {}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        anyhow::ensure!(
-            bytes.len() + n <= max,
-            "blob {sha}: over the {max}-byte read limit"
-        );
-        bytes.extend_from_slice(&chunk[..n]);
-    }
+    let bytes = std::fs::read(&path).with_context(|| format!("journal blob {}", path.display()))?;
     anyhow::ensure!(
         sha_bytes(&bytes) == sha,
         "blob {sha}: content hash mismatch"

@@ -78,7 +78,7 @@ test.case("accept takes only a complete, text-only, smaller summary", function()
 	local first = compact.accept({ text = "SUM", finish = "stop" }, "TASK", m, 4, false)
 	test.ok(first:find("^TASK\n\n%[compaction%-summary%]"), first)
 	test.ok(first:find("SUM", 1, true))
-	test.ok(compact.accept({ text = "SUM" }, "TASK", m, 4, true):find("history({", 1, true), "the archive notice when history is on")
+	test.ok(compact.accept({ text = "SUM" }, "TASK", m, 4, true):find("history()", 1, true), "the archive notice when history is on")
 	test.eq(select(2, compact.accept({ text = "SUM", finish = "length" }, "TASK", m, 4, false)), "length")
 	test.eq(select(2, compact.accept({ text = "SUM", finish = "tool_markup" }, "TASK", m, 4, false)), "tool_markup")
 	test.eq(select(2, compact.accept({ text = "SUM", calls = { {} } }, "TASK", m, 4, false)), "tool call")
@@ -206,7 +206,7 @@ end)
 
 test.case("history() is documented in the summary once the archive has entries, not before", function()
 	local with = compact.wrap("TASK", "S", true)
-	for _, needle in { 'history({q = "literal text"})', "before = p.next", "e.text", "offset = e.next_offset", "case-sensitively" } do
+	for _, needle in { "history() lists", "history(id)", "history(id, {from = i, to = j})", 'find("needle", 1, true)', "16 MiB" } do
 		test.ok(with:find(needle, 1, true), needle)
 	end
 	test.ok(not compact.wrap("TASK", "S", false):find("history(", 1, true))
