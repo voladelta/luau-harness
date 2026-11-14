@@ -83,6 +83,7 @@ environment:
   HX_API_URL        Anthropic Messages endpoint (default https://api.deepseek.com/anthropic/v1/messages)
   HX_KEY_ENV        name of the variable that holds the API key (default DEEPSEEK_API_KEY)
   HX_MODEL          model name (default deepseek-flash)
+  HX_EFFORT         how hard the model thinks: none ... max (default: the endpoint's)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.

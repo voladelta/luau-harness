@@ -26,6 +26,9 @@ M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
 M.output_limit = 30000 -- bytes of a tool result shown to the model
 M.lua_seconds = 60 -- time limit of one `lua` tool call
+M.effort = host.env("HX_EFFORT") -- how hard the model thinks, as output_config.effort; nil leaves it to the endpoint
+M.repeat_reminders = { 3, 5, 8 } -- the same call made this many times in a row gets a reminder
+M.empty_retries = 2 -- a reply with nothing in it is asked for again this many times
 
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
 local function progress(text)
@@ -34,13 +37,24 @@ local function progress(text)
 	end
 end
 
--- Keeps the start and the end of a long text: the start says what ran, the end says how it went.
+-- Keeps the start and the end of a long text: the start says what ran, the end says how it went. The whole text
+-- goes to a file in $TMPDIR, so what was left out can still be read or searched.
+local spills = 0
 local function clip(text)
 	if #text <= M.output_limit then
 		return text
 	end
 	local half = M.output_limit // 2
-	return text:sub(1, half) .. ("\n[... %d bytes omitted ...]\n"):format(#text - 2 * half) .. text:sub(-half)
+	local where = ""
+	local tmp = host.env("TMPDIR")
+	if tmp then
+		spills += 1
+		local path = ("%s/hx-output-%d.txt"):format(tmp, spills)
+		if host.write(path, text) then
+			where = "; the whole output is in " .. path
+		end
+	end
+	return text:sub(1, half) .. ("\n[... %d bytes omitted%s ...]\n"):format(#text - 2 * half, where) .. text:sub(-half)
 end
 
 -- Removes control characters but newline and tab. Escape sequences in text from the model would otherwise
@@ -104,8 +118,9 @@ end
 
 -- Tools -----------------------------------------------------------------------------------------------------
 --
--- Each tool is {name, description, parameters (a JSON schema), run(args) -> string}. A tool reports failure by
--- raising; the message goes back to the model. Add project tools to this list.
+-- Each tool is {name, description, parameters (a JSON schema), run(args) -> string}, and may have `aliases`, a
+-- map from an argument name models often send to the tool's own name for it. A tool reports failure by raising;
+-- the message goes back to the model. Add project tools to this list.
 
 local scratch = setmetatable({}, { __index = _G }) -- globals of `lua` snippets live here, across calls
 
@@ -154,18 +169,20 @@ M.tools = {
 	{
 		name = "read",
 		description = "Read a text file. Returns whole lines from line `offset` (default 1), up to `limit` lines "
-			.. "(default 2000) or the output limit, and ends with the range it returned when that is not the whole file.",
+			.. "(default 2000) or the output limit, each as `NUMBER: text`; the numbers are not part of the file. "
+			.. "When that is not the whole file, it ends with the range it returned and the offset to go on from.",
 		parameters = {
 			type = "object",
 			properties = {
-				path = { type = "string" },
-				offset = { type = "number" },
-				limit = { type = "number" },
+				file_path = { type = "string" },
+				offset = { type = "number", description = "first line, from 1" },
+				limit = { type = "number", description = "most lines to return" },
 			},
-			required = { "path" },
+			required = { "file_path" },
 		},
+		aliases = { path = "file_path" },
 		run = function(args)
-			local text, err = host.read(need(args, "path", "string"))
+			local text, err = host.read(need(args, "file_path", "string"))
 			if not text then
 				error(err, 0)
 			end
@@ -182,23 +199,32 @@ M.tools = {
 				error(("offset %d is past the end: the file has %d lines"):format(first, #lines), 0)
 			end
 			-- Whole lines up to the byte limit, never head and tail, so the range says exactly what was left out.
-			local size = #lines[first]
+			local function numbered(i)
+				return ("%d: %s"):format(i, lines[i])
+			end
+			local shown = { numbered(first) }
+			local size = #shown[1]
 			for i = first + 1, last do
-				size += 1 + #lines[i]
+				local line = numbered(i)
+				size += 1 + #line
 				if size > M.output_limit then
 					last = i - 1
 					break
 				end
+				table.insert(shown, line)
 			end
 			local body
 			if #lines[first] > M.output_limit then
 				-- A line longer than the limit still counts as read, so the next offset moves past it.
-				body = lines[first]:sub(1, M.output_limit)
+				last = first
+				body = ("%d: %s"):format(first, lines[first]:sub(1, M.output_limit))
 					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], M.output_limit)
 			else
-				body = table.concat(lines, "\n", first, last)
+				body = table.concat(shown, "\n")
 			end
-			if first > 1 or last < #lines then
+			if last < #lines then
+				body ..= ("\n[lines %d-%d of %d; offset=%d goes on]"):format(first, last, #lines, last + 1)
+			elseif first > 1 then
 				body ..= ("\n[lines %d-%d of %d]"):format(first, last, #lines)
 			end
 			return body
@@ -206,14 +232,16 @@ M.tools = {
 	},
 	{
 		name = "write",
-		description = "Create or overwrite a file with `content`. Missing directories are created.",
+		description = "Create or overwrite a file with `content`. Missing directories are created. For a change to "
+			.. "part of an existing file, edit is cheaper and safer.",
 		parameters = {
 			type = "object",
-			properties = { path = { type = "string" }, content = { type = "string" } },
-			required = { "path", "content" },
+			properties = { file_path = { type = "string" }, content = { type = "string" } },
+			required = { "file_path", "content" },
 		},
+		aliases = { path = "file_path" },
 		run = function(args)
-			local path, content = need(args, "path", "string"), need(args, "content", "string")
+			local path, content = need(args, "file_path", "string"), need(args, "content", "string")
 			local ok, err = host.write(path, content)
 			if not ok then
 				error(err, 0)
@@ -224,45 +252,62 @@ M.tools = {
 	{
 		name = "edit",
 		description = "Replace the exact text `old_string` with `new_string` in a file. `old_string` must occur "
-			.. "exactly once, unless `replace_all` is true, which replaces every occurrence.",
+			.. "exactly once, unless `replace_all` is true, which replaces every occurrence. Copy it from the file "
+			.. "without the line numbers read puts in front.",
 		parameters = {
 			type = "object",
 			properties = {
-				path = { type = "string" },
+				file_path = { type = "string" },
 				old_string = { type = "string" },
 				new_string = { type = "string" },
 				replace_all = { type = "boolean" },
 			},
-			required = { "path", "old_string", "new_string" },
+			required = { "file_path", "old_string", "new_string" },
 		},
+		aliases = { path = "file_path" },
 		run = function(args)
-			local path, old, new = need(args, "path", "string"), need(args, "old_string", "string"),
+			local path, old, new = need(args, "file_path", "string"), need(args, "old_string", "string"),
 				need(args, "new_string", "string")
 			if old == "" then
 				error("old_string must not be empty", 0)
+			end
+			if old == new then
+				error("old_string and new_string are the same, so this edit would change nothing", 0)
 			end
 			local text, err = host.read(path)
 			if not text then
 				error(err, 0)
 			end
-			local pieces, count, at = {}, 0, 1
-			while true do
-				local from, to = text:find(old, at, true)
-				if not from then
-					break
+			local function replace(from_text, to_text)
+				local pieces, count, at = {}, 0, 1
+				while true do
+					local from, to = text:find(from_text, at, true)
+					if not from then
+						break
+					end
+					table.insert(pieces, text:sub(at, from - 1))
+					table.insert(pieces, to_text)
+					count += 1
+					at = to + 1
 				end
-				table.insert(pieces, text:sub(at, from - 1))
-				table.insert(pieces, new)
-				count += 1
-				at = to + 1
+				table.insert(pieces, text:sub(at))
+				return pieces, count
+			end
+			local pieces, count = replace(old, new)
+			-- Models write line ends as \n. In a file with \r\n ends, the same text is found with them.
+			if count == 0 and text:find("\r\n", 1, true) and old:find("\n", 1, true) then
+				local function crlf(s)
+					return (s:gsub("\r?\n", "\r\n"))
+				end
+				pieces, count = replace(crlf(old), crlf(new))
 			end
 			if count == 0 then
-				error("old text not found in " .. path, 0)
+				local hint = old:match("^%s*%d+: ") and " without the line numbers read adds" or ""
+				error(("old text not found in %s: read the file again and copy the text exactly%s"):format(path, hint), 0)
 			end
 			if count > 1 and not args.replace_all then
 				error(("old text occurs %d times in %s: add surrounding lines to make it unique, or pass replace_all"):format(count, path), 0)
 			end
-			table.insert(pieces, text:sub(at))
 			local ok, write_err = host.write(path, table.concat(pieces))
 			if not ok then
 				error(write_err, 0)
@@ -350,11 +395,17 @@ local function run_tool(call)
 	if not tool then
 		return "error: there is no tool named " .. tostring(call.name), true
 	end
-	local args = call.input
-	if type(args) ~= "table" then
+	if type(call.input) ~= "table" then
 		return "error: the tool input is not an object", true
 	end
-	local what = M.printable(tostring(args.command or args.path or args.code or ""):sub(1, 100):gsub("\n", " "))
+	-- A copy, so that renaming an alias leaves the call in the history as the model sent it.
+	local args = table.clone(call.input)
+	for alias, name in tool.aliases or {} do
+		if args[alias] ~= nil and args[name] == nil then
+			args[name], args[alias] = args[alias], nil
+		end
+	end
+	local what = M.printable(tostring(args.command or args.file_path or args.code or ""):sub(1, 100):gsub("\n", " "))
 	progress(("  %s %s"):format(tool.name, what))
 	local problem = argument_problem(tool, args)
 	if problem then
@@ -395,6 +446,7 @@ function M.request(system, messages)
 		model = M.model,
 		max_tokens = M.max_output,
 		thinking = { type = "adaptive" },
+		output_config = M.effort and { effort = M.effort } or nil,
 		cache_control = { type = "ephemeral" }, -- cache the longest prefix seen before, where caching is opt-in
 		system = system,
 		messages = messages,
@@ -430,8 +482,9 @@ function M.system_prompt()
 		("You are a coding agent working in %s through the tools you are given."):format(host.cwd),
 		host.sandboxed
 				and "The kernel confines you: you can write inside this project directory and $TMPDIR, and read those "
-					.. "plus the system directories. \"Permission denied\" anywhere else is that wall. Say so and "
-					.. "stop, rather than looking for a way around it."
+					.. "plus the system directories. \"Permission denied\" anywhere else is that wall. Do not refuse "
+					.. "in advance: try what the task needs, and only when the wall denies it, say so and stop "
+					.. "rather than looking for a way around it."
 			or "Nothing confines you in this session: you act with the user's full access to this machine. Stay "
 				.. "inside this project directory unless the task says otherwise.",
 		"You can extend yourself. You run on the loop built into hx; .hx/loop.luau, if the project has one, starts "
@@ -440,6 +493,10 @@ function M.system_prompt()
 			.. "and it returns "
 			.. "a table of functions. Call one from the lua tool as ext(\"NAME\").fn(...). Extensions stay with "
 			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore.",
+		"Use the read tool, not shell commands like cat, sed, head or tail, to look at text files; its offset and "
+			.. "limit read a range of lines or go on through a large file. Read a file before you edit it, unless "
+			.. "you wrote or edited it yourself in this session. Check the [exit N] status at the end of every bash "
+			.. "result, and look into a failure before moving on.",
 		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
 	}
 	local extensions = extension_index()
@@ -633,37 +690,151 @@ end
 function M.compact(system, talk)
 	progress("  compacting the conversation")
 	local asking = talk:fork()
-	asking:say(
-		"The conversation is about to be replaced by a summary, and you will continue from that summary alone. "
-			.. "Write it now, as plain text, without calling tools: the task, what is done, what you learned "
-			.. "about this project that was costly to find out, and the exact next steps."
-	)
+	asking:say(M.compact_prompt)
 	local summary = text_of(ask(system, asking))
 	if summary == "" then
 		progress("  no summary came back; keeping the conversation as it is")
 		return
 	end
-	talk:restart("Earlier turns were replaced by this summary, written by you:\n\n" .. summary .. "\n\nContinue.")
+	talk:restart(
+		"Earlier turns were replaced by this checkpoint, written by you:\n\n"
+			.. summary
+			.. "\n\nTreat it as established and continue the work from it directly, without restating or "
+			.. "acknowledging it."
+	)
+end
+
+-- The request for the summary. It goes behind the whole conversation, as the last user message, so the request
+-- reuses the cached prefix. The summary is in English whatever the conversation's language: it becomes the start
+-- of everything after it, and a summary in another language pulls the model's own reasoning into that language.
+M.compact_prompt = table.concat({
+	"The conversation is about to be replaced by a summary, and you will continue from that summary alone. "
+		.. "Write it now as a checkpoint, without calling tools, in concise English, with exactly these sections "
+		.. "in this order. Use terse bullets; write (none) for an empty section rather than leaving it out.",
+	"",
+	"## Task",
+	"- what the user asked for, and how that changed; quote the user where the exact words matter",
+	"## Files",
+	"- exact path: why it matters, what was changed",
+	"## Errors and fixes",
+	"- the error, and how it was fixed",
+	"## Learned",
+	"- facts about this project that were costly to find out: commands, conventions, traps",
+	"## Done",
+	"- what is finished and checked",
+	"## Current work",
+	"- what was in progress just now",
+	"## Next step",
+	"- the single next action",
+	"",
+	"Keep exact file paths, commands, error text, identifiers and numbers. Keep the user's corrections and "
+		.. "instructions. If the conversation starts with an earlier checkpoint, merge it: keep what is still "
+		.. "true, drop what is not, and do not copy it over unchanged.",
+}, "\n")
+
+-- A JSON text of a value with the keys of every object in order, so that two equal calls give the same text.
+local function canonical(value)
+	if type(value) ~= "table" then
+		return json.encode(value)
+	end
+	if #value > 0 or next(value) == nil then
+		local items = {}
+		for _, item in value do
+			table.insert(items, canonical(item))
+		end
+		return "[" .. table.concat(items, ",") .. "]"
+	end
+	local keys = {}
+	for key in value do
+		table.insert(keys, tostring(key))
+	end
+	table.sort(keys)
+	local members = {}
+	for _, key in keys do
+		table.insert(members, json.encode(key) .. ":" .. canonical(value[key]))
+	end
+	return "{" .. table.concat(members, ",") .. "}"
+end
+
+-- What the model is told when it makes the same call again and again.
+function M.repeat_reminder(call, count, first)
+	if first then
+		return "You are repeating the exact same tool call with the same arguments. Look at what it returned "
+			.. "before calling it again: if the task is not done, try a different approach or different arguments."
+	end
+	local args = canonical(call.input)
+	if #args > 500 then
+		args = args:sub(1, 500) .. ("... (%d more bytes)"):format(#args - 500)
+	end
+	return ("You have made the same %s call %d times in a row, with these arguments: %s\nThe calls are not "
+		.. "making progress. Do not make this call again. Look at the last result and choose a different action "
+		.. "or different arguments, or finish the task if you have what you need."):format(call.name, count, args)
+end
+
+-- Whether a reply has anything in it. Thinking alone counts; an empty text block does not.
+local function has_content(content)
+	for _, block in content do
+		if block.type ~= "text" or block.text ~= "" then
+			return true
+		end
+	end
+	return false
+end
+
+-- Prints the text of a reply: the model's words are the answer, on stdout.
+local function show_text(reply)
+	for _, block in reply.content do
+		if block.type == "text" and block.text ~= "" then
+			print(host.tty and M.printable(block.text) or block.text)
+		end
+	end
 end
 
 -- Runs the model until it answers without asking for a tool.
 function M.turn(system, talk)
+	local last_call, repeats = nil, 0 -- the run of identical calls, which ends with this turn
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
+		for _ = 1, M.empty_retries do
+			if has_content(reply.content) or reply.stop_reason == "max_tokens" then
+				break
+			end
+			progress("  the model sent an empty reply; asking again")
+			reply = ask(system, talk)
+		end
 		local cut_off = reply.stop_reason == "max_tokens"
+		show_text(reply)
+		-- A call whose input is not an object is kept as an empty one: the endpoint refuses a history that has
+		-- one, and would refuse every request after it. The model still hears that the call was malformed.
+		local malformed = {}
 		for _, block in reply.content do
-			if block.type == "text" and block.text ~= "" then
-				print(host.tty and M.printable(block.text) or block.text)
+			if block.type == "tool_use" and type(block.input) ~= "table" then
+				malformed[block.id] = true
+				block.input = {}
 			end
 		end
 		local calls = talk:reply(reply.content)
 		if #calls > 0 then
+			local reminder = nil
 			talk:answer(function(call)
 				if cut_off then
 					return "error: this call was cut off by the output limit and did not run. Send it again, smaller.", true
 				end
+				if malformed[call.id] then
+					return "error: the tool input is not an object", true
+				end
+				local key = call.name .. canonical(call.input)
+				repeats = key == last_call and repeats + 1 or 1
+				last_call = key
+				local at = table.find(M.repeat_reminders, repeats)
+				if at then
+					reminder = M.repeat_reminder(call, repeats, at == 1)
+				end
 				return run_tool(call)
 			end)
+			if reminder then
+				talk:say(reminder)
+			end
 			if prompt_size(reply) > M.compact_at then
 				M.compact(system, talk)
 			end
@@ -675,6 +846,14 @@ function M.turn(system, talk)
 			end
 			return
 		end
+	end
+	-- Out of replies. The model gets one more, to say where the work stands, rather than none.
+	talk:say(("You have used all %d replies this task allows. Do not call any more tools. Write your final "
+		.. "report now: what you changed, what you checked, what is left."):format(M.max_replies))
+	local reply = ask(system, talk)
+	show_text(reply)
+	if #talk:reply(reply.content) > 0 then
+		talk:abandon("the reply limit was reached")
 	end
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
 end

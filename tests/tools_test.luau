@@ -32,36 +32,36 @@ for _, tool in loop.tools do
 end
 
 -- write, read
-check("write", tools.write({ path = dir .. "a/b/file.txt", content = "one\ntwo\nthree\n" }), ("wrote 14 bytes to %sa/b/file.txt"):format(dir))
-check("read", tools.read({ path = dir .. "a/b/file.txt" }), "one\ntwo\nthree")
-check("read a range", tools.read({ path = dir .. "a/b/file.txt", offset = 2, limit = 1 }), "two\n[lines 2-2 of 3]")
-raises("read past the end", tools.read, { path = dir .. "a/b/file.txt", offset = 9 }, "past the end")
-raises("read a missing file", tools.read, { path = dir .. "nope" }, "No such file")
-raises("read a directory", tools.read, { path = dir .. "a" }, "is a directory")
-raises("read without a path", tools.read, {}, 'argument "path" must be a string')
-tools.write({ path = dir .. "empty", content = "" })
-check("read an empty file", tools.read({ path = dir .. "empty" }), "[empty file]")
+check("write", tools.write({ file_path = dir .. "a/b/file.txt", content = "one\ntwo\nthree\n" }), ("wrote 14 bytes to %sa/b/file.txt"):format(dir))
+check("read", tools.read({ file_path = dir .. "a/b/file.txt" }), "1: one\n2: two\n3: three")
+check("read a range", tools.read({ file_path = dir .. "a/b/file.txt", offset = 2, limit = 1 }), "2: two\n[lines 2-2 of 3; offset=3 goes on]")
+raises("read past the end", tools.read, { file_path = dir .. "a/b/file.txt", offset = 9 }, "past the end")
+raises("read a missing file", tools.read, { file_path = dir .. "nope" }, "No such file")
+raises("read a directory", tools.read, { file_path = dir .. "a" }, "is a directory")
+raises("read without a path", tools.read, {}, 'argument "file_path" must be a string')
+tools.write({ file_path = dir .. "empty", content = "" })
+check("read an empty file", tools.read({ file_path = dir .. "empty" }), "[empty file]")
 -- A long file comes back as whole lines up to the byte limit, and says where to go on.
 host.sh(("seq 1 1000 > %sseq.txt"):format(dir))
 local function numbers(from, to)
 	local lines = {}
 	for i = from, to do
-		table.insert(lines, tostring(i))
+		table.insert(lines, ("%d: %d"):format(i, i))
 	end
 	return table.concat(lines, "\n")
 end
 loop.output_limit = 100
-check("read stops at the byte limit", tools.read({ path = dir .. "seq.txt" }), numbers(1, 36) .. "\n[lines 1-36 of 1000]")
-check("read goes on from the next offset", tools.read({ path = dir .. "seq.txt", offset = 37, limit = 3 }), "37\n38\n39\n[lines 37-39 of 1000]")
-check("read the last lines", tools.read({ path = dir .. "seq.txt", offset = 999 }), "999\n1000\n[lines 999-1000 of 1000]")
-tools.write({ path = dir .. "wide.txt", content = "short\n" .. string.rep("x", 250) .. "\nafter\n" })
-check("read stops before a line over the limit", tools.read({ path = dir .. "wide.txt" }), "short\n[lines 1-1 of 3]")
-check("a line over the limit comes back cut, with a note", tools.read({ path = dir .. "wide.txt", offset = 2 }), string.rep("x", 100) .. "\n[line 2 is 250 bytes; only the first 100 are shown]\n[lines 2-2 of 3]")
-check("and the next offset moves past it", tools.read({ path = dir .. "wide.txt", offset = 3 }), "after\n[lines 3-3 of 3]")
-tools.write({ path = dir .. "one.txt", content = string.rep("y", 250) })
-check("a file of one long line", tools.read({ path = dir .. "one.txt" }), string.rep("y", 100) .. "\n[line 1 is 250 bytes; only the first 100 are shown]")
+check("read stops at the byte limit", tools.read({ file_path = dir .. "seq.txt" }), numbers(1, 17) .. "\n[lines 1-17 of 1000; offset=18 goes on]")
+check("read goes on from the next offset", tools.read({ file_path = dir .. "seq.txt", offset = 37, limit = 3 }), numbers(37, 39) .. "\n[lines 37-39 of 1000; offset=40 goes on]")
+check("read the last lines", tools.read({ file_path = dir .. "seq.txt", offset = 999 }), numbers(999, 1000) .. "\n[lines 999-1000 of 1000]")
+tools.write({ file_path = dir .. "wide.txt", content = "short\n" .. string.rep("x", 250) .. "\nafter\n" })
+check("read stops before a line over the limit", tools.read({ file_path = dir .. "wide.txt" }), "1: short\n[lines 1-1 of 3; offset=2 goes on]")
+check("a line over the limit comes back cut, with a note", tools.read({ file_path = dir .. "wide.txt", offset = 2 }), "2: " .. string.rep("x", 100) .. "\n[line 2 is 250 bytes; only the first 100 are shown]\n[lines 2-2 of 3; offset=3 goes on]")
+check("and the next offset moves past it", tools.read({ file_path = dir .. "wide.txt", offset = 3 }), "3: after\n[lines 3-3 of 3]")
+tools.write({ file_path = dir .. "one.txt", content = string.rep("y", 250) })
+check("a file of one long line", tools.read({ file_path = dir .. "one.txt" }), "1: " .. string.rep("y", 100) .. "\n[line 1 is 250 bytes; only the first 100 are shown]")
 loop.output_limit = 30000
-check("a file within the limits comes back whole", tools.read({ path = dir .. "seq.txt", limit = 5000 }), numbers(1, 1000))
+check("a file within the limits comes back whole", tools.read({ file_path = dir .. "seq.txt", limit = 5000 }), numbers(1, 1000))
 
 -- host.write replaces a file through a temporary one, and the file stays what it was
 local w = dir .. "w/"
@@ -93,15 +93,22 @@ check("makes the file it names", host.read(w .. "gone.txt"), "made")
 check("no temporary file is left", table.concat(host.list(w), " "), "dangling.txt gone.txt link.txt new.txt one.txt real.txt run.sh two.txt")
 
 -- edit
-tools.write({ path = dir .. "e.txt", content = "alpha beta\nalpha gamma\n" })
-check("edit", tools.edit({ path = dir .. "e.txt", old_string = "beta", new_string = "BETA" }), ("replaced 1 occurrence in %se.txt"):format(dir))
+tools.write({ file_path = dir .. "e.txt", content = "alpha beta\nalpha gamma\n" })
+check("edit", tools.edit({ file_path = dir .. "e.txt", old_string = "beta", new_string = "BETA" }), ("replaced 1 occurrence in %se.txt"):format(dir))
 check("edit result", host.read(dir .. "e.txt"), "alpha BETA\nalpha gamma\n")
-raises("edit an ambiguous match", tools.edit, { path = dir .. "e.txt", old_string = "alpha", new_string = "x" }, "occurs 2 times")
+raises("edit an ambiguous match", tools.edit, { file_path = dir .. "e.txt", old_string = "alpha", new_string = "x" }, "occurs 2 times")
 check("an ambiguous edit changes nothing", host.read(dir .. "e.txt"), "alpha BETA\nalpha gamma\n")
-check("edit all", tools.edit({ path = dir .. "e.txt", old_string = "alpha", new_string = "%1", replace_all = true }), ("replaced 2 occurrences in %se.txt"):format(dir))
+check("edit all", tools.edit({ file_path = dir .. "e.txt", old_string = "alpha", new_string = "%1", replace_all = true }), ("replaced 2 occurrences in %se.txt"):format(dir))
 check("edit is literal, not a pattern", host.read(dir .. "e.txt"), "%1 BETA\n%1 gamma\n")
-raises("edit a missing text", tools.edit, { path = dir .. "e.txt", old_string = "zzz", new_string = "x" }, "not found")
-raises("edit with an empty old", tools.edit, { path = dir .. "e.txt", old_string = "", new_string = "x" }, "must not be empty")
+raises("edit a missing text", tools.edit, { file_path = dir .. "e.txt", old_string = "zzz", new_string = "x" }, "not found")
+raises("edit with an empty old", tools.edit, { file_path = dir .. "e.txt", old_string = "", new_string = "x" }, "must not be empty")
+raises("edit that changes nothing", tools.edit, { file_path = dir .. "e.txt", old_string = "BETA", new_string = "BETA" }, "change nothing")
+raises("a missing text says how to recover", tools.edit, { file_path = dir .. "e.txt", old_string = "zzz", new_string = "x" }, "read the file again")
+raises("line numbers from read are named", tools.edit, { file_path = dir .. "e.txt", old_string = "1: %1 BETA", new_string = "x" }, "without the line numbers")
+-- A file with \r\n line ends is edited with the \n ends models write, and keeps its own.
+tools.write({ file_path = dir .. "crlf.txt", content = "one\r\ntwo\r\nthree\n" })
+check("edit across \\r\\n ends", tools.edit({ file_path = dir .. "crlf.txt", old_string = "one\ntwo", new_string = "1\n2" }), ("replaced 1 occurrence in %scrlf.txt"):format(dir))
+check("keeps the file's ends", host.read(dir .. "crlf.txt"), "1\r\n2\r\nthree\n")
 
 -- bash
 check("bash", tools.bash({ command = "echo out; echo err >&2; exit 3" }), "out\nerr\n[exit 3]")
@@ -116,6 +123,9 @@ local clipped = tools.bash({ command = "seq 1 1000" })
 check("long output keeps its start", clipped:sub(1, 4), "1\n2\n")
 check("long output keeps its end", clipped:find("1000\n[exit 0]", 1, true) ~= nil, true)
 check("long output says what is missing", clipped:find("bytes omitted", 1, true) ~= nil, true)
+local spill = clipped:match("the whole output is in (%S+)")
+check("long output names the file that holds all of it", spill ~= nil, true)
+check("and the file holds all of it", spill and host.read(spill), host.sh("seq 1 1000").out)
 loop.output_limit = 30000
 
 -- printable

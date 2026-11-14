@@ -72,6 +72,7 @@ after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not 
 | `HX_API_URL` | Anthropic Messages endpoint | `https://api.deepseek.com/anthropic/v1/messages` |
 | `HX_KEY_ENV` | name of the variable holding the API key | `DEEPSEEK_API_KEY` |
 | `HX_MODEL` | model name | `deepseek-flash` |
+| `HX_EFFORT` | how hard the model thinks, sent as `output_config.effort` (DeepSeek takes `none` to `max`) | the endpoint's |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
 Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143
@@ -147,15 +148,15 @@ Know these before you rely on it.
 
 ## The loop
 
-`lua/loop.luau` is the whole agent: about 700 lines. It speaks the Anthropic Messages format, asks for adaptive
+`lua/loop.luau` is the whole agent: about 950 lines. It speaks the Anthropic Messages format, asks for adaptive
 thinking, and sends thinking blocks back exactly as they came. The five tools it defines:
 
 | Tool | Does |
 |---|---|
-| `bash` | runs a command, returns its output and exit status, kills it after a timeout |
-| `read` | returns a range of lines of a file |
+| `bash` | runs a command, returns its output and exit status, kills it after a timeout; a long output is cut in the middle and kept whole in a file in `$TMPDIR` |
+| `read` | returns a range of lines of a file, numbered |
 | `write` | creates or overwrites a file |
-| `edit` | replaces an exact piece of text that occurs once |
+| `edit` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too |
 | `lua` | runs Luau inside the harness; this is how extensions are called |
 
 `hx --init` writes `.hx/loop.luau` from `lua/overlay.luau`:
@@ -169,7 +170,14 @@ return M
 
 Every setting at the top of the loop is a field of `M`, and so are the parts a project may want to replace:
 `M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until the model
-is done) and `M.compact`. The loop always calls them through `M`, so a replacement takes effect everywhere.
+is done), `M.compact` and `M.compact_prompt`. The loop always calls them through `M`, so a replacement takes
+effect everywhere.
+
+The file tools take `file_path`, the name most models are trained on, and accept `path` for it. Some habits of
+the model are handled in the loop rather than left to the prompt: the same call made 3, 5 and 8 times in a row
+gets a reminder to try something else, a reply with nothing in it is asked for again, a call whose input is not
+an object stays in the history as `{}` so that later requests are not refused, and a task that runs out of
+replies gets one more, to report where it stands.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON. The logs hold
@@ -259,6 +267,10 @@ cmake --preset dev && cmake --build --preset dev && ctest --preset dev
 clang-format --dry-run --Werror src/*.cpp src/*.h
 clang-tidy -p build-dev --quiet src/*.cpp
 ```
+
+`tests/live_test.py` runs the agent against the real endpoint: making and editing files, reading a line range,
+noticing a failed command, following a long output to its file, and compacting. It costs tokens, so ctest
+leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set.
 
 ## Limits
 

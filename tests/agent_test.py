@@ -181,9 +181,55 @@ class AgentTest(unittest.TestCase):
         results = self.tool_results()
         self.assertIn("not an object", results[0])
         self.assertIn("no tool named nope", results[1])
-        self.assertIn('missing argument "path": read takes path, limit, offset', results[2])
+        self.assertIn('missing argument "file_path": read takes file_path, limit, offset', results[2])
         failed = self.model.requests[1]["messages"][-1]["content"][0]
         self.assertIs(failed["is_error"], True)
+        # The malformed input goes back as an empty object, which the endpoint accepts in a history.
+        self.assertEqual(self.model.requests[1]["messages"][1]["content"][0]["input"], {})
+
+    def test_an_empty_reply_is_asked_for_again(self):
+        done = self.run_hx("go", script=[reply([]), reply([text("")]), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "ok\n")
+        self.assertEqual(len(self.model.requests), 3)
+        self.assertEqual(self.model.requests[0], self.model.requests[2])
+
+    def test_a_reply_of_thinking_alone_is_not_empty(self):
+        done = self.run_hx("go", script=[reply([{"type": "thinking", "thinking": "hm", "signature": "s"}])])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.model.requests), 1)
+
+    def test_a_repeated_call_gets_a_reminder(self):
+        same = [call("bash", {"command": "true", "timeout": 5}, f"c{i}") for i in range(5)]
+        same[1] = call("bash", {"timeout": 5, "command": "true"}, "c1")  # the order of the keys does not matter
+        done = self.run_hx("go", script=[*same, say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        def reminder(request):
+            last = request["messages"][-1]["content"]
+            return [b["text"] for b in last if b["type"] == "text"]
+        reminders = [reminder(r) for r in self.model.requests[1:]]
+        self.assertEqual([len(r) for r in reminders], [0, 0, 1, 0, 1])
+        self.assertIn("repeating the exact same tool call", reminders[2][0])
+        self.assertIn('same bash call 5 times in a row, with these arguments: {"command":"true","timeout":5}',
+                      reminders[4][0])
+
+    def test_running_out_of_replies_still_gets_a_report(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write("local M = assert(host.load(host.default_loop, '=loop'))() M.max_replies = 2 return M")
+        done = self.run_hx("go", script=[call("bash", {"command": "true"}, "c1"), call("bash", {"command": "true"}, "c2"),
+                                         say("REPORT")])
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, "REPORT\n")
+        self.assertIn("stopped after 2 model replies", done.stderr)
+        self.assertIn("Write your final report now", self.model.requests[2]["messages"][-1]["content"][-1]["text"])
+
+    def test_effort_is_sent_when_set(self):
+        done = self.run_hx("go", script=[say("ok")])
+        self.assertNotIn("output_config", self.model.requests[0])
+        done = self.run_hx("go", script=[say("ok")], HX_EFFORT="max")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[1]["output_config"], {"effort": "max"})
 
     def test_the_task_can_come_from_stdin(self):
         done = self.run_hx(stdin="line one\nline two\n", script=[say("ok")])
@@ -1035,10 +1081,19 @@ class AgentTest(unittest.TestCase):
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results(), [
-            'error: unknown argument "old": edit takes path, old_string, new_string, replace_all',
-            'error: missing argument "new_string": edit takes path, old_string, new_string, replace_all',
+            'error: unknown argument "old": edit takes file_path, old_string, new_string, replace_all',
+            'error: missing argument "new_string": edit takes file_path, old_string, new_string, replace_all',
             "replaced 1 occurrence in f.txt"])
         self.assertEqual(read(self.project, "f.txt"), "1 two\n")
+
+    def test_path_is_taken_for_file_path(self):
+        with open(os.path.join(self.project, "f.txt"), "w") as f:
+            f.write("one\n")
+        done = self.run_hx("go", script=[call("read", {"path": "f.txt"}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results(), ["1: one"])
+        # The call stays in the history as the model sent it.
+        self.assertEqual(self.model.requests[1]["messages"][1]["content"][0]["input"], {"path": "f.txt"})
 
     def test_control_characters_reach_a_terminal_only_as_text(self):
         words = "\x1b]52;c;aGk=\x07red\x1b[31m!"
