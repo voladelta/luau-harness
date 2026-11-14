@@ -63,6 +63,35 @@ check("a file of one long line", tools.read({ path = dir .. "one.txt" }), string
 loop.output_limit = 30000
 check("a file within the limits comes back whole", tools.read({ path = dir .. "seq.txt", limit = 5000 }), numbers(1, 1000))
 
+-- host.write replaces a file through a temporary one, and the file stays what it was
+local w = dir .. "w/"
+local function sh(command)
+	return host.sh(command:format(w, w)).out
+end
+host.write(w .. "run.sh", "#!/bin/sh\necho old\n")
+sh("chmod 754 %srun.sh")
+check("write over an executable", host.write(w .. "run.sh", "#!/bin/sh\necho new\n"), true)
+check("it keeps its mode", sh("stat -c %%a %srun.sh"), "754\n")
+check("and runs the new content", sh("%srun.sh"), "new\n")
+host.write(w .. "new.txt", "x")
+check("a new file has the default mode", sh("stat -c %%a %snew.txt"), host.sh("printf '%o\\n' $(( 0666 & ~$(umask) ))").out)
+host.write(w .. "real.txt", "old")
+sh("ln -s real.txt %slink.txt")
+check("write through a link", host.write(w .. "link.txt", "new"), true)
+check("the link stays a link", sh("readlink %slink.txt"), "real.txt\n")
+check("and the file it names has the content", host.read(w .. "real.txt"), "new")
+host.write(w .. "one.txt", "old")
+sh("ln %sone.txt %stwo.txt")
+check("write to a file with two names", host.write(w .. "one.txt", "new"), true)
+check("it is still one file", sh("stat -c %%h %sone.txt"), "2\n")
+check("and the other name sees the content", host.read(w .. "two.txt"), "new")
+check("write to /dev/null", host.write("/dev/null", "x"), true)
+check("which stays a device", host.sh("stat -c %F /dev/null").out, "character special file\n")
+sh("ln -s gone.txt %sdangling.txt")
+check("write through a dangling link", host.write(w .. "dangling.txt", "made"), true)
+check("makes the file it names", host.read(w .. "gone.txt"), "made")
+check("no temporary file is left", table.concat(host.list(w), " "), "dangling.txt gone.txt link.txt new.txt one.txt real.txt run.sh two.txt")
+
 -- edit
 tools.write({ path = dir .. "e.txt", content = "alpha beta\nalpha gamma\n" })
 check("edit", tools.edit({ path = dir .. "e.txt", old_string = "beta", new_string = "BETA" }), ("replaced 1 occurrence in %se.txt"):format(dir))

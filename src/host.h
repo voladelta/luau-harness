@@ -25,7 +25,8 @@ struct HostConfig {
 //   host.llm(body, {timeout=600}) -> status, text | nil, error
 //   host.sh(command, {timeout=120}) -> {out=, code=, signal=, timed_out=}
 //   host.read(path) -> string | nil, error
-//   host.write(path, data) -> true | nil, error       creates missing parent directories
+//   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a file by
+//                                                     renaming a new one over it, so it is never left cut short
 //   host.list(dir) -> {names} | nil, error            sorted; directories end in "/"
 //   host.load(source, name?, env?) -> function | nil, error
 //   host.try(fn, ...) -> true, ... | false, error     pcall that is also where a stop ends (below)

@@ -678,6 +678,32 @@ class AgentTest(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"process {pid} is still alive")
 
+    # --- files ---
+
+    def test_a_write_that_fails_part_way_leaves_the_old_content(self):
+        with open(os.path.join(self.project, "f.txt"), "w") as f:
+            f.write("old\n")
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("print(host.write('f.txt', string.rep('x', 100000)))\nprint(table.concat(host.list('.'), ' '))\n")
+        # A file size limit of 1 KiB makes the write fail after its first kilobyte, whoever owns what. SIGXFSZ is
+        # ignored, so the write returns EFBIG instead of killing hx.
+        done = subprocess.run(["bash", "-c", 'ulimit -f 1 && trap "" XFSZ && exec "$0" --run s.luau', HX],
+                              cwd=self.project, env=self.env(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "nil\tf.txt: File too large\nf.txt s.luau\n")
+        self.assertEqual(read(self.project, "f.txt"), "old\n")
+
+    def test_a_lone_rw_file_is_written_in_place(self):
+        # Its directory is outside the wall, so no temporary file can be made beside it.
+        outside = os.path.join(self.root, "lone.txt")
+        with open(outside, "w") as f:
+            f.write("old")
+        done = self.run_hx("--rw", outside, "go", script=[call("write", {"path": outside, "content": "new"}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results(), [f"wrote 3 bytes to {outside}"])
+        self.assertEqual(read(outside), "new")
+        self.assertEqual(sorted(os.listdir(self.root)), ["home", "lone.txt", "project"])
+
     # --- extensions and the project's own loop ---
 
     def test_the_model_extends_itself_and_the_extension_stays(self):

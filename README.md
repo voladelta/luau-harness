@@ -206,7 +206,7 @@ Everything Luau can do to the machine:
 | `host.llm(body, {timeout=600})` | `status, text`, or `nil, error` |
 | `host.sh(command, {timeout=120})` | `{out, code, signal, timed_out}` |
 | `host.read(path)` | the contents, or `nil, error` |
-| `host.write(path, data)` | `true`, or `nil, error`; creates parent directories |
+| `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed write leaves the old content; its mode stays, and a link stays a link. A device, a FIFO, a file with other hard links, or one in a directory that refuses a new file is written in place |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
 | `host.load(source, name, env)` | a function, or `nil, error` |
 | `host.try(fn, ...)` | `true, ...`, or `false, error`: a `pcall` that is also where a stop ends |

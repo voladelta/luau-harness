@@ -355,11 +355,39 @@ int l_read(lua_State* L) {
     return 1;
 }
 
+// Writes all of data, going on after a signal. Returns false with errno set when the system refuses.
+bool write_all(int fd, std::string_view data) {
+    while (!data.empty()) {
+        const ssize_t n = write(fd, data.data(), data.size());
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        data.remove_prefix(static_cast<std::size_t>(n));
+    }
+    return true;
+}
+
+// The permission bits a file created now gets: 0666 less the umask, which can only be read by setting it.
+mode_t new_file_mode() {
+    const mode_t mask = umask(0);
+    umask(mask);
+    return 0666 & ~mask;
+}
+
+// A file is written by writing a temporary file beside it and renaming that over it, so a full disk or a killed hx
+// leaves the old content or the new, never a file cut short. Nothing is synced: a power loss can still lose both,
+// and that is not what this guards against. Where a new file could not stand in for the old one, the file is
+// written in place instead: something other than a regular file (/dev/null, a FIFO), a file with other names that
+// must go on seeing it, a dangling link, a directory that refuses a new file (a lone --rw file), or a file whose
+// owner and group the new one cannot be given.
 int l_write(lua_State* L) {
     const char* path = check_cstring(L, 1);
     std::size_t length = 0;
     const char* raw = luaL_checklstring(L, 2, &length);
-    std::string_view data(raw, length);
+    const std::string_view data(raw, length);
 
     std::error_code ec;
     const std::filesystem::path parent = std::filesystem::path(path).parent_path();
@@ -369,19 +397,36 @@ int l_write(lua_State* L) {
             return fail(L, fmt::format("{}: {}", parent.string(), ec.message()));
         }
     }
-    const UniqueFd file(open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666));
-    if (!file.valid()) {
-        return fail_errno(L, path);
-    }
-    while (!data.empty()) {
-        const ssize_t n = write(file.get(), data.data(), data.size());
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return fail_errno(L, path);
+
+    struct stat st {};
+    struct stat entry {};
+    const bool exists = stat(path, &st) == 0;
+    const bool missing = !exists && errno == ENOENT && lstat(path, &entry) != 0;  // not even a dangling link
+    if ((exists && S_ISREG(st.st_mode) && st.st_nlink == 1) || missing) {
+        // A link is followed, so the file it names is replaced and the link stays.
+        const std::filesystem::path target = exists ? std::filesystem::canonical(path, ec) : path;
+        std::string temp = (target.parent_path() / fmt::format(".{}.hx-XXXXXX", target.filename().string())).string();
+        UniqueFd file(ec ? -1 : mkostemp(temp.data(), O_CLOEXEC));
+        if (file.valid() && exists && fchown(file.get(), st.st_uid, st.st_gid) != 0) {
+            unlink(temp.c_str());
+            file.reset();
         }
-        data.remove_prefix(static_cast<std::size_t>(n));
+        if (file.valid()) {
+            const mode_t mode = exists ? st.st_mode & 07777 : new_file_mode();
+            if (!write_all(file.get(), data) || fchmod(file.get(), mode) != 0 ||
+                rename(temp.c_str(), target.c_str()) != 0) {
+                const int error = errno;
+                unlink(temp.c_str());
+                return fail(L, fmt::format("{}: {}", path, error_text(error)));
+            }
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+    }
+
+    const UniqueFd file(open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666));
+    if (!file.valid() || !write_all(file.get(), data)) {
+        return fail_errno(L, path);
     }
     lua_pushboolean(L, 1);
     return 1;
