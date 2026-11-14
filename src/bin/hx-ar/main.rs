@@ -186,7 +186,8 @@ async fn real_main() -> Result<()> {
     hx::outln!("{}", serde_json::to_string(&report)?)
 }
 
-/// Without `--context-window`, ask the provider once here for the model's window rather than in every episode.
+/// Without `--context-window`, ask the provider once here, rather than in every episode, for the model's window and
+/// (unless `--max-output` was given) the output cap it implies, as `hx run` would at launch.
 async fn with_provider_limits(mut child: Vec<String>) -> Vec<String> {
     if child.iter().any(|a| a == "--context-window") {
         return child;
@@ -194,7 +195,11 @@ async fn with_provider_limits(mut child: Vec<String>) -> Vec<String> {
     let Some(cfg) = run::llm_cfg(&child) else {
         return child;
     };
-    if let Some((window, _)) = hx::llm::provider_limits(&cfg).await {
+    if let Some((window, completion)) = hx::llm::provider_limits(&cfg).await {
+        if !child.iter().any(|a| a == "--max-output") {
+            let cap = hx::llm::default_max_output(Some(window), completion);
+            child.extend(["--max-output".into(), cap.to_string()]);
+        }
         child.extend(["--context-window".into(), window.to_string()]);
     }
     child

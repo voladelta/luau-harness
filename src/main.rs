@@ -146,9 +146,7 @@ ENVIRONMENT:
 ";
 
 const DEFAULT_MAX_TURNS: u64 = 200;
-/// Room for a reasoning model's thinking plus a large edit in one reply (DeepSeek counts reasoning as output); with
-/// `--context-window`, at most a quarter of that window.
-const DEFAULT_MAX_OUTPUT: u64 = 65536;
+use llm::DEFAULT_MAX_OUTPUT;
 
 #[derive(Clone, Copy, PartialEq)]
 enum FlagKind {

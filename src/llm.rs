@@ -4,6 +4,20 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::time::Duration;
 
+/// The default output cap per model reply: room for a reasoning model's thinking plus a large edit in one reply
+/// (DeepSeek counts reasoning as output). With a known context window, at most a quarter of that window
+/// (`default_max_output`).
+pub const DEFAULT_MAX_OUTPUT: u64 = 65536;
+
+/// The output cap per reply when none is given: `DEFAULT_MAX_OUTPUT`, at most a quarter of the context window and at
+/// most the provider's listed cap (`completion`), when those are known.
+pub fn default_max_output(window: Option<u64>, completion: Option<u64>) -> u64 {
+    window
+        .map_or(DEFAULT_MAX_OUTPUT, |w| DEFAULT_MAX_OUTPUT.min(w / 4))
+        .min(completion.unwrap_or(u64::MAX))
+        .max(1)
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct LlmCfg {
     pub model: String,
@@ -408,6 +422,15 @@ fn reply(resp: Value) -> std::result::Result<Reply, String> {
 #[cfg(test)]
 mod tests {
     use super::{Answered, LlmCfg, chat, client, retry_after};
+
+    #[test]
+    fn the_default_output_cap_follows_the_window_and_the_listed_cap() {
+        use super::{DEFAULT_MAX_OUTPUT, default_max_output};
+        assert_eq!(default_max_output(None, None), DEFAULT_MAX_OUTPUT);
+        assert_eq!(default_max_output(Some(128_000), None), 32_000);
+        assert_eq!(default_max_output(Some(1_000_000), Some(8_192)), 8_192);
+        assert_eq!(default_max_output(Some(2), None), 1);
+    }
 
     #[tokio::test]
     async fn an_error_status_is_an_answer_even_when_its_body_is_cut_off() {
