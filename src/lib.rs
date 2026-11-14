@@ -43,6 +43,9 @@ pub mod vm;
 pub mod workflow;
 pub mod workflow_runtime;
 
+#[cfg(test)]
+mod tests;
+
 /// stdout was closed by its reader (`hx run ... | head -1`): hx stops writing and exits quietly.
 #[derive(Debug)]
 pub struct ClosedStdout;
