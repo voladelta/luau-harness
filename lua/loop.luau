@@ -688,6 +688,32 @@ local function report()
 	host.log(("[%d replies, %d tokens in (%d cached), %d out]"):format(usage.replies, usage.input, usage.cached, usage.output))
 end
 
+-- Bracketed paste. While it is on, the terminal wraps pasted text in the two markers, so a pasted message of many
+-- lines can be told from lines typed one by one. A terminal that does not know the sequences ignores them, and
+-- its lines carry no markers. The terminal stays in line mode, so it echoes the markers as ^[[200~ and ^[[201~.
+local PASTE_ON, PASTE_OFF = "\27[?2004h", "\27[?2004l"
+local PASTE_START, PASTE_END = "\27[200~", "\27[201~"
+
+-- Reads one message with read(), which returns a line or nil at the end of input. A line is a message, unless it
+-- carries the start of a paste: then lines are read up to the one that carries its end, and the message is all
+-- of them, joined with newlines, without the markers. Text typed before or after the markers belongs to it. A
+-- paste cut short by the end of input is the message so far. Returns nil at the end of input.
+function M.read_message(read)
+	local line = read()
+	if not line or not line:find(PASTE_START, 1, true) then
+		return line
+	end
+	local lines = { line }
+	while not line:find(PASTE_END, 1, true) do
+		line = read()
+		if not line then
+			break
+		end
+		table.insert(lines, line)
+	end
+	return (table.concat(lines, "\n"):gsub("\27%[20[01]~", ""))
+end
+
 function M.main()
 	local system = M.system_prompt()
 	local talk = Conversation.new()
@@ -716,7 +742,19 @@ function M.main()
 
 	host.log(("hx: %s in %s. Ctrl-C stops a turn, Ctrl-D leaves."):format(M.model, host.cwd))
 	while true do
-		local line = host.input("> ")
+		-- Paste is turned on with every prompt, in case a command the model ran turned it off. Only the first
+		-- line of a message gets a prompt. The read is its own host.try so that a stop there can turn paste off
+		-- before it ends the run.
+		local prompt = PASTE_ON .. "> "
+		local read_ok, line = host.try(M.read_message, function()
+			local text = host.input(prompt)
+			prompt = ""
+			return text
+		end)
+		if not read_ok then
+			host.log(PASTE_OFF)
+			error(line, 0)
+		end
 		if not line then
 			break
 		end
@@ -726,6 +764,7 @@ function M.main()
 			if not ok then
 				if err == "terminated" then
 					save(system, talk.messages)
+					host.log(PASTE_OFF)
 					error(err, 0)
 				end
 				-- Any other failure ends the turn, not the session: what is owed is answered and the prompt comes back.
@@ -740,6 +779,7 @@ function M.main()
 			save(system, talk.messages)
 		end
 	end
+	host.log(PASTE_OFF)
 	report()
 	return 0
 end

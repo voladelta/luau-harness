@@ -67,7 +67,8 @@ script, even one that starts with `-`.
 | `HX_MODEL` | model name | `deepseek-flash` |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
-At the prompt, Ctrl-C stops the current turn and Ctrl-D leaves.
+At the prompt, each line is a message and a pasted message of many lines is one message (in a terminal that
+supports bracketed paste); Ctrl-C stops the current turn and Ctrl-D leaves.
 
 ## The wall
 

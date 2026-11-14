@@ -1,4 +1,4 @@
--- The tools and the extension loader of the built-in loop. Run with: hx --run tests/tools_test.luau
+-- The tools, the extension loader and the reading of pasted messages of the built-in loop. Run with: hx --run tests/tools_test.luau
 -- Works in $TMPDIR, which hx creates for the run and removes afterwards.
 
 local loop = assert(host.load(host.default_loop, "=loop"))()
@@ -146,6 +146,25 @@ raises("a broken extension", loop.ext, "broken", "ext/broken")
 raises("a missing extension", loop.ext, "nope", "no extension nope")
 raises("a path as an extension name", loop.ext, "../x", "letters, digits")
 host.sh("rm -rf .hx")
+
+-- read_message joins the lines of a bracketed paste into one message.
+local function message(lines)
+	local i = 0
+	local got = loop.read_message(function()
+		i += 1
+		return lines[i]
+	end)
+	return got, i
+end
+check("a plain line is a message", message({ "hello", "next" }), "hello")
+check("a plain line reads one line", select(2, message({ "hello", "next" })), 1)
+check("the end of input", message({}), nil)
+check("a paste is one message", message({ "\27[200~first", "second", "third\27[201~", "next" }), "first\nsecond\nthird")
+check("a paste reads up to its end", select(2, message({ "\27[200~a", "b\27[201~", "next" })), 2)
+check("a paste on one line", message({ "\27[200~one\27[201~", "next" }), "one")
+check("typed text around a paste", message({ "before \27[200~a", "b\27[201~ after" }), "before a\nb after")
+check("a paste cut short by the end of input", message({ "\27[200~a", "b" }), "a\nb")
+check("empty lines in a paste", message({ "\27[200~a", "", "b\27[201~" }), "a\n\nb")
 
 if failures > 0 then
 	error(failures .. " tool check(s) failed", 0)

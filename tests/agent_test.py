@@ -517,6 +517,75 @@ class AgentTest(unittest.TestCase):
             {"type": "text", "text": "again"},
         ])
 
+    def test_a_pasted_message_is_one_message(self):
+        self.model.script = [say("one"), say("two"), say("three")]
+        master, slave = pty.openpty()
+        with open(os.path.join(self.root, "stderr"), "w+b") as errors:
+            process = subprocess.Popen([HX], cwd=self.project, env=self.env(), stdin=slave, stdout=subprocess.PIPE,
+                                       stderr=errors, text=True)
+            os.close(slave)
+            try:
+                os.write(master, b"\x1b[200~first line\nsecond line\nthird\x1b[201~\n")
+                self.assertEqual(process.stdout.readline(), "one\n")
+                self.assertEqual(len(self.model.requests), 1)
+                os.write(master, b"plain\n")
+                self.assertEqual(process.stdout.readline(), "two\n")
+                os.write(master, b"before \x1b[200~a\nb\x1b[201~ after\n")
+                self.assertEqual(process.stdout.readline(), "three\n")
+                os.write(master, b"\x04")
+                process.stdout.close()
+                self.assertEqual(process.wait(timeout=20), 0)
+            finally:
+                process.kill()
+                os.close(master)
+            errors.seek(0)
+            written = errors.read()
+        self.assertEqual(len(self.model.requests), 3)
+        self.assertEqual(self.model.requests[0]["messages"], [{"role": "user", "content": "first line\nsecond line\nthird"}])
+        self.assertEqual(self.model.requests[1]["messages"][2], {"role": "user", "content": "plain"})
+        self.assertEqual(self.model.requests[2]["messages"][4], {"role": "user", "content": "before a\nb after"})
+        # Paste is turned on at the prompt and off when the session ends.
+        self.assertIn(b"\x1b[?2004h> ", written)
+        self.assertGreater(written.rfind(b"\x1b[?2004l"), written.rfind(b"\x1b[?2004h"))
+
+    def test_a_paste_cut_short_by_the_end_of_input_is_sent(self):
+        self.model.script = [say("got it")]
+        master, slave = pty.openpty()
+        process = subprocess.Popen([HX], cwd=self.project, env=self.env(), stdin=slave, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+        os.close(slave)
+        try:
+            os.write(master, b"\x1b[200~cut\nshort\n\x04")
+            self.assertEqual(process.stdout.readline(), "got it\n")
+            process.stdout.close()
+            self.assertEqual(process.wait(timeout=20), 0)
+        finally:
+            process.kill()
+            os.close(master)
+        self.assertEqual(self.model.requests[0]["messages"], [{"role": "user", "content": "cut\nshort"}])
+
+    def test_a_stop_at_the_prompt_turns_paste_off(self):
+        master, slave = pty.openpty()
+        with open(os.path.join(self.root, "stderr"), "w+b") as errors:
+            process = subprocess.Popen([HX], cwd=self.project, env=self.env(), stdin=slave, stdout=subprocess.DEVNULL,
+                                       stderr=errors)
+            os.close(slave)
+            try:
+                deadline = time.monotonic() + 20
+                while "> " not in read(errors.name) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                os.write(master, b"\x1b[200~half a paste\n")
+                time.sleep(0.3)  # let it block in the read of the next line
+                process.send_signal(signal.SIGINT)
+                self.assertEqual(process.wait(timeout=20), 130)
+            finally:
+                process.kill()
+                os.close(master)
+            errors.seek(0)
+            written = errors.read()
+        self.assertTrue(written.endswith(b"\x1b[?2004l\n"), written)
+        self.assertEqual(self.model.requests, [])
+
     def test_a_tool_cannot_swallow_an_interrupt(self):
         code = "local ok, err = pcall(host.sh, 'echo $$ > cmd.pid; sleep 300') return 'swallowed: ' .. tostring(err)"
         self.model.script = [call("lua", {"code": code}), say("after the interrupt")]
