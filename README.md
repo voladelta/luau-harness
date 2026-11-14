@@ -172,7 +172,8 @@ Everything Luau can do to the machine:
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
 | `host.load(source, name, env)` | a function, or `nil, error` |
-| `host.timed(seconds, fn, ...)` | `true, ...`, or `false, error`; the error is `"timeout"` when the limit passed |
+| `host.try(fn, ...)` | `true, ...`, or `false, error`: a `pcall` that is also where a stop ends |
+| `host.timed(seconds, fn, ...)` | as `host.try`; the error is `"timeout"` when the limit passed |
 | `host.input(prompt)` | a line from stdin, or `nil` at the end |
 | `host.log(text)`, `host.sleep(seconds)`, `host.env(name)` | |
 | `host.args`, `host.cwd`, `host.interactive`, `host.sandboxed`, `host.default_loop` | |
@@ -180,8 +181,10 @@ Everything Luau can do to the machine:
 
 Two rules hold across all of them:
 
-- **A signal becomes exactly one Luau error.** Ctrl-C raises `"interrupted"` from whichever call it cut short,
-  or at the next step of Luau code. SIGTERM and SIGHUP raise `"terminated"`.
+- **A stop cannot be swallowed.** Ctrl-C raises `"interrupted"` from whichever call it cut short, and again at
+  every later step of Luau code and every blocking call, until the outermost `host.try` or `host.timed` returns
+  `false, "interrupted"`. That is the only place a stop ends, so a plain `pcall` cannot make it go away: outside
+  any `host.try` it ends the run. SIGTERM and SIGHUP raise `"terminated"` the same way.
 - **A time limit reaches blocking calls.** Inside `host.timed`, `llm`, `sh` and `sleep` give up when the limit
   passes, and limits nest.
 

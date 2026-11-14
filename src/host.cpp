@@ -45,7 +45,7 @@ constexpr double kLongest = 1e9;  // seconds, about 30 years: the longest durati
 
 // Signal handlers cannot be given context, so this state is global. It is the only mutable global state here.
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
-volatile std::sig_atomic_t g_signal = 0;      // a signal waiting to become a Luau error
+volatile std::sig_atomic_t g_signal = 0;      // a stop in progress: the signal that asked for it
 volatile std::sig_atomic_t g_foreground = 0;  // process group of the command host.sh is waiting for
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -95,17 +95,33 @@ double duration(double seconds) {
     return seconds > 0 ? std::min(seconds, kLongest) : 0.0;
 }
 
-// Turns a pending signal into its Luau error. This is the only place a signal is consumed, so each one surfaces
-// exactly once, at the first point that notices it.
+const char* stop_error(int sig) {
+    return sig == SIGINT ? "interrupted" : "terminated";
+}
+
+// Raises the stop in progress as its Luau error. The stop is not over: every later safepoint and blocking call
+// raises it again, until the outermost host.try or host.timed returns, so no pcall can swallow it.
 void raise_if_signaled(lua_State* L) {
     if (g_signal == 0) {
         return;
     }
-    const int sig = g_signal;
-    g_signal = 0;
-    lua_pushstring(L, sig == SIGINT ? "interrupted" : "terminated");
+    lua_pushstring(L, stop_error(g_signal));
     lua_error(L);
 }
+
+// Counts a host.try or host.timed call for as long as it runs.
+class TryScope {
+  public:
+    explicit TryScope(int& depth) noexcept : depth_(depth) { ++depth_; }
+    TryScope(const TryScope&) = delete;
+    TryScope& operator=(const TryScope&) = delete;
+    TryScope(TryScope&&) = delete;
+    TryScope& operator=(TryScope&&) = delete;
+    ~TryScope() { --depth_; }
+
+  private:
+    int& depth_;
+};
 
 // Names the process group a second, impatient signal should kill, for as long as the scope lives.
 class ForegroundScope {
@@ -122,7 +138,7 @@ class ForegroundScope {
 class DeadlineScope {
   public:
     DeadlineScope(double& slot, double limit) noexcept : slot_(slot), outer_(slot) {
-        slot_ = outer_ > 0 && outer_ < limit ? outer_ : limit;
+        slot_ = limit <= 0 || (outer_ > 0 && outer_ < limit) ? outer_ : limit;
     }
     DeadlineScope(const DeadlineScope&) = delete;
     DeadlineScope& operator=(const DeadlineScope&) = delete;
@@ -137,7 +153,7 @@ class DeadlineScope {
 
 void on_signal(int sig) {
     if (g_signal != 0) {
-        // The first signal has not been turned into an error yet, so the loop is stuck: leave now.
+        // The first stop has not reached the end of its scope yet, so the loop is stuck: leave now.
         if (g_foreground > 0) {
             kill(-g_foreground, SIGKILL);
         }
@@ -387,6 +403,7 @@ int l_load(lua_State* L) {
 // --- small things -----------------------------------------------------------------------------------------
 
 int l_input(lua_State* L) {
+    raise_if_signaled(L);
     const char* prompt = luaL_optstring(L, 1, "");
     fmt::print(stderr, "{}", prompt);
     static_cast<void>(std::fflush(stderr));
@@ -448,6 +465,7 @@ int Host::llm(lua_State* L) {
     const char* body = luaL_checklstring(L, 1, &length);
     Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 600));
+    raise_if_signaled(L);  // a stop in progress starts no request
     HostConfig& config = host.config_;
 
     const CurlEasy curl(curl_easy_init());
@@ -502,6 +520,7 @@ int Host::sh(lua_State* L) {
     const char* command = check_cstring(L, 1);
     Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
+    raise_if_signaled(L);  // a stop in progress starts no command
 
     std::array<int, 2> pipe_fds{};
     if (pipe2(pipe_fds.data(), O_CLOEXEC) != 0) {
@@ -593,6 +612,7 @@ double Host::within_limit(double seconds) const {
 
 int Host::sleep(lua_State* L) {
     constexpr double kStep = 0.1;  // short naps, so a signal ends the sleep promptly
+    raise_if_signaled(L);
     const double until = now() + of(L).within_limit(luaL_checknumber(L, 1));
     while (g_signal == 0) {
         const double left = until - now();
@@ -606,20 +626,46 @@ int Host::sleep(lua_State* L) {
     return 0;
 }
 
-// host.timed(seconds, fn, ...): a pcall whose callee is stopped with the error "timeout" once the limit passes.
+// Calls the function at stack index fn with the arguments above it, under a time limit (0 for none), and returns
+// true and its results or false and its error. This is where a stop ends: a call that returns while a stop is in
+// progress returns false and the stop's error, whatever the function did, and the outermost such call also ends
+// the stop.
+int Host::protect(lua_State* L, int fn, double deadline) {
+    luaL_checktype(L, fn, LUA_TFUNCTION);
+    Host& host = of(L);
+    int status = 0;
+    {
+        const DeadlineScope limit(host.deadline_, deadline);
+        const TryScope scope(host.tries_);
+        if (g_signal == 0) {  // a stop in progress does not start the function
+            status = lua_pcall(L, lua_gettop(L) - fn, LUA_MULTRET, 0);
+        }
+    }
+    if (const int sig = g_signal; sig != 0) {
+        if (host.tries_ == 0) {
+            g_signal = 0;
+        }
+        lua_settop(L, 0);
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, stop_error(sig));
+        return 2;
+    }
+    lua_pushboolean(L, status == 0 ? 1 : 0);
+    lua_insert(L, fn);
+    return lua_gettop(L) - fn + 1;
+}
+
+// host.try(fn, ...): a pcall that is also where a stop ends.
+int Host::try_(lua_State* L) {
+    return protect(L, 1, 0);
+}
+
+// host.timed(seconds, fn, ...): host.try whose callee is stopped with the error "timeout" once the limit passes.
 // Limits nest: an inner call cannot outlast the outer one. llm, sh and sleep give up when the limit passes, and
 // the error is raised as soon as Luau code runs again.
 int Host::timed(lua_State* L) {
     const double seconds = duration(luaL_checknumber(L, 1));
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-    int status = 0;
-    {
-        const DeadlineScope limit(of(L).deadline_, now() + seconds);
-        status = lua_pcall(L, lua_gettop(L) - 2, LUA_MULTRET, 0);
-    }
-    lua_pushboolean(L, status == 0 ? 1 : 0);
-    lua_replace(L, 1);
-    return lua_gettop(L);
+    return protect(L, 2, now() + seconds);
 }
 
 void Host::open(lua_State* L) {
@@ -628,9 +674,9 @@ void Host::open(lua_State* L) {
     callbacks->interrupt = on_interrupt;
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"llm", llm},       {"sh", sh},       {"timed", timed}, {"read", l_read},
-        {"write", l_write}, {"list", l_list}, {"load", l_load}, {"input", l_input},
-        {"log", l_log},     {"sleep", sleep}, {"env", l_env},   {nullptr, nullptr},
+        {"llm", llm},       {"sh", sh},       {"try", try_},      {"timed", timed},   {"read", l_read},
+        {"write", l_write}, {"list", l_list}, {"load", l_load},   {"input", l_input}, {"log", l_log},
+        {"sleep", sleep},   {"env", l_env},   {nullptr, nullptr},
     };
     luaL_register(L, "host", kFunctions);
 

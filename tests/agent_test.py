@@ -389,6 +389,63 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(self.model.requests[1]["messages"], [
             {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "again"}]}])
 
+    def test_a_tool_cannot_swallow_an_interrupt(self):
+        code = "local ok, err = pcall(host.sh, 'echo $$ > cmd.pid; sleep 300') return 'swallowed: ' .. tostring(err)"
+        self.model.script = [call("lua", {"code": code}), say("after the interrupt")]
+        master, slave = pty.openpty()
+        process = subprocess.Popen([HX], cwd=self.project, env=self.env(), stdin=slave, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+        os.close(slave)
+        try:
+            os.write(master, b"run it\n")
+            pid = self.wait_for_pid_file("cmd.pid")
+            process.send_signal(signal.SIGINT)
+            self.assert_gone(pid)
+            os.write(master, b"go on\n")
+            self.assertEqual(process.stdout.readline(), "after the interrupt\n")
+            os.write(master, b"\x04")
+            process.stdout.close()
+            self.assertEqual(process.wait(timeout=20), 0)
+        finally:
+            process.kill()
+            os.close(master)
+        self.assertEqual(self.model.requests[1]["messages"][2]["content"], [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "error: interrupted by the user", "is_error": True},
+            {"type": "text", "text": "go on"},
+        ])
+
+    def run_interrupted(self, source):
+        """Runs a script, interrupts it once the command it starts has written cmd.pid, and returns the result."""
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write(source)
+        process = subprocess.Popen([HX, "run", "s.luau"], cwd=self.project, env=self.env(), stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        pid = self.wait_for_pid_file("cmd.pid")
+        process.send_signal(signal.SIGINT)
+        out, _ = process.communicate(timeout=20)
+        self.assert_gone(pid)
+        return process.returncode, out
+
+    def test_pcall_cannot_swallow_an_interrupt(self):
+        code, out = self.run_interrupted("print(pcall(host.sh, 'echo $$ > cmd.pid; sleep 20'))\nprint('after')\n")
+        self.assertEqual((code, out), (130, ""))
+
+    def test_host_try_is_where_an_interrupt_ends(self):
+        code, out = self.run_interrupted(
+            "print(host.try(host.sh, 'echo $$ > cmd.pid; sleep 20'))\nprint(host.sh('echo carries on').out)\n")
+        self.assertEqual((code, out), (0, "false\tinterrupted\ncarries on\n\n"))
+
+    def test_an_inner_scope_does_not_end_an_interrupt(self):
+        code, out = self.run_interrupted(
+            "local inner\n"
+            "local ok, err = host.try(function()\n"
+            "  inner = { host.timed(30, host.sh, 'echo $$ > cmd.pid; sleep 20') }\n"
+            "  host.sh('touch never.txt')\n"
+            "end)\n"
+            "print(ok, err, inner[1], inner[2])\n")
+        self.assertEqual((code, out), (0, "false\tinterrupted\tfalse\tinterrupted\n"))
+        self.assertFalse(os.path.exists(os.path.join(self.project, "never.txt")))
+
     def test_without_the_sandbox_the_model_is_told_so(self):
         outside = os.path.join(self.root, "outside.txt")
         done = self.run_hx("--no-sandbox", "go", script=[call("bash", {"command": f"echo x > {outside} && echo wrote"}), say("ok")])

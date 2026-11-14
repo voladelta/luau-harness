@@ -6,10 +6,13 @@
 --   host.sh(command, {timeout=}) -> {out=, code=, signal=, timed_out=}
 --   host.read(path), host.write(path, data), host.list(dir)
 --   host.load(source, name, env) -> function | nil, error
---   host.timed(seconds, fn, ...) -> true, ... | false, error
+--   host.try(fn, ...) -> true, ... | false, error     a pcall that is also where a stop ends
+--   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit
 --   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
 --   host.args, host.cwd, host.interactive, host.sandboxed, host.default_loop
 --   json.encode, json.decode, json.array, json.null
+-- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
+-- host.timed returns; a plain pcall cannot swallow them.
 -- The whole process sits inside one Landlock ruleset, so nothing in this file can reach more of the machine
 -- than the model's own shell can.
 
@@ -21,11 +24,6 @@ M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
 M.output_limit = 30000 -- bytes of a tool result shown to the model
 M.lua_seconds = 60 -- time limit of one `lua` tool call
-
--- Errors the host raises when the user or the system wants the run to stop. They must never be swallowed.
-local function is_stop(err)
-	return err == "interrupted" or err == "terminated"
-end
 
 -- Keeps the start and the end of a long text: the start says what ran, the end says how it went.
 local function clip(text)
@@ -285,7 +283,7 @@ local function find_tool(name)
 end
 
 -- Runs one tool_use block from the model. Returns the text of the result and whether it is an error. Nothing a
--- tool does can end the run, except a stop signal.
+-- tool does can end the run; a stop does, because the host raises it again as soon as this returns.
 local function run_tool(call)
 	local tool = find_tool(call.name)
 	if not tool then
@@ -300,9 +298,6 @@ local function run_tool(call)
 	local ok, result = pcall(tool.run, args)
 	if ok then
 		return result, false
-	end
-	if is_stop(result) then
-		error(result, 0)
 	end
 	return "error: " .. tostring(result), true
 end
@@ -646,7 +641,7 @@ function M.main()
 			error("no task: pass it as arguments or on stdin", 0)
 		end
 		talk:say(task)
-		local ok, err = pcall(turn, system, talk)
+		local ok, err = host.try(turn, system, talk)
 		save(system, talk.messages)
 		report()
 		if not ok then
@@ -663,7 +658,7 @@ function M.main()
 		end
 		if not line:match("^%s*$") then
 			talk:say(line)
-			local ok, err = pcall(turn, system, talk)
+			local ok, err = host.try(turn, system, talk)
 			if not ok then
 				if err ~= "interrupted" then
 					save(system, talk.messages)

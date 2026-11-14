@@ -30,16 +30,21 @@ struct HostConfig {
 //   host.write(path, data) -> true | nil, error       creates missing parent directories
 //   host.list(dir) -> {names} | nil, error            sorted; directories end in "/"
 //   host.load(source, name?, env?) -> function | nil, error
-//   host.timed(seconds, fn, ...) -> true, ... | false, error     pcall with a time limit ("timeout");
+//   host.try(fn, ...) -> true, ... | false, error     pcall that is also where a stop ends (below)
+//   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit ("timeout");
 //                                                     llm, sh and sleep inside it end when the limit does
 //   host.input(prompt?) -> line | nil at end of input
 //   host.log(text)                                    one line on stderr
 //   host.sleep(seconds), host.env(name)
 //   host.args, host.cwd, host.interactive, host.sandboxed, host.default_loop
 //
-// A signal becomes exactly one Luau error, raised by whichever notices it first: the blocking call it cut
-// short (llm, sh, sleep, input) or the next VM safepoint. SIGINT raises "interrupted", SIGTERM and SIGHUP raise
-// "terminated". An expired host.timed limit raises "timeout" the same way.
+// A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
+// SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input)
+// raises it again for as long as the stop lasts; a blocking call that starts then does not start its work. The
+// stop ends only when the outermost host.try or host.timed returns: that call returns false and the stop's error,
+// whatever its function did. Inner ones return the same and leave the stop in progress. Outside all of them it
+// unwinds to the top, so no pcall can swallow it. An expired host.timed limit raises "timeout" the same way, until
+// its call returns.
 //
 // Destroying the Host kills every process group host.sh started that is still alive.
 class Host {
@@ -60,7 +65,9 @@ class Host {
     static void on_interrupt(lua_State* L, int gc);
     static int llm(lua_State* L);
     static int sh(lua_State* L);
+    static int try_(lua_State* L);
     static int timed(lua_State* L);
+    static int protect(lua_State* L, int fn, double deadline);
     static int sleep(lua_State* L);
 
     // Shortens a wait so that it ends no later than the host.timed limit in force. A negative wait is an empty one.
@@ -69,6 +76,7 @@ class Host {
     HostConfig config_;
     bool sandboxed_;
     double deadline_ = 0;        // the innermost host.timed limit on the monotonic clock; 0 for none
+    int tries_ = 0;              // host.try and host.timed calls in progress
     std::vector<pid_t> groups_;  // process groups host.sh started
 };
 
