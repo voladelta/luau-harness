@@ -1,0 +1,103 @@
+-- The tools and the extension loader of the built-in loop. Run with: hxm run tests/tools_test.luau
+-- Works in $TMPDIR, which hxm creates for the run and removes afterwards.
+
+local loop = assert(host.load(host.default_loop, "=loop"))()
+local dir = host.env("TMPDIR") .. "/"
+
+local failures = 0
+local function check(name, got, want)
+	if got ~= want then
+		failures += 1
+		print(("FAIL %s\n  got:  %s\n  want: %s"):format(name, tostring(got), tostring(want)))
+	end
+end
+
+local tools = {}
+for _, tool in loop.tools do
+	tools[tool.name] = tool.run
+end
+
+local function raises(name, fn, args, fragment)
+	local ok, err = pcall(fn, args)
+	check(name .. " raises", ok, false)
+	if not ok and not tostring(err):find(fragment, 1, true) then
+		check(name .. " message", err, fragment)
+	end
+end
+
+-- Every tool has a schema that names its required arguments as a JSON array.
+for _, tool in loop.tools do
+	local schema = json.encode(tool.parameters)
+	check(tool.name .. " schema lists required", schema:find('"required":%[') ~= nil, true)
+end
+
+-- write, read
+check("write", tools.write({ path = dir .. "a/b/file.txt", content = "one\ntwo\nthree\n" }), ("wrote 14 bytes to %sa/b/file.txt"):format(dir))
+check("read", tools.read({ path = dir .. "a/b/file.txt" }), "one\ntwo\nthree")
+check("read a range", tools.read({ path = dir .. "a/b/file.txt", offset = 2, limit = 1 }), "two\n[lines 2-2 of 3]")
+raises("read past the end", tools.read, { path = dir .. "a/b/file.txt", offset = 9 }, "past the end")
+raises("read a missing file", tools.read, { path = dir .. "nope" }, "No such file")
+raises("read a directory", tools.read, { path = dir .. "a" }, "is a directory")
+raises("read without a path", tools.read, {}, 'argument "path" must be a string')
+tools.write({ path = dir .. "empty", content = "" })
+check("read an empty file", tools.read({ path = dir .. "empty" }), "[empty file]")
+
+-- edit
+tools.write({ path = dir .. "e.txt", content = "alpha beta\nalpha gamma\n" })
+check("edit", tools.edit({ path = dir .. "e.txt", old = "beta", new = "BETA" }), ("replaced 1 occurrence in %se.txt"):format(dir))
+check("edit result", host.read(dir .. "e.txt"), "alpha BETA\nalpha gamma\n")
+raises("edit an ambiguous match", tools.edit, { path = dir .. "e.txt", old = "alpha", new = "x" }, "occurs 2 times")
+check("an ambiguous edit changes nothing", host.read(dir .. "e.txt"), "alpha BETA\nalpha gamma\n")
+check("edit all", tools.edit({ path = dir .. "e.txt", old = "alpha", new = "%1", all = true }), ("replaced 2 occurrences in %se.txt"):format(dir))
+check("edit is literal, not a pattern", host.read(dir .. "e.txt"), "%1 BETA\n%1 gamma\n")
+raises("edit a missing text", tools.edit, { path = dir .. "e.txt", old = "zzz", new = "x" }, "not found")
+raises("edit with an empty old", tools.edit, { path = dir .. "e.txt", old = "", new = "x" }, "must not be empty")
+
+-- bash
+check("bash", tools.bash({ command = "echo out; echo err >&2; exit 3" }), "out\nerr\n[exit 3]")
+check("bash adds a newline before the status", tools.bash({ command = "printf x" }), "x\n[exit 0]")
+check("bash with no output", tools.bash({ command = "true" }), "[exit 0]")
+check("bash timeout", tools.bash({ command = "echo start; sleep 30", timeout = 0.3 }), "start\n[timed out and was killed]")
+check("bash signal", tools.bash({ command = "kill -9 $$" }), "[killed by signal 9]")
+check("bash has no terminal on stdin", tools.bash({ command = "cat" }), "[exit 0]")
+check("a background job does not hold the call open", tools.bash({ command = "sleep 30 & echo started", timeout = 5 }), "started\n[exit 0]")
+loop.output_limit = 100
+local clipped = tools.bash({ command = "seq 1 1000" })
+check("long output keeps its start", clipped:sub(1, 4), "1\n2\n")
+check("long output keeps its end", clipped:find("1000\n[exit 0]", 1, true) ~= nil, true)
+check("long output says what is missing", clipped:find("bytes omitted", 1, true) ~= nil, true)
+loop.output_limit = 30000
+
+-- lua
+check("lua returns", tools.lua({ code = "return 1 + 1, 'x', {a = 1}" }), '2\nx\n{"a":1}')
+check("lua prints", tools.lua({ code = "print('a', 1) print('b')" }), "a\t1\nb")
+check("lua with nothing to show", tools.lua({ code = "local x = 1" }), "[no output]")
+tools.lua({ code = "counter = 41" })
+check("lua globals persist", tools.lua({ code = "counter += 1 return counter" }), "42")
+check("lua globals stay out of the harness", counter, nil)
+raises("lua syntax error", tools.lua, { code = "return +" }, "lua:1")
+raises("lua runtime error", tools.lua, { code = "error('boom')" }, "boom")
+loop.lua_seconds = 0.2
+raises("lua time limit", tools.lua, { code = "while true do end" }, "timeout")
+raises("the limit holds inside pcall", tools.lua, { code = "while true do pcall(function() while true do end end) end" }, "timeout")
+loop.lua_seconds = 60
+
+-- extensions (relative to the working directory, like the real thing)
+check("this test runs where it can write", host.write(".hxm/ext/greet.luau", "-- greets\nreturn { hello = function(n) return 'hello ' .. n end }\n"), true)
+check("ext", loop.ext("greet").hello("x"), "hello x")
+check("ext is cached", loop.ext("greet"), loop.ext("greet"))
+host.write(".hxm/ext/greet.luau", "-- greets\nreturn { hello = function(n) return 'hi ' .. n end }\n")
+check("ext reloads a changed file", loop.ext("greet").hello("x"), "hi x")
+check("ext from the lua tool", tools.lua({ code = "return ext('greet').hello('y')" }), "hi y")
+host.write(".hxm/ext/twice.luau", "-- uses another extension\nreturn { hello = function(n) return ext('greet').hello(n) .. '!' end }\n")
+check("an extension can use another", loop.ext("twice").hello("z"), "hi z!")
+host.write(".hxm/ext/broken.luau", "return {")
+raises("a broken extension", loop.ext, "broken", "ext/broken")
+raises("a missing extension", loop.ext, "nope", "no extension nope")
+raises("a path as an extension name", loop.ext, "../x", "letters, digits")
+host.sh("rm -rf .hxm")
+
+if failures > 0 then
+	error(failures .. " tool check(s) failed", 0)
+end
+print("tools: ok")
