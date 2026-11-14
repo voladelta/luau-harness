@@ -247,7 +247,7 @@ const PUSH_DESTRUCTIVE: &[&str] = &[
 const WRAPPERS: &[&str] = &[
     "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice", "chrt",
     "taskset", "timeout", "xargs", "parallel", "stdbuf", "setsid", "setpriv", "unshare", "nsenter",
-    "chroot", "busybox", "flock", "strace", "ltrace", "find",
+    "chroot", "busybox", "flock", "strace", "ltrace",
 ];
 /// How far after a wrapper its program may start. Every word up to the program is tried as the program, and each try
 /// reads the rest of the command, so the bound keeps classification linear in the command's length. Real wrapper
@@ -444,11 +444,28 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
+/// How many leading words of a simple command are shell reserved words: they open or close a compound command and
+/// run nothing themselves. `time` is one of them and takes `-p` and `--`.
+fn reserved_len(words: &[String]) -> usize {
+    let (mut n, mut after_time) = (0, false);
+    while let Some(word) = words.get(n) {
+        let word = word.as_str();
+        if RESERVED.contains(&word) {
+            after_time = word == "time";
+        } else if !(after_time && matches!(word, "-p" | "--")) {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
 /// A simple command's words from its first program word on: leading reserved words and assignments skipped.
 fn command_words(words: &[String]) -> &[String] {
+    let words = command_words_after_reserved(words);
     let start = words
         .iter()
-        .position(|w| !RESERVED.contains(&w.as_str()) && !is_assignment(w))
+        .position(|w| !is_assignment(w))
         .unwrap_or(words.len());
     &words[start..]
 }
@@ -456,11 +473,37 @@ fn command_words(words: &[String]) -> &[String] {
 /// A simple command's words with leading reserved words skipped (`{ git push; }` is `git push`). Assignments stay:
 /// `GIT_SSH_COMMAND=x git push` is not the command an entry for `git push` approved.
 fn command_words_after_reserved(words: &[String]) -> &[String] {
-    let start = words
+    &words[reserved_len(words)..]
+}
+
+/// The highest effect class among the simple commands of a script given as one string (`bash -c`, `eval`,
+/// `env -S`).
+fn script_class(script: &str) -> Class {
+    commands(script)
         .iter()
-        .position(|w| !RESERVED.contains(&w.as_str()))
-        .unwrap_or(words.len());
-    &words[start..]
+        .map(|c| class_of(c))
+        .max()
+        .unwrap_or(Class::LocalWrite)
+}
+
+/// The scripts `env` is told to split into a command: the values of `-S` and `--split-string`, attached or not.
+fn split_strings(words: &[String]) -> impl Iterator<Item = &str> {
+    words.iter().enumerate().filter_map(|(k, word)| {
+        let next = || words.get(k + 1).map(String::as_str);
+        if let Some(value) = word.strip_prefix("--split-string") {
+            return value
+                .strip_prefix('=')
+                .or_else(|| value.is_empty().then(next).flatten());
+        }
+        // A cluster of short options: `S` takes the rest of the word, or the next word.
+        let cluster = word.strip_prefix('-').filter(|c| !c.starts_with('-'))?;
+        let (_, value) = cluster.split_once('S')?;
+        if value.is_empty() {
+            next()
+        } else {
+            Some(value)
+        }
+    })
 }
 
 /// The effect class of one simple command (its words, as `commands` splits them).
@@ -479,9 +522,17 @@ fn class_of(words: &[String]) -> Class {
         Some(last) => (last, Class::LocalWrite),
         None => (WRAPPED_OFFSETS, Class::Irreversible),
     };
+    let split = if words.iter().any(|w| program(w) == "env") {
+        split_strings(words)
+            .map(script_class)
+            .max()
+            .unwrap_or(Class::LocalWrite)
+    } else {
+        Class::LocalWrite
+    };
     (1..words.len().min(last + 1))
         .map(|k| program_class(command_words(&words[k..])))
-        .fold(unknown, Class::max)
+        .fold(unknown.max(split), Class::max)
 }
 
 /// Can the shell run `word` as written? `commands` leaves a `$` wherever the shell substitutes text at run time, so a
@@ -501,30 +552,13 @@ fn leading_operands(wrapper: &str) -> usize {
 /// The last offset in `words` (a simple command whose first word is a wrapper) at which the wrapped program can start,
 /// following nested wrappers; None when that may lie beyond `WRAPPED_OFFSETS`. Options and their values come first,
 /// so the first word that is neither an option, an assignment nor the value of an option is the wrapper's first
-/// operand, and the program follows its leading operands. `find` runs the word after each `-exec`, `-execdir`, `-ok`
-/// and `-okdir`; `command -v` and `command -V` run nothing.
+/// operand, and the program follows its leading operands. `command -v` and `command -V` run nothing.
 fn last_program_offset(words: &[String]) -> Option<usize> {
     let (mut wrapper, mut furthest) = (0, 0);
     loop {
         let name = program(&words[wrapper]);
         // The words that can be this wrapper's program.
-        let (from, last) = if name == "find" {
-            let mut last = None;
-            for (k, w) in words.iter().enumerate().skip(wrapper + 1) {
-                if matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
-                    && k + 1 < words.len()
-                {
-                    if k + 1 > WRAPPED_OFFSETS {
-                        return None;
-                    }
-                    last = Some(k + 1);
-                }
-            }
-            let Some(last) = last else {
-                return Some(furthest);
-            };
-            (last, last)
-        } else {
+        let (from, last) = {
             let mut operand = None;
             for k in wrapper + 1..words.len() {
                 if k > WRAPPED_OFFSETS {
@@ -612,20 +646,23 @@ fn program_class(words: &[String]) -> Class {
                 .iter()
                 .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
                 .and_then(|p| args[p + 1..].iter().find(|a| !a.starts_with('-')));
-            return script
-                .map(|s| {
-                    commands(s)
-                        .iter()
-                        .map(|c| class_of(c))
-                        .max()
-                        .unwrap_or(Class::LocalWrite)
-                })
-                .unwrap_or(Class::LocalWrite);
+            return script.map_or(Class::LocalWrite, |s| script_class(s));
         }
-        "eval" => {
-            return commands(&args.join(" "))
+        "eval" => return script_class(&args.join(" ")),
+        // `find` runs the command after each `-exec`, `-execdir`, `-ok` and `-okdir`, up to its `;` or `+`.
+        "find" => {
+            return args
                 .iter()
-                .map(|c| class_of(c))
+                .enumerate()
+                .filter(|(_, a)| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+                .map(|(k, _)| {
+                    let command = &args[k + 1..];
+                    let end = command
+                        .iter()
+                        .position(|a| matches!(a.as_str(), ";" | "+"))
+                        .unwrap_or(command.len());
+                    class_of(&command[..end])
+                })
                 .max()
                 .unwrap_or(Class::LocalWrite);
         }
@@ -1085,6 +1122,11 @@ impl Policy {
         let (mut read, mut write) = (self.read_roots.clone(), self.write_roots.clone());
         read.push(self.registry());
         for g in self.grants.lock().unwrap().iter() {
+            // A grant that is not recursive names a file. Landlock applies a rule on a directory to everything
+            // below it, so a path that is a directory now is not passed on.
+            if !g.recursive && g.path.is_dir() {
+                continue;
+            }
             read.push(g.path.clone());
             if g.write {
                 write.push(g.path.clone());
@@ -1285,6 +1327,14 @@ impl Policy {
         let Some(outside) = denied.downcast_ref::<OutsideRoots>() else {
             return Err(denied);
         };
+        // A write names one file, existing or new. A directory is no file: granted, it would reach a child's
+        // Landlock rules as its whole tree.
+        if write && outside.path.exists() && !outside.path.is_file() {
+            bail!(
+                "policy: {} is not a file; outside the allowed roots only a single file can be granted for writing",
+                shown(&outside.path.to_string_lossy())
+            );
+        }
         // The requested file itself (children can then change it, not create its siblings), or a requested directory
         // for reading; never a tree that holds the home directory, protected configuration or hx's own files.
         let grant = PathGrant {
@@ -1301,8 +1351,13 @@ impl Policy {
             );
         }
         // Autopilot grants single files. A directory exposes everything in it, including credential files that file
-        // tools refuse by name but shell commands can read, so only the owner can grant one.
-        let source = if self.autopilot && !grant.recursive {
+        // tools refuse by name but shell commands can read, so only the owner can grant one. The same goes for
+        // writing a hidden file or anything under a hidden directory: shell startup files, `~/.ssh`, `~/.config` and
+        // another repository's `.git` are where a write turns into code that runs later, outside this run.
+        let hidden = grant.path.components().any(|c| {
+            matches!(c, std::path::Component::Normal(name) if name.as_encoded_bytes().starts_with(b"."))
+        });
+        let source = if self.autopilot && !grant.recursive && !(write && hidden) {
             ApprovalSource::Auto
         } else {
             if self.mode == ApprovalMode::Deny {
@@ -1324,6 +1379,9 @@ impl Policy {
             {
                 Ok(true) => ApprovalSource::Prompt,
                 Ok(false) => bail!(ApprovalRequired(format!("{denied}; the user declined"))),
+                Err(_) if self.autopilot => bail!(ApprovalRequired(format!(
+                    "{denied}; --yes does not grant a directory or writing a hidden path, and there is no controlling terminal to ask"
+                ))),
                 Err(e) => bail!(ApprovalRequired(format!("{denied}; {e}"))),
             }
         };
@@ -1939,6 +1997,27 @@ mod tests {
         for cmd in &must_ask {
             assert!(p.classify_sh(cmd) >= Class::External, "{cmd}");
         }
+        // `time` has an option of its own, and `env` can be handed its command as one string.
+        for (cmd, class) in [
+            ("time -p git push origin main", Class::External),
+            (
+                "time -p -- git push --force origin main",
+                Class::Irreversible,
+            ),
+            ("env -S 'git push origin main'", Class::External),
+            ("env -S 'git push --force origin main'", Class::Irreversible),
+            ("env --split-string='git push --force'", Class::Irreversible),
+            ("env --split-string 'git push --force'", Class::Irreversible),
+            ("env -iS 'git push --force'", Class::Irreversible),
+            ("env -S'git push --force'", Class::Irreversible),
+            (
+                "sudo find . -name x -exec git push --force \\;",
+                Class::Irreversible,
+            ),
+            ("find . -exec sh -c 'git push' \\;", Class::External),
+        ] {
+            assert_eq!(p.classify_sh(cmd), class, "{cmd}");
+        }
         // A program hidden past the bound is never approved by autopilot.
         let mut hidden = vec![format!(
             "find . {} -exec git push --force \\;",
@@ -1972,6 +2051,11 @@ mod tests {
             vec!["tests/test_x.py"; 60].join(" ")
         );
         let long_find = format!("find . {} -print", vec!["-name '*.rs' -o"; 30].join(" "));
+        // `find` names its program after `-exec`, however long the expression before it.
+        let long_exec = format!(
+            "find . -type f \\( {} -name '*.md' \\) -not -path './target/*' -exec grep -l TODO {{}} +",
+            ["-name '*.rs' -o"; 12].join(" ")
+        );
         let everyday = [
             "cargo test",
             "cargo build --release",
@@ -2001,6 +2085,9 @@ mod tests {
             "echo `date`",
             long_args.as_str(),
             long_find.as_str(),
+            long_exec.as_str(),
+            "time -p cargo test",
+            "env -S 'cargo test'",
         ];
         for cmd in everyday {
             assert!(p.classify_sh(cmd) <= Class::LocalWrite, "{cmd}");
@@ -2319,6 +2406,62 @@ mod tests {
                 .is_err(),
             "a credential file is never granted"
         );
+        drop(p);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_write_grant_never_names_a_directory_and_autopilot_asks_before_hidden_paths() {
+        let (p, dir, _dirs) = test_policy("grant-dir-write", true, &[]);
+        let outside = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "hx-policy-grant-dir-write-out-{}",
+                std::process::id()
+            ));
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::create_dir_all(outside.join(".config")).unwrap();
+        for target in [Path::new("/"), outside.as_path(), &outside.join("sub")] {
+            let err = p
+                .authorize_path(&target.to_string_lossy(), true)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("is not a file"), "{err}");
+        }
+        assert!(p.grants.lock().unwrap().is_empty(), "nothing was granted");
+        // A grant journaled by an older run may still name a directory: it is never turned into a tree rule.
+        p.grants.lock().unwrap().push(PathGrant {
+            path: outside.clone(),
+            recursive: false,
+            write: true,
+        });
+        let rules = p.confinement();
+        assert!(!rules.write.contains(&outside) && !rules.read.contains(&outside));
+        p.grants.lock().unwrap().clear();
+        // Autopilot writes an ordinary file outside the roots, and asks (here: is refused) for a hidden one.
+        p.authorize_path(&outside.join("notes.txt").to_string_lossy(), true)
+            .await
+            .unwrap();
+        for hidden in [
+            ".bashrc",
+            ".config/unit.service",
+            "sub/.git/hooks/pre-commit",
+        ] {
+            let err = p
+                .authorize_path(&outside.join(hidden).to_string_lossy(), true)
+                .await
+                .unwrap_err();
+            assert!(
+                err.is::<OutsideRoots>() || err.is::<ApprovalRequired>(),
+                "{hidden}: {err}"
+            );
+        }
+        // Reading a hidden file that is no credential is still an ordinary request.
+        std::fs::write(outside.join(".bashrc"), "x").unwrap();
+        p.authorize_path(&outside.join(".bashrc").to_string_lossy(), false)
+            .await
+            .unwrap();
         drop(p);
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&dir);

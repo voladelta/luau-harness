@@ -100,6 +100,13 @@ else
   HOME=$REALHOME $H exec --workspace "$W" --yes "write('$REALHOME/notes.txt', 'n\\n') sh('echo PWNED > $REALHOME/.config/hx/trust.toml; echo PWNED > $REALHOME/other.txt')" >/dev/null 2>&1
   check "--yes write grant covers the file, not its parent tree" "$(cat $REALHOME/notes.txt $REALHOME/.config/hx/trust.toml; [ -e $REALHOME/other.txt ] && echo WROTE)" "n
 ORIG"
+  # A write that names a directory is no single file: it must not become a tree a later command can write.
+  for target in / "$REALHOME"; do
+    HOME=$REALHOME $H exec --workspace "$W" --yes "pcall(write, '$target', 'x') sh('echo PWNED > $REALHOME/.config/hx/trust.toml; echo PWNED > $REALHOME/other.txt')" >/dev/null 2>&1
+  done
+  check "--yes write on a directory grants nothing" "$(cat $REALHOME/.config/hx/trust.toml; [ -e $REALHOME/other.txt ] && echo WROTE)" "ORIG"
+  out=$(HOME=$REALHOME $H exec --workspace "$W" --yes "print(pcall(write, '$REALHOME/.bashrc', 'x'), pcall(write, '$REALHOME/.config/systemd/user/x.service', 'x'))" 2>&1 </dev/null | head -1)
+  check "--yes does not write hidden files outside the roots" "$(echo "$out" | cut -f1,2 | tr '\t' '|')$(echo "$out" | grep -c 'does not grant')$([ -e $REALHOME/.bashrc ] && echo WROTE)" "false|false1"
   rm -rf $REALHOME
   out=$(run "local r = sh('cat $S1; echo written > $ESC') print(r.code ~= 0, r.stdout == '')" | head -1)
   check "confined shell cannot read or write beyond the roots" "$(echo "$out" | tr '\t' '|')$([ -e $ESC ] && echo WROTE)" "true|true"
@@ -114,6 +121,12 @@ for cmd in "env $pad touch padded.txt" "\"\$(echo touch)\" substituted.txt" "tou
   out=$(run "print(pcall(sh, [[$cmd]]))" | head -1)
   check "unreadable program needs approval and does not run: ${cmd:0:24}" "$(echo "$out" | grep -c 'approval_required')$(ls $W/*ed.txt 2>/dev/null)" "1"
 done
+for cmd in "time -p git push origin main" "env -S 'git push origin main'" "env --split-string='git push --force'"; do
+  out=$(run "print(pcall(sh, [[$cmd]]))" | head -1)
+  check "a command behind time -p or env -S needs approval: ${cmd:0:22}" "$(echo "$out" | grep -c 'approval_required')" "1"
+done
+out=$(run "print(sh([[find . -type f \\( -name '*.rs' -o -name '*.py' -o -name '*.md' -o -name '*.toml' -o -name '*.lua' -o -name '*.luau' -o -name '*.sh' -o -name '*.txt' \\) -not -path './target/*' -not -path './.git/*' -exec grep -l TODO {} +]]).code ~= nil)" | head -1)
+check "a long read-only find -exec runs unasked" "$out" "true"
 out=$(run 'local a, b, c = sh("command -v sh"), sh("env RUST_BACKTRACE=1 timeout 60 true"), sh("for f in *.txt; do wc -l \"$f\" >/dev/null; done")
 print(a.code, b.code, c.code)' | head -1)
 check "command -v, wrapped and looping commands run unasked" "$(echo "$out" | tr '\t' '|')" "0|0|0"
