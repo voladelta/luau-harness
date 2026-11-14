@@ -1,6 +1,7 @@
 //! Responses API client with native tool calling for any compatible endpoint.
 use crate::net;
 use anyhow::Result;
+use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -84,6 +85,60 @@ pub struct Reply {
     pub cache_read: u64,
     pub cache_write: u64,
     pub output: u64,
+}
+
+/// The model a `Host` asks: the run's provider over HTTP (`Http`), or a scripted model in tests.
+///
+/// `send` makes exactly one attempt. Admission, billing, retries, the run deadline and the trace belong to the
+/// supervisor around it, so an implementation never retries. A failure is classified by its type, which the caller
+/// downcasts from the `anyhow::Error`:
+/// - `Answered`: the provider answered without a usable generation (an error status, or a malformed 200 body);
+/// - `net::Error` with `Delivery::NotSent`: the request never reached the provider, so nothing was generated;
+/// - anything else: the response was lost, and the generation may have been billed.
+pub trait Model: Send + Sync {
+    /// Refuse, before the request is admitted and journaled, a request this model cannot send at all with `cfg`
+    /// (its credentials are missing).
+    fn preflight(&self, cfg: &LlmCfg) -> Result<()> {
+        let _ = cfg;
+        Ok(())
+    }
+
+    /// One request; see the trait's documentation for how a failure is classified.
+    fn send<'a>(&'a self, cfg: &'a LlmCfg, req: &'a Value) -> BoxFuture<'a, Result<Reply>>;
+}
+
+/// The Responses API over HTTP (`chat`) with one client and the run's key.
+pub struct Http {
+    client: reqwest::Client,
+    /// None: read from the request's `LlmCfg` per request, for a resumed run that launched without one.
+    key: Option<String>,
+}
+
+impl Http {
+    /// A client for `cfg`'s provider that sends `key`, or, when it is None, the key `cfg` names at each request.
+    pub fn new(cfg: &LlmCfg, key: Option<String>) -> Result<Self> {
+        Ok(Self {
+            client: client(cfg)?,
+            key,
+        })
+    }
+
+    fn key(&self, cfg: &LlmCfg) -> Result<String> {
+        match &self.key {
+            Some(key) => Ok(key.clone()),
+            None => cfg.key(),
+        }
+    }
+}
+
+impl Model for Http {
+    fn preflight(&self, cfg: &LlmCfg) -> Result<()> {
+        self.key(cfg).map(drop)
+    }
+
+    fn send<'a>(&'a self, cfg: &'a LlmCfg, req: &'a Value) -> BoxFuture<'a, Result<Reply>> {
+        Box::pin(async move { chat(&self.client, cfg, &self.key(cfg)?, req).await })
+    }
 }
 
 /// The most bytes hx reads of one model response, error bodies and every streamed event included: far above a real
@@ -368,7 +423,7 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
 }
 
 /// A finished Responses API response object -> Reply; Err is the message of a provider error.
-fn reply(resp: Value) -> std::result::Result<Reply, String> {
+pub(crate) fn reply(resp: Value) -> std::result::Result<Reply, String> {
     if resp.get("error").is_some_and(|error| !error.is_null()) {
         return Err(format!("API error: {}", resp["error"]));
     }

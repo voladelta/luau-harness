@@ -1,7 +1,7 @@
 //! Model adapter and supervised agent/controller execution. Descendants share one admission ledger.
 use crate::{
     controller::{Command, Controller, Event},
-    llm::{self, LlmCfg, Reply},
+    llm::{self, LlmCfg, Model, Reply},
     policy::{Budget, BudgetExceeded, Policy},
     supervisor::{Principal, RunState, Supervisor},
     vm::Vm,
@@ -52,9 +52,9 @@ pub struct Host {
     pub max_turns: usize,
     pub depth: usize,
     pub max_depth: usize,
-    pub http: reqwest::Client,
+    /// What `chat` asks; every descendant shares it.
+    pub model: Arc<dyn Model>,
     pub trace: Arc<Mutex<Option<std::fs::File>>>,
-    pub key: String,
     pub packs: Vec<String>,
 }
 
@@ -104,7 +104,28 @@ impl AgentOptions {
 }
 
 impl Host {
+    /// Launch a new run against the provider `llm` names, over HTTP.
     pub fn start(llm: LlmCfg, policy: Arc<Policy>, options: StartOptions) -> Result<Arc<Self>> {
+        Self::launch(llm, policy, options, None)
+    }
+
+    /// Launch a new run whose requests go to `model` instead of the provider `llm` names; `llm` is still the run's
+    /// frozen model configuration.
+    pub fn start_with(
+        model: Arc<dyn Model>,
+        llm: LlmCfg,
+        policy: Arc<Policy>,
+        options: StartOptions,
+    ) -> Result<Arc<Self>> {
+        Self::launch(llm, policy, options, Some(model))
+    }
+
+    fn launch(
+        llm: LlmCfg,
+        policy: Arc<Policy>,
+        options: StartOptions,
+        model: Option<Arc<dyn Model>>,
+    ) -> Result<Arc<Self>> {
         let StartOptions {
             task,
             max_turns,
@@ -130,7 +151,9 @@ impl Host {
                 packs.push(pack.clone());
             }
         }
-        llm.key()?; // Reject missing credentials before committing a new run manifest.
+        if model.is_none() {
+            llm.key()?; // Reject missing credentials before committing a new run manifest.
+        }
         let launch = crate::supervisor::Launch {
             model: llm,
             task,
@@ -141,25 +164,47 @@ impl Host {
             workflow,
         };
         let supervisor = Supervisor::start(policy, launch)?;
-        Self::from_supervisor(supervisor, trace)
+        Self::from_supervisor(supervisor, trace, model)
     }
 
+    /// Resume the run in `policy`'s journal against the provider its manifest names, over HTTP.
     pub fn resume(policy: Arc<Policy>, trace: Option<PathBuf>) -> Result<Arc<Self>> {
-        Self::from_supervisor(Supervisor::resume(policy)?, trace)
+        Self::from_supervisor(Supervisor::resume(policy)?, trace, None)
     }
 
-    fn from_supervisor(supervisor: Arc<Supervisor>, trace: Option<PathBuf>) -> Result<Arc<Self>> {
+    /// Resume the run in `policy`'s journal with its requests going to `model`.
+    pub fn resume_with(
+        model: Arc<dyn Model>,
+        policy: Arc<Policy>,
+        trace: Option<PathBuf>,
+    ) -> Result<Arc<Self>> {
+        Self::from_supervisor(Supervisor::resume(policy)?, trace, Some(model))
+    }
+
+    /// The root host of `supervisor`'s run. Without `model`, it asks the manifest's provider over HTTP, with the key
+    /// read now; a run that resumes finished or paused at an owner gate may have none yet, and reads it per request.
+    fn from_supervisor(
+        supervisor: Arc<Supervisor>,
+        trace: Option<PathBuf>,
+        model: Option<Arc<dyn Model>>,
+    ) -> Result<Arc<Self>> {
         let m = supervisor
             .manifest
             .as_ref()
             .context("missing run manifest")?;
-        let key = if matches!(
-            &supervisor.restored,
-            Some(RunState::Finished { .. } | RunState::AwaitingReview { .. })
-        ) {
-            m.model.key().unwrap_or_default()
-        } else {
-            m.model.key()?
+        let model = match model {
+            Some(model) => model,
+            None => {
+                let key = if matches!(
+                    &supervisor.restored,
+                    Some(RunState::Finished { .. } | RunState::AwaitingReview { .. })
+                ) {
+                    m.model.key().ok()
+                } else {
+                    Some(m.model.key()?)
+                };
+                Arc::new(llm::Http::new(&m.model, key)?)
+            }
         };
         let file = trace.map(std::fs::File::create).transpose()?;
         Ok(Arc::new(Self {
@@ -172,9 +217,8 @@ impl Host {
             max_turns: m.max_turns,
             depth: 0,
             max_depth: 2,
-            http: llm::client(&m.model)?,
+            model,
             trace: Arc::new(Mutex::new(file)),
-            key,
             packs: m.packs.clone(),
             supervisor,
         }))
@@ -205,9 +249,8 @@ impl Host {
             max_turns: self.max_turns,
             depth: self.depth + 1,
             max_depth: self.max_depth,
-            http: self.http.clone(),
+            model: self.model.clone(),
             trace: self.trace.clone(),
-            key: self.key.clone(),
             packs: self.packs.clone(),
         }))
     }
@@ -262,15 +305,11 @@ impl Host {
     /// One budgeted, journaled request to `cfg`: the run's provider, key and model, possibly with another reasoning effort.
     pub async fn chat_as(&self, cfg: &LlmCfg, req: &Value) -> Result<Reply> {
         crate::controller::validate_request(req)?;
+        self.model.preflight(cfg)?;
         let mut retries = 0;
-        let key = if self.key.is_empty() {
-            cfg.key()?
-        } else {
-            self.key.clone()
-        };
         loop {
             let op = self.supervisor.reserve_model(cfg, req, self.depth).await?;
-            let call = llm::chat(&self.http, cfg, &key, req);
+            let call = self.model.send(cfg, req);
             let result = match self.supervisor.remaining() {
                 Some(remaining) => tokio::time::timeout(remaining, call)
                     .await
