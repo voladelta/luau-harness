@@ -79,10 +79,6 @@ fn operand_count(command: &str) -> Option<(usize, &'static str)> {
         "approve" => (1, "usage: hx approve PKG"),
         "skills" => (0, "usage: hx skills"),
         "trust" => (0, "usage: hx trust [--yes]"),
-        "staged" => (0, "usage: hx staged"),
-        "accept" => (1, "usage: hx accept NAME [--yes]"),
-        "reject" => (1, "usage: hx reject NAME"),
-        "rollback" => (1, "usage: hx rollback MODULE"),
         "log" => (2, "usage: hx log verify LOG"),
         "paths" => (0, "usage: hx paths"),
         _ => return None,
@@ -123,10 +119,6 @@ COMMANDS:
     approve      lock a project package or skill and grant the capabilities it requests
     skills       list skills in .agents/skills and ~/.agents/skills and whether each is approved
     trust        review this workspace's .harness config and hx.lock, then trust it (runs refuse untrusted config)
-    staged       list what the agent staged: packages and harness-module replacements
-    accept       review and activate something staged
-    reject       discard something staged
-    rollback     undo the last accepted replacement of a harness module
     log verify   check an event log's hash chain and list unknown-outcome effects
     paths        print where hx keeps this workspace's logs, state and secrets, and the trust store
 ";
@@ -223,7 +215,7 @@ const FLAGS: &[Flag] = {
             "--pack",
             Text,
             "A,B",
-            "extra packs: std/authoring (agent-written tools), std/vision (view() shows images)",
+            "extra packs: std/vision (view() shows images)",
         ),
         flag(
             RUN,
@@ -330,7 +322,7 @@ const FLAGS: &[Flag] = {
         ),
         flag(&["recover"], "--decision", Text, "D", "complete or abandon"),
         flag(
-            &["recover", "trust", "accept"],
+            &["recover", "trust"],
             "--yes",
             Switch,
             "",
@@ -411,18 +403,8 @@ fn help_for(cmd: &str) -> Option<&'static str> {
         "skills" => {
             "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and whether each is approved.\nOnly approved, unchanged skills are visible to the model; approve with `hx approve NAME`.\n"
         }
-        "staged" => {
-            "hx staged\n\nList what the agent staged: packages (NAME) and harness-module replacements (std/MODULE).\n"
-        }
         "trust" => {
-            "hx trust [--yes]\n\nShow this workspace's config (.harness/*.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, .harness/versions/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in hx's trust store (see `hx paths`).\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n"
-        }
-        "accept" => {
-            "hx accept NAME [--yes]\n\nReview something staged (every file, control characters escaped), then activate exactly that. A package is locked in hx.lock and granted the capabilities\nit requests; a module replacement (std/MODULE) must load and keep every export, and becomes the override.\nPrompts on a terminal; without one, --yes is required.\n"
-        }
-        "reject" => "hx reject NAME\n\nDiscard something staged.\n",
-        "rollback" => {
-            "hx rollback MODULE\n\nRestore what the last accepted replacement of MODULE (e.g. std/printer) replaced.\n"
+            "hx trust [--yes]\n\nShow this workspace's config (.harness/*.toml, .harness/init.luau, .harness/override/,\n.harness/tools/, hx.lock) and trust its exact content. Until then `hx run` and `hx exec` refuse to\nstart (pass --ignore-config to run without it): a cloned repo cannot widen file-tool access, start MCP servers or\npre-approve packages and skills. The record lives in hx's trust store (see `hx paths`).\nPrompts on a terminal; without one, --yes is required. HX_TRUST=HASH trusts exactly that config for one launch.\n"
         }
         "log" => {
             "hx log verify LOG\n\nCheck the hash chain and the session every record names, the blobs records reference and the recovery\naccounting, and list effects with an unknown outcome.\nLOG is a run name (its journal in this workspace's log directory, see `hx paths`) or a path to the journal.\nExit codes: 0 ok, 1 broken chain, bad blob or invalid recovery accounting, 3 unknown outcomes.\n"
@@ -704,25 +686,6 @@ async fn real_main() -> Result<std::process::ExitCode> {
                 modules::Resolver::new(workspace).skills_status(&dirs)?
             )
         }
-        // hx staged | accept NAME [--yes] | reject NAME | rollback MODULE : the user's side of staging (nothing the agent can call does this)
-        "staged" => {
-            let l = modules::Resolver::new(workspace).list_staged();
-            outln!(
-                "{}",
-                if l.is_empty() {
-                    "nothing staged".to_string()
-                } else {
-                    l.join("\n")
-                }
-            )
-        }
-        "reject" => {
-            let n = operands(&args)?[0];
-            modules::Resolver::new(workspace).reject(n)?;
-            outln!("rejected {n}")
-        }
-        "accept" => cmd_accept(&args, &workspace, &dirs),
-        "rollback" => cmd_rollback(&args, &workspace, &dirs),
         "log" => return cmd_log_verify(&args, &own),
         "paths" => {
             outln!(
@@ -1031,31 +994,6 @@ fn cmd_trust(args: &[String], workspace: &Path, dirs: &dirs::Dirs) -> Result<()>
     outln!("trusted {} ({h})", workspace.display())
 }
 
-/// hx rollback MODULE : undo the last accepted replacement of a harness module
-fn cmd_rollback(args: &[String], workspace: &Path, dirs: &dirs::Dirs) -> Result<()> {
-    let module = operands(args)?[0];
-    let rt = trust::Retrust::before(workspace, dirs);
-    outln!(
-        "{}",
-        modules::Resolver::new(workspace.to_path_buf()).rollback(module)?
-    )?;
-    rt.after()
-}
-
-/// hx accept NAME [--yes] : review something staged, then activate exactly what the review showed
-fn cmd_accept(args: &[String], workspace: &Path, dirs: &dirs::Dirs) -> Result<()> {
-    let n = operands(args)?[0];
-    let r = modules::Resolver::new(workspace.to_path_buf());
-    let review = r.review(n)?;
-    outln!("{}", review.text)?;
-    if !has(args, "--yes") {
-        confirm(&review.question())?;
-    }
-    let rt = trust::Retrust::before(workspace, dirs);
-    outln!("{}", r.accept(review)?)?;
-    rt.after()
-}
-
 /// hx log verify LOG : check the chain and the sessions, the referenced blobs and the accounting, and list effects with
 /// an unknown outcome (exit 1 damaged, 3 unknown)
 fn cmd_log_verify(args: &[String], own: &dirs::WorkspaceDirs) -> Result<std::process::ExitCode> {
@@ -1134,10 +1072,6 @@ mod tests {
             ("approve", &["PKG"], ""),
             ("skills", &[], ""),
             ("trust", &[], ""),
-            ("staged", &[], ""),
-            ("accept", &["NAME"], ""),
-            ("reject", &["NAME"], ""),
-            ("rollback", &["std/printer"], ""),
             ("log", &["verify", "FILE"], ""),
             ("paths", &[], ""),
         ];
@@ -1214,7 +1148,7 @@ mod tests {
     fn only_optional_packs_can_be_enabled() {
         for ok in [
             "exec --pack std/vision",
-            "run --model m --pack std/authoring,std/vision task",
+            "run --model m --pack std/vision task",
         ] {
             validate_args(&argv(ok)).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }

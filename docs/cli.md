@@ -17,8 +17,6 @@ Every command takes `--help`.
 | `hx approve PKG` | Lock a project package's or skill's hash and grant the capabilities it requests |
 | `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and whether each is approved |
 | `hx trust [--yes]` | Review this workspace's `.harness` config and `hx.lock`, print its hash, then trust it; runs refuse untrusted config |
-| `hx staged` / `hx accept NAME` / `hx reject NAME` | Review what the agent staged (tools as `NAME`, module replacements as `std/MODULE`), then activate or discard it |
-| `hx rollback MODULE` | Undo the last accepted replacement of a harness module |
 | `hx log verify LOG` | Check a log's hash chain and the session its records name, the blobs it references and its recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |
 | `hx paths` | Print where hx keeps this workspace's files, one `name: path` per line: `log`, `state` (the workspace's state directory, which holds `log` and the files of programs built on hx), `secrets`, and the `trust` store |
 
@@ -49,7 +47,7 @@ hx always uses the Responses API. Requests go to `/responses` under the configur
 | `--context-window N` | 1000000 (assumed) | The model's context window, used by `std/compact`: compaction starts at 80% of it. Without the flag, a run on OpenRouter (the default base URL) reads the model's `context_length` and `top_provider.max_completion_tokens` from `/models` once at launch; the manifest keeps them for resume. When that fails (another provider, an unlisted model, no network), hx says so on stderr and assumes the default; give a smaller model's window so it compacts before an overflow |
 | `--max-tokens N` `--max-wall SECS` | none | Admission thresholds and absolute deadline; flags override `policy.toml` for a new run |
 | `--provider-only A,B` | | OpenRouter only: route to these providers, no fallbacks |
-| `--pack A,B` | | Extra packs: `std/authoring` (agent-written tools), `std/vision` (`view()` shows images to a vision model); any other name is an error (compaction and recheck are set in `.harness/init.luau`, RPI with `--rpi`). Also accepted by `hx exec` |
+| `--pack A,B` | | Extra packs: `std/vision` (`view()` shows images to a vision model); any other name is an error (compaction and recheck are set in `.harness/init.luau`, RPI with `--rpi`). Also accepted by `hx exec` |
 | `--trace FILE` | | Write a readable trace |
 
 ## Owner command flags

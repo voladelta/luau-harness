@@ -13,15 +13,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Config files whose content trust covers (paths relative to the workspace), besides every other `.harness/*.toml`,
-/// plus whole trees: module overrides and the saved versions `hx rollback` restores. (`.harness/staged` is not covered: `hx accept` shows what it activates and
-/// asks, and the agent stages there itself.)
+/// plus whole trees: module overrides and local tools.
 const FILES: [&str; 4] = [
     ".harness/policy.toml",
     ".harness/mcp.toml",
     ".harness/init.luau",
     "hx.lock",
 ];
-const TREES: [&str; 3] = [".harness/override", ".harness/versions", ".harness/tools"];
+const TREES: [&str; 2] = [".harness/override", ".harness/tools"];
 
 fn key(ws: &Path) -> String {
     std::fs::canonicalize(ws)
@@ -286,7 +285,7 @@ pub fn record(ws: &Path, dirs: &Dirs) -> Result<Option<String>> {
     Ok(Some(h))
 }
 
-/// For commands the user runs that change the config themselves (`hx approve`, `accept`, `rollback`):
+/// For commands the user runs that change the config themselves (`hx approve`):
 /// keep a trusted workspace trusted, but never let them bless config the user has not trusted yet.
 pub struct Retrust<'a> {
     ws: PathBuf,
@@ -323,6 +322,22 @@ impl<'a> Retrust<'a> {
         }
         Ok(())
     }
+}
+
+/// Text as the owner's terminal shows it in a review: control characters (except newline and tab) and bidirectional
+/// formatting characters are escaped, so bytes someone else wrote cannot move the cursor, recolour or reorder what the
+/// owner reads before answering.
+pub fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let bidi = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if (c.is_control() && c != '\n' && c != '\t') || bidi {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -603,8 +603,6 @@ pub enum Tool {
     Agent,
     McpList,
     McpCall,
-    Promote,
-    ProposeModule,
     Http,
     Llm,
 }
@@ -623,8 +621,6 @@ impl Tool {
             Self::Agent => "agent",
             Self::McpList => "mcp_list",
             Self::McpCall => "mcp_call",
-            Self::Promote => "promote",
-            Self::ProposeModule => "propose_module",
             Self::Http => "http",
             Self::Llm => "llm",
         }
@@ -633,7 +629,7 @@ impl Tool {
     fn capability(self) -> Capability {
         match self {
             Self::Read | Self::Search | Self::History | Self::View => Capability::FsRead,
-            Self::Write | Self::Edit | Self::Promote | Self::ProposeModule => Capability::FsWrite,
+            Self::Write | Self::Edit => Capability::FsWrite,
             Self::Sh => Capability::ProcSh,
             Self::Agent => Capability::LlmAgent,
             Self::McpList | Self::McpCall => Capability::McpCall,

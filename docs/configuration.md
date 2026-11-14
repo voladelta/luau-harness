@@ -38,7 +38,7 @@ max_tokens = 600000
 max_wall_secs = 900
 
 [packs]
-enable = []                     # std/authoring, std/vision (as --pack); any other name is an error
+enable = []                     # std/vision (as --pack); any other name is an error
 ```
 
 The workspace, private temp directory and `[fs]` roots are standing file-tool permissions. With `mode = "prompt"`, other file-tool paths ask on the owner's controlling terminal. A write grant covers the requested file only, with read access (shell commands may then change that file, not create its siblings); a read grant covers the requested file, or the subtree when a directory is requested. A directory that is `/`, contains your home directory, or contains protected configuration, credentials or sealed state is never granted, in any mode: add a narrower `[fs]` root instead. Home has no implicit grant. A `sealed` path is refused to file tools in every mode and is never granted; it may not lie inside a read root (that would put it within shell commands' reach), so a policy that seals one there is refused. Refusal or a missing terminal leaves the operation unexecuted. Grants are shared by descendants and journaled for resume, and a new run starts with fresh grants.
@@ -108,7 +108,7 @@ require("std/recheck").enabled = true
 
 ## Workspace trust
 
-Every `.harness/*.toml` (hx's `policy.toml` and `mcp.toml`, and the config of programs built on hx, such as `ar.toml`), `.harness/init.luau`, `.harness/override/`, `.harness/tools/`, `.harness/versions/` (what `hx rollback` restores) and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in the trust store (`trust.toml` in hx's configuration directory, outside the repo and every root of the model's), `hx run` and `hx exec` refuse to start:
+Every `.harness/*.toml` (hx's `policy.toml` and `mcp.toml`, and the config of programs built on hx, such as `ar.toml`), `.harness/init.luau`, `.harness/override/`, `.harness/tools/` and `hx.lock` live in the repo, so whoever wrote the repo could widen file-tool access, start MCP commands, run evaluator commands or pre-approve packages and skills. Trust covers the exact content of all of them. Until you review the config with `hx trust`, which records its hash in the trust store (`trust.toml` in hx's configuration directory, outside the repo and every root of the model's), `hx run` and `hx exec` refuse to start:
 
 ```text
 Error: this workspace's config is not trusted (.harness/policy.toml); review it and run `hx trust`, or pass --ignore-config to run without it
@@ -117,7 +117,7 @@ Error: this workspace's config is not trusted (.harness/policy.toml); review it 
 - `--ignore-config` runs without any of this workspace's config, trusted or not.
 - Any edit makes the workspace untrusted again.
 - `hx run --resume` is never refused: a resumed run uses only its frozen manifest.
-- `hx approve`, `hx accept` and `hx rollback` keep an already trusted workspace trusted.
+- `hx approve` keeps an already trusted workspace trusted.
 - A workspace without such files needs nothing.
 - `HX_TRUST=HASH` in hx's environment trusts exactly that config for one launch (throwaway copies, scripts); `hx trust` prints the hash.
 
@@ -125,8 +125,8 @@ Error: this workspace's config is not trusted (.harness/policy.toml); review it 
 
 `hx.lock` is the single approval record: per package, the approved version, what it was approved as (`kind = "package"` for `.harness/pkgs/NAME`, `"agent-skill"` for a skill under `.agents/skills`) and its content hash. The hash covers the package's `hx.toml`, so approving a package grants exactly the capabilities its manifest requests, and a manifest that asks for more no longer matches its approval. An approval holds only where it was made: a skill approved under `.agents/skills` (no Luau, no capabilities) that is copied into `.harness/pkgs` is not approved there, whatever its `hx.toml` says.
 
-The hash is SHA-256 over a tag naming the kind, then every file of the package (entries starting with `.` excluded), each as its length-prefixed relative path followed by its length-prefixed content, in path order. `hx approve`, `hx skills`, `hx accept` and a run's launch read a package through the same function, so they agree on what was approved. Locks written by hx versions before this encoding no longer match: run `hx approve NAME` again for each package and skill.
+The hash is SHA-256 over a tag naming the kind, then every file of the package (entries starting with `.` excluded), each as its length-prefixed relative path followed by its length-prefixed content, in path order. `hx approve`, `hx skills` and a run's launch read a package through the same function, so they agree on what was approved. Locks written by hx versions before this encoding no longer match: run `hx approve NAME` again for each package and skill.
 
-A run builds its extensions from the config bytes trust checked, `hx.lock` included, never from a second read of the files. `hx.lock` and the module overrides `hx accept` and `hx rollback` write are replaced atomically.
+A run builds its extensions from the config bytes trust checked, `hx.lock` included, never from a second read of the files. `hx.lock` is replaced atomically.
 
 Older lock files may still carry `[package.grants]` tables or a `.harness/grants.toml`; hx ignores both.

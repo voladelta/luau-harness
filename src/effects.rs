@@ -83,7 +83,7 @@ pub enum Ret {
         finished: bool,
         turns: u64,
     },
-    /// generic structured result (MCP calls, promote, propose_module)
+    /// generic structured result (MCP calls)
     Json(Value),
     Err(String),
 }

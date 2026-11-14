@@ -92,7 +92,7 @@ def main():
               ("clippy", ["cargo", "clippy", "--release", "--all-targets", "--quiet", "--", "-D", "warnings"]),
               ("Rust tests", ["cargo", "test", "--release", "--quiet"]),
               ("std unit tests", ["target/release/hx", "test", "stdlib/std"])]
-    for name in ("extension", "llm", "mcp", "vision", "compact", "harness", "journal", "budget", "caps", "upgrade", "trust"):
+    for name in ("extension", "llm", "mcp", "vision", "compact", "harness", "journal", "budget", "caps", "trust"):
         suites.append((name + "_checks", ["bash", f"scripts/{name}_checks.sh"]))
     for name in ("approval", "redesign", "custom_tool", "rpi", "history"):
         suites.append((name + "_checks", ["python3", f"scripts/{name}_checks.py"]))

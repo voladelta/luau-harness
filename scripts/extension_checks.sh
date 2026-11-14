@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Extension checks, no API key: skills, tool packages, agent-written tools (deftool/promote/accept),
-# no self-approval, frozen extensions with live session state. Build first: cargo build --release
+# Extension checks, no API key: skills, tool packages, no self-approval, frozen extensions with live session state. Build first: cargo build --release
 cd "$(dirname "$0")/.."
 source scripts/check_helpers.sh
 cleanup() { kill $MOCK 2>/dev/null; pkill -f "sleep 4243" 2>/dev/null; }
 MOCK=
 W=$T/ws; mkdir -p $W/.harness/pkgs/release $W/.harness/pkgs/slug
 x() { $H exec --workspace $W "$@" 2>&1 | grep -v "^-- ops="; }
-# agent-written tools are an opt-in pack: xt runs with it
-xt() { x --pack std/authoring "$@"; }
 
 # --- the user installs a skill and a tool package (plain files; nothing is active until approved)
 cat > $W/.harness/pkgs/release/hx.toml <<'TOML'
@@ -67,31 +64,8 @@ check "prompt says how to search and load skills" "$(echo "$s" | grep -c 'skills
 E=$T/empty; mkdir -p $E; run $E
 check "no extensions installed: the prompt is unchanged" "$(system_of_last | grep -c 'Installed extensions')" "0"
 
-# --- Definitions stay inactive; promotion never executes unapproved source or tests.
-check "authoring remains opt-in" "$(x 'print(type(deftool),type(promote))' | head -1)" "nil	nil"
-out=$(xt 'local d=deftool("peek", [==[write("unapproved.txt","bad"); return {}]==], {caps={fs={"write"}}}); print(d.active,tools.peek)')
-check "definition does not execute or activate" "$(echo "$out" | head -1) $([ -e $W/unapproved.txt ] && echo bad || echo safe)" "false	nil safe"
-check "definitions do not pollute vars" "$(xt 'deftool("t1","return {}"); x=1; print(vars().tools,vars().deftool,vars().x)' | head -1)" "nil	nil	1"
-TOOL='deftool("shout", [==[return {run=function(s) return s:upper() .. "!" end}]==], {
- signature="shout.run(s: string): string",doc="shouts",tests=[==[
- local m=require("shout");test.case("shouts",function() test.eq(m.run("hi"),"HI!") end)
- ]==]})'
-out=$(xt "$TOOL"$'\nlocal r=promote("shout"); print(r.ok,r.tested); print(r.message)')
-check "promotion stages without execution" "$(echo "$out" | head -1)" "true	false"
-check "promotion explains owner testing and acceptance" "$(echo "$out" | grep -c 'hx accept shout')" "1"
-check "staged source is not installed" "$([ -d $W/.harness/staged/shout ] && [ ! -d $W/.harness/pkgs/shout ] && echo yes || echo no)" "yes"
-check "a new session cannot see staged source" "$(x 'print(tools.shout)' | head -1)" "nil"
-check "owner can run staged tests" "$($H test $W/.harness/staged/shout --workspace $W | tail -1)" "1 passed, 0 failed"
-$H accept shout --yes --workspace $W >/dev/null 2>&1
-check "accepted source is available to a new run" "$(x 'print(tools.shout.run("ok"))' | head -1)" "OK!"
-out=$(xt 'deftool("bad","return {}",{tests=[==[write("unapproved-test.txt","bad")]==]}); local r=promote("bad"); print(r.ok,r.tested)')
-check "unapproved tests are not executed by promotion" "$(echo "$out" | head -1) $([ -e $W/unapproved-test.txt ] && echo bad || echo safe)" "true	false safe"
-out=$(xt 'deftool("untested","return {}"); local r=promote("untested"); print(r.ok,r.message)')
-check "promotion still requires submitted tests" "$(echo "$out" | head -1 | grep -c 'must have tests')" "1"
-
-# --- file tools cannot change installed or staged extensions
+# --- file tools cannot change installed extensions
 check "cannot write into .harness/pkgs" "$(x 'print(pcall(write, ".harness/pkgs/evil/hx.toml", "x"))' | head -1 | grep -c protected)" "1"
-check "cannot write into .harness/staged" "$(x 'print(pcall(write, ".harness/staged/evil/init.luau", "x"))' | head -1 | grep -c protected)" "1"
 check "no accept/approve function exists for the agent" "$(x 'print(type(accept), type(approve), type(hx), type(require))' | head -1)" "nil	nil	nil	nil"
 
 # --- extensions stay frozen when a user edits and re-approves a tool during a session
@@ -156,12 +130,12 @@ echo y > $T/src/linked/.git/ORIG_HEAD
 check "git activity in a skill does not un-approve it" "$(HOME=$FH $H skills --workspace $A | grep -c '^linked .* approved')" "1"
 
 # --- hx test runs a package's tests inside its boundary
-S=$W/.harness/staged/sneak; mkdir -p $S/tests
+S=$T/sneak; mkdir -p $S/tests
 printf '[package]\nname = "sneak"\nversion = "0.1.0"\n' > $S/hx.toml; echo 'return {}' > $S/init.luau
 echo 'test.case("escape", function() sh("touch pwned") end) test.case("lib", function() test.eq(require("sneak").x, nil) end)' > $S/tests/t.luau
 out=$($H test $S --workspace $W 2>&1)
 check "hx test: a test cannot use what the package does not declare" "$(echo "$out" | grep -c 'capability_denied')$(echo "$out" | tail -1)$([ -e $W/pwned ] && echo pwned)" "11 passed, 1 failed"
-mkdir -p $W/.harness/staged/bare/tests; echo 'test.case("x", function() end)' > $W/.harness/staged/bare/tests/t.luau
-check "hx test: a staged directory without hx.toml is refused" "$($H test $W/.harness/staged/bare --workspace $W 2>&1 | grep -c 'not a package')" "1"
+mkdir -p $W/.harness/bare/tests; echo 'test.case("x", function() end)' > $W/.harness/bare/tests/t.luau
+check "hx test: a directory in .harness without hx.toml is refused" "$($H test $W/.harness/bare --workspace $W 2>&1 | grep -c 'not a package')" "1"
 
 finish

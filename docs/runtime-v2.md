@@ -131,7 +131,7 @@ Local HTTP endpoints carry an explicit read-only classification (default: extern
 
 Package initializers must be pure. Put file/process work inside exported methods. Pass invocation state as explicit data and save results in the agent's `durable` store when needed.
 
-`hx approve` and `hx accept` affect future runs. The old `parallel`, `refresh_extensions()` and `reload()` APIs have been removed. `deftool()` records an inactive source definition; `promote()` syntax-checks and stages it without executing unapproved source or tests. The owner reviews, runs `hx test DIR`, accepts it, and starts a new run or branch.
+`hx approve` affects future runs. The old `parallel`, `refresh_extensions()` and `reload()` APIs have been removed. The model cannot define, stage or activate extensions; the owner edits `.harness/`, runs `hx trust`, and starts a new run or branch.
 
 `hx revoke LOG` writes a protected revocation marker. The supervisor stops admitting operations and refuses subsequent resume. It cannot undo already accepted external work.
 

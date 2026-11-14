@@ -3,13 +3,12 @@
 //!   * the MODULE env: where harness modules (std loop, printer, ...) run, with `require` and the `hx` API.
 use crate::effects::{Effects, Ret};
 use crate::host::Host;
-use crate::modules::Resolver;
 use crate::policy::{Class, Policy};
 use crate::prims;
 use anyhow::{Context, Result};
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic, VmState};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -901,20 +900,6 @@ fn clean_error(e: &mlua::Error) -> String {
     }
 }
 
-#[derive(Clone)]
-struct ToolDef {
-    source: String,
-    doc: String,
-    signature: String,
-    types: String,
-    tests: String,
-    caps: crate::supervisor::Capabilities,
-}
-
-fn opt_string(o: &Option<Table>, k: &str) -> String {
-    prims::opt_str(o, k).unwrap_or_default()
-}
-
 fn stderr_print(_: &Lua, args: Variadic<Value>) -> mlua::Result<()> {
     eprintln!(
         "{}",
@@ -926,45 +911,12 @@ fn stderr_print(_: &Lua, args: Variadic<Value>) -> mlua::Result<()> {
     Ok(())
 }
 
-/// opts.caps = { fs = {"read"}, proc = {"sh"} }; an unknown capability is an error.
-fn caps_of(o: &Option<Table>) -> mlua::Result<crate::supervisor::Capabilities> {
-    let mut out = BTreeMap::new();
-    if let Some(Value::Table(caps)) = o.as_ref().map(|t| t.get::<Value>("caps")).transpose()? {
-        for pair in caps.pairs::<String, Vec<String>>() {
-            let (k, v) = pair?;
-            out.insert(k, v);
-        }
-    }
-    crate::supervisor::Capabilities::from_map(&out).map_err(mlua::Error::external)
-}
-
-fn toml_str(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
-}
-
-fn render_manifest(name: &str, d: &ToolDef) -> String {
-    let mut t = format!(
-        "[package]\nname = {}\nversion = \"0.1.0\"\nkind = \"tool\"\ndescription = {}\n\n[tool]\nsignature = {}\ndoc = {}\n\n[capabilities]\n",
-        toml_str(name),
-        toml_str(&d.doc),
-        toml_str(&d.signature),
-        toml_str(&d.doc)
-    );
-    for (k, v) in d.caps.to_map() {
-        t.push_str(&format!(
-            "{k} = [{}]\n",
-            v.iter().map(|x| toml_str(x)).collect::<Vec<_>>().join(", ")
-        ));
-    }
-    t
-}
-
 /// Packs every agent VM installs: the package bindings and the MCP binding.
 const BASE_PACKS: [&str; 2] = ["std/packages", "std/mcp"];
 
 /// The packs a run or `hx exec` may add (`--pack`, `[packs] enable` in policy.toml), installed in the agent VM after
 /// the base packs. Every other `std` module is part of the loop and is configured in `.harness/init.luau`.
-pub const OPTIONAL_PACKS: [&str; 2] = ["std/authoring", "std/vision"];
+pub const OPTIONAL_PACKS: [&str; 1] = ["std/vision"];
 
 /// Refuse any pack that is not one of `OPTIONAL_PACKS`, rather than enable nothing.
 pub fn check_packs(packs: &[String]) -> Result<()> {
@@ -999,7 +951,6 @@ impl Vm {
         let out = Arc::new(Mutex::new(Printed::default()));
         let ops = Arc::new(AtomicUsize::new(0));
         let deadline = Arc::new(Deadline::default());
-        let resolver = Arc::new(Resolver::new(root.clone()));
         let supervisor = match &host {
             Some(h) => h.supervisor.clone(),
             None => {
@@ -1501,7 +1452,7 @@ impl Vm {
                 lua.create_function(move |lua, ()| crate::values::copy_in(lua, &mh.model_info()))?,
             )?;
         }
-        // ---- extension API: installed packages, agent-defined tools, staging for promotion ----
+        // ---- extension API: installed packages and skills ----
         let pres = registry.clone();
         hx.set("autopilot", policy.autopilot)?;
         hx.set("confined", crate::confine::status().is_ok())?;
@@ -1531,72 +1482,6 @@ impl Vm {
                     .map_err(mlua::Error::external)
             })?,
         )?;
-        let defs: Arc<Mutex<HashMap<String, ToolDef>>> = Arc::new(Mutex::new(HashMap::new()));
-        let d_defs = defs.clone();
-        let deftool = lua.create_function(move |lua, (name, source, opts): (String, String, Option<Table>)| {
-            if !crate::modules::valid_name(&name) {
-                return Err(mlua::Error::runtime("deftool: the name must be lowercase letters, digits and _ (starting with a letter)"));
-            }
-            let caps = caps_of(&opts)?;
-            lua.load(&source).into_function()?; // syntax check only; unapproved source must never execute
-            d_defs.lock().unwrap().insert(name.clone(), ToolDef { source, doc: opt_string(&opts, "doc"), signature: opt_string(&opts, "signature"), types: opt_string(&opts, "types"), tests: opt_string(&opts, "tests"), caps });
-            let definition = lua.create_table()?;
-            definition.set("name", name)?; definition.set("active", false)?;
-            Ok(definition)
-        })?;
-        let (p_defs, p_res, p_fx) = (defs.clone(), resolver.clone(), fx.clone());
-        let promote = lua.create_async_function(move |lua, name: String| {
-            let (defs, res, fx) = (p_defs.clone(), p_res.clone(), p_fx.clone());
-            async move {
-                let def = defs.lock().unwrap().get(&name).cloned().ok_or_else(|| mlua::Error::runtime(format!("promote: no tool named {name:?}; define it with deftool() first")))?;
-                let args = json!({"name": name, "source_sha": crate::eventlog::sha_bytes(def.source.as_bytes()), "tests_sha": crate::eventlog::sha_bytes(def.tests.as_bytes())});
-                let ret = fx.run(&lua, crate::supervisor::Tool::Promote, Class::LocalWrite, args, || async {
-                    if def.tests.trim().is_empty() {
-                        return Ok(Ret::Json(json!({"ok": false, "message": "a tool must have tests to be promoted: pass opts.tests to deftool()"})));
-                    }
-                    let types = format!("-- {}\n-- {}\n{}\n", def.signature, def.doc, def.types);
-                    let files = vec![
-                        ("hx.toml".to_string(), render_manifest(&name, &def)),
-                        ("init.luau".to_string(), def.source.clone()),
-                        ("types.d.luau".to_string(), types),
-                        ("tests/t.luau".to_string(), def.tests.clone()),
-                    ];
-                    lua.load(&def.tests).into_function()?;
-                    let dir = res.stage(&name, &files).map_err(mlua::Error::external)?;
-                    Ok(Ret::Json(json!({
-                        "ok": true,
-                        "message": format!("staged tool '{name}' without executing unapproved code. Review it, run `hx test {}`, then `hx accept {name}`. It becomes available in a new run.", dir.display()),
-                        "tested": false,
-                    })))
-                }).await?;
-                prims::json_value(&lua, ret)
-            }
-        })?;
-        let (u_res, u_fx) = (resolver.clone(), fx.clone());
-        let propose_module = lua.create_async_function(move |lua, (module, source, opts): (String, String, Option<Table>)| {
-            let (res, fx) = (u_res.clone(), u_fx.clone());
-            async move {
-                let reason = opt_string(&opts, "reason");
-                let args = json!({"module": module, "source_sha": crate::eventlog::sha_bytes(source.as_bytes()), "reason": reason});
-                let ret = fx.run(&lua, crate::supervisor::Tool::ProposeModule, Class::LocalWrite, args, || async {
-                    Ok(match res.stage_module(&module, &source, &reason) {
-                        Ok(_) => Ret::Json(json!({"ok": true, "message": format!("staged a replacement for {module}. It is NOT active: the user reviews it and runs `hx accept {module}`; it applies to new runs.")})),
-                        Err(e) => Ret::Json(json!({"ok": false, "message": e.to_string()})),
-                    })
-                }).await?;
-                prims::json_value(&lua, ret)
-            }
-        })?;
-        // the opt-in std/authoring pack exposes these to the model's session (hx.expose)
-        let authoring = lua.create_table()?;
-        for (n, f) in [
-            ("deftool", deftool),
-            ("promote", promote),
-            ("propose_module", propose_module),
-        ] {
-            authoring.set(n, f)?;
-        }
-        hx.set("authoring", authoring)?;
         modenv.set("hx", hx)?;
         let lines = crate::tools::install(&lua, &session.env, supervisor, host, fx.clone())?;
         for name in registry.tools.keys() {

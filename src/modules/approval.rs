@@ -1,5 +1,4 @@
 //! Approval: the one package reader (`snapshot`), its digest, `hx.lock`, `hx approve` and `hx skills`.
-use super::staging::terminal_safe;
 use super::{Manifest, PkgInfo, Resolver, valid_package_name};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -157,7 +156,7 @@ impl std::error::Error for LockError {}
 /// Where a package's files live, which also decides how its manifest is read.
 #[derive(Clone, Debug)]
 pub enum Location {
-    /// A directory with an `hx.toml` (`.harness/pkgs/NAME`, a staged package, a package under test).
+    /// A directory with an `hx.toml` (`.harness/pkgs/NAME`, a package under test).
     Package(PathBuf),
     /// `.agents/skills/NAME` or `~/.agents/skills/NAME`: SKILL.md and plain files, no Luau, no capabilities.
     AgentSkill(PathBuf),
@@ -192,8 +191,8 @@ pub struct Snapshot {
 const SNAPSHOT_FILES: usize = 10_000;
 const SNAPSHOT_BYTES: usize = 64 << 20;
 
-/// Read a package or skill. This is the only reader of package directories: approval, `hx skills`, the run's registry,
-/// `hx test` and `hx accept` all go through it.
+/// Read a package or skill. This is the only reader of package directories: approval, `hx skills`, the run's registry
+/// and `hx test` all go through it.
 ///
 /// The directory itself may be a symlink (a skill linked into `~/.agents/skills`): its target's content is what is
 /// read, hashed and approved. Inside it, entries whose name starts with `.` (`.git`, editor files) are skipped, and a
@@ -445,7 +444,7 @@ impl Resolver {
     }
 
     /// Every installed package (`.harness/pkgs`, sorted), then every agent skill no package shadows. Dot-entries in
-    /// `.harness/pkgs` (an interrupted `hx accept`) are not packages.
+    /// `.harness/pkgs` are not packages.
     pub(super) fn installed(&self) -> Vec<(String, Location)> {
         let mut out: Vec<(String, Location)> = std::fs::read_dir(self.harness().join("pkgs"))
             .into_iter()
@@ -488,7 +487,7 @@ impl Resolver {
                         }
                         None => format!(
                             "error: {}",
-                            terminal_safe(e.to_string().lines().next().unwrap_or(""))
+                            crate::trust::terminal_safe(e.to_string().lines().next().unwrap_or(""))
                         ),
                     },
                 }

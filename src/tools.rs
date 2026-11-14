@@ -442,19 +442,8 @@ pub fn capture<'a>(
         let result = (|| -> Result<(String, Definition)> {
             ensure!(identifier(&name), "invalid tool namespace {name:?}");
             ensure!(
-                ![
-                    "tools",
-                    "skills",
-                    "skill",
-                    "mcp",
-                    "deftool",
-                    "promote",
-                    "propose_module",
-                    "view",
-                    "hx",
-                    "agent"
-                ]
-                .contains(&name.as_str()),
+                !["tools", "skills", "skill", "mcp", "view", "hx", "agent"]
+                    .contains(&name.as_str()),
                 "reserved tool namespace {name}"
             );
             ensure!(

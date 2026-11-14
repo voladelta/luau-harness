@@ -123,7 +123,6 @@ hx run --prompt-file task.md --model MODEL --base-url https://api.example.com/v1
 | `hx review` / `hx recover` / `hx revoke` | Record an RPI review decision, settle an uncertain operation, stop a run |
 | `hx trust` | Review this workspace's `.harness` config and `hx.lock`, then trust it |
 | `hx approve` / `hx skills` / `hx test` | Approve packages and skills, list skills, run a package's tests |
-| `hx staged` / `hx accept` / `hx reject` / `hx rollback` | Review and activate what the agent staged; undo a module replacement |
 | `hx log verify LOG` | Check a log's hash chain and recovery accounting |
 | `hx paths` | Print where this workspace's logs, state and secrets are kept, and the trust store |
 

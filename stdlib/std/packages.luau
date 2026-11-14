@@ -4,8 +4,6 @@
 --                          if any, and where its other files are (agent skills from .agents/skills or ~/.agents/skills too)
 --   skills(query?)         -> { {name, description} }: search approved skills by name and description (best first).
 --                          Skills are NOT listed in the prompt: the model searches or loads one when the user names it.
---   deftool / promote      (the std/authoring pack) inactive source definitions, staged without execution;
---                          activated in future runs after the user reviews, tests and accepts them
 local M = {}
 
 local function strip_frontmatter(text: string): string

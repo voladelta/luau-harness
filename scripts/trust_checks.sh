@@ -87,12 +87,6 @@ XDG_CONFIG_HOME=$T/linkcfg $H trust --workspace $W --yes >/dev/null
 check "a root that reaches the store through a symlinked path is still refused" "$(XDG_CONFIG_HOME=$T/linkcfg $H exec --workspace $W 'print(1)' 2>&1 | grep -c "overlaps hx's configuration directory")" "1"
 rm $W/.harness/policy.toml; XDG_CONFIG_HOME=$T/linkcfg $H trust --workspace $W --yes >/dev/null
 check "store reached through a symlinked path is still protected" "$(XDG_CONFIG_HOME=$T/linkcfg $H exec --workspace $W "print(pcall(write, '$T/linkcfg/hx/trust.toml', 'forged'))" 2>/dev/null | head -1 | grep -c protected)" "1"
-# saved versions are covered: a planted rollback target makes the workspace untrusted, and rollback cannot bless it
-fresh roll; printf '[budget]\nmax_tokens = 1000000\n' > $W/.harness/policy.toml; $H trust --workspace $W --yes >/dev/null
-mkdir -p $W/.harness/versions/std__printer; echo 'return { top = function() return "[planted]" end }' > $W/.harness/versions/std__printer/0001.luau
-check "a planted saved version revokes trust" "$($H exec --workspace $W 'print(1)' 2>&1 | grep -c 'not trusted')" "1"
-$H rollback std/printer --workspace $W >/dev/null 2>&1
-check "rollback does not bless planted content" "$($H exec --workspace $W 'print({1})' 2>&1 | grep -c 'planted\|not trusted')" "1"
 # HX_TRUST=HASH with approve does not persist trust
 fresh envp; printf '[approval]\nallow = ["git push"]\n' > $W/.harness/policy.toml; mkdir -p $W/.agents/skills/k; printf -- '---\ndescription: k\n---\nk\n' > $W/.agents/skills/k/SKILL.md
 HX_TRUST=$($H trust --workspace $W </dev/null 2>/dev/null | sed -n 's/^config hash: \([0-9a-f]*\) .*/\1/p') $H approve k --workspace $W >/dev/null 2>&1

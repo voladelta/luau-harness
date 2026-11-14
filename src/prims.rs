@@ -62,10 +62,6 @@ fn read_checked(p: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     crate::atomic_file::Target::open(p, false)?.read(max)
 }
 
-pub fn opt_str(o: &Option<Table>, k: &str) -> Option<String> {
-    o.as_ref()
-        .and_then(|t| t.get::<Option<String>>(k).ok().flatten())
-}
 pub fn bad(r: Ret) -> mlua::Error {
     rt(format!("unexpected native result {r:?}"))
 }

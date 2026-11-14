@@ -11,7 +11,7 @@ lastlog() { ls -t "$(logdir $W)"/*.jsonl | head -1; }
 newws n
 $H exec --workspace $W --yes 'write("a.txt", "hi")' >/dev/null 2>&1
 check "--yes still writes a log" "$(ls "$(logdir $W)"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')" "1"
-$H staged --workspace $W >/dev/null
+$H skills --workspace $W >/dev/null
 check "admin commands open no log session" "$(ls "$(logdir $W)"/*.jsonl | wc -l | tr -d ' ')" "1"
 check "the log lives in hx's state directory, not the workspace" "$(logdir $W | grep -c "^$XDG_STATE_HOME/hx/workspaces/n-[0-9a-f]\{16\}/log$")$([ -e $W/.harness/log ] && echo IN-TREE)" "1"
 check "hx paths names the log, state, secrets and trust locations" "$($H paths --workspace $W | cut -d: -f1 | tr '\n' ' ')" "log state secrets trust "
