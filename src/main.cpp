@@ -358,56 +358,77 @@ std::string pop_message(lua_State* L) {
     return message;
 }
 
-// Runs a loop or script. A chunk that returns a table with a `main` function is a module: main() is called and
-// its numeric result is the exit status. Anything else is a plain script that has already done its work.
-int run_module(lua_State* L, std::string_view source, const std::string& name) {
-    const auto failure = [&] {
-        const std::string message = pop_message(L);
-        if (message == "interrupted") {
-            return kExitInterrupted;
-        }
-        if (message == "terminated") {
-            return kExitTerminated;
-        }
-        fmt::print(stderr, "hx: {}\n", message);
-        return kExitFailure;
-    };
-    if (!load_chunk(L, source, name) || lua_pcall(L, 0, 1, 0) != 0) {
-        return failure();
+// Whether the error on top of the stack is a stop signal, which ends the run whatever was running.
+bool is_stop(lua_State* L) {
+    const char* text = lua_tostring(L, -1);
+    const std::string_view message = text != nullptr ? text : "";
+    return message == "interrupted" || message == "terminated";
+}
+
+// Turns the error on top of the stack into an exit status, and reports it unless it is a stop signal.
+int failure(lua_State* L) {
+    const std::string message = pop_message(L);
+    if (message == "interrupted") {
+        return kExitInterrupted;
     }
+    if (message == "terminated") {
+        return kExitTerminated;
+    }
+    fmt::print(stderr, "hx: {}\n", message);
+    return kExitFailure;
+}
+
+// Whether the value on top of the stack is a module: a table with a `main` function.
+bool is_module(lua_State* L) {
     if (!lua_istable(L, -1)) {
-        return 0;
+        return false;
     }
     lua_getfield(L, -1, "main");
-    if (!lua_isfunction(L, -1)) {
-        return 0;
-    }
+    const bool module = lua_isfunction(L, -1);
+    lua_pop(L, 1);
+    return module;
+}
+
+// Calls main() of the module on top of the stack. Its numeric result is the exit status.
+int run_main(lua_State* L) {
+    lua_getfield(L, -1, "main");
     if (lua_pcall(L, 0, 1, 0) != 0) {
-        return failure();
+        return failure(L);
     }
     return lua_isnumber(L, -1) != 0 ? lua_tointeger(L, -1) : 0;
 }
 
-struct Loop {
-    std::string source;
-    std::string name;
-};
+// Runs a loop or script. A chunk that returns a table with a `main` function is a module: main() is called and
+// its numeric result is the exit status. Anything else is a plain script that has already done its work.
+int run_module(lua_State* L, std::string_view source, const std::string& name) {
+    if (!load_chunk(L, source, name) || lua_pcall(L, 0, 1, 0) != 0) {
+        return failure(L);
+    }
+    return is_module(L) ? run_main(L) : 0;
+}
 
-// Picks the loop: the project's own when it at least compiles, the built-in one otherwise, so a loop the model
-// broke cannot keep the next session from starting.
-Loop choose_loop(lua_State* L) {
-    Loop builtin{std::string(hx::kDefaultLoop), "=loop"};
-    std::optional<std::string> project = read_file(kProjectLoop);
-    if (!project) {
-        return builtin;
+// Runs the project's loop when it loads and returns a module, the built-in one otherwise, so a loop the model
+// broke cannot keep the next session from starting. An error inside main() is a real error, not a reason to
+// fall back, and neither is a stop signal while the project's loop loads.
+int run_loop(lua_State* L) {
+    if (std::optional<std::string> project = read_file(kProjectLoop)) {
+        std::string why;
+        if (!load_chunk(L, *project, fmt::format("={}", kProjectLoop))) {
+            why = fmt::format("does not compile ({})", pop_message(L));
+        } else if (lua_pcall(L, 0, 1, 0) != 0) {
+            if (is_stop(L)) {
+                return failure(L);
+            }
+            why = fmt::format("raised an error while loading ({})", pop_message(L));
+        } else if (!is_module(L)) {
+            lua_pop(L, 1);
+            why = "does not return a table with a main function";
+        } else {
+            return run_main(L);
+        }
+        fmt::print(stderr, "hx: {} {}; using the built-in loop\n", kProjectLoop, why);
     }
-    Loop own{std::move(*project), fmt::format("={}", kProjectLoop)};
-    if (load_chunk(L, own.source, own.name)) {
-        lua_pop(L, 1);
-        return own;
-    }
-    fmt::print(stderr, "hx: {} does not compile ({}); using the built-in loop\n", kProjectLoop, pop_message(L));
-    return builtin;
+    return run_module(L, hx::kDefaultLoop, "=loop");
 }
 
 int run(const std::vector<std::string_view>& argv) {
@@ -476,8 +497,7 @@ int run(const std::vector<std::string_view>& argv) {
     if (script) {
         return run_module(L, *script, fmt::format("={}", options.script));
     }
-    const Loop loop = choose_loop(L);
-    return run_module(L, loop.source, loop.name);
+    return run_loop(L);
 }
 
 // Reports a fatal error without being able to fail itself.

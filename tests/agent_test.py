@@ -587,6 +587,36 @@ class AgentTest(unittest.TestCase):
         self.assertIn("does not compile", done.stderr)
         self.assertIn("using the built-in loop", done.stderr)
 
+    def test_a_project_loop_that_raises_while_loading_falls_back(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write("local M = host.load(host.default_loop)()\nM.tools.nope.run = nil\nreturn M\n")
+        done = self.run_hx("go", script=[say("still works")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "still works\n")
+        self.assertIn("raised an error while loading (.hx/loop.luau:2:", done.stderr)
+        self.assertIn("using the built-in loop", done.stderr)
+
+    def test_a_project_loop_that_is_not_a_module_falls_back(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        for source in ["return {}\n", "local M = host.load(host.default_loop)()\nM.main = nil\nreturn M\n", "print('x')\n"]:
+            with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+                f.write(source)
+            done = self.run_hx("go", script=[say("still works")])
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertTrue(done.stdout.endswith("still works\n"), source)
+            self.assertIn("does not return a table with a main function; using the built-in loop", done.stderr)
+
+    def test_an_error_inside_the_project_loop_is_not_a_fallback(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write("return { main = function() error('main broke', 0) end }\n")
+        done = self.run_hx("go", script=[say("never")])
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("hx: main broke", done.stderr)
+        self.assertNotIn("built-in", done.stderr)
+        self.assertEqual(self.model.requests, [])
+
     def test_run_executes_a_script(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("print(json.encode(host.args), host.sh('echo hi').out)\n")

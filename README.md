@@ -107,7 +107,7 @@ Know these before you rely on it.
 - **A process outlives `hx` when `hx` dies without its exit path:** killed with SIGKILL, or leaving at once on a
   second signal that came before the first was handled. Such a process stays confined, but it is not killed.
 - **The model can edit `.hx/loop.luau` and its extensions.** That is the point, and it shows in `git diff`.
-  If the loop no longer compiles, the built-in one runs instead.
+  If the loop no longer loads and returns a `main` function, the built-in one runs instead.
 - **Nothing asks before a file in the project is changed or deleted.** Git is the undo.
 
 ## The loop
