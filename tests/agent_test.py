@@ -521,6 +521,9 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results()[1], "HEY!")
         self.assertNotIn("Extensions in this project", self.model.requests[0]["system"])
+        # It is told what runs it, not that a file which may not exist does.
+        self.assertIn("the loop built into hx", self.model.requests[0]["system"])
+        self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system"])
         # A later session is told about it.
         self.run_hx("again", script=[say("ok")])
         self.assertIn("- shout: shouts a word", self.model.requests[-1]["system"])

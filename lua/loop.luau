@@ -370,8 +370,10 @@ function M.system_prompt()
 					.. "stop, rather than looking for a way around it."
 			or "Nothing confines you in this session: you act with the user's full access to this machine. Stay "
 				.. "inside this project directory unless the task says otherwise.",
-		"You can extend yourself. The harness running you is .hx/loop.luau, and extensions are Luau modules in "
-			.. ".hx/ext/NAME.luau: the first line is a `--` comment saying what the module does, and it returns "
+		"You can extend yourself. You run on the loop built into hx; .hx/loop.luau, if the project has one, starts "
+			.. "from it and changes parts. The lua tool can read the built-in source as host.default_loop. Extensions "
+			.. "are Luau modules in .hx/ext/NAME.luau: the first line is a `--` comment saying what the module does, "
+			.. "and it returns "
 			.. "a table of functions. Call one from the lua tool as ext(\"NAME\").fn(...). Extensions stay with "
 			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore.",
 		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
