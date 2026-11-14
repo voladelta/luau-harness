@@ -2,6 +2,7 @@
 """Checks of hx against the real model endpoint. They cost tokens and need the network, so ctest does not run them.
 
 usage: DEEPSEEK_API_KEY=... live_test.py PATH_TO_HX [unittest arguments]
+       ANTHROPIC_API_KEY=... HX_MODEL=sonnet live_test.py PATH_TO_HX [unittest arguments]
 
 HX_MODEL, HX_API_URL and HX_KEY_ENV are passed through. Each test gets a fresh project with a .hx directory, so the
 conversation is kept in .hx/log/ and the checks can look at the code the model sent, not only at what it said.
@@ -37,7 +38,9 @@ M.call_seconds = 20'''
 
 class LiveTest(unittest.TestCase):
     def setUp(self):
-        key_env = os.environ.get("HX_KEY_ENV", "DEEPSEEK_API_KEY")
+        model = os.environ.get("HX_MODEL", "")
+        claude = model.startswith("claude-") or model in ("opus", "sonnet", "haiku")
+        key_env = os.environ.get("HX_KEY_ENV", "ANTHROPIC_API_KEY" if claude else "DEEPSEEK_API_KEY")
         if not os.environ.get(key_env):
             self.skipTest(f"no {key_env}")
         self.project = tempfile.mkdtemp(prefix="hx-live-")

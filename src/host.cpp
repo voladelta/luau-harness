@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <csignal>
@@ -94,6 +95,29 @@ double option(lua_State* L, int idx, const char* name, double fallback) {
     lua_getfield(L, idx, name);
     const double value = lua_isnil(L, -1) ? fallback : luaL_checknumber(L, -1);
     lua_pop(L, 1);
+    return value;
+}
+
+// The `beta` field of host.llm's options: the anthropic-beta header, a comma-separated list of beta names. Only
+// letters, digits, '-', '_' and ',' are taken, so the value cannot end the header and start another.
+std::string beta_option(lua_State* L, int idx) {
+    if (lua_isnoneornil(L, idx)) {
+        return {};
+    }
+    luaL_checktype(L, idx, LUA_TTABLE);
+    lua_getfield(L, idx, "beta");
+    std::string value;
+    if (!lua_isnil(L, -1)) {
+        std::size_t length = 0;
+        const char* text = luaL_checklstring(L, -1, &length);
+        value.assign(text, length);
+    }
+    lua_pop(L, 1);
+    for (const char c : value) {
+        if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '-' && c != '_' && c != ',') {
+            luaL_error(L, "host.llm: beta is beta names separated by commas, not %s", value.c_str());
+        }
+    }
     return value;
 }
 
@@ -790,9 +814,13 @@ int Host::llm(lua_State* L) {
     if (!curl) {
         return fail(L, "cannot start an HTTP request");
     }
+    const std::string beta = beta_option(L, 2);
     Headers headers;
     headers.add("Content-Type: application/json");
     headers.add("anthropic-version: 2023-06-01");
+    if (!beta.empty()) {
+        headers.add(fmt::format("anthropic-beta: {}", beta));
+    }
     if (!config.api_key.empty()) {
         headers.add(fmt::format("x-api-key: {}", config.api_key));
     }

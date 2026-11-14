@@ -298,6 +298,69 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.model.requests[1]["output_config"], {"effort": "max"})
 
+    def test_a_claude_model_gets_its_effort_fallbacks_and_betas(self):
+        done = self.run_hx("--model", "opus", "go", script=[say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        sent = self.model.requests[0]
+        self.assertEqual(sent["model"], "claude-opus-5-5")
+        self.assertEqual(sent["output_config"], {"effort": "medium"})
+        self.assertEqual(sent["fallbacks"], "default")
+        self.assertEqual(sent["thinking"], {"type": "adaptive", "display": "updates",
+                                            "block_binding": {"prefix_mismatch_behavior": "drop_block"}})
+        self.assertEqual(self.model.headers[0]["anthropic-beta"], "thinking-binding-controls-2026-08-01,"
+                         "thinking-display-updates-2026-08-18,server-side-fallback-2026-07-01")
+        # Haiku 5.5 has no server-side fallback; HX_EFFORT still wins.
+        done = self.run_hx("go", script=[say("ok")], HX_MODEL="haiku", HX_EFFORT="low")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        sent = self.model.requests[1]
+        self.assertEqual(sent["model"], "claude-haiku-5-5")
+        self.assertEqual(sent["output_config"], {"effort": "low"})
+        self.assertNotIn("fallbacks", sent)
+        self.assertEqual(self.model.headers[1]["anthropic-beta"], "thinking-binding-controls-2026-08-01")
+        # Another model gets the plain request.
+        done = self.run_hx("--model", "deepseek-flash", "go", script=[say("ok")])
+        self.assertEqual(self.model.requests[2]["thinking"], {"type": "adaptive"})
+        self.assertNotIn("fallbacks", self.model.requests[2])
+        self.assertNotIn("anthropic-beta", self.model.headers[2])
+
+    def test_the_model_follows_the_key_that_is_set(self):
+        show = ["--run", "-"]
+        script = "print(host.env('HX_MODEL'))"
+        done = self.run_hx(*show, stdin=script, HX_API_URL="", HX_MODEL="", DEEPSEEK_API_KEY="", ANTHROPIC_API_KEY="k")
+        self.assertEqual(done.stdout, "claude-opus-5-5\n", done.stderr)
+        done = self.run_hx(*show, stdin=script, HX_API_URL="", HX_MODEL="", DEEPSEEK_API_KEY="d", ANTHROPIC_API_KEY="k")
+        self.assertEqual(done.stdout, "deepseek-flash\n", done.stderr)
+        done = self.run_hx(*show, stdin=script, HX_MODEL="sonnet")
+        self.assertEqual(done.stdout, "claude-sonnet-5-5\n", done.stderr)
+
+    def test_what_a_declining_model_wrote_before_a_fallback_is_not_sent_back(self):
+        fallback = {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}}
+        thinking = {"type": "thinking", "thinking": "", "signature": "sig"}
+        done = self.run_hx("--model", "opus", "go", script=[
+            reply([thinking, use("bash", {"command": "echo no"}, "c0"), fallback, thinking,
+                   use("bash", {"command": "echo yes"}, "c1")], stop="tool_use"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("claude-opus-5-5 declined; claude-opus-5 continued", done.stderr)
+        self.assertEqual(self.model.requests[1]["messages"][1]["content"],
+                         [fallback, thinking, use("bash", {"command": "echo yes"}, "c1")])
+        self.assertEqual(self.tool_results(), ["yes\n[exit 0]"])
+
+    def test_progress_updates_are_shown_for_a_claude_model(self):
+        update = {"type": "thinking", "thinking": "Looking at the tests next.", "signature": "sig"}
+        done = self.run_hx("--model", "sonnet", "go", script=[reply([update, text("ok")])])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Looking at the tests next.", done.stderr)
+        self.assertEqual(done.stdout, "ok\n")
+        done = self.run_hx("--model", "deepseek-flash", "go", script=[reply([update, text("ok")])])
+        self.assertNotIn("Looking at the tests next.", done.stderr)
+
+    def test_a_refusal_names_its_category(self):
+        refused = reply([], stop="refusal")
+        refused[1]["stop_details"] = {"type": "refusal", "category": "cyber", "explanation": None}
+        done = self.run_hx("--model", "opus", "go", script=[refused])
+        self.assertIn("[the model declined to answer (cyber)]", done.stderr)
+
     def test_the_task_can_come_from_stdin(self):
         done = self.run_hx(stdin="line one\nline two\n", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)

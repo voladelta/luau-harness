@@ -8,8 +8,9 @@ it. The model can extend the harness by writing Luau modules into the project.
 
 ```
 cd my-project
-export DEEPSEEK_API_KEY=...
+export DEEPSEEK_API_KEY=...         # or ANTHROPIC_API_KEY=... for Claude
 hx "add a --json flag to the export command and test it"
+hx --model sonnet "same, on Claude Sonnet 5.5"
 ```
 
 ## The idea
@@ -61,7 +62,7 @@ after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not 
 
 | Option | Meaning |
 |---|---|
-| `--model NAME` | the model to ask; overrides `HX_MODEL` |
+| `--model NAME` | the model to ask; overrides `HX_MODEL`. `opus`, `sonnet` and `haiku` are the current Claude models |
 | `--ro PATH` | also allow reading `PATH` |
 | `--rw PATH` | also allow writing `PATH` |
 | `--keep-env NAME` | keep a secret-looking variable in the environment of commands |
@@ -73,10 +74,10 @@ after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not 
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `HX_API_URL` | Anthropic Messages endpoint | `https://api.deepseek.com/anthropic/v1/messages` |
-| `HX_KEY_ENV` | name of the variable holding the API key | `DEEPSEEK_API_KEY` |
-| `HX_MODEL` | model name | `deepseek-flash` |
-| `HX_EFFORT` | how hard the model thinks: `low`, `high` or `max`, sent as `output_config.effort` | the endpoint's (`high` on DeepSeek) |
+| `HX_MODEL` | model name; `opus`, `sonnet` and `haiku` stand for `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` | `deepseek-flash`, or `claude-opus-5-5` when `ANTHROPIC_API_KEY` is set and `DEEPSEEK_API_KEY` is not |
+| `HX_API_URL` | Anthropic Messages endpoint | `https://api.anthropic.com/v1/messages` for a `claude-*` model, `https://api.deepseek.com/anthropic/v1/messages` otherwise |
+| `HX_KEY_ENV` | name of the variable holding the API key | `ANTHROPIC_API_KEY` for a `claude-*` model, `DEEPSEEK_API_KEY` otherwise |
+| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort` | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
 Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143
@@ -190,6 +191,23 @@ reply with nothing in it is retried like a busy server; and a task that runs out
 report where it stands.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
+### Claude models
+
+`M.claude` lists what the loop adds for the Claude models it knows; any other model, DeepSeek's included, gets the
+plain request. The settings follow Anthropic's guidance for these models:
+
+| | Opus 5.5 | Sonnet 5.5 | Haiku 5.5 |
+|---|---|---|---|
+| `output_config.effort`, unless `HX_EFFORT` is set | `medium` | `medium` | `medium` |
+| `fallbacks: "default"`: a declined request runs again on a model picked for why it was declined, in the same round trip | yes | yes | no (Haiku has none) |
+| `thinking.display: "updates"`: notes between tool calls come back and show as progress lines | yes | yes | no |
+| `thinking.block_binding: drop_block`: a thinking block sent back after a changed history is dropped rather than failing the request | yes | yes | yes |
+
+The betas these need go in the `anthropic-beta` header, which Luau sets with `host.llm(body, {beta = "a,b"})`. Thinking
+is adaptive and cannot be turned off on these models; effort is the control. A reply a fallback model finished
+carries a `fallback` block; the loop drops what the declining model wrote before it, as the API requires, and a
+refusal is logged with its category.
+
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON. The logs hold
 file contents, so that directory carries a `.gitignore` that keeps all of it out of git.
 
@@ -234,7 +252,7 @@ Everything Luau can do to the machine:
 
 | Primitive | Returns |
 |---|---|
-| `host.llm(body, {timeout=600})` | `status, text`, or `nil, error` |
+| `host.llm(body, {timeout=600, beta=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header |
 | `host.sh(command, {timeout=120})` | `{out, code, signal, timed_out}` |
 | `host.read(path)` | the contents, or `nil, error` |
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed or killed write leaves the old content; its owner, mode, extended attributes and ACLs stay, and a link stays a link. A device, a FIFO, a file with other hard links, one whose attributes cannot be copied, or one in a directory that refuses a new file is written in place |
@@ -281,13 +299,15 @@ clang-tidy -p build-dev --quiet src/*.cpp
 `tests/live_test.py` runs the agent against the real endpoint: making and editing files, reading a line range,
 noticing a failed command, following a long output to its file, compacting a Vietnamese conversation into English
 checkpoints that keep a fact, giving up a status polled between sleeps, and reporting when out of replies. It costs tokens, so ctest
-leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set.
+leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set, or with `ANTHROPIC_API_KEY` and `HX_MODEL=sonnet`
+(or `opus`, `haiku`).
 
 ## Limits
 
-- One endpoint, which must accept the Anthropic Messages format and an `x-api-key` header. The default is
-  DeepSeek's; `HX_API_URL=https://api.anthropic.com/v1/messages` with `HX_KEY_ENV=ANTHROPIC_API_KEY` and a
-  Claude model in `HX_MODEL` has not been tried.
+- One endpoint per run, which must accept the Anthropic Messages format and an `x-api-key` header: the Claude
+  API for a `claude-*` model, DeepSeek's otherwise. The model is fixed at start: a project loop that changes
+  `M.model` to a Claude model still talks to the endpoint `--model` or `HX_MODEL` chose. The Claude settings have
+  been checked against a stand-in server, not yet against the live API.
 - No streaming: a reply appears when it is complete.
 - Tool calls in one reply run one after another.
 - The whole conversation is encoded again for every request. At 5 MB that takes 16 ms.

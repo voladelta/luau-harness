@@ -63,7 +63,7 @@ examples:
   hx -q "summarise the README" > summary.txt
 
 options:
-  --model NAME      model to ask (overrides HX_MODEL)
+  --model NAME      model to ask (overrides HX_MODEL): opus, sonnet, haiku or a full name
   --ro PATH         also allow reading PATH (a toolchain in your home directory, for example)
   --rw PATH         also allow writing PATH
   --keep-env NAME   keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET,
@@ -80,10 +80,14 @@ options:
   A value can follow its option as the next word or after =, as in --ro=PATH.
 
 environment:
-  HX_API_URL        Anthropic Messages endpoint (default https://api.deepseek.com/anthropic/v1/messages)
-  HX_KEY_ENV        name of the variable that holds the API key (default DEEPSEEK_API_KEY)
-  HX_MODEL          model name (default deepseek-flash)
-  HX_EFFORT         how hard the model thinks: low, high or max (default: the endpoint's)
+  HX_MODEL          model name; opus, sonnet and haiku are the current Claude models (default
+                    deepseek-flash, or claude-opus-5-5 when only ANTHROPIC_API_KEY is set)
+  HX_API_URL        Anthropic Messages endpoint (default https://api.anthropic.com/v1/messages for
+                    a claude-* model, https://api.deepseek.com/anthropic/v1/messages otherwise)
+  HX_KEY_ENV        name of the variable that holds the API key (default ANTHROPIC_API_KEY for a
+                    claude-* model, DEEPSEEK_API_KEY otherwise)
+  HX_EFFORT         how hard the model thinks: low, medium, high, xhigh or max (default: medium on
+                    the Claude models hx knows, the endpoint's own otherwise)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.
@@ -94,8 +98,19 @@ exit status:
 docs: https://github.com/voladelta/luau-harness
 )";
 
-constexpr const char* kDefaultUrl = "https://api.deepseek.com/anthropic/v1/messages";
-constexpr const char* kDefaultKeyEnv = "DEEPSEEK_API_KEY";
+constexpr const char* kDeepSeekUrl = "https://api.deepseek.com/anthropic/v1/messages";
+constexpr const char* kDeepSeekKeyEnv = "DEEPSEEK_API_KEY";
+constexpr const char* kDeepSeekModel = "deepseek-flash";
+constexpr const char* kAnthropicUrl = "https://api.anthropic.com/v1/messages";
+constexpr const char* kAnthropicKeyEnv = "ANTHROPIC_API_KEY";
+constexpr const char* kAnthropicModel = "claude-opus-5-5";
+
+// Short names for the current Claude models.
+constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
+    {"opus", "claude-opus-5-5"},
+    {"sonnet", "claude-sonnet-5-5"},
+    {"haiku", "claude-haiku-5-5"},
+};
 constexpr const char* kProjectLoop = ".hx/loop.luau";
 
 constexpr int kExitFailure = 1;
@@ -331,6 +346,35 @@ std::string take_secrets(std::string_view key_env, const std::vector<std::string
 std::string env_or(const char* name, std::string_view fallback) {
     const char* value = std::getenv(name);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
     return std::string(value != nullptr && *value != '\0' ? value : fallback);
+}
+
+struct Endpoint {
+    std::string model;
+    std::string url;
+    std::string key_env;
+};
+
+// The model, and where to send it. --model wins over HX_MODEL, and opus, sonnet and haiku name the current Claude
+// models. Without either, a Claude model is asked when ANTHROPIC_API_KEY is set and DEEPSEEK_API_KEY is not, and
+// DeepSeek's otherwise. A claude-* model goes to the Claude API with ANTHROPIC_API_KEY, any other to DeepSeek with
+// DEEPSEEK_API_KEY; HX_API_URL and HX_KEY_ENV override either.
+Endpoint choose_endpoint(const std::optional<std::string>& flag) {
+    std::string model = flag ? *flag : env_or("HX_MODEL", "");
+    for (const auto& [alias, name] : kModelAliases) {
+        if (model == alias) {
+            model = name;
+        }
+    }
+    if (model.empty()) {
+        const bool only_anthropic = env_or(kDeepSeekKeyEnv, "").empty() && !env_or(kAnthropicKeyEnv, "").empty();
+        model = only_anthropic && env_or("HX_API_URL", "").empty() ? kAnthropicModel : kDeepSeekModel;
+    }
+    const bool claude = model.starts_with("claude-");
+    return {
+        .model = model,
+        .url = env_or("HX_API_URL", claude ? kAnthropicUrl : kDeepSeekUrl),
+        .key_env = env_or("HX_KEY_ENV", claude ? kAnthropicKeyEnv : kDeepSeekKeyEnv),
+    };
 }
 
 // A private temporary directory, exported as TMPDIR and removed with everything in it at exit.
@@ -590,17 +634,16 @@ int run(const std::vector<std::string_view>& argv) {
         return init_project(options.full);
     }
 
-    if (options.model) {
-        setenv("HX_MODEL", options.model->c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
-    }
+    const Endpoint endpoint = choose_endpoint(options.model);
+    setenv("HX_MODEL", endpoint.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
     const bool stdin_tty = isatty(STDIN_FILENO) != 0;
     if (options.no_input && options.mode == Mode::Agent && options.args.empty() && stdin_tty) {
         throw UsageError("no task, and --no-input forbids the prompt: give the task as arguments or on stdin");
     }
 
     hx::HostConfig config;
-    config.api_url = env_or("HX_API_URL", kDefaultUrl);
-    config.api_key = take_secrets(env_or("HX_KEY_ENV", kDefaultKeyEnv), options.keep_env);
+    config.api_url = endpoint.url;
+    config.api_key = take_secrets(endpoint.key_env, options.keep_env);
     config.args = options.args;
     config.interactive = options.mode == Mode::Agent && options.args.empty() && stdin_tty && !options.no_input;
     config.quiet = options.quiet;

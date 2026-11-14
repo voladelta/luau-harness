@@ -23,7 +23,7 @@ struct HostConfig {
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
 // the VM and the system:
 //
-//   host.llm(body, {timeout=600}) -> status, text | nil, error
+//   host.llm(body, {timeout=600, beta=}) -> status, text | nil, error     beta: the anthropic-beta header
 //   host.sh(command, {timeout=120}) -> {out=, code=, signal=, timed_out=}
 //   host.read(path) -> string | nil, error
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a file by

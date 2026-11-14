@@ -3,7 +3,8 @@
 -- parts meant to be replaced are fields of M and are always called through M.
 --
 -- The host supplies a small kernel and nothing else:
---   host.llm(body) -> status, text | nil, error      POST to the configured endpoint; the host adds the API key
+--   host.llm(body, {timeout=, beta=}) -> status, text | nil, error     POST to the configured endpoint; the host
+--                                                     adds the API key, and beta as the anthropic-beta header
 --   host.sh(command, {timeout=}) -> {out=, code=, signal=, timed_out=}
 --   host.read(path), host.write(path, data), host.list(dir)
 --   host.load(source, name, env) -> function | nil, error
@@ -26,7 +27,8 @@ M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
 M.output_limit = 30000 -- bytes of a tool result shown to the model
 M.call_seconds = 600 -- time limit of one `lua` tool call, commands and all
-M.effort = host.env("HX_EFFORT") -- low, high or max: how hard the model thinks; nil leaves it to the endpoint
+M.effort = host.env("HX_EFFORT") -- low, medium, high, xhigh or max: how hard the model thinks; nil leaves it to
+-- the model's entry in M.claude, or else to the endpoint
 M.repeat_reminders = { 3, 5, 8 } -- a function call with the same result this many times in a task gets a reminder
 
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
@@ -485,6 +487,24 @@ end
 -- (text, thinking, tool_use, tool_result), and tools given as {name, description, input_schema}. To use another
 -- wire format, replace M.request and M.turn.
 
+-- What the loop sends to the Claude models it knows, beyond adaptive thinking, by model name. A model not listed
+-- gets the plain request, so DeepSeek and older Claude models see nothing they might reject.
+--   effort     sent when M.effort is unset: these models think by effort alone, and the API's own default
+--              differs between them (medium on Opus and Haiku 5.5, high on Sonnet 5.5); medium is where
+--              Anthropic suggests starting agentic coding on all three
+--   fallbacks  a declined request is run again on another model, chosen by why it was declined, in the same
+--              round trip; Haiku 5.5 has no fallback
+--   display    "updates": the notes the model writes between tool calls come back in thinking blocks, which
+--              the loop shows as progress lines; without it they come back empty
+-- Every listed model checks that a thinking block goes back after the same history it was written after. The
+-- loop only ever appends, but a project may change it: block_binding drop_block then drops a stale block instead
+-- of failing the request.
+M.claude = {
+	["claude-opus-5-5"] = { effort = "medium", fallbacks = "default", display = "updates" },
+	["claude-sonnet-5-5"] = { effort = "medium", fallbacks = "default", display = "updates" },
+	["claude-haiku-5-5"] = { effort = "medium" },
+}
+
 local usage = { replies = 0, input = 0, cached = 0, output = 0 }
 
 local function tool_specs()
@@ -516,26 +536,71 @@ local function has_content(reply)
 	return false
 end
 
+-- A reply a fallback model finished carries a `fallback` block where the switch happened. What the declining model
+-- wrote before the last one is not its to send back: its thinking, tool calls and other model-internal blocks are
+-- dropped, and the fallback block stays where it is, because the API checks the thinking around it by its place.
+local internal_before_fallback = { thinking = true, redacted_thinking = true, tool_use = true, server_tool_use = true }
+local function after_fallback(reply)
+	local last = nil
+	for i, block in reply.content do
+		if block.type == "fallback" then
+			last = i
+		end
+	end
+	if not last then
+		return
+	end
+	local from, to = reply.content[last]["from"], reply.content[last].to
+	progress(("  %s declined; %s continued"):format(tostring(from and from.model), tostring(to and to.model)))
+	local kept = {}
+	for i, block in reply.content do
+		if i >= last or not internal_before_fallback[block.type] then
+			table.insert(kept, block)
+		end
+	end
+	reply.content = kept
+end
+
 -- Sends the conversation and returns the decoded reply. Retries what is worth retrying, then raises. The endpoint
 -- sometimes answers 200 with nothing in it; that is retried like a busy server, since the same request may well
 -- get a real reply.
 function M.request(system, messages)
+	local claude = M.claude[M.model]
+	local thinking = { type = "adaptive" }
+	local betas = {}
+	local fallbacks = nil
+	if claude then
+		thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
+		table.insert(betas, "thinking-binding-controls-2026-08-01")
+		if claude.display then
+			thinking.display = claude.display
+			table.insert(betas, "thinking-display-updates-2026-08-18")
+		end
+		if claude.fallbacks then
+			fallbacks = claude.fallbacks
+			table.insert(betas, "server-side-fallback-2026-07-01")
+		end
+	end
+	local effort = M.effort or (claude and claude.effort)
 	local body = json.encode({
 		model = M.model,
 		max_tokens = M.max_output,
-		thinking = { type = "adaptive" },
-		output_config = M.effort and { effort = M.effort } or nil,
+		thinking = thinking,
+		output_config = effort and { effort = effort } or nil,
+		fallbacks = fallbacks,
 		cache_control = { type = "ephemeral" }, -- cache the longest prefix seen before, where caching is opt-in
 		system = system,
 		messages = messages,
 		tools = tool_specs(),
 	})
+	local options = { beta = #betas > 0 and table.concat(betas, ",") or nil }
 	local attempts = 5
 	for attempt = 1, attempts do
-		local status, text = host.llm(body)
+		local status, text = host.llm(body, options)
 		if status == 200 then
 			local reply, err = json.decode(text)
 			if type(reply) == "table" and type(reply.content) == "table" then
+				after_fallback(reply)
 				usage.replies += 1
 				usage.input += prompt_size(reply)
 				usage.cached += (reply.usage or {}).cache_read_input_tokens or 0
@@ -831,11 +896,16 @@ function M.repeat_reminder(call, count, first)
 		.. "action, or finish the task and say what you found."):format(call, count)
 end
 
--- Prints the text of a reply: the model's words are the answer, on stdout.
+-- Prints the text of a reply: the model's words are the answer, on stdout. A model asked for progress updates
+-- (M.claude's display) writes its notes between tool calls into thinking blocks; those are progress lines.
 local function show_text(reply)
+	local claude = M.claude[M.model]
+	local updates = claude and claude.display == "updates"
 	for _, block in reply.content do
 		if block.type == "text" and block.text ~= "" then
 			print(host.tty and M.printable(block.text) or block.text)
+		elseif updates and block.type == "thinking" and type(block.thinking) == "string" and block.thinking ~= "" then
+			progress("  " .. M.printable(block.thinking))
 		end
 	end
 end
@@ -875,7 +945,9 @@ function M.turn(system, talk)
 			talk:say("Your reply was cut off by the output limit. Continue.")
 		else
 			if reply.stop_reason == "refusal" then
-				host.log("[the model declined to answer]")
+				local details = type(reply.stop_details) == "table" and reply.stop_details or {}
+				local category = type(details.category) == "string" and " (" .. details.category .. ")" or ""
+				host.log("[the model declined to answer" .. category .. "]")
 			end
 			return
 		end
