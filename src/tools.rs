@@ -328,11 +328,11 @@ pub fn definition(table: &Table) -> Result<Definition> {
 }
 
 /// Registration (`inspect`) runs a tool file under these: CPU seconds and memory.
-pub(crate) const REGISTER_SECS: u64 = 1;
-pub(crate) const REGISTER_MEMORY: usize = 16 << 20;
+pub const REGISTER_SECS: u64 = 1;
+pub const REGISTER_MEMORY: usize = 16 << 20;
 /// An HTTP tool request's timeout (seconds) and largest response body.
-pub(crate) const HTTP_TIMEOUT_SECS: u64 = 120;
-pub(crate) const HTTP_MAX_BODY: usize = 8 << 20;
+pub const HTTP_TIMEOUT_SECS: u64 = 120;
+pub const HTTP_MAX_BODY: usize = 8 << 20;
 
 fn inspect(text: &str) -> Result<Definition> {
     let lua = Lua::new();

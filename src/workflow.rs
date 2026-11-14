@@ -534,7 +534,7 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
     }
     Ok(Some(bytes))
 }
-pub(crate) fn git_inventory(root: &Path) -> Result<Option<Vec<PathBuf>>> {
+pub fn git_inventory(root: &Path) -> Result<Option<Vec<PathBuf>>> {
     use std::os::unix::ffi::OsStringExt;
     let Some(top) = git_output(root, &["rev-parse", "--show-toplevel"])? else {
         return Ok(None);

@@ -25,9 +25,9 @@ fn array_metatable(lua: &Lua) -> mlua::Result<Table> {
     Ok(table)
 }
 
-pub(crate) const MAX_BYTES: usize = 16 << 20;
-pub(crate) const MAX_NODES: usize = 262_144;
-pub(crate) const MAX_DEPTH: usize = 64;
+pub const MAX_BYTES: usize = 16 << 20;
+pub const MAX_NODES: usize = 262_144;
+pub const MAX_DEPTH: usize = 64;
 #[derive(Default)]
 pub(crate) struct Limit {
     bytes: usize,

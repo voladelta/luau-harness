@@ -1,43 +1,11 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("hx supports Linux only");
-
-/// `print!` that returns `Result` instead of panicking: see `write_stdout`. Defined before the modules so they can use
-/// it too.
-macro_rules! out {
-    ($($arg:tt)*) => { $crate::write_stdout(format_args!($($arg)*)) };
-}
-
-/// `println!` that returns `Result` instead of panicking: see `write_stdout`.
-macro_rules! outln {
-    ($($arg:tt)*) => { $crate::write_stdout(format_args!("{}\n", format_args!($($arg)*))) };
-}
-
-mod ar;
-mod atomic_file;
-mod batch;
-mod confine;
-mod controller;
-mod dirs;
-mod effects;
-mod eventlog;
-mod history;
-mod host;
-mod llm;
-mod mcp;
-mod modules;
-mod net;
-mod packages;
-mod policy;
-mod prims;
-mod supervisor;
-mod tools;
-mod trust;
-mod values;
-mod vm;
-mod workflow;
-mod workflow_runtime;
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+// Every library module under the name it had when it was declared here, so code in this file refers to it unchanged.
+#[allow(unused_imports)]
+use hx::{
+    CLOSED_STDOUT_STATUS, ClosedStdout, ar, atomic_file, batch, confine, controller, dirs, effects,
+    eventlog, history, host, llm, mcp, modules, net, out, outln, packages, policy, prims,
+    supervisor, tools, trust, values, vm, workflow, workflow_runtime,
+};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -500,31 +468,6 @@ fn confirm(question: &str) -> Result<()> {
         bail!("not accepted");
     }
     Ok(())
-}
-
-/// stdout was closed by its reader (`hx run ... | head -1`): hx stops writing and exits quietly.
-#[derive(Debug)]
-struct ClosedStdout;
-impl std::fmt::Display for ClosedStdout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("stdout is closed")
-    }
-}
-impl std::error::Error for ClosedStdout {}
-
-/// The exit status after stdout was closed: what a process killed by SIGPIPE reports to its shell. hx keeps SIGPIPE
-/// ignored (Rust's default) because it writes to child pipes, such as an MCP server's stdin, that may close.
-const CLOSED_STDOUT_STATUS: u8 = 128 + libc::SIGPIPE as u8;
-
-/// Write to stdout and flush, for the `out!` and `outln!` macros. A closed stdout is `ClosedStdout`, which `main`
-/// turns into a quiet exit; `print!` would panic instead, and the panic hook aborts.
-fn write_stdout(text: std::fmt::Arguments<'_>) -> Result<()> {
-    use std::io::Write;
-    let mut stdout = std::io::stdout().lock();
-    match stdout.write_fmt(text).and_then(|()| stdout.flush()) {
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(ClosedStdout.into()),
-        result => Ok(result.context("cannot write to stdout")?),
-    }
 }
 
 #[tokio::main]

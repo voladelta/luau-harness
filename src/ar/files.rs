@@ -14,9 +14,9 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 
 /// Limits on the editable files of one snapshot: total bytes, file count and directory depth.
-pub(crate) const MAX_SNAPSHOT: usize = 16 << 20;
-pub(crate) const MAX_FILES: usize = 10_000;
-pub(crate) const MAX_DEPTH: usize = 32;
+pub const MAX_SNAPSHOT: usize = 16 << 20;
+pub const MAX_FILES: usize = 10_000;
+pub const MAX_DEPTH: usize = 32;
 
 /// One editable file: its bytes and whether it is executable.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

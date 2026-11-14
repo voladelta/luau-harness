@@ -180,14 +180,14 @@ pub fn note_leftovers(workspace: &Path, dirs: &WorkspaceDirs) {
 /// A `Dirs` in a fresh temporary directory beside nothing else, removed when dropped: unit tests never touch the
 /// developer's own `~/.config/hx` or `~/.local/state/hx`.
 #[cfg(test)]
-pub struct TestDirs {
+pub(crate) struct TestDirs {
     base: PathBuf,
     dirs: Dirs,
 }
 
 #[cfg(test)]
 impl TestDirs {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!("hx-test-dirs-{}-{n}", std::process::id()));
