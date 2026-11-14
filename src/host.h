@@ -81,7 +81,7 @@ class Host {
 };
 
 // Makes SIGINT, SIGTERM and SIGHUP stop the running command or request and surface as a Luau error. A second
-// signal that arrives before the first was handled exits the process at once.
+// signal that arrives before the first was handled kills every descendant, as ~Host would, and exits at once.
 void install_signal_handlers();
 
 }  // namespace hx

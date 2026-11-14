@@ -68,7 +68,14 @@ def read(*path):
         return f.read()
 
 
-def reply(content, stop="end_turn", input_tokens=10):
+def kill_quietly(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def reply(content,stop="end_turn", input_tokens=10):
     usage = {"input_tokens": input_tokens, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 5}
     return 200, {"id": "msg_1", "type": "message", "role": "assistant", "content": content, "stop_reason": stop,
                  "stop_sequence": None, "usage": usage}
@@ -655,6 +662,28 @@ class AgentTest(unittest.TestCase):
             "print(ok, err, inner[1], inner[2])\n")
         self.assertEqual((code, out), (0, "false\tinterrupted\tfalse\tinterrupted\n"))
         self.assertFalse(os.path.exists(os.path.join(self.project, "never.txt")))
+
+    def test_a_second_signal_kills_what_the_model_started(self):
+        # host.read of a FIFO whose writer never writes goes on reading after a signal, so the first stop is never
+        # handled and the second signal leaves at once.
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("host.sh(\"setsid sh -c 'echo $$ > daemon.pid; exec sleep 300' > /dev/null 2>&1 < /dev/null &\")\n"
+                    "host.sh(\"mkfifo fifo; sh -c 'echo $$ > writer.pid; exec sleep 300' > fifo &\")\n"
+                    "host.read('fifo')\n")
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        daemon = self.wait_for_pid_file("daemon.pid")
+        writer = self.wait_for_pid_file("writer.pid")  # written once hx has the FIFO open
+        for pid in (daemon, writer):
+            self.addCleanup(kill_quietly, pid)  # against a binary that leaves them behind
+        time.sleep(0.3)  # let the read block
+        process.send_signal(signal.SIGINT)
+        time.sleep(0.3)
+        self.assertIsNone(process.poll(), "the first signal ended the run: the test did not get hx stuck")
+        process.send_signal(signal.SIGINT)
+        self.assertEqual(process.wait(timeout=20), 130)
+        self.assert_gone(daemon)
+        self.assert_gone(writer)
 
     def test_without_the_sandbox_the_model_is_told_so(self):
         outside = os.path.join(self.root, "outside.txt")

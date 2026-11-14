@@ -126,8 +126,9 @@ Know these before you rely on it.
   with. When the task reads text you do not trust, run `hx` in a clone (`git clone project project-hx`) and
   `git pull` from it: commits cross over, hooks and configuration do not.
 - **Secrets stored in the project are readable**, as are secrets in variables with unusual names.
-- **A process outlives `hx` when `hx` dies without its exit path:** killed with SIGKILL, or leaving at once on a
-  second signal that came before the first was handled. Such a process stays confined, but it is not killed.
+- **A process outlives `hx` when `hx` itself is killed with SIGKILL, or crashes.** Every other way out kills
+  what the model started, leaving at once on a second Ctrl-C included. Such a process stays confined, but it is
+  not killed.
 - **The model can edit `.hx/loop.luau` and its extensions.** That is the point, and it shows in `git diff`.
   If the loop no longer loads and returns a `main` function, the built-in one runs instead.
 - **Nothing asks before a file in the project is changed or deleted.** Git is the undo.

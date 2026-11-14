@@ -1,6 +1,7 @@
 #include "host.h"
 
 #include <curl/curl.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/prctl.h>
@@ -49,8 +50,7 @@ constexpr double kLongest = 1e9;  // seconds, about 30 years: the longest durati
 
 // Signal handlers cannot be given context, so this state is global. It is the only mutable global state here.
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
-volatile std::sig_atomic_t g_signal = 0;      // a stop in progress: the signal that asked for it
-volatile std::sig_atomic_t g_foreground = 0;  // process group of the command host.sh is waiting for
+volatile std::sig_atomic_t g_signal = 0;  // a stop in progress: the signal that asked for it
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 double now() {
@@ -127,17 +127,6 @@ class TryScope {
     int& depth_;
 };
 
-// Names the process group a second, impatient signal should kill, for as long as the scope lives.
-class ForegroundScope {
-  public:
-    explicit ForegroundScope(pid_t group) noexcept { g_foreground = group; }
-    ForegroundScope(const ForegroundScope&) = delete;
-    ForegroundScope& operator=(const ForegroundScope&) = delete;
-    ForegroundScope(ForegroundScope&&) = delete;
-    ForegroundScope& operator=(ForegroundScope&&) = delete;
-    ~ForegroundScope() { g_foreground = 0; }
-};
-
 // Tightens a time limit for as long as the scope lives, then puts the outer limit back. A limit of 0 means none.
 class DeadlineScope {
   public:
@@ -155,12 +144,83 @@ class DeadlineScope {
     double outer_;
 };
 
+// --- processes --------------------------------------------------------------------------------------------
+//
+// The signal handler leaves through kill_descendants, so everything here is async-signal-safe: system calls and
+// fixed buffers only, nothing that allocates or takes a lock.
+
+// The parent of a process, read from /proc/PID/stat: "PID (COMM) STATE PPID ...". COMM can hold spaces and
+// parentheses, so the fields are counted from the last ')'. Returns 0 when that cannot be read.
+pid_t parent_of(int proc, std::string_view pid) {
+    constexpr std::string_view kStat = "/stat";
+    std::array<char, 64> path{};  // "PID/stat", relative to /proc
+    if (pid.size() + kStat.size() >= path.size()) {
+        return 0;
+    }
+    std::memcpy(path.data(), pid.data(), pid.size());
+    std::memcpy(path.data() + pid.size(), kStat.data(), kStat.size());
+    const UniqueFd file(openat(proc, path.data(), O_RDONLY | O_CLOEXEC));
+    std::array<char, 512> buffer{};  // reaches well past PPID: COMM is at most 64 bytes
+    const ssize_t n = file.valid() ? read(file.get(), buffer.data(), buffer.size()) : -1;
+    if (n <= 0) {
+        return 0;
+    }
+    const std::string_view stat(buffer.data(), static_cast<std::size_t>(n));
+    const std::size_t close = stat.rfind(')');
+    if (close == std::string_view::npos || stat.size() < close + 4) {
+        return 0;
+    }
+    const std::string_view fields = stat.substr(close + 4);  // past ") S "
+    pid_t parent = 0;
+    std::from_chars(fields.data(), fields.data() + fields.size(), parent);
+    return parent;
+}
+
+// Kills and reaps every descendant of hx. Killing a child orphans its children, which then become children of hx,
+// a subreaper, so each round reaches one level further down the tree.
+void kill_descendants() noexcept {
+    const pid_t self = getpid();
+    for (int round = 0; round < kKillRounds; ++round) {
+        const UniqueFd proc(open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        if (!proc.valid()) {
+            return;
+        }
+        bool found = false;
+        alignas(dirent64) std::array<char, 4096> entries{};
+        for (;;) {
+            const ssize_t n = getdents64(proc.get(), entries.data(), entries.size());
+            if (n <= 0) {
+                break;
+            }
+            std::size_t at = 0;
+            while (at < static_cast<std::size_t>(n)) {
+                unsigned short size = 0;
+                std::memcpy(&size, entries.data() + at + offsetof(dirent64, d_reclen), sizeof(size));
+                const std::string_view name(entries.data() + at + offsetof(dirent64, d_name));
+                at += size;
+                pid_t pid = 0;
+                const auto [stop, error] = std::from_chars(name.data(), name.data() + name.size(), pid);
+                if (error != std::errc() || stop != name.data() + name.size() || parent_of(proc.get(), name) != self) {
+                    continue;
+                }
+                // Waiting for each one before going on means its children are already hx's when they are listed.
+                found = true;
+                kill(pid, SIGKILL);
+                while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+                }
+            }
+        }
+        if (!found) {
+            return;
+        }
+    }
+}
+
 void on_signal(int sig) {
     if (g_signal != 0) {
-        // The first stop has not reached the end of its scope yet, so the loop is stuck: leave now.
-        if (g_foreground > 0) {
-            kill(-g_foreground, SIGKILL);
-        }
+        // The first stop has not reached the end of its scope yet, so the loop is stuck: leave now. No destructor
+        // runs on the way out, so what the model started is killed here.
+        kill_descendants();
         _exit(128 + sig);
     }
     g_signal = sig;
@@ -257,43 +317,6 @@ void kill_group(pid_t group) {
     if (kill(-group, SIGKILL) != 0) {
         kill(group, SIGKILL);
     }
-}
-
-// The parent of a process, read from /proc/PID/stat: "PID (COMM) STATE PPID ...". COMM can hold spaces and
-// parentheses, so the fields are counted from the last ')'. Returns 0 when that cannot be read.
-pid_t parent_of(pid_t pid) {
-    const UniqueFd file(open(fmt::format("/proc/{}/stat", pid).c_str(), O_RDONLY | O_CLOEXEC));
-    std::array<char, 512> buffer{};  // reaches well past PPID: COMM is at most 64 bytes
-    const ssize_t n = file.valid() ? read(file.get(), buffer.data(), buffer.size()) : -1;
-    if (n <= 0) {
-        return 0;
-    }
-    const std::string_view stat(buffer.data(), static_cast<std::size_t>(n));
-    const std::size_t close = stat.rfind(')');
-    if (close == std::string_view::npos || stat.size() < close + 4) {
-        return 0;
-    }
-    const std::string_view fields = stat.substr(close + 4);  // past ") S "
-    pid_t parent = 0;
-    std::from_chars(fields.data(), fields.data() + fields.size(), parent);
-    return parent;
-}
-
-// The processes whose parent is hx, exited ones that have not been reaped included.
-std::vector<pid_t> children() {
-    const pid_t self = getpid();
-    std::vector<pid_t> found;
-    std::error_code ec;
-    for (std::filesystem::directory_iterator it("/proc", ec), end; !ec && it != end; it.increment(ec)) {
-        const std::string name = it->path().filename().string();
-        const char* last = name.data() + name.size();
-        pid_t pid = 0;
-        const auto [stop, error] = std::from_chars(name.data(), last, pid);
-        if (error == std::errc() && stop == last && parent_of(pid) == self) {
-            found.push_back(pid);
-        }
-    }
-    return found;
 }
 
 // Runs in the forked child, so it may only call async-signal-safe functions: no allocation, no stdio.
@@ -532,22 +555,8 @@ Host::Host(HostConfig config, const Sandbox& sandbox) : config_(std::move(config
     prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 }
 
-// Kills every descendant. Killing a child orphans its children, which then become children of hx, so each round
-// reaches one level further down the tree.
 Host::~Host() {
-    for (int round = 0; round < kKillRounds; ++round) {
-        const std::vector<pid_t> doomed = children();
-        if (doomed.empty()) {
-            break;
-        }
-        for (const pid_t pid : doomed) {
-            kill(pid, SIGKILL);
-        }
-        for (const pid_t pid : doomed) {
-            while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
-            }
-        }
-    }
+    kill_descendants();
 }
 
 Host& Host::of(lua_State* L) {
@@ -645,8 +654,6 @@ int Host::sh(lua_State* L) {
     }
     input.reset();
     fcntl(output.get(), F_SETFL, O_NONBLOCK);
-
-    const ForegroundScope foreground(pid);
 
     Capture capture;
     std::array<char, kBufferSize> buffer{};
