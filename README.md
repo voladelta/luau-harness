@@ -119,8 +119,11 @@ Know these before you rely on it.
   outside the sandbox), `ssh-agent`, Wayland and a Docker socket within reach. `hx` prints a note at startup when
   this is so. To close it then, run `hx` as a separate Unix user that owns nothing but the project.
 - **The network is open.** The model can send anywhere what it can read. The wall limits what it can read.
-- **What the model writes, you may later run.** A changed `Makefile`, test, or `.git/hooks` script runs with
-  your full access when you run it outside `hx`. Git hooks do not show in `git diff`.
+- **What the model writes, you may later run.** A changed `Makefile`, test, `.git/hooks` script or `.git/config`
+  runs with your full access when you use it outside `hx`. Hooks and `.git/config` do not show in `git diff`,
+  and a `core.fsmonitor` or pager set there runs on your next `git status`, the very command you would review
+  with. When the task reads text you do not trust, run `hx` in a clone (`git clone project project-hx`) and
+  `git pull` from it: commits cross over, hooks and configuration do not.
 - **Secrets stored in the project are readable**, as are secrets in variables with unusual names.
 - **A process outlives `hx` when `hx` dies without its exit path:** killed with SIGKILL, or leaving at once on a
   second signal that came before the first was handled. Such a process stays confined, but it is not killed.
