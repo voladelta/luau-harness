@@ -212,7 +212,8 @@ Sandbox Sandbox::confine(const std::vector<Rule>& rules, bool unix_sockets) {
     for (const Rule& rule : rules) {
         const UniqueFd target(open(rule.path.c_str(), O_PATH | O_CLOEXEC));
         if (!target.valid()) {
-            if (!rule.required && (errno == ENOENT || errno == ENOTDIR)) {
+            // An optional path that is missing, or that this user cannot even reach, needs no rule.
+            if (!rule.required && (errno == ENOENT || errno == ENOTDIR || errno == EACCES)) {
                 continue;
             }
             fail(rule.path);

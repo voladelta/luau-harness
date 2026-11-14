@@ -17,7 +17,7 @@ enum class Access : std::uint8_t {
 struct Rule {
     std::string path;
     Access access;
-    bool required;  // a missing optional path is skipped; a missing required one is an error
+    bool required;  // an optional path that is missing or out of reach is skipped; for a required one that is an error
 };
 
 // The sandbox could not be applied.
