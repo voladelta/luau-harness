@@ -41,6 +41,27 @@ raises("read a directory", tools.read, { path = dir .. "a" }, "is a directory")
 raises("read without a path", tools.read, {}, 'argument "path" must be a string')
 tools.write({ path = dir .. "empty", content = "" })
 check("read an empty file", tools.read({ path = dir .. "empty" }), "[empty file]")
+-- A long file comes back as whole lines up to the byte limit, and says where to go on.
+host.sh(("seq 1 1000 > %sseq.txt"):format(dir))
+local function numbers(from, to)
+	local lines = {}
+	for i = from, to do
+		table.insert(lines, tostring(i))
+	end
+	return table.concat(lines, "\n")
+end
+loop.output_limit = 100
+check("read stops at the byte limit", tools.read({ path = dir .. "seq.txt" }), numbers(1, 36) .. "\n[lines 1-36 of 1000]")
+check("read goes on from the next offset", tools.read({ path = dir .. "seq.txt", offset = 37, limit = 3 }), "37\n38\n39\n[lines 37-39 of 1000]")
+check("read the last lines", tools.read({ path = dir .. "seq.txt", offset = 999 }), "999\n1000\n[lines 999-1000 of 1000]")
+tools.write({ path = dir .. "wide.txt", content = "short\n" .. string.rep("x", 250) .. "\nafter\n" })
+check("read stops before a line over the limit", tools.read({ path = dir .. "wide.txt" }), "short\n[lines 1-1 of 3]")
+check("a line over the limit comes back cut, with a note", tools.read({ path = dir .. "wide.txt", offset = 2 }), string.rep("x", 100) .. "\n[line 2 is 250 bytes; only the first 100 are shown]\n[lines 2-2 of 3]")
+check("and the next offset moves past it", tools.read({ path = dir .. "wide.txt", offset = 3 }), "after\n[lines 3-3 of 3]")
+tools.write({ path = dir .. "one.txt", content = string.rep("y", 250) })
+check("a file of one long line", tools.read({ path = dir .. "one.txt" }), string.rep("y", 100) .. "\n[line 1 is 250 bytes; only the first 100 are shown]")
+loop.output_limit = 30000
+check("a file within the limits comes back whole", tools.read({ path = dir .. "seq.txt", limit = 5000 }), numbers(1, 1000))
 
 -- edit
 tools.write({ path = dir .. "e.txt", content = "alpha beta\nalpha gamma\n" })

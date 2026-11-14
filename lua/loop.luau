@@ -138,8 +138,8 @@ M.tools = {
 	},
 	{
 		name = "read",
-		description = "Read a text file. Returns up to `limit` lines (default 2000) starting at line `offset` "
-			.. "(default 1).",
+		description = "Read a text file. Returns whole lines from line `offset` (default 1), up to `limit` lines "
+			.. "(default 2000) or the output limit, and ends with the range it returned when that is not the whole file.",
 		parameters = {
 			type = "object",
 			properties = {
@@ -166,7 +166,23 @@ M.tools = {
 			if first > #lines then
 				error(("offset %d is past the end: the file has %d lines"):format(first, #lines), 0)
 			end
-			local body = clip(table.concat(lines, "\n", first, last))
+			-- Whole lines up to the byte limit, never head and tail, so the range says exactly what was left out.
+			local size = #lines[first]
+			for i = first + 1, last do
+				size += 1 + #lines[i]
+				if size > M.output_limit then
+					last = i - 1
+					break
+				end
+			end
+			local body
+			if #lines[first] > M.output_limit then
+				-- A line longer than the limit still counts as read, so the next offset moves past it.
+				body = lines[first]:sub(1, M.output_limit)
+					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], M.output_limit)
+			else
+				body = table.concat(lines, "\n", first, last)
+			end
 			if first > 1 or last < #lines then
 				body ..= ("\n[lines %d-%d of %d]"):format(first, last, #lines)
 			end
