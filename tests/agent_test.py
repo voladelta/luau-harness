@@ -83,6 +83,15 @@ class ToolsHandler(http.server.BaseHTTPRequestHandler):
                                           "snippet": "s", "summary": "A small fast language.", "content": "",
                                           "site_name": None, "site_icon": None, "date": None, "authority": 3}]},
         "/v1/tools/fetch": {"title": "Luau", "content": "# Luau\n\nA small fast language."},
+        "/exa/search": {"requestId": "r1", "costDollars": {"total": 0.012},
+                        "results": [{"title": "Luau", "url": "https://luau.org", "id": "x",
+                                     "publishedDate": "2026-08-26T00:00:00.000Z", "author": None,
+                                     "highlights": ["Luau is a small fast language.", "It has gradual types."]}],
+                        "output": {"content": "Luau is a fast, small, gradually typed language.",
+                                   "grounding": [{"field": "content", "confidence": "high",
+                                                  "citations": [{"url": "https://luau.org", "title": "Luau"}]}]},
+                        "notices": [{"code": "RESTRICTIONS_RELAXED", "path": "/query", "message": "site: removed."}],
+                        "warnings": [{"code": "IGNORED_FIELD", "path": "/x", "message": "x is ignored."}]},
         "/v1/tools/ocr": {"id": "ocr-1", "object": "ocr.result", "created": 0, "purpose": "x", "page_count": 1,
                           "pages": [{"index": 0, "text": "Recognized words", "finish_reason": "stop"}],
                           "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
@@ -188,7 +197,7 @@ class AgentTest(unittest.TestCase):
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
         env.update(HOME=self.home, HX_API_URL=self.model.url, HX_KEY_ENV="HX_TEST_KEY", HX_TEST_KEY=KEY,
-                   NO_PROXY="127.0.0.1", DEEPSEEK_API_KEY="")
+                   NO_PROXY="127.0.0.1", DEEPSEEK_API_KEY="", EXA_API_KEY="")
         env.update(extra)
         return env
 
@@ -1250,12 +1259,57 @@ class AgentTest(unittest.TestCase):
         self.assertIn("- web (built in): searches the web", self.model.requests[0]["system"])
         self.assertIn("- ocr (built in): reads the text", self.model.requests[0]["system"])
 
+    def test_exa_deep_search_goes_to_exa_with_its_key_alone(self):
+        tools = Tools()
+        self.addCleanup(tools.server_close)
+        self.addCleanup(tools.shutdown)
+        exa_key = "exa-key-77"
+        code = ("local r = ext('exa').deep('what is luau', 'prefer luau.org; pull the type system', "
+                "{queries = {'luau gradual typing'}}) "
+                "assert(r.answer and r.results[1].highlights[2] and r.grounding[1].field == 'content' "
+                "and r.cost == 0.012) return r")
+        done = self.run_hx("go", HX_EXA_URL=tools.url.replace("/v1/tools", "/exa/search"), EXA_API_KEY=exa_key,
+                           script=[call("lua", {"code": code}, "c1"),
+                                   call("lua", {"code": "return ext('web').search('x')"}, "c2"),
+                                   call("bash", {"command": "env"}, "c3"),
+                                   say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        results = self.tool_results()
+        self.assertIn("Luau is a fast, small, gradually typed language.\n\nnotice: site: removed.\n\nSources:\n"
+                      "1. Luau (2026-08-26)\n   https://luau.org\n"
+                      "   Luau is a small fast language. ... It has gradual types.", results[0])
+        # One request, to Exa, with its key as x-api-key, asking for deep research with highlights and a text answer.
+        self.assertEqual([r["path"] for r in tools.requests], ["/exa/search"])
+        request = tools.requests[0]
+        self.assertEqual(request["headers"]["x-api-key"], exa_key)
+        self.assertNotIn("authorization", request["headers"])
+        body = json.loads(request["body"])
+        self.assertEqual({k: body[k] for k in ("query", "objective", "additionalQueries", "type", "numResults",
+                                               "contents")},
+                         {"query": "what is luau", "objective": "prefer luau.org; pull the type system",
+                          "additionalQueries": ["luau gradual typing"], "type": "deep", "numResults": 10,
+                          "contents": {"highlights": True}})
+        self.assertEqual(body["outputSchema"]["type"], "text")
+        # The warning is logged for whoever runs hx; the model does not see it.
+        self.assertIn("exa warning: x is ignored.", done.stderr)
+        self.assertNotIn("x is ignored", json.dumps(self.model.requests))
+        # The Exa key does not open DeepSeek's tools, and reaches neither the model nor the commands.
+        self.assertIn("without DEEPSEEK_API_KEY", results[1])
+        self.assertNotIn(exa_key, json.dumps(self.model.requests))
+        self.assertNotIn(exa_key, results[2])
+        # Only exa is listed, since only its key is there.
+        system = self.model.requests[0]["system"]
+        self.assertIn("- exa (built in): researches a question", system)
+        self.assertNotIn("- web (built in)", system)
+
     def test_without_a_deepseek_key_the_tools_say_so(self):
         done = self.run_hx("go", script=[
             call("lua", {"code": "return ext('web').search('luau')"}, "c1"),
             call("lua", {"code": "return host.tool('search', '{}')"}, "c2"),
             call("lua", {"code": "return host.tool('chat', '{}')"}, "c3"),
             call("lua", {"code": "return ext('ocr').read('nope.pdf')"}, "c4"),
+            call("lua", {"code": "return ext('exa').deep('luau', 'why')"}, "c5"),
+            call("lua", {"code": "return host.tool('exa', '{}')"}, "c6"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
@@ -1263,6 +1317,8 @@ class AgentTest(unittest.TestCase):
         self.assertIn("no DEEPSEEK_API_KEY", results[1])
         self.assertIn("no tool chat", results[2])
         self.assertIn("without DEEPSEEK_API_KEY", results[3])
+        self.assertIn("without EXA_API_KEY", results[4])
+        self.assertIn("no EXA_API_KEY", results[5])
         self.assertNotIn("(built in)", self.model.requests[0]["system"])
 
     def test_ocr_of_a_file_outside_the_wall_is_refused_before_sending(self):

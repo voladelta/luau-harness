@@ -46,7 +46,7 @@ namespace {
 constexpr std::size_t kMaxFile = std::size_t{64} << 20;                // host.read refuses larger files
 constexpr std::size_t kMaxResponse = std::size_t{256} << 20;           // host.llm and host.tool abort a larger reply
 constexpr std::size_t kMaxUpload = std::size_t{100} << 20;             // the largest file DeepSeek's OCR takes
-constexpr std::string_view kToolNames[] = {"search", "fetch", "ocr"};  // host.tool's endpoints
+constexpr std::string_view kToolNames[] = {"search", "fetch", "ocr", "exa"};  // host.tool's endpoints
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;
 constexpr int kPollMs = 50;
@@ -871,15 +871,17 @@ int Host::llm(lua_State* L) {
 }
 
 // host.tool(name, request, {timeout=300}): a request to one of DeepSeek's tool endpoints, HX_TOOLS_URL/NAME, with
-// DEEPSEEK_API_KEY as a bearer token. Only the names in kToolNames are taken, so the key reaches those endpoints
-// and nothing else. A string request is sent as JSON; a table is sent as a multipart form, in which `file` names
-// a file to upload and every other field is a text field.
+// DEEPSEEK_API_KEY as a bearer token, or, for "exa", to Exa's search endpoint, HX_EXA_URL, with EXA_API_KEY as
+// x-api-key. Only the names in kToolNames are taken, so each key reaches its own endpoints and nothing else. A
+// string request is sent as JSON; a table is sent as a multipart form, in which `file` names a file to upload and
+// every other field is a text field. Exa takes JSON only.
 int Host::tool(lua_State* L) {
     const std::string_view name = check_cstring(L, 1);
     if (std::ranges::find(kToolNames, name) == std::end(kToolNames)) {
-        luaL_error(L, "host.tool: no tool %s; the tools are search, fetch and ocr", std::string(name).c_str());
+        luaL_error(L, "host.tool: no tool %s; the tools are search, fetch, ocr and exa", std::string(name).c_str());
     }
-    const bool form = lua_istable(L, 2);
+    const bool exa = name == "exa";
+    const bool form = !exa && lua_istable(L, 2);
     if (!form) {
         luaL_checktype(L, 2, LUA_TSTRING);
     }
@@ -887,8 +889,9 @@ int Host::tool(lua_State* L) {
     const double timeout = host.within_limit(option(L, 3, "timeout", 300));
     raise_if_signaled(L);
     const HostConfig& config = host.config_;
-    if (config.tools_key.empty()) {
-        return fail(L, "no DEEPSEEK_API_KEY: hx was started without one, so the DeepSeek tools cannot be used");
+    if (exa ? config.exa_key.empty() : config.tools_key.empty()) {
+        return fail(L, exa ? "no EXA_API_KEY: hx was started without one, so Exa cannot be used"
+                           : "no DEEPSEEK_API_KEY: hx was started without one, so the DeepSeek tools cannot be used");
     }
 
     const CurlEasy curl(curl_easy_init());
@@ -896,7 +899,8 @@ int Host::tool(lua_State* L) {
         return fail(L, "cannot start an HTTP request");
     }
     Headers headers;
-    headers.add(fmt::format("Authorization: Bearer {}", config.tools_key));
+    headers.add(exa ? fmt::format("x-api-key: {}", config.exa_key)
+                    : fmt::format("Authorization: Bearer {}", config.tools_key));
     const CurlMime mime(form ? curl_mime_init(curl.get()) : nullptr);
     if (form) {
         if (!mime) {
@@ -951,7 +955,8 @@ int Host::tool(lua_State* L) {
         curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body);
         curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(length));
     }
-    return post(L, curl.get(), fmt::format("{}/{}", config.tools_url, name), headers, timeout, config.ca_bundle);
+    const std::string url = exa ? config.exa_url : fmt::format("{}/{}", config.tools_url, name);
+    return post(L, curl.get(), url, headers, timeout, config.ca_bundle);
 }
 
 int Host::sh(lua_State* L) {
@@ -1146,6 +1151,8 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "tty");
     lua_pushboolean(L, config_.tools_key.empty() ? 0 : 1);
     lua_setfield(L, -2, "tools");
+    lua_pushboolean(L, config_.exa_key.empty() ? 0 : 1);
+    lua_setfield(L, -2, "exa");
     lua_createtable(L, 0, static_cast<int>(config_.extensions.size()));
     for (const auto& [name, source] : config_.extensions) {
         lua_pushlstring(L, source.data(), source.size());

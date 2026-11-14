@@ -13,9 +13,9 @@
 --   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
 --   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 --   host.tty                                          stdout is a terminal
---   host.tool(name, request, {timeout=}) -> status, text | nil, error     DeepSeek's search, fetch or ocr endpoint;
---                                                     the host adds DEEPSEEK_API_KEY
---   host.tools                                        that key is there
+--   host.tool(name, request, {timeout=}) -> status, text | nil, error     DeepSeek's search, fetch or ocr endpoint,
+--                                                     or Exa's search for "exa"; the host adds the key
+--   host.tools, host.exa                              DEEPSEEK_API_KEY, EXA_API_KEY is there
 --   host.extensions                                   the built-in extensions' sources, by name
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
@@ -69,7 +69,7 @@ end
 -- An extension is a Luau module in .hx/ext/NAME.luau that returns a table of functions. The model writes them
 -- with write() and calls them from its code, so the tool never changes. A module is loaded again whenever its
 -- file has changed. Extensions see the same functions the model's code does. hx has some built in
--- (host.extensions: web and ocr); a project's file of the same name takes the place of one.
+-- (host.extensions: web, ocr and exa); a project's file of the same name takes the place of one.
 
 local ext_dir = ".hx/ext/"
 local ext_cache = {}
@@ -143,8 +143,9 @@ function M.ext(name)
 	return value
 end
 
--- One line per extension: its name and the comment on its first line. The built-in ones are listed when the
--- DeepSeek key they need is there, unless the project has its own of that name.
+-- One line per extension: its name and the comment on its first line. The built-in ones are listed when the key
+-- they need is there (EXA_API_KEY for exa, DEEPSEEK_API_KEY for the rest), unless the project has its own of that
+-- name.
 local function extension_index()
 	local lines, own = {}, {}
 	local function add(name, source, mark)
@@ -157,16 +158,16 @@ local function extension_index()
 			add(name, host.read(ext_dir .. file) or "", "")
 		end
 	end
-	if host.tools then
-		local names = {}
-		for name in host.extensions do
+	local names = {}
+	for name in host.extensions do
+		if if name == "exa" then host.exa else host.tools then
 			table.insert(names, name)
 		end
-		table.sort(names)
-		for _, name in names do
-			if not own[name] then
-				add(name, host.extensions[name], " (built in)")
-			end
+	end
+	table.sort(names)
+	for _, name in names do
+		if not own[name] then
+			add(name, host.extensions[name], " (built in)")
 		end
 	end
 	return lines

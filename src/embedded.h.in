@@ -19,6 +19,7 @@ inline constexpr std::string_view kLoopOverlay = R"HXLUAU(@HX_OVERLAY_SOURCE@)HX
 inline constexpr std::pair<std::string_view, std::string_view> kExtensions[] = {
     {"web", R"HXLUAU(@HX_EXT_WEB_SOURCE@)HXLUAU"},
     {"ocr", R"HXLUAU(@HX_EXT_OCR_SOURCE@)HXLUAU"},
+    {"exa", R"HXLUAU(@HX_EXT_EXA_SOURCE@)HXLUAU"},
 };
 
 }  // namespace hx

@@ -91,6 +91,8 @@ environment:
   HX_TOOLS_URL      base of DeepSeek's search, fetch and OCR endpoints, which the built-in web and ocr
                     extensions use with DEEPSEEK_API_KEY, whatever the model (default
                     https://api.deepseek.com/v1/tools)
+  HX_EXA_URL        Exa's search endpoint, which the built-in exa extension uses for deep search with
+                    EXA_API_KEY, whatever the model (default https://api.exa.ai/search)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.
@@ -105,6 +107,8 @@ constexpr const char* kDeepSeekUrl = "https://api.deepseek.com/anthropic/v1/mess
 constexpr const char* kDeepSeekKeyEnv = "DEEPSEEK_API_KEY";
 constexpr const char* kDeepSeekModel = "deepseek-flash";
 constexpr const char* kDeepSeekToolsUrl = "https://api.deepseek.com/v1/tools";
+constexpr const char* kExaKeyEnv = "EXA_API_KEY";
+constexpr const char* kExaUrl = "https://api.exa.ai/search";
 constexpr const char* kAnthropicUrl = "https://api.anthropic.com/v1/messages";
 constexpr const char* kAnthropicKeyEnv = "ANTHROPIC_API_KEY";
 constexpr const char* kAnthropicModel = "claude-opus-5-5";
@@ -320,11 +324,12 @@ bool looks_secret(std::string name) {
 struct Secrets {
     std::string key;        // the model endpoint's
     std::string tools_key;  // DEEPSEEK_API_KEY, for DeepSeek's tool endpoints whatever the model
+    std::string exa_key;    // EXA_API_KEY, for Exa's search endpoint whatever the model
 };
 
-// Returns the API key and the DeepSeek key, and removes both, and every other variable that looks like a secret,
-// from the environment. Commands the model runs inherit the environment, and with the network open an inherited
-// secret is a leaked one. The entries are also wiped where they sit, because /proc/PID/environ shows the original
+// Returns the API key, the DeepSeek key and the Exa key, and removes all three, and every other variable that looks
+// like a secret, from the environment. Commands the model runs inherit the environment, and with the network open an
+// inherited secret is a leaked one. The entries are also wiped where they sit, because /proc/PID/environ shows the original
 // memory.
 Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& keep) {
     Secrets secrets;
@@ -345,8 +350,12 @@ Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& k
         if (is_tools_key) {
             secrets.tools_key = text.substr(equals + 1);
         }
+        const bool is_exa_key = name == kExaKeyEnv;
+        if (is_exa_key) {
+            secrets.exa_key = text.substr(equals + 1);
+        }
         const bool kept = std::find(keep.begin(), keep.end(), name) != keep.end();
-        if (is_key || is_tools_key || (looks_secret(name) && !kept)) {
+        if (is_key || is_tools_key || is_exa_key || (looks_secret(name) && !kept)) {
             doomed.emplace_back(name, *entry);
         }
     }
@@ -664,6 +673,8 @@ int run(const std::vector<std::string_view>& argv) {
     Secrets secrets = take_secrets(endpoint.key_env, options.keep_env);
     config.api_key = std::move(secrets.key);
     config.tools_key = std::move(secrets.tools_key);
+    config.exa_url = env_or("HX_EXA_URL", kExaUrl);
+    config.exa_key = std::move(secrets.exa_key);
     config.args = options.args;
     config.interactive = options.mode == Mode::Agent && options.args.empty() && stdin_tty && !options.no_input;
     config.quiet = options.quiet;

@@ -16,6 +16,8 @@ struct HostConfig {
     std::string api_key;            // sent as x-api-key; Luau code never sees it
     std::string tools_url;          // where host.tool posts: NAME is appended as /NAME
     std::string tools_key;          // DEEPSEEK_API_KEY, sent as a bearer token by host.tool; empty for none
+    std::string exa_url;            // where host.tool("exa") posts: Exa's /search
+    std::string exa_key;            // EXA_API_KEY, sent as x-api-key by host.tool("exa"); empty for none
     std::string ca_bundle;          // a file of trust roots to use instead of libcurl's own; empty for those
     std::vector<std::string> args;  // host.args
     bool interactive = false;       // host.interactive: stdin is a terminal and no task was given
@@ -28,8 +30,9 @@ struct HostConfig {
 // the VM and the system:
 //
 //   host.llm(body, {timeout=600, beta=}) -> status, text | nil, error     beta: the anthropic-beta header
-//   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr;
-//                                                     request is JSON text, or a form table whose `file` is a path
+//   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr, or
+//                                                     Exa's search for "exa"; request is JSON text, or (DeepSeek
+//                                                     only) a form table whose `file` is a path
 //   host.sh(command, {timeout=120}) -> {out=, code=, signal=, timed_out=}
 //   host.read(path) -> string | nil, error
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a file by
@@ -45,6 +48,7 @@ struct HostConfig {
 //   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 //   host.tty                                          stdout is a terminal
 //   host.tools                                        a DeepSeek key is there for host.tool
+//   host.exa                                          an Exa key is there for host.tool("exa")
 //   host.extensions                                   the built-in extensions' sources, by name
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
