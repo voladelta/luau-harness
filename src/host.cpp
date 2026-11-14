@@ -450,7 +450,13 @@ int l_input(lua_State* L) {
     static_cast<void>(std::fflush(stderr));
     std::string line;
     if (!std::getline(std::cin, line)) {
-        raise_if_signaled(L);
+        if (g_signal != 0) {
+            // The read was cut short, not ended. Left as it is, the stream would report the end of input to
+            // every later call, and a loop that outlives the stop could never read again.
+            std::cin.clear();
+            std::clearerr(stdin);
+            raise_if_signaled(L);
+        }
         return 0;
     }
     lua_pushlstring(L, line.data(), line.size());

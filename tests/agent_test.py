@@ -477,6 +477,17 @@ class AgentTest(unittest.TestCase):
             "print(host.try(host.sh, 'echo $$ > cmd.pid; sleep 20'))\nprint(host.sh('echo carries on').out)\n")
         self.assertEqual((code, out), (0, "false\tinterrupted\ncarries on\n\n"))
 
+    def test_input_still_reads_after_an_interrupted_read(self):
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("print('ready')\nprint(host.try(host.input))\nprint(host.input())\n")
+        process = subprocess.Popen([HX, "run", "s.luau"], cwd=self.project, env=self.env(), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(process.stdout.readline(), "ready\n")
+        time.sleep(0.3)  # let it block in the read
+        process.send_signal(signal.SIGINT)
+        out, _ = process.communicate("a line\n", timeout=20)
+        self.assertEqual((process.returncode, out), (0, "false\tinterrupted\na line\n"))
+
     def test_an_inner_scope_does_not_end_an_interrupt(self):
         code, out = self.run_interrupted(
             "local inner\n"
