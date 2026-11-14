@@ -404,8 +404,9 @@ mode_t new_file_mode() {
 // leaves the old content or the new, never a file cut short. Nothing is synced: a power loss can still lose both,
 // and that is not what this guards against. Where a new file could not stand in for the old one, the file is
 // written in place instead: something other than a regular file (/dev/null, a FIFO), a file with other names that
-// must go on seeing it, a dangling link, a directory that refuses a new file (a lone --rw file), or a file whose
-// owner and group the new one cannot be given.
+// must go on seeing it, a dangling link, a directory that refuses a new file (a lone --rw file), a file whose
+// owner and group the new one cannot be given, or a file that may not be written (a rename would not ask it, so
+// the open is left to refuse).
 int l_write(lua_State* L) {
     const char* path = check_cstring(L, 1);
     std::size_t length = 0;
@@ -425,7 +426,7 @@ int l_write(lua_State* L) {
     struct stat entry {};
     const bool exists = stat(path, &st) == 0;
     const bool missing = !exists && errno == ENOENT && lstat(path, &entry) != 0;  // not even a dangling link
-    if ((exists && S_ISREG(st.st_mode) && st.st_nlink == 1) || missing) {
+    if ((exists && S_ISREG(st.st_mode) && st.st_nlink == 1 && access(path, W_OK) == 0) || missing) {
         // A link is followed, so the file it names is replaced and the link stays.
         const std::filesystem::path target = exists ? std::filesystem::canonical(path, ec) : path;
         std::string temp = (target.parent_path() / fmt::format(".{}.hx-XXXXXX", target.filename().string())).string();

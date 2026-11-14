@@ -733,6 +733,55 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(read(outside), "new")
         self.assertEqual(sorted(os.listdir(self.root)), ["home", "lone.txt", "project"])
 
+    def as_ordinary_user(self):
+        """The command prefix that runs hx as a user file permissions apply to. Root is not one, so as root the
+        test directories are handed to nobody and hx runs as nobody."""
+        if os.geteuid() != 0:
+            return []
+        os.chmod(self.root, 0o755)
+        for path in (self.project, self.home):
+            os.chown(path, 65534, 65534)
+        return ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"]
+
+    def test_a_read_only_file_is_not_replaced(self):
+        # Renaming a new file over it would not ask the file's own permission, so the write must refuse as before.
+        become = self.as_ordinary_user()
+        target = os.path.join(self.project, "ro.txt")
+        with open(target, "w") as f:
+            f.write("old")
+        os.chmod(target, 0o444)
+        owner = os.stat(self.project)
+        os.chown(target, owner.st_uid, owner.st_gid)  # the same owner and group, so only the mode stands in the way
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("print(host.write('ro.txt', 'new'))\n")
+        done = subprocess.run([*become, HX, "--run", "s.luau"], cwd=self.project, env=self.env(TMPDIR=self.home),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "nil\tro.txt: Permission denied\n")
+        self.assertEqual(read(target), "old")
+        self.assertEqual(sorted(os.listdir(self.project)), ["ro.txt", "s.luau"])
+
+    def test_a_trust_root_out_of_reach_does_not_stop_hx(self):
+        # The variable names a file in a directory this user cannot enter: there is nothing to allow, so no rule.
+        become = self.as_ordinary_user()
+        locked = os.path.join(self.root, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(locked, "ca.pem"), "w") as f:
+            f.write("roots")
+        os.chmod(locked, 0o700 if os.geteuid() == 0 else 0)
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("print(host.sandboxed)\n")
+        env = self.env(TMPDIR=self.home, REQUESTS_CA_BUNDLE=os.path.join(locked, "ca.pem"))
+        for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO",
+                     "CARGO_HTTP_CAINFO", "AWS_CA_BUNDLE", "NIX_SSL_CERT_FILE"):
+            env.pop(name, None)
+        try:
+            done = subprocess.run([*become, HX, "--run", "s.luau"], cwd=self.project, env=env, capture_output=True,
+                                  text=True, timeout=60)
+        finally:
+            os.chmod(locked, 0o700)  # so that tearDown can remove it
+        self.assertEqual((done.returncode, done.stdout), (0, "true\n"), done.stderr)
+
     # --- extensions and the project's own loop ---
 
     def test_the_model_extends_itself_and_the_extension_stays(self):
