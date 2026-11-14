@@ -57,6 +57,7 @@ script, even one that starts with `-`.
 | `--ro PATH` | also allow reading `PATH` |
 | `--rw PATH` | also allow writing `PATH` |
 | `--keep-env NAME` | keep a secret-looking variable in the environment of commands |
+| `--unix-sockets` | before Landlock ABI 9, let commands create unix sockets (see "The wall") |
 | `--no-sandbox` | run without Landlock; the model is told it is not confined |
 
 | Variable | Meaning | Default |
@@ -94,6 +95,13 @@ Also in force:
 - No setuid program can raise privileges (`no_new_privs`), so `sudo` does not work inside.
 - On Linux 6.12 or later, confined processes cannot signal processes outside the sandbox or reach their
   abstract unix sockets.
+- Unix sockets by path are walled off too. From Landlock ABI 9 the kernel refuses a connection to a socket whose
+  path the rules above do not make readable. Before ABI 9 Landlock cannot, so on x86-64 and aarch64 a seccomp
+  filter refuses to create unix sockets at all (`socketpair` still works, and `hx` itself falls back where it
+  would use one, such as for name resolution). The filter also refuses `io_uring`, which can create sockets
+  without the socket call, and every call from 32-bit code. That breaks tools that open unix sockets by path:
+  the docker CLI, tmux, some test suites; and 32-bit programs. `--unix-sockets` leaves the filter out, and `hx`
+  then prints a note at startup.
 - The API key is read once and removed from the environment, together with every variable whose name ends in
   `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS`. Luau code never sees the key: the host adds
   it to requests for the configured endpoint only, and commands cannot read it out of the host's memory.
@@ -104,12 +112,11 @@ Also in force:
 
 Know these before you rely on it.
 
-- **Unix sockets by path are reachable on kernels before Landlock ABI 9.** A confined command cannot list
-  `/run/user/1000`, but it can connect to a socket there. That puts the D-Bus session bus (which can start
-  programs outside the sandbox), `ssh-agent` and a Docker socket within reach. `hx` prints a note at startup
-  when the kernel cannot refuse this. With ABI 9 the connection is refused unless the socket's path is
-  readable under the rules above. To close it on an older kernel, run `hx` as a separate Unix user that owns
-  nothing but the project.
+- **With `--unix-sockets` on a kernel before Landlock ABI 9, or on another architecture than x86-64 or
+  aarch64, unix sockets by path are reachable.** A confined command cannot list `/run/user/1000`, but it can
+  connect to a socket there. That puts the D-Bus session bus and systemd's user socket (both can start programs
+  outside the sandbox), `ssh-agent`, Wayland and a Docker socket within reach. `hx` prints a note at startup when
+  this is so. To close it then, run `hx` as a separate Unix user that owns nothing but the project.
 - **The network is open.** The model can send anywhere what it can read. The wall limits what it can read.
 - **What the model writes, you may later run.** A changed `Makefile`, test, or `.git/hooks` script runs with
   your full access when you run it outside `hx`. Git hooks do not show in `git diff`.

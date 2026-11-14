@@ -36,26 +36,32 @@ class Sandbox {
     // restriction cannot be lifted. Where the kernel supports it, the process is also cut off from signalling
     // processes outside the sandbox and from their abstract unix sockets. Network access is not restricted.
     //
+    // Below kUnixSocketAbi, Landlock cannot refuse a connection to a unix socket by path. Unless unix_sockets is
+    // true, a seccomp filter then refuses to create unix sockets at all (socketpair still works), on x86-64 and
+    // aarch64; elsewhere nothing closes the gap and blocks_unix_sockets() says so.
+    //
     // Call it while the process is single-threaded: Landlock binds the calling thread and its descendants only.
-    // Throws SandboxError, with the process unchanged, when the kernel cannot do it.
-    [[nodiscard]] static Sandbox confine(const std::vector<Rule>& rules);
+    // Throws SandboxError when the kernel cannot do it. The process may then be partly restricted, so the caller
+    // should stop rather than carry on without walls.
+    [[nodiscard]] static Sandbox confine(const std::vector<Rule>& rules, bool unix_sockets);
 
     // The user's explicit decision to run without walls.
-    [[nodiscard]] static Sandbox none() noexcept { return Sandbox(0); }
+    [[nodiscard]] static Sandbox none() noexcept { return Sandbox(0, false); }
 
     // The first Landlock ABI that can refuse connections to unix sockets outside the sandbox.
     static constexpr int kUnixSocketAbi = 9;
 
     [[nodiscard]] bool confined() const noexcept { return abi_ > 0; }
     // False when confined commands can still connect to unix sockets by path (the D-Bus session bus, ssh-agent).
-    [[nodiscard]] bool blocks_unix_sockets() const noexcept { return abi_ >= kUnixSocketAbi; }
+    [[nodiscard]] bool blocks_unix_sockets() const noexcept { return abi_ >= kUnixSocketAbi || filtered_; }
     // The Landlock ABI in force, or 0 when not confined.
     [[nodiscard]] int abi() const noexcept { return abi_; }
 
   private:
-    explicit Sandbox(int abi) noexcept : abi_(abi) {}
+    explicit Sandbox(int abi, bool filtered) noexcept : abi_(abi), filtered_(filtered) {}
 
     int abi_;
+    bool filtered_;  // the seccomp filter against unix sockets is installed
 };
 
 }  // namespace hx

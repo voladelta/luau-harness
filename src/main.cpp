@@ -56,6 +56,8 @@ options:
   --rw PATH        also allow writing PATH
   --keep-env NAME  keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET, PASSWORD
                    or CREDENTIALS) in the environment of commands
+  --unix-sockets   before Landlock ABI 9, let commands create unix sockets; they can then connect to any
+                   socket by path, the D-Bus session bus and ssh-agent included
   --no-sandbox     run without Landlock (the model can then touch anything you can)
   -h, --help       show this text
 
@@ -90,6 +92,7 @@ struct Options {
     std::vector<std::string> write_paths;
     std::vector<std::string> keep_env;
     bool sandbox = true;
+    bool unix_sockets = false;
     bool full = false;  // --init --full: copy the whole built-in loop, not the overlay
 };
 
@@ -110,6 +113,8 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             options.write_paths.push_back(operand(arg));
         } else if (arg == "--keep-env") {
             options.keep_env.push_back(operand(arg));
+        } else if (arg == "--unix-sockets") {
+            options.unix_sockets = true;
         } else if (arg == "--no-sandbox") {
             options.sandbox = false;
         } else if (arg == "-h" || arg == "--help") {
@@ -326,7 +331,7 @@ hx::Sandbox confine(const Options& options, const fs::path& project, const fs::p
                         project.string()));
     }
     try {
-        return hx::Sandbox::confine(sandbox_rules(options, project, tmp));
+        return hx::Sandbox::confine(sandbox_rules(options, project, tmp), options.unix_sockets);
     } catch (const hx::SandboxError& error) {
         throw UsageError(fmt::format("no sandbox: {}. Pass --no-sandbox to run without one.", error.what()));
     }

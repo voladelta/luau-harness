@@ -1,11 +1,16 @@
 #include "sandbox.h"
 
 #include <fcntl.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -112,9 +117,66 @@ uint64_t rights_of(Access access) {
     throw SandboxError(fmt::format("{}: {}", what, error_text()));
 }
 
+// Before ABI 9, a seccomp filter stands in for kResolveUnix. Connecting to a unix socket by path needs a unix
+// socket, so the filter refuses socket(AF_UNIX, ...). socketpair stays: a pair is already connected and can
+// reach no path. io_uring is refused too, because IORING_OP_SOCKET creates sockets without the socket call.
+// A call from another architecture (32-bit code on x86-64 would use socketcall) is refused whatever it is.
+#if (defined(__x86_64__) || defined(__aarch64__)) && !defined(__ILP32__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+
+#ifdef __x86_64__
+constexpr uint32_t kAuditArch = AUDIT_ARCH_X86_64;
+#else
+constexpr uint32_t kAuditArch = AUDIT_ARCH_AARCH64;
+#endif
+// x32 calls on x86-64 carry this bit in their number and report the x86-64 architecture. No x86-64 or aarch64
+// call number comes near it, so one program serves both.
+constexpr uint32_t kX32Bit = 0x40000000U;
+constexpr uint32_t kIoUringSetup = 425;  // the same on every architecture
+
+constexpr sock_filter stmt(uint32_t code, uint32_t k) {
+    return {static_cast<uint16_t>(code), 0, 0, k};
+}
+constexpr sock_filter jump(uint32_t code, uint32_t k, uint8_t if_true, uint8_t if_false) {
+    return {static_cast<uint16_t>(code), if_true, if_false, k};
+}
+
+// Returns whether the filter is installed: always, on the architectures it is written for.
+bool filter_unix_sockets() {
+    constexpr auto kArch = static_cast<uint32_t>(offsetof(seccomp_data, arch));
+    constexpr auto kNumber = static_cast<uint32_t>(offsetof(seccomp_data, nr));
+    constexpr auto kFirstArg = static_cast<uint32_t>(offsetof(seccomp_data, args));  // its low half: little-endian
+    // A jump skips that many instructions. The last three are the verdicts: 8 allow, 9 ENOSYS, 10 EACCES.
+    std::array<sock_filter, 11> program{{
+        stmt(BPF_LD | BPF_W | BPF_ABS, kArch),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 7),
+        stmt(BPF_LD | BPF_W | BPF_ABS, kNumber),
+        jump(BPF_JMP | BPF_JGE | BPF_K, kX32Bit, 5, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, kIoUringSetup, 4, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_socket, 0, 2),
+        stmt(BPF_LD | BPF_W | BPF_ABS, kFirstArg),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 2, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
+    }};
+    const sock_fprog fprog{static_cast<unsigned short>(program.size()), program.data()};
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog, 0, 0) != 0) {
+        fail("PR_SET_SECCOMP");
+    }
+    return true;
+}
+
+#else
+
+bool filter_unix_sockets() {
+    return false;  // not written for this architecture; blocks_unix_sockets() stays false and hx says so
+}
+
+#endif
+
 }  // namespace
 
-Sandbox Sandbox::confine(const std::vector<Rule>& rules) {
+Sandbox Sandbox::confine(const std::vector<Rule>& rules, bool unix_sockets) {
     const long version = syscall(kCreateRuleset, nullptr, 0, kCreateRulesetVersion);
     if (version < 1) {
         throw SandboxError("this kernel has no Landlock (needs Linux 5.13 or later with the landlock LSM enabled)");
@@ -166,14 +228,16 @@ Sandbox Sandbox::confine(const std::vector<Rule>& rules) {
         }
     }
 
-    // Required by landlock_restrict_self, and wanted anyway: no setuid program can raise a child's privileges.
+    // Required by landlock_restrict_self and by a seccomp filter, and wanted anyway: no setuid program can raise
+    // a child's privileges.
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
         fail("PR_SET_NO_NEW_PRIVS");
     }
     if (syscall(kRestrictSelf, ruleset.get(), 0) != 0) {
         fail("landlock_restrict_self");
     }
-    return Sandbox(abi);
+    const bool filtered = abi < kUnixSocketAbi && !unix_sockets && filter_unix_sockets();
+    return Sandbox(abi, filtered);
 }
 
 }  // namespace hx

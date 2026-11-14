@@ -13,6 +13,7 @@ import os
 import pty
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -335,6 +336,34 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("Bad file descriptor", self.tool_results()[0])
         self.assertNotIn("FROM-OUTSIDE", json.dumps(self.model.requests))
+
+    def test_a_unix_socket_outside_cannot_be_reached(self):
+        path = os.path.join(self.root, "outside.sock")
+        connect = f"import socket; s = socket.socket(socket.AF_UNIX); s.connect('{path}'); print('connected')"
+        pair = "import socket; a, b = socket.socketpair(); a.send(b'pair'); print(b.recv(4).decode())"
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(path)
+            listener.listen()
+            done = self.run_hx("go", script=[call("bash", {"command": f'python3 -c "{connect}"'}, "c1"),
+                                             call("bash", {"command": f'python3 -c "{pair}"'}, "c2"), say("ok")])
+            listener.setblocking(False)
+            with self.assertRaises(BlockingIOError):  # nothing is waiting to be accepted
+                listener.accept()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        refused, paired = self.tool_results()
+        # Before Landlock ABI 9 the filter refuses the socket; from ABI 9 Landlock refuses the connection.
+        self.assertIn("PermissionError", refused)
+        self.assertNotIn("[exit 0]", refused)
+        self.assertEqual(paired, "pair\n[exit 0]")
+        self.assertNotIn("unix sockets", done.stderr)  # the wall is whole, so there is no note
+
+    def test_unix_sockets_opens_sockets_inside_the_project(self):
+        script = ("import socket; s = socket.socket(socket.AF_UNIX); s.bind('in.sock'); s.listen(); "
+                  "c = socket.socket(socket.AF_UNIX); c.connect('in.sock'); a, _ = s.accept(); c.send(b'local'); "
+                  "print(a.recv(5).decode())")
+        done = self.run_hx("--unix-sockets", "go", script=[call("bash", {"command": f'python3 -c "{script}"'}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results(), ["local\n[exit 0]"])
 
     def test_keep_env_keeps_a_variable(self):
         self.run_hx("--keep-env", "KEPT_TOKEN", "go", KEPT_TOKEN="kept-value", script=[
