@@ -91,6 +91,11 @@ end
 local function counted(fn)
 	return function(...)
 		local result = fn.run(...)
+		-- A command that succeeded and printed nothing did something rather than looked at something (git add,
+		-- mkdir, a sleep between polls): that it does so again says nothing about progress.
+		if result == "[exit 0]" then
+			return result
+		end
 		local args = {}
 		for i = 1, select("#", ...) do
 			args[i] = as_text((select(i, ...)))
@@ -1344,7 +1349,8 @@ function M.compact(system, talk)
 end
 
 -- What the model is told when a function call has returned the same result `count` times in this task (see
--- `counted`), as `call`, the call written out. `first` is the first reminder of the turn.
+-- `counted`), as `call`, the call written out. `first` is true at the lowest threshold of M.repeat_reminders; a
+-- loop inside one call that passes several at once gets the later wording.
 function M.repeat_reminder(call, count, first)
 	if #call > 500 then
 		call = call:sub(1, 500) .. ("... (%d more bytes)"):format(#call - 500)

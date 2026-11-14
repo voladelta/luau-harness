@@ -298,13 +298,20 @@ class AgentTest(unittest.TestCase):
         return [[b["text"] for b in r["messages"][-1]["content"] if b["type"] == "text"] for r in self.model.requests[1:]]
 
     def test_a_repeated_call_gets_a_reminder(self):
-        same = [call("bash", {"command": "true", "timeout": 5}, f"c{i}") for i in range(5)]
+        same = [call("bash", {"command": "echo same", "timeout": 5}, f"c{i}") for i in range(5)]
         done = self.run_hx("go", script=[*same, say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         reminders = self.reminders()
         self.assertEqual([len(r) for r in reminders], [0, 0, 1, 0, 1])
-        self.assertIn('bash("true", 5) has now returned the same result 3 times', reminders[2][0])
-        self.assertIn('bash("true", 5) has returned the same result 5 times in this task', reminders[4][0])
+        self.assertIn('bash("echo same", 5) has now returned the same result 3 times', reminders[2][0])
+        self.assertIn('bash("echo same", 5) has returned the same result 5 times in this task', reminders[4][0])
+
+    def test_a_silent_command_that_succeeds_is_not_counted(self):
+        # git add, mkdir or a sleep between steps does something; doing it again is not a sign of being stuck.
+        same = [call("bash", {"command": "true"}, f"c{i}") for i in range(5)]
+        done = self.run_hx("go", script=[*same, say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual([len(r) for r in self.reminders()], [0, 0, 0, 0, 0])
 
     def test_a_loop_inside_one_call_is_counted_too(self):
         # The model's code prints a counter, so no two tool results are alike; the function results are.
