@@ -313,8 +313,11 @@ class Encoder {
         }
         luaL_checkstack(L_, 4, "json nesting");
 
+        // The length is a border, not a count: {1, 2, nil, 4, x = 5} may have length 4 and four keys. So a table
+        // is an array only when every key is an integer in 1..length and there are length of them.
         const auto length = static_cast<std::size_t>(lua_objlen(L_, idx));
         std::size_t count = 0;
+        std::size_t indices = 0;             // keys that are integers in 1..length
         std::vector<std::string_view> keys;  // views into strings the table keeps alive
         lua_pushnil(L_);
         while (lua_next(L_, idx) != 0) {
@@ -323,12 +326,18 @@ class Encoder {
                 std::size_t key_length = 0;
                 const char* key = lua_tolstring(L_, -2, &key_length);
                 keys.emplace_back(key, key_length);
+            } else if (lua_type(L_, -2) == LUA_TNUMBER) {
+                const double key = lua_tonumber(L_, -2);
+                if (key >= 1 && key <= static_cast<double>(length) && std::floor(key) == key) {
+                    ++indices;
+                }
             }
             lua_pop(L_, 1);
         }
 
-        if (is_marked_array(L_, idx) || (length > 0 && count == length)) {
-            if (count != length) {
+        const bool array = indices == count && count == length;
+        if (is_marked_array(L_, idx) || (length > 0 && array)) {
+            if (!array) {
                 return fail("a json.array may only have the keys 1..n");
             }
             writer_.StartArray();

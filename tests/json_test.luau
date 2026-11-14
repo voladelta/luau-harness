@@ -36,6 +36,12 @@ fails("function", { f = print }, "cannot encode a function")
 fails("mixed table", { 1, 2, x = 3 }, "neither an array")
 fails("number keys", { [1.5] = 1 }, "neither an array")
 fails("sparse marked array", json.array({ [3] = 1 }), "keys 1..n")
+-- The length of a table with a hole is a border, and here it equals the number of keys: no key may be dropped.
+fails("a hole and a string key", { 1, 2, nil, 4, x = "dropped" }, "neither an array")
+fails("a hole and a fractional key", { 1, 2, nil, 4, [1.5] = "dropped" }, "neither an array")
+fails("a marked array with a string key", json.array({ 1, 2, x = 3 }), "keys 1..n")
+fails("a marked array with a hole and a string key", json.array({ 1, 2, nil, 4, x = 5 }), "keys 1..n")
+check("an array built in reverse", json.encode({ [3] = "c", [2] = "b", [1] = "a" }), '["a","b","c"]')
 local cycle = {}
 cycle.self = cycle
 fails("cycle", cycle, "too deep")
