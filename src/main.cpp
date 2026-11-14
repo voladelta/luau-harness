@@ -491,6 +491,9 @@ int run(const std::vector<std::string_view>& argv) {
     config.default_loop = hx::kDefaultLoop;
     // libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules).
     config.ca_bundle = env_or("SSL_CERT_FILE", env_or("CURL_CA_BUNDLE", ""));
+    if (access(config.ca_bundle.c_str(), R_OK) != 0) {
+        config.ca_bundle.clear();  // a stale variable must not break every request; libcurl's own roots then apply
+    }
 
     std::optional<std::string> script;
     if (options.mode == Mode::Script) {
