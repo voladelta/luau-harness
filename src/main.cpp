@@ -46,8 +46,9 @@ namespace fs = std::filesystem;
 
 constexpr std::string_view kUsage = R"(usage:
   hx [options] [TASK...]             run the agent on TASK; with no task, read it from stdin or start a prompt
-  hx [options] run FILE [ARGS...]    run a Luau script with the host primitives
-  hx init [--full]                   write .hx/loop.luau, a loop that starts from the built-in one; with
+  hx [options] --run FILE [ARGS...]  run a Luau script with the host primitives; every word after FILE is
+                                     passed to the script, even one that starts with -
+  hx --init [--full]                 write .hx/loop.luau, a loop that starts from the built-in one; with
                                      --full, a copy of the whole built-in loop
 
 options:
@@ -89,7 +90,7 @@ struct Options {
     std::vector<std::string> write_paths;
     std::vector<std::string> keep_env;
     bool sandbox = true;
-    bool full = false;  // init: copy the whole built-in loop, not the overlay
+    bool full = false;  // --init --full: copy the whole built-in loop, not the overlay
 };
 
 Options parse_args(const std::vector<std::string_view>& argv) {
@@ -114,6 +115,18 @@ Options parse_args(const std::vector<std::string_view>& argv) {
         } else if (arg == "-h" || arg == "--help") {
             options.mode = Mode::Help;
             return options;
+        } else if (arg == "--init") {
+            options.mode = Mode::Init;
+        } else if (arg == "--full") {
+            options.full = true;
+        } else if (arg == "--run") {
+            if (options.mode == Mode::Init) {
+                throw UsageError("--run and --init do not go together");
+            }
+            options.mode = Mode::Script;
+            options.script = operand(arg);
+            ++i;
+            break;  // the rest belongs to the script
         } else if (arg == "--") {
             ++i;
             break;
@@ -123,21 +136,13 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             break;
         }
     }
-    if (i < argv.size() && argv[i] == "init" &&
-        (i + 1 == argv.size() || (i + 2 == argv.size() && argv[i + 1] == "--full"))) {
-        options.mode = Mode::Init;
-        options.full = i + 2 == argv.size();
-        return options;
-    }
-    if (i < argv.size() && argv[i] == "run") {
-        if (i + 1 >= argv.size()) {
-            throw UsageError("run needs a file");
-        }
-        options.mode = Mode::Script;
-        options.script = argv[i + 1];
-        i += 2;
-    }
     options.args.assign(argv.begin() + static_cast<std::ptrdiff_t>(i), argv.end());
+    if (options.full && options.mode != Mode::Init) {
+        throw UsageError("--full goes with --init");
+    }
+    if (options.mode == Mode::Init && !options.args.empty()) {
+        throw UsageError("--init takes no task");
+    }
     return options;
 }
 

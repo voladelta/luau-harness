@@ -462,7 +462,7 @@ class AgentTest(unittest.TestCase):
         """Runs a script, interrupts it once the command it starts has written cmd.pid, and returns the result."""
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write(source)
-        process = subprocess.Popen([HX, "run", "s.luau"], cwd=self.project, env=self.env(), stdout=subprocess.PIPE,
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(), stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
         pid = self.wait_for_pid_file("cmd.pid")
         process.send_signal(signal.SIGINT)
@@ -482,7 +482,7 @@ class AgentTest(unittest.TestCase):
     def test_input_still_reads_after_an_interrupted_read(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("print('ready')\nprint(host.try(host.input))\nprint(host.input())\n")
-        process = subprocess.Popen([HX, "run", "s.luau"], cwd=self.project, env=self.env(), stdin=subprocess.PIPE,
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(), stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(process.stdout.readline(), "ready\n")
         time.sleep(0.3)  # let it block in the read
@@ -563,13 +563,13 @@ class AgentTest(unittest.TestCase):
         self.assertIn("Run the tests with make check.", self.model.requests[0]["system"])
 
     def test_init_writes_an_overlay_on_the_built_in_loop(self):
-        done = self.run_hx("init")
+        done = self.run_hx("--init")
         self.assertEqual(done.returncode, 0, done.stderr)
         loop = os.path.join(self.project, ".hx", "loop.luau")
         source = read(loop)
         self.assertEqual(source, read(REPO, "lua", "overlay.luau"))
         self.assertIn("host.load(host.default_loop", source)
-        self.assertEqual(self.run_hx("init").returncode, 2)  # never overwrites
+        self.assertEqual(self.run_hx("--init").returncode, 2)  # never overwrites
         # Unchanged, it behaves as the built-in loop does.
         done = self.run_hx("go", script=[say("ok")])
         self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
@@ -587,7 +587,7 @@ class AgentTest(unittest.TestCase):
         self.assertTrue(sent["system"].endswith("Run `make check` before you report."))
 
     def test_init_full_copies_the_whole_loop(self):
-        done = self.run_hx("init", "--full")
+        done = self.run_hx("--init", "--full")
         self.assertEqual(done.returncode, 0, done.stderr)
         loop = os.path.join(self.project, ".hx", "loop.luau")
         source = read(loop)
@@ -687,14 +687,23 @@ class AgentTest(unittest.TestCase):
     def test_run_executes_a_script(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("print(json.encode(host.args), host.sh('echo hi').out)\n")
-        done = self.run_hx("run", "s.luau", "a", "b")
+        done = self.run_hx("--run", "s.luau", "a", "--b")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout, '["a","b"]\thi\n\n')
+        self.assertEqual(done.stdout, '["a","--b"]\thi\n\n')
+
+    def test_a_task_may_start_with_any_word(self):
+        done = self.run_hx("run", "the", "tests", script=[say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[0]["messages"][0]["content"], "run the tests")
+        done = self.run_hx("init", script=[say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[-1]["messages"][0]["content"], "init")
+        self.assertFalse(os.path.exists(os.path.join(self.project, ".hx", "loop.luau")))
 
     def test_a_script_error_is_reported(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("error('it broke')\n")
-        done = self.run_hx("run", "s.luau")
+        done = self.run_hx("--run", "s.luau")
         self.assertEqual(done.returncode, 1)
         self.assertIn("s.luau:1: it broke", done.stderr)
 

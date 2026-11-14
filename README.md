@@ -44,10 +44,13 @@ header-only).
 ## Use
 
 ```
-hx [options] [TASK...]            run the agent; without a task, read it from stdin or start a prompt
-hx [options] run FILE [ARGS...]   run a Luau script with the host primitives
-hx init                           make this project own its loop
+hx [options] [TASK...]              run the agent; without a task, read it from stdin or start a prompt
+hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives
+hx --init [--full]                  make this project own its loop
 ```
+
+A task is any words at all: `hx run the tests` asks the model. After `--run FILE`, every word goes to the
+script, even one that starts with `-`.
 
 | Option | Meaning |
 |---|---|

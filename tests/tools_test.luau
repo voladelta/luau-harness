@@ -1,4 +1,4 @@
--- The tools and the extension loader of the built-in loop. Run with: hx run tests/tools_test.luau
+-- The tools and the extension loader of the built-in loop. Run with: hx --run tests/tools_test.luau
 -- Works in $TMPDIR, which hx creates for the run and removes afterwards.
 
 local loop = assert(host.load(host.default_loop, "=loop"))()

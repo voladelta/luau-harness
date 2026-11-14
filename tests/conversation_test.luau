@@ -1,4 +1,4 @@
--- The conversation state machine of the built-in loop. Run with: hx run tests/conversation_test.luau
+-- The conversation state machine of the built-in loop. Run with: hx --run tests/conversation_test.luau
 --
 -- A random walk tries every operation in every state. A legal operation must leave a history that
 -- Conversation:problem() accepts; an illegal one must raise and leave the history untouched.

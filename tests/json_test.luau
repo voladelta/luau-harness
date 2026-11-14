@@ -1,4 +1,4 @@
--- json.encode / json.decode. Run with: hx run tests/json_test.luau
+-- json.encode / json.decode. Run with: hx --run tests/json_test.luau
 
 local failures = 0
 local function check(name, got, want)
