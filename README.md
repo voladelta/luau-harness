@@ -185,7 +185,7 @@ return M
 
 Every setting at the top of the loop is a field of `M`, and so are the parts a project may want to replace:
 `M.functions`, `M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until
-the model is done), `M.compact` and `M.compact_prompt`. The loop always calls them through `M`, so a replacement
+the model is done), `M.compact`, `M.compact_prompt` and `M.resume_prompt`. The loop always calls them through `M`, so a replacement
 takes effect everywhere.
 
 Some habits of the model are handled in the loop rather than left to the prompt: a call that gets the same result
@@ -205,11 +205,25 @@ plain request. The settings follow Anthropic's guidance for these models:
 | `fallbacks: "default"`: a declined request runs again on a model picked for why it was declined, in the same round trip | yes | yes | no (Haiku has none) |
 | `thinking.display: "updates"`: notes between tool calls come back and show as progress lines | yes | yes | no |
 | `thinking.block_binding: drop_block`: a thinking block sent back after a changed history is dropped rather than failing the request | yes | yes | yes |
+| `compaction: {type: "summarize"}`: past `M.compact_at` prompt tokens, the API writes the summary (on-demand compaction) | yes | yes | yes |
 
 The betas these need go in the `anthropic-beta` header, which Luau sets with `host.llm(body, {beta = "a,b"})`. Thinking
 is adaptive and cannot be turned off on these models; effort is the control. A reply a fallback model finished
 carries a `fallback` block; the loop drops what the declining model wrote before it, as the API requires, and a
 refusal is logged with its category.
+
+Compaction on these models is the API's on-demand kind: the loop sends the conversation as it stands, with the same
+system prompt, tools, thinking and effort, plus `compaction` with `M.compact_prompt` as its `instructions`. The
+signed `compaction` block that comes back replaces every message it summarized; it goes first in the next request,
+exactly as it came, followed by `M.resume_prompt`. If no block comes back, the conversation is kept and compacted
+after a later reply. Any other model, DeepSeek's included, is asked for the summary as an ordinary reply.
+
+Prompt caching follows each provider's docs. Every model gets a prefix that only grows: the system prompt is built
+once per run, the tool description never changes, JSON keys are sorted, and the history is only appended to. A
+Claude model gets two cache breakpoints: one on the system prompt, so tools and system are still read from the
+cache after a compaction, and the top-level automatic one, which moves forward with the conversation. DeepSeek
+caches every prefix by itself and ignores `cache_control`. The line at the end of a run gives the tokens read
+from the cache and written to it.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON. The logs hold
 file contents, so that directory carries a `.gitignore` that keeps all of it out of git.

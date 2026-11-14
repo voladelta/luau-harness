@@ -348,7 +348,12 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(sent["thinking"], {"type": "adaptive", "display": "updates",
                                             "block_binding": {"prefix_mismatch_behavior": "drop_block"}})
         self.assertEqual(self.model.headers[0]["anthropic-beta"], "thinking-binding-controls-2026-08-01,"
-                         "thinking-display-updates-2026-08-18,server-side-fallback-2026-07-01")
+                         "thinking-display-updates-2026-08-18,server-side-fallback-2026-07-01,compact-2026-09-04")
+        # Two cache breakpoints: one on the system prompt, which outlives a compaction, and the automatic one.
+        self.assertEqual(sent["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(len(sent["system"]), 1)
+        self.assertEqual(sent["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertIn("coding agent", sent["system"][0]["text"])
         # Haiku 5.5 has no server-side fallback; HX_EFFORT still wins.
         done = self.run_hx("go", script=[say("ok")], HX_MODEL="haiku", HX_EFFORT="low")
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -356,12 +361,14 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(sent["model"], "claude-haiku-5-5")
         self.assertEqual(sent["output_config"], {"effort": "low"})
         self.assertNotIn("fallbacks", sent)
-        self.assertEqual(self.model.headers[1]["anthropic-beta"], "thinking-binding-controls-2026-08-01")
+        self.assertEqual(self.model.headers[1]["anthropic-beta"], "thinking-binding-controls-2026-08-01,compact-2026-09-04")
         # Another model gets the plain request.
         done = self.run_hx("--model", "deepseek-flash", "go", script=[say("ok")])
         self.assertEqual(self.model.requests[2]["thinking"], {"type": "adaptive"})
         self.assertNotIn("fallbacks", self.model.requests[2])
         self.assertNotIn("anthropic-beta", self.model.headers[2])
+        # DeepSeek caches by itself and ignores cache_control: the system prompt goes as the plain string.
+        self.assertIsInstance(self.model.requests[2]["system"], str)
 
     def test_the_model_follows_the_key_that_is_set(self):
         show = ["--run", "-"]
@@ -491,6 +498,47 @@ class AgentTest(unittest.TestCase):
         self.assertIn("SUMMARY TEXT", after["messages"][0]["content"])
         self.assertEqual(after["system"], ask["system"])
         self.assertEqual(done.stdout, "finished\n")  # the summary itself is not printed as an answer
+
+    def test_a_claude_model_compacts_on_the_server(self):
+        block = {"type": "compaction", "content": "SUMMARY TEXT", "signature": "sig-c"}
+        compacted = (200, {"id": "msg_c", "type": "message", "role": "assistant", "content": [block],
+                           "stop_reason": "compaction", "stop_sequence": None,
+                           "usage": {"input_tokens": 0, "output_tokens": 0,
+                                     "iterations": [{"type": "compaction", "input_tokens": 300, "output_tokens": 70}]}})
+        done = self.run_hx("--model", "opus", "the task", script=[
+            call("bash", {"command": "echo big"}, input_tokens=200000), compacted, say("finished")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        first, ask, after = self.model.requests
+        # The same request as the conversation's, with `compaction` and the loop's own summarization prompt.
+        self.assertEqual(ask["compaction"]["type"], "summarize")
+        self.assertIn("## Next step", ask["compaction"]["instructions"])
+        self.assertEqual(ask["messages"][0], first["messages"][0])
+        self.assertEqual([b["type"] for b in ask["messages"][2]["content"]], ["tool_result"])
+        for key in ("system", "tools", "thinking", "output_config", "model"):
+            self.assertEqual(ask[key], first[key])
+        self.assertIn("compact-2026-09-04", self.model.headers[1]["anthropic-beta"].split(","))
+        # The block goes first, exactly as it came, and stands for everything it summarized.
+        self.assertEqual(len(after["messages"]), 1)
+        self.assertEqual(after["messages"][0]["role"], "user")
+        self.assertEqual(after["messages"][0]["content"][0], block)
+        self.assertIn("continue the work", after["messages"][0]["content"][1]["text"])
+        self.assertNotIn("compaction", after)
+        self.assertIn("compact-2026-09-04", self.model.headers[2]["anthropic-beta"].split(","))
+        self.assertEqual(done.stdout, "finished\n")
+        # What the summary cost is counted from usage.iterations.
+        self.assertIn("3 replies", done.stderr)
+        self.assertIn("80 out]", done.stderr)
+
+    def test_a_claude_compaction_without_a_summary_keeps_the_conversation(self):
+        empty = (200, {"id": "msg_c", "type": "message", "role": "assistant", "content": [], "stop_reason": "max_tokens",
+                       "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}})
+        done = self.run_hx("--model", "opus", "the task", script=[
+            call("bash", {"command": "echo big"}, input_tokens=200000), empty, say("finished")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("no summary came back (max_tokens)", done.stderr)
+        _, ask, after = self.model.requests
+        self.assertEqual(after["messages"], ask["messages"])
+        self.assertNotIn("compaction", after)
 
     # --- the walls ---
 

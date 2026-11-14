@@ -140,17 +140,26 @@ class LiveTest(unittest.TestCase):
             self.assertIn("os.path.abspath('.')", self.read(f"mod{i}.py"))
         self.assertLessEqual(len(self.code()), 4, self.code())
 
+    def checkpoint(self):
+        """The summary the conversation now starts from: a Claude model's compaction block, which the API wrote,
+        or the text of the checkpoint another model wrote as a reply."""
+        first = self.log["messages"][0]["content"]
+        if isinstance(first, list):
+            if first[0].get("type") == "compaction":
+                return first[0]["content"]
+            first = first[0]["text"]
+        self.assertIn("written by you:", first, "the conversation was never compacted")
+        return first.split("written by you:", 1)[1]
+
     def test_a_compacted_conversation_goes_on_from_its_checkpoint(self):
         self.overlay("M.compact_at = 1")
         self.write("a.txt", "alpha\nbravo\ncharlie\n")
         self.run_hx("first read a.txt. Then, in a separate call, write b.txt with the lines of a.txt in reverse "
                     "order. Then read b.txt to check it.")
         self.assertEqual(self.read("b.txt").split(), ["charlie", "bravo", "alpha"])
-        first = self.log["messages"][0]["content"]
-        first = first if isinstance(first, str) else first[0]["text"]
-        self.assertIn("checkpoint", first)
+        summary = self.checkpoint()
         for section in ("## Task", "## Files", "## Next step"):
-            self.assertIn(section, first)
+            self.assertIn(section, summary)
 
     def test_a_fact_found_early_outlives_several_checkpoints_and_they_are_in_english(self):
         # Every call is compacted, so the code has to be carried from checkpoint to checkpoint, and the
@@ -163,10 +172,7 @@ class LiveTest(unittest.TestCase):
         self.run_hx("Hãy làm từng bước một, mỗi bước một lần gọi công cụ: chạy ./code.sh; rồi đọc a.txt; rồi đọc "
                     "b.txt; rồi đọc c.txt. Cuối cùng ghi mã truy cập mà code.sh in ra vào tệp answer.txt.")
         self.assertEqual(self.read("answer.txt").strip(), "KX-4471-QZ")
-        texts = self.said() + [self.log["messages"][0]["content"]]
-        texts = [t if isinstance(t, str) else t[0]["text"] for t in texts]
-        last = [t for t in texts if "checkpoint" in t][-1]
-        summary = last.split("written by you:", 1)[1]
+        summary = self.checkpoint()
         letters = [ch for ch in summary if ch.isalpha()]
         self.assertGreater(sum(ch.isascii() for ch in letters) / len(letters), 0.9, summary)
 

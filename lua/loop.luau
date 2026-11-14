@@ -524,16 +524,34 @@ end
 --              round trip; Haiku 5.5 has no fallback
 --   display    "updates": the notes the model writes between tool calls come back in thinking blocks, which
 --              the loop shows as progress lines; without it they come back empty
+--   compaction the API writes the summary when the conversation grows too long (on-demand compaction, the
+--              kind Anthropic says to use wherever it is available), instead of the loop asking for one as an
+--              ordinary reply; see M.compact
 -- Every listed model checks that a thinking block goes back after the same history it was written after. The
 -- loop only ever appends, but a project may change it: block_binding drop_block then drops a stale block instead
 -- of failing the request.
 M.claude = {
-	["claude-opus-5-5"] = { effort = "medium", fallbacks = "default", display = "updates" },
-	["claude-sonnet-5-5"] = { effort = "medium", fallbacks = "default", display = "updates" },
-	["claude-haiku-5-5"] = { effort = "medium" },
+	["claude-opus-5-5"] = { effort = "medium", fallbacks = "default", display = "updates", compaction = true },
+	["claude-sonnet-5-5"] = { effort = "medium", fallbacks = "default", display = "updates", compaction = true },
+	["claude-haiku-5-5"] = { effort = "medium", compaction = true },
 }
 
-local usage = { replies = 0, input = 0, cached = 0, output = 0 }
+local usage = { replies = 0, input = 0, cached = 0, written = 0, output = 0 }
+
+-- Adds a reply's tokens to the run's count. A compaction reply has zero at the top and the summarization call in
+-- usage.iterations; where iterations are given, they are what was billed.
+local function count_usage(reply)
+	local counts = type(reply.usage) == "table" and reply.usage or {}
+	local parts = type(counts.iterations) == "table" and #counts.iterations > 0 and counts.iterations or { counts }
+	usage.replies += 1
+	for _, part in parts do
+		usage.input += (part.input_tokens or 0) + (part.cache_read_input_tokens or 0)
+			+ (part.cache_creation_input_tokens or 0)
+		usage.cached += part.cache_read_input_tokens or 0
+		usage.written += part.cache_creation_input_tokens or 0
+		usage.output += part.output_tokens or 0
+	end
+end
 
 local function tool_specs()
 	local specs = json.array({}) -- a list even when a project has taken every tool away
@@ -591,8 +609,9 @@ end
 
 -- Sends the conversation and returns the decoded reply. Retries what is worth retrying, then raises. The endpoint
 -- sometimes answers 200 with nothing in it; that is retried like a busy server, since the same request may well
--- get a real reply.
-function M.request(system, messages)
+-- get a real reply. `compaction`, given, asks a Claude model for a summary in place of a reply (see M.compact);
+-- that reply comes back however empty it is, since an empty one is an answer too.
+function M.request(system, messages, compaction)
 	local claude = M.claude[M.model]
 	local thinking = { type = "adaptive" }
 	local betas = {}
@@ -608,18 +627,41 @@ function M.request(system, messages)
 			fallbacks = claude.fallbacks
 			table.insert(betas, "server-side-fallback-2026-07-01")
 		end
+		-- On every request, not only the one that asks for the summary: a request that carries the block needs it.
+		if claude.compaction then
+			table.insert(betas, "compact-2026-09-04")
+		end
 	end
 	local effort = M.effort or (claude and claude.effort)
+	-- Caching. The Claude API caches a prefix only up to a breakpoint, and a request reads only what an earlier one
+	-- wrote at a breakpoint. Two of them, both with the default five-minute life, which every request in a running
+	-- loop refreshes:
+	--   on the system prompt: tools and system, which never change in a run, get an entry of their own. A
+	--     compaction replaces every message; without this entry it would pay for tools and system again too. A
+	--     new run in the same project within five minutes reads it as well.
+	--   top-level, automatic: the API puts it on the last block and moves it forward as the conversation grows, so
+	--     each request reads everything the one before it sent and writes only what was added since.
+	-- Everything ahead of a breakpoint has to be byte for byte the same, request after request: the system prompt
+	-- is built once per run, the tool description is the same each time, json.encode sorts keys, the conversation
+	-- is only ever appended to (a reminder is a text block behind the tool results, never taken out again), and
+	-- thinking and effort are fixed for the run.
+	-- DeepSeek caches every prefix by itself and ignores cache_control, so any model that is not Claude gets the
+	-- system prompt as the plain string; the same stable prefix is what makes its cache hits.
+	local system_field = system
+	if M.model:match("^claude%-") then
+		system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
+	end
 	local body = json.encode({
 		model = M.model,
 		max_tokens = M.max_output,
 		thinking = thinking,
 		output_config = effort and { effort = effort } or nil,
 		fallbacks = fallbacks,
-		cache_control = { type = "ephemeral" }, -- cache the longest prefix seen before, where caching is opt-in
-		system = system,
+		cache_control = { type = "ephemeral" },
+		system = system_field,
 		messages = messages,
 		tools = tool_specs(),
+		compaction = compaction,
 	})
 	local options = { beta = #betas > 0 and table.concat(betas, ",") or nil }
 	local attempts = 5
@@ -629,11 +671,8 @@ function M.request(system, messages)
 			local reply, err = json.decode(text)
 			if type(reply) == "table" and type(reply.content) == "table" then
 				after_fallback(reply)
-				usage.replies += 1
-				usage.input += prompt_size(reply)
-				usage.cached += (reply.usage or {}).cache_read_input_tokens or 0
-				usage.output += (reply.usage or {}).output_tokens or 0
-				if has_content(reply) then
+				count_usage(reply)
+				if compaction or has_content(reply) then
 					return reply
 				end
 				status, text = "empty reply", "the model sent a reply with nothing in it"
@@ -796,6 +835,14 @@ function Conversation:restart(text)
 	self:say(text)
 end
 
+-- Forgets everything and starts again from a compaction block, which the API reads in place of the messages it
+-- summarized, followed by one user message. The block goes first in the first message, exactly as it came.
+function Conversation:resume(block, text)
+	expect(self, "resume", "idle", "ready")
+	table.clear(self.messages)
+	table.insert(self.messages, { role = "user", content = { block, { type = "text", text = text } } })
+end
+
 -- A copy to try something on. It shares the old messages; the last one, which say() may extend, is its own.
 function Conversation:fork()
 	local copy = Conversation.new()
@@ -854,16 +901,17 @@ local function text_of(reply)
 end
 
 -- Sends the conversation to the model. Only a conversation that is ready, and sound, is ever sent.
-local function ask(system, talk)
+local function ask(system, talk, compaction)
 	local problem = talk:state() ~= "ready" and "it is " .. talk:state() .. ", not ready" or talk:problem()
 	if problem then
 		error("this conversation cannot be sent: " .. problem, 0)
 	end
-	return M.request(system, talk.messages)
+	return M.request(system, talk.messages, compaction)
 end
 
--- The request for the summary. It goes behind the whole conversation, as the last user message, so the request
--- reuses the cached prefix. The summary is in English whatever the conversation's language: it becomes the start
+-- The request for the summary: a Claude model with on-demand compaction gets it as the `instructions`; any other
+-- model gets it behind the whole conversation, as the last user message, so the request reuses the cached prefix.
+-- The summary is in English whatever the conversation's language: it becomes the start
 -- of everything after it, and a summary in another language pulls the model's own reasoning into that language.
 M.compact_prompt = table.concat({
 	"The conversation is about to be replaced by a summary, and you will continue from that summary alone. "
@@ -890,9 +938,47 @@ M.compact_prompt = table.concat({
 		.. "true, drop what is not, and do not copy it over unchanged.",
 }, "\n")
 
--- Replaces the conversation with the model's own summary of what happened.
+-- What follows a compaction block, so that the model goes on with the work.
+M.resume_prompt = "Earlier turns were replaced by the checkpoint above, written by you. Treat it as established "
+	.. "and continue the work from it directly, without restating or acknowledging it."
+
+-- On-demand compaction, for the Claude models whose M.claude entry says so. The request is the conversation as it
+-- stands, with the same model, system, tools, thinking and effort, so it reads the cached prefix, plus
+-- `compaction`; M.compact_prompt is its `instructions`, which replace the API's own summarization prompt. The API
+-- writes the summary into a signed `compaction` block and no reply. The block then takes the place of every
+-- message it summarized: it goes first, exactly as it came, and is sent with every later request. A newer block
+-- summarizes the old one with what came after it. A request that brings no block (cut off, refused, a tool call)
+-- or fails leaves the conversation as it is, to be compacted after a later reply, as the docs advise.
+local function compact_on_server(system, talk)
+	local ok, reply = pcall(ask, system, talk, { type = "summarize", instructions = M.compact_prompt })
+	if not ok then
+		progress("  compaction failed, the conversation stays as it is: " .. tostring(reply))
+		return
+	end
+	local block = nil
+	if reply.stop_reason == "compaction" then
+		for _, b in reply.content do
+			if b.type == "compaction" then
+				block = b
+			end
+		end
+	end
+	if not block then
+		progress(("  no summary came back (%s); keeping the conversation as it is"):format(tostring(reply.stop_reason)))
+		return
+	end
+	talk:resume(block, M.resume_prompt)
+end
+
+-- Replaces the conversation with the model's own summary of what happened. A Claude model that has on-demand
+-- compaction gets it; any other model, DeepSeek's included, is asked for the summary as an ordinary reply,
+-- behind the whole conversation so that the request reuses the cached prefix.
 function M.compact(system, talk)
 	progress("  compacting the conversation")
+	local claude = M.claude[M.model]
+	if claude and claude.compaction then
+		return compact_on_server(system, talk)
+	end
 	local asking = talk:fork()
 	asking:say(M.compact_prompt)
 	local summary = text_of(ask(system, asking))
@@ -1004,7 +1090,9 @@ local function save(system, messages)
 end
 
 local function report()
-	progress(("[%d replies, %d tokens in (%d cached), %d out]"):format(usage.replies, usage.input, usage.cached, usage.output))
+	-- A healthy run reads most of what goes in from the cache and writes little of it. DeepSeek reports no writes.
+	progress(("[%d replies, %d tokens in (%d read from cache, %d written to it), %d out]"):format(usage.replies,
+		usage.input, usage.cached, usage.written, usage.output))
 end
 
 -- Bracketed paste. While it is on, the terminal wraps pasted text in the two markers, so a pasted message of many
