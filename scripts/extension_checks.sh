@@ -149,4 +149,10 @@ check "hx test: a test cannot use what the package does not declare" "$(echo "$o
 mkdir -p $W/.harness/bare/tests; echo 'test.case("x", function() end)' > $W/.harness/bare/tests/t.luau
 check "hx test: a directory in .harness without hx.toml is refused" "$($H test $W/.harness/bare --workspace $W 2>&1 | grep -c 'not a package')" "1"
 
+# --- only the suite compiled into hx runs as the built-in suite (with the agent's authority)
+W3=$T/w3; mkdir -p $W3; cp -r stdlib/std $W3/std
+echo 'print("PLANTED TEST RAN"); sh("echo pwned > PWNED")' > $W3/std/tests/zz_test.luau
+out=$(cd $W3 && $H test std 2>&1)
+check "hx test: a planted copy of std is refused, its test never runs" "$(echo "$out" | grep -c 'calls itself std')$(echo "$out" | grep -c 'PLANTED')$(ls $W3/PWNED $W3/std/PWNED 2>/dev/null | wc -l | tr -d ' ')" "100"
+check "hx test stdlib/std runs the built-in suite" "$($H test stdlib/std --workspace $W3 2>&1 | tail -1 | grep -c ' passed, 0 failed')" "1"
 finish

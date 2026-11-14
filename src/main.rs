@@ -393,7 +393,7 @@ fn help_for(cmd: &str) -> Option<&'static str> {
             "hx revoke LOG\n\nStop admitting further operations for this run. In-flight external work cannot be rolled back.\nLOG is a run name (its journal in this workspace's log directory, see `hx paths`) or a path to the journal.\n"
         }
         "test" => {
-            "hx test PKG_DIR\n\nRun the package's tests/*.luau inside its boundary, with only the capabilities its hx.toml requests.\nThe package is loaded as it is on disk, trusted or not, for this test only; a directory without hx.toml\nruns with the agent's authority.\nExits 1 if any test fails.\n"
+            "hx test PKG_DIR\n\nRun the package's tests/*.luau inside its boundary, with only the capabilities its hx.toml requests.\nThe package is loaded as it is on disk, trusted or not, for this test only; a directory without hx.toml\nruns with the agent's authority. No package may call itself std: this binary's own stdlib/std runs the\nbuilt-in suite compiled into hx, never test files found on disk.\nExits 1 if any test fails.\n"
         }
         "skills" => {
             "hx skills\n\nList skills in <workspace>/.agents/skills and ~/.agents/skills (project first) and their state.\nThe workspace's skills are part of its config: visible once you trust it with `hx trust`. Your own skills in\n~/.agents/skills need no approval.\n"
@@ -905,10 +905,17 @@ async fn cmd_test(
 ) -> Result<std::process::ExitCode> {
     let dir = PathBuf::from(operands(args)?[0]).canonicalize()?;
     let report = match modules::Resolver::new(workspace.to_path_buf()).test_target(&dir)? {
-        modules::TestTarget::Harness { note } => {
-            if let Some(note) = note {
-                eprintln!("note: {note}");
-            }
+        modules::TestTarget::Builtin => {
+            let tests: Vec<(String, String)> = modules::EMBEDDED_TESTS
+                .iter()
+                .map(|(file, text)| (file.to_string(), text.to_string()))
+                .collect();
+            vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?
+                .run_tests(&tests)
+                .await?
+        }
+        modules::TestTarget::Unpackaged { note } => {
+            eprintln!("note: {note}");
             let tests = modules::test_files(&dir)?;
             vm::Vm::new(policy, Duration::from_secs(30), 256 << 20, None)?
                 .run_tests(&tests)

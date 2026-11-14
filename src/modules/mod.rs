@@ -141,6 +141,39 @@ pub const EMBEDDED: &[(&str, &str, &str)] = &[
     ("std", "system.md", include_str!("../../prompts/system.md")),
 ];
 
+/// The built-in package's own test suite, `stdlib/std/tests/*.luau`: (file, text). `hx test` runs these, never test
+/// files found on disk, as the built-in suite with the agent's authority.
+pub const EMBEDDED_TESTS: &[(&str, &str)] = &[
+    (
+        "compact_test.luau",
+        include_str!("../../stdlib/std/tests/compact_test.luau"),
+    ),
+    (
+        "hooks_test.luau",
+        include_str!("../../stdlib/std/tests/hooks_test.luau"),
+    ),
+    (
+        "loop_test.luau",
+        include_str!("../../stdlib/std/tests/loop_test.luau"),
+    ),
+    (
+        "mcp_test.luau",
+        include_str!("../../stdlib/std/tests/mcp_test.luau"),
+    ),
+    (
+        "printer_test.luau",
+        include_str!("../../stdlib/std/tests/printer_test.luau"),
+    ),
+    (
+        "prompt_test.luau",
+        include_str!("../../stdlib/std/tests/prompt_test.luau"),
+    ),
+    (
+        "rpi_test.luau",
+        include_str!("../../stdlib/std/tests/rpi_test.luau"),
+    ),
+];
+
 /// A package's `hx.toml`. Unknown tables and unknown capabilities are load errors, so a typo cannot silently grant
 /// nothing (or less than intended).
 #[derive(Debug, Deserialize, Default)]

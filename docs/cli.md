@@ -13,7 +13,7 @@ Every command takes `--help`.
 | `hx recover LOG OP --decision complete\|abandon --yes` | Record an owner's decision about an uncertain mutation; never executes it |
 | `hx revoke LOG` | Stop admitting further operations for a run |
 | `hx exec CHUNK...` | Run Luau chunks in one session (no API key) |
-| `hx test PKG_DIR` | Run a package's `tests/*.luau` inside its boundary, with only the capabilities its `hx.toml` requests; exits 1 on failure |
+| `hx test PKG_DIR` | Run a package's `tests/*.luau` inside its boundary, with only the capabilities its `hx.toml` requests, loading it as it is on disk; exits 1 on failure. A package may not be named `std`: `hx test stdlib/std` in the source tree hx was built from runs the built-in suite compiled into hx (with the agent's authority, for developing hx), never test files on disk |
 | `hx skills` | List skills in `.agents/skills` and `~/.agents/skills` and the state of each (trusted, changed since trust, a user skill, shadowed, or why it cannot load) |
 | `hx trust [--yes]` | Review this workspace's `.harness` config, packages and skills (each with its kind, declared capabilities and file count) and what changed since the last trust, print its hash, then trust it; runs refuse untrusted config |
 | `hx log verify LOG` | Check a log's hash chain and the session its records name, the blobs it references and its recovery accounting; exit 0 ok, 1 invalid, 3 unknown outcomes |

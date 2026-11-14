@@ -110,33 +110,50 @@ fn names_are_validated_and_std_cannot_be_shadowed() {
 }
 
 #[test]
-fn only_the_built_in_std_package_is_tested_as_the_built_in_suite() {
+fn only_this_binarys_std_runs_the_built_in_suite_and_only_its_embedded_tests() {
     let root = ws("teststd");
     let r = Resolver::new(root.clone());
-    let is_harness =
-        |dir: &Path| matches!(r.test_target(dir), Ok(TestTarget::Harness { note: None }));
-    // this repository's stdlib/std, and a copy of the embedded files
-    assert!(is_harness(
-        &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("stdlib/std")
-            .canonicalize()
-            .unwrap()
-    ));
-    let copy = root.join("copy");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("stdlib/std")
+        .canonicalize()
+        .unwrap();
+    assert!(matches!(r.test_target(&source), Ok(TestTarget::Builtin)));
+    // the embedded suite is the source tree's, file for file
+    let mut on_disk = test_files(&source).unwrap();
+    on_disk.sort();
+    let embedded: Vec<(String, String)> = EMBEDDED_TESTS
+        .iter()
+        .map(|(f, t)| (f.to_string(), t.to_string()))
+        .collect();
+    assert_eq!(
+        on_disk, embedded,
+        "embed every stdlib/std/tests file in EMBEDDED_TESTS"
+    );
+    // an exact copy of std with a planted test, or a directory that only claims the name, is refused
+    let copy = root.join("std");
     for (_, file, text) in EMBEDDED.iter().filter(|(_, file, _)| *file != "system.md") {
         write(copy.join(file), text);
     }
-    assert!(is_harness(&copy));
-    // any other directory that calls itself std is refused
+    write(
+        copy.join("tests/zz_test.luau"),
+        "sh('echo pwned > PWNED')\n",
+    );
+    assert!(err(r.test_target(&copy)).contains("calls itself std"));
     let fake = root.join("fake");
     write(
         fake.join("hx.toml"),
         "[package]\nname = \"std\"\nversion = \"1\"\n",
     );
-    write(fake.join("tests/a.luau"), "print(sh('id'))\n");
-    assert!(err(r.test_target(&fake)).contains("not the built-in std package"));
-    std::fs::write(copy.join("loop.luau"), "return {}\n").unwrap();
-    assert!(err(r.test_target(&copy)).contains("not the built-in std package"));
+    assert!(err(r.test_target(&fake)).contains("calls itself std"));
+    // renamed, the copy is an ordinary package tested inside its boundary
+    write(
+        copy.join("hx.toml"),
+        "[package]\nname = \"mystd\"\nversion = \"1\"\n",
+    );
+    assert!(matches!(
+        r.test_target(&copy),
+        Ok(TestTarget::Package { name, .. }) if name == "mystd"
+    ));
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -290,32 +290,28 @@ pub enum TestTarget {
         name: String,
         snapshot: Box<Snapshot>,
     },
-    /// Not a project package (the built-in std package's suite, or a directory without `hx.toml`): the tests run in
-    /// the harness's module environment with the agent's authority, as `hx exec` would. `note` says so when the
-    /// owner might expect otherwise.
-    Harness { note: Option<String> },
+    /// The built-in std package's suite, as compiled into this binary (`EMBEDDED_TESTS`), whatever the directory
+    /// holds: it runs in the harness's module environment with the agent's authority, as `hx exec` would.
+    Builtin,
+    /// A directory without `hx.toml`, which is not a package: its tests run with the agent's authority, like `hx exec`,
+    /// and `note` says so.
+    Unpackaged { note: String },
 }
 
-/// Whether `dir` is the built-in std package: this binary's own source tree, or a copy whose files are exactly the
-/// embedded ones (`system.md` is embedded from `prompts/`, so it is not part of the directory).
-fn is_builtin_std(dir: &Path, snap: &Snapshot) -> bool {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/std");
-    if source.canonicalize().is_ok_and(|source| source == dir) {
-        return true;
-    }
-    EMBEDDED
-        .iter()
-        .filter(|(pkg, file, _)| *pkg == "std" && *file != "system.md")
-        .all(|(_, file, text)| {
-            snap.files
-                .get(*file)
-                .is_some_and(|bytes| bytes == text.as_bytes())
-        })
+/// This binary's own `stdlib/std`, for developing the built-in package: `hx test` runs the embedded suite there.
+fn is_source_std(dir: &Path) -> bool {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("stdlib/std")
+        .canonicalize()
+        .is_ok_and(|source| source == dir)
 }
 
 impl Resolver {
     /// What `hx test DIR` runs: see `TestTarget`. `dir` must be canonical.
     pub fn test_target(&self, dir: &Path) -> Result<TestTarget> {
+        if is_source_std(dir) {
+            return Ok(TestTarget::Builtin);
+        }
         let inside_harness = dir.starts_with(self.harness());
         if !dir.join("hx.toml").exists() {
             anyhow::ensure!(
@@ -327,7 +323,7 @@ impl Resolver {
                 "{} has no hx.toml, so it is not a package: its tests run with the agent's authority, like `hx exec`",
                 dir.display()
             );
-            return Ok(TestTarget::Harness { note: Some(note) });
+            return Ok(TestTarget::Unpackaged { note });
         }
         let snap = snapshot(Location::Package(dir.to_path_buf()))?;
         let dir_name = || {
@@ -342,16 +338,12 @@ impl Resolver {
             }
             _ => dir_name(),
         };
-        if name == "std" {
-            // The name alone proves nothing: any directory can claim it, and the built-in suite runs with the agent's
-            // authority.
-            anyhow::ensure!(
-                !inside_harness && is_builtin_std(dir, &snap),
-                "{} calls itself std, but it is not the built-in std package; give it another name",
-                dir.display()
-            );
-            return Ok(TestTarget::Harness { note: None });
-        }
+        // Any directory can claim the name, and one that looks like std is still an ordinary package.
+        anyhow::ensure!(
+            name != "std",
+            "{} calls itself std, but only the built-in package is std (its suite is compiled into hx); give it another name",
+            dir.display()
+        );
         anyhow::ensure!(
             valid_package_name(&name),
             "{name:?} is not a valid package name"
