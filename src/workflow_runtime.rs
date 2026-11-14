@@ -670,6 +670,48 @@ impl Host {
     }
 }
 
+/// `stage`, in the session of a workflow's root agent: the active stage's `id`, `name` and `checks`, and `submit`.
+pub fn install(cx: &crate::vm::Context) -> Result<()> {
+    if !cx.host.is_some_and(|h| h.is_workflow_root()) {
+        return Ok(());
+    }
+    let (lua, supervisor) = (cx.lua, cx.supervisor);
+    let stage = lua.create_table()?;
+    let frame = supervisor.workflow.lock().unwrap().clone().unwrap();
+    if let Some(active) = frame.stage.as_ref().map(|a| &a.spec) {
+        stage.set("id", active.id.clone())?;
+        stage.set("name", active.name.clone())?;
+        stage.set(
+            "checks",
+            crate::values::copy_in(
+                lua,
+                &serde_json::to_value(&frame.check_plan).map_err(mlua::Error::external)?,
+            )?,
+        )?;
+    }
+    let owner = supervisor.clone();
+    let epoch = supervisor.workflow_epoch();
+    // Preparing a submission hashes the project and reads the journal: blocking work, kept off the VM's thread.
+    stage.set(
+        "submit",
+        lua.create_async_function(move |_, value: mlua::Value| {
+            let owner = owner.clone();
+            let payload = crate::values::copy_out(value);
+            async move {
+                let payload = payload?;
+                crate::effects::yield_first().await;
+                tokio::task::spawn_blocking(move || owner.submit_stage(epoch, payload))
+                    .await
+                    .map_err(mlua::Error::external)?
+                    .map_err(mlua::Error::external)
+            }
+        })?,
+    )?;
+    stage.set_readonly(true);
+    lua.globals().set("stage", stage)?;
+    Ok(())
+}
+
 /// `hx review`: record an owner decision for the open gate. Recording never executes anything; `hx run --resume`
 /// consumes the decision.
 pub fn review(path: &Path, gate_id: &str, decision: &str, input_file: Option<&Path>) -> Result<()> {

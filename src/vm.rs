@@ -1,15 +1,15 @@
 //! Luau VM. Bindings load, then sandbox(true). Two environments sit on the read-only globals:
 //!   * the SESSION env: the model's persistent variables (what `vars()` lists);
 //!   * the MODULE env: where harness modules (std loop, printer, ...) run, with `require` and the `hx` API.
-use crate::effects::{Effects, Ret};
+use crate::effects::Effects;
 use crate::host::Host;
-use crate::policy::{Class, Policy};
+use crate::policy::Policy;
 use crate::prims;
-use anyhow::{Context, Result};
+use crate::supervisor::Supervisor;
+use anyhow::{Context as _, Result};
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic, VmState};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -421,6 +421,7 @@ mod session_budget_tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::Instant;
 
     fn vm(name: &str, budget: Duration, mem_limit: usize) -> (Vm, PathBuf, crate::dirs::TestDirs) {
@@ -939,40 +940,39 @@ pub struct Vm {
     effects: Arc<Effects>,
 }
 
-impl Vm {
-    pub fn new(
-        policy: Arc<Policy>,
-        budget: Duration,
-        mem_limit: usize,
-        host: Option<Arc<Host>>,
-    ) -> Result<Vm> {
-        let root: PathBuf = policy.workspace.clone();
-        let lua = Lua::new();
-        let out = Arc::new(Mutex::new(Printed::default()));
-        let ops = Arc::new(AtomicUsize::new(0));
-        let deadline = Arc::new(Deadline::default());
-        let supervisor = match &host {
-            Some(h) => h.supervisor.clone(),
-            None => {
-                let mut registry = crate::modules::Registry::capture(&root, &policy.dirs)?;
-                registry.materialize_skills(&policy.log)?;
-                crate::supervisor::Supervisor::ephemeral(policy.clone(), Arc::new(registry))
-            }
-        };
-        let registry = supervisor.registry.clone();
-        let g = lua.globals();
-        let principal = host
-            .as_ref()
-            .map(|h| h.principal.clone())
-            .unwrap_or(crate::supervisor::Principal::Agent { read_only: false });
-        let fx = Effects::supervised(
-            supervisor.clone(),
-            principal,
-            host.as_ref().map(|h| h.depth).unwrap_or(0),
-            deadline.clone(),
-        );
+/// What a subsystem's `install` needs to add its bindings to a VM that is being built. Bindings the model sees are
+/// globals, set before the sandbox makes the globals read-only; the module API goes on the `hx` table afterwards.
+pub struct Context<'a> {
+    pub lua: &'a Lua,
+    pub policy: &'a Arc<Policy>,
+    /// The seam every binding that acts goes through.
+    pub fx: &'a Arc<Effects>,
+    pub supervisor: &'a Arc<Supervisor>,
+    /// The agent this VM serves; none for `hx exec`, `hx test` and unit tests.
+    pub host: Option<&'a Arc<Host>>,
+    /// Operations the running chunk performed (its feedback's `ops`).
+    pub ops: &'a Arc<AtomicUsize>,
+}
 
-        // --- session-side builtins (visible to the model) ---
+/// Names a pack exposed in the session (`hx.expose`); `vars()` leaves them out.
+type Exposed = Arc<Mutex<std::collections::HashSet<String>>>;
+
+/// The session's own bindings: `print`'s plumbing and `vars()` as globals, and the `hx.expose` and `hx.retain` that
+/// reach into the session.
+struct SessionBindings {
+    env: Table,
+    out: Arc<Mutex<Printed>>,
+    exposed: Exposed,
+    /// The module loader, once it exists: `print` formats values with std/printer.
+    require: Arc<Mutex<Option<Function>>>,
+    /// chunks run so far (see `hx.retain`)
+    chunks: Arc<AtomicU64>,
+}
+
+impl SessionBindings {
+    fn install(lua: &Lua) -> Result<Self> {
+        let g = lua.globals();
+        let out = Arc::new(Mutex::new(Printed::default()));
         let session_env = lua.create_table()?;
         let buf = out.clone();
         g.set(
@@ -1013,8 +1013,7 @@ impl Vm {
             })?,
         )?;
         let env_for_vars = session_env.clone();
-        let exposed: Arc<Mutex<std::collections::HashSet<String>>> =
-            Arc::new(Mutex::new(Default::default()));
+        let exposed: Exposed = Arc::new(Mutex::new(Default::default()));
         let ex_vars = exposed.clone();
         g.set("vars", lua.create_function(move |lua, ()| {
             let t = lua.create_table()?;
@@ -1025,327 +1024,18 @@ impl Vm {
             }
             Ok(t)
         })?)?;
-        if let Some(h) = host.clone().filter(|h| h.depth == 0) {
-            let hfx = fx.clone();
-            let hops = ops.clone();
-            g.set(
-                "history",
-                lua.create_async_function(
-                    move |lua, (id, range): (Option<Value>, Option<Value>)| {
-                        let (h, fx, ops) = (h.clone(), hfx.clone(), hops.clone());
-                        async move {
-                            let id = id.map(crate::values::copy_out).transpose()?;
-                            let range = range.map(crate::values::copy_out).transpose()?;
-                            let query = crate::history::Query::parse(id, range)
-                                .map_err(mlua::Error::external)?;
-                            let args = json!(query);
-                            ops.fetch_add(1, Ordering::Relaxed);
-                            let result = fx
-                                .run(
-                                    &lua,
-                                    crate::supervisor::Tool::History,
-                                    Class::Read,
-                                    args,
-                                    || async move {
-                                        let value = tokio::task::spawn_blocking(move || {
-                                            crate::history::query(&h.policy.log, query)
-                                        })
-                                        .await
-                                        .map_err(mlua::Error::external)?
-                                        .map_err(mlua::Error::external)?;
-                                        Ok(Ret::Json(value))
-                                    },
-                                )
-                                .await?;
-                            prims::json_value(&lua, result)
-                        }
-                    },
-                )?,
-            )?;
-        }
-        let (bs, bh, bfx, bops) = (supervisor.clone(), host.clone(), fx.clone(), ops.clone());
-        g.set(
-            "batch",
-            lua.create_async_function(move |lua, input: Value| {
-                let (s, h, fx, ops) = (bs.clone(), bh.clone(), bfx.clone(), bops.clone());
-                async move {
-                    crate::effects::yield_first().await;
-                    s.authorize_stage(fx.stage_epoch, crate::supervisor::Tool::Read, Class::Read)
-                        .map_err(mlua::Error::external)?;
-                    let _active = crate::workflow_runtime::EffectGuard::new(&s);
-                    let operations = crate::values::copy_out(input)?;
-                    let _wait = fx.awaiting(&lua);
-                    crate::batch::run(&fx, &lua, h, &ops, operations).await
-                }
-            })?,
-        )?;
-        if host.as_ref().is_some_and(|h| h.is_workflow_root()) {
-            let stage = lua.create_table()?;
-            let frame = supervisor.workflow.lock().unwrap().clone().unwrap();
-            if let Some(active) = frame.stage.as_ref().map(|a| &a.spec) {
-                stage.set("id", active.id.clone())?;
-                stage.set("name", active.name.clone())?;
-                stage.set(
-                    "checks",
-                    crate::values::copy_in(
-                        &lua,
-                        &serde_json::to_value(&frame.check_plan).map_err(mlua::Error::external)?,
-                    )?,
-                )?;
-            }
-            let owner = supervisor.clone();
-            let epoch = supervisor.workflow_epoch();
-            // Preparing a submission hashes the project and reads the journal: blocking work, kept off the VM's thread.
-            stage.set(
-                "submit",
-                lua.create_async_function(move |_, value: Value| {
-                    let owner = owner.clone();
-                    let payload = crate::values::copy_out(value);
-                    async move {
-                        let payload = payload?;
-                        crate::effects::yield_first().await;
-                        tokio::task::spawn_blocking(move || owner.submit_stage(epoch, payload))
-                            .await
-                            .map_err(mlua::Error::external)?
-                            .map_err(mlua::Error::external)
-                    }
-                })?,
-            )?;
-            stage.set_readonly(true);
-            g.set("stage", stage)?;
-        }
-        let saved = host
-            .as_ref()
-            .map(|h| h.durable.clone())
-            .unwrap_or_else(|| supervisor.durable.clone());
-        let durable = lua.create_table()?;
-        let data = saved.clone();
-        durable.set(
-            "get",
-            lua.create_function(
-                move |lua, key: String| match data.lock().unwrap().get(&key) {
-                    Some(value) => crate::values::copy_in(lua, value),
-                    None => Ok(Value::Nil),
-                },
-            )?,
-        )?;
-        let stage_owner = supervisor.clone();
-        let stage_epoch = supervisor.workflow_epoch();
-        durable.set(
-            "set",
-            lua.create_function(move |_, (key, value): (String, Value)| {
-                stage_owner
-                    .authorize_stage(stage_epoch, crate::supervisor::Tool::Read, Class::Read)
-                    .map_err(mlua::Error::external)?;
-                let value = crate::values::copy_out(value)?;
-                let mut saved = saved.lock().unwrap();
-                fn store(
-                    saved: &mut serde_json::Value,
-                ) -> &mut serde_json::Map<String, serde_json::Value> {
-                    saved
-                        .as_object_mut()
-                        .expect("the durable store is validated as an object when loaded")
-                }
-                let previous = store(&mut saved).insert(key.clone(), value);
-                if let Err(e) = crate::values::validate(&saved) {
-                    match previous {
-                        Some(previous) => store(&mut saved).insert(key, previous),
-                        None => store(&mut saved).remove(&key),
-                    };
-                    return Err(e);
-                }
-                Ok(())
-            })?,
-        )?;
-        durable.set_readonly(true);
-        g.set("durable", durable)?;
-        if let Some(h) = host.clone() {
-            let afx = fx.clone();
-            g.set(
-                "agent",
-                lua.create_async_function(move |lua, (task, opts): (String, Option<Table>)| {
-                    let (h, afx) = (h.clone(), afx.clone());
-                    async move {
-                        let options = crate::host::AgentOptions::from_lua(opts)?;
-                        let child = h
-                            .child(&options, afx.principal.clone())
-                            .map_err(mlua::Error::external)?;
-                        prims::agent(&afx, &lua, child, task, &options)
-                            .await?
-                            .into_lua(&lua)
-                    }
-                })?,
-            )?;
-        }
-        prims::install(&lua, fx.clone(), ops.clone())?;
+        Ok(Self {
+            env: session_env,
+            out,
+            exposed,
+            require: require_cell,
+            chunks: Arc::new(AtomicU64::new(0)),
+        })
+    }
 
-        // ---- MCP: frozen server configuration; every list/call records a receipt ----
-        let mcp = crate::mcp::Mcp::frozen(policy.clone(), registry.mcp.clone())?;
-        if let Some(m) = mcp.clone() {
-            let (lfx, lm) = (fx.clone(), m.clone());
-            g.set(
-                "__mcp_list",
-                lua.create_async_function(move |lua, server: String| {
-                    let (fx, m) = (lfx.clone(), lm.clone());
-                    async move {
-                        let ret = fx
-                            .run(
-                                &lua,
-                                crate::supervisor::Tool::McpList,
-                                Class::Read,
-                                json!({"server": server}),
-                                || async {
-                                    let tools = m
-                                        .list_tools(&server)
-                                        .await
-                                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
-                                    Ok(Ret::Json(serde_json::Value::Array(tools)))
-                                },
-                            )
-                            .await?;
-                        prims::json_value(&lua, ret)
-                    }
-                })?,
-            )?;
-            let (cfx, cm) = (fx.clone(), m.clone());
-            g.set(
-                "__mcp_call",
-                lua.create_async_function(
-                    move |lua, (server, tool, args): (String, String, Value)| {
-                        let (fx, m) = (cfx.clone(), cm.clone());
-                        async move {
-                            let args_json = crate::values::copy_out(args)?;
-                            let class = if m.is_read_only(&server, &tool) {
-                                Class::Read
-                            } else {
-                                Class::External
-                            };
-                            let a = json!({"server": server, "tool": tool, "args": args_json});
-                            let ret = fx
-                                .run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
-                                    let call = crate::policy::Call::Mcp {
-                                        server: &server,
-                                        tool: &tool,
-                                    };
-                                    fx.pol
-                                        .approve_call(call, &args_json, class)
-                                        .await
-                                        .map_err(mlua::Error::external)?;
-                                    let r = m
-                                        .request(
-                                            &server,
-                                            "tools/call",
-                                            json!({"name": tool, "arguments": args_json}),
-                                        )
-                                        .await
-                                        .map_err(|e| {
-                                            crate::net::effect_error(
-                                                class,
-                                                e.delivery,
-                                                e.to_string(),
-                                            )
-                                        })?;
-                                    Ok(Ret::Json(r))
-                                })
-                                .await?;
-                            prims::json_value(&lua, ret)
-                        }
-                    },
-                )?,
-            )?;
-        }
-        let mcp_names: Vec<String> = mcp
-            .as_ref()
-            .map(|m| m.servers.keys().cloned().collect())
-            .unwrap_or_default();
-        lua.load(PRELUDE).set_name("=prelude").exec()?;
-
-        lua.sandbox(true)?;
-        lua.set_memory_limit(mem_limit)?;
-        Budget {
-            run_deadline: supervisor.manifest.as_ref().and_then(|m| m.deadline),
-            deadline: deadline.clone(),
-            waiting: Some(fx.waiting.clone()),
-            exceeded: "time budget exceeded (infinite loop?)",
-        }
-        .install(&lua);
-        let gmt = locked_env(&lua, &g)?;
-        session_env.set_metatable(Some(gmt.clone()))?;
-
-        // --- module env: require + hx API (not visible to the model's session) ---
-        let modenv = lua.create_table()?;
-        modenv.set_metatable(Some(gmt))?;
-        let loaded = lua.create_table()?;
-        let (res, menv, ld, supervisor_for_load, package_host, package_fx) = (
-            registry.clone(),
-            modenv.clone(),
-            loaded.clone(),
-            supervisor.clone(),
-            host.clone(),
-            fx.clone(),
-        );
-        let require = lua.create_function(move |lua, name: String| {
-            let cached: Value = ld.get(name.as_str())?;
-            if !cached.is_nil() {
-                return Ok(cached);
-            }
-            let load = |src: &crate::modules::Source| -> mlua::Result<Value> {
-                if let Some((pkg, _)) = &src.pkg {
-                    if name != *pkg {
-                        return Err(mlua::Error::runtime(
-                            "package submodules are private; call exported package methods",
-                        ));
-                    }
-                    return crate::packages::proxy(
-                        lua,
-                        supervisor_for_load.clone(),
-                        package_host.clone(),
-                        pkg,
-                        package_fx.clone(),
-                    )
-                    .map(Value::Table);
-                }
-                let env = menv.clone();
-                let f = lua
-                    .load(&src.text)
-                    .set_name(format!("={name}"))
-                    .set_environment(env)
-                    .into_function()?;
-                f.call(())
-            };
-            let src = res
-                .resolve(&name)
-                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
-            let v = match load(&src) {
-                // A project override must load and return a table (every harness module does); otherwise fall back
-                // to the built-in module so a typo in an override cannot take the harness down.
-                Ok(v @ Value::Table(_)) => v,
-                bad if src.is_override => {
-                    let why = match bad {
-                        Err(e) => e.to_string().lines().next().unwrap_or("").to_string(),
-                        Ok(v) => format!("returned {} instead of a table", v.type_name()),
-                    };
-                    eprintln!(
-                        "warning: override {} is broken ({why}); using the built-in {name}",
-                        src.origin
-                    );
-                    let base = res
-                        .resolve(&format!("base:{name}"))
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
-                    load(&base)?
-                }
-                other => other?,
-            };
-            ld.set(name.as_str(), v.clone())?;
-            Ok(v)
-        })?;
-        *require_cell.lock().unwrap() = Some(require.clone());
-        modenv.set("require", require)?;
-        modenv.set("print", lua.create_function(stderr_print)?)?;
-
-        let hx = lua.create_table()?;
+    fn install_api(&self, lua: &Lua, hx: &Table) -> Result<()> {
         // A pack adds functions/tables to the model's session (not to `vars()`): hx.expose("tests", tests)
-        let (sess_env, ex_set) = (session_env.clone(), exposed.clone());
+        let (sess_env, ex_set) = (self.env.clone(), self.exposed.clone());
         hx.set(
             "expose",
             lua.create_function(move |_, (name, v): (String, Value)| {
@@ -1356,10 +1046,9 @@ impl Vm {
         )?;
         // hx.retain(v) -> n: keep a value the printer cut as `_cut[n]` in the session, so its notice can name it. The list
         // belongs to the latest chunk that cut something; the next chunk can read it until it cuts something itself.
-        let chunks = Arc::new(AtomicU64::new(0));
         let (cut_env, cut_chunks, cut_seq) = (
-            session_env.clone(),
-            chunks.clone(),
+            self.env.clone(),
+            self.chunks.clone(),
             Arc::new(Mutex::new(u64::MAX)),
         );
         hx.set(
@@ -1380,123 +1069,101 @@ impl Vm {
                 Ok(list.raw_len())
             })?,
         )?;
-        let session = Session {
-            lua: lua.clone(),
-            log: policy.log.clone(),
-            env: session_env,
-            out,
-            ops,
-            deadline,
-            budget,
-            mem_limit,
-            chunks,
-        };
-        // hx.view_image(path, max) -> { path, width, height, orig_width, orig_height, mime, data } for the vision pack.
-        // Record the live image identity once and return the same loaded bytes.
-        let vfx = fx.clone();
-        hx.set("view_image", lua.create_async_function(move |lua, (path, max): (String, Option<u32>)| {
-            let vfx = vfx.clone();
-            async move {
-                let max = max.unwrap_or(VIEW_MAX.0).clamp(VIEW_MAX.1, VIEW_MAX.2);
-                let (pol, image_path) = (vfx.pol.clone(), path.clone());
-                // The journal records the image's identity; the image itself comes back through `live`.
-                let live: Arc<Mutex<Option<crate::prims::ViewImage>>> = Arc::default();
-                let slot = live.clone();
-                vfx.run(&lua, crate::supervisor::Tool::View, Class::Read, json!({"path": &path, "max": max}), || prims::blocking(move || {
-                    let v = crate::prims::load_view_image(&pol, &image_path, max).map_err(mlua::Error::runtime)?;
-                    let meta = json!({"sha256": v.sha256, "width": v.width, "height": v.height}).to_string();
-                    *slot.lock().unwrap() = Some(v);
-                    Ok(Ret::Str(meta))
-                })).await?;
-                let v = live.lock().unwrap().take().ok_or_else(|| mlua::Error::runtime("view executor returned no image"))?;
-                let t = lua.create_table()?;
-                t.set("path", path)?;
-                t.set("width", v.width)?;
-                t.set("height", v.height)?;
-                t.set("orig_width", v.orig.0)?;
-                t.set("orig_height", v.orig.1)?;
-                t.set("mime", v.mime)?;
-                t.set("data", v.data_b64)?;
-                Ok(t)
+        Ok(())
+    }
+}
+
+impl Vm {
+    /// Build an agent's VM: every subsystem installs its bindings, then the sandbox locks the globals, then the
+    /// module environment gets `require` and the `hx` API, then the local tools join the session.
+    pub fn new(
+        policy: Arc<Policy>,
+        budget: Duration,
+        mem_limit: usize,
+        host: Option<Arc<Host>>,
+    ) -> Result<Vm> {
+        let lua = Lua::new();
+        let deadline = Arc::new(Deadline::default());
+        let supervisor = match &host {
+            Some(h) => h.supervisor.clone(),
+            None => {
+                let mut registry =
+                    crate::modules::Registry::capture(&policy.workspace, &policy.dirs)?;
+                registry.materialize_skills(&policy.log)?;
+                Supervisor::ephemeral(policy.clone(), Arc::new(registry))
             }
-        })?)?;
-        let h2 = host.clone();
-        hx.set(
-            "log",
-            lua.create_function(move |_, line: String| {
-                match &h2 {
-                    Some(h) => h.log(&line),
-                    None => eprintln!("{line}"),
-                }
-                Ok(())
-            })?,
-        )?;
-        let rroot = registry.clone();
-        hx.set(
-            "asset",
-            lua.create_function(move |_, name: String| {
-                rroot.asset(&name).map_err(mlua::Error::external)
-            })?,
-        )?;
-        if let Some(h) = host.clone() {
-            let bh = h.clone();
-            hx.set(
-                "budget",
-                lua.create_function(move |lua, ()| {
-                    crate::values::copy_in(lua, &bh.budget_status())
-                })?,
-            )?;
-            let mh = h.clone();
-            hx.set(
-                "model_info",
-                lua.create_function(move |lua, ()| crate::values::copy_in(lua, &mh.model_info()))?,
-            )?;
+        };
+        let principal = host
+            .as_ref()
+            .map(|h| h.principal.clone())
+            .unwrap_or(crate::supervisor::Principal::Agent { read_only: false });
+        let fx = Effects::supervised(
+            supervisor.clone(),
+            principal,
+            host.as_ref().map(|h| h.depth).unwrap_or(0),
+            deadline.clone(),
+        );
+        let ops = Arc::new(AtomicUsize::new(0));
+        let cx = Context {
+            lua: &lua,
+            policy: &policy,
+            fx: &fx,
+            supervisor: &supervisor,
+            host: host.as_ref(),
+            ops: &ops,
+        };
+
+        // --- session-side builtins (visible to the model) ---
+        // The real globals: once sandboxed, `lua.globals()` is a fresh, empty environment in front of them.
+        let globals = lua.globals();
+        let session = SessionBindings::install(&lua)?;
+        crate::history::install(&cx)?;
+        crate::batch::install(&cx)?;
+        crate::workflow_runtime::install(&cx)?;
+        crate::builtins::install_durable(&cx)?;
+        crate::builtins::install_agent(&cx)?;
+        prims::install(&lua, fx.clone(), ops.clone())?;
+        let mcp_servers = crate::mcp::install(&cx)?;
+        lua.load(PRELUDE).set_name("=prelude").exec()?;
+
+        lua.sandbox(true)?;
+        lua.set_memory_limit(mem_limit)?;
+        Budget {
+            run_deadline: supervisor.manifest.as_ref().and_then(|m| m.deadline),
+            deadline: deadline.clone(),
+            waiting: Some(fx.waiting.clone()),
+            exceeded: "time budget exceeded (infinite loop?)",
         }
-        // ---- extension API: installed packages and skills ----
-        let pres = registry.clone();
-        hx.set("autopilot", policy.autopilot)?;
-        hx.set("confined", crate::confine::status().is_ok())?;
-        hx.set(
-            "limits",
-            crate::values::copy_in(&lua, &prims::prompt_limits())?,
-        )?;
-        hx.set(
-            "mcp_servers",
-            lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_names.clone()))?,
-        )?;
-        hx.set(
-            "packages",
-            lua.create_function(move |lua, ()| {
-                crate::values::copy_in(
-                    lua,
-                    &serde_json::to_value(&pres.packages).map_err(mlua::Error::external)?,
-                )
-            })?,
-        )?;
-        let assets = registry.clone();
-        hx.set(
-            "skill_asset",
-            lua.create_function(move |_, (name, file): (String, String)| {
-                assets
-                    .asset(&format!("{name}/{file}"))
-                    .map_err(mlua::Error::external)
-            })?,
-        )?;
+        .install(&lua);
+        let gmt = locked_env(&lua, &globals)?;
+        session.env.set_metatable(Some(gmt.clone()))?;
+
+        // --- module env: require + hx API (not visible to the model's session) ---
+        let modenv = lua.create_table()?;
+        modenv.set_metatable(Some(gmt))?;
+        let require = crate::packages::require(&cx, &modenv)?;
+        *session.require.lock().unwrap() = Some(require.clone());
+        modenv.set("require", require)?;
+        modenv.set("print", lua.create_function(stderr_print)?)?;
+        let hx = lua.create_table()?;
+        session.install_api(&lua, &hx)?;
+        crate::builtins::install_view(&cx, &hx)?;
+        crate::packages::install_api(&cx, &hx, mcp_servers)?;
         modenv.set("hx", hx)?;
-        let lines = crate::tools::install(&lua, &session.env, supervisor, host, fx.clone())?;
-        for name in registry.tools.keys() {
-            if !session.env.raw_get::<Value>(name.as_str())?.is_nil() {
-                exposed.lock().unwrap().insert(name.clone());
-            }
-        }
-        let tool_prompt = if lines.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n# Local tools (user-configured)\n{}", lines.join("\n"))
-        };
+        let tool_prompt = crate::tools::install(&cx, &session.env, &session.exposed)?;
         Ok(Vm {
+            session: Session {
+                lua: lua.clone(),
+                log: policy.log.clone(),
+                env: session.env,
+                out: session.out,
+                ops,
+                deadline,
+                budget,
+                mem_limit,
+                chunks: session.chunks,
+            },
             lua,
-            session,
             modenv,
             tool_prompt,
             #[cfg(test)]

@@ -307,6 +307,51 @@ fn render(message: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// `history(id?, range?)`, in the root agent's session only: the compactions so far, read from the journal.
+pub fn install(cx: &crate::vm::Context) -> Result<()> {
+    use crate::{effects::Ret, policy::Class, prims};
+    use std::sync::atomic::Ordering;
+    let Some(h) = cx.host.cloned().filter(|h| h.depth == 0) else {
+        return Ok(());
+    };
+    let hfx = cx.fx.clone();
+    let hops = cx.ops.clone();
+    cx.lua.globals().set(
+        "history",
+        cx.lua.create_async_function(
+            move |lua, (id, range): (Option<mlua::Value>, Option<mlua::Value>)| {
+                let (h, fx, ops) = (h.clone(), hfx.clone(), hops.clone());
+                async move {
+                    let id = id.map(crate::values::copy_out).transpose()?;
+                    let range = range.map(crate::values::copy_out).transpose()?;
+                    let query = Query::parse(id, range).map_err(mlua::Error::external)?;
+                    let args = json!(query);
+                    ops.fetch_add(1, Ordering::Relaxed);
+                    let result = fx
+                        .run(
+                            &lua,
+                            crate::supervisor::Tool::History,
+                            Class::Read,
+                            args,
+                            || async move {
+                                let value = tokio::task::spawn_blocking(move || {
+                                    crate::history::query(&h.policy.log, query)
+                                })
+                                .await
+                                .map_err(mlua::Error::external)?
+                                .map_err(mlua::Error::external)?;
+                                Ok(Ret::Json(value))
+                            },
+                        )
+                        .await?;
+                    prims::json_value(&lua, result)
+                }
+            },
+        )?,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

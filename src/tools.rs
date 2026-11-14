@@ -14,7 +14,7 @@ use serde_json::json;
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -628,8 +628,34 @@ fn redact(value: &mut serde_json::Value, key: &str) {
     }
 }
 
-/// Bind all methods together, rejecting collisions before touching the session environment.
+/// Install the frozen local tools in the session `env`, marking them `exposed` (out of `vars()`), and return what
+/// the system prompt says about them (empty without tools).
 pub fn install(
+    cx: &crate::vm::Context,
+    env: &Table,
+    exposed: &Mutex<std::collections::HashSet<String>>,
+) -> Result<String> {
+    let lines = bind(
+        cx.lua,
+        env,
+        cx.supervisor.clone(),
+        cx.host.cloned(),
+        cx.fx.clone(),
+    )?;
+    for name in cx.supervisor.registry.tools.keys() {
+        if !env.raw_get::<Value>(name.as_str())?.is_nil() {
+            exposed.lock().unwrap().insert(name.clone());
+        }
+    }
+    Ok(if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n# Local tools (user-configured)\n{}", lines.join("\n"))
+    })
+}
+
+/// Bind all methods together, rejecting collisions before touching the session environment.
+fn bind(
     lua: &Lua,
     env: &Table,
     supervisor: Arc<crate::supervisor::Supervisor>,

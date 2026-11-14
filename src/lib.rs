@@ -19,6 +19,7 @@ macro_rules! outln {
 
 pub mod atomic_file;
 pub mod batch;
+pub mod builtins;
 pub mod confine;
 pub mod controller;
 pub mod dirs;

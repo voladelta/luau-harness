@@ -759,6 +759,88 @@ impl Mcp {
     }
 }
 
+/// `__mcp_list` and `__mcp_call` (std/mcp's raw bindings) for the frozen server configuration; every list and call
+/// records a receipt. Returns the configured server names, for `hx.mcp_servers`.
+pub fn install(cx: &crate::vm::Context) -> Result<Vec<String>> {
+    use crate::{effects::Ret, policy::Class, prims};
+    let (lua, fx) = (cx.lua, cx.fx);
+    let g = lua.globals();
+    let mcp = Mcp::frozen(cx.policy.clone(), cx.supervisor.registry.mcp.clone())?;
+    if let Some(m) = mcp.clone() {
+        let (lfx, lm) = (fx.clone(), m.clone());
+        g.set(
+            "__mcp_list",
+            lua.create_async_function(move |lua, server: String| {
+                let (fx, m) = (lfx.clone(), lm.clone());
+                async move {
+                    let ret = fx
+                        .run(
+                            &lua,
+                            crate::supervisor::Tool::McpList,
+                            Class::Read,
+                            json!({"server": server}),
+                            || async {
+                                let tools = m
+                                    .list_tools(&server)
+                                    .await
+                                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                                Ok(Ret::Json(serde_json::Value::Array(tools)))
+                            },
+                        )
+                        .await?;
+                    prims::json_value(&lua, ret)
+                }
+            })?,
+        )?;
+        let (cfx, cm) = (fx.clone(), m.clone());
+        g.set(
+            "__mcp_call",
+            lua.create_async_function(
+                move |lua, (server, tool, args): (String, String, mlua::Value)| {
+                    let (fx, m) = (cfx.clone(), cm.clone());
+                    async move {
+                        let args_json = crate::values::copy_out(args)?;
+                        let class = if m.is_read_only(&server, &tool) {
+                            Class::Read
+                        } else {
+                            Class::External
+                        };
+                        let a = json!({"server": server, "tool": tool, "args": args_json});
+                        let ret = fx
+                            .run(&lua, crate::supervisor::Tool::McpCall, class, a, || async {
+                                let call = crate::policy::Call::Mcp {
+                                    server: &server,
+                                    tool: &tool,
+                                };
+                                fx.pol
+                                    .approve_call(call, &args_json, class)
+                                    .await
+                                    .map_err(mlua::Error::external)?;
+                                let r = m
+                                    .request(
+                                        &server,
+                                        "tools/call",
+                                        json!({"name": tool, "arguments": args_json}),
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        crate::net::effect_error(class, e.delivery, e.to_string())
+                                    })?;
+                                Ok(Ret::Json(r))
+                            })
+                            .await?;
+                        prims::json_value(&lua, ret)
+                    }
+                },
+            )?,
+        )?;
+    }
+    Ok(mcp
+        .as_ref()
+        .map(|m| m.servers.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

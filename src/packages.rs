@@ -358,6 +358,144 @@ pub fn proxy(
     )
 }
 
+/// The module environment's `require`: a harness module from the frozen registry, run in `modenv`, or a package's
+/// proxy. Each name loads once.
+pub fn require(cx: &crate::vm::Context, modenv: &Table) -> anyhow::Result<mlua::Function> {
+    let loaded = cx.lua.create_table()?;
+    let (res, menv, ld, supervisor_for_load, package_host, package_fx) = (
+        cx.supervisor.registry.clone(),
+        modenv.clone(),
+        loaded.clone(),
+        cx.supervisor.clone(),
+        cx.host.cloned(),
+        cx.fx.clone(),
+    );
+    let require = cx.lua.create_function(move |lua, name: String| {
+        let cached: Value = ld.get(name.as_str())?;
+        if !cached.is_nil() {
+            return Ok(cached);
+        }
+        let load = |src: &crate::modules::Source| -> mlua::Result<Value> {
+            if let Some((pkg, _)) = &src.pkg {
+                if name != *pkg {
+                    return Err(mlua::Error::runtime(
+                        "package submodules are private; call exported package methods",
+                    ));
+                }
+                return proxy(
+                    lua,
+                    supervisor_for_load.clone(),
+                    package_host.clone(),
+                    pkg,
+                    package_fx.clone(),
+                )
+                .map(Value::Table);
+            }
+            let env = menv.clone();
+            let f = lua
+                .load(&src.text)
+                .set_name(format!("={name}"))
+                .set_environment(env)
+                .into_function()?;
+            f.call(())
+        };
+        let src = res
+            .resolve(&name)
+            .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        let v = match load(&src) {
+            // A project override must load and return a table (every harness module does); otherwise fall back
+            // to the built-in module so a typo in an override cannot take the harness down.
+            Ok(v @ Value::Table(_)) => v,
+            bad if src.is_override => {
+                let why = match bad {
+                    Err(e) => e.to_string().lines().next().unwrap_or("").to_string(),
+                    Ok(v) => format!("returned {} instead of a table", v.type_name()),
+                };
+                eprintln!(
+                    "warning: override {} is broken ({why}); using the built-in {name}",
+                    src.origin
+                );
+                let base = res
+                    .resolve(&format!("base:{name}"))
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                load(&base)?
+            }
+            other => other?,
+        };
+        ld.set(name.as_str(), v.clone())?;
+        Ok(v)
+    })?;
+    Ok(require)
+}
+
+/// The `hx` module API harness modules and packs use: logging, assets, budget and model facts, limits, and the
+/// installed packages, skills and MCP servers (`mcp_servers`, from `mcp::install`).
+pub fn install_api(
+    cx: &crate::vm::Context,
+    hx: &Table,
+    mcp_servers: Vec<String>,
+) -> anyhow::Result<()> {
+    let (lua, registry) = (cx.lua, &cx.supervisor.registry);
+    let h2 = cx.host.cloned();
+    hx.set(
+        "log",
+        lua.create_function(move |_, line: String| {
+            match &h2 {
+                Some(h) => h.log(&line),
+                None => eprintln!("{line}"),
+            }
+            Ok(())
+        })?,
+    )?;
+    let rroot = registry.clone();
+    hx.set(
+        "asset",
+        lua.create_function(move |_, name: String| {
+            rroot.asset(&name).map_err(mlua::Error::external)
+        })?,
+    )?;
+    if let Some(h) = cx.host.cloned() {
+        let bh = h.clone();
+        hx.set(
+            "budget",
+            lua.create_function(move |lua, ()| values::copy_in(lua, &bh.budget_status()))?,
+        )?;
+        let mh = h.clone();
+        hx.set(
+            "model_info",
+            lua.create_function(move |lua, ()| values::copy_in(lua, &mh.model_info()))?,
+        )?;
+    }
+    // ---- extension API: installed packages and skills ----
+    let pres = registry.clone();
+    hx.set("autopilot", cx.policy.autopilot)?;
+    hx.set("confined", crate::confine::status().is_ok())?;
+    hx.set("limits", values::copy_in(lua, &prims::prompt_limits())?)?;
+    hx.set(
+        "mcp_servers",
+        lua.create_function(move |lua, ()| lua.create_sequence_from(mcp_servers.clone()))?,
+    )?;
+    hx.set(
+        "packages",
+        lua.create_function(move |lua, ()| {
+            values::copy_in(
+                lua,
+                &serde_json::to_value(&pres.packages).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let assets = registry.clone();
+    hx.set(
+        "skill_asset",
+        lua.create_function(move |_, (name, file): (String, String)| {
+            assets
+                .asset(&format!("{name}/{file}"))
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    Ok(())
+}
+
 /// What `hx test` prints: the failures, and the counts.
 #[derive(Default)]
 pub struct TestReport {

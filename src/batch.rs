@@ -179,6 +179,33 @@ fn error_text(error: &mlua::Error) -> String {
     }
 }
 
+/// `batch(operations)`: see `run`.
+pub fn install(cx: &crate::vm::Context) -> Result<()> {
+    use crate::policy::Class;
+    let (bs, bh, bfx, bops) = (
+        cx.supervisor.clone(),
+        cx.host.cloned(),
+        cx.fx.clone(),
+        cx.ops.clone(),
+    );
+    cx.lua.globals().set(
+        "batch",
+        cx.lua.create_async_function(move |lua, input: Value| {
+            let (s, h, fx, ops) = (bs.clone(), bh.clone(), bfx.clone(), bops.clone());
+            async move {
+                crate::effects::yield_first().await;
+                s.authorize_stage(fx.stage_epoch, crate::supervisor::Tool::Read, Class::Read)
+                    .map_err(mlua::Error::external)?;
+                let _active = crate::workflow_runtime::EffectGuard::new(&s);
+                let operations = crate::values::copy_out(input)?;
+                let _wait = fx.awaiting(&lua);
+                run(&fx, &lua, h, &ops, operations).await
+            }
+        })?,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
