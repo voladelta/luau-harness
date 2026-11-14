@@ -127,7 +127,7 @@ thinking, and sends thinking blocks back exactly as they came. The five tools it
 
 ```lua
 local M = host.load(host.default_loop, "=loop")()
-M.model = "deepseek-pro"
+M.model = "deepseek-v4-pro"
 table.insert(M.tools, { name = "check", description = "...", parameters = {...}, run = function(args) ... end })
 return M
 ```

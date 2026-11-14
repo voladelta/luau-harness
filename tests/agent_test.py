@@ -571,7 +571,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
         # A setting changed in it, and a function replaced in it, change what is sent.
         with open(loop, "w") as f:
-            f.write(source.replace('-- M.model = "deepseek-pro"', 'M.model = "project-model"')
+            f.write(source.replace('-- M.model = "deepseek-v4-pro"', 'M.model = "project-model"')
                     .replace("-- local built_in_prompt", "local built_in_prompt")
                     .replace("-- function M.system_prompt()", "function M.system_prompt()")
                     .replace("-- \treturn built_in_prompt()", "\treturn built_in_prompt()")

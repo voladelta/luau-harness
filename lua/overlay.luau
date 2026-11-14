@@ -6,7 +6,7 @@
 local M = host.load(host.default_loop, "=loop")()
 
 -- The model, and the other settings at the top of the built-in loop:
--- M.model = "deepseek-pro"
+-- M.model = "deepseek-v4-pro"
 
 -- A tool of this project's own. run(args) returns the text the model sees; raising reports an error to it.
 -- table.insert(M.tools, {
