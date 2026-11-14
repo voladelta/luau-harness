@@ -288,7 +288,7 @@ and cheaper through `web`.
 
 | Call | Returns |
 |---|---|
-| `ext("exa").deep(query, objective, {queries?, schema?, count?, lite?})` | `{answer, grounding, results, notices, cost}`: `answer` is text, or a table when `schema` is given; `grounding` lists the citations behind each field; `results` are the sources, best first, `{title, url, date?, author?, highlights}`. Printed or returned from `lua`, it reads as the answer and a numbered list of sources. `objective` says which documents should rank first, which to leave out and what facts to pull; `queries` is up to 10 further starting searches; `schema` is an Exa output schema of type `"object"` (at most 10 properties, 2 levels deep); `count` is 1 to 100 sources (default 10); `lite = true` uses `deep-lite` |
+| `ext("exa").deep(query, objective, {queries?, schema?, count?})` | `{answer, grounding, results, notices, cost}`: `answer` is text, or a table when `schema` is given; `grounding` lists the citations behind each field; `results` are the sources, best first, `{title, url, date?, author?, highlights}`. Printed or returned from `lua`, it reads as the answer and a numbered list of sources. `objective` says which documents should rank first, which to leave out and what facts to pull; `queries` is up to 10 further starting searches; `schema` is an Exa output schema of type `"object"` (at most 10 properties, 2 levels deep); `count` is 1 to 100 sources (default 10). The search type is always `deep` |
 
 Every request asks for highlights, Exa's excerpts of each page that answer the query, not the whole page. Exa's
 notices go to the model with the answer; its warnings go to stderr. Deep Search costs $12 per 1,000 requests up to

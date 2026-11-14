@@ -1,4 +1,4 @@
--- researches a question on the web with Exa's Deep Search: deep(query, objective, {queries?, schema?, count?, lite?}) -> answer and sources
+-- researches a question on the web with Exa's Deep Search: deep(query, objective, {queries?, schema?, count?}) -> answer and sources
 --
 -- Built into hx; a project's own .hx/ext/exa.luau takes its place. The call goes to Exa's /search endpoint with
 -- type "deep" and EXA_API_KEY, whatever model the loop talks to. hx adds the key; this code never sees it.
@@ -121,15 +121,14 @@ local function research_text(r)
 end
 local Research = { __tostring = research_text }
 
--- deep(query, objective, {queries = nil, schema = nil, count = 10, lite = false}) -> research
+-- deep(query, objective, {queries = nil, schema = nil, count = 10}) -> research
 --
 -- query says what to research, in plain words: the subject, and any source type or period that changes what a
 -- good page looks like. objective is the goal this search serves: which documents should rank first, which should
 -- be left out, and what specific facts or figures to pull from them. queries is a list of up to 10 further
 -- searches to start from, each a different direction, not a rephrasing. schema is an Exa output schema of type
 -- "object" (at most 10 properties in all, 2 levels deep, every array with items), for an answer as a table; by
--- default the answer is text. count is how many sources come back, 1 to 100 (the price covers 10). lite = true
--- uses deep-lite: lighter research, about 4 seconds.
+-- default the answer is text. count is how many sources come back, 1 to 100 (the price covers 10).
 --
 -- The research is {answer (text, or a table for a schema), grounding ({field, citations = {{url, title}},
 -- confidence}), results ({title, url, date?, author?, highlights}), notices (strings), cost (dollars or nil)}.
@@ -175,7 +174,7 @@ function M.deep(query, objective, options)
 		query = query,
 		objective = objective,
 		additionalQueries = queries,
-		type = options.lite and "deep-lite" or "deep",
+		type = "deep",
 		numResults = count,
 		contents = { highlights = true },
 		outputSchema = schema or { type = "text", description = M.answer },
