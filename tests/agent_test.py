@@ -318,6 +318,19 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(self.tool_results()[1], "still running\n[exit 0]")
         self.assert_gone(int(read(self.project, "bg.pid")))
 
+    def test_a_daemon_lives_until_hx_exits(self):
+        for flags in [(), ("--no-sandbox",)]:
+            daemon = "setsid sh -c 'echo $$ > daemon.pid; exec sleep 300' > /dev/null 2>&1 < /dev/null &"
+            done = self.run_hx(*flags, "go", script=[
+                call("bash", {"command": daemon + " while [ ! -s daemon.pid ]; do sleep 0.05; done"}, "c1"),
+                call("bash", {"command": "ps -o sid= -p $$ $(cat daemon.pid)"}, "c2"),
+                say("ok")])
+            self.assertEqual(done.returncode, 0, done.stderr)
+            sessions = self.tool_results()[1].split()[:2]
+            self.assertNotEqual(sessions[0], sessions[1], "the daemon left the command's session")
+            self.assert_gone(int(read(self.project, "daemon.pid")))
+            os.remove(os.path.join(self.project, "daemon.pid"))
+
     def wait_for_pid_file(self, name):
         path = os.path.join(self.project, name)
         for _ in range(200):

@@ -3,6 +3,7 @@
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +27,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -41,6 +44,7 @@ constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm aborts
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;
 constexpr int kPollMs = 50;
+constexpr int kKillRounds = 100;  // at exit, so that a fork storm cannot hold hx up forever
 constexpr double kLongest = 1e9;  // seconds, about 30 years: the longest duration a call can ask for
 
 // Signal handlers cannot be given context, so this state is global. It is the only mutable global state here.
@@ -255,6 +259,43 @@ void kill_group(pid_t group) {
     }
 }
 
+// The parent of a process, read from /proc/PID/stat: "PID (COMM) STATE PPID ...". COMM can hold spaces and
+// parentheses, so the fields are counted from the last ')'. Returns 0 when that cannot be read.
+pid_t parent_of(pid_t pid) {
+    const UniqueFd file(open(fmt::format("/proc/{}/stat", pid).c_str(), O_RDONLY | O_CLOEXEC));
+    std::array<char, 512> buffer{};  // reaches well past PPID: COMM is at most 64 bytes
+    const ssize_t n = file.valid() ? read(file.get(), buffer.data(), buffer.size()) : -1;
+    if (n <= 0) {
+        return 0;
+    }
+    const std::string_view stat(buffer.data(), static_cast<std::size_t>(n));
+    const std::size_t close = stat.rfind(')');
+    if (close == std::string_view::npos || stat.size() < close + 4) {
+        return 0;
+    }
+    const std::string_view fields = stat.substr(close + 4);  // past ") S "
+    pid_t parent = 0;
+    std::from_chars(fields.data(), fields.data() + fields.size(), parent);
+    return parent;
+}
+
+// The processes whose parent is hx, exited ones that have not been reaped included.
+std::vector<pid_t> children() {
+    const pid_t self = getpid();
+    std::vector<pid_t> found;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it("/proc", ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        const char* last = name.data() + name.size();
+        pid_t pid = 0;
+        const auto [stop, error] = std::from_chars(name.data(), last, pid);
+        if (error == std::errc() && stop == last && parent_of(pid) == self) {
+            found.push_back(pid);
+        }
+    }
+    return found;
+}
+
 // Runs in the forked child, so it may only call async-signal-safe functions: no allocation, no stdio.
 [[noreturn]] void exec_bash(const char* command, int output) {
     // A session of its own: one process group to kill, and no terminal to ask a question on.
@@ -434,11 +475,27 @@ int l_env(lua_State* L) {
 
 }  // namespace
 
-Host::Host(HostConfig config, const Sandbox& sandbox) : config_(std::move(config)), sandboxed_(sandbox.confined()) {}
+Host::Host(HostConfig config, const Sandbox& sandbox) : config_(std::move(config)), sandboxed_(sandbox.confined()) {
+    // An orphan comes to hx instead of init, whatever session it moved to, so every process a command started stays
+    // a descendant of hx and ~Host can find it.
+    prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+}
 
+// Kills every descendant. Killing a child orphans its children, which then become children of hx, so each round
+// reaches one level further down the tree.
 Host::~Host() {
-    for (const pid_t group : groups_) {
-        kill(-group, SIGKILL);
+    for (int round = 0; round < kKillRounds; ++round) {
+        const std::vector<pid_t> doomed = children();
+        if (doomed.empty()) {
+            break;
+        }
+        for (const pid_t pid : doomed) {
+            kill(pid, SIGKILL);
+        }
+        for (const pid_t pid : doomed) {
+            while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+            }
+        }
     }
 }
 
@@ -518,9 +575,13 @@ int Host::llm(lua_State* L) {
 
 int Host::sh(lua_State* L) {
     const char* command = check_cstring(L, 1);
-    Host& host = of(L);
+    const Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
     raise_if_signaled(L);  // a stop in progress starts no command
+    // Adopted orphans that have exited are zombies of hx. No command of hx's own is running now, so this cannot
+    // take the status of one.
+    while (waitpid(-1, nullptr, WNOHANG) > 0) {
+    }
 
     std::array<int, 2> pipe_fds{};
     if (pipe2(pipe_fds.data(), O_CLOEXEC) != 0) {
@@ -538,8 +599,6 @@ int Host::sh(lua_State* L) {
     input.reset();
     fcntl(output.get(), F_SETFL, O_NONBLOCK);
 
-    std::erase_if(host.groups_, [](pid_t group) { return kill(-group, 0) != 0 && errno == ESRCH; });
-    host.groups_.push_back(pid);
     const ForegroundScope foreground(pid);
 
     Capture capture;

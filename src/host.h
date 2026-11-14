@@ -1,8 +1,6 @@
 #ifndef HX_HOST_H_
 #define HX_HOST_H_
 
-#include <sys/types.h>
-
 #include <string>
 #include <vector>
 
@@ -46,7 +44,8 @@ struct HostConfig {
 // unwinds to the top, so no pcall can swallow it. An expired host.timed limit raises "timeout" the same way, until
 // its call returns.
 //
-// Destroying the Host kills every process group host.sh started that is still alive.
+// The Host makes hx a child subreaper, so whatever a command leaves running stays a descendant of hx, even after
+// setsid. Destroying the Host kills every descendant.
 class Host {
   public:
     // The Sandbox is required as evidence that confinement was decided before anything can run.
@@ -75,9 +74,8 @@ class Host {
 
     HostConfig config_;
     bool sandboxed_;
-    double deadline_ = 0;        // the innermost host.timed limit on the monotonic clock; 0 for none
-    int tries_ = 0;              // host.try and host.timed calls in progress
-    std::vector<pid_t> groups_;  // process groups host.sh started
+    double deadline_ = 0;  // the innermost host.timed limit on the monotonic clock; 0 for none
+    int tries_ = 0;        // host.try and host.timed calls in progress
 };
 
 // Makes SIGINT, SIGTERM and SIGHUP stop the running command or request and surface as a Luau error. A second

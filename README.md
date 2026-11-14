@@ -86,7 +86,8 @@ Also in force:
 - The API key is read once and removed from the environment, together with every variable whose name ends in
   `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS`. Luau code never sees the key: the host adds
   it to requests for the configured endpoint only, and commands cannot read it out of the host's memory.
-- The VM has a memory ceiling of 1 GiB, and every process group a command started is killed when `hx` exits.
+- The VM has a memory ceiling of 1 GiB, and every process a command started is killed when `hx` exits, a
+  daemon that called `setsid` included: `hx` is a child subreaper, so all of them stay its descendants.
 
 ### What the wall does not do
 
@@ -102,7 +103,8 @@ Know these before you rely on it.
 - **What the model writes, you may later run.** A changed `Makefile`, test, or `.git/hooks` script runs with
   your full access when you run it outside `hx`. Git hooks do not show in `git diff`.
 - **Secrets stored in the project are readable**, as are secrets in variables with unusual names.
-- **A process that calls `setsid` outlives `hx`.** It stays confined, but it is not killed.
+- **A process outlives `hx` when `hx` dies without its exit path:** killed with SIGKILL, or leaving at once on a
+  second signal that came before the first was handled. Such a process stays confined, but it is not killed.
 - **The model can edit `.hx/loop.luau` and its extensions.** That is the point, and it shows in `git diff`.
   If the loop no longer compiles, the built-in one runs instead.
 - **Nothing asks before a file in the project is changed or deleted.** Git is the undo.
