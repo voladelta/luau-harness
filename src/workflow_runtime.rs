@@ -1,26 +1,167 @@
 //! RPI's durable stage boundaries: submission authority, receipts, artifacts and owner gates. The host side is
 //! specific to std/rpi; only stage routing and prompts live in Luau.
+//!
+//! The rest of the runtime reaches the workflow through two narrow seams, and names no workflow anywhere else:
+//!   * `StageFence`, the effect seam's hook (`Effects::fence`): may this effect run now, and what facts go on its
+//!     receipt;
+//!   * `RootWorkflow`, the host loop's hook (`root`): opening a resumed run, stage boundaries, owner gates, pending
+//!     delivery, chunk ends, projections and the report's workflow fields.
 use crate::{
+    controller::Command,
     eventlog,
     host::Host,
-    policy::Class,
-    supervisor::{Checkpoint, RunState, Supervisor, Tool},
+    policy::{BudgetExceeded, Class, Policy},
+    supervisor::{Checkpoint, RunState, Tool},
     workflow::*,
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{path::Path, sync::atomic::Ordering};
+use std::{
+    ops::ControlFlow,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
-pub struct EffectGuard<'a>(&'a Supervisor);
-impl<'a> EffectGuard<'a> {
-    pub fn new(supervisor: &'a Supervisor) -> Self {
-        supervisor.active_effects.fetch_add(1, Ordering::SeqCst);
-        Self(supervisor)
+/// A workflow's live state in a run: the execution frame its checkpoints carry, and the effects in flight. The
+/// supervisor holds it (`Supervisor::workflow`) when the run's manifest selects a workflow.
+pub struct WorkflowRuntime {
+    policy: Arc<Policy>,
+    frame: Mutex<ExecutionFrame>,
+    /// Effects (and batches) admitted under the fence and not yet finished: a submission and a boundary need none.
+    active_effects: AtomicUsize,
+}
+
+impl WorkflowRuntime {
+    pub fn new(policy: Arc<Policy>, frame: ExecutionFrame) -> Arc<Self> {
+        Arc::new(Self {
+            policy,
+            frame: Mutex::new(frame),
+            active_effects: AtomicUsize::new(0),
+        })
+    }
+
+    /// The frame as it is now, for a checkpoint.
+    pub fn frame(&self) -> ExecutionFrame {
+        self.frame.lock().unwrap().clone()
+    }
+
+    /// The effect hook for a VM made now: it admits effects of the stage active now, until that stage submits or ends.
+    pub fn fence(self: &Arc<Self>) -> StageFence {
+        StageFence {
+            epoch: self.frame.lock().unwrap().stage_epoch,
+            runtime: self.clone(),
+        }
     }
 }
+
+/// The effect seam's hook: one VM's hold on the stage that was active when the VM was made. It answers whether an
+/// effect may run now (the stage ceiling and the submission fence) and observes the facts its receipt carries.
+#[derive(Clone)]
+pub struct StageFence {
+    runtime: Arc<WorkflowRuntime>,
+    epoch: u64,
+}
+
+/// Counts an effect as in flight until dropped (see `StageFence::in_flight`).
+pub struct EffectGuard<'a>(&'a WorkflowRuntime);
 impl Drop for EffectGuard<'_> {
     fn drop(&mut self) {
         self.0.active_effects.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl StageFence {
+    /// May an effect of `tool` run now? Only while this VM's stage is the active one and has not submitted, and only
+    /// if the stage's access admits the tool: an inspect stage reads and asks, it does not change anything.
+    pub fn admit(&self, tool: Tool, class: Class) -> Result<()> {
+        let frame = self.runtime.frame.lock().unwrap();
+        ensure!(
+            self.epoch == frame.stage_epoch,
+            "stage effect belongs to a stale epoch"
+        );
+        let active = frame.stage.as_ref().context("no active workflow stage")?;
+        ensure!(
+            active.submission.is_none(),
+            "stage.submit is terminal: effects after submission are refused"
+        );
+        let stage = &active.spec;
+        if stage.access == StageAccess::Inspect {
+            ensure!(
+                matches!(
+                    tool,
+                    Tool::Read
+                        | Tool::Search
+                        | Tool::History
+                        | Tool::View
+                        | Tool::Agent
+                        | Tool::Llm
+                        | Tool::McpList
+                ) || matches!(tool, Tool::Http | Tool::McpCall) && class == Class::Read,
+                "stage inspect access denies {}",
+                tool.name()
+            );
+        }
+        Ok(())
+    }
+
+    /// Count an admitted effect as in flight until the guard drops: a submission or a boundary waits for none.
+    pub fn in_flight(&self) -> EffectGuard<'_> {
+        self.runtime.active_effects.fetch_add(1, Ordering::SeqCst);
+        EffectGuard(&self.runtime)
+    }
+
+    /// The stage facts for the intent of an effect of `tool`: the stage ID, and for a verification-stage shell
+    /// command the project as observed now. Observation runs Git and hashes up to 256 MiB, so it runs on a blocking
+    /// thread.
+    pub async fn intent_facts(&self, tool: Tool) -> Result<Option<StageFacts>> {
+        self.stage_facts(tool, true).await
+    }
+
+    /// The stage facts for the outcome of an effect whose intent recorded `intent` (none for an effect without an
+    /// intent, whose record no check receipt can use, so the project is not observed for it). A project that could not
+    /// be observed at intent makes the receipt unusable already; its outcome carries the same error unobserved.
+    pub async fn outcome_facts(
+        &self,
+        tool: Tool,
+        intent: Option<&StageFacts>,
+    ) -> Result<Option<StageFacts>> {
+        match intent.and_then(|facts| facts.project.as_ref()) {
+            Some(ProjectFact::Unobservable(_)) => Ok(intent.cloned()),
+            Some(ProjectFact::Digest(_)) => self.stage_facts(tool, true).await,
+            None => self.stage_facts(tool, false).await,
+        }
+    }
+
+    async fn stage_facts(&self, tool: Tool, observe: bool) -> Result<Option<StageFacts>> {
+        let (stage_id, plan) = {
+            let frame = self.runtime.frame.lock().unwrap();
+            let Some(active) = frame.stage.as_ref() else {
+                return Ok(None);
+            };
+            let verify = observe && matches!(tool, Tool::Sh) && active.spec.verify;
+            (
+                active.spec.id.clone(),
+                verify.then(|| frame.check_plan.clone()),
+            )
+        };
+        let project = match plan {
+            None => None,
+            Some(plan) => {
+                let workspace = self.runtime.policy.workspace.clone();
+                let observed =
+                    tokio::task::spawn_blocking(move || observe_checks(&workspace, &plan))
+                        .await
+                        .context("project observation thread")?;
+                Some(match observed {
+                    Ok(observation) => ProjectFact::Digest(observation.digest),
+                    Err(error) => ProjectFact::Unobservable(format!("{error:#}")),
+                })
+            }
+        };
+        Ok(Some(StageFacts { stage_id, project }))
     }
 }
 
@@ -60,7 +201,7 @@ impl StageFacts {
 }
 
 /// What a resumed owner gate does next.
-pub(crate) enum OwnerResume {
+enum OwnerResume {
     /// No unconsumed decision is recorded: the run stays paused.
     Waiting,
     /// A decision was consumed; deliver this event to the controller.
@@ -69,129 +210,28 @@ pub(crate) enum OwnerResume {
     Rejected(String),
 }
 
-impl Supervisor {
-    pub fn workflow_epoch(&self) -> Option<u64> {
-        self.workflow
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|f| f.stage_epoch)
-    }
-    pub fn authorize_stage(&self, epoch: Option<u64>, tool: Tool, class: Class) -> Result<()> {
-        let frame = self.workflow.lock().unwrap();
-        let Some(frame) = frame.as_ref() else {
-            return Ok(());
-        };
-        ensure!(
-            epoch == Some(frame.stage_epoch),
-            "stage effect belongs to a stale epoch"
-        );
-        let active = frame.stage.as_ref().context("no active workflow stage")?;
-        ensure!(
-            active.submission.is_none(),
-            "stage.submit is terminal: effects after submission are refused"
-        );
-        let stage = &active.spec;
-        if stage.access == StageAccess::Inspect {
-            ensure!(
-                matches!(
-                    tool,
-                    Tool::Read
-                        | Tool::Search
-                        | Tool::History
-                        | Tool::View
-                        | Tool::Agent
-                        | Tool::Llm
-                        | Tool::McpList
-                ) || matches!(tool, Tool::Http | Tool::McpCall) && class == Class::Read,
-                "stage inspect access denies {}",
-                tool.name()
-            );
-        }
-        Ok(())
-    }
-    /// The stage facts for the intent of an effect of `tool`: the stage ID, and for a verification-stage shell
-    /// command the project as observed now. Observation runs Git and hashes up to 256 MiB, so it runs on a blocking
-    /// thread.
-    pub async fn intent_stage(&self, tool: Tool) -> Result<Option<StageFacts>> {
-        self.stage_facts(tool, true).await
-    }
-
-    /// The stage facts for the outcome of an effect whose intent recorded `intent` (none for an effect without an
-    /// intent, whose record no check receipt can use, so the project is not observed for it). A project that could not
-    /// be observed at intent makes the receipt unusable already; its outcome carries the same error unobserved.
-    pub async fn outcome_stage(
-        &self,
-        tool: Tool,
-        intent: Option<&StageFacts>,
-    ) -> Result<Option<StageFacts>> {
-        match intent.and_then(|facts| facts.project.as_ref()) {
-            Some(ProjectFact::Unobservable(_)) => Ok(intent.cloned()),
-            Some(ProjectFact::Digest(_)) => self.stage_facts(tool, true).await,
-            None => self.stage_facts(tool, false).await,
-        }
-    }
-
-    async fn stage_facts(&self, tool: Tool, observe: bool) -> Result<Option<StageFacts>> {
-        let (stage_id, plan) = {
-            let guard = self.workflow.lock().unwrap();
-            let Some((frame, active)) = guard
-                .as_ref()
-                .and_then(|f| f.stage.as_ref().map(|a| (f, a)))
-            else {
-                return Ok(None);
-            };
-            let verify = observe && matches!(tool, Tool::Sh) && active.spec.verify;
-            (
-                active.spec.id.clone(),
-                verify.then(|| frame.check_plan.clone()),
-            )
-        };
-        let project = match plan {
-            None => None,
-            Some(plan) => {
-                let workspace = self.policy.workspace.clone();
-                let observed =
-                    tokio::task::spawn_blocking(move || observe_checks(&workspace, &plan))
-                        .await
-                        .context("project observation thread")?;
-                Some(match observed {
-                    Ok(observation) => ProjectFact::Digest(observation.digest),
-                    Err(error) => ProjectFact::Unobservable(format!("{error:#}")),
-                })
-            }
-        };
-        Ok(Some(StageFacts { stage_id, project }))
-    }
-
+impl WorkflowRuntime {
     /// `stage.submit`: check the payload against the active stage and prepare the submission the chunk's boundary
     /// seals. Everything the model influences is checked here, so a bad payload is a refused call the model can
     /// correct rather than a failed boundary. A refusal also marks the stage, so the chunk reports `submission_error`.
-    pub fn submit_stage(&self, epoch: Option<u64>, payload: Value) -> Result<String> {
-        self.check()?;
+    fn submit(&self, epoch: u64, payload: Value) -> Result<String> {
         let result = self.prepare_submission(epoch, payload);
-        if result.is_err()
-            && let Some(active) = self
-                .workflow
-                .lock()
-                .unwrap()
-                .as_mut()
-                .filter(|f| Some(f.stage_epoch) == epoch)
-                .and_then(|f| f.stage.as_mut())
-        {
-            active.refused = true;
+        if result.is_err() {
+            let mut frame = self.frame.lock().unwrap();
+            if frame.stage_epoch == epoch
+                && let Some(active) = frame.stage.as_mut()
+            {
+                active.refused = true;
+            }
         }
         result
     }
 
-    fn prepare_submission(&self, epoch: Option<u64>, mut payload: Value) -> Result<String> {
+    fn prepare_submission(&self, epoch: u64, mut payload: Value) -> Result<String> {
         let (stage, plan, started) = {
-            let guard = self.workflow.lock().unwrap();
-            let frame = guard
-                .as_ref()
-                .context("stage.submit requires an active workflow")?;
+            let frame = self.frame.lock().unwrap();
             ensure!(
-                epoch == Some(frame.stage_epoch),
+                epoch == frame.stage_epoch,
                 "stage.submit belongs to a stale stage"
             );
             let active = frame
@@ -291,7 +331,7 @@ impl Supervisor {
     /// Store the checked submission's document and make it the stage's prepared submission.
     fn seal_submission(
         &self,
-        epoch: Option<u64>,
+        epoch: u64,
         stage: StageSpec,
         payload: Value,
         document: String,
@@ -303,10 +343,9 @@ impl Supervisor {
                 &json!({"stage":stage.id,"payload":payload,"blob":document_blob})
             )?)
         );
-        let mut guard = self.workflow.lock().unwrap();
-        let active = guard
-            .as_mut()
-            .filter(|f| Some(f.stage_epoch) == epoch)
+        let mut frame = self.frame.lock().unwrap();
+        let active = Some(&mut *frame)
+            .filter(|f| f.stage_epoch == epoch)
             .and_then(|f| f.stage.as_mut())
             .filter(|a| a.submission.is_none())
             .context("stage.submit: the stage changed while the submission was prepared")?;
@@ -320,9 +359,9 @@ impl Supervisor {
     }
 
     /// End a root chunk of the active stage. A failed chunk invalidates its prepared submission.
-    pub fn finish_stage_chunk(&self, success: bool) -> ChunkEnd {
-        let mut frame = self.workflow.lock().unwrap();
-        let Some(active) = frame.as_mut().and_then(|f| f.stage.as_mut()) else {
+    fn finish_stage_chunk(&self, success: bool) -> ChunkEnd {
+        let mut frame = self.frame.lock().unwrap();
+        let Some(active) = frame.stage.as_mut() else {
             return ChunkEnd::default();
         };
         if !success {
@@ -357,67 +396,178 @@ fn document_event(
     ]))
 }
 
-impl Host {
-    pub(crate) fn is_workflow_root(&self) -> bool {
-        self.depth == 0
-            && self
-                .supervisor
-                .manifest
-                .as_ref()
-                .is_some_and(|m| m.workflow.is_some())
+/// The host loop's hook: the run's workflow as its root agent drives it. The loop calls it at the few points a
+/// workflow needs (see the module header); everything else in the loop is the plain loop.
+pub(crate) struct RootWorkflow<'a> {
+    host: &'a Host,
+    config: &'a WorkflowConfig,
+    runtime: &'a WorkflowRuntime,
+}
+
+/// The run's workflow, if its manifest selects one and `host` is the root agent.
+pub(crate) fn root(host: &Host) -> Option<RootWorkflow<'_>> {
+    if host.depth != 0 {
+        return None;
+    }
+    Some(RootWorkflow {
+        config: host.supervisor.manifest.as_ref()?.workflow.as_ref()?,
+        runtime: host.supervisor.workflow.as_deref()?,
+        host,
+    })
+}
+
+impl RootWorkflow<'_> {
+    /// The workflow's controller module, named by the frozen manifest.
+    pub(crate) fn controller_entry(&self) -> String {
+        format!("std/{}", self.config.name)
+    }
+
+    /// The active stage's ID, for a compaction archive.
+    pub(crate) fn stage_id(&self) -> Option<String> {
+        self.runtime
+            .frame
+            .lock()
+            .unwrap()
+            .stage
+            .as_ref()
+            .map(|a| a.spec.id.clone())
+    }
+
+    /// The event a committed boundary or consumed decision left for the controller, not yet delivered.
+    pub(crate) fn pending_event(&self) -> Option<Value> {
+        self.runtime.frame.lock().unwrap().pending_event.clone()
+    }
+
+    /// Whether the controller step for `event` is administrative: it delivers an owner decision or a stage start,
+    /// dispatches no model or workspace effect, and so runs even past the run deadline.
+    pub(crate) fn administrative(&self, event: &Value) -> bool {
+        matches!(
+            event["kind"].as_str(),
+            Some("owner_decision" | "boundary_ready")
+        )
+    }
+
+    /// After a controller step: a chunk result the controller did not turn into a boundary invalidates the chunk's
+    /// submission, and a delivered administrative event is consumed.
+    pub(crate) fn after_step(&self, event: &Value, command: &Command, administrative: bool) {
+        if event["kind"] == "run_result" && !matches!(command, Command::Boundary { .. }) {
+            self.runtime.finish_stage_chunk(false);
+        }
+        if administrative {
+            self.runtime.frame.lock().unwrap().pending_event = None;
+        }
+    }
+
+    /// End a root chunk: its prepared submission, or that `stage.submit` refused one, goes into its result.
+    pub(crate) fn end_chunk(&self, result: &mut Value) {
+        let end = self.runtime.finish_stage_chunk(result["error"].is_null());
+        if let Some(submission) = end.submission {
+            result["submission"] = submission;
+        }
+        if end.refused {
+            result["submission_error"] = json!(true);
+        }
+    }
+
+    /// A workflow ends only through a boundary; the plain loop's `finish` is refused.
+    pub(crate) fn refuse_finish(&self) -> Result<()> {
+        anyhow::bail!("RPI must finish through a durable workflow boundary")
+    }
+
+    /// The workflow's fields of a report: its name and status, the active stage, and where the artifacts are.
+    pub(crate) fn decorate_report(&self, report: &mut Value) {
+        report["workflow"] = json!(self.config.name);
+        if report.get("status").is_none() {
+            report["status"] = json!(if report["finished"] == true {
+                "completed"
+            } else {
+                "stopped"
+            });
+        }
+        let frame = self.runtime.frame.lock().unwrap();
+        if report.get("stage").is_none() {
+            report["stage"] = json!(frame.stage.as_ref().map(|a| &a.spec.name));
+        }
+        report["artifact_directory"] = json!(
+            self.host
+                .workspace
+                .join(".agents/artifacts")
+                .join(format!("rpi-{}", self.host.policy.log.session))
+        );
     }
 
     /// Regenerate the readable projections under `.agents/artifacts/rpi-RUN/`. They are views of canonical journal
     /// blobs, so a failure is reported and never stops the run.
-    pub(crate) fn project_workflow_artifacts(&self) {
-        if !self.is_workflow_root() {
-            return;
-        }
-        let latest: Vec<ArtifactRef> = match self.supervisor.workflow.lock().unwrap().as_ref() {
-            // Keep only the latest projection for a stable view name.
-            Some(frame) => {
-                let mut latest = std::collections::BTreeMap::new();
-                for artifact in &frame.artifacts {
-                    latest.insert(&artifact.name, artifact);
-                }
-                latest.into_values().cloned().collect()
+    pub(crate) fn project_artifacts(&self) {
+        let host = self.host;
+        // Keep only the latest projection for a stable view name.
+        let latest: Vec<ArtifactRef> = {
+            let frame = self.runtime.frame.lock().unwrap();
+            let mut latest = std::collections::BTreeMap::new();
+            for artifact in &frame.artifacts {
+                latest.insert(&artifact.name, artifact);
             }
-            None => return,
+            latest.into_values().cloned().collect()
         };
         for artifact in &latest {
             if let Err(error) = project_artifact(
-                &self.workspace,
-                &self.policy.log.session,
-                self.policy.log.dir(),
+                &host.workspace,
+                &host.policy.log.session,
+                host.policy.log.dir(),
                 artifact,
             ) {
                 let message = format!("artifact projection {} failed: {error:#}", artifact.name);
                 eprintln!("hx: warning: {message}");
-                self.log(&format!("### WARNING\n{message}"));
+                host.log(&format!("### WARNING\n{message}"));
             }
         }
     }
 
-    pub(crate) fn workflow_pause_report(&self, report: &serde_json::Map<String, Value>) -> Value {
+    fn pause_report(&self, report: &serde_json::Map<String, Value>) -> Value {
         let mut report = Value::Object(report.clone());
-        if let Err(error) = self.supervisor.check() {
+        if let Err(error) = self.host.supervisor.check() {
             report["continuation_error"] = json!(error.to_string());
         }
-        self.report(report, 0.0)
+        self.host.report(report, 0.0)
+    }
+
+    /// Open a resumed run paused at an owner gate: deliver the owner's recorded decision (`Continue` with its event),
+    /// or stay paused and return the pause report (`Break`). Any other run continues with no event of the workflow's.
+    pub(crate) fn open_gate(&self) -> Result<ControlFlow<Value, Option<Value>>> {
+        let host = self.host;
+        let Some(paused @ RunState::AwaitingReview { report, gate, .. }) =
+            &host.supervisor.restored
+        else {
+            return Ok(ControlFlow::Continue(None));
+        };
+        Ok(match self.resume_owner_decision(gate) {
+            Ok(OwnerResume::Deliver(event)) => ControlFlow::Continue(Some(event)),
+            Ok(OwnerResume::Waiting) => ControlFlow::Break(self.pause_report(report)),
+            Ok(OwnerResume::Rejected(reason)) => {
+                // Commit the consumption, so the gate reopens for a new decision.
+                host.supervisor.checkpoint(
+                    &host.lane,
+                    paused.clone(),
+                    &host.durable.lock().unwrap(),
+                )?;
+                let mut report = report.clone();
+                report.insert("decision_rejected".into(), json!(reason));
+                ControlFlow::Break(self.pause_report(&report))
+            }
+            Err(error) if error.is::<BudgetExceeded>() => {
+                ControlFlow::Break(self.pause_report(report))
+            }
+            Err(error) => return Err(error),
+        })
     }
 
     /// Consume the latest unconsumed owner decision recorded for the open gate, exactly once. An approval of an
     /// acceptance gate whose project changed since verification is consumed without effect, so the owner can record
     /// another decision for the same gate.
-    pub(crate) fn resume_owner_decision(&self, request: &ReviewRequest) -> Result<OwnerResume> {
-        let mut frame = self
-            .supervisor
-            .workflow
-            .lock()
-            .unwrap()
-            .clone()
-            .context("missing workflow frame")?;
-        let records = eventlog::load(&self.policy.log.path)?;
+    fn resume_owner_decision(&self, request: &ReviewRequest) -> Result<OwnerResume> {
+        let host = self.host;
+        let mut frame = self.runtime.frame();
+        let records = eventlog::load(&host.policy.log.path)?;
         let decision = records.iter().rev().find(|r| {
             r["kind"] == "owner_decision"
                 && r["gate_id"] == request.gate_id
@@ -435,11 +585,11 @@ impl Host {
             .context("owner decision without a valid decision")?;
         // A final acceptance reduction dispatches no model or workspace effects.
         if !(request.continuation == Continuation::Finish && kind == Decision::Approve) {
-            self.supervisor.check()?;
+            host.supervisor.check()?;
         }
         let text = decision["content_blob"]
             .as_str()
-            .map(|b| eventlog::read_blob(self.policy.log.dir(), b))
+            .map(|b| eventlog::read_blob(host.policy.log.dir(), b))
             .transpose()?
             .map(String::from_utf8)
             .transpose()?
@@ -448,14 +598,14 @@ impl Host {
         if kind == Decision::Approve
             && let Some(project) = &request.project
         {
-            let stale = match observe_project(&self.workspace, &project.extra_inputs) {
+            let stale = match observe_project(&host.workspace, &project.extra_inputs) {
                 Ok(now) if now.digest == project.digest => None,
                 Ok(_) => Some("the project changed after verification".to_string()),
                 Err(error) => Some(format!("the project cannot be observed: {error:#}")),
             };
             if let Some(reason) = stale {
                 frame.consumed_decisions.push(id);
-                *self.supervisor.workflow.lock().unwrap() = Some(frame);
+                *self.runtime.frame.lock().unwrap() = frame;
                 return Ok(OwnerResume::Rejected(format!(
                     "approval of acceptance gate {} discarded: {reason}; record `revise` to repair and verify again",
                     request.gate_id
@@ -471,14 +621,14 @@ impl Host {
         });
         frame.consumed_decisions.push(id);
         let event = crate::controller::Event::OwnerDecision {
-            document: document_event(&frame, &self.policy.log)?,
+            document: document_event(&frame, &host.policy.log)?,
             decision: json!(kind),
             text,
             request: serde_json::to_value(request)?,
         }
         .to_json();
         frame.pending_event = Some(event.clone());
-        *self.supervisor.workflow.lock().unwrap() = Some(frame);
+        *self.runtime.frame.lock().unwrap() = frame;
         Ok(OwnerResume::Deliver(event))
     }
 
@@ -489,29 +639,20 @@ impl Host {
         boundary: Boundary,
         controller: &Value,
     ) -> Result<RunState> {
-        ensure!(
-            self.is_workflow_root(),
-            "workflow boundary requires explicit root workflow selection"
-        );
+        let host = self.host;
         boundary.validate()?;
         ensure!(
-            self.supervisor.active_effects.load(Ordering::SeqCst) == 0,
+            self.runtime.active_effects.load(Ordering::SeqCst) == 0,
             "boundary requires quiescent descendants"
         );
-        let mut frame = self
-            .supervisor
-            .workflow
-            .lock()
-            .unwrap()
-            .clone()
-            .context("missing workflow frame")?;
+        let mut frame = self.runtime.frame();
         let hash = eventlog::sha_bytes(&serde_json::to_vec(&boundary)?);
         if let Some(old) = frame.boundaries.get(&boundary.id) {
             ensure!(old == &hash, "boundary ID reused with different contents");
             anyhow::bail!("boundary already committed; consume its pending delivery");
         }
         if frame.artifacts.is_empty() {
-            let task = &self
+            let task = &host
                 .supervisor
                 .manifest
                 .as_ref()
@@ -520,7 +661,7 @@ impl Host {
             frame.artifacts.push(ArtifactRef {
                 id: "request".into(),
                 name: "01-request.md".into(),
-                document_blob: self.policy.log.blob(task.as_bytes())?,
+                document_blob: host.policy.log.blob(task.as_bytes())?,
                 summary: "Original request".into(),
                 submission: json!({}),
                 stage_id: "request".into(),
@@ -570,12 +711,12 @@ impl Host {
                     );
                 }
                 frame.stage_epoch += 1;
-                let mut metadata = json!({"workspace":self.workspace,"files":crate::host::file_tree(&self.workspace),"check_plan":frame.check_plan});
+                let mut metadata = json!({"workspace":host.workspace,"files":crate::host::file_tree(&host.workspace),"check_plan":frame.check_plan});
                 frame.observation = None;
                 if stage.verify {
                     // An unobservable project does not stop the run: the stage is told why, and its verification
                     // fails, which goes to repair.
-                    match observe_checks(&self.workspace, &frame.check_plan) {
+                    match observe_checks(&host.workspace, &frame.check_plan) {
                         Ok(observation) => frame.observation = Some(observation),
                         Err(error) => metadata["project_error"] = json!(format!("{error:#}")),
                     }
@@ -586,7 +727,7 @@ impl Host {
                     refused: false,
                 });
                 let event = crate::controller::Event::BoundaryReady {
-                    document: document_event(&frame, &self.policy.log)?,
+                    document: document_event(&frame, &host.policy.log)?,
                     stage: serde_json::to_value(&stage)?,
                     metadata,
                 }
@@ -614,8 +755,8 @@ impl Host {
                     "status": if input {"needs_input"} else {"awaiting_review"},
                     "stage": frame.stage.as_ref().map(|a| &a.spec.name),
                     "gate": request,
-                    "artifact_directory": self.workspace.join(".agents/artifacts").join(format!("rpi-{}", self.policy.log.session)),
-                    "next_command": format!("hx review {} --gate {} --decision {}", self.policy.log.path.display(), request.gate_id,
+                    "artifact_directory": host.workspace.join(".agents/artifacts").join(format!("rpi-{}", host.policy.log.session)),
+                    "next_command": format!("hx review {} --gate {} --decision {}", host.policy.log.path.display(), request.gate_id,
                         if input {"answer --input-file answers.md"} else {"approve"}),
                 });
                 if !frame.check_plan.is_empty() {
@@ -646,16 +787,16 @@ impl Host {
                         "workflow cannot finish with failed check evidence"
                     );
                     ensure!(
-                        self.supervisor.uncertain_operations().is_empty(),
+                        host.supervisor.uncertain_operations().is_empty(),
                         "workflow cannot finish with uncertain effects"
                     );
                 }
                 report.insert(
                     "artifact_directory".into(),
                     json!(
-                        self.workspace
+                        host.workspace
                             .join(".agents/artifacts")
-                            .join(format!("rpi-{}", self.policy.log.session))
+                            .join(format!("rpi-{}", host.policy.log.session))
                     ),
                 );
                 report.insert("artifact_refs".into(), json!(frame.artifacts));
@@ -665,19 +806,19 @@ impl Host {
                 RunState::Finished { report }
             }
         };
-        *self.supervisor.workflow.lock().unwrap() = Some(frame);
+        *self.runtime.frame.lock().unwrap() = frame;
         Ok(saved)
     }
 }
 
 /// `stage`, in the session of a workflow's root agent: the active stage's `id`, `name` and `checks`, and `submit`.
 pub fn install(cx: &crate::vm::Context) -> Result<()> {
-    if !cx.host.is_some_and(|h| h.is_workflow_root()) {
+    let Some(workflow) = cx.host.and_then(|h| root(h)) else {
         return Ok(());
-    }
-    let (lua, supervisor) = (cx.lua, cx.supervisor);
+    };
+    let lua = cx.lua;
     let stage = lua.create_table()?;
-    let frame = supervisor.workflow.lock().unwrap().clone().unwrap();
+    let frame = workflow.runtime.frame();
     if let Some(active) = frame.stage.as_ref().map(|a| &a.spec) {
         stage.set("id", active.id.clone())?;
         stage.set("name", active.name.clone())?;
@@ -689,21 +830,30 @@ pub fn install(cx: &crate::vm::Context) -> Result<()> {
             )?,
         )?;
     }
-    let owner = supervisor.clone();
-    let epoch = supervisor.workflow_epoch();
+    let (supervisor, runtime) = (
+        cx.supervisor.clone(),
+        cx.supervisor
+            .workflow
+            .clone()
+            .expect("a root workflow has a runtime"),
+    );
+    let epoch = frame.stage_epoch;
     // Preparing a submission hashes the project and reads the journal: blocking work, kept off the VM's thread.
     stage.set(
         "submit",
         lua.create_async_function(move |_, value: mlua::Value| {
-            let owner = owner.clone();
+            let (supervisor, runtime) = (supervisor.clone(), runtime.clone());
             let payload = crate::values::copy_out(value);
             async move {
                 let payload = payload?;
                 crate::effects::yield_first().await;
-                tokio::task::spawn_blocking(move || owner.submit_stage(epoch, payload))
-                    .await
-                    .map_err(mlua::Error::external)?
-                    .map_err(mlua::Error::external)
+                tokio::task::spawn_blocking(move || {
+                    supervisor.check()?;
+                    runtime.submit(epoch, payload)
+                })
+                .await
+                .map_err(mlua::Error::external)?
+                .map_err(mlua::Error::external)
             }
         })?,
     )?;

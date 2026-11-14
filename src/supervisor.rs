@@ -824,8 +824,8 @@ pub struct Supervisor {
     pub durable: Arc<Mutex<Value>>,
     pub restored: Option<RunState>,
     pub recovery: Option<Value>,
-    pub workflow: Mutex<Option<crate::workflow::ExecutionFrame>>,
-    pub active_effects: std::sync::atomic::AtomicUsize,
+    /// The run's workflow, when its manifest selects one: the effect seam's hook and the frame its checkpoints carry.
+    pub workflow: Option<Arc<crate::workflow_runtime::WorkflowRuntime>>,
 }
 
 /// What a new run is launched with. `Supervisor::start` freezes it into the run's manifest.
@@ -884,7 +884,6 @@ impl Supervisor {
             .log
             .write("manifest", json!({"format": FORMAT, "blob": blob}), true)?;
         Ok(Arc::new(Self {
-            policy,
             history: crate::history::History::default(),
             registry: Arc::new(registry),
             manifest: Some(manifest),
@@ -894,8 +893,10 @@ impl Supervisor {
             durable: Arc::new(Mutex::new(durable)),
             restored: None,
             recovery: None,
-            workflow: Mutex::new(workflow.map(|_| crate::workflow::ExecutionFrame::default())),
-            active_effects: std::sync::atomic::AtomicUsize::new(0),
+            workflow: workflow.map(|_| {
+                crate::workflow_runtime::WorkflowRuntime::new(policy.clone(), Default::default())
+            }),
+            policy,
         }))
     }
 
@@ -911,8 +912,7 @@ impl Supervisor {
             durable: Arc::new(Mutex::new(json!({}))),
             restored: None,
             recovery: None,
-            workflow: Mutex::new(None),
-            active_effects: std::sync::atomic::AtomicUsize::new(0),
+            workflow: None,
         })
     }
 
@@ -982,7 +982,6 @@ impl Supervisor {
         let mut registry = manifest.registry.clone();
         registry.materialize_skills(&policy.log)?;
         Ok(Arc::new(Self {
-            policy,
             history: crate::history::History::restore(&records)?,
             registry: Arc::new(registry),
             manifest: Some(manifest),
@@ -992,8 +991,9 @@ impl Supervisor {
             durable: Arc::new(Mutex::new(std::mem::take(&mut durable))),
             restored,
             recovery,
-            workflow: Mutex::new(workflow),
-            active_effects: std::sync::atomic::AtomicUsize::new(0),
+            workflow: workflow
+                .map(|frame| crate::workflow_runtime::WorkflowRuntime::new(policy.clone(), frame)),
+            policy,
         }))
     }
 
@@ -1053,7 +1053,7 @@ impl Supervisor {
     ) -> Result<()> {
         self.policy.log.check()?;
         let workflow = if lane == "root" {
-            self.workflow.lock().unwrap().clone()
+            self.workflow.as_ref().map(|w| w.frame())
         } else {
             None
         };

@@ -2,7 +2,7 @@
 use crate::eventlog::{self, EventLog};
 use crate::policy::{ApprovalRequired, ApprovalSource, Class, Policy};
 use crate::supervisor::{Principal, Supervisor, Tool};
-use crate::workflow_runtime::StageFacts;
+use crate::workflow_runtime::{StageFacts, StageFence};
 use anyhow::Result;
 use mlua::Lua;
 use serde_json::{Value, json};
@@ -132,7 +132,9 @@ pub struct Effects {
     pub depth: usize,
     pub supervisor: Arc<Supervisor>,
     pub principal: Principal,
-    pub stage_epoch: Option<u64>,
+    /// The workflow's hook, in a run with a workflow: whether an effect may run now, and the facts its receipt
+    /// carries. Without one, every effect the principal may run is admitted and its receipt carries no extra facts.
+    pub fence: Option<StageFence>,
     /// The chunk's time budget guards against Luau loops, not waiting: time spent awaiting an effect moves it forward.
     pub deadline: Arc<crate::vm::Deadline>,
     /// Luau threads (by pointer) awaiting an effect, with a count per thread; the interrupt skips only those threads,
@@ -191,7 +193,7 @@ impl Effects {
     ) -> Arc<Self> {
         Arc::new(Self {
             pol: supervisor.policy.clone(),
-            stage_epoch: supervisor.workflow_epoch(),
+            fence: supervisor.workflow.as_ref().map(|w| w.fence()),
             depth,
             supervisor,
             principal,
@@ -208,7 +210,21 @@ impl Effects {
         json!({"depth": self.depth, "args_sha": sha})
     }
 
-    fn begin(&self, c: &Call, stage: Option<&StageFacts>) -> mlua::Result<Option<u64>> {
+    /// Whether the hook admits an effect of `tool` now (always, without a hook). Bindings that act only through other
+    /// effects (`batch`, `durable.set`) ask it too, as a read.
+    pub fn admit(&self, tool: Tool, class: Class) -> mlua::Result<()> {
+        match &self.fence {
+            Some(fence) => fence.admit(tool, class).map_err(mlua::Error::external),
+            None => Ok(()),
+        }
+    }
+
+    /// Count an admitted effect as in flight for the hook until the guard drops.
+    pub fn in_flight(&self) -> Option<crate::workflow_runtime::EffectGuard<'_>> {
+        self.fence.as_ref().map(StageFence::in_flight)
+    }
+
+    fn begin(&self, c: &Call, facts: Option<&StageFacts>) -> mlua::Result<Option<u64>> {
         let Call {
             tool,
             class,
@@ -218,7 +234,7 @@ impl Effects {
         (class != Class::Read)
             .then(|| {
                 self.supervisor
-                    .intent(tool, class, args, sha, self.depth, &self.principal, stage)
+                    .intent(tool, class, args, sha, self.depth, &self.principal, facts)
             })
             .transpose()
             .map_err(|e| rt(e.to_string()))
@@ -230,7 +246,7 @@ impl Effects {
         c: &Call,
         res: &mlua::Result<Ret>,
         ms: u64,
-        stage: Option<&StageFacts>,
+        facts: Option<&StageFacts>,
     ) -> mlua::Result<()> {
         let Call {
             tool,
@@ -259,8 +275,8 @@ impl Effects {
         if let Ret::Sh { approval, .. } = &ret {
             r["approval"] = json!(approval.name());
         }
-        if let Some(stage) = stage {
-            stage.record(&mut r);
+        if let Some(facts) = facts {
+            facts.record(&mut r);
         }
         if let Ret::Err(m) = &ret {
             r["detail"] = json!({"error": m.chars().take(300).collect::<String>()});
@@ -316,9 +332,7 @@ impl Effects {
         Fut: Future<Output = mlua::Result<Ret>>,
     {
         yield_first().await;
-        self.supervisor
-            .authorize_stage(self.stage_epoch, tool, class)
-            .map_err(mlua::Error::external)?;
+        self.admit(tool, class)?;
         self.supervisor
             .authorize(&self.principal, tool, class)
             .map_err(|e| rt(e.to_string()))?;
@@ -335,9 +349,7 @@ impl Effects {
             None
         };
         // State may change while queued behind another mutation.
-        self.supervisor
-            .authorize_stage(self.stage_epoch, tool, class)
-            .map_err(mlua::Error::external)?;
+        self.admit(tool, class)?;
         self.supervisor
             .authorize(&self.principal, tool, class)
             .map_err(mlua::Error::external)?;
@@ -350,16 +362,15 @@ impl Effects {
             args: &args,
             sha: &sha,
         };
-        let intent_stage = if class != Class::Read {
-            self.supervisor
-                .intent_stage(tool)
+        let receipt_facts = match &self.fence {
+            Some(fence) if class != Class::Read => fence
+                .intent_facts(tool)
                 .await
-                .map_err(mlua::Error::external)?
-        } else {
-            None
+                .map_err(mlua::Error::external)?,
+            _ => None,
         };
-        let intent = self.begin(&call, intent_stage.as_ref())?;
-        let _active = crate::workflow_runtime::EffectGuard::new(&self.supervisor);
+        let intent = self.begin(&call, receipt_facts.as_ref())?;
+        let _active = self.in_flight();
         let authorization = async {
             let path = match tool {
                 Tool::Sh => args["cwd"].as_str(),
@@ -384,11 +395,9 @@ impl Effects {
         let mut res = match allowed {
             Err(e) => Err(e),
             Ok(()) => {
-                // Recheck after an owner wait: a run may have been revoked or a stage may have ended.
+                // Recheck after an owner wait: a run may have been revoked or the hook may no longer admit the effect.
                 let dispatch = async {
-                    self.supervisor
-                        .authorize_stage(self.stage_epoch, tool, class)
-                        .map_err(mlua::Error::external)?;
+                    self.admit(tool, class)?;
                     self.supervisor
                         .authorize(&self.principal, tool, class)
                         .map_err(mlua::Error::external)?;
@@ -409,17 +418,19 @@ impl Effects {
         if let Ok(Ret::Sh { operation_id, .. }) = &mut res {
             *operation_id = intent;
         }
-        let outcome_stage = self
-            .supervisor
-            .outcome_stage(tool, intent_stage.as_ref())
-            .await
-            .map_err(mlua::Error::external)?;
+        let outcome_receipt_facts = match &self.fence {
+            Some(fence) => fence
+                .outcome_facts(tool, receipt_facts.as_ref())
+                .await
+                .map_err(mlua::Error::external)?,
+            None => None,
+        };
         self.finish(
             intent,
             &call,
             &res,
             t0.elapsed().as_millis() as u64,
-            outcome_stage.as_ref(),
+            outcome_receipt_facts.as_ref(),
         )?;
         res
     }

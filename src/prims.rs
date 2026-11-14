@@ -273,7 +273,7 @@ pub async fn search(
     let base = opts.path.clone().unwrap_or_else(|| ".".into());
     let cap = opts.cap().map_err(|e| rt(e.to_string()))?;
     let args = json!({"pattern": &pattern, "path": &base, "glob": opts.glob, "max": opts.max, "ignore_case": opts.ignore_case, "literal": opts.literal});
-    let (pol, workflow) = (fx.pol.clone(), fx.supervisor.workflow_epoch().is_some());
+    let (pol, workflow) = (fx.pol.clone(), fx.supervisor.workflow.is_some());
     let ret = fx
         .run(lua, Tool::Search, Class::Read, args, || {
             blocking(move || {

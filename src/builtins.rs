@@ -28,14 +28,11 @@ pub fn install_durable(cx: &Context) -> Result<()> {
             },
         )?,
     )?;
-    let stage_owner = supervisor.clone();
-    let stage_epoch = supervisor.workflow_epoch();
+    let fx = cx.fx.clone();
     durable.set(
         "set",
         lua.create_function(move |_, (key, value): (String, Value)| {
-            stage_owner
-                .authorize_stage(stage_epoch, crate::supervisor::Tool::Read, Class::Read)
-                .map_err(mlua::Error::external)?;
+            fx.admit(crate::supervisor::Tool::Read, Class::Read)?;
             let value = crate::values::copy_out(value)?;
             let mut saved = saved.lock().unwrap();
             fn store(

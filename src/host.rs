@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::{
     future::Future,
     io::Write,
+    ops::ControlFlow,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -245,25 +246,8 @@ impl Host {
             }
         }
         report["uncertain_operations"] = json!(uncertain);
-        if self.is_workflow_root() {
-            report["workflow"] = json!("rpi");
-            if report.get("status").is_none() {
-                report["status"] = json!(if report["finished"] == true {
-                    "completed"
-                } else {
-                    "stopped"
-                });
-            }
-            if let Some(frame) = self.supervisor.workflow.lock().unwrap().as_ref() {
-                if report.get("stage").is_none() {
-                    report["stage"] = json!(frame.stage.as_ref().map(|a| &a.spec.name));
-                }
-                report["artifact_directory"] = json!(
-                    self.workspace
-                        .join(".agents/artifacts")
-                        .join(format!("rpi-{}", self.policy.log.session))
-                );
-            }
+        if let Some(workflow) = crate::workflow_runtime::root(self) {
+            workflow.decorate_report(&mut report);
         }
         if report["ops_per_turn"] == json!({}) {
             report["ops_per_turn"] = json!([]);
@@ -417,72 +401,43 @@ impl Host {
         })
     }
 
-    pub(crate) fn controller(&self) -> Result<Controller> {
+    /// The controller: the run's workflow's (named by the manifest) in the root agent, else std/loop. An
+    /// administrative step dispatches nothing, so it runs without the run deadline.
+    fn controller(&self, administrative: bool) -> Result<Controller> {
+        let entry = crate::workflow_runtime::root(self)
+            .map_or_else(|| "std/loop".into(), |w| w.controller_entry());
+        let deadline = self.supervisor.manifest.as_ref().and_then(|m| m.deadline);
         Controller::new(
             self.supervisor.registry.clone(),
             self.model_info(),
             String::new(),
-            self.supervisor.manifest.as_ref().and_then(|m| m.deadline),
-            if self.is_workflow_root() {
-                "std/rpi"
-            } else {
-                "std/loop"
-            },
+            deadline.filter(|_| !administrative),
+            &entry,
         )
     }
 
     async fn execute_task(self: Arc<Self>, task: String, max_turns: usize) -> Result<Value> {
         self.policy.log.check()?;
-        let workflow = self.is_workflow_root();
-        self.project_workflow_artifacts();
+        // The workflow's hook, in a root agent whose run has one; every use below is a boundary it needs.
+        let workflow = crate::workflow_runtime::root(&self);
+        if let Some(workflow) = &workflow {
+            workflow.project_artifacts();
+        }
         if self.depth == 0
             && let Some(RunState::Finished { report }) = &self.supervisor.restored
         {
             return Ok(self.report(Value::Object(report.clone()), 0.0));
         }
-        let owner_event = if workflow
-            && let Some(paused @ RunState::AwaitingReview { report, gate, .. }) =
-                &self.supervisor.restored
-        {
-            use crate::workflow_runtime::OwnerResume;
-            match self.resume_owner_decision(gate) {
-                Ok(OwnerResume::Deliver(event)) => Some(event),
-                Ok(OwnerResume::Waiting) => return Ok(self.workflow_pause_report(report)),
-                Ok(OwnerResume::Rejected(reason)) => {
-                    // Commit the consumption, so the gate reopens for a new decision.
-                    self.supervisor.checkpoint(
-                        &self.lane,
-                        paused.clone(),
-                        &self.durable.lock().unwrap(),
-                    )?;
-                    let mut report = report.clone();
-                    report.insert("decision_rejected".into(), json!(reason));
-                    return Ok(self.workflow_pause_report(&report));
-                }
-                Err(error) if error.is::<BudgetExceeded>() => {
-                    return Ok(self.workflow_pause_report(report));
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            None
+        let owner_event = match workflow.as_ref().map(|w| w.open_gate()).transpose()? {
+            Some(ControlFlow::Break(paused)) => return Ok(paused),
+            Some(ControlFlow::Continue(event)) => event,
+            None => None,
         };
         if owner_event.is_none() {
             self.supervisor.check()?;
         }
         let t0 = Instant::now();
-        let administrative = owner_event.is_some();
-        let controller = if administrative {
-            Controller::new(
-                self.supervisor.registry.clone(),
-                self.model_info(),
-                String::new(),
-                None,
-                "std/rpi",
-            )?
-        } else {
-            self.controller()?
-        };
+        let controller = self.controller(owner_event.is_some())?;
         let mut state = if self.depth == 0 {
             match &self.supervisor.restored {
                 Some(RunState::Running { controller }|RunState::AwaitingReview{controller,..}) => controller.clone(),
@@ -507,16 +462,7 @@ impl Host {
         } else {
             None
         };
-        let pending = if workflow {
-            self.supervisor
-                .workflow
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|f| f.pending_event.clone())
-        } else {
-            None
-        };
+        let pending = workflow.as_ref().and_then(|w| w.pending_event());
         let mut event = owner_event
             .or(pending)
             .or_else(|| recovery.take())
@@ -527,11 +473,7 @@ impl Host {
         // reuses it so it is a byte prefix of that request and the provider's cached prefix applies.
         let mut agent_system: Option<Value> = None;
         loop {
-            let admin = workflow
-                && matches!(
-                    event["kind"].as_str(),
-                    Some("owner_decision" | "boundary_ready")
-                );
+            let admin = workflow.as_ref().is_some_and(|w| w.administrative(&event));
             if admin {
                 self.policy.log.check()?;
             } else {
@@ -539,42 +481,14 @@ impl Host {
             }
             let previous_messages = state["messages"].as_array().cloned().unwrap_or_default();
             let was_compacting = compacting;
-            let source_stage = self
-                .supervisor
-                .workflow
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|f| f.stage.as_ref().map(|a| a.spec.id.clone()));
-            let controller = if admin {
-                Controller::new(
-                    self.supervisor.registry.clone(),
-                    self.model_info(),
-                    String::new(),
-                    None,
-                    "std/rpi",
-                )?
-            } else {
-                self.controller()?
-            };
+            let source_stage = workflow.as_ref().and_then(|w| w.stage_id());
+            let controller = self.controller(admin)?;
             let (next_state, command) = controller.step(&state, &event)?;
             ensure_object(&next_state)?;
             let mut command = crate::controller::command(&command)?;
             state = next_state;
-            if workflow
-                && event["kind"] == "run_result"
-                && !matches!(command, Command::Boundary { .. })
-            {
-                self.supervisor.finish_stage_chunk(false);
-            }
-            if workflow && admin {
-                self.supervisor
-                    .workflow
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .unwrap()
-                    .pending_event = None;
+            if let Some(workflow) = &workflow {
+                workflow.after_step(&event, &command, admin);
             }
             if std::mem::take(&mut compacting) {
                 let failed = state["messages"].get(0) == previous_messages.first();
@@ -675,19 +589,21 @@ impl Host {
                     id,
                     submission,
                     next,
-                } => self.apply_boundary(
-                    crate::workflow::Boundary {
-                        id: id.clone(),
-                        submission: submission.clone(),
-                        next: next.clone(),
-                    },
-                    &state,
-                )?,
+                } => workflow
+                    .as_ref()
+                    .context("workflow boundary requires explicit root workflow selection")?
+                    .apply_boundary(
+                        crate::workflow::Boundary {
+                            id: id.clone(),
+                            submission: submission.clone(),
+                            next: next.clone(),
+                        },
+                        &state,
+                    )?,
                 Command::Finish { report } => {
-                    anyhow::ensure!(
-                        !workflow,
-                        "RPI must finish through a durable workflow boundary"
-                    );
+                    if let Some(workflow) = &workflow {
+                        workflow.refuse_finish()?;
+                    }
                     RunState::Finished {
                         report: report.clone(),
                     }
@@ -702,9 +618,9 @@ impl Host {
                 &self.durable.lock().unwrap(),
                 archive,
             )?;
-            if let Command::Boundary { .. } = &command {
+            if let (Command::Boundary { .. }, Some(workflow)) = (&command, &workflow) {
                 vm = None;
-                self.project_workflow_artifacts();
+                workflow.project_artifacts();
                 match saved {
                     RunState::Finished { report } => {
                         return Ok(self.report(Value::Object(report), t0.elapsed().as_secs_f64()));
@@ -713,15 +629,8 @@ impl Host {
                         return Ok(self.report(Value::Object(report), t0.elapsed().as_secs_f64()));
                     }
                     _ => {
-                        event = self
-                            .supervisor
-                            .workflow
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .unwrap()
-                            .pending_event
-                            .clone()
+                        event = workflow
+                            .pending_event()
                             .context("boundary delivery missing")?;
                         continue;
                     }
@@ -766,16 +675,8 @@ impl Host {
                         true,
                     )?;
                     let mut result = vm.as_ref().unwrap().run_chunk(&code).await?;
-                    if workflow {
-                        let end = self
-                            .supervisor
-                            .finish_stage_chunk(result["error"].is_null());
-                        if let Some(submission) = end.submission {
-                            result["submission"] = submission;
-                        }
-                        if end.refused {
-                            result["submission_error"] = json!(true);
-                        }
+                    if let Some(workflow) = &workflow {
+                        workflow.end_chunk(&mut result);
                     }
                     let notifications = vm
                         .as_ref()
