@@ -76,6 +76,9 @@ pub struct Reply {
 /// reply (a long generation streams its text several times over, as deltas and in the final object), and a bound on
 /// what a provider, or anything on the path, can make hx hold.
 pub const MAX_RESPONSE: usize = 256 << 20;
+/// Bytes of an error response hx reads, and characters of it kept in the error message.
+const ERROR_BODY: usize = 64 << 10;
+const ERROR_EXCERPT: usize = 2000;
 
 /// The provider hx calls without `--base-url`.
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -293,9 +296,16 @@ pub async fn chat(http: &reqwest::Client, cfg: &LlmCfg, key: &str, req: &Value) 
         .is_some_and(|v| v.starts_with("text/event-stream"));
     let mut budget = net::ResponseBudget::new(MAX_RESPONSE);
     if !status.is_success() {
-        // The status settles it whether or not the body arrives whole.
-        let text = match budget.body(&mut response).await {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        // The status settles it whether or not the body arrives whole. The message goes into the journal, the trace
+        // and the controller's state, so it carries an excerpt of the body, not the body.
+        let text = match net::ResponseBudget::new(ERROR_BODY)
+            .body(&mut response)
+            .await
+        {
+            Ok(bytes) => String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(ERROR_EXCERPT)
+                .collect(),
             Err(e) => format!("({e})"),
         };
         return Err(answered(format!("API {status}: {text}")).into());

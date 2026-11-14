@@ -543,7 +543,15 @@ pub fn install_http(
             let (Some(spec), Some(client)) = (def.http.get(&endpoint), clients.get(&endpoint)) else { return Err(mlua::Error::runtime("undeclared HTTP endpoint")) };
             let args = values::copy_out(args)?;
             let serde_json::Value::Object(mut fields) = args.clone() else { return Err(mlua::Error::runtime("http arguments must be an object")) };
-            let key = spec.secret.as_ref().map(|name| secret(&fx.pol.dirs, &fx.pol.workspace, name)).transpose().map_err(mlua::Error::external)?;
+            crate::effects::yield_first().await;
+            let key = match spec.secret.clone() {
+                Some(name) => {
+                    let pol = fx.pol.clone();
+                    let read = move || secret(&pol.dirs, &pol.workspace, &name);
+                    Some(tokio::task::spawn_blocking(read).await.map_err(mlua::Error::external)?.map_err(mlua::Error::external)?)
+                }
+                None => None,
+            };
             let mut url = template(&spec.url).map_err(mlua::Error::external)?.url(&mut fields)?;
             // GET and DELETE carry no body: their remaining arguments are the query. The others send them as JSON.
             let bodiless = matches!(spec.method.as_str(), "GET" | "DELETE");

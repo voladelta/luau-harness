@@ -85,7 +85,7 @@ Environment: `HX_MODEL` and `HX_BASE_URL` set defaults for the matching `run` fl
 
 ## Report and logs
 
-`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer`, tokens and `log`, the path of the run's event log. Event logs live outside the workspace, in hx's state directory: `$XDG_STATE_HOME/hx/workspaces/NAME-ID/log/` (default `~/.local/state/hx/...`; `NAME` is the workspace directory's name, `ID` 16 hex digits of the SHA-256 of its canonical path). `hx paths` prints the directory. The log stores file contents and command output as blobs in its `blobs/` directory, so treat it as sensitive. A `.harness/log`, `.harness/ar` or `.harness/secrets.toml` left in a workspace by an earlier version is not read; hx says so once and names the new location.
+`hx run` prints a JSON report on stdout: turns, Luau errors, `finished`, `final_answer`, tokens and `log`, the path of the run's event log. Event logs live outside the workspace, in hx's state directory: `$XDG_STATE_HOME/hx/workspaces/NAME-ID/log/` (default `~/.local/state/hx/...`; `NAME` is the workspace directory's name, `ID` 16 hex digits of the SHA-256 of its canonical path). `hx paths` prints the directory. The log stores file contents and command output as blobs in its `blobs/` directory, so treat it as sensitive. A `.harness/log`, `.harness/ar` or `.harness/secrets.toml` left in a workspace by an earlier version is not read; hx says so at each launch and names the new location.
 
 ## Checkpoints and resume
 

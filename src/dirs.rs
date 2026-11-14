@@ -35,16 +35,19 @@ impl Dirs {
     /// else from `HOME`.
     pub fn from_env() -> Result<Self> {
         let base = |var: &str, default: &str| -> Result<PathBuf> {
-            match std::env::var_os(var)
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-            {
-                Some(dir) => Ok(dir),
+            // A relative value is ignored, as the XDG base directory specification says.
+            let set = std::env::var_os(var).map(PathBuf::from);
+            match set.as_ref().filter(|p| p.is_absolute()) {
+                Some(dir) => Ok(dir.clone()),
                 None => std::env::var_os("HOME")
                     .filter(|h| !h.is_empty())
                     .map(|h| PathBuf::from(h).join(default))
-                    .with_context(|| {
-                        format!("neither {var} nor HOME is set; hx needs one to find its own files")
+                    .with_context(|| match set {
+                        Some(relative) => format!(
+                            "{var} is a relative path ({}) and HOME is not set; hx needs an absolute one to find its own files",
+                            relative.display()
+                        ),
+                        None => format!("neither {var} nor HOME is set; hx needs one to find its own files"),
                     }),
             }
         };
@@ -153,17 +156,21 @@ fn resolve(dir: &Path) -> PathBuf {
     out
 }
 
-/// Say once, on stderr, that files an earlier version of hx kept inside the workspace are no longer read, and where
-/// their successors live. Nothing is moved.
+/// Say on stderr, at each launch, that files an earlier version of hx kept inside the workspace are no longer read,
+/// and where their successors live. Nothing is moved.
 pub fn note_leftovers(workspace: &Path, dirs: &WorkspaceDirs) {
-    for (old, new) in [
-        (".harness/secrets.toml", &dirs.secrets),
-        (".harness/log", &dirs.log),
-        (".harness/ar", &dirs.ar),
-    ] {
-        if std::fs::symlink_metadata(workspace.join(old)).is_ok() {
+    let left = |old: &str| std::fs::symlink_metadata(workspace.join(old)).is_ok();
+    if left(".harness/secrets.toml") {
+        eprintln!(
+            "hx: note: .harness/secrets.toml is left from an earlier version of hx and is not read; move it to {} \
+             (until then the model's shell commands can read it where it is)",
+            dirs.secrets.display()
+        );
+    }
+    for (old, new) in [(".harness/log", &dirs.log), (".harness/ar", &dirs.ar)] {
+        if left(old) {
             eprintln!(
-                "hx: note: {old} is left from an earlier version of hx and is not read; hx keeps it in {} now",
+                "hx: note: {old} is left from an earlier version of hx and is not read; new runs are kept in {}",
                 new.display()
             );
         }

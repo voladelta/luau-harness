@@ -163,7 +163,7 @@ class Tools(unittest.TestCase):
         (self.ws / ".harness/secrets.toml").write_text('TINYFISH_API_KEY="leftover-test-key"\n')
         out = self.run_code(code)
         self.assertEqual(CALLS[-1][-1], "project-test-key")
-        self.assertIn(f".harness/secrets.toml is left from an earlier version of hx and is not read; hx keeps it in {project}", out)
+        self.assertIn(f".harness/secrets.toml is left from an earlier version of hx and is not read; move it to {project}", out)
         (self.ws / ".harness/secrets.toml").unlink()
         env = dict(self.env, TINYFISH_API_KEY="environment-test-key")
         out = self.run_code(code, env=env)

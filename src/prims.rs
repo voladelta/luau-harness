@@ -105,6 +105,23 @@ pub struct ReadOptions {
     pub limit: Option<f64>,
 }
 
+impl ReadOptions {
+    /// The lines to skip and to take: `offset` and `limit` are whole numbers from 1.
+    fn lines(&self) -> mlua::Result<(usize, usize)> {
+        let whole = |name: &str, value: Option<f64>, default: usize| match value {
+            None => Ok(default),
+            Some(n) if n >= 1.0 && n.fract() == 0.0 && n <= usize::MAX as f64 => Ok(n as usize),
+            Some(n) => Err(rt(format!(
+                "read: options: {name} must be a whole number of lines from 1, got {n}"
+            ))),
+        };
+        Ok((
+            whole("offset", self.offset, 1)? - 1,
+            whole("limit", self.limit, usize::MAX)?,
+        ))
+    }
+}
+
 /// Read a file's bytes exactly as stored (or the requested lines of it), under the read policy.
 pub async fn read(
     fx: &Effects,
@@ -112,6 +129,7 @@ pub async fn read(
     path: String,
     opts: ReadOptions,
 ) -> mlua::Result<Vec<u8>> {
+    opts.lines()?;
     let args = json!({"path": &path, "offset": opts.offset, "limit": opts.limit});
     let pol = fx.pol.clone();
     match fx
@@ -141,11 +159,7 @@ fn read_file(pol: &crate::policy::Policy, path: &str, opts: &ReadOptions) -> mlu
     if opts.offset.is_none() && opts.limit.is_none() {
         return Ok(bytes);
     }
-    let start = opts.offset.unwrap_or(1.0).max(1.0) as usize - 1;
-    let take = opts
-        .limit
-        .map(|l| l.max(0.0) as usize)
-        .unwrap_or(usize::MAX);
+    let (start, take) = opts.lines()?;
     Ok(bytes
         .split_inclusive(|b| *b == b'\n')
         .skip(start)
@@ -1226,6 +1240,10 @@ mod file_tests {
         let r = vm.session.run(r#"local trap = setmetatable({}, {__index = function() error("metamethod ran") end})
             local ok, e = pcall(read, "f", trap); assert(not ok and not tostring(e):find("metamethod ran", 1, true), tostring(e))
             assert(not pcall(read, "f", {offest = 2}))
+            for _, bad in {{offset = 0}, {offset = -5}, {offset = 1.5}, {limit = 0}, {limit = -1}} do
+                local ok, e = pcall(read, "f", bad); assert(not ok and tostring(e):find("read: options:", 1, true), tostring(e))
+            end
+            assert(read("f", {offset = 1, limit = 1}) == "x\n" and read("f", {offset = 99}) == "")
             assert(not pcall(search, "x", {ignore_case = "yes"}))
             assert(not pcall(edit, "f", "x", "y", {al = true}))"#).await;
         assert!(r.error.is_none(), "{:?}", r.error);
