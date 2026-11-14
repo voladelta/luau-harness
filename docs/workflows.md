@@ -83,6 +83,8 @@ min_delta = 0.05
 
 `select` must reach the shift the result has to survive (other years, symbols or input ranges) and have enough cases to tell candidates apart. No `grader` or `holdout` root may overlap the workspace or hx's own configuration and state directories (`hx paths`; `~` itself contains them), since model-edited code runs in the evaluators that read those roots.
 
+Editable paths lie inside the workspace and outside `.harness/`, `.git/` and `.agents/skills/`. The workspace's committed skills are trusted configuration: every episode gets them as committed, and its child run trusts exactly them, so no episode can rewrite a skill a later episode loads. Packages under `.harness/pkgs` are not copied into episodes.
+
 ### How a search runs
 
 1. **Freeze.** The committed tree is frozen at launch. Every episode is a fresh child `hx run` in a throwaway copy of it. `mcp.ar.eval{note = "hypothesis"}` asks `hx-ar` to score a snapshot of the editable files in another throwaway copy, with a scrubbed environment, confined by Landlock to its copy and the `grader` roots; network confinement must be supplied externally. Only the editable paths carry between episodes.

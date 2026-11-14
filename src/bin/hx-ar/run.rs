@@ -128,8 +128,10 @@ impl Spec {
                     && parts
                         .iter()
                         .all(|c| !c.is_empty() && *c != "." && *c != "..")
-                    && !matches!(parts[0], ".harness" | ".git"),
-                "ar.toml: editable path {p:?} must be a relative path inside the workspace, outside .harness and .git"
+                    && !matches!(parts[0], ".harness" | ".git")
+                    // the workspace's skills are trusted configuration that every episode loads
+                    && !(parts[0] == ".agents" && parts.get(1).is_none_or(|c| *c == "skills")),
+                "ar.toml: editable path {p:?} must be a relative path inside the workspace, outside .harness, .git and .agents/skills"
             );
         }
         let agent_reads = hx::policy::system_read_roots();
@@ -2421,5 +2423,33 @@ mod tests {
             .to_string();
         assert!(error.contains("overlaps hx's"), "{error}");
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn an_editable_path_may_not_reach_the_workspaces_skills() {
+        let base = std::env::temp_dir().join(format!("hx-artest-skills-{}", std::process::id()));
+        let dirs = Dirs::at(&base.join("config"), &base.join("state"));
+        let ws = base.join("ws");
+        for (editable, refused) in [
+            (".agents", true),
+            (".agents/skills", true),
+            (".agents/skills/x", true),
+            (".agents/artifacts", false),
+        ] {
+            let _ = std::fs::remove_dir_all(&ws);
+            std::fs::create_dir_all(ws.join(".harness")).unwrap();
+            std::fs::write(
+                ws.join(".harness/ar.toml"),
+                format!("editable = [\"{editable}\"]\neval = \"true\"\n"),
+            )
+            .unwrap();
+            let loaded = Spec::load(&ws, &hx::trust::Config::read(&ws).unwrap(), &dirs);
+            assert_eq!(
+                loaded.is_err_and(|e| e.to_string().contains(".agents/skills")),
+                refused,
+                "{editable}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

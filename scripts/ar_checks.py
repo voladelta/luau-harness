@@ -41,7 +41,9 @@ def workspace(name, files=None, spec=None):
     git("config", "user.name", "test")
     (path / ".harness").mkdir()
     (path / ".gitignore").write_text(".harness/\n")
-    files = files or {"x.txt": "0\n", "search.py": SCORE % 7, "select.py": SCORE % 5}
+    # the owner's repository carries a skill: it is trusted configuration, copied into every episode, which trusts it
+    files = files or {"x.txt": "0\n", "search.py": SCORE % 7, "select.py": SCORE % 5,
+                      ".agents/skills/notes/SKILL.md": "---\ndescription: notes\n---\nKeep notes.\n"}
     for rel, text in files.items():
         (path / rel).parent.mkdir(parents=True, exist_ok=True)
         (path / rel).write_text(text)
