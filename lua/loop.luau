@@ -8,6 +8,8 @@
 --                                                     adds the API key, and beta as the anthropic-beta header
 --   host.sh(command, {timeout=}) -> {out=, code=, signal=, timed_out=}
 --   host.read(path), host.write(path, data), host.list(dir)
+--   host.clip(text, limit) -> text | head, tail       text when it fits in limit bytes; else up to limit // 2 from
+--                                                     each end, cut at a line or a character, as host.sh's output
 --   host.load(source, name, env) -> function | nil, error
 --   host.try(fn, ...) -> true, ... | false, error     a pcall that is also where a stop ends
 --   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit

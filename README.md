@@ -172,7 +172,7 @@ call to the next. The code acts through these functions:
 | `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout. The status line is for reading: output used as data comes from `host.sh(command).out` |
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file |
-| `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too |
+| `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
 | `skill(name)` | a skill's instructions, by name; for a name no skill has, the list of skills to pick from (see "Skills") |
 | `ext(name)` | an extension's table of functions |
 
@@ -180,6 +180,14 @@ call to the next. The code acts through these functions:
 back to the model with what the code printed before it. Only the result is clipped, once: past `M.output_limit`
 it keeps the start and the end, and the whole of it goes to a file in `$TMPDIR` whose path it names. A function
 returns everything, so code can work on an output of any size.
+
+Code from the model and from extensions sees `host`, `json` and the standard libraries through read-only views:
+an assignment such as `host.sh = nil` raises "host is read-only" instead of breaking every later call, and the
+text such code passes to `host.log` and `host.input` is made printable, so it cannot send an escape sequence to
+the terminal. `_G` there is the code's own globals, and a chunk loaded with `host.load` and no environment gets
+globals of its own. `for key, value in view` iterates a view; `pairs` and `next` see nothing in one. The views
+stop mistakes, not code that digs with `rawset` or `debug` on purpose, and `host.extensions` and `host.args` are
+still the tables themselves. The loop, a project's `.hx/loop.luau` and `--run` scripts use the real host.
 
 `hx --init` writes `.hx/loop.luau` from `lua/overlay.luau`:
 
@@ -240,7 +248,8 @@ caches every prefix by itself and ignores `cache_control`. The line at the end o
 from the cache and written to it.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON, after every reply that
-called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. The logs
+called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. Whether
+the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. The logs
 hold file contents, so that directory carries a `.gitignore` that keeps all of it out of git.
 
 ### The conversation is a state machine
@@ -475,8 +484,12 @@ Development build, with AddressSanitizer, UBSan and warnings as errors:
 cmake --preset dev && cmake --build --preset dev && ctest --preset dev
 clang-format --dry-run --Werror src/*.cpp src/*.h
 clang-tidy -p build-dev --quiet src/*.cpp
-luau-analyze lua/*.luau lua/ext/*.luau tests/*.luau     # prints nothing when all is well
+luau-analyze lua/*.luau lua/ext/*.luau tests/*.luau     # prints nothing when all is well; nor with --solver=old
 ```
+
+The Luau tests are `tests/*_test.luau`, and share their checks in `tests/check.luau`. One runs by hand from a
+scratch directory, with absolute paths, as `hx -q --ro /path/to/tests --run /path/to/tests/tools_test.luau`: the
+`--ro` lets the test read `check.luau` through the wall.
 
 The Luau files in `lua/` are `--!strict`; an extension carries that on its second line, because its first is the
 description the system prompt shows. `.luaurc` names the globals the host provides. When `luau-analyze` is
