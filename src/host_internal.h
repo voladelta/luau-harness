@@ -59,8 +59,7 @@ void push_strings(lua_State* L, const std::vector<std::string>& strings);
 
 // --- host_files.cpp ------------------------------------------------------------------------------------------
 
-int l_read(lua_State* L);
-int l_write(lua_State* L);
+// host.read and host.write are members of Host, which holds the time limit they wait within.
 int l_list(lua_State* L);
 
 // --- host_proc.cpp: signals, waits and the processes hx started ----------------------------------------

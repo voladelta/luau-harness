@@ -66,16 +66,21 @@ struct HostConfig {
 //   host.judge(line?) -> {answers}, pending           sends a line to the judge, if given, and waits for what it
 //                                                     owes, until 2 s before the host.timed limit; a line is
 //                                                     refused while an answer is owed
-//   host.read(path) -> string | nil, error
+//   host.read(path) -> string | nil, error            a FIFO or a device is read without blocking, and a wait for
+//                                                     a writer or for more ends with the host.timed limit
+//                                                     ("PATH: timed out") or a stop, as for write's below
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a regular file
 //                                                     by renaming a new one with its mode over it, so it is never
 //                                                     left cut short; writes in place where a new file cannot
-//                                                     stand in for it (hard links, a device, a dangling link)
+//                                                     stand in for it (hard links, a device, a FIFO, a dangling
+//                                                     link), waiting for a FIFO's reader or for room only until
+//                                                     the host.timed limit or a stop
 //   host.list(dir) -> {names} | nil, error            sorted; directories end in "/"
 //   host.load(source, name?, env?) -> function | nil, error
 //   host.try(fn, ...) -> true, ... | false, error     pcall that is also where a stop ends (below)
 //   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit ("timeout");
-//                                                     llm, sh and sleep inside it end when the limit does
+//                                                     llm, sh, sleep, and read and write of a FIFO or
+//                                                     a device inside it end when the limit does
 //   host.input(prompt?) -> line | nil at end of input
 //   host.log(text)                                    one line on stderr
 //   host.sleep(seconds), host.env(name)
@@ -88,12 +93,12 @@ struct HostConfig {
 //   host.judged                                       a judge is there for host.judge
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
-// SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input)
-// raises it again for as long as the stop lasts; a blocking call that starts then does not start its work. The
-// stop ends only when the outermost host.try or host.timed returns: that call returns false and the stop's error,
-// whatever its function did. Inner ones return the same and leave the stop in progress. Outside all of them it
-// unwinds to the top, so no pcall can swallow it. An expired host.timed limit raises "timeout" the same way, until
-// its call returns.
+// SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input,
+// and read and write of a FIFO or a device) raises it again for as long as the stop lasts; a blocking call that
+// starts then does not start its work. The stop ends only when the outermost host.try or host.timed returns: that
+// call returns false and the stop's error, whatever its function did. Inner ones return the same and leave the
+// stop in progress. Outside all of them it unwinds to the top, so no pcall can swallow it. An expired host.timed
+// limit raises "timeout" the same way, until its call returns.
 //
 // The Host makes hx a child subreaper, so whatever a command leaves running stays a descendant of hx, even after
 // setsid. Destroying the Host kills every descendant.
@@ -118,6 +123,8 @@ class Host {
     static int timed(lua_State* L);
     static int protect(lua_State* L, int fn, double deadline);
     static int sleep(lua_State* L);
+    static int read_file(lua_State* L);
+    static int write_file(lua_State* L);
     static int judge(lua_State* L);
 
     // Shortens a wait so that it ends no later than the host.timed limit in force. A negative wait is an empty one.

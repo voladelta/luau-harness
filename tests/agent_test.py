@@ -1233,6 +1233,35 @@ class AgentTest(unittest.TestCase):
             os.chmod(locked, 0o700)  # so that tearDown can remove it
         self.assertEqual((done.returncode, done.stdout), (0, "true\n"), done.stderr)
 
+    def test_a_fifo_is_read_and_written_within_the_time_limit(self):
+        script = ("host.sh('mkfifo fifo')\n"
+                  "print(host.timed(1, host.read, 'fifo'))\n"
+                  "print(host.timed(1, host.write, 'fifo', 'x'))\n"
+                  "host.sh(\"(sleep 0.2; printf 'one '; sleep 0.2; printf two) > fifo &\")\n"
+                  "print(host.timed(10, host.read, 'fifo'))\n"
+                  "host.sh('cat fifo > got.txt &')\n"
+                  "print(host.timed(10, host.write, 'fifo', string.rep('y', 200000)))\n"
+                  "host.sh('(exec 3<fifo; sleep 30) & sleep 0.2')\n"  # a reader that never reads: the pipe fills
+                  "print(host.timed(1, host.write, 'fifo', string.rep('y', 200000)))\n"
+                  "print(host.read('/dev/null'), host.write('/dev/null', 'x'))\n")
+        started = time.monotonic()
+        done = self.run_hx("--run", "-", stdin=script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # A wait cut short by the limit returns its own error; no Luau runs after it to raise "timeout".
+        self.assertEqual(done.stdout, "true\tnil\tfifo: timed out\n" * 2 + "true\tone two\ntrue\ttrue\n"
+                                      "true\tnil\tfifo: timed out\n\ttrue\n")
+        self.assertLess(time.monotonic() - started, 20)
+        for _ in range(100):
+            if os.path.getsize(os.path.join(self.project, "got.txt")) == 200000:
+                break
+            time.sleep(0.05)
+        self.assertEqual(os.path.getsize(os.path.join(self.project, "got.txt")), 200000)
+
+    def test_a_stop_reaches_a_read_of_a_fifo(self):
+        code, out = self.run_interrupted(
+            "host.sh('mkfifo fifo; echo $$ > cmd.pid')\nprint(host.try(host.read, 'fifo'))\nprint('after')\n")
+        self.assertEqual((code, out), (0, "false\tinterrupted\nafter\n"))
+
     # --- extensions and the project's own loop ---
 
     def test_the_model_extends_itself_and_the_extension_stays(self):
