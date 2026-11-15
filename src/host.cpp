@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -28,6 +29,8 @@
 #include <iostream>
 #include <memory>
 #include <new>
+#include <optional>
+#include <span>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -206,12 +209,41 @@ pid_t parent_of(int proc, std::string_view pid) {
     return parent;
 }
 
-// Kills every descendant of hx, then waits a moment for them to be gone. A descendant is a child of hx or of a
-// process killed here, so the whole tree is killed without waiting for any part of it to die: SIGKILL cannot end a
-// process stuck in uninterruptible I/O (a dead NFS server) until the I/O returns, and hx does not wait on one
-// longer than kReapSeconds. Nothing is reaped until every process is killed, so the zombies hold their PIDs and
-// none can be reused by a process that is not a descendant.
-void kill_descendants() noexcept {
+// Calls fn(proc, name, pid) for each process in /proc, where proc is /proc open and name the PID as text. Returns
+// false when /proc cannot be read.
+template <typename Fn>
+bool for_each_process(const Fn& fn) noexcept {
+    const UniqueFd proc(open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!proc.valid()) {
+        return false;
+    }
+    alignas(dirent64) std::array<char, 4096> entries{};
+    for (;;) {
+        const ssize_t n = getdents64(proc.get(), entries.data(), entries.size());
+        if (n <= 0) {
+            return true;
+        }
+        std::size_t at = 0;
+        while (at < static_cast<std::size_t>(n)) {
+            unsigned short size = 0;
+            std::memcpy(&size, entries.data() + at + offsetof(dirent64, d_reclen), sizeof(size));
+            const std::string_view name(entries.data() + at + offsetof(dirent64, d_name));
+            at += size;
+            pid_t pid = 0;
+            const auto [stop, error] = std::from_chars(name.data(), name.data() + name.size(), pid);
+            if (error == std::errc() && stop == name.data() + name.size()) {
+                fn(proc.get(), name, pid);
+            }
+        }
+    }
+}
+
+// Kills every descendant of hx that is not spared (a sorted list of PIDs), then waits a moment for them to be gone.
+// A descendant is a child of hx or of a process killed here, so the whole tree is killed without waiting for any
+// part of it to die: SIGKILL cannot end a process stuck in uninterruptible I/O (a dead NFS server) until the I/O
+// returns, and hx does not wait on one longer than kReapSeconds. Nothing is reaped until every process is killed,
+// so the zombies hold their PIDs and none can be reused by a process that is not a descendant.
+void kill_descendants(std::span<const pid_t> spared = {}) noexcept {
     const pid_t self = getpid();
     std::array<pid_t, kMaxKilled> killed{};
     std::size_t count = 0;
@@ -220,60 +252,50 @@ void kill_descendants() noexcept {
                killed.begin() + static_cast<std::ptrdiff_t>(count);
     };
     for (int round = 0; round < kKillRounds; ++round) {
-        const UniqueFd proc(open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        if (!proc.valid()) {
-            break;
-        }
         bool found = false;
-        alignas(dirent64) std::array<char, 4096> entries{};
-        for (;;) {
-            const ssize_t n = getdents64(proc.get(), entries.data(), entries.size());
-            if (n <= 0) {
-                break;
+        const bool listed = for_each_process([&](int proc, std::string_view name, pid_t pid) {
+            if (was_killed(pid) || std::binary_search(spared.begin(), spared.end(), pid)) {
+                return;
             }
-            std::size_t at = 0;
-            while (at < static_cast<std::size_t>(n)) {
-                unsigned short size = 0;
-                std::memcpy(&size, entries.data() + at + offsetof(dirent64, d_reclen), sizeof(size));
-                const std::string_view name(entries.data() + at + offsetof(dirent64, d_name));
-                at += size;
-                pid_t pid = 0;
-                const auto [stop, error] = std::from_chars(name.data(), name.data() + name.size(), pid);
-                if (error != std::errc() || stop != name.data() + name.size() || was_killed(pid)) {
-                    continue;
-                }
-                const pid_t parent = parent_of(proc.get(), name);
-                if (parent != self && !was_killed(parent)) {
-                    continue;
-                }
-                // Once kill returns, a fork in that process either has finished, so its child is listed by a
-                // later scan, or fails.
-                found = true;
-                kill(pid, SIGKILL);
-                if (count < killed.size()) {
-                    killed.at(count) = pid;
-                    ++count;
-                }
+            const pid_t parent = parent_of(proc, name);
+            if (parent != self && !was_killed(parent)) {
+                return;
             }
-        }
-        if (!found) {
+            // Once kill returns, a fork in that process either has finished, so its child is listed by a later
+            // scan, or fails.
+            found = true;
+            kill(pid, SIGKILL);
+            if (count < killed.size()) {
+                killed.at(count) = pid;
+                ++count;
+            }
+        });
+        if (!listed || !found) {
             break;
         }
     }
-    // A killed process whose children were killed too passes them to hx as it dies, so waiting for any child
-    // reaps the whole tree.
+    // A killed process whose children were killed too passes them to hx as it dies, so reaping every child that
+    // has exited, until no killed process is left, reaps the whole tree.
     const double deadline = now() + kReapSeconds;
     for (;;) {
-        const pid_t pid = waitpid(-1, nullptr, WNOHANG);
-        if (pid > 0 || (pid < 0 && errno == EINTR)) {
-            continue;
+        while (waitpid(-1, nullptr, WNOHANG) > 0) {
         }
-        if (pid < 0 || now() >= deadline) {
-            return;  // ECHILD: none left
+        const bool left = std::any_of(killed.begin(), killed.begin() + static_cast<std::ptrdiff_t>(count),
+                                      [](pid_t pid) { return kill(pid, 0) == 0; });
+        if (!left || now() >= deadline) {
+            return;
         }
         const timespec nap{0, 10'000'000};
         nanosleep(&nap, nullptr);
     }
+}
+
+// Every process there is now, sorted: what kill_descendants spares after a command behind a narrower wall.
+std::vector<pid_t> processes_now() {
+    std::vector<pid_t> pids;
+    for_each_process([&](int /*proc*/, std::string_view /*name*/, pid_t pid) { pids.push_back(pid); });
+    std::sort(pids.begin(), pids.end());
+    return pids;
 }
 
 void on_signal(int sig) {
@@ -437,9 +459,16 @@ bool reap_within(pid_t pid, int& status, double seconds) {
 }
 
 // Runs in the forked child, so it may only call async-signal-safe functions: no allocation, no stdio.
-[[noreturn]] void exec_bash(const char* command, int output) {
+[[noreturn]] void exec_bash(const char* command, int output, const Wall* wall) {
     // A session of its own: one process group to kill, and no terminal to ask a question on.
     setsid();
+    if (wall != nullptr && !wall->enter()) {
+        constexpr std::string_view message = "hx: cannot put up the command's wall\n";
+        if (write(output, message.data(), message.size()) < 0) {
+            // Nothing more can be said.
+        }
+        _exit(126);
+    }
     const int null = open("/dev/null", O_RDONLY);
     if (null >= 0) {
         dup2(null, STDIN_FILENO);
@@ -963,6 +992,9 @@ int Host::sh(lua_State* L) {
     const char* command = check_cstring(L, 1);
     const Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
+    const std::optional<Wall> wall = host.narrower_wall(L, 2);
+    // A command behind a narrower wall is not trusted to leave anything running: what it started dies with it.
+    const std::vector<pid_t> before = wall ? processes_now() : std::vector<pid_t>{};
     raise_if_signaled(L);  // a stop in progress starts no command
     // Adopted orphans that have exited are zombies of hx. No command of hx's own is running now, so this cannot
     // take the status of one.
@@ -980,7 +1012,7 @@ int Host::sh(lua_State* L) {
         luaL_error(L, "fork: %s", error_text().c_str());
     }
     if (pid == 0) {
-        exec_bash(command, input.get());
+        exec_bash(command, input.get(), wall ? &*wall : nullptr);
     }
     input.reset();
     fcntl(output.get(), F_SETFL, O_NONBLOCK);
@@ -1024,7 +1056,10 @@ int Host::sh(lua_State* L) {
         poll(&waiter, at_end ? 0 : 1, kPollMs);
     }
     // bash is gone, or killed and left for a later reap. Whatever it left running keeps running, so do not wait
-    // for the pipe to close.
+    // for the pipe to close; unless it ran behind a narrower wall, and then what it left is killed now.
+    if (wall) {
+        kill_descendants(before);
+    }
     drain();
     if (ending == Ending::Signaled) {
         raise_if_signaled(L);
@@ -1047,6 +1082,82 @@ int Host::sh(lua_State* L) {
     lua_pushboolean(L, ending == Ending::TimedOut ? 1 : 0);
     lua_setfield(L, -2, "timed_out");
     return 1;
+}
+
+// The wall that host.sh's options read and write ask for, or none when they ask for nothing.
+std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
+    if (!lua_istable(L, idx)) {
+        return std::nullopt;
+    }
+    std::vector<Rule> rules = config_.system_rules;
+    bool asked = false;  // an empty list still asks: the command then reaches the system directories only
+    for (const auto& [field, access] : {std::pair{"read", Access::Read}, std::pair{"write", Access::Write}}) {
+        lua_getfield(L, idx, field);
+        if (!lua_isnil(L, -1)) {
+            luaL_argcheck(L, lua_istable(L, -1), idx, fmt::format("{} is a list of paths", field).c_str());
+            asked = true;
+            for (int i = 1; lua_rawgeti(L, -1, i) != LUA_TNIL; ++i) {
+                rules.push_back({check_cstring(L, -1), access, true});
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+    if (!asked) {
+        return std::nullopt;
+    }
+    try {
+        return Wall::prepare(rules);
+    } catch (const SandboxError& error) {
+        luaL_error(L, "host.sh: %s", error.what());
+    }
+}
+
+// host.judge(line): one line to the judge and its one-line answer. A stop or a time limit can cut the wait short;
+// the judge still answers that call later, and the answer is dropped then.
+int Host::judge(lua_State* L) {
+    std::size_t length = 0;
+    const char* line = luaL_checklstring(L, 1, &length);
+    Host& host = of(L);
+    if (!host.config_.judge.valid()) {
+        luaL_error(L, "host.judge: no judge in this session (start hx with --judge KIT)");
+    }
+    if (std::memchr(line, '\n', length) != nullptr) {
+        luaL_error(L, "host.judge: send one line, without a newline");
+    }
+    raise_if_signaled(L);
+    const int fd = host.config_.judge.get();
+    if (!write_all(fd, std::string(line, length) + "\n")) {
+        luaL_error(L, "host.judge: the judge is gone");
+    }
+    ++host.judge_owed_;
+    std::array<char, kBufferSize> buffer{};
+    for (;;) {
+        if (const std::size_t end = host.judge_in_.find('\n'); end != std::string::npos) {
+            const std::string answer = host.judge_in_.substr(0, end);
+            host.judge_in_.erase(0, end + 1);
+            if (--host.judge_owed_ == 0) {
+                lua_pushlstring(L, answer.data(), answer.size());
+                return 1;
+            }
+            continue;
+        }
+        raise_if_signaled(L);
+        if (host.deadline_ > 0 && now() >= host.deadline_) {
+            lua_pushstring(L, "timeout");
+            lua_error(L);
+        }
+        pollfd waiter{fd, POLLIN, 0};
+        poll(&waiter, 1, kPollMs);
+        const ssize_t n = recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+            luaL_error(L, "host.judge: the judge is gone");
+        }
+        if (n > 0) {
+            host.judge_in_.append(buffer.data(), static_cast<std::size_t>(n));
+        }
+    }
 }
 
 double Host::within_limit(double seconds) const {
@@ -1121,9 +1232,9 @@ void Host::open(lua_State* L) {
     callbacks->interrupt = on_interrupt;
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"llm", llm},     {"tool", tool},     {"sh", sh},       {"try", try_},      {"timed", timed},
-        {"read", l_read}, {"write", l_write}, {"list", l_list}, {"load", l_load},   {"input", l_input},
-        {"log", l_log},   {"sleep", sleep},   {"env", l_env},   {nullptr, nullptr},
+        {"llm", llm},     {"tool", tool},     {"sh", sh},       {"try", try_},    {"timed", timed},
+        {"read", l_read}, {"write", l_write}, {"list", l_list}, {"load", l_load}, {"input", l_input},
+        {"log", l_log},   {"sleep", sleep},   {"env", l_env},   {"judge", judge}, {nullptr, nullptr},
     };
     luaL_register(L, "host", kFunctions);
 
@@ -1153,6 +1264,8 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "tools");
     lua_pushboolean(L, config_.exa_key.empty() ? 0 : 1);
     lua_setfield(L, -2, "exa");
+    lua_pushboolean(L, config_.judge.valid() ? 1 : 0);
+    lua_setfield(L, -2, "judged");
     lua_createtable(L, 0, static_cast<int>(config_.extensions.size()));
     for (const auto& [name, source] : config_.extensions) {
         lua_pushlstring(L, source.data(), source.size());

@@ -6,9 +6,12 @@
 
 #include <curl/curl.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <cstddef>
@@ -16,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -55,6 +59,8 @@ usage:
                                       every word after FILE goes to the script, even one starting with -
   hx --init [--full]                  write .hx/loop.luau, a loop that starts from the built-in one;
                                       with --full, a copy of the whole built-in loop
+  hx --judge KIT [options] [TASK...]  run the agent with a judge: only changes it submits and the kit's
+                                      measurements confirm count; KIT must lie outside the wall
 
 examples:
   hx "add a --json flag to the export command and test it"
@@ -64,6 +70,9 @@ examples:
 
 options:
   --model NAME      model to ask (overrides HX_MODEL): opus, sonnet, haiku or a full name
+  --judge KIT       judge the agent's changes with the kit in directory KIT (run, and optionally build
+                    and check); the agent cannot read the kit, and the champion, its patch and the
+                    ledger go to a directory outside the wall
   --ro PATH         also allow reading PATH (a toolchain in your home directory, for example)
   --rw PATH         also allow writing PATH
   --keep-env NAME   keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET,
@@ -142,6 +151,7 @@ struct Options {
     std::vector<std::string> write_paths;
     std::vector<std::string> keep_env;
     std::optional<std::string> model;
+    std::optional<std::string> judge;  // --judge KIT
     bool sandbox = true;
     bool unix_sockets = false;
     bool full = false;  // --init --full: copy the whole built-in loop, not the overlay
@@ -152,7 +162,7 @@ struct Options {
 // Every option hx knows, for the suggestion after a misspelt one.
 constexpr std::string_view kOptionNames[] = {
     "--model",    "--ro",   "--rw",   "--keep-env", "--unix-sockets", "--no-sandbox", "--quiet",
-    "--no-input", "--init", "--full", "--run",      "--help",         "--version",
+    "--no-input", "--init", "--full", "--run",      "--help",         "--version",    "--judge",
 };
 
 // Edit distance, for "did you mean".
@@ -228,6 +238,8 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             options.keep_env.push_back(value("NAME"));
         } else if (arg == "--model") {
             options.model = value("NAME");
+        } else if (arg == "--judge") {
+            options.judge = value("KIT");
         } else if (arg == "--unix-sockets") {
             flag();
             options.unix_sockets = true;
@@ -273,6 +285,9 @@ Options parse_args(const std::vector<std::string_view>& argv) {
     }
     if (options.mode == Mode::Init && !options.args.empty()) {
         throw UsageError("--init takes no task");
+    }
+    if (options.judge && !options.sandbox) {
+        throw UsageError("--judge needs the wall: without it the agent could read the kit and rewrite the ledger");
     }
     return options;
 }
@@ -442,9 +457,8 @@ class CurlGlobal {
     ~CurlGlobal() { curl_global_cleanup(); }
 };
 
-// The walls: system directories are readable, the project and a private temporary directory are writable, and
-// the rest of the machine (the home directory above all) cannot be opened at all.
-std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& project, const fs::path& tmp) {
+// What every wall lets in: system directories to read, harmless devices, git's configuration and trust roots.
+std::vector<hx::Rule> system_rules() {
     using hx::Access;
     std::vector<hx::Rule> rules;
     for (const char* path : {"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/proc",
@@ -471,14 +485,27 @@ std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& proj
             rules.push_back({std::move(path), Access::Read, false});
         }
     }
-    rules.push_back({project.string(), Access::Write, true});
-    rules.push_back({tmp.string(), Access::Write, true});
+    return rules;
+}
+
+// The --ro and --rw paths.
+void add_user_rules(std::vector<hx::Rule>& rules, const Options& options) {
     for (const std::string& path : options.read_paths) {
-        rules.push_back({path, Access::Read, true});
+        rules.push_back({path, hx::Access::Read, true});
     }
     for (const std::string& path : options.write_paths) {
-        rules.push_back({path, Access::Write, true});
+        rules.push_back({path, hx::Access::Write, true});
     }
+}
+
+// The walls: system directories are readable, the project and a private temporary directory are writable, and
+// the rest of the machine (the home directory above all) cannot be opened at all.
+std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& project, const fs::path& tmp) {
+    using hx::Access;
+    std::vector<hx::Rule> rules = system_rules();
+    rules.push_back({project.string(), Access::Write, true});
+    rules.push_back({tmp.string(), Access::Write, true});
+    add_user_rules(rules, options);
     return rules;
 }
 
@@ -629,6 +656,164 @@ int run_loop(lua_State* L) {
     return run_module(L, hx::kDefaultLoop, "=loop");
 }
 
+// Runs body in a fresh VM that has the host primitives. The Host outlives the VM, and kills what the VM's commands
+// left running when it goes.
+template <typename Body>
+int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) {
+    hx::install_signal_handlers();
+    hx::Host host(std::move(config), sandbox);
+    std::size_t vm_memory = 0;  // declared before the state, which frees through it
+    const LuaState state(lua_newstate(limited_alloc, &vm_memory));
+    if (!state) {
+        throw std::runtime_error("cannot create a Luau state");
+    }
+    lua_State* L = state.get();
+    luaL_openlibs(L);
+    hx::open_json(L);
+    host.open(L);
+    return body(L);
+}
+
+// --- the judge -------------------------------------------------------------------------------------------
+//
+// With --judge, a second process measures what the agent submits. It is forked before the agent's wall goes up and
+// puts up a wall of its own: it reads the project and the kit and writes only its state directory, which the
+// agent's wall leaves out, as it leaves out the kit. The agent's only way to it is one socket, line by line
+// (host.judge). The judge itself is lua/judge.luau, built into hx, so nothing the agent writes can change it.
+
+// Whether a rule lets in path, or anything under it.
+bool reaches(const std::vector<hx::Rule>& rules, const fs::path& path) {
+    for (const hx::Rule& rule : rules) {
+        std::error_code ec;
+        const fs::path base = fs::weakly_canonical(rule.path, ec);
+        if (ec) {
+            continue;
+        }
+        const fs::path inside = path.lexically_relative(base);
+        if (!inside.empty() && *inside.begin() != "..") {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct Judge {
+    pid_t pid = -1;
+    int channel = -1;  // the agent's end, owned by the Host
+    fs::path state;
+};
+
+// Where the judge keeps the champion, its patch and the ledger: $XDG_STATE_HOME/hx/judge/PROJECT-TIME.
+fs::path judge_state(const fs::path& project) {
+    std::string base = env_or("XDG_STATE_HOME", "");
+    if (!base.starts_with('/')) {
+        base = env_or("HOME", "") + "/.local/state";
+    }
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    std::array<char, 32> stamp{};
+    const std::size_t length = std::strftime(stamp.data(), stamp.size(), "%Y%m%d-%H%M%S", &local);
+    return fs::path(base) / "hx" / "judge" /
+           fmt::format("{}-{}", project.filename().string(), std::string_view(stamp.data(), length));
+}
+
+[[noreturn]] void judge_main(const Options& options, int channel, const fs::path& project, const fs::path& kit,
+                             const fs::path& state) {
+    int status = kExitFailure;
+    try {
+        setsid();  // the terminal's Ctrl-C is for the agent; the judge ends when its channel does
+        if (dup2(channel, STDIN_FILENO) < 0 || dup2(channel, STDOUT_FILENO) < 0) {
+            throw std::runtime_error(fmt::format("judge: dup2: {}", hx::error_text()));
+        }
+        close(channel);
+        static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
+        const fs::path tmp = state / "tmp";
+        fs::create_directories(tmp);
+        setenv("TMPDIR", tmp.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): one thread
+
+        std::vector<hx::Rule> rules = system_rules();
+        rules.push_back({project.string(), hx::Access::Read, true});
+        rules.push_back({kit.string(), hx::Access::Read, true});
+        rules.push_back({state.string(), hx::Access::Write, true});
+        add_user_rules(rules, options);  // the candidate's commands get them too, as the agent's do
+        const hx::Sandbox sandbox = hx::Sandbox::confine(rules, options.unix_sockets);
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+
+        hx::HostConfig config;
+        config.args = {kit.string(), state.string()};
+        for (const std::string& path : options.read_paths) {
+            config.args.insert(config.args.end(), {"--ro", path});
+        }
+        for (const std::string& path : options.write_paths) {
+            config.args.insert(config.args.end(), {"--rw", path});
+        }
+        config.quiet = options.quiet;
+        config.system_rules = system_rules();
+        status = run_vm(std::move(config), sandbox, [](lua_State* L) { return run_module(L, hx::kJudge, "=judge"); });
+    } catch (const std::exception& error) {
+        fmt::print(stderr, "hx: judge: {}\n", error.what());
+    }
+    static_cast<void>(std::fflush(stderr));
+    _exit(status);
+}
+
+// Forks the judge for --judge KIT and returns the agent's end of the channel to it.
+Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::path& project, const fs::path& tmp) {
+    std::error_code ec;
+    const fs::path kit = fs::canonical(kit_dir, ec);
+    if (ec || !fs::is_directory(kit)) {
+        throw UsageError(fmt::format("--judge {}: not a directory", kit_dir));
+    }
+    if (access((kit / "run").c_str(), X_OK) != 0) {
+        throw UsageError(fmt::format("--judge {}: the kit needs an executable file named run", kit.string()));
+    }
+    const std::vector<hx::Rule> wall = sandbox_rules(options, project, tmp);
+    if (reaches(wall, kit)) {
+        throw UsageError(
+            fmt::format("--judge {}: the agent could read the kit there; keep it outside the project, "
+                        "the system directories and every --ro and --rw path",
+                        kit.string()));
+    }
+    Judge judge{.state = judge_state(project)};
+    fs::create_directories(judge.state, ec);
+    if (ec || reaches(wall, judge.state)) {
+        throw UsageError(fmt::format("cannot keep the judge's state in {}: {}", judge.state.string(),
+                                     ec ? ec.message() : "the agent could reach it"));
+    }
+    std::array<int, 2> ends{};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends.data()) != 0) {
+        throw std::runtime_error(fmt::format("socketpair: {}", hx::error_text()));
+    }
+    static_cast<void>(std::fflush(nullptr));  // or the child would write out the parent's buffers again
+    judge.pid = fork();
+    if (judge.pid < 0) {
+        throw std::runtime_error(fmt::format("fork: {}", hx::error_text()));
+    }
+    if (judge.pid == 0) {
+        close(ends[0]);
+        judge_main(options, ends[1], project, kit, judge.state);
+    }
+    close(ends[1]);
+    judge.channel = ends[0];
+    return judge;
+}
+
+// Tells the judge the session is over and waits for its summary. A trial in progress is finished first.
+void finish_judge(const Judge& judge) {
+    constexpr int kWaitSeconds = 120;
+    shutdown(judge.channel, SHUT_WR);
+    for (int tick = 0; tick < kWaitSeconds * 10; ++tick) {
+        if (waitpid(judge.pid, nullptr, WNOHANG) != 0) {
+            return;
+        }
+        const timespec nap{0, 100'000'000};
+        nanosleep(&nap, nullptr);
+    }
+    fmt::print(stderr, "hx: the judge did not finish in {} seconds; its state is in {}\n", kWaitSeconds,
+               judge.state.string());
+}
+
 // A descriptor inherited from whoever started hx was opened outside the wall and would pass through it to every
 // command. Marking them close-on-exec keeps them from commands; hx itself never uses them.
 void close_inherited_fds() {
@@ -714,6 +899,8 @@ int run(const std::vector<std::string_view>& argv) {
 
     // The model's words go to stdout and progress to stderr; line buffering keeps the two in order in a pipe.
     static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
+    const std::optional<Judge> judge =
+        options.judge ? std::optional(spawn_judge(options, *options.judge, project, tmp.path())) : std::nullopt;
     const CurlGlobal curl;
     const hx::Sandbox sandbox = options.sandbox ? confine(options, project, tmp.path()) : hx::Sandbox::none();
     if (sandbox.confined() && !sandbox.blocks_unix_sockets()) {
@@ -724,23 +911,17 @@ int run(const std::vector<std::string_view>& argv) {
     }
     // Keeps the commands the model runs from reading the key out of this process's memory.
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-    hx::install_signal_handlers();
-
-    hx::Host host(std::move(config), sandbox);  // outlives the VM; kills what the model left running when it goes
-    std::size_t vm_memory = 0;                  // declared before the state, which frees through it
-    const LuaState state(lua_newstate(limited_alloc, &vm_memory));
-    if (!state) {
-        throw std::runtime_error("cannot create a Luau state");
+    config.system_rules = system_rules();
+    if (judge) {
+        config.judge = hx::UniqueFd(judge->channel);
     }
-    lua_State* L = state.get();
-    luaL_openlibs(L);
-    hx::open_json(L);
-    host.open(L);
-
-    if (script) {
-        return run_module(L, *script, fmt::format("={}", options.script));
-    }
-    return run_loop(L);
+    return run_vm(std::move(config), sandbox, [&](lua_State* L) {
+        const int status = script ? run_module(L, *script, fmt::format("={}", options.script)) : run_loop(L);
+        if (judge) {
+            finish_judge(*judge);
+        }
+        return status;
+    });
 }
 
 // Reports a fatal error without being able to fail itself.

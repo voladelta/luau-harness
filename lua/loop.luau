@@ -17,6 +17,7 @@
 --                                                     or Exa's search for "exa"; the host adds the key
 --   host.tools, host.exa                              DEEPSEEK_API_KEY, EXA_API_KEY is there
 --   host.extensions                                   the built-in extensions' sources, by name
+--   host.judge(line) -> line, host.judged             the judge's channel, with --judge KIT
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
 -- host.timed returns; a plain pcall cannot swallow them.
@@ -713,6 +714,23 @@ M.functions = {
 	},
 }
 
+-- With --judge, one more function: the only way a change counts.
+if host.judged then
+	table.insert(M.functions, {
+		name = "submit",
+		usage = "submit(note) -> text: hands the project as it stands to the judge, with a note on what you "
+			.. "changed and what you expect. The judge builds and measures it beside the champion, the best version "
+			.. "so far, with a kit you cannot see, and returns its verdict. Only verdicts count.",
+		run = function(note)
+			check("submit", note, 1, "note", "string")
+			progress("  submit " .. M.printable(note:sub(1, 100):gsub("\n", " ")))
+			local verdict = json.decode(host.judge(json.encode({ note = note })))
+			progress("  " .. M.printable(verdict:match("^[^\n]*")))
+			return verdict
+		end,
+	})
+end
+
 -- Tools -----------------------------------------------------------------------------------------------------
 --
 -- Each tool is {name, description, parameters (a JSON schema), run(args) -> text, failed?}. A tool may also report
@@ -1064,6 +1082,16 @@ function M.system_prompt()
 			.. "you wrote or edited it yourself in this session.",
 		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
 	}
+	if host.judged then
+		table.insert(parts, "This session is judged. A judge outside your wall measures the project with a kit "
+			.. "you cannot read: it builds it, runs it beside the champion, the best version so far, in pairs, and "
+			.. "keeps a change only when it is better by more than a margin and holds up again on fresh runs. "
+			.. "Your own measurements guide you; only submit() decides. Work one idea at a time: make the change, "
+			.. "check with your own tests that it still works, then submit it. After a win, commit it with git so "
+			.. "you can come back to it; after any other verdict, put the project back to the last win before the "
+			.. "next idea, unless you mean to build on this one. Keep going while you have ideas with a real chance, "
+			.. "then report each verdict and what the champion holds.")
+	end
 	local extensions = extension_index()
 	if #extensions > 0 then
 		table.insert(parts, "Extensions:\n" .. table.concat(extensions, "\n"))

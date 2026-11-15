@@ -27,6 +27,8 @@ hx --model sonnet "same, on Claude Sonnet 5.5"
 - **One wall, built by the kernel.** Before anything runs, the process confines itself with Landlock. The VM,
   the file functions and every command the model starts inherit the same rules, so no function needs a path
   check and no command needs to be judged by its text.
+- **A change counts when a judge says so.** With `--judge KIT`, a second process, behind a wall of its own,
+  measures what the model submits with a kit the model cannot read, and keeps only gains that hold up twice.
 - **Extensions have no more power than the model.** An extension is Luau running in the same confined process.
   It can do nothing the model's own shell could not, so nothing needs to be approved, staged or trusted.
 
@@ -52,6 +54,7 @@ header-only).
 hx [options] [TASK...]              run the agent; without a task, read it from stdin or start a prompt
 hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives (FILE - reads stdin)
 hx --init [--full]                  write .hx/loop.luau, which starts from the built-in loop (--full: a copy)
+hx --judge KIT [options] [TASK...]  run the agent with a judge: only what it submits and the kit confirms counts
 hx --help | --version
 ```
 
@@ -62,6 +65,7 @@ after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not 
 
 | Option | Meaning |
 |---|---|
+| `--judge KIT` | judge the model's work with the kit in directory `KIT`, which must lie outside the wall (see "The judge") |
 | `--model NAME` | the model to ask; overrides `HX_MODEL`. `opus`, `sonnet` and `haiku` are the current Claude models |
 | `--ro PATH` | also allow reading `PATH` |
 | `--rw PATH` | also allow writing `PATH` |
@@ -246,6 +250,67 @@ An illegal operation raises and changes nothing, so an interrupt, a cut-off repl
 a history the API would reject. `tests/conversation_test.luau` checks this with a random walk over every
 operation in every state.
 
+## The judge
+
+An agent asked to make a number go up will sometimes make it only look higher: it skips the slow case, moves the
+timer, or just says it won. So with `--judge KIT` the model only proposes. A judge that it can neither read nor
+change measures each change against the best version so far, the **champion**, and keeps only what it confirms.
+The idea is [Thermite](https://github.com/iammrduncan/thermite)'s, cut down to one machine and one process.
+
+```
+hx --judge ~/kits/primes "make 'python3 primes.py N' fast for large N, keeping every answer right"
+```
+
+A **kit** is the judge's half of the project, a directory with up to four files:
+
+| File | Does |
+|---|---|
+| `run` | required, executable. Runs in a copy of the candidate and is timed by the judge from outside; it exits 0 when it worked |
+| `build` | optional, executable. Runs once per candidate before any run, untimed |
+| `check` | optional, executable. Runs as `check DIR` after each run, where `DIR/.judge/stdout` is what the run printed. It exits 0 when the output is right; a number on its last line is the score, and higher is better. Without a score, the measure is the run's time. What it prints when it fails goes to the model |
+| `kit.json` | optional: `{"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}`: pairs per round (1 suits a score that does not vary), the smallest gain that counts, the seconds one build, run or check may take, and whether the model hears verdicts without their numbers, so that it cannot fit what the kit holds back by reading scores |
+
+The model gets one more function, `submit(note)`, and a paragraph in its prompt that says how judging works.
+Each submission goes through the same steps:
+
+1. **Copied.** The judge copies the project as it stands, without `.git` and `.hx`.
+2. **Built**, by the kit's `build`, if there is one. A build that fails is `broken`.
+3. **Screened.** The candidate and the champion run in pairs, each pair in a random order, and each run in a fresh
+   copy of its build, so nothing one run leaves helps the next. A run or check that fails is `invalid`. The change
+   is better when the median pair and all pairs but one favour it, by more than the margin. Otherwise it is
+   `no different` or `worse`.
+4. **Confirmed.** A change that looks better is measured again in fresh pairs and judged on those alone: `win`, or
+   `not confirmed`.
+
+At the start the judge measures the project as it is. That is the first champion; if it does not pass, the first
+submission that does is. The model hears each verdict with its numbers. When the session ends, hx prints a
+summary, and the judge's state directory, `$XDG_STATE_HOME/hx/judge/PROJECT-TIME` (`~/.local/state` by default),
+holds `champion.patch` (the champion against the start, for `patch -p1`), `ledger.jsonl` (every trial, its note,
+verdict and gains) and `trials/N.patch` for every trial, whatever its verdict.
+
+The walls are what make the verdicts worth having:
+
+- **The judge is its own process.** hx forks it before the agent's wall goes up. It confines itself to reading the
+  project and the kit and writing its state directory; the agent's wall leaves out the kit and the state
+  directory, and hx refuses a kit or state directory that the agent could read. The two talk over one socket, a
+  line each way, through `host.judge`. The agent sends only a note; the judge builds each candidate
+  from its own copy of the project.
+- **The candidate cannot read the kit either.** `build` and `run` run behind a narrower wall still: their copy of
+  the candidate, the system directories and the `--ro` and `--rw` paths. Only the file being run is copied in,
+  and it can delete itself once loaded, as a driver holding unseen data should. `check` reads the kit and the
+  run's copy and writes nothing that lasts.
+- **A candidate leaves nothing running.** What a build or run started dies when it ends, so no process of the
+  candidate's can slow the champion's runs, or write into an output after the run.
+- **The judge is built into hx** (`lua/judge.luau`). A project's loop can change everything about the agent, but
+  not the judge.
+- **What the kit gets wrong, the judge cannot fix.** A check that accepts a wrong answer lets it win, and a run
+  dominated by start-up buries a real gain in noise. Try a kit on the unchanged project, and on a known-bad change,
+  before trusting it. On a kernel before Linux 6.12 (Landlock ABI 6), a candidate could signal the judge, which
+  can stop judging but not forge a verdict.
+
+The time a whole `lua` call may take, `M.call_seconds` (600), bounds one submission too; a kit with slow runs needs
+a larger one in `.hx/loop.luau`.
+
 ## Extensions
 
 An extension is a Luau module at `.hx/ext/NAME.luau`. Its first line is a comment that says what it does, and
@@ -336,7 +401,8 @@ Everything Luau can do to the machine:
 |---|---|
 | `host.llm(body, {timeout=600, beta=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header |
 | `host.tool(name, request, {timeout=300})` | `status, text`, or `nil, error`: a POST to DeepSeek's `search`, `fetch` or `ocr` endpoint with `DEEPSEEK_API_KEY`, or, for `"exa"`, to Exa's search endpoint with `EXA_API_KEY`. A string `request` is sent as JSON; for DeepSeek, a table is sent as a form, whose `file` field is the path of a file to upload |
-| `host.sh(command, {timeout=120})` | `{out, code, signal, timed_out}` |
+| `host.sh(command, {timeout=120, read=, write=})` | `{out, code, signal, timed_out}`. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force; and whatever it starts is killed when it ends |
+| `host.judge(line)` | the judge's one-line answer to one line, with `--judge` |
 | `host.read(path)` | the contents, or `nil, error` |
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed or killed write leaves the old content; its owner, mode, extended attributes and ACLs stay, and a link stays a link. A device, a FIFO, a file with other hard links, one whose attributes cannot be copied, or one in a directory that refuses a new file is written in place |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
@@ -350,6 +416,7 @@ Everything Luau can do to the machine:
 | `host.tty` | `true` when stdout is a terminal |
 | `host.tools` | `true` when hx has a `DEEPSEEK_API_KEY` for `host.tool` |
 | `host.exa` | `true` when hx has an `EXA_API_KEY` for `host.tool("exa")` |
+| `host.judged` | `true` when there is a judge for `host.judge` |
 | `host.extensions` | the built-in extensions' sources, by name |
 | `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | |
 
@@ -373,6 +440,7 @@ Two rules hold across all of them:
 | `src/host.cpp` | the `host` primitives, signals, time limits |
 | `src/json.cpp` | JSON between Lua values and text, on RapidJSON's streaming reader and writer |
 | `lua/loop.luau` | the agent |
+| `lua/judge.luau` | the judge, which `--judge` runs in a process of its own |
 | `lua/ext/*.luau` | the built-in extensions |
 
 Development build, with AddressSanitizer, UBSan and warnings as errors:

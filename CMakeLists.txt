@@ -71,11 +71,12 @@ find_package(CURL REQUIRED)
 # starts when a project's own loop is broken. The overlay, which `hx --init` writes, is embedded the same way.
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/loop.luau HX_LOOP_SOURCE)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/overlay.luau HX_OVERLAY_SOURCE)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/judge.luau HX_JUDGE_SOURCE)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/web.luau HX_EXT_WEB_SOURCE)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/ocr.luau HX_EXT_OCR_SOURCE)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/exa.luau HX_EXT_EXA_SOURCE)
 configure_file(src/embedded.h.in embedded.h @ONLY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS lua/loop.luau lua/overlay.luau lua/ext/web.luau
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS lua/loop.luau lua/overlay.luau lua/judge.luau lua/ext/web.luau
                                                                lua/ext/ocr.luau lua/ext/exa.luau)
 
 add_executable(hx src/main.cpp src/host.cpp src/json.cpp src/sandbox.cpp)

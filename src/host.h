@@ -1,11 +1,13 @@
 #ifndef HX_HOST_H_
 #define HX_HOST_H_
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "sandbox.h"
+#include "sys.h"
 
 struct lua_State;
 
@@ -24,6 +26,8 @@ struct HostConfig {
     bool quiet = false;             // host.quiet: --quiet, so the loop leaves out progress lines
     std::string default_loop;       // host.default_loop: the built-in loop's source
     std::vector<std::pair<std::string, std::string>> extensions;  // host.extensions: built-in ones, name and source
+    std::vector<Rule> system_rules;  // what every wall lets in: system directories, harmless devices, trust roots
+    UniqueFd judge;                  // a line-based channel to the judge process (--judge); invalid for none
 };
 
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
@@ -33,7 +37,10 @@ struct HostConfig {
 //   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr, or
 //                                                     Exa's search for "exa"; request is JSON text, or (DeepSeek
 //                                                     only) a form table whose `file` is a path
-//   host.sh(command, {timeout=120}) -> {out=, code=, signal=, timed_out=}
+//   host.sh(command, {timeout=120, read=, write=}) -> {out=, code=, signal=, timed_out=}
+//                                                     read and write are lists of paths: given either, the command
+//                                                     runs behind a narrower wall, the system directories and those
+//   host.judge(line) -> line                          sends one line to the judge and waits for its answer
 //   host.read(path) -> string | nil, error
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a file by
 //                                                     renaming a new one over it, so it is never left cut short
@@ -50,6 +57,7 @@ struct HostConfig {
 //   host.tools                                        a DeepSeek key is there for host.tool
 //   host.exa                                          an Exa key is there for host.tool("exa")
 //   host.extensions                                   the built-in extensions' sources, by name
+//   host.judged                                       a judge is there for host.judge
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
 // SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input)
@@ -84,14 +92,19 @@ class Host {
     static int timed(lua_State* L);
     static int protect(lua_State* L, int fn, double deadline);
     static int sleep(lua_State* L);
+    static int judge(lua_State* L);
 
     // Shortens a wait so that it ends no later than the host.timed limit in force. A negative wait is an empty one.
     [[nodiscard]] double within_limit(double seconds) const;
+    // The narrower wall host.sh's options at idx ask for, prepared before the fork.
+    [[nodiscard]] std::optional<Wall> narrower_wall(lua_State* L, int idx) const;
 
     HostConfig config_;
     bool sandboxed_;
-    double deadline_ = 0;  // the innermost host.timed limit on the monotonic clock; 0 for none
-    int tries_ = 0;        // host.try and host.timed calls in progress
+    double deadline_ = 0;   // the innermost host.timed limit on the monotonic clock; 0 for none
+    int tries_ = 0;         // host.try and host.timed calls in progress
+    std::string judge_in_;  // what the judge sent that is not yet a whole line
+    int judge_owed_ = 0;    // answers the judge still owes; those of calls a stop cut short are dropped
 };
 
 // Makes SIGINT, SIGTERM and SIGHUP stop the running command or request and surface as a Luau error. A second

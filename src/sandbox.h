@@ -4,7 +4,10 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "sys.h"
 
 namespace hx {
 
@@ -62,6 +65,22 @@ class Sandbox {
 
     int abi_;
     bool filtered_;  // the seccomp filter against unix sockets is installed
+};
+
+// A narrower wall inside the one this process is in, decided now and put up later in a forked child. Landlock
+// rulesets stack, so a command behind it can reach only what both this wall and the process's own allow.
+class Wall {
+  public:
+    // Throws SandboxError when the kernel has no Landlock or a required path cannot be had.
+    [[nodiscard]] static Wall prepare(const std::vector<Rule>& rules);
+
+    // Confines the calling thread and its descendants. System calls only, so a forked child may call it.
+    [[nodiscard]] bool enter() const noexcept;
+
+  private:
+    explicit Wall(UniqueFd ruleset) noexcept : ruleset_(std::move(ruleset)) {}
+
+    UniqueFd ruleset_;
 };
 
 }  // namespace hx

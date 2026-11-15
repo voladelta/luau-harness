@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -182,9 +183,9 @@ bool filter_unix_sockets() {
 
 #endif
 
-}  // namespace
-
-Sandbox Sandbox::confine(const std::vector<Rule>& rules, bool unix_sockets) {
+// Creates a ruleset that grants the rules and handles every right the kernel's ABI knows, so anything they do not
+// grant is denied. Returns the ruleset and the ABI.
+std::pair<UniqueFd, int> make_ruleset(const std::vector<Rule>& rules) {
     const long version = syscall(kCreateRuleset, nullptr, 0, kCreateRulesetVersion);
     if (version < 1) {
         throw SandboxError("this kernel has no Landlock (needs Linux 5.13 or later with the landlock LSM enabled)");
@@ -204,7 +205,7 @@ Sandbox Sandbox::confine(const std::vector<Rule>& rules, bool unix_sockets) {
         attr_size = 2 * sizeof(uint64_t);
     }
 
-    const UniqueFd ruleset(static_cast<int>(syscall(kCreateRuleset, &attr, attr_size, 0)));
+    UniqueFd ruleset(static_cast<int>(syscall(kCreateRuleset, &attr, attr_size, 0)));
     if (!ruleset.valid()) {
         fail("landlock_create_ruleset");
     }
@@ -236,17 +237,33 @@ Sandbox Sandbox::confine(const std::vector<Rule>& rules, bool unix_sockets) {
             fail(fmt::format("landlock_add_rule {}", rule.path));
         }
     }
+    return {std::move(ruleset), abi};
+}
 
+// Puts the ruleset up around the calling thread and everything it will start. System calls only.
+bool restrict_self(int ruleset) noexcept {
     // Required by landlock_restrict_self and by a seccomp filter, and wanted anyway: no setuid program can raise
     // a child's privileges.
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-        fail("PR_SET_NO_NEW_PRIVS");
-    }
-    if (syscall(kRestrictSelf, ruleset.get(), 0) != 0) {
+    return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 && syscall(kRestrictSelf, ruleset, 0) == 0;
+}
+
+}  // namespace
+
+Sandbox Sandbox::confine(const std::vector<Rule>& rules, bool unix_sockets) {
+    const auto [ruleset, abi] = make_ruleset(rules);
+    if (!restrict_self(ruleset.get())) {
         fail("landlock_restrict_self");
     }
     const bool filtered = abi < kUnixSocketAbi && !unix_sockets && filter_unix_sockets();
     return Sandbox(abi, filtered);
+}
+
+Wall Wall::prepare(const std::vector<Rule>& rules) {
+    return Wall(make_ruleset(rules).first);
+}
+
+bool Wall::enter() const noexcept {
+    return restrict_self(ruleset_.get());
 }
 
 }  // namespace hx

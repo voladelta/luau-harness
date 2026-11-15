@@ -15,6 +15,9 @@ inline constexpr std::string_view kDefaultLoop = R"HXLUAU(@HX_LOOP_SOURCE@)HXLUA
 // lua/overlay.luau: what `hx --init` writes to .hx/loop.luau, a loop that loads the one above and changes parts.
 inline constexpr std::string_view kLoopOverlay = R"HXLUAU(@HX_OVERLAY_SOURCE@)HXLUAU";
 
+// lua/judge.luau: the judge that --judge KIT runs in a process of its own.
+inline constexpr std::string_view kJudge = R"HXLUAU(@HX_JUDGE_SOURCE@)HXLUAU";
+
 // lua/ext/*.luau: the built-in extensions, which ext(NAME) loads when the project has no .hx/ext/NAME.luau.
 inline constexpr std::pair<std::string_view, std::string_view> kExtensions[] = {
     {"web", R"HXLUAU(@HX_EXT_WEB_SOURCE@)HXLUAU"},

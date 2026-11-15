@@ -138,7 +138,7 @@ def text(words):
 # The model has one tool, lua, and calls the functions from its code. A scripted bash, read, write or edit call
 # becomes the code a model would send for it: `return bash("...")`.
 FUNCTIONS = {"bash": ["command", "timeout"], "read": ["path", "offset", "limit"], "write": ["path", "content"],
-             "edit": ["path", "old", "new", "all"]}
+             "edit": ["path", "old", "new", "all"], "submit": ["note"]}
 
 
 def lua_literal(value):
@@ -1529,6 +1529,116 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("s.luau:1: it broke", done.stderr)
 
+
+    def test_a_narrower_wall_holds_its_command_and_what_it_leaves(self):
+        with open(os.path.join(self.project, "secret.txt"), "w") as f:
+            f.write("s3cret\n")
+        with open(os.path.join(self.project, "wall.luau"), "w") as f:
+            f.write("""
+local box = host.env("TMPDIR") .. "/box"
+host.sh("mkdir -p " .. box)
+host.sh("sleep 61 > /dev/null 2>&1 &")  -- an ordinary background job
+print(host.sh("cat secret.txt", { write = { box } }).code ~= 0)
+print(host.sh("echo inside > " .. box .. "/f && cat " .. box .. "/f", { write = { box } }).out)
+host.sh("setsid sleep 62 > /dev/null 2>&1 & echo left", { write = { box } })
+print(host.sh("pgrep -x sleep -a").out)
+""")
+        done = self.run_hx("--run", "wall.luau")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.splitlines()
+        self.assertEqual(lines[:2], ["true", "inside"])
+        self.assertIn("sleep 61", done.stdout)
+        self.assertNotIn("sleep 62", done.stdout)
+
+    # --- the judge ---
+
+    def make_kit(self, where=None):
+        """A kit that times prog.sh and passes only when it prints 42."""
+        kit = where or os.path.join(self.root, "kit")
+        os.makedirs(kit, exist_ok=True)
+        for name, body in [("run", "#!/bin/sh\nsh prog.sh\n"),
+                           ("check", '#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "wrong: $(head -c 80 "$1/.judge/stdout")"; exit 1; }\n')]:
+            with open(os.path.join(kit, name), "w") as f:
+                f.write(body)
+            os.chmod(os.path.join(kit, name), 0o755)
+        with open(os.path.join(kit, "kit.json"), "w") as f:
+            f.write('{"runs": 3}')
+        with open(os.path.join(self.project, "prog.sh"), "w") as f:
+            f.write("sleep 0.3\necho 42\n")
+        return kit
+
+    def judge_state(self):
+        base = os.path.join(self.home, ".local", "state", "hx", "judge")
+        (name,) = os.listdir(base)
+        return os.path.join(base, name)
+
+    def test_the_judge_keeps_only_confirmed_wins(self):
+        kit = self.make_kit()
+        with open(os.path.join(self.project, "drive.luau"), "w") as f:
+            f.write(f"""
+local function submit(note, prog)
+    host.write("prog.sh", prog)
+    print((json.decode(host.judge(json.encode({{ note = note }}))):gsub("\\n", " | ")))
+end
+submit("same", "sleep 0.3\\necho 42\\n")
+submit("faster", "sleep 0.05\\necho 42\\n")
+submit("wrong", "echo 41\\n")
+submit("peek", "cat {kit}/check >/dev/null 2>&1 && echo leaked || echo 42\\n")
+submit("slower", "sleep 0.2\\necho 42\\n")
+""")
+        done = self.run_hx("--judge", kit, "--run", "drive.luau", XDG_STATE_HOME="")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.splitlines()
+        self.assertTrue(lines[0].startswith("Trial 1. no different:"), lines[0])
+        self.assertIn("The champion is still the starting point.", lines[0])
+        self.assertTrue(lines[1].startswith("Trial 2. win:"), lines[1])
+        self.assertTrue(lines[2].startswith("Trial 3. invalid: the check failed: | wrong: 41"), lines[2])
+        # The candidate's run cannot read the kit: had it, it would have printed "leaked" and failed the check.
+        self.assertTrue(lines[3].startswith("Trial 4. win:"), lines[3])
+        self.assertTrue(lines[4].startswith("Trial 5. worse:"), lines[4])
+        self.assertIn("hx judge: 5 trials: 2 win, 1 no different, 1 worse, 1 invalid", done.stderr)
+        state = self.judge_state()
+        ledger = [json.loads(line) for line in read(state, "ledger.jsonl").splitlines()]
+        self.assertEqual([e["verdict"] for e in ledger], ["start", "no different", "win", "invalid", "win", "worse"])
+        self.assertEqual(ledger[2]["note"], "faster")
+        patch = read(state, "champion.patch")
+        self.assertIn("+cat", patch)
+        self.assertIn("-sleep 0.3", patch)
+        self.assertTrue(os.path.exists(os.path.join(state, "trials", "3.patch")))
+
+    def test_the_agent_cannot_reach_the_kit_or_the_ledger(self):
+        kit = self.make_kit()
+        state_base = os.path.join(self.home, ".local", "state")
+        with open(os.path.join(self.project, "peek.luau"), "w") as f:
+            f.write(f"print(host.read('{kit}/check'), host.list('{state_base}'), host.sh('ls {kit}').code ~= 0)\n")
+        done = self.run_hx("--judge", kit, "--run", "peek.luau", XDG_STATE_HOME="")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.split()[0], "nil")
+        self.assertIn("\tnil\t", done.stdout)
+        self.assertTrue(done.stdout.rstrip().endswith("true"), done.stdout)
+
+    def test_a_kit_the_agent_could_read_is_refused(self):
+        kit = self.make_kit(os.path.join(self.project, "kit"))
+        done = self.run_hx("--judge", kit, "go")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("the agent could read the kit there", done.stderr)
+        self.assertEqual(self.model.requests, [])
+        done = self.run_hx("--judge", self.make_kit(), "--no-sandbox", "go")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--judge needs the wall", done.stderr)
+
+    def test_submit_hands_the_project_to_the_judge(self):
+        kit = self.make_kit()
+        done = self.run_hx("--judge", kit, "speed it up", XDG_STATE_HOME="", script=[
+            call("bash", {"command": "printf 'sleep 0.05\\necho 42\\n' > prog.sh"}),
+            call("submit", {"note": "dropped the long sleep"}, call_id="call_2"), say("It won.")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("This session is judged.", self.model.requests[0]["system"])
+        self.assertIn("submit(note)", self.model.requests[0]["tools"][0]["description"])
+        self.assertTrue(self.tool_results()[1].startswith("Trial 1. win:"), self.tool_results())
+        self.assertIn("hx judge: 1 trial: 1 win", done.stderr)
+        ledger = [json.loads(line) for line in read(self.judge_state(), "ledger.jsonl").splitlines()]
+        self.assertEqual(ledger[1]["note"], "dropped the long sleep")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
