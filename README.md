@@ -196,6 +196,10 @@ call directly rather than from code), `M.skill_dirs`, `M.system_prompt`, `M.requ
 The loop always calls them through `M`, so a replacement takes effect everywhere. `M.model` starts as `host.model`,
 the model `--model` or `HX_MODEL` chose with its alias resolved.
 
+A project function may run a `lua` call inside the running one (`M.tools[1].run`), or a whole `M.turn` on another
+`Conversation`, as a sub-agent. The nested call keeps the outer call's printed lines, and the nested turn counts
+repeats on its own and leaves the outer turn's counts alone. The model's globals are shared by both.
+
 Some habits of the model are handled in the loop rather than left to the prompt: a function call that gets the same
 result for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to
 try something else only when it knows an action that will change the result (results are compared by length and a
@@ -337,6 +341,9 @@ that code prints. A changed file is loaded again on its next use. Each
 session starts with a list of the project's extensions in the system prompt. The tool itself never changes, so
 prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the project.
 
+An extension whose name starts with `_` is a helper for other extensions: `ext()` loads it like any other, and
+the system prompt does not list it.
+
 ### Built in: web, ocr and exa
 
 Three extensions come with hx, in `lua/ext/`. Two of them, `web` and `ocr`, call DeepSeek's [Search, Fetch](https://api-docs.deepseek.com/guides/search)
@@ -350,7 +357,9 @@ project's own `.hx/ext/web.luau` or `.hx/ext/ocr.luau` takes the place of the bu
 | `ext("web").fetch(url)` | the page as Markdown, its title first as a heading when the page does not show it |
 | `ext("ocr").read(path, purpose?)` | the text of a PDF, Word, PowerPoint or image file, up to 100 MiB and 1,000 pages. A PDF is read with `rich_layout_recognition`, which keeps tables and layout and leaves box tokens in the text; anything else with `text_recognition`. A document of several pages has a `[page N]` line before each |
 
-Requests that fail with 408, 429 or 5xx, or get no answer, are tried three times. The file for OCR is read by the
+Requests that fail with 408, 429 or 5xx, or get no answer, are tried three times, Exa's too. The retry loop, the
+reading of error bodies and the argument checks are written once, in the helper `_http`, which all three load; a
+project's own `.hx/ext/_http.luau` takes its place for all of them. The file for OCR is read by the
 host inside the wall, so a file the model cannot read cannot be sent. Search and Fetch cost $0.75 per 1,000
 requests, OCR $0.225 per 1,000 pages.
 
@@ -458,7 +467,12 @@ Development build, with AddressSanitizer, UBSan and warnings as errors:
 cmake --preset dev && cmake --build --preset dev && ctest --preset dev
 clang-format --dry-run --Werror src/*.cpp src/*.h
 clang-tidy -p build-dev --quiet src/*.cpp
+luau-analyze lua/*.luau lua/ext/*.luau tests/*.luau     # prints nothing when all is well
 ```
+
+The Luau files in `lua/` are `--!strict`; an extension carries that on its second line, because its first is the
+description the system prompt shows. `.luaurc` names the globals the host provides. When `luau-analyze` is
+installed, `ctest` runs it over every Luau file as the test `analyze`, and anything it prints fails the test.
 
 `tests/live_test.py` runs the agent against the real endpoint: making and editing files, reading a line range,
 noticing a failed command, following a long output to its file, compacting a Vietnamese conversation into English
