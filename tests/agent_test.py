@@ -336,6 +336,45 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual([len(r) for r in self.reminders()], [0, 0, 0, 0])
 
+    def test_a_long_result_is_counted_by_all_of_it(self):
+        # Long results are counted by a digest, not kept: one byte changed in the middle is still a new result.
+        loop = ('local a = string.rep("a", 300000) '
+                'for i = 1, 4 do write("big", a:sub(1, 150000) .. i .. a:sub(150002)) bash("cat big") end '
+                'for i = 1, 3 do bash("cat big") end')
+        done = self.run_hx("go", script=[call("lua", {"code": loop}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        reminders = self.reminders()
+        self.assertEqual([len(r) for r in reminders], [1])
+        self.assertIn('bash("cat big") has now returned the same result 4 times', reminders[0][0])
+
+    def test_loading_an_extension_again_is_not_counted(self):
+        # ext returns the same table of functions each time, which says nothing about progress.
+        done = self.run_hx("go", script=[call("lua", {"code": "for i = 1, 6 do ext('web') end return 'ok'"}),
+                                         say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results(), ["ok"])
+        self.assertEqual([len(r) for r in self.reminders()], [0])
+
+    def test_the_log_is_saved_during_the_turn(self):
+        # A run killed half-way leaves its log up to the last tool call, not nothing.
+        os.makedirs(os.path.join(self.project, ".hx"))
+        done = self.run_hx("go", script=[call("bash", {"command": "echo first"}, "c1"),
+                                         call("bash", {"command": "cat .hx/log/*.json"}, "c2"), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        during = json.loads(self.tool_results()[1].rsplit("\n", 1)[0])
+        self.assertEqual([m["role"] for m in during["messages"]], ["user", "assistant", "user"])
+        self.assertEqual(during["messages"][2]["content"][0]["content"], "first\n[exit 0]")
+        logs = [name for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(len(json.loads(read(self.project, ".hx", "log", logs[0]))["messages"]), 6)
+
+    def test_sessions_in_the_same_second_keep_their_own_logs(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        for _ in range(3):
+            self.assertEqual(self.run_hx("go", script=[say("ok")]).returncode, 0)
+        logs = [name for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
+        self.assertEqual(len(logs), 3)
+
     def test_running_out_of_replies_still_gets_a_report(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
@@ -1364,7 +1403,8 @@ class AgentTest(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
         # A setting changed in it, and a function replaced in it, change what is sent.
         with open(loop, "w") as f:
-            f.write(source.replace('-- M.model = host.env("HX_MODEL") or "deepseek-v4-pro"', 'M.model = "project-model"')
+            f.write(source.replace('-- M.model = host.model or host.env("HX_MODEL") or "deepseek-v4-pro"',
+                                   'M.model = "project-model"')
                     .replace("-- local built_in_prompt", "local built_in_prompt")
                     .replace("-- function M.system_prompt()", "function M.system_prompt()")
                     .replace("-- \treturn built_in_prompt()", "\treturn built_in_prompt()")
@@ -1383,7 +1423,8 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(source, read(REPO, "lua", "loop.luau"))
         # The copy is what runs: change it and the behaviour changes.
         with open(loop, "w") as f:
-            f.write(source.replace('M.model = host.env("HX_MODEL") or "deepseek-flash"', 'M.model = "project-model"'))
+            f.write(source.replace('M.model = host.model or host.env("HX_MODEL") or "deepseek-flash"',
+                                   'M.model = "project-model"'))
         self.run_hx("go", script=[say("ok")])
         self.assertEqual(self.model.requests[0]["model"], "project-model")
 

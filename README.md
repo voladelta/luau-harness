@@ -172,7 +172,7 @@ call to the next. The code acts through these functions:
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too |
-| `skill(name)` | a skill's instructions, by name; other words search the skills (see "Skills") |
+| `skill(name)` | a skill's instructions, by name; for a name no skill has, the list of skills to pick from (see "Skills") |
 | `ext(name)` | an extension's table of functions |
 
 `host.*` and `json.*` are there too, for working on raw data. A function that fails raises, and the error goes
@@ -184,26 +184,29 @@ returns everything, so code can work on an output of any size.
 
 ```lua
 local M = host.load(host.default_loop, "=loop")()
-M.model = host.env("HX_MODEL") or "deepseek-v4-pro"  -- --model and HX_MODEL still win
+M.model = host.model or host.env("HX_MODEL") or "deepseek-v4-pro"  -- --model and HX_MODEL still win
 table.insert(M.functions, { name = "check", usage = "check() -> text: runs the tests", run = function() ... end })
 return M
 ```
 
 Every setting at the top of the loop is a field of `M`, and so are the parts a project may want to replace:
-`M.functions`, `M.skill_dirs`, `M.system_prompt`, `M.request` (one request to the model), `M.turn` (replies and tool calls until
-the model is done), `M.compact`, `M.compact_prompt` and `M.resume_prompt`. The loop always calls them through `M`, so a replacement
-takes effect everywhere.
+`M.functions`, `M.tools` (the tools the model is offered: `lua` alone, unless a project adds one the model should
+call directly rather than from code), `M.skill_dirs`, `M.system_prompt`, `M.request` (one request to the model),
+`M.turn` (replies and tool calls until the model is done), `M.compact`, `M.compact_prompt` and `M.resume_prompt`.
+The loop always calls them through `M`, so a replacement takes effect everywhere. `M.model` starts as `host.model`,
+the model `--model` or `HX_MODEL` chose with its alias resolved.
 
-Some habits of the model are handled in the loop rather than left to the prompt: a call that gets the same result
-for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to try
-something else only when it knows an action that will change the result; a reply with nothing in it is retried
-like a busy server; and a task that runs out of replies gets one more, to report where it stands.
+Some habits of the model are handled in the loop rather than left to the prompt: a function call that gets the same
+result for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to
+try something else only when it knows an action that will change the result (results are compared by length and a
+hash, so a long one is not kept); a reply with nothing in it is retried like a busy server; and a task that runs out of replies gets one more, to report where it stands.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
 ### Claude models
 
 `M.claude` lists what the loop adds for the Claude models it knows; any other model, DeepSeek's included, gets the
-plain request. The settings follow Anthropic's guidance for these models:
+plain request. Any `claude-*` model, listed or not, gets the system prompt as a block with `cache_control`; only a
+listed one gets the features below. The settings follow Anthropic's guidance for these models:
 
 | | Opus 5.5 | Sonnet 5.5 | Haiku 5.5 |
 |---|---|---|---|
@@ -231,8 +234,9 @@ cache after a compaction, and the top-level automatic one, which moves forward w
 caches every prefix by itself and ignores `cache_control`. The line at the end of a run gives the tokens read
 from the cache and written to it.
 
-When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON. The logs hold
-file contents, so that directory carries a `.gitignore` that keeps all of it out of git.
+When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON, after every reply that
+called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. The logs
+hold file contents, so that directory carries a `.gitignore` that keeps all of it out of git.
 
 ### The conversation is a state machine
 
@@ -328,7 +332,8 @@ return {
 ```
 
 The model writes extensions with `write` and calls them from its code as `ext("NAME").count("src")`. An
-extension can call the same functions the model's code can. A changed file is loaded again on its next use. Each
+extension can call the same functions the model's code can, and what it prints goes into the tool result with what
+that code prints. A changed file is loaded again on its next use. Each
 session starts with a list of the project's extensions in the system prompt. The tool itself never changes, so
 prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the project.
 
@@ -379,18 +384,18 @@ Group commits by area, newest first. Run scripts/authors.sh for the credits line
 hx looks in `.hx/skills/`, `.agents/skills/` and `.claude/skills/` in the project, then `~/.agents/skills/` and
 `~/.claude/skills/`, and the first skill of a name wins. The two in your home directory are outside the wall, so
 they are found only when you open them: `hx --ro ~/.claude/skills "..."`. A skill with
-`disable-model-invocation: true` is left out of the prompt and of searches, but still loads by its name. Other
+`disable-model-invocation: true` is left out of the prompt and of the list, but still loads by its name. Other
 fields, such as `allowed-tools`, `model` and `hooks`, are ignored: there is one tool, and the wall is the same for
 everything.
 
-The system prompt lists each skill with its description, up to `M.skill_index_full` (30) of them; up to
-`M.skill_index_names` (150) it lists their names only, and past that only how many there are. The list is made once
-per run, so it does not upset the prompt cache. The model loads a skill from its code:
+The system prompt lists each skill with its description, up to `M.skill_index_full` (30) of them, and past that
+their names only. The list is made once per run, so it does not upset the prompt cache. The model loads a skill
+from its code:
 
 | Call | Returns |
 |---|---|
 | `skill("release-notes")` | the text after the front matter, headed by the skill's directory and its other files by their paths from the project (up to `M.skill_files_shown`, 30), so a script the skill names can be run as it is listed; the work itself stays in the project directory. Case, `-`, `_`, `.` and spaces in the name do not matter, so `skill("Release_Notes")` is the same call; when two skills differ only in those, both are listed with their paths instead |
-| `skill("changelog from git")` | when no skill has that name: the closest skills by name and description, as `name: description` lines. The name close to the words, or near it by up to two typos, counts most, then words of the name, then words of the description, where `spreadsheet` also matches `spreadsheets` |
+| `skill("changelog")` | when no skill has that name: the skills as `name: description` lines, up to `M.skill_listed` (50) and then how many more, for the model to pick one. There is no fuzzy search: the model reads descriptions better than a score would |
 
 Scripts in a skill run through `bash`, inside the wall like any other command. A skill in the project can be
 written by the model, and a skill in a repository you cloned is text from whoever wrote it, like its README.

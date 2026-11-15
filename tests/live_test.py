@@ -210,24 +210,30 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(text.strip().splitlines()[-1], "-- hx")
         self.assertEqual(text.strip().splitlines()[0], text.strip().splitlines()[0].upper())
 
-    def test_a_skill_not_listed_is_found_by_search(self):
-        # Past M.skill_index_names the prompt gives only how many skills there are, so the model has to search.
-        self.overlay("M.skill_index_full = 0\nM.skill_index_names = 0")
+    def test_a_skill_not_listed_is_found_from_the_list_for_an_unknown_name(self):
+        # With the skills left out of the system prompt, the model knows of skill() only from the tool description;
+        # a name no skill has returns the list of skills with their descriptions, and it picks from that.
+        self.overlay("local built_in_prompt = M.system_prompt\n"
+                     "function M.system_prompt()\n"
+                     "\treturn (built_in_prompt():gsub('\\n\\nSkills are instructions.*$', ''))\n"
+                     "end")
         self.skill(".agents/skills", "ship-it", "Deploy a release of this project to production.",
                    "In this project, deploying means writing the single word DEPLOYED to the file deploy.log. Do "
                    "nothing else.\n")
         for name, about in (("pdf-tools", "Read and merge PDF files."), ("xlsx", "Edit Excel spreadsheets."),
                             ("changelog", "Write the changelog from git history.")):
             self.skill(".agents/skills", name, about, "Not this one.\n")
-        self.run_hx("deploy the release")
-        code = "\n".join(self.code())
-        # Searching with skill() or reading the skill files directly both find it.
-        self.assertRegex(code, r"skill\(|SKILL\.md", "the skill was not looked for")
+        self.run_hx("deploy the release, following this project's skill for it")
+        self.assertNotIn("ship-it", self.log["system"], "the overlay did not take the skills out of the prompt")
         self.assertNotIn("ship-it", self.code()[0], "the name was not in the prompt, so it cannot be known up front")
+        listed = [r for r in self.results() if "No skill is named" in r]
+        self.assertTrue(listed, "skill() was not asked for a name to get the list")
+        self.assertIn("- ship-it: Deploy a release", listed[0])
+        self.assertIn("skill(", "\n".join(self.code()[1:]))
         self.assertEqual(self.read("deploy.log").strip(), "DEPLOYED")
 
     def test_a_skill_listed_by_name_only_is_loaded(self):
-        # Between M.skill_index_full and M.skill_index_names the prompt lists names without descriptions.
+        # Past M.skill_index_full the prompt lists names without descriptions.
         self.overlay("M.skill_index_full = 1")
         self.skill(".hx/skills", "tag-version", "Tag a version of this project.",
                    "Tagging a version here means writing the version, and nothing else, to the file VERSION.\n")

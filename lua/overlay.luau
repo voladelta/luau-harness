@@ -5,9 +5,9 @@
 
 local M = host.load(host.default_loop, "=loop")()
 
--- The model, and the other settings at the top of the built-in loop. Reading HX_MODEL first keeps
--- `hx --model NAME` and the variable in charge:
--- M.model = host.env("HX_MODEL") or "deepseek-v4-pro"
+-- The model, and the other settings at the top of the built-in loop. Reading host.model (what `hx --model NAME`
+-- or HX_MODEL chose) first keeps them in charge:
+-- M.model = host.model or host.env("HX_MODEL") or "deepseek-v4-pro"
 
 -- A function of this project's own, which the model's code can call. `usage` is what the model reads about it;
 -- run returns what the code gets back, and raising reports an error to the model.

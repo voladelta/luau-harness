@@ -185,6 +185,7 @@ for _, name in { "bash(command, timeout?)", "read(path, offset?, limit?)", "writ
 	check("the tool describes " .. name, description:find(name, 1, true) ~= nil, true)
 end
 check("the description is the same each time, for the cache", loop.tools[1].description(), description)
+check("ext is described once", select(2, description:gsub("ext%(name%)", "")), 1)
 
 -- the host's limits
 local started = os.time()

@@ -13,6 +13,8 @@
 --   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
 --   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 --   host.tty                                          stdout is a terminal
+--   host.model                                        the model --model or HX_MODEL chose, its alias resolved
+--                                                     (opus is claude-opus-5-5); nil on an older hx
 --   host.tool(name, request, {timeout=}) -> status, text | nil, error     DeepSeek's search, fetch or ocr endpoint,
 --                                                     or Exa's search for "exa"; the host adds the key
 --   host.tools, host.exa                              DEEPSEEK_API_KEY, EXA_API_KEY is there
@@ -26,7 +28,7 @@
 
 local M = {}
 
-M.model = host.env("HX_MODEL") or "deepseek-flash"
+M.model = host.model or host.env("HX_MODEL") or "deepseek-flash"
 M.max_output = 16000 -- tokens per model reply
 M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
@@ -69,13 +71,14 @@ end
 --
 -- An extension is a Luau module in .hx/ext/NAME.luau that returns a table of functions. The model writes them
 -- with write() and calls them from its code, so the tool never changes. A module is loaded again whenever its
--- file has changed. Extensions see the same functions the model's code does. hx has some built in
+-- file has changed. Extensions see the same functions the model's code does, and what they print goes into the
+-- tool result with what that code prints. hx has some built in
 -- (host.extensions: web, ocr and exa); a project's file of the same name takes the place of one.
 
 local ext_dir = ".hx/ext/"
 local ext_cache = {}
 -- What code from the model and from extensions sees: the functions of M.functions (looked up when used, so a
--- project's changes to the list count at once), ext, and the Luau globals.
+-- project's changes to the list count at once), print, and the Luau globals.
 --
 -- Every function call is counted by what it was asked and what it returned. A call that returns what it returned
 -- before is going nowhere, whatever ran in between and whether the model repeats it across tool calls or in a loop
@@ -83,26 +86,47 @@ local ext_cache = {}
 -- clock and so never repeat exactly. A command rerun after a fix returns something new, so it does not count.
 local repeats = { counts = {}, worst = nil } -- this turn's counts, and the call repeated most
 
--- A value as text: JSON where it has a JSON form, and nil as null.
-local function as_text(value)
+-- A value as JSON, nil as null; nil for a value with no JSON form, such as a table of functions.
+local function as_json(value)
 	local ok, text = pcall(json.encode, value == nil and json.null or value)
-	return ok and text or tostring(value)
+	return ok and text or nil
+end
+
+-- A short stand-in for a text, so that the counts do not keep every result of the turn (a bash call returns up to a
+-- mebibyte): a short text itself, a longer one its length and a hash of all of it, read four bytes at a time.
+-- Different texts of the same length rarely share a hash, and when they do it costs only an early reminder.
+local function digest(text)
+	if #text <= 256 then
+		return text
+	end
+	local data, hash, tail = buffer.fromstring(text), 0, #text - #text % 4
+	-- 65599 times a hash below the prime 4294967291, plus a 32-bit word, stays below 2^53, so it is exact.
+	for at = 0, tail - 4, 4 do
+		hash = (hash * 65599 + buffer.readu32(data, at)) % 4294967291
+	end
+	for at = tail, #text - 1 do
+		hash = (hash * 65599 + buffer.readu8(data, at)) % 4294967291
+	end
+	return ("%d:%d"):format(#text, hash)
 end
 
 local function counted(fn)
 	return function(...)
 		local result = fn.run(...)
 		-- A command that succeeded and printed nothing did something rather than looked at something (git add,
-		-- mkdir, a sleep between polls): that it does so again says nothing about progress.
-		if result == "[exit 0]" then
+		-- mkdir, a sleep between polls): that it does so again says nothing about progress. Nor does a result with
+		-- no text form, such as ext's table of functions, which is the same table each time.
+		local text = result ~= "[exit 0]" and (type(result) == "string" and result or as_json(result))
+		if not text then
 			return result
 		end
 		local args = {}
 		for i = 1, select("#", ...) do
-			args[i] = as_text((select(i, ...)))
+			local value = (select(i, ...))
+			args[i] = as_json(value) or tostring(value)
 		end
 		local call = ("%s(%s)"):format(fn.name, table.concat(args, ", "))
-		local key = call .. "\0" .. as_text(result)
+		local key = digest(call) .. "\0" .. digest(text)
 		local count = (repeats.counts[key] or 0) + 1
 		repeats.counts[key] = count
 		if not repeats.worst or count > repeats.worst.count then
@@ -112,14 +136,31 @@ local function counted(fn)
 	end
 end
 
-local function lookup(_, name)
-	if name == "ext" then
-		return M.ext
+-- Where print goes: into the result of the `lua` call that is running, which is what the model sees, whether the
+-- model's code prints or an extension it called does. Outside a call (a test calling an extension), to stderr, never
+-- to stdout, which carries only the answer.
+local printed = nil -- the lines of the running call
+local function capture_print(...)
+	local parts = table.pack(...)
+	for i = 1, parts.n do
+		parts[i] = tostring(parts[i])
 	end
+	local line = table.concat(parts, "\t")
+	if printed then
+		table.insert(printed, line)
+	else
+		host.log(line)
+	end
+end
+
+local function lookup(_, name)
 	for _, fn in M.functions do
 		if fn.name == name then
 			return counted(fn)
 		end
+	end
+	if name == "print" then
+		return capture_print
 	end
 	return _G[name]
 end
@@ -183,7 +224,7 @@ end
 --
 -- A skill is instructions for one kind of task, in the Agent Skills format: a directory with a SKILL.md, whose
 -- YAML front matter has a name and a description, and whatever scripts and references the text points to. The
--- system prompt lists them; skill(name) returns one's text, and any other words search names and descriptions.
+-- system prompt lists them; skill(name) returns one's text, and a name no skill has returns the list to pick from.
 -- Only name, description and disable-model-invocation are read: hx has one tool and one wall, so allowed-tools,
 -- model and hooks mean nothing here. Directories are searched in this order, and the first skill of a name wins.
 -- A directory in the home directory is outside the wall unless hx was started with --ro for it; then it is
@@ -196,10 +237,9 @@ if home and home:sub(1, 1) == "/" then
 	table.insert(M.skill_dirs, home .. "/.agents/skills/")
 	table.insert(M.skill_dirs, home .. "/.claude/skills/")
 end
-M.skill_index_full = 30 -- up to this many skills, the system prompt lists each with its description
-M.skill_index_names = 150 -- up to this many, it lists their names; past it, only how many there are
-M.skill_description_limit = 250 -- characters of a description in the system prompt and in search results
-M.skill_matches = 8 -- search results returned
+M.skill_index_full = 30 -- up to this many skills, the system prompt lists each with its description; past it, names
+M.skill_listed = 50 -- skills, with their descriptions, that skill() lists for a name no skill has
+M.skill_description_limit = 250 -- characters of a description in those lists
 
 local function trim(text)
 	return (text:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -298,73 +338,6 @@ local function skill_line(skill)
 	return ("- %s: %s"):format(skill.name, description)
 end
 
--- Edit distance between two strings, by bytes.
-local function distance(a, b)
-	local row = {}
-	for j = 0, #b do
-		row[j] = j
-	end
-	for i = 1, #a do
-		local diagonal = row[0]
-		row[0] = i
-		for j = 1, #b do
-			local above = row[j]
-			row[j] = math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a:byte(i) == b:byte(j) and 0 or 1))
-			diagonal = above
-		end
-	end
-	return row[#b]
-end
-
-local stop_words = {}
-for _, word in ("a an and the of for to in on with by or is it this that use using how what when do does skill"):split(" ") do
-	stop_words[word] = true
-end
-
-local function words(text)
-	local list = {}
-	for word in text:lower():gsub("[%-_]", " "):gmatch("[^%s%p]+") do
-		if #word > 1 and not stop_words[word] then
-			table.insert(list, word)
-		end
-	end
-	return list
-end
-
--- Whether a word of the query matches one of a list: the same word, or one starts with the other (spreadsheet,
--- spreadsheets) when both are at least 3 bytes long.
-local function word_score(word, list)
-	local best = 0
-	for _, other in list do
-		if other == word then
-			return 1
-		elseif #word >= 3 and #other >= 3 and (other:sub(1, #word) == word or word:sub(1, #other) == other) then
-			best = 0.6
-		end
-	end
-	return best
-end
-
--- How well a skill matches a query: the whole name close to the query, then the query's words in the name and in
--- the description. 0 is no match.
-local function skill_score(skill, query)
-	local q, n = skill_key(query), skill_key(skill.name)
-	local score = 0
-	if #q >= 3 and (n:find(q, 1, true) or q:find(n, 1, true)) then
-		score += 6
-	elseif #q >= 4 and #n >= 4 then
-		local d = distance(q, n)
-		if d <= 2 then
-			score += 5 - d
-		end
-	end
-	local name_words, description_words = words(skill.name), words(skill.description)
-	for _, word in words(query) do
-		score += 3 * word_score(word, name_words) + word_score(word, description_words)
-	end
-	return score
-end
-
 M.skill_files_shown = 30 -- files of a loaded skill named, with their paths, in its heading
 
 -- The files of a skill other than SKILL.md, as paths from the project directory, so that the model can use them as
@@ -389,8 +362,21 @@ local function skill_files(dir)
 	return files
 end
 
--- What skill(text) returns: the skill named text, or else the skills that match it best.
-function M.skill(text)
+-- The skills the model is told about: all but those marked disable-model-invocation.
+local function listed_skills()
+	local listed = {}
+	for _, skill in M.skills() do
+		if not skill.hidden then
+			table.insert(listed, skill)
+		end
+	end
+	return listed
+end
+
+-- What skill(name) returns: the skill of that name, or the skills whose names differ from it only in case, -, _, .
+-- and spaces when there are several, or else the list of skills to pick from. No guessing past that: the model
+-- reads the list and picks better than a fuzzy match would.
+function M.skill(name)
 	local skills = M.skills()
 	if #skills == 0 then
 		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
@@ -398,7 +384,7 @@ function M.skill(text)
 	end
 	local found
 	for _, skill in skills do
-		if skill.name == text then
+		if skill.name == name then
 			found = { skill }
 			break
 		end
@@ -406,7 +392,7 @@ function M.skill(text)
 	if not found then
 		found = {}
 		for _, skill in skills do
-			if skill_key(skill.name) == skill_key(text) then
+			if skill_key(skill.name) == skill_key(name) then
 				table.insert(found, skill)
 			end
 		end
@@ -427,83 +413,50 @@ function M.skill(text)
 		end
 		return head .. "]\n\n" .. trim(body)
 	elseif #found > 1 then
-		local lines = { ("Several skills have a name like %q; load one by its exact name:"):format(text) }
+		local lines = { ("Several skills have a name like %q; load one by its exact name:"):format(name) }
 		for _, skill in found do
 			table.insert(lines, skill_line(skill) .. " (" .. skill.path .. ")")
 		end
 		return table.concat(lines, "\n")
 	end
 
-	local ranked = {}
-	for _, skill in skills do
-		local score = not skill.hidden and skill_score(skill, text) or 0
-		if score > 0 then
-			table.insert(ranked, { skill = skill, score = score })
-		end
+	local listed = listed_skills()
+	local lines = { ("No skill is named %q."):format(name) }
+	if #listed == 0 then
+		return lines[1]
 	end
-	table.sort(ranked, function(a, b)
-		if a.score ~= b.score then
-			return a.score > b.score
-		end
-		return a.skill.name < b.skill.name
-	end)
-	local lines = {}
-	if #ranked == 0 then
-		table.insert(lines, ("No skill is named %q or matches it."):format(text))
-		local shown = {}
-		for _, skill in skills do
-			if not skill.hidden then
-				table.insert(shown, skill)
-			end
-		end
-		if #shown > 0 and #shown <= 20 then
-			table.insert(lines, "The skills are:")
-			for _, skill in shown do
-				table.insert(lines, skill_line(skill))
-			end
-		else
-			table.insert(lines, ("There are %d skills; try other words."):format(#shown))
-		end
-		return table.concat(lines, "\n")
+	table.insert(lines, "Pick one of these and load it by its name:")
+	for i = 1, math.min(#listed, M.skill_listed) do
+		table.insert(lines, skill_line(listed[i]))
 	end
-	table.insert(lines, ("No skill is named %q. The closest by name and description:"):format(text))
-	for i = 1, math.min(#ranked, M.skill_matches) do
-		table.insert(lines, skill_line(ranked[i].skill))
+	if #listed > M.skill_listed then
+		table.insert(lines, ("and %d more, named in the system prompt"):format(#listed - M.skill_listed))
 	end
-	table.insert(lines, "Load one with skill(name).")
 	return table.concat(lines, "\n")
 end
 
--- The system prompt's part on skills: each with its description, or only their names, or only how many there are.
+-- The system prompt's part on skills: each with its description, or past M.skill_index_full only their names, which
+-- keeps the prompt short; skill() with a name no skill has gives the descriptions.
 local function skill_index()
-	local shown = {}
-	for _, skill in M.skills() do
-		if not skill.hidden then
-			table.insert(shown, skill)
-		end
-	end
-	if #shown == 0 then
+	local listed = listed_skills()
+	if #listed == 0 then
 		return nil
 	end
 	local head = "Skills are instructions for particular kinds of task. When the task matches one, load it with "
 		.. "skill(name) before you start, and follow it."
-	if #shown <= M.skill_index_full then
+	if #listed <= M.skill_index_full then
 		local lines = { head }
-		for _, skill in shown do
+		for _, skill in listed do
 			table.insert(lines, skill_line(skill))
 		end
 		return table.concat(lines, "\n")
 	end
-	if #shown <= M.skill_index_names then
-		local names = {}
-		for _, skill in shown do
-			table.insert(names, skill.name)
-		end
-		return ("%s There are %d: %s. skill(words) searches their names and descriptions."):format(head, #shown,
-			table.concat(names, ", "))
+	local names = {}
+	for _, skill in listed do
+		table.insert(names, skill.name)
 	end
-	return ("%s There are %d; skill(words) searches their names and descriptions, so search when a task may have "
-		.. "one."):format(head, #shown)
+	return ("%s There are %d: %s. To see what they are for, call skill() with a name none has, as skill(\"?\"), "
+		.. "which lists them with their descriptions."):format(head, #listed, table.concat(names, ", "))
 end
 
 -- Functions -------------------------------------------------------------------------------------------------
@@ -701,15 +654,21 @@ M.functions = {
 	},
 	{
 		name = "skill",
-		usage = "skill(name) -> text: the instructions of the skill of that name (case, - and _ do not matter), "
-			.. "headed by its directory; any other words search the skills' names and descriptions and return the "
-			.. "closest.",
-		run = function(text)
-			check("skill", text, 1, "name", "string")
-			if trim(text) == "" then
-				error("skill: give a skill's name, or words to search for", 0)
+		usage = "skill(name) -> text: the instructions of the skill of that name (case, -, _, . and spaces do not "
+			.. "matter), headed by its directory; for a name no skill has, the skills with what each is for.",
+		run = function(name)
+			check("skill", name, 1, "name", "string")
+			if trim(name) == "" then
+				error("skill: give a skill's name", 0)
 			end
-			return M.skill(trim(text))
+			return M.skill(trim(name))
+		end,
+	},
+	{
+		name = "ext",
+		usage = "ext(name) -> table: the extension .hx/ext/NAME.luau, or one built into hx.",
+		run = function(name)
+			return M.ext(name)
 		end,
 	},
 }
@@ -747,8 +706,13 @@ end
 
 -- Tools -----------------------------------------------------------------------------------------------------
 --
--- Each tool is {name, description, parameters (a JSON schema), run(args) -> text, failed?}. A tool may also report
--- failure by raising; the message goes back to the model. The built-in loop has one tool.
+-- The tools the model is offered. The built-in loop has one, `lua`, and a project rarely needs more: a function in
+-- M.functions is usually the better choice, since code can call it in a loop or with other calls, and so can
+-- extensions. M.tools is still a real extension point, for a tool the model should call directly rather than from
+-- code (one a model was trained on, say); a project adds one with
+-- table.insert(M.tools, {...}), and the loop checks its arguments against its schema and runs it like `lua`.
+-- Each tool is {name, description (text, or a function that returns it), parameters (a JSON schema),
+-- run(args) -> text, failed?}. A tool may also report failure by raising; the message goes back to the model.
 
 local scratch = setmetatable({}, { __index = lookup }) -- globals of `lua` code live here, across calls
 
@@ -777,7 +741,6 @@ local function lua_description()
 	for _, fn in M.functions do
 		table.insert(lines, "- " .. fn.usage)
 	end
-	table.insert(lines, "- ext(name) -> table: the extension .hx/ext/NAME.luau, or one built into hx.")
 	table.insert(lines, "- host.sh(command) -> {out, code}, host.read(path) -> text, host.write(path, text), "
 		.. "host.list(dir), json.encode, json.decode: the plain primitives, for working on data.")
 	table.insert(lines, "")
@@ -802,18 +765,14 @@ M.tools = {
 				error('argument "code" must be a string', 0)
 			end
 			local lines = {}
-			scratch.print = function(...)
-				local parts = table.pack(...)
-				for i = 1, parts.n do
-					parts[i] = tostring(parts[i])
-				end
-				table.insert(lines, table.concat(parts, "\t"))
-			end
+			scratch.print = capture_print -- again each call, in case the model's code assigned print
 			local chunk, err = host.load(args.code, "=lua", scratch)
 			if not chunk then
 				return "error: " .. err, true
 			end
+			printed = lines
 			local results = table.pack(host.timed(M.call_seconds, chunk))
+			printed = nil
 			local failed = not results[1]
 			if failed then
 				table.insert(lines, "error: " .. tostring(results[2]))
@@ -916,6 +875,16 @@ M.claude = {
 	["claude-haiku-5-5"] = { effort = "medium", compaction = true },
 }
 
+-- What the loop knows of M.model, the one place that decides. "Is this Claude" has two answers, and each use
+-- needs a different one:
+--   any claude-* model speaks the Claude API, so it gets the system prompt as a block with cache_control, which
+--     every Claude model accepts (DeepSeek ignores the field and gets a plain string)
+--   only a model listed in M.claude gets the newer features of its entry; an older Claude model gets none
+-- Returns whether the model is Claude, and its M.claude entry or nil.
+local function claude_model()
+	return M.model:match("^claude%-") ~= nil, M.claude[M.model]
+end
+
 local usage = { replies = 0, input = 0, cached = 0, written = 0, output = 0 }
 
 -- Adds a reply's tokens to the run's count. A compaction reply has zero at the top and the summarization call in
@@ -992,27 +961,27 @@ end
 -- get a real reply. `compaction`, given, asks a Claude model for a summary in place of a reply (see M.compact);
 -- that reply comes back however empty it is, since an empty one is an answer too.
 function M.request(system, messages, compaction)
-	local claude = M.claude[M.model]
+	local is_claude, features = claude_model()
 	local thinking = { type = "adaptive" }
 	local betas = {}
 	local fallbacks = nil
-	if claude then
+	if features then
 		thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
 		table.insert(betas, "thinking-binding-controls-2026-08-01")
-		if claude.display then
-			thinking.display = claude.display
+		if features.display then
+			thinking.display = features.display
 			table.insert(betas, "thinking-display-updates-2026-08-18")
 		end
-		if claude.fallbacks then
-			fallbacks = claude.fallbacks
+		if features.fallbacks then
+			fallbacks = features.fallbacks
 			table.insert(betas, "server-side-fallback-2026-07-01")
 		end
 		-- On every request, not only the one that asks for the summary: a request that carries the block needs it.
-		if claude.compaction then
+		if features.compaction then
 			table.insert(betas, "compact-2026-09-04")
 		end
 	end
-	local effort = M.effort or (claude and claude.effort)
+	local effort = M.effort or (features and features.effort)
 	-- Caching. The Claude API caches a prefix only up to a breakpoint, and a request reads only what an earlier one
 	-- wrote at a breakpoint. Two of them, both with the default five-minute life, which every request in a running
 	-- loop refreshes:
@@ -1028,7 +997,7 @@ function M.request(system, messages, compaction)
 	-- DeepSeek caches every prefix by itself and ignores cache_control, so any model that is not Claude gets the
 	-- system prompt as the plain string; the same stable prefix is what makes its cache hits.
 	local system_field = system
-	if M.model:match("^claude%-") then
+	if is_claude then
 		system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
 	end
 	local body = json.encode({
@@ -1144,8 +1113,11 @@ local Conversation = {}
 Conversation.__index = Conversation
 M.Conversation = Conversation
 
+-- on_answer, if set, is called with the conversation after each answer: after every reply that called tools and
+-- their results. M.main sets it to save the log, so a run killed half-way still leaves one; it is here rather than
+-- in M.turn so that it goes on when a project replaces M.turn. A fork does not carry it.
 function Conversation.new()
-	return setmetatable({ messages = {} }, Conversation)
+	return setmetatable({ messages = {}, on_answer = nil }, Conversation)
 end
 
 local function tool_calls(message)
@@ -1214,6 +1186,9 @@ function Conversation:answer(run)
 		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = failed or nil })
 	end
 	table.insert(self.messages, { role = "user", content = results })
+	if self.on_answer then
+		self.on_answer(self)
+	end
 end
 
 -- Answers whatever is owed with an error, so a turn stopped half-way leaves a history that can continue.
@@ -1372,8 +1347,8 @@ end
 -- behind the whole conversation so that the request reuses the cached prefix.
 function M.compact(system, talk)
 	progress("  compacting the conversation")
-	local claude = M.claude[M.model]
-	if claude and claude.compaction then
+	local _, features = claude_model()
+	if features and features.compaction then
 		return compact_on_server(system, talk)
 	end
 	local asking = talk:fork()
@@ -1411,8 +1386,8 @@ end
 -- Prints the text of a reply: the model's words are the answer, on stdout. A model asked for progress updates
 -- (M.claude's display) writes its notes between tool calls into thinking blocks; those are progress lines.
 local function show_text(reply)
-	local claude = M.claude[M.model]
-	local updates = claude and claude.display == "updates"
+	local _, features = claude_model()
+	local updates = features and features.display == "updates"
 	for _, block in reply.content do
 		if block.type == "text" and block.text ~= "" then
 			print(host.tty and M.printable(block.text) or block.text)
@@ -1475,8 +1450,11 @@ function M.turn(system, talk)
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
 end
 
--- With a .hx directory, each session's conversation is kept in .hx/log/ as JSON.
-local log_path = host.list(".hx") and (".hx/log/%s.json"):format(os.date("%Y%m%d-%H%M%S")) or nil
+-- With a .hx directory, each session's conversation is kept in .hx/log/ as JSON. The name starts with the time, so
+-- the logs sort by it, and ends with the random part of this run's $TMPDIR (hx-XXXXXX), which no other running hx
+-- shares, so two sessions started in the same second keep two logs.
+local log_path = host.list(".hx") and (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
+	(host.env("TMPDIR") or ""):match("([%w]+)/*$") or "0") or nil
 local function save(system, messages)
 	if log_path then
 		-- Logs hold file contents, so the directory keeps itself out of git, however .hx/ came to exist.
@@ -1522,6 +1500,10 @@ end
 function M.main()
 	local system = M.system_prompt()
 	local talk = Conversation.new()
+	-- Encoding even a long conversation takes milliseconds, next to seconds for a reply.
+	talk.on_answer = function()
+		save(system, talk.messages)
+	end
 	local task = table.concat(host.args, " ")
 
 	if not host.interactive then
