@@ -128,6 +128,7 @@ constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
     {"sonnet", "claude-sonnet-5-5"},
     {"haiku", "claude-haiku-5-5"},
 };
+constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh", "max"};  // what HX_EFFORT may be
 constexpr const char* kProjectLoop = ".hx/loop.luau";
 
 constexpr int kExitFailure = 1;
@@ -546,6 +547,20 @@ hx::Sandbox confine(const Options& options, const fs::path& project, const fs::p
                         "Run hx inside a project directory.",
                         project.string()));
     }
+    // The same for a path the wall is asked to let in: --rw ~ is one slip away from --rw ~/src.
+    for (const auto& [flag, paths] :
+         {std::pair{"--ro", &options.read_paths}, std::pair{"--rw", &options.write_paths}}) {
+        for (const std::string& path : *paths) {
+            std::error_code ec;
+            const fs::path whole = fs::canonical(path, ec);
+            if (!ec && (whole == "/" || holds_home(whole))) {
+                throw UsageError(
+                    fmt::format("refusing {} {}: it would open your whole home directory. Name the "
+                                "directories inside it that the task needs, or pass --no-sandbox.",
+                                flag, path));
+            }
+        }
+    }
     try {
         return hx::Sandbox::confine(sandbox_rules(options, project, tmp), options.unix_sockets);
     } catch (const hx::SandboxError& error) {
@@ -744,6 +759,12 @@ int run(const std::vector<std::string_view>& argv) {
 
     const ModelChoice endpoint = choose_endpoint(options.model);
     setenv("HX_MODEL", endpoint.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+    // A misspelt effort would only come back as the endpoint's error, a round trip later.
+    if (const std::string effort = env_or("HX_EFFORT", ""); effort.empty()) {
+        unsetenv("HX_EFFORT");  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+    } else if (std::ranges::find(kEfforts, effort) == std::end(kEfforts)) {
+        throw UsageError(fmt::format("HX_EFFORT={}: the efforts are low, medium, high, xhigh and max", effort));
+    }
     const bool stdin_tty = isatty(STDIN_FILENO) != 0;
     if (options.no_input && options.mode == Mode::Agent && options.args.empty() && stdin_tty) {
         throw UsageError("no task, and --no-input forbids the prompt: give the task as arguments or on stdin");
@@ -788,9 +809,13 @@ int run(const std::vector<std::string_view>& argv) {
         config.extensions.emplace_back(name, source);
     }
     // libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules).
-    config.ca_bundle = env_or("SSL_CERT_FILE", env_or("CURL_CA_BUNDLE", ""));
-    if (access(config.ca_bundle.c_str(), R_OK) != 0) {
-        config.ca_bundle.clear();  // a stale variable must not break every request; libcurl's own roots then apply
+    // The first of the two that can be read: a stale variable must not hide a good one, or break every request.
+    // With neither, libcurl's own roots apply.
+    for (const char* name : {"SSL_CERT_FILE", "CURL_CA_BUNDLE"}) {
+        if (const std::string path = env_or(name, ""); !path.empty() && access(path.c_str(), R_OK) == 0) {
+            config.ca_bundle = path;
+            break;
+        }
     }
 
     std::optional<std::string> script;

@@ -148,8 +148,9 @@ class LiveTest(unittest.TestCase):
             if first[0].get("type") == "compaction":
                 return first[0]["content"]
             first = first[0]["text"]
-        self.assertIn("written by you:", first, "the conversation was never compacted")
-        return first.split("written by you:", 1)[1]
+        resume = "\n\nEarlier turns were replaced by the checkpoint above"  # M.resume_prompt follows the summary
+        self.assertIn(resume, first, "the conversation was never compacted")
+        return first.rsplit(resume, 1)[0]
 
     def test_a_compacted_conversation_goes_on_from_its_checkpoint(self):
         self.overlay("M.compact_at = 1")

@@ -506,11 +506,35 @@ class Capture {
         }
     }
 
+    // At most kCaptureHalf from each end. Each part ends or starts at a line where one is near, and never inside
+    // a character: half a character is not valid UTF-8, and would be lost without a word.
     [[nodiscard]] std::string text() const {
-        if (dropped_ == 0) {
-            return head_ + tail_;
+        if (head_.size() + tail_.size() <= 2 * kCaptureHalf) {
+            return head_ + tail_;  // nothing was dropped: the tail only fills once the head is full
         }
-        return fmt::format("{}\n[... {} bytes of output omitted ...]\n{}", head_, dropped_, tail_);
+        const auto continues = [](char c) { return (static_cast<unsigned char>(c) & 0xC0U) == 0x80U; };
+        std::string_view head = head_;
+        std::string_view tail = std::string_view(tail_).substr(tail_.size() - kCaptureHalf);
+        if (const std::size_t line = head.rfind('\n'); line != std::string_view::npos && line > head.size() / 2) {
+            head = head.substr(0, line + 1);
+        } else {
+            while (!head.empty() && continues(head.back())) {
+                head.remove_suffix(1);
+            }
+            if (!head.empty() && static_cast<unsigned char>(head.back()) >= 0xC0U) {
+                head.remove_suffix(1);  // the lead byte of the character that was cut
+            }
+        }
+        if (const std::size_t line = tail.find('\n'); line != std::string_view::npos && line < tail.size() / 2) {
+            tail.remove_prefix(line + 1);
+        } else {
+            while (!tail.empty() && continues(tail.front())) {
+                tail.remove_prefix(1);
+            }
+        }
+        const std::size_t omitted = dropped_ + head_.size() + tail_.size() - head.size() - tail.size();
+        return fmt::format("{}{}[... {} bytes of output omitted ...]\n{}", head, head.ends_with('\n') ? "" : "\n",
+                           omitted, tail);
     }
 
   private:

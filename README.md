@@ -81,7 +81,7 @@ after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not 
 | `HX_MODEL` | model name; `opus`, `sonnet` and `haiku` stand for `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` | `deepseek-flash`, or `claude-opus-5-5` when `ANTHROPIC_API_KEY` is set and `DEEPSEEK_API_KEY` is not |
 | `HX_API_URL` | Anthropic Messages endpoint | `https://api.anthropic.com/v1/messages` for a `claude-*` model, `https://api.deepseek.com/anthropic/v1/messages` otherwise |
 | `HX_KEY_ENV` | name of the variable holding the API key | `ANTHROPIC_API_KEY` for a `claude-*` model, `DEEPSEEK_API_KEY` otherwise |
-| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort` | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
+| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
 | `HX_TOOLS_URL` | base of DeepSeek's Search, Fetch and OCR endpoints, which the built-in `web` and `ocr` extensions call with `DEEPSEEK_API_KEY`, whatever the model | `https://api.deepseek.com/v1/tools` |
 | `HX_EXA_URL` | Exa's search endpoint, which the built-in `exa` extension calls with `EXA_API_KEY`, whatever the model | `https://api.exa.ai/search` |
 
@@ -114,7 +114,7 @@ environment, which the model cannot change. `hx`'s own request uses `SSL_CERT_FI
 Also in force:
 
 - `hx` refuses to start in `/`, in your home directory or in any directory that contains it, such as `/home`,
-  where the wall would leave your home directory open.
+  where the wall would leave your home directory open. It refuses a `--ro` or `--rw` path of that kind too.
 - No setuid program can raise privileges (`no_new_privs`), so `sudo` does not work inside.
 - On Linux 6.12 or later, confined processes cannot signal processes outside the sandbox or reach their
   abstract unix sockets.

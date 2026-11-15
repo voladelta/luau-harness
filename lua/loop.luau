@@ -39,9 +39,10 @@ M.effort = host.env("HX_EFFORT") -- low, medium, high, xhigh or max: how hard th
 M.repeat_reminders = { 3, 5, 8 } -- a function call with the same result this many times in a task gets a reminder
 
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
+-- Its text is made printable here, once: it carries file names, skill names and server replies, none of them hx's.
 local function progress(text)
 	if not host.quiet then
-		host.log(text)
+		host.log(M.printable(text))
 	end
 end
 
@@ -58,13 +59,24 @@ local function clip(text)
 	spills += 1
 	local path = ("%s/hx-output-%d.txt"):format(host.env("TMPDIR"), spills)
 	local where = host.write(path, text) and "; the whole output is in " .. path or ""
-	return text:sub(1, half) .. ("\n[... %d bytes omitted%s ...]\n"):format(#text - 2 * half, where) .. text:sub(-half)
+	-- Each part ends or starts at a line where one is near, and never inside a character: half a character is
+	-- not valid UTF-8, and would reach the model as a replacement character with nothing to say one was lost.
+	local head, tail = text:sub(1, half), text:sub(-half)
+	local lines = head:match("^(.*\n)")
+	head = lines and #lines > half // 2 and lines or head:gsub("[\192-\255][\128-\191]*$", "")
+	local rest = tail:match("^[^\n]*\n(.*)$")
+	tail = rest and #rest > half // 2 and rest or tail:gsub("^[\128-\191]+", "")
+	return head .. (head:sub(-1) == "\n" and "" or "\n")
+		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail
 end
 
 -- Removes control characters but newline and tab. Escape sequences in text from the model would otherwise
--- reach the terminal, which they can retitle, scramble or (OSC 52) use to write the clipboard.
+-- reach the terminal, which they can retitle, scramble or (OSC 52) use to write the clipboard. The C1 controls
+-- (U+0080 to U+009F, which some terminals take for escape sequences too) and the characters that reverse the
+-- direction of text (U+202A to U+202E, U+2066 to U+2069) go as well.
 function M.printable(text)
-	return (text:gsub("[\0-\8\11-\31\127]", ""))
+	return (text:gsub("[\0-\8\11-\31\127]", ""):gsub("\194[\128-\159]", ""):gsub("\226\128[\170-\174]", "")
+		:gsub("\226\129[\166-\169]", ""))
 end
 
 -- Extensions ------------------------------------------------------------------------------------------------
@@ -332,8 +344,11 @@ end
 
 local function cut(text, limit)
 	text = text:gsub("%s+", " ")
-	if utf8.len(text) and utf8.len(text) > limit then
+	local length = utf8.len(text)
+	if length and length > limit then
 		text = text:sub(1, utf8.offset(text, limit + 1) - 1) .. " ..."
+	elseif not length and #text > limit then -- not UTF-8, so by bytes
+		text = text:sub(1, limit) .. " ..."
 	end
 	return text
 end
@@ -475,7 +490,16 @@ end
 -- Checks one argument, and names the call's whole shape when it is wrong: a model used to JSON tools may pass a
 -- table of named arguments where a string belongs.
 local function check(fname, value, position, name, kind, optional)
-	if type(value) == kind or value == nil and optional then
+	if value == nil and optional then
+		return
+	end
+	local got = type(value)
+	if kind == "whole number" then -- a line number or a count: 2.5, inf and nan are numbers too
+		if got == "number" and value % 1 == 0 then
+			return
+		end
+		got = got == "number" and tostring(value) or got
+	elseif got == kind then
 		return
 	end
 	local usage = fname
@@ -484,8 +508,7 @@ local function check(fname, value, position, name, kind, optional)
 			usage = fn.usage:match("^[^>]*%)") or fn.name
 		end
 	end
-	error(("%s: argument %d (%s) must be a %s, not %s; usage: %s"):format(fname, position, name, kind, type(value),
-		usage), 0)
+	error(("%s: argument %d (%s) must be a %s, not %s; usage: %s"):format(fname, position, name, kind, got, usage), 0)
 end
 
 M.functions = {
@@ -525,8 +548,11 @@ M.functions = {
 			.. "For the file's exact contents, as data, use host.read(path).",
 		run = function(path, offset, limit)
 			check("read", path, 1, "path", "string")
-			check("read", offset, 2, "offset", "number", true)
-			check("read", limit, 3, "limit", "number", true)
+			check("read", offset, 2, "offset", "whole number", true)
+			check("read", limit, 3, "limit", "whole number", true)
+			if limit and limit < 1 then
+				error(("read: limit must be 1 or more, not %d"):format(limit), 0)
+			end
 			progress("  read " .. M.printable(path))
 			local text, err = host.read(path)
 			if not text then
@@ -1372,12 +1398,7 @@ function M.compact(system, talk)
 		progress("  no summary came back; keeping the conversation as it is")
 		return
 	end
-	talk:restart(
-		"Earlier turns were replaced by this checkpoint, written by you:\n\n"
-			.. summary
-			.. "\n\nTreat it as established and continue the work from it directly, without restating or "
-			.. "acknowledging it."
-	)
+	talk:restart(summary .. "\n\n" .. M.resume_prompt) -- the same words as behind a compaction block
 end
 
 -- What the model is told when a function call has returned the same result `count` times in this task (see
@@ -1574,7 +1595,7 @@ function M.main()
 					host.log("[interrupted]")
 				else
 					talk:abandon("the turn failed: " .. tostring(err))
-					host.log("[the turn failed: " .. tostring(err) .. "]")
+					host.log(M.printable("[the turn failed: " .. tostring(err) .. "]"))
 				end
 			end
 			save(system, talk.messages)

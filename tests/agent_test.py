@@ -194,7 +194,9 @@ class AgentTest(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def env(self, **extra):
-        env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+        # Without the caller's own hx settings, or a test's result would depend on the shell it was run from.
+        env = {k: v for k, v in os.environ.items()
+               if not k.lower().endswith("_proxy") and not k.startswith("HX_") and k != "ANTHROPIC_API_KEY"}
         env.update(HOME=self.home, HX_API_URL=self.model.url, HX_KEY_ENV="HX_TEST_KEY", HX_TEST_KEY=KEY,
                    NO_PROXY="127.0.0.1", DEEPSEEK_API_KEY="", EXA_API_KEY="")
         env.update(extra)
