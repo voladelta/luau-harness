@@ -120,8 +120,7 @@ class Host {
     static int judge(lua_State* L);
 
     // Shortens a wait so that it ends no later than the host.timed limit in force. A negative wait is an empty one.
-    // The next VM safepoint reads the clock, so a limit that the wait ran into is raised as soon as Luau code runs.
-    [[nodiscard]] double within_limit(double seconds);
+    [[nodiscard]] double within_limit(double seconds) const;
     // The narrower wall host.sh's options at idx ask for, prepared before the fork.
     [[nodiscard]] std::optional<Wall> narrower_wall(lua_State* L, int idx) const;
     // The endpoint of that name, or null.
@@ -139,9 +138,6 @@ class Host {
     // Made at the first request.
     std::unique_ptr<CURL, CurlDeleter> curl_;
     double deadline_ = 0;   // the innermost host.timed limit on the monotonic clock; 0 for none
-    int countdown_ = 1;     // VM safepoints left until the clock is next read against deadline_
-    int stride_ = 1;        // safepoints from one clock read to the next, so that one comes about every millisecond
-    double checked_ = 0;    // when the clock was last read against deadline_
     int tries_ = 0;         // host.try and host.timed calls in progress
     std::string judge_in_;  // what the judge sent that is not yet a whole line
     int judge_owed_ = 0;    // answers the judge still owes: a later host.judge returns them

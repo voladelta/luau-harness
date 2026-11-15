@@ -56,7 +56,7 @@ constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm and ho
 constexpr std::size_t kMaxUpload = std::size_t{100} << 20;    // the largest file DeepSeek's OCR takes
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;
-constexpr int kPollMs = 50;
+constexpr double kNoPidfdPoll = 0.05;     // seconds between looks at a command whose exit cannot be waited for
 constexpr int kKillRounds = 100;          // at exit, so that a fork storm cannot hold hx up forever
 constexpr std::size_t kMaxKilled = 4096;  // processes remembered at exit; past that, more rounds find the rest
 constexpr double kReapSeconds = 1.0;      // how long hx waits for a process it killed to be gone
@@ -65,6 +65,9 @@ constexpr double kLongest = 1e9;          // seconds, about 30 years: the longes
 // Signal handlers cannot be given context, so this state is global. It is the only mutable global state here.
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 volatile std::sig_atomic_t g_signal = 0;  // a stop in progress: the signal that asked for it
+// The time limit's timer has fired, so the next VM safepoint reads the clock. It starts set and stays set until a
+// timer exists: without one, every safepoint reads the clock, which is slower and no less right.
+volatile std::sig_atomic_t g_expired = 1;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 double now() {
@@ -162,15 +165,44 @@ class TryScope {
     int& depth_;
 };
 
+// The process's one timer, which raises SIGALRM at the time limit in force, or null when the kernel gave none.
+timer_t* limit_timer() noexcept {
+    static timer_t timer{};
+    static const bool made = [] {
+        sigevent event{};
+        event.sigev_notify = SIGEV_SIGNAL;
+        event.sigev_signo = SIGALRM;
+        return timer_create(CLOCK_MONOTONIC, &event, &timer) == 0;
+    }();
+    return made ? &timer : nullptr;
+}
+
+// Sets the timer to fire at deadline, a time on the monotonic clock; 0 turns it off. A deadline already past fires
+// at once. The VM is interrupted by a flag the signal sets, so a tight loop pays for no clock read, and the limit is
+// as exact as the next safepoint, however slow the steps between safepoints are.
+void arm_limit(double deadline) noexcept {
+    timer_t* timer = limit_timer();
+    if (timer == nullptr) {
+        return;  // g_expired stays set, and every safepoint reads the clock
+    }
+    const auto whole = static_cast<time_t>(deadline);
+    const itimerspec at{{0, 0}, {whole, static_cast<long>((deadline - static_cast<double>(whole)) * 1e9)}};
+    timer_settime(*timer, TIMER_ABSTIME, &at, nullptr);
+}
+
 // Tightens a time limit for as long as the scope lives, then puts the outer limit back. A limit of 0 means none.
 class DeadlineScope {
   public:
     DeadlineScope(double& slot, double limit) noexcept : slot_(slot), outer_(slot) {
         slot_ = limit <= 0 || (outer_ > 0 && outer_ < limit) ? outer_ : limit;
+        arm_limit(slot_);
     }
     DeadlineScope(const DeadlineScope&) = delete;
     DeadlineScope& operator=(const DeadlineScope&) = delete;
-    ~DeadlineScope() { slot_ = outer_; }
+    ~DeadlineScope() {
+        slot_ = outer_;
+        arm_limit(slot_);
+    }
 
   private:
     double& slot_;
@@ -316,6 +348,30 @@ void on_signal(int sig) {
         _exit(128 + sig);
     }
     g_signal = sig;
+}
+
+void on_alarm(int /*sig*/) {
+    g_expired = 1;
+}
+
+// Waits until one of fds is ready, for at most seconds (negative: without limit), or until a signal arrives. A stop
+// that arrives just before the wait is not slept through: the stop signals are held back while g_signal is looked
+// at, and ppoll lets them in again as it starts to wait.
+void wait_for(std::span<pollfd> fds, double seconds) noexcept {
+    sigset_t stops;
+    sigset_t before;
+    sigemptyset(&stops);
+    for (const int sig : {SIGINT, SIGTERM, SIGHUP}) {
+        sigaddset(&stops, sig);
+    }
+    sigprocmask(SIG_BLOCK, &stops, &before);
+    if (g_signal == 0) {
+        seconds = std::min(seconds, kLongest);
+        const auto whole = static_cast<time_t>(seconds);
+        const timespec limit{whole, static_cast<long>((seconds - static_cast<double>(whole)) * 1e9)};
+        ppoll(fds.data(), fds.size(), seconds < 0 ? nullptr : &limit, &before);
+    }
+    sigprocmask(SIG_SETMASK, &before, nullptr);
 }
 
 // --- host.llm ---------------------------------------------------------------------------------------------
@@ -751,32 +807,25 @@ Host& Host::of(lua_State* L) {
 }
 
 // Runs at VM safepoints (loop back edges, calls). Luau code cannot block these, so a signal or an expired time
-// limit always reaches the code that is running. A signal is checked at every one. Reading the clock at every one
-// made a tight loop several times slower, so under a time limit it is read about once a millisecond: every
-// stride_ safepoints, where stride_ follows how fast they have been coming, up to kMaxStride.
+// limit always reaches the code that is running. Both are flags a signal handler sets, so a safepoint costs two
+// loads; the clock is read only once the limit's timer has fired (see arm_limit).
 void Host::on_interrupt(lua_State* L, int gc) {
-    // Safepoints in a tight loop come every few nanoseconds and a clock read takes tens. A larger stride costs less
-    // there, but where safepoints turn slow all at once, the limit can be overrun by up to this many of them.
-    constexpr int kMaxStride = 64;
-    constexpr double kCheckEvery = 1e-3;  // seconds
     if (gc >= 0) {
         return;  // inside the collector: raising here is not allowed
     }
     raise_if_signaled(L);
-    Host& host = of(L);
-    if (host.deadline_ <= 0 || --host.countdown_ > 0) {
+    if (g_expired == 0) {
         return;
     }
-    const double at = now();
-    if (at >= host.deadline_) {
+    // Cleared before the clock is read, so a timer that fires meanwhile is not lost. It may have fired for a limit
+    // that has ended since; then the clock says so and nothing is raised.
+    g_expired = limit_timer() != nullptr ? 0 : 1;
+    const Host& host = of(L);
+    if (host.deadline_ > 0 && now() >= host.deadline_) {
+        g_expired = 1;  // raised again at every safepoint until the limit's call returns, so no pcall swallows it
         lua_pushstring(L, "timeout");
         lua_error(L);
     }
-    const double took = at - host.checked_;  // since the last read, which may be long ago: then the stride drops
-    const double scaled = took > 0 ? host.stride_ * kCheckEvery / took : kMaxStride;
-    host.stride_ = static_cast<int>(std::clamp(scaled, 1.0, static_cast<double>(kMaxStride)));
-    host.countdown_ = host.stride_;
-    host.checked_ = at;
 }
 
 const Endpoint* Host::endpoint(std::string_view name) const {
@@ -993,10 +1042,10 @@ int Host::sh(lua_State* L) {
             reaped = reap_within(pid, status, kReapSeconds);
             break;
         }
-        // Wake on bash's exit, a hang-up, or output; the timeout is for the deadline and signals. A negative
-        // descriptor is not watched.
+        // Wake on bash's exit, a hang-up, output, a signal or the deadline. A negative descriptor is not watched.
         std::array<pollfd, 3> waiters{{{exited.get(), POLLIN, 0}, {hangup, POLLRDHUP, 0}, {output.get(), POLLIN, 0}}};
-        poll(waiters.data(), at_end ? 2 : 3, kPollMs);
+        const double left = std::max(deadline - now(), 0.0);
+        wait_for(std::span(waiters).first(at_end ? 2 : 3), exited.valid() ? left : std::min(left, kNoPidfdPoll));
         if ((waiters[1].revents & (POLLRDHUP | POLLHUP)) != 0) {
             ending = Ending::HungUp;
             kill_group(pid);
@@ -1116,7 +1165,7 @@ int Host::judge(lua_State* L) {
             return 2;
         }
         pollfd waiter{fd, POLLIN, 0};
-        poll(&waiter, 1, kPollMs);
+        wait_for({&waiter, 1}, until > 0 ? std::max(until - now(), 0.0) : -1.0);
         const ssize_t n = recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
         if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
             luaL_error(L, "host.judge: the judge is gone");
@@ -1127,17 +1176,15 @@ int Host::judge(lua_State* L) {
     }
 }
 
-double Host::within_limit(double seconds) {
+double Host::within_limit(double seconds) const {
     seconds = duration(seconds);
     if (deadline_ <= 0) {
         return seconds;
     }
-    countdown_ = 1;
     return std::clamp(deadline_ - now(), 0.0, seconds);
 }
 
 int Host::sleep(lua_State* L) {
-    constexpr double kStep = 0.1;  // short naps, so a signal ends the sleep promptly
     raise_if_signaled(L);
     const double until = now() + of(L).within_limit(luaL_checknumber(L, 1));
     while (g_signal == 0) {
@@ -1145,8 +1192,7 @@ int Host::sleep(lua_State* L) {
         if (left <= 0) {
             break;
         }
-        const timespec nap{0, static_cast<long>(std::min(left, kStep) * 1e9)};
-        nanosleep(&nap, nullptr);
+        wait_for({}, left);  // a signal ends it at once
     }
     raise_if_signaled(L);
     return 0;
@@ -1258,6 +1304,10 @@ void install_signal_handlers() {
     for (const int sig : {SIGINT, SIGTERM, SIGHUP}) {
         sigaction(sig, &action, nullptr);
     }
+    // The time limit's timer. It only sets a flag for the VM, so system calls go on where they can.
+    action.sa_handler = on_alarm;
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &action, nullptr);
     static_cast<void>(std::signal(SIGPIPE, SIG_IGN));
 }
 
