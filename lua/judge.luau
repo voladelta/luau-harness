@@ -92,9 +92,17 @@ local function read_config(): (Config?, ...string)
 	return result :: Config
 end
 
+-- Removes control characters but newline and tab, as M.printable in loop.luau does: a failing run's output and a
+-- trial's reason are the candidate's words, and they go to the same terminal as the agent's. The judge runs in a
+-- VM of its own and shares no code with the loop, so it keeps its own copy.
+local function printable(text: string): string
+	return (text:gsub("[\0-\8\11-\31\127]", ""):gsub("\194[\128-\159]", ""):gsub("\226\128[\170-\174]", "")
+		:gsub("\226\129[\166-\169]", ""))
+end
+
 local function say(text: string)
 	if not host.quiet then
-		host.log("judge: " .. text)
+		host.log(printable("judge: " .. text))
 	end
 end
 
@@ -466,7 +474,7 @@ end
 
 -- Prints the summary and leaves only the ledger and the patches: the trees were copies.
 local function summary()
-	host.log(summary_text())
+	host.log(printable(summary_text()))
 	host.sh(("cd %s && rm -rf run tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
 		:format(quote(state)))
 end
