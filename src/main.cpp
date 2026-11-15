@@ -75,7 +75,7 @@ options:
   --ro PATH         also allow reading PATH (a toolchain in your home directory, for example)
   --rw PATH         also allow writing PATH
   --keep-env NAME   keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET,
-                    PASSWORD, PASSWD or CREDENTIALS) in the environment of commands
+                    PASSWORD, PASSWD, CREDENTIALS, _PAT or _PWD) in the environment of commands
   --unix-sockets    before Landlock ABI 9, let commands create unix sockets; they can then connect to
                     any socket by path, the D-Bus session bus and ssh-agent included
   --no-sandbox      run without Landlock (the model can then touch anything you can)
@@ -354,20 +354,19 @@ int init_project(bool full) {
     return 0;
 }
 
-// A variable whose name ends in one of these words is treated as a secret. Matching the end, not any part, keeps
-// plumbing such as GIT_CONFIG_KEY_0 or AWS_ACCESS_KEY_ID in place.
+// A variable whose name ends in one of these words is treated as a secret, with or without an underscore before
+// it: MY_API_KEY, OPENAI_APIKEY, PGPASSWORD. Matching the end, not any part, keeps plumbing such as GIT_CONFIG_KEY_0
+// or AWS_ACCESS_KEY_ID in place. PAT and PWD are short enough to end ordinary words, and PWD and OLDPWD are no
+// secrets, so those two count only after an underscore: GITHUB_PAT, MYSQL_PWD.
 bool looks_secret(std::string name) {
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     for (const std::string_view mark : {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIALS"}) {
-        if (!name.ends_with(mark)) {
-            continue;
-        }
-        if (name.size() == mark.size() || name[name.size() - mark.size() - 1] == '_') {
+        if (name.ends_with(mark)) {
             return true;
         }
     }
-    return false;
+    return name.ends_with("_PAT") || name.ends_with("_PWD");
 }
 
 struct Secrets {

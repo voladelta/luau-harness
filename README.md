@@ -127,10 +127,11 @@ Also in force:
   the docker CLI, tmux, some test suites; and 32-bit programs. `--unix-sockets` leaves the filter out, and `hx`
   then prints a note at startup.
 - The API key is read once and removed from the environment, together with every variable whose name ends in
-  `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS`. Luau code never sees the key: the host adds
-  it to requests for the configured endpoint only, and commands cannot read it out of the host's memory.
-  `DEEPSEEK_API_KEY` is kept the same way for DeepSeek's tool endpoints, and is sent only to
-  `HX_TOOLS_URL/search`, `/fetch` and `/ocr`; `EXA_API_KEY` too, sent only to `HX_EXA_URL`.
+  `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS` (`MY_API_KEY`, `OPENAI_APIKEY`, `PGPASSWORD`),
+  or in `_PAT` or `_PWD` (`GITHUB_PAT`, `MYSQL_PWD`; `PWD` and `OLDPWD` stay). `--keep-env NAME` keeps one. Luau
+  code never sees the key: the host adds it to requests for the configured endpoint only, and commands cannot
+  read it out of the host's memory. `DEEPSEEK_API_KEY` is kept the same way for DeepSeek's tool endpoints, and is
+  sent only to `HX_TOOLS_URL/search`, `/fetch` and `/ocr`; `EXA_API_KEY` too, sent only to `HX_EXA_URL`.
 - The VM has a memory ceiling of 1 GiB, and every process a command started is killed when `hx` exits, a
   daemon that called `setsid` included: `hx` is a child subreaper, so all of them stay its descendants.
 

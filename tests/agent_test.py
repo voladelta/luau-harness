@@ -755,6 +755,18 @@ class AgentTest(unittest.TestCase):
             call("bash", {"command": "echo $KEPT_TOKEN"}), say("ok")])
         self.assertEqual(self.tool_results(), ["kept-value\n[exit 0]"])
 
+    def test_a_secret_is_known_by_the_end_of_its_name(self):
+        secrets = {"PGPASSWORD": "s1", "OPENAI_APIKEY": "s2", "GITHUB_PAT": "s3", "MYSQL_PWD": "s4", "MY_API_KEY": "s5",
+                   "AUTHTOKEN": "s6"}
+        kept = {"GIT_CONFIG_KEY_0": "p1", "PATH_PAT_X": "p2", "COMPAT": "p3", "OLDPWD": "/", "KEPT_PAT": "s7"}
+        done = self.run_hx("--keep-env", "KEPT_PAT", "--run", "-", stdin="print(host.sh('env').out)",
+                           **secrets, **kept)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        shown = dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+        self.assertEqual([name for name in secrets if name in shown], [])
+        self.assertEqual({name: shown.get(name) for name in kept}, kept)
+        self.assertIn("PWD", shown)
+
     # --- processes ---
 
     def test_a_command_that_runs_too_long_is_killed_with_its_children(self):
