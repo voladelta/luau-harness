@@ -423,6 +423,7 @@ Everything Luau can do to the machine:
 | `host.read(path)` | the contents, or `nil, error`. A FIFO or a device is read without blocking: waiting for a writer, or for more, ends with the `host.timed` limit in force (`nil, "PATH: timed out"`) or a stop |
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A regular file is replaced by renaming a new one over it, so a failed write leaves the old content (a killed one can leave the new file beside it); the mode stays and a link stays a link, but owner, extended attributes and ACLs are not carried over. A device, a FIFO, a file with other hard links, a dangling link, or a file in a directory that refuses a new file is written in place; waiting for a FIFO's reader, or for room, ends as `host.read`'s waits do |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
+| `host.clip(text, limit)` | `text` when it is at most `limit` bytes; otherwise `head, tail`, at most `limit // 2` bytes from each end. Each is cut at a line when that keeps more than half of it, and otherwise never inside a UTF-8 character; `host.sh` cuts a long output the same way |
 | `host.load(source, name, env)` | a function, or `nil, error` |
 | `host.try(fn, ...)` | `true, ...`, or `false, error`: a `pcall` that is also where a stop ends |
 | `host.timed(seconds, fn, ...)` | as `host.try`; the error is `"timeout"` when the limit passed |

@@ -122,24 +122,18 @@ local function progress(text: string)
 end
 
 -- Keeps the start and the end of a long result: the start says what ran, the end says how it went. Only the result
--- the model is sent is clipped, once; the functions return everything, so code can work on all of it. The whole text
--- goes to a file in $TMPDIR (hx makes one for every run, inside the wall), so what was left out can still be read
--- or searched.
+-- the model is sent is clipped, once; the functions return everything, so code can work on all of it. host.clip
+-- cuts it, as host.sh cuts a command's output, at a line where one is near and never inside a character. The whole
+-- text goes to a file in $TMPDIR (hx makes one for every run, inside the wall), so what was left out can still be
+-- read or searched.
 local function clip(text: string): string
-	if #text <= M.output_limit then
+	local head: string, tail: string? = host.clip(text, M.output_limit)
+	if tail == nil then
 		return text
 	end
-	local half = M.output_limit // 2
 	live.spills += 1
 	local path = ("%s/hx-output-%d.txt"):format(host.env("TMPDIR"), live.spills)
 	local where: string = host.write(path, text) and "; the whole output is in " .. path or ""
-	-- Each part ends or starts at a line where one is near, and never inside a character: half a character is
-	-- not valid UTF-8, and would reach the model as a replacement character with nothing to say one was lost.
-	local head: string, tail: string = text:sub(1, half), text:sub(-half)
-	local lines = head:match("^(.*\n)")
-	head = lines and #lines > half // 2 and lines or (head:gsub("[\192-\255][\128-\191]*$", ""))
-	local rest = tail:match("^[^\n]*\n(.*)$")
-	tail = rest and #rest > half // 2 and rest or (tail:gsub("^[\128-\191]+", ""))
 	return head .. (head:sub(-1) == "\n" and "" or "\n")
 		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail
 end

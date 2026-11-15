@@ -76,6 +76,9 @@ struct HostConfig {
 //                                                     link), waiting for a FIFO's reader or for room only until
 //                                                     the host.timed limit or a stop
 //   host.list(dir) -> {names} | nil, error            sorted; directories end in "/"
+//   host.clip(text, limit) -> text | head, tail       text when it fits in limit bytes; else at most limit // 2
+//                                                     from each end, cut at a line when that keeps more than
+//                                                     half, and never inside a character, as host.sh's output
 //   host.load(source, name?, env?) -> function | nil, error
 //   host.try(fn, ...) -> true, ... | false, error     pcall that is also where a stop ends (below)
 //   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit ("timeout");

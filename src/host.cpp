@@ -94,6 +94,41 @@ void push_strings(lua_State* L, const std::vector<std::string>& strings) {
 
 namespace {
 
+// --- cutting a long text: see cut_head and cut_tail in host_internal.h -----------------------------------------
+
+// A byte that continues a UTF-8 character rather than starting one.
+bool continues(char c) {
+    return (static_cast<unsigned char>(c) & 0xC0U) == 0x80U;
+}
+
+}  // namespace
+
+std::string_view cut_head(std::string_view head) {
+    if (const std::size_t line = head.rfind('\n'); line != std::string_view::npos && 2 * (line + 1) > head.size()) {
+        return head.substr(0, line + 1);
+    }
+    while (!head.empty() && continues(head.back())) {
+        head.remove_suffix(1);
+    }
+    if (!head.empty() && static_cast<unsigned char>(head.back()) >= 0xC0U) {
+        head.remove_suffix(1);  // the lead byte of the character that was cut
+    }
+    return head;
+}
+
+std::string_view cut_tail(std::string_view tail) {
+    if (const std::size_t line = tail.find('\n');
+        line != std::string_view::npos && 2 * (tail.size() - line - 1) > tail.size()) {
+        return tail.substr(line + 1);
+    }
+    while (!tail.empty() && continues(tail.front())) {
+        tail.remove_prefix(1);
+    }
+    return tail;
+}
+
+namespace {
+
 // --- time limits ----------------------------------------------------------------------------------------------
 
 // Counts a host.try or host.timed call for as long as it runs.
@@ -199,6 +234,27 @@ int l_input(lua_State* L) {
     }
     lua_pushlstring(L, line.data(), line.size());
     return 1;
+}
+
+// host.clip(text, limit): text when it is at most limit bytes; otherwise its head and its tail, at most limit // 2
+// bytes each, cut as cut_head and cut_tail cut them. The caller says what is missing between them, and in its own
+// words: the loop names the file it kept the whole text in.
+int l_clip(lua_State* L) {
+    std::size_t length = 0;
+    const char* raw = luaL_checklstring(L, 1, &length);
+    const double limit = luaL_checknumber(L, 2);
+    if (static_cast<double>(length) <= limit) {
+        lua_settop(L, 1);
+        return 1;
+    }
+    // Below length here, so it fits; a negative limit (or nan) keeps nothing.
+    const std::size_t half = limit > 0 ? static_cast<std::size_t>(limit / 2) : 0;
+    const std::string_view text(raw, length);
+    const std::string_view head = cut_head(text.substr(0, half));
+    const std::string_view tail = cut_tail(text.substr(length - half));
+    lua_pushlstring(L, head.data(), head.size());
+    lua_pushlstring(L, tail.data(), tail.size());
+    return 2;
 }
 
 int l_log(lua_State* L) {
@@ -328,7 +384,8 @@ void Host::open(lua_State* L) {
     static constexpr luaL_Reg kFunctions[] = {
         {"llm", llm},        {"tool", tool},        {"sh", sh},       {"try", try_},    {"timed", timed},
         {"read", read_file}, {"write", write_file}, {"list", l_list}, {"load", l_load}, {"input", l_input},
-        {"log", l_log},      {"sleep", sleep},      {"env", l_env},   {"judge", judge}, {nullptr, nullptr},
+        {"log", l_log},      {"sleep", sleep},      {"env", l_env},   {"judge", judge}, {"clip", l_clip},
+        {nullptr, nullptr},
     };
     luaL_register(L, "host", kFunctions);
 

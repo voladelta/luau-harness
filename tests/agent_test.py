@@ -1262,6 +1262,17 @@ class AgentTest(unittest.TestCase):
             "host.sh('mkfifo fifo; echo $$ > cmd.pid')\nprint(host.try(host.read, 'fifo'))\nprint('after')\n")
         self.assertEqual((code, out), (0, "false\tinterrupted\nafter\n"))
 
+    def test_clip_keeps_both_ends_cut_at_a_line_or_a_character(self):
+        script = ("local function show(...) print(select('#', ...), json.encode({...})) end\n"
+                  "show(host.clip('abc', 3))\n"
+                  "show(host.clip(string.rep('xxxxxxx\\n', 4), 20))\n"  # a line near each cut
+                  "show(host.clip('a\\nbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\nc', 12))\n"  # lines too far: cut at a character
+                  "show(host.clip(string.rep('\\u{e9}', 10), 7))\n")  # each cut falls inside an é
+        done = self.run_hx("--run", "-", stdin=script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), [
+            '1\t["abc"]', '2\t["xxxxxxx\\n","xxxxxxx\\n"]', '2\t["a\\nbbbb","bbbb\\nc"]', '2\t["é","é"]'])
+
     # --- extensions and the project's own loop ---
 
     def test_the_model_extends_itself_and_the_extension_stays(self):

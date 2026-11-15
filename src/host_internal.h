@@ -57,6 +57,13 @@ void raise_if_signaled(lua_State* L);
 // Pushes a Luau list of the strings.
 void push_strings(lua_State* L, const std::vector<std::string>& strings);
 
+// What host.sh and host.clip keep of a long text: its start and its end, each cut where a reader loses least. A part
+// ends or starts at a line when that keeps more than half of it; otherwise it is cut at a character, never inside
+// one, since half a character is not valid UTF-8 and would be lost without a word.
+// cut_head: the start of a text that goes on past it. cut_tail: the end of a text that began before it.
+std::string_view cut_head(std::string_view head);
+std::string_view cut_tail(std::string_view tail);
+
 // --- host_files.cpp ------------------------------------------------------------------------------------------
 
 // host.read and host.write are members of Host, which holds the time limit they wait within.
