@@ -227,6 +227,10 @@ check("a body that is not JSON", http.message(string.rep("x", 400)), string.rep(
 check("no body", http.message(nil), "nil")
 check("a short text is not clipped", http.clip("a  b\n c", 10), "a b c")
 check("a long text is clipped on a character", http.clip(string.rep("é", 5), 3), "ééé ...")
+check("the limit counts characters, not bytes", http.clip(string.rep("é", 500), 800), string.rep("é", 500))
+check("a text of exactly the limit is whole", http.clip(string.rep("é", 3), 3), "ééé")
+check("text that is not UTF-8 is counted in bytes", http.clip(string.rep("\255", 5), 3), "\255\255\255 ...")
+check("and is whole within the limit", http.clip("\255\255", 3), "\255\255")
 
 -- A project's own extension of the same name takes the place of the built-in one. ext() reads .hx/ext in the
 -- current directory, the build directory here, so the file is removed again.

@@ -40,12 +40,15 @@ function M.check(fname: string, value: unknown, position: number, name: string, 
 end
 
 -- The text with its runs of white space made one space, cut to `limit` characters with " ..." when it has more
--- than `limit` bytes. The cut falls on a character boundary, so a cut text is still UTF-8.
+-- than `limit` characters. The cut falls on a character boundary, so a cut text is still UTF-8. Text that is not
+-- valid UTF-8 has no characters to count, so it is counted and cut by bytes, as the loop's own listings do.
 function M.clip(text: string, limit: number): string
 	text = text:gsub("%s+", " ")
-	if #text > limit then
-		local cut = utf8.offset(text, limit + 1) or #text + 1
-		text = text:sub(1, cut - 1) .. " ..."
+	local length = utf8.len(text)
+	if length and length > limit then
+		text = text:sub(1, utf8.offset(text, limit + 1) - 1) .. " ..."
+	elseif not length and #text > limit then
+		text = text:sub(1, limit) .. " ..."
 	end
 	return text
 end
