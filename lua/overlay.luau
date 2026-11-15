@@ -1,3 +1,4 @@
+--!strict
 -- This project's hx loop. It starts from the loop built into hx and changes only what this project needs, so
 -- the rest keeps up with hx. host.default_loop holds the built-in loop's source: read it to see what a part
 -- does before replacing it. If this file raises while loading, or returns no table with a `main` function, hx

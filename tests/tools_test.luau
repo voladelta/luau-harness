@@ -227,7 +227,69 @@ host.write(".hx/ext/broken.luau", "return {")
 raises("a broken extension", "ext/broken", loop.ext, "broken")
 raises("a missing extension", "no extension nope", loop.ext, "nope")
 raises("a path as an extension name", "letters, digits", loop.ext, "../x")
+-- A name that starts with _ is a helper other extensions share: it loads, but the model is not told of it.
+host.write(".hx/ext/_x.luau", "-- shared code\nreturn { two = function() return 2 end }\n")
+check("a helper extension loads", loop.ext("_x").two(), 2)
+local prompt = loop.system_prompt()
+check("the prompt lists the other extensions", prompt:find("- greet: greets", 1, true) ~= nil, true)
+check("but not a helper", prompt:find("_x", 1, true), nil)
 host.sh("rm -rf .hx")
+
+-- Nesting. A project function can run a `lua` call inside the running one, or a whole turn on another
+-- Conversation, as a sub-agent. Either leaves the outer call's printed lines and the outer turn's repeat counts
+-- as it found them.
+table.insert(loop.functions, { name = "nested", usage = "nested(code, seconds?) -> text", run = function(code, seconds)
+	local outer = loop.call_seconds
+	loop.call_seconds = seconds or outer
+	local result = loop.tools[1].run({ code = code })
+	loop.call_seconds = outer
+	return result
+end })
+check("a nested lua call keeps the outer call's prints",
+	lua("print('outer 1') local inner = nested('print(\"inner\")') print('outer 2') return inner"), "outer 1\nouter 2\ninner")
+check("and so does one that fails",
+	lua("print('outer 1') local inner = nested('error(\"no\", 0)') print('outer 2') return inner"), "outer 1\nouter 2\nerror: no")
+check("or runs out of time",
+	lua("print('outer 1') local inner = nested('print(1) while true do end', 0.2) print('outer 2') return inner"),
+	"outer 1\nouter 2\n1\nerror: timeout")
+-- A scripted model: each request takes the next reply.
+local replies, next_id = {}, 0
+local function calls(code)
+	next_id += 1
+	return { stop_reason = "tool_use", content = { { type = "tool_use", id = "c" .. next_id, name = "lua", input = { code = code } } } }
+end
+local done = { stop_reason = "end_turn", content = { { type = "thinking", thinking = "", signature = "s" } } }
+local request = loop.request
+loop.request = function()
+	return assert(table.remove(replies, 1), "the scripted model ran out of replies")
+end
+table.insert(loop.functions, { name = "subagent", usage = "subagent() -> text", run = function()
+	local talk = loop.Conversation.new()
+	talk:say("a sub-task")
+	loop.turn("system", talk)
+	return "the sub-agent is done"
+end })
+local same = "return bash('echo same')"
+-- The outer turn runs the same call twice, then a sub-agent whose turn runs it once, then the call a third time.
+replies = { calls(same), calls(same), calls("return subagent()"), calls(same), done, calls(same), done }
+local talk = loop.Conversation.new()
+talk:say("the task")
+loop.turn("system", talk)
+check("the script was played to the end", #replies, 0)
+local reminders = {}
+for _, message in talk.messages do
+	for _, block in if type(message.content) == "table" then message.content else {} do
+		if block.type == "text" then
+			table.insert(reminders, block.text)
+		end
+	end
+end
+check("a nested turn neither resets the outer turn's counts nor adds to them", #reminders, 1)
+check("so the outer turn's third call is its third",
+	(reminders[1] or ""):find('bash("echo same") has now returned the same result 3 times', 1, true) ~= nil, true)
+loop.request = request
+table.remove(loop.functions)
+table.remove(loop.functions)
 
 -- read_message joins the lines of a bracketed paste into one message.
 local function message(lines)

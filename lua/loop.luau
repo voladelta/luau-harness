@@ -1,3 +1,4 @@
+--!strict
 -- The hx loop, built into hx. A project changes it in .hx/loop.luau, which loads this module, replaces some of
 -- its fields and returns it (`hx --init` writes such a file), or owns all of it as a copy (`hx --init --full`). The
 -- parts meant to be replaced are fields of M and are always called through M.
@@ -26,6 +27,52 @@
 -- The whole process sits inside one Landlock ruleset, so nothing in this file can reach more of the machine
 -- than the model's own shell can.
 
+-- The shapes the loop is built on. host and json are untyped, so what they return is `any`: a local that holds it
+-- is annotated with what the primitive says it returns, so that a check of it narrows the type.
+
+-- A block of a message's content, as the API sends it: text, thinking, tool_use, tool_result, compaction,
+-- fallback and others. Blocks go back exactly as they came, so a block keeps fields the loop never names.
+type Block = {
+	type: string,
+	text: string?,
+	thinking: any,
+	id: string?,
+	name: string?,
+	input: any,
+	tool_use_id: string?,
+	content: any,
+	is_error: boolean?,
+	from: any,
+	to: any,
+}
+-- The user's content may be a plain string; the model's is always a list of blocks.
+type Message = { role: string, content: string | { Block } }
+-- What a reply's usage says: tokens, and for a compaction the summarization call's in iterations.
+type Usage = {
+	input_tokens: number?,
+	cache_read_input_tokens: number?,
+	cache_creation_input_tokens: number?,
+	output_tokens: number?,
+	iterations: { Usage }?,
+}
+-- A decoded reply from the model.
+type Reply = { content: { Block }, stop_reason: string?, stop_details: any, usage: Usage? }
+-- A function the model's code calls (see M.functions).
+type Function = { name: string, usage: string, run: (...any) -> ...any }
+-- The JSON schema of a tool's arguments, as far as the loop reads it.
+type Schema = { type: string?, properties: { [string]: any }?, required: { string }? }
+-- A tool the model is offered (see M.tools): the text of its result, and whether it failed.
+type Tool = {
+	name: string,
+	description: string | () -> string,
+	parameters: Schema?,
+	run: ({ [string]: any }) -> (string, boolean?),
+}
+-- A skill found in one of M.skill_dirs (see M.skills).
+type Skill = { name: string, description: string, dir: string, path: string, hidden: boolean }
+-- What M.claude says of a model the loop knows.
+type Features = { effort: string?, fallbacks: string?, display: string?, compaction: boolean? }
+
 local M = {}
 
 M.model = host.model
@@ -38,9 +85,35 @@ M.effort = host.env("HX_EFFORT") -- low, medium, high, xhigh or max: how hard th
 -- the model's entry in M.claude, or else to the endpoint
 M.repeat_reminders = { 3, 5, 8 } -- a function call with the same result this many times in a task gets a reminder
 
+-- Everything the loop changes as it runs, in one place, by how long it lives. A project function or extension can
+-- run a `lua` call inside another, or a turn on another Conversation inside a turn (a sub-agent), so whatever lives
+-- for one call or one turn is set on the way in and the outer value put back on the way out, however it ends: a
+-- nested call or turn leaves its parent's state as it found it. The globals of the model's code are the model's,
+-- not the loop's, and live in `scratch` (see the lua tool).
+type Repeats = { counts: { [string]: number }, worst: { call: string, count: number }? }
+local live: {
+	usage: { replies: number, input: number, cached: number, written: number, output: number },
+	spills: number,
+	ext_cache: { [string]: { source: string, value: any } },
+	wrappers: { [Function]: (...any) -> ...any },
+	repeats: Repeats,
+	printed: { string }?,
+} = {
+	-- For the whole run, from when the module loads:
+	usage = { replies = 0, input = 0, cached = 0, written = 0, output = 0 }, -- tokens, for the line at the end
+	spills = 0, -- files that clipped results went to, so the next one has a name of its own
+	ext_cache = {}, -- each extension loaded, by name, with the source it was loaded from
+	wrappers = setmetatable({}, { __mode = "k" }), -- each function's counting wrapper, made once
+	-- For one turn, set by M.turn: each function call's count by what it was asked and what it returned, and the
+	-- call repeated most. Outside any turn (a test calling the functions), one set for the run.
+	repeats = { counts = {}, worst = nil },
+	-- For one `lua` call, set by the tool: the lines it printed. nil outside any call.
+	printed = nil,
+}
+
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
 -- Its text is made printable here, once: it carries file names, skill names and server replies, none of them hx's.
-local function progress(text)
+local function progress(text: string)
 	if not host.quiet then
 		host.log(M.printable(text))
 	end
@@ -50,22 +123,21 @@ end
 -- the model is sent is clipped, once; the functions return everything, so code can work on all of it. The whole text
 -- goes to a file in $TMPDIR (hx makes one for every run, inside the wall), so what was left out can still be read
 -- or searched.
-local spills = 0
-local function clip(text)
+local function clip(text: string): string
 	if #text <= M.output_limit then
 		return text
 	end
 	local half = M.output_limit // 2
-	spills += 1
-	local path = ("%s/hx-output-%d.txt"):format(host.env("TMPDIR"), spills)
-	local where = host.write(path, text) and "; the whole output is in " .. path or ""
+	live.spills += 1
+	local path = ("%s/hx-output-%d.txt"):format(host.env("TMPDIR"), live.spills)
+	local where: string = host.write(path, text) and "; the whole output is in " .. path or ""
 	-- Each part ends or starts at a line where one is near, and never inside a character: half a character is
 	-- not valid UTF-8, and would reach the model as a replacement character with nothing to say one was lost.
-	local head, tail = text:sub(1, half), text:sub(-half)
+	local head: string, tail: string = text:sub(1, half), text:sub(-half)
 	local lines = head:match("^(.*\n)")
-	head = lines and #lines > half // 2 and lines or head:gsub("[\192-\255][\128-\191]*$", "")
+	head = lines and #lines > half // 2 and lines or (head:gsub("[\192-\255][\128-\191]*$", ""))
 	local rest = tail:match("^[^\n]*\n(.*)$")
-	tail = rest and #rest > half // 2 and rest or tail:gsub("^[\128-\191]+", "")
+	tail = rest and #rest > half // 2 and rest or (tail:gsub("^[\128-\191]+", ""))
 	return head .. (head:sub(-1) == "\n" and "" or "\n")
 		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail
 end
@@ -74,7 +146,7 @@ end
 -- reach the terminal, which they can retitle, scramble or (OSC 52) use to write the clipboard. The C1 controls
 -- (U+0080 to U+009F, which some terminals take for escape sequences too) and the characters that reverse the
 -- direction of text (U+202A to U+202E, U+2066 to U+2069) go as well.
-function M.printable(text)
+function M.printable(text: string): string
 	return (text:gsub("[\0-\8\11-\31\127]", ""):gsub("\194[\128-\159]", ""):gsub("\226\128[\170-\174]", "")
 		:gsub("\226\129[\166-\169]", ""))
 end
@@ -88,18 +160,18 @@ end
 -- (host.extensions: web, ocr and exa); a project's file of the same name takes the place of one.
 
 local ext_dir = ".hx/ext/"
-local ext_cache = {}
+
 -- What code from the model and from extensions sees: the functions of M.functions (looked up when used, so a
 -- project's changes to the list count at once), print, and the Luau globals.
 --
 -- Every function call is counted by what it was asked and what it returned. A call that returns what it returned
 -- before is going nowhere, whatever ran in between and whether the model repeats it across tool calls or in a loop
 -- inside one: that is the unit the repeat reminder counts, not the tool call, whose code may print a counter or a
--- clock and so never repeat exactly. A command rerun after a fix returns something new, so it does not count.
-local repeats = { counts = {}, worst = nil } -- this turn's counts, and the call repeated most
+-- clock and so never repeat exactly. A command rerun after a fix returns something new, so it does not count. The
+-- counts are live.repeats, the running turn's.
 
 -- A value as JSON, nil as null; nil for a value with no JSON form, such as a table of functions.
-local function as_json(value)
+local function as_json(value: any): string?
 	local ok, text = pcall(json.encode, value == nil and json.null or value)
 	return ok and text or nil
 end
@@ -107,7 +179,7 @@ end
 -- A short stand-in for a text, so that the counts do not keep every result of the turn (a bash call returns up to a
 -- mebibyte): a short text itself, a longer one its length and a hash of all of it, read four bytes at a time.
 -- Different texts of the same length rarely share a hash, and when they do it costs only an early reminder.
-local function digest(text)
+local function digest(text: string): string
 	if #text <= 256 then
 		return text
 	end
@@ -122,7 +194,7 @@ local function digest(text)
 	return ("%d:%d"):format(#text, hash)
 end
 
-local function counted(fn)
+local function counted(fn: Function): (...any) -> ...any
 	return function(...)
 		local results = table.pack(fn.run(...))
 		local result = results[1] -- what a function shows the model; any further values pass through uncounted
@@ -140,6 +212,7 @@ local function counted(fn)
 		end
 		local call = ("%s(%s)"):format(fn.name, table.concat(args, ", "))
 		local key = digest(call) .. "\0" .. digest(text)
+		local repeats = live.repeats
 		local count = (repeats.counts[key] or 0) + 1
 		repeats.counts[key] = count
 		if not repeats.worst or count > repeats.worst.count then
@@ -152,26 +225,24 @@ end
 -- Where print goes: into the result of the `lua` call that is running, which is what the model sees, whether the
 -- model's code prints or an extension it called does. Outside a call (a test calling an extension), to stderr, never
 -- to stdout, which carries only the answer.
-local printed = nil -- the lines of the running call
-local function capture_print(...)
+local function capture_print(...: any)
 	local parts = table.pack(...)
 	for i = 1, parts.n do
 		parts[i] = tostring(parts[i])
 	end
 	local line = table.concat(parts, "\t")
-	if printed then
-		table.insert(printed, line)
+	if live.printed then
+		table.insert(live.printed, line)
 	else
 		host.log(line)
 	end
 end
 
-local wrappers = setmetatable({}, { __mode = "k" }) -- each function's counting wrapper, made once
-local function lookup(_, name)
+local function lookup(_: any, name: string): any
 	for _, fn in M.functions do
 		if fn.name == name then
-			local wrapper = wrappers[fn] or counted(fn)
-			wrappers[fn] = wrapper
+			local wrapper = live.wrappers[fn] or counted(fn)
+			live.wrappers[fn] = wrapper
 			return wrapper
 		end
 	end
@@ -181,38 +252,40 @@ local function lookup(_, name)
 	return _G[name]
 end
 
-function M.ext(name)
+function M.ext(name: string): any
 	if type(name) ~= "string" or not name:match("^[%w_%-]+$") then
 		error("an extension name is letters, digits, _ and -", 0)
 	end
-	local source, err = host.read(ext_dir .. name .. ".luau")
-	local built_in = not source and host.extensions[name]
-	if built_in then
-		source = built_in
-	elseif not source then
-		error("no extension " .. name .. ": " .. err, 0)
+	local own: string?, err: string? = host.read(ext_dir .. name .. ".luau")
+	local built_in: string? = if own then nil else host.extensions[name]
+	local source = own or built_in
+	if not source then
+		error("no extension " .. name .. ": " .. tostring(err), 0)
 	end
-	local cached = ext_cache[name]
+	local cached = live.ext_cache[name]
 	if cached and cached.source == source then
 		return cached.value
 	end
-	local chunk, load_err = host.load(source, (built_in and "=hx/ext/" or "=ext/") .. name,
+	local chunk: (() -> any)?, load_err: string? = host.load(source, (built_in and "=hx/ext/" or "=ext/") .. name,
 		setmetatable({}, { __index = lookup })) -- globals of its own: one extension's do not leak into another
 	if not chunk then
 		error(load_err, 0)
 	end
 	local value = chunk()
-	ext_cache[name] = { source = source, value = value }
+	live.ext_cache[name] = { source = source, value = value }
 	return value
 end
 
 -- One line per extension: its name and the comment on its first line. The built-in ones are listed when the key
 -- they need is there (EXA_API_KEY for exa, DEEPSEEK_API_KEY for the rest), unless the project has its own of that
--- name.
-local function extension_index()
+-- name. A name that starts with _ is a helper, code that other extensions share: ext() loads it, but it is not
+-- listed, the project's or built in.
+local function extension_index(): { string }
 	local lines, own = {}, {}
-	local function add(name, source, mark)
-		table.insert(lines, ("- %s%s: %s"):format(name, mark, source:match("^%-%-%s*([^\n]*)") or "(no description)"))
+	local function add(name: string, source: string, mark: string)
+		if name:sub(1, 1) ~= "_" then
+			table.insert(lines, ("- %s%s: %s"):format(name, mark, source:match("^%-%-%s*([^\n]*)") or "(no description)"))
+		end
 	end
 	for _, file in host.list(ext_dir) or {} do
 		local name = file:match("^([%w_%-]+)%.luau$")
@@ -257,28 +330,27 @@ M.skill_index_full = 30 -- up to this many skills, the system prompt lists each 
 M.skill_listed = 50 -- skills, with their descriptions, that skill() lists for a name no skill has
 M.skill_description_limit = 250 -- characters of a description in those lists
 
-local function trim(text)
+local function trim(text: string): string
 	return (text:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 -- The fields of a SKILL.md's front matter that are plain or block scalars, and the text after it. Enough YAML for
 -- what skills put there: `key: value`, quoted values, values continued on indented lines, and | and > blocks.
 -- Nested maps are read as text and ignored.
-function M.skill_front_matter(text)
+function M.skill_front_matter(text: string): ({ [string]: string }, string)
 	text = text:gsub("^\239\187\191", ""):gsub("\r\n", "\n")
-	local head, body = text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*\n(.*)$")
-	if not head then
-		head = text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*$")
-		body = ""
-	end
+	local head, rest = text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*\n(.*)$")
+	head = head or text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*$") -- front matter with nothing after it
 	if not head then
 		return {}, text
 	end
-	local fields, lines, i = {}, head:split("\n"), 1
+	local body = rest or ""
+	local fields: { [string]: string }, lines, i = {}, head:split("\n"), 1
 	while i <= #lines do
-		local key, value = lines[i]:match("^([%w_%-]+):%s*(.-)%s*$")
+		local key, matched = lines[i]:match("^([%w_%-]+):%s*(.-)%s*$")
 		i += 1
-		if key then
+		if key and matched then -- both or neither
+			local value: string = matched
 			if value:match("^[|>][-+]?%d*$") then
 				local folded, block = value:sub(1, 1) == ">", {}
 				while i <= #lines and (lines[i]:match("^%s") or lines[i] == "") do
@@ -309,19 +381,19 @@ function M.skill_front_matter(text)
 end
 
 -- Lower case, without - _ . and spaces: pdf-tools, PDF_Tools and pdftools are one name.
-local function skill_key(name)
+local function skill_key(name: string): string
 	return (name:lower():gsub("[%-_%.%s]", ""))
 end
 
 -- Every skill that can be found now: {name, description, dir, path, hidden}, in the order of M.skill_dirs and then
 -- by directory name. Found anew on each call, so a skill written in this session is found too.
-function M.skills()
-	local skills, seen = {}, {}
+function M.skills(): { Skill }
+	local skills: { Skill }, seen = {}, {}
 	for _, dir in M.skill_dirs do
 		for _, entry in host.list(dir) or {} do
 			local dir_name = entry:match("^(.+)/$")
 			local path = dir_name and dir .. dir_name .. "/SKILL.md"
-			local text = path and host.read(path)
+			local text: string? = path and host.read(path)
 			if text then
 				local fields = M.skill_front_matter(text)
 				local name = trim(fields.name or "")
@@ -342,7 +414,7 @@ function M.skills()
 	return skills
 end
 
-local function cut(text, limit)
+local function cut(text: string, limit: number): string
 	text = text:gsub("%s+", " ")
 	local length = utf8.len(text)
 	if length and length > limit then
@@ -353,7 +425,7 @@ local function cut(text, limit)
 	return text
 end
 
-local function skill_line(skill)
+local function skill_line(skill: Skill): string
 	local description = skill.description ~= "" and cut(skill.description, M.skill_description_limit)
 		or "(no description)"
 	return ("- %s: %s"):format(skill.name, description)
@@ -363,9 +435,9 @@ M.skill_files_shown = 30 -- files of a loaded skill named, with their paths, in 
 
 -- The files of a skill other than SKILL.md, as paths from the project directory, so that the model can use them as
 -- they are: up to M.skill_files_shown, three directories deep.
-local function skill_files(dir)
+local function skill_files(dir: string): { string }
 	local files = {}
-	local function walk(path, depth)
+	local function walk(path: string, depth: number)
 		for _, entry in host.list(path) or {} do
 			if #files >= M.skill_files_shown then
 				return
@@ -384,7 +456,7 @@ local function skill_files(dir)
 end
 
 -- The skills the model is told about: all but those marked disable-model-invocation.
-local function listed_skills()
+local function listed_skills(): { Skill }
 	local listed = {}
 	for _, skill in M.skills() do
 		if not skill.hidden then
@@ -397,21 +469,20 @@ end
 -- What skill(name) returns: the skill of that name, or the skills whose names differ from it only in case, -, _, .
 -- and spaces when there are several, or else the list of skills to pick from. No guessing past that: the model
 -- reads the list and picks better than a fuzzy match would.
-function M.skill(name)
+function M.skill(name: string): string
 	local skills = M.skills()
 	if #skills == 0 then
 		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
 			.. table.concat(M.skill_dirs, ", ") .. "."
 	end
-	local found
+	local found: { Skill } = {}
 	for _, skill in skills do
 		if skill.name == name then
 			found = { skill }
 			break
 		end
 	end
-	if not found then
-		found = {}
+	if #found == 0 then
 		for _, skill in skills do
 			if skill_key(skill.name) == skill_key(name) then
 				table.insert(found, skill)
@@ -420,9 +491,9 @@ function M.skill(name)
 	end
 	if #found == 1 then
 		local skill = found[1]
-		local source, err = host.read(skill.path)
+		local source: string?, err: string? = host.read(skill.path)
 		if not source then
-			error(("skill: %s: %s"):format(skill.path, err), 0)
+			error(("skill: %s: %s"):format(skill.path, tostring(err)), 0)
 		end
 		local _, body = M.skill_front_matter(source)
 		progress("  skill " .. skill.name)
@@ -458,7 +529,7 @@ end
 
 -- The system prompt's part on skills: each with its description, or past M.skill_index_full only their names, which
 -- keeps the prompt short; skill() with a name no skill has gives the descriptions.
-local function skill_index()
+local function skill_index(): string?
 	local listed = listed_skills()
 	if #listed == 0 then
 		return nil
@@ -487,9 +558,22 @@ end
 -- usually the text the model is meant to see, and reports failure by raising. The same functions are there for
 -- extensions. Add project functions to this list; the order is the order the model reads them in.
 
+-- The start of a command or a note, on one line, for its progress line.
+local function headline(text: string): string
+	return M.printable((text:sub(1, 100):gsub("\n", " ")))
+end
+
+-- What a host primitive returns, when it worked: its value, or `nil, error`, which raises the error.
+local function or_raise<T>(value: T?, err: string?): T
+	if not value then
+		error(err, 0)
+	end
+	return value
+end
+
 -- Checks one argument, and names the call's whole shape when it is wrong: a model used to JSON tools may pass a
 -- table of named arguments where a string belongs.
-local function check(fname, value, position, name, kind, optional)
+local function check(fname: string, value: any, position: number, name: string, kind: string, optional: boolean?)
 	if value == nil and optional then
 		return
 	end
@@ -520,10 +604,10 @@ M.functions = {
 			.. "instead. The command is killed after timeout "
 			.. "seconds (default 120). A process left in the background must send its output to a file, and is "
 			.. "killed when this session ends, daemons included: nothing you start outlives it.",
-		run = function(command, timeout)
+		run = function(command: any, timeout: any): string
 			check("bash", command, 1, "command", "string")
 			check("bash", timeout, 2, "timeout", "number", true)
-			progress("  bash " .. M.printable(command:sub(1, 100):gsub("\n", " ")))
+			progress("  bash " .. headline(command))
 			local result = host.sh(command, { timeout = timeout })
 			local status
 			if result.timed_out then
@@ -546,7 +630,7 @@ M.functions = {
 			.. "to limit lines (default 2000) or the output limit, each as `NUMBER: text`; the numbers are not part "
 			.. "of the file. When that is not the whole file, it ends with the range and the offset to go on from. "
 			.. "For the file's exact contents, as data, use host.read(path).",
-		run = function(path, offset, limit)
+		run = function(path: any, offset: any, limit: any): string
 			check("read", path, 1, "path", "string")
 			check("read", offset, 2, "offset", "whole number", true)
 			check("read", limit, 3, "limit", "whole number", true)
@@ -554,10 +638,7 @@ M.functions = {
 				error(("read: limit must be 1 or more, not %d"):format(limit), 0)
 			end
 			progress("  read " .. M.printable(path))
-			local text, err = host.read(path)
-			if not text then
-				error(err, 0)
-			end
+			local text: string = or_raise(host.read(path))
 			if text == "" then
 				return "[empty file]"
 			end
@@ -615,14 +696,11 @@ M.functions = {
 		name = "write",
 		usage = "write(path, content) -> text: creates or overwrites a file. Missing directories are created. For a "
 			.. "change to part of an existing file, edit is cheaper and safer.",
-		run = function(path, content)
+		run = function(path: any, content: any): string
 			check("write", path, 1, "path", "string")
 			check("write", content, 2, "content", "string")
 			progress("  write " .. M.printable(path))
-			local ok, err = host.write(path, content)
-			if not ok then
-				error(err, 0)
-			end
+			or_raise(host.write(path, content))
 			return ("wrote %d bytes to %s"):format(#content, path)
 		end,
 	},
@@ -631,7 +709,7 @@ M.functions = {
 		usage = "edit(path, old, new, all?) -> text: replaces the exact text old with new in a file. old must occur "
 			.. "exactly once, unless all is true, which replaces every occurrence. Copy old from the file without "
 			.. "the line numbers read puts in front.",
-		run = function(path, old, new, all)
+		run = function(path: any, old: any, new: any, all: any): string
 			check("edit", path, 1, "path", "string")
 			check("edit", old, 2, "old", "string")
 			check("edit", new, 3, "new", "string")
@@ -643,15 +721,12 @@ M.functions = {
 			if old == new then
 				error("edit: old and new are the same, so this edit would change nothing", 0)
 			end
-			local text, err = host.read(path)
-			if not text then
-				error(err, 0)
-			end
-			local function replace(from_text, to_text)
+			local text: string = or_raise(host.read(path))
+			local function replace(from_text: string, to_text: string): ({ string }, number)
 				local pieces, count, at = {}, 0, 1
 				while true do
 					local from, to = text:find(from_text, at, true)
-					if not from then
+					if not from or not to then -- both or neither
 						break
 					end
 					table.insert(pieces, text:sub(at, from - 1))
@@ -665,7 +740,7 @@ M.functions = {
 			local pieces, count = replace(old, new)
 			-- Models write line ends as \n. In a file with \r\n ends, the same text is found with them.
 			if count == 0 and text:find("\r\n", 1, true) and old:find("\n", 1, true) then
-				local function crlf(s)
+				local function crlf(s: string): string
 					return (s:gsub("\r?\n", "\r\n"))
 				end
 				pieces, count = replace(crlf(old), crlf(new))
@@ -677,10 +752,7 @@ M.functions = {
 			if count > 1 and not all then
 				error(("edit: old text occurs %d times in %s: add surrounding lines to make it unique, or pass all = true"):format(count, path), 0)
 			end
-			local ok, write_err = host.write(path, table.concat(pieces))
-			if not ok then
-				error(write_err, 0)
-			end
+			or_raise(host.write(path, table.concat(pieces)))
 			return ("replaced %d occurrence%s in %s"):format(count, count == 1 and "" or "s", path)
 		end,
 	},
@@ -688,7 +760,7 @@ M.functions = {
 		name = "skill",
 		usage = "skill(name) -> text: the instructions of the skill of that name (case, -, _, . and spaces do not "
 			.. "matter), headed by its directory; for a name no skill has, the skills with what each is for.",
-		run = function(name)
+		run = function(name: any): string
 			check("skill", name, 1, "name", "string")
 			if trim(name) == "" then
 				error("skill: give a skill's name", 0)
@@ -699,7 +771,7 @@ M.functions = {
 	{
 		name = "ext",
 		usage = "ext(name) -> table: the extension .hx/ext/NAME.luau, or one built into hx.",
-		run = function(name)
+		run = function(name: any): any
 			return M.ext(name)
 		end,
 	},
@@ -713,10 +785,10 @@ if host.judged then
 			.. "changed and what you expect. The judge builds and measures it beside the champion, the best version "
 			.. "so far, with a kit you cannot see, and returns its verdict. Only verdicts count. One submission at a "
 			.. "time: with no note, it submits nothing and waits for a verdict still owed.",
-		run = function(note)
+		run = function(note: any): string
 			check("submit", note, 1, "note", "string", true)
 			if note then
-				progress("  submit " .. M.printable(note:sub(1, 100):gsub("\n", " ")))
+				progress("  submit " .. headline(note))
 			end
 			local lines, pending = host.judge(note and json.encode({ note = note:sub(1, 4000) }) or nil)
 			local verdicts = {}
@@ -746,23 +818,22 @@ end
 -- Each tool is {name, description (text, or a function that returns it), parameters (a JSON schema),
 -- run(args) -> text, failed?}. A tool may also report failure by raising; the message goes back to the model.
 
-local scratch = setmetatable({}, { __index = lookup }) -- globals of `lua` code live here, across calls
+-- The globals of `lua` code live here, across calls, for the whole run. It is the model's workspace rather than
+-- the loop's state, so a nested call shares it on purpose: code a project function runs as a `lua` call sees the
+-- globals the model set, as the model's own next call would. A sub-agent's turn shares it too: a call is not told
+-- which conversation it answers.
+local scratch = setmetatable({}, { __index = lookup })
 
-local function show(value)
+local function show(value: any): string
 	local meta = getmetatable(value)
 	if type(meta) == "table" and meta.__tostring then -- a value that says how it reads, as search results do
 		return tostring(value)
 	end
-	if type(value) == "table" then
-		local ok, text = pcall(json.encode, value)
-		if ok then
-			return text
-		end
-	end
-	return tostring(value)
+	local text = if type(value) == "table" then as_json(value) else nil
+	return text or tostring(value)
 end
 
-local function lua_description()
+local function lua_description(): string
 	local lines = {
 		"Run Luau code in the project directory. This is how you act: the code calls the functions below. The "
 			.. "result is what the code prints and then what it returns; a function's value shows only when you "
@@ -783,7 +854,7 @@ local function lua_description()
 	return table.concat(lines, "\n")
 end
 
-M.tools = {
+local tools: { Tool } = {
 	{
 		name = "lua",
 		description = lua_description,
@@ -792,38 +863,44 @@ M.tools = {
 			properties = { code = { type = "string" } },
 			required = { "code" },
 		},
-		run = function(args)
+		run = function(args: { [string]: any }): (string, boolean)
 			if type(args.code) ~= "string" then
 				error('argument "code" must be a string', 0)
 			end
-			local lines = {}
+			local lines: { string } = {}
 			scratch.print = capture_print -- again each call, in case the model's code assigned print
-			local chunk, err = host.load(args.code, "=lua", scratch)
+			local chunk: (() -> ...any)?, err: string? = host.load(args.code, "=lua", scratch)
 			if not chunk then
-				return "error: " .. err, true
+				return "error: " .. tostring(err), true
 			end
-			printed = lines
-			local results = table.pack(host.timed(M.call_seconds, chunk))
-			printed = nil
-			local failed = not results[1]
-			if failed then
-				table.insert(lines, "error: " .. tostring(results[2]))
+			-- The outer call's lines are put back before any other call or return: on a stop the host raises again
+			-- at the first of those, and this call's lines must not be left in the outer call's place.
+			local outer = live.printed
+			live.printed = lines
+			local ok, results = host.timed(M.call_seconds, function()
+				return table.pack(chunk())
+			end)
+			live.printed = outer
+			if not ok then
+				table.insert(lines, "error: " .. tostring(results))
 			else
-				for i = 2, results.n do
+				for i = 1, results.n do
 					table.insert(lines, show(results[i]))
 				end
 			end
+			local failed = not ok
 			return #lines > 0 and clip(table.concat(lines, "\n")) or "[no output]", failed
 		end,
 	},
 }
+M.tools = tools
 
 -- Checks a call's argument names against the tool's own schema. The message names what was sent and what the
 -- tool takes, so a model that reached for another harness's names can see its mistake. Returns nil or it. A
 -- schema without `properties` names no arguments, so then any name is accepted.
-local function argument_problem(tool, args)
-	local schema = tool.parameters or {}
-	local properties, required = schema.properties, schema.required or {}
+local function argument_problem(tool: Tool, args: { [string]: any }): string?
+	local schema: Schema = tool.parameters or {}
+	local properties, required: { string } = schema.properties, schema.required or {}
 	local takes, optional = table.clone(required), {}
 	for name in properties or {} do
 		if not table.find(required, name) then
@@ -846,7 +923,7 @@ local function argument_problem(tool, args)
 	return nil
 end
 
-local function find_tool(name)
+local function find_tool(name: string?): Tool?
 	for _, tool in M.tools do
 		if tool.name == name then
 			return tool
@@ -857,7 +934,7 @@ end
 
 -- Runs one tool_use block from the model. Returns the text of the result and whether it is an error. Nothing a
 -- tool does can end the run; a stop does, because the host raises it again as soon as this returns.
-local function run_tool(call)
+local function run_tool(call: Block): (string, boolean)
 	local tool = find_tool(call.name)
 	if not tool then
 		return "error: there is no tool named " .. tostring(call.name), true
@@ -913,28 +990,31 @@ M.claude = {
 --     every Claude model accepts (DeepSeek ignores the field and gets a plain string)
 --   only a model listed in M.claude gets the newer features of its entry; an older Claude model gets none
 -- Returns whether the model is Claude, and its M.claude entry or nil.
-local function claude_model()
+local function claude_model(): (boolean, Features?)
 	return M.model:match("^claude%-") ~= nil, M.claude[M.model]
 end
 
-local usage = { replies = 0, input = 0, cached = 0, written = 0, output = 0 }
+-- Tokens a request put in front of the model, cached or not.
+local function prompt_tokens(counts: Usage): number
+	return (counts.input_tokens or 0) + (counts.cache_read_input_tokens or 0) + (counts.cache_creation_input_tokens or 0)
+end
 
 -- Adds a reply's tokens to the run's count. A compaction reply has zero at the top and the summarization call in
 -- usage.iterations; where iterations are given, they are what was billed.
-local function count_usage(reply)
-	local counts = type(reply.usage) == "table" and reply.usage or {}
+local function count_usage(reply: Reply)
+	local counts: Usage = type(reply.usage) == "table" and reply.usage or {}
 	local parts = type(counts.iterations) == "table" and #counts.iterations > 0 and counts.iterations or { counts }
+	local usage = live.usage
 	usage.replies += 1
 	for _, part in parts do
-		usage.input += (part.input_tokens or 0) + (part.cache_read_input_tokens or 0)
-			+ (part.cache_creation_input_tokens or 0)
+		usage.input += prompt_tokens(part)
 		usage.cached += part.cache_read_input_tokens or 0
 		usage.written += part.cache_creation_input_tokens or 0
 		usage.output += part.output_tokens or 0
 	end
 end
 
-local function tool_specs()
+local function tool_specs(): { any }
 	local specs = json.array({}) -- a list even when a project has taken every tool away
 	for _, tool in M.tools do
 		local description = type(tool.description) == "function" and tool.description() or tool.description
@@ -943,15 +1023,9 @@ local function tool_specs()
 	return specs
 end
 
--- Tokens the last request put in front of the model, cached or not.
-local function prompt_size(reply)
-	local counts = reply.usage or {}
-	return (counts.input_tokens or 0) + (counts.cache_read_input_tokens or 0) + (counts.cache_creation_input_tokens or 0)
-end
-
 -- Whether a reply has anything in it. Thinking alone counts; an empty text block does not. A reply cut off by
 -- the output limit (the loop asks it to go on) or refused (that is the answer) counts however empty it is.
-local function has_content(reply)
+local function has_content(reply: Reply): boolean
 	if reply.stop_reason == "max_tokens" or reply.stop_reason == "refusal" then
 		return true
 	end
@@ -967,7 +1041,7 @@ end
 -- wrote before the last one is not its to send back: its thinking, tool calls and other model-internal blocks are
 -- dropped, and the fallback block stays where it is, because the API checks the thinking around it by its place.
 local internal_before_fallback = { thinking = true, redacted_thinking = true, tool_use = true, server_tool_use = true }
-local function after_fallback(reply)
+local function after_fallback(reply: Reply)
 	local last = nil
 	for i, block in reply.content do
 		if block.type == "fallback" then
@@ -992,7 +1066,7 @@ end
 -- sometimes answers 200 with nothing in it; that is retried like a busy server, since the same request may well
 -- get a real reply. `compaction`, given, asks a Claude model for a summary in place of a reply (see M.compact);
 -- that reply comes back however empty it is, since an empty one is an answer too.
-function M.request(system, messages, compaction)
+function M.request(system: string, messages: { Message }, compaction: { [string]: any }?): Reply
 	local is_claude, features = claude_model()
 	local thinking = { type = "adaptive" }
 	local betas = {}
@@ -1073,7 +1147,7 @@ function M.request(system, messages, compaction)
 	error("unreachable")
 end
 
-function M.system_prompt()
+function M.system_prompt(): string
 	local parts = {
 		("You are a coding agent working in %s. You act by running Luau code with the lua tool; the code calls "
 			.. "the functions the tool lists. Put several steps in one call when you know what each will do, and take "
@@ -1145,17 +1219,19 @@ end
 local Conversation = {}
 Conversation.__index = Conversation
 M.Conversation = Conversation
+type Conversation = setmetatable<{ messages: { Message }, on_answer: ((Conversation) -> ())? }, typeof(Conversation)>
+type State = "idle" | "ready" | "owing"
 
 -- on_answer, if set, is called with the conversation after each answer: after every reply that called tools and
 -- their results. M.main sets it to save the log, so a run killed half-way still leaves one; it is here rather than
 -- in M.turn so that it goes on when a project replaces M.turn. A fork does not carry it.
-function Conversation.new()
+function Conversation.new(): Conversation
 	return setmetatable({ messages = {}, on_answer = nil }, Conversation)
 end
 
-local function tool_calls(message)
+local function tool_calls(message: Message): { Block }
 	local calls = {}
-	for _, block in message.content do
+	for _, block in message.content :: { Block } do -- only a reply is asked, and a reply's content is a list
 		if block.type == "tool_use" then
 			table.insert(calls, block)
 		end
@@ -1163,7 +1239,7 @@ local function tool_calls(message)
 	return calls
 end
 
-function Conversation:state()
+function Conversation.state(self: Conversation): State
 	local last = self.messages[#self.messages]
 	if not last then
 		return "idle"
@@ -1173,47 +1249,47 @@ function Conversation:state()
 	return #tool_calls(last) > 0 and "owing" or "idle"
 end
 
-local function expect(self, operation, ...)
-	local state = self:state()
+local function expect(self: Conversation, operation: string, ...: State)
+	local now = self:state()
 	for _, allowed in { ... } do
-		if state == allowed then
+		if now == allowed then
 			return
 		end
 	end
-	error(("conversation: cannot %s while %s"):format(operation, state), 3)
+	error(("conversation: cannot %s while %s"):format(operation, now), 3)
 end
 
 -- Adds text from the user. After tool results or earlier text it joins that message, behind what is there.
-function Conversation:say(text)
+function Conversation.say(self: Conversation, text: string)
 	expect(self, "say", "idle", "ready")
 	local last = self.messages[#self.messages]
 	if not last or last.role ~= "user" then
 		table.insert(self.messages, { role = "user", content = text })
 		return
 	end
-	if type(last.content) == "string" then
-		last.content = { { type = "text", text = last.content } }
-	end
-	table.insert(last.content, { type = "text", text = text })
+	local content = last.content
+	local blocks: { Block } = if type(content) == "string" then { { type = "text", text = content } } else content
+	last.content = blocks
+	table.insert(blocks, { type = "text", text = text })
 end
 
 -- Records the model's reply exactly as it came (thinking blocks have to go back unchanged) and returns its
 -- tool calls. An empty reply records nothing: the user's message is still the last word.
-function Conversation:reply(content)
+function Conversation.reply(self: Conversation, content: { Block }): { Block }
 	expect(self, "reply", "ready")
 	if #content == 0 then
 		return {}
 	end
-	local message = { role = "assistant", content = content }
+	local message: Message = { role = "assistant", content = content }
 	table.insert(self.messages, message)
 	return tool_calls(message)
 end
 
 -- Answers every tool call of the last reply with what run(call) returns: the result text, and whether it is an
 -- error. If run raises, nothing is recorded and the calls are still owed.
-function Conversation:answer(run)
+function Conversation.answer(self: Conversation, run: (Block) -> (string, boolean?))
 	expect(self, "answer", "owing")
-	local results = {}
+	local results: { Block } = {}
 	for _, call in tool_calls(self.messages[#self.messages]) do
 		local text, failed = run(call)
 		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = failed or nil })
@@ -1225,7 +1301,7 @@ function Conversation:answer(run)
 end
 
 -- Answers whatever is owed with an error, so a turn stopped half-way leaves a history that can continue.
-function Conversation:abandon(reason)
+function Conversation.abandon(self: Conversation, reason: string)
 	if self:state() == "owing" then
 		self:answer(function()
 			return "error: " .. reason, true
@@ -1234,7 +1310,7 @@ function Conversation:abandon(reason)
 end
 
 -- Forgets everything and starts again from one user message.
-function Conversation:restart(text)
+function Conversation.restart(self: Conversation, text: string)
 	expect(self, "restart", "idle", "ready")
 	table.clear(self.messages)
 	self:say(text)
@@ -1242,14 +1318,14 @@ end
 
 -- Forgets everything and starts again from a compaction block, which the API reads in place of the messages it
 -- summarized, followed by one user message. The block goes first in the first message, exactly as it came.
-function Conversation:resume(block, text)
+function Conversation.resume(self: Conversation, block: Block, text: string)
 	expect(self, "resume", "idle", "ready")
 	table.clear(self.messages)
 	table.insert(self.messages, { role = "user", content = { block, { type = "text", text = text } } })
 end
 
 -- A copy to try something on. It shares the old messages; the last one, which say() may extend, is its own.
-function Conversation:fork()
+function Conversation.fork(self: Conversation): Conversation
 	local copy = Conversation.new()
 	copy.messages = table.clone(self.messages)
 	local last = copy.messages[#copy.messages]
@@ -1261,7 +1337,7 @@ end
 
 -- Checks the whole history against the rules above. Returns nil, or what is wrong. The functions above keep it
 -- nil; this is the independent check, run before every request and by the tests.
-function Conversation:problem()
+function Conversation.problem(self: Conversation): string?
 	local owed = nil -- the calls the next message has to answer
 	for i, message in self.messages do
 		local expected = i % 2 == 1 and "user" or "assistant"
@@ -1295,7 +1371,7 @@ function Conversation:problem()
 	return nil
 end
 
-local function text_of(reply)
+local function text_of(reply: Reply): string
 	local parts = {}
 	for _, block in reply.content do
 		if block.type == "text" then
@@ -1306,7 +1382,7 @@ local function text_of(reply)
 end
 
 -- Sends the conversation to the model. Only a conversation that is ready, and sound, is ever sent.
-local function ask(system, talk, compaction)
+local function ask(system: string, talk: Conversation, compaction: { [string]: any }?): Reply
 	local problem = talk:state() ~= "ready" and "it is " .. talk:state() .. ", not ready" or talk:problem()
 	if problem then
 		error("this conversation cannot be sent: " .. problem, 0)
@@ -1347,6 +1423,17 @@ M.compact_prompt = table.concat({
 M.resume_prompt = "Earlier turns were replaced by the checkpoint above, written by you. Treat it as established "
 	.. "and continue the work from it directly, without restating or acknowledging it."
 
+-- Sends the request for a summary. One that fails leaves the conversation as it is, to be compacted after a later
+-- reply, on any model: losing the summary must not lose the task. Returns the reply, or nil.
+local function ask_for_summary(system: string, talk: Conversation, compaction: { [string]: any }?): Reply?
+	local ok, reply = pcall(ask, system, talk, compaction)
+	if not ok then
+		progress("  compaction failed, the conversation stays as it is: " .. tostring(reply))
+		return nil
+	end
+	return reply
+end
+
 -- On-demand compaction, for the Claude models whose M.claude entry says so. The request is the conversation as it
 -- stands, with the same model, system, tools, thinking and effort, so it reads the cached prefix, plus
 -- `compaction`; M.compact_prompt is its `instructions`, which replace the API's own summarization prompt. The API
@@ -1354,13 +1441,12 @@ M.resume_prompt = "Earlier turns were replaced by the checkpoint above, written 
 -- message it summarized: it goes first, exactly as it came, and is sent with every later request. A newer block
 -- summarizes the old one with what came after it. A request that brings no block (cut off, refused, a tool call)
 -- or fails leaves the conversation as it is, to be compacted after a later reply, as the docs advise.
-local function compact_on_server(system, talk)
-	local ok, reply = pcall(ask, system, talk, { type = "summarize", instructions = M.compact_prompt })
-	if not ok then
-		progress("  compaction failed, the conversation stays as it is: " .. tostring(reply))
+local function compact_on_server(system: string, talk: Conversation)
+	local reply = ask_for_summary(system, talk, { type = "summarize", instructions = M.compact_prompt })
+	if not reply then
 		return
 	end
-	local block = nil
+	local block: Block? = nil
 	if reply.stop_reason == "compaction" then
 		for _, b in reply.content do
 			if b.type == "compaction" then
@@ -1378,19 +1464,17 @@ end
 -- Replaces the conversation with the model's own summary of what happened. A Claude model that has on-demand
 -- compaction gets it; any other model, DeepSeek's included, is asked for the summary as an ordinary reply,
 -- behind the whole conversation so that the request reuses the cached prefix.
-function M.compact(system, talk)
+function M.compact(system: string, talk: Conversation)
 	progress("  compacting the conversation")
 	local _, features = claude_model()
 	if features and features.compaction then
-		return compact_on_server(system, talk)
+		compact_on_server(system, talk)
+		return
 	end
 	local asking = talk:fork()
 	asking:say(M.compact_prompt)
-	-- A request that fails leaves the conversation as it is, to be compacted after a later reply, as on a Claude
-	-- model: losing the summary must not lose the task.
-	local ok, reply = pcall(ask, system, asking)
-	if not ok then
-		progress("  compaction failed, the conversation stays as it is: " .. tostring(reply))
+	local reply = ask_for_summary(system, asking, nil)
+	if not reply then
 		return
 	end
 	local summary = text_of(reply)
@@ -1404,7 +1488,7 @@ end
 -- What the model is told when a function call has returned the same result `count` times in this task (see
 -- `counted`), as `call`, the call written out. `first` is true at the lowest threshold of M.repeat_reminders; a
 -- loop inside one call that passes several at once gets the later wording.
-function M.repeat_reminder(call, count, first)
+function M.repeat_reminder(call: string, count: number, first: boolean): string
 	if #call > 500 then
 		call = call:sub(1, 500) .. ("... (%d more bytes)"):format(#call - 500)
 	end
@@ -1420,21 +1504,21 @@ end
 
 -- Prints the text of a reply: the model's words are the answer, on stdout. A model asked for progress updates
 -- (M.claude's display) writes its notes between tool calls into thinking blocks; those are progress lines.
-local function show_text(reply)
+local function show_text(reply: Reply)
 	local _, features = claude_model()
 	local updates = features and features.display == "updates"
 	for _, block in reply.content do
 		if block.type == "text" and block.text ~= "" then
-			print(host.tty and M.printable(block.text) or block.text)
+			local text = block.text :: string -- a text block has its text
+			print(host.tty and M.printable(text) or text)
 		elseif updates and block.type == "thinking" and type(block.thinking) == "string" and block.thinking ~= "" then
 			progress("  " .. M.printable(block.thinking))
 		end
 	end
 end
 
--- Runs the model until it answers without asking for a tool.
-function M.turn(system, talk)
-	repeats.counts, repeats.worst = {}, nil
+-- The body of M.turn, which gives it a count of repeats of its own.
+local function turn(system: string, talk: Conversation)
 	local reminded = 0 -- the highest count already reminded of
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
@@ -1450,17 +1534,17 @@ function M.turn(system, talk)
 			end)
 			-- One reminder for the highest threshold the worst call has passed since the last one, however many
 			-- times a loop inside one call passed.
-			local worst, due = repeats.worst, nil
+			local worst, due = live.repeats.worst, nil
 			for i, at in M.repeat_reminders do
 				if worst and worst.count >= at and at > reminded then
 					due = i
 				end
 			end
-			if due then
+			if due and worst then -- due is set only when there is a worst
 				reminded = M.repeat_reminders[due]
 				talk:say(M.repeat_reminder(worst.call, worst.count, due == 1))
 			end
-			if prompt_size(reply) > M.compact_at then
+			if prompt_tokens(reply.usage or {}) > M.compact_at then
 				M.compact(system, talk)
 			end
 		elseif cut_off then
@@ -1485,12 +1569,24 @@ function M.turn(system, talk)
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
 end
 
+-- Runs the model until it answers without asking for a tool. The turn counts repeats afresh, and puts the outer
+-- turn's counts back when it ends, however it ends: as with printed lines in the lua tool, before any other call.
+function M.turn(system: string, talk: Conversation)
+	local outer = live.repeats
+	live.repeats = { counts = {}, worst = nil }
+	local ok, err = pcall(turn, system, talk)
+	live.repeats = outer
+	if not ok then
+		error(err, 0)
+	end
+end
+
 -- With a .hx directory, each session's conversation is kept in .hx/log/ as JSON. The name starts with the time, so
 -- the logs sort by it, and ends with the random part of this run's $TMPDIR (hx-XXXXXX), which no other running hx
 -- shares, so two sessions started in the same second keep two logs.
 local log_path = host.list(".hx") and (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
-	(host.env("TMPDIR") or ""):match("([%w]+)/*$") or "0") or nil
-local function save(system, messages)
+	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0") or nil
+local function save(system: string, messages: { Message })
 	if log_path then
 		-- Logs hold file contents, so the directory keeps itself out of git, however .hx/ came to exist.
 		if not host.read(".hx/log/.gitignore") then
@@ -1502,6 +1598,7 @@ end
 
 local function report()
 	-- A healthy run reads most of what goes in from the cache and writes little of it. DeepSeek reports no writes.
+	local usage = live.usage
 	progress(("[%d replies, %d tokens in (%d read from cache, %d written to it), %d out]"):format(usage.replies,
 		usage.input, usage.cached, usage.written, usage.output))
 end
@@ -1516,7 +1613,7 @@ local PASTE_START, PASTE_END = "\27[200~", "\27[201~"
 -- carries the start of a paste: then lines are read up to the one that carries its end, and the message is all
 -- of them, joined with newlines, without the markers. Text typed before or after the markers belongs to it. A
 -- paste cut short by the end of input is the message so far. Returns nil at the end of input.
-function M.read_message(read)
+function M.read_message(read: () -> string?): string?
 	local line = read()
 	if not line or not line:find(PASTE_START, 1, true) then
 		return line
@@ -1532,7 +1629,7 @@ function M.read_message(read)
 	return (table.concat(lines, "\n"):gsub("\27%[20[01]~", ""))
 end
 
-function M.main()
+function M.main(): number
 	local system = M.system_prompt()
 	local talk = Conversation.new()
 	-- Encoding even a long conversation takes milliseconds, next to seconds for a reply.
