@@ -117,6 +117,15 @@ tools.write(dir .. "crlf.txt", "one\r\ntwo\r\nthree\n")
 check("edit across \\r\\n ends", tools.edit(dir .. "crlf.txt", "one\ntwo", "1\n2"), ("replaced 1 occurrence in %scrlf.txt"):format(dir))
 check("keeps the file's ends", host.read(dir .. "crlf.txt"), "1\r\n2\r\nthree\n")
 check("read shows \\r\\n ends as plain ones", tools.read(dir .. "crlf.txt"), "1: 1\n2: 2\n3: three")
+-- In a file whose line ends are \r\n, the text that goes in gets them, though old was found as written.
+tools.write(dir .. "crlf2.txt", "one\r\ntwo\r\nthree\r\n")
+tools.edit(dir .. "crlf2.txt", "two", "2\n2b")
+check("new text takes the file's \\r\\n ends", host.read(dir .. "crlf2.txt"), "one\r\n2\r\n2b\r\nthree\r\n")
+tools.edit(dir .. "crlf2.txt", "2b\r\n", "x\r\ny\n")
+check("and keeps them when it has them already", host.read(dir .. "crlf2.txt"), "one\r\n2\r\nx\r\ny\r\nthree\r\n")
+tools.write(dir .. "lf.txt", "one\ntwo\n")
+tools.edit(dir .. "lf.txt", "two", "2\n2b")
+check("a file with \\n ends keeps them", host.read(dir .. "lf.txt"), "one\n2\n2b\n")
 
 -- bash
 check("bash", tools.bash("echo out; echo err >&2; exit 3"), "out\nerr\n[exit 3]")

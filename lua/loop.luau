@@ -810,12 +810,14 @@ M.functions = {
 				table.insert(pieces, text:sub(at))
 				return pieces, count
 			end
-			local pieces, count = replace(old, new)
-			-- Models write line ends as \n. In a file with \r\n ends, the same text is found with them.
+			-- Models write line ends as \n. In a file whose line ends are \r\n (its first line's are), new gets them
+			-- too, so the file keeps one kind. Where old is not found as written and the file has \r\n ends at all,
+			-- old is looked for with them, and new takes them like the text it replaces.
+			local function crlf(s: string): string
+				return (s:gsub("\r?\n", "\r\n"))
+			end
+			local pieces, count = replace(old, if text:match("\r?\n") == "\r\n" then crlf(new) else new)
 			if count == 0 and text:find("\r\n", 1, true) and old:find("\n", 1, true) then
-				local function crlf(s: string): string
-					return (s:gsub("\r?\n", "\r\n"))
-				end
 				pieces, count = replace(crlf(old), crlf(new))
 			end
 			if count == 0 then
