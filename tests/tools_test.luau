@@ -176,6 +176,27 @@ lua("read = 'shadowed'")
 check("a global named like a function shadows it", lua("return type(read)"), "string")
 lua("read = nil")
 check("and gives it back once cleared", lua("return type(read)"), "function")
+
+-- The model's code sees the host's tables read-only: an assignment raises and names the reason, and later calls
+-- still work, the loop's own included.
+for _, assignment in { "host.sh = nil", "json.encode = nil", "_G.host.sh = nil", "string.format = nil",
+	"host.load('host.sh = nil')()" } do
+	local result, broke = lua(assignment)
+	check(assignment .. " fails", broke, true)
+	check(assignment .. " says why", result:find("is read-only", 1, true) ~= nil, true)
+end
+check("bash still works", lua("return bash('echo still')"), "still\n[exit 0]")
+check("json still works", lua("return json.encode({1})"), "[1]")
+check("and so does the loop's own json", json.encode({ 2 }), "[2]")
+check("reads see the host as it is", lua("return host.cwd == " .. ("%q"):format(host.cwd)), "true")
+check("a view is the same value each time", lua("return host == _G.host"), "true")
+check("its tables can be iterated", lua("local n = 0 for name in host.extensions do n += 1 end return n > 0"), "true")
+check("and so can the view", lua("local found = false for name in host do found = found or name == 'sh' end return found"), "true")
+check("_G.print is the print that reaches the model", lua("_G.print('through _G')"), "through _G")
+check("_G is the code's own globals", lua("_G.via_g = 7 return via_g"), "7")
+check("which stay out of the harness", _G.via_g, nil)
+check("a chunk the code loads sees the views too", lua("return host.load('return host')() == host"), "true")
+check("and has globals of its own", lua("host.load('loaded_global = 1')() return loaded_global"), "nil")
 table.insert(loop.functions, { name = "twice", usage = "twice(n) -> number", run = function(n) return 2 * n end })
 check("a project function is there at once", lua("return twice(21)"), "42")
 check("and the model reads about it", loop.tools[1].description():find("- twice(n) -> number", 1, true) ~= nil, true)
@@ -223,6 +244,9 @@ host.write(".hx/ext/uses.luau", "-- uses a function\nreturn { run = function() r
 check("an extension can call the functions", loop.ext("uses").run(), "from ext\n[exit 0]")
 host.write(".hx/ext/twice.luau", "-- uses another extension\nreturn { hello = function(n) return ext('greet').hello(n) .. '!' end }\n")
 check("an extension can use another", loop.ext("twice").hello("z"), "hi z!")
+host.write(".hx/ext/meddle.luau", "-- meddles\nreturn { f = function() host.sh = nil end }\n")
+raises("an extension cannot assign to the host either", "host is read-only", loop.ext("meddle").f)
+check("so commands still run", tools.bash("echo ok"), "ok\n[exit 0]")
 host.write(".hx/ext/broken.luau", "return {")
 raises("a broken extension", "ext/broken", loop.ext, "broken")
 raises("a missing extension", "no extension nope", loop.ext, "nope")

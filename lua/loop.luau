@@ -161,9 +161,6 @@ end
 
 local ext_dir = ".hx/ext/"
 
--- What code from the model and from extensions sees: the functions of M.functions (looked up when used, so a
--- project's changes to the list count at once), print, and the Luau globals.
---
 -- Every function call is counted by what it was asked and what it returned. A call that returns what it returned
 -- before is going nowhere, whatever ran in between and whether the model repeats it across tool calls or in a loop
 -- inside one: that is the unit the repeat reminder counts, not the tool call, whose code may print a counter or a
@@ -224,7 +221,7 @@ end
 
 -- Where print goes: into the result of the `lua` call that is running, which is what the model sees, whether the
 -- model's code prints or an extension it called does. Outside a call (a test calling an extension), to stderr, never
--- to stdout, which carries only the answer.
+-- to stdout, which carries only the answer, and as text only, since stderr may be a terminal.
 local function capture_print(...: any)
 	local parts = table.pack(...)
 	for i = 1, parts.n do
@@ -234,11 +231,72 @@ local function capture_print(...: any)
 	if live.printed then
 		table.insert(live.printed, line)
 	else
-		host.log(line)
+		host.log(M.printable(line))
 	end
 end
 
-local function lookup(_: any, name: string): any
+-- Code from the model and from extensions sees the host's tables (host, json, string, table and the other
+-- libraries) only through read-only views. The loop shares those tables: `host.sh = nil` or `json.encode = nil` in
+-- one call would otherwise break every later call, and the loop with them, for the rest of the session. A view
+-- reads through to its table at each access, so what the host or a test puts there later is seen, and an
+-- assignment raises. rawset, getfenv and debug still reach the tables themselves: the views stop mistakes, not
+-- code that digs on purpose.
+local function read_only(name: string, real: { [any]: any }, own: { [string]: any }?): any
+	local view = {}
+	return setmetatable(view, {
+		__index = function(_, key: any): any
+			local mine = if own and type(key) == "string" then own[key] else nil
+			if mine ~= nil then
+				return mine
+			end
+			return real[key]
+		end,
+		__newindex = function(_, key: any)
+			error(("%s is read-only: %s.%s cannot be assigned"):format(name, name, tostring(key)), 2)
+		end,
+		-- `for name, value in host.extensions` and the like iterate the table itself, with the view's values.
+		__iter = function()
+			local key = nil
+			return function(): (any, any)
+				key = next(real, key)
+				if key == nil then
+					return nil, nil
+				end
+				return key, view[key]
+			end
+		end,
+		__len = function(): number
+			return #real
+		end,
+		__metatable = "read-only",
+	})
+end
+
+-- What differs in the view of `host`. host.log and host.input write to a terminal, so the text they are given is
+-- made printable, as the loop's own lines are; the loop itself keeps the real host, because it writes escape
+-- sequences (bracketed paste) on purpose. A chunk that host.load gives no environment gets globals of its own
+-- that read these views, as an extension does, not the real ones.
+local function host_view_parts(real: { [any]: any }, fresh_globals: () -> any): { [string]: any }
+	return {
+		log = function(text: any, ...: any)
+			return real.log(if type(text) == "string" then M.printable(text) else text, ...)
+		end,
+		input = function(prompt: any, ...: any)
+			return real.input(if type(prompt) == "string" then M.printable(prompt) else prompt, ...)
+		end,
+		load = function(source: any, name: any, env: any, ...: any)
+			return real.load(source, name, if env == nil then fresh_globals() else env, ...)
+		end,
+	}
+end
+
+-- Each table's view, by the table, made once, so that a view is the same value from call to call.
+local views: { [any]: any } = {}
+
+-- The globals of code from the model and from extensions: the functions of M.functions (looked up when used, so a
+-- project's changes to the list count at once), print, the views above, and the other Luau globals. `env` is the
+-- code's own table of globals, which is also its _G.
+local function lookup(env: any, name: string): any
 	for _, fn in M.functions do
 		if fn.name == name then
 			local wrapper = live.wrappers[fn] or counted(fn)
@@ -248,8 +306,23 @@ local function lookup(_: any, name: string): any
 	end
 	if name == "print" then
 		return capture_print
+	elseif name == "_G" then
+		return env
 	end
-	return _G[name]
+	local value = _G[name]
+	if type(value) ~= "table" then
+		return value
+	end
+	local view = views[value]
+	if not view then
+		view = read_only(name, value, if name == "host"
+			then host_view_parts(value, function(): any
+				return setmetatable({}, { __index = lookup })
+			end)
+			else nil)
+		views[value] = view
+	end
+	return view
 end
 
 function M.ext(name: string): any

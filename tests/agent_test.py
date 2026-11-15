@@ -1508,13 +1508,22 @@ class AgentTest(unittest.TestCase):
 
     def test_control_characters_reach_a_terminal_only_as_text(self):
         words = "\x1b]52;c;aGk=\x07red\x1b[31m!"
-        script = [call("bash", {"command": "true # \x1b]0;title\x07"}), say(words)]
-        # Into a pipe, the model's words are passed on unchanged; the progress line never carries the escapes.
-        done = self.run_hx("go", script=script)
+        # The model's own code writes to the terminal through host.log and host.input, and prints through _G.print.
+        writes = ('host.log("log\\27]0;pwned\\7") _G.print("print\\27]0;pwned\\7") '
+                  'return host.input("ask\\27]0;pwned\\7")')
+        script = [call("bash", {"command": "true # \x1b]0;title\x07"}, "c1"), call("lua", {"code": writes}, "c2"),
+                  say(words)]
+        # Into a pipe, the model's words are passed on unchanged; the progress line never carries the escapes, nor
+        # does what the model's code writes there.
+        done = self.run_hx("go", script=script, stdin="typed\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, words + "\n")
         self.assertIn("bash true # ]0;title", done.stderr)
+        self.assertIn("log]0;pwned", done.stderr)
+        self.assertIn("ask]0;pwned", done.stderr)
         self.assertNotIn("\x1b", done.stderr)
+        # _G.print is the print that goes to the model, which reads the text as it is; no terminal sees it.
+        self.assertEqual(self.tool_results()[1], "print\x1b]0;pwned\x07\ntyped")
         # On a terminal they are stripped.
         self.model.script = list(script)
         master, slave = pty.openpty()
