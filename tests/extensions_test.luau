@@ -1,4 +1,5 @@
--- The built-in extensions, web and ocr, against a stand-in for host.tool. Run with: hx --run tests/extensions_test.luau
+-- The built-in extensions, web, ocr and exa, and the helper they share, against a stand-in for host.tool.
+-- Run with: hx --run tests/extensions_test.luau
 
 local loop = assert(host.load(host.default_loop, "=loop"))()
 
@@ -19,16 +20,20 @@ local function raises(name, fragment, fn, ...)
 end
 
 -- The stand-in answers each call with the next scripted {status, text} and records what it was asked.
-local calls, answers = {}, {}
+-- The seconds of each wait between tries are recorded too, instead of slept.
+local calls, answers, waits = {}, {}, {}
 host.tool = function(name, request, options)
 	table.insert(calls, { name = name, request = request, options = options })
 	local answer = table.remove(answers, 1) or { 500, "script ran out" }
 	return answer[1], answer[2]
 end
-host.sleep = function() end
+host.sleep = function(seconds)
+	table.insert(waits, seconds)
+end
 host.quiet = true
 local function script(...)
 	table.clear(calls)
+	table.clear(waits)
 	answers = { ... }
 end
 
@@ -98,6 +103,11 @@ raises("a query that is not a string", "must be a string, not table", web.search
 script({ 503, '{"error": {"message": "busy"}}' }, { 429, "slow down" }, { 200, '{"results": []}' })
 web.search("q")
 check("503 and 429 are retried", #calls, 3)
+check("after 2 s, then 4", table.concat(waits, ","), "2,4")
+check("with the time limit each", calls[1].options.timeout, 60)
+script({ 200, '{"error": {"message": "quota spent"}}' })
+raises("an answer that carries an error", "search failed: quota spent", web.search, "q")
+check("such an answer is not retried", #calls, 1)
 script({ 400, '{"error": {"message": "bad query", "type": "invalid_request_error"}}' })
 raises("a 400", "search failed (400): bad query", web.search, "q")
 check("a 400 is not retried", #calls, 1)
@@ -154,8 +164,69 @@ script({ 200, json.encode({ error = { message = "try later", type = "service_una
 	{ 200, json.encode({ page_count = 1, pages = { { index = 0, text = "ok", finish_reason = "stop" } } }) })
 check("an unavailable service is tried again", ocr.read("a.png"), "ok")
 check("it took two calls", #calls, 2)
+check("ocr waits 4 s before its second try", table.concat(waits, ","), "4")
+script({ 200, json.encode({ error = { message = "down", code = "internal_error" } }) },
+	{ 200, json.encode({ error = { message = "down", code = "internal_error" } }) },
+	{ 200, json.encode({ error = { message = "still down", code = "internal_error" } }) })
+raises("a recognition that keeps failing", "ocr of a.png failed (recognition failed): still down", ocr.read, "a.png")
+check("and 8 s before its third", table.concat(waits, ","), "4,8")
 script({ 413, '{"error": {"message": "file too large"}}' })
 raises("a file too large", "(413): file too large", ocr.read, "big.pdf")
+raises("ocr of a path that is not a string", "ocr.read: argument 1 (path) must be a string, not number", ocr.read, 1)
+
+-- exa
+host.exa = false
+raises("exa without a key", "without EXA_API_KEY", loop.ext("exa").deep, "luau", "why")
+host.exa = true
+local exa = loop.ext("exa")
+script({ 200, json.encode({
+	output = { content = "Luau is gradually typed.", grounding = { { field = "content" } } },
+	results = { { title = "Luau", url = "https://luau.org", publishedDate = "2026-08-26T00:00:00Z",
+		highlights = { "small  and\nfast", 7, "typed" } } },
+	notices = { { message = "site: removed." } },
+	warnings = { { message = "x is ignored." } },
+	costDollars = { total = 0.012 },
+}) })
+local research = exa.deep("what is luau", "pull the type system", { queries = { "luau types" }, count = 3 })
+check("deep asks exa", calls[1].name, "exa")
+local asked = json.decode(calls[1].request)
+check("deep sends the query", asked.query, "what is luau")
+check("deep sends the further queries", asked.additionalQueries[1], "luau types")
+check("deep sends the count", asked.numResults, 3)
+check("deep asks for a text answer", asked.outputSchema.type, "text")
+check("deep keeps the cost", research.cost, 0.012)
+check("a highlight that is not text is left out", #research.results[1].highlights, 2)
+check("research reads as text", tostring(research), table.concat({
+	"Luau is gradually typed.",
+	"",
+	"notice: site: removed.",
+	"",
+	"Sources:",
+	"1. Luau (2026-08-26)",
+	"   https://luau.org",
+	"   small and fast ... typed",
+}, "\n"))
+script({ 401, '{"message": "bad key"}' })
+raises("an Exa error with its message at the top", "exa.deep failed (401): bad key", exa.deep, "q", "o")
+script({ 500, "" }, { 502, "" }, { 200, '{"results": []}' })
+check("exa retries a 5xx", tostring(exa.deep("q", "o")), "[no sources]")
+check("exa waits 2 s, then 4", table.concat(waits, ","), "2,4")
+script({ 200, "<html>" })
+raises("an Exa answer that is not JSON", "exa: Exa sent an answer that is not JSON: <html>", exa.deep, "q", "o")
+raises("deep with an objective that is not a string", "exa.deep: argument 2 (objective) must be a string, not nil",
+	exa.deep, "q")
+raises("a schema that is not an object", 'of type "object"', exa.deep, "q", "o", { schema = { type = "array" } })
+
+-- _http, the helper the three share
+local http = loop.ext("_http")
+check("an error's message", http.message('{"error": {"message": "m"}}'), "m")
+check("an error as text", http.message('{"error": "e"}'), "e")
+check("a message at the top is not read unasked", http.message('{"message": "top"}'), '{"message": "top"}')
+check("a message at the top, asked for", http.message('{"message": "top"}', true), "top")
+check("a body that is not JSON", http.message(string.rep("x", 400)), string.rep("x", 300))
+check("no body", http.message(nil), "nil")
+check("a short text is not clipped", http.clip("a  b\n c", 10), "a b c")
+check("a long text is clipped on a character", http.clip(string.rep("é", 5), 3), "ééé ...")
 
 -- A project's own extension of the same name takes the place of the built-in one. ext() reads .hx/ext in the
 -- current directory, the build directory here, so the file is removed again.
