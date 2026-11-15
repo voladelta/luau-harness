@@ -455,7 +455,13 @@ Two rules hold across all of them:
 | `src/main.cpp` | arguments, secrets, the sandbox rules, starting the VM |
 | `src/judge.cpp` | the judge's process for `--judge`: checking the kit, forking, its wall, hanging up at the end |
 | `src/sandbox.cpp` | Landlock; `Sandbox` is the proof that confinement was decided, and a `Host` cannot be built without it |
-| `src/host.cpp` | the `host` primitives, signals, time limits |
+| `src/host.cpp` | the `host` table and the VM: stops and time limits at safepoints, `host.try`, `host.timed`, `host.load` and the small primitives |
+| `src/host_proc.cpp` | signals, waiting until one arrives, and killing every process hx started |
+| `src/host_sh.cpp` | `host.sh`: forking the command behind its wall, its limits, and both ends of its output |
+| `src/host_http.cpp` | `host.llm` and `host.tool`: requests to the endpoints, each key to its own URLs only |
+| `src/host_files.cpp` | `host.read`, `host.write` and `host.list` |
+| `src/host_judge.cpp` | `host.judge`: the agent's end of the channel to the judge |
+| `src/host_internal.h`, `src/sys.h` | what the `host*.cpp` files share, and the small system helpers every file uses |
 | `src/json.cpp` | JSON between Lua values and text, on RapidJSON's streaming reader and writer |
 | `lua/loop.luau` | the agent |
 | `lua/judge.luau` | the judge, which `--judge` runs in a process of its own |
