@@ -103,13 +103,15 @@ local live: {
 	usage = { replies = 0, input = 0, cached = 0, written = 0, output = 0 }, -- tokens, for the line at the end
 	spills = 0, -- files that clipped results went to, so the next one has a name of its own
 	ext_cache = {}, -- each extension loaded, by name, with the source it was loaded from
-	wrappers = setmetatable({}, { __mode = "k" }), -- each function's counting wrapper, made once
+	wrappers = {}, -- each function's counting wrapper, made once; weak keys, below
 	-- For one turn, set by M.turn: each function call's count by what it was asked and what it returned, and the
 	-- call repeated most. Outside any turn (a test calling the functions), one set for the run.
 	repeats = { counts = {}, worst = nil },
 	-- For one `lua` call, set by the tool: the lines it printed. nil outside any call.
 	printed = nil,
 }
+-- A function a project takes out of M.functions takes its wrapper with it.
+setmetatable(live.wrappers, { __mode = "k" })
 
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
 -- Its text is made printable here, once: it carries file names, skill names and server replies, none of them hx's.
@@ -198,7 +200,10 @@ local function counted(fn: Function): (...any) -> ...any
 		-- A command that succeeded and printed nothing did something rather than looked at something (git add,
 		-- mkdir, a sleep between polls): that it does so again says nothing about progress. Nor does a result with
 		-- no text form, such as ext's table of functions, which is the same table each time.
-		local text = result ~= "[exit 0]" and (type(result) == "string" and result or as_json(result))
+		local text: string? = nil
+		if result ~= "[exit 0]" then
+			text = if type(result) == "string" then result else as_json(result)
+		end
 		if not text then
 			return table.unpack(results, 1, results.n)
 		end
@@ -977,9 +982,11 @@ local function argument_problem(tool: Tool, args: { [string]: any }): string?
 	local schema: Schema = tool.parameters or {}
 	local properties, required: { string } = schema.properties, schema.required or {}
 	local takes, optional = table.clone(required), {}
-	for name in properties or {} do
-		if not table.find(required, name) then
-			table.insert(optional, name)
+	if properties then
+		for name in properties do
+			if not table.find(required, name) then
+				table.insert(optional, name)
+			end
 		end
 	end
 	table.sort(optional)
@@ -1078,7 +1085,8 @@ end
 -- usage.iterations; where iterations are given, they are what was billed.
 local function count_usage(reply: Reply)
 	local counts: Usage = type(reply.usage) == "table" and reply.usage or {}
-	local parts = type(counts.iterations) == "table" and #counts.iterations > 0 and counts.iterations or { counts }
+	local iterations = counts.iterations
+	local parts: { Usage } = if type(iterations) == "table" and #iterations > 0 then iterations else { counts }
 	local usage = live.usage
 	usage.replies += 1
 	for _, part in parts do
@@ -1177,7 +1185,7 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 	-- thinking and effort are fixed for the run.
 	-- DeepSeek caches every prefix by itself and ignores cache_control, so any model that is not Claude gets the
 	-- system prompt as the plain string; the same stable prefix is what makes its cache hits.
-	local system_field = system
+	local system_field: string | { { [string]: any } } = system
 	if is_claude then
 		system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
 	end
@@ -1294,7 +1302,9 @@ end
 local Conversation = {}
 Conversation.__index = Conversation
 M.Conversation = Conversation
-type Conversation = setmetatable<{ messages: { Message }, on_answer: ((Conversation) -> ())? }, typeof(Conversation)>
+-- Written with typeof(setmetatable(...)) rather than setmetatable<...>, which only the new type solver knows.
+type ConversationFields = { messages: { Message }, on_answer: ((Conversation) -> ())? }
+type Conversation = typeof(setmetatable({} :: ConversationFields, Conversation))
 type State = "idle" | "ready" | "owing"
 
 -- on_answer, if set, is called with the conversation after each answer: after every reply that called tools and
@@ -1321,7 +1331,10 @@ function Conversation.state(self: Conversation): State
 	elseif last.role == "user" then
 		return "ready"
 	end
-	return #tool_calls(last) > 0 and "owing" or "idle"
+	if #tool_calls(last) > 0 then
+		return "owing"
+	end
+	return "idle"
 end
 
 local function expect(self: Conversation, operation: string, ...: State)
@@ -1367,7 +1380,8 @@ function Conversation.answer(self: Conversation, run: (Block) -> (string, boolea
 	local results: { Block } = {}
 	for _, call in tool_calls(self.messages[#self.messages]) do
 		local text, failed = run(call)
-		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = failed or nil })
+		local is_error: boolean? = failed or nil -- the field is left out, not false, when the call worked
+		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = is_error })
 	end
 	table.insert(self.messages, { role = "user", content = results })
 	if self.on_answer then
@@ -1413,7 +1427,7 @@ end
 -- Checks the whole history against the rules above. Returns nil, or what is wrong. The functions above keep it
 -- nil; this is the independent check, run before every request and by the tests.
 function Conversation.problem(self: Conversation): string?
-	local owed = nil -- the calls the next message has to answer
+	local owed: { Block }? = nil -- the calls the next message has to answer
 	for i, message in self.messages do
 		local expected = i % 2 == 1 and "user" or "assistant"
 		if message.role ~= expected then
@@ -1426,7 +1440,9 @@ function Conversation.problem(self: Conversation): string?
 			owed = tool_calls(message)
 		else
 			local answered = 0
-			for j, block in type(message.content) == "table" and message.content or {} do
+			local content = message.content
+			local blocks: { Block } = if type(content) == "table" then content else {} -- text alone answers nothing
+			for j, block in blocks do
 				if block.type == "tool_result" then
 					answered += 1
 					if answered ~= j then
@@ -1592,8 +1608,9 @@ local function show_text(reply: Reply)
 	end
 end
 
--- The body of M.turn, which gives it a count of repeats of its own.
-local function turn(system: string, talk: Conversation)
+-- The body of M.turn, which gives it a count of repeats of its own. Returns the reply that ended the turn, which
+-- M.turn does not pass on: it is there so that the type of pcall(turn, ...) has a second value, the error.
+local function turn(system: string, talk: Conversation): Reply
 	local reminded = 0 -- the highest count already reminded of
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
@@ -1630,7 +1647,7 @@ local function turn(system: string, talk: Conversation)
 				local category = type(details.category) == "string" and " (" .. details.category .. ")" or ""
 				host.log("[the model declined to answer" .. category .. "]")
 			end
-			return
+			return reply
 		end
 	end
 	-- Out of replies. The model gets one more, to say where the work stands, rather than none.
