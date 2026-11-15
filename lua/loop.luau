@@ -1658,11 +1658,12 @@ end
 
 -- With a .hx directory, each session's conversation is kept in .hx/log/ as JSON. The name starts with the time, so
 -- the logs sort by it, and ends with the random part of this run's $TMPDIR (hx-XXXXXX), which no other running hx
--- shares, so two sessions started in the same second keep two logs.
-local log_path = host.list(".hx") and (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
-	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0") or nil
+-- shares, so two sessions started in the same second keep two logs. Whether .hx exists is asked at each save, not
+-- once at the start: a session that makes it, say by writing its first extension, keeps its log too.
+local log_path = (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
+	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0")
 local function save(system: string, messages: { Message })
-	if log_path then
+	if host.list(".hx") then
 		-- Logs hold file contents, so the directory keeps itself out of git, however .hx/ came to exist.
 		if not host.read(".hx/log/.gitignore") then
 			host.write(".hx/log/.gitignore", "*\n")

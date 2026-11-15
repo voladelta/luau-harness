@@ -1238,11 +1238,11 @@ class AgentTest(unittest.TestCase):
         # A later session is told about it.
         self.run_hx("again", script=[say("ok")])
         self.assertIn("- shout: shouts a word", self.model.requests[-1]["system"])
-        # With a .hx directory, the conversation was saved.
-        logs = sorted(name for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json"))
-        self.assertTrue(logs)
-        saved = json.loads(read(self.project, ".hx", "log", logs[0]))
-        self.assertEqual(saved["messages"][0]["role"], "user")
+        # Each session's conversation was saved, the first one's too, though .hx did not exist when it started.
+        logs = [json.loads(read(self.project, ".hx", "log", name))
+                for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
+        self.assertEqual(sorted(log["messages"][0]["content"] for log in logs), ["again", "go"])
+        saved = next(log for log in logs if log["messages"][0]["content"] == "again")
         self.assertEqual(saved["system"], self.model.requests[-1]["system"])
         # The logs hold file contents, so git does not see them, though nothing but the model made .hx/.
         self.assertEqual(read(self.project, ".hx", "log", ".gitignore"), "*\n")
@@ -1545,6 +1545,15 @@ class AgentTest(unittest.TestCase):
             process.kill()
             os.close(master)
         self.assertEqual(out, b"]52;c;aGk=red[31m!\r\n")
+
+    def test_a_session_that_makes_hx_keeps_its_log(self):
+        # No .hx when the session starts: the model makes it by writing its first extension.
+        module = "-- says hi\nreturn { hi = function() return 'hi' end }\n"
+        done = self.run_hx("go", script=[call("write", {"path": ".hx/ext/hi.luau", "content": module}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        logs = [name for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(len(json.loads(read(self.project, ".hx", "log", logs[0]))["messages"]), 4)
 
     def test_run_executes_a_script(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
