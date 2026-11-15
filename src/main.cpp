@@ -10,7 +10,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cerrno>
 #include <cstddef>
@@ -131,11 +130,12 @@ constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
 constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh", "max"};  // what HX_EFFORT may be
 constexpr const char* kProjectLoop = ".hx/loop.luau";
 
-constexpr int kExitFailure = 1;
-constexpr int kExitUsage = 2;
 constexpr int kExitInterrupted = 130;  // 128 + SIGINT, as a shell reports it
 constexpr int kExitTerminated = 143;   // 128 + SIGTERM
 
+using hx::env_or;
+using hx::kExitFailure;
+using hx::kExitUsage;
 using hx::UsageError;
 
 enum class Mode : std::uint8_t { Agent, Script, Init, Help, Version };
@@ -197,6 +197,58 @@ UsageError unknown_option(std::string_view arg) {
     return UsageError{message};
 }
 
+// One option word, --name, -n or --name=value, and the value it may take: after the =, or the next word.
+class OptionWord {
+  public:
+    // The word is argv[at]; a value taken from the next word moves at past it.
+    OptionWord(const std::vector<std::string_view>& argv, std::size_t& at) : argv_(argv), at_(at), name_(argv[at]) {
+        // --name=value is the same as --name value.
+        if (const std::size_t equals = name_.find('='); name_.starts_with("--") && equals != std::string_view::npos) {
+            inline_value_ = name_.substr(equals + 1);
+            name_ = name_.substr(0, equals);
+        }
+    }
+    OptionWord(const OptionWord&) = delete;
+    OptionWord& operator=(const OptionWord&) = delete;
+    ~OptionWord() = default;
+
+    [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+    // The value of an option that takes one; metavar names it in the error when it is missing.
+    std::string value(std::string_view metavar) {
+        if (inline_value_ ? inline_value_->empty() : at_ + 1 >= argv_.size()) {
+            throw UsageError(fmt::format("{} needs a value: {} {}", name_, name_, metavar));
+        }
+        return std::string(inline_value_ ? *inline_value_ : argv_[++at_]);
+    }
+
+    // Refuses a value given to an option that takes none.
+    void flag() const {
+        if (inline_value_) {
+            throw UsageError(fmt::format("{} takes no value", name_));
+        }
+    }
+
+  private:
+    const std::vector<std::string_view>& argv_;
+    std::size_t& at_;
+    std::string_view name_;
+    std::optional<std::string_view> inline_value_;
+};
+
+// The options that cannot be judged one word at a time.
+void check_combinations(const Options& options) {
+    if (options.full && options.mode != Mode::Init) {
+        throw UsageError("--full goes with --init");
+    }
+    if (options.mode == Mode::Init && !options.args.empty()) {
+        throw UsageError("--init takes no task");
+    }
+    if (options.judge && !options.sandbox) {
+        throw UsageError("--judge needs the wall: without it the agent could read the kit and rewrite the ledger");
+    }
+}
+
 Options parse_args(const std::vector<std::string_view>& argv) {
     Options options;
     std::size_t i = 0;
@@ -209,45 +261,29 @@ Options parse_args(const std::vector<std::string_view>& argv) {
         if (word.size() < 2 || !word.starts_with('-')) {
             break;  // the task starts here
         }
-        // --name=value is the same as --name value.
-        std::string_view arg = word;
-        std::optional<std::string_view> inline_value;
-        if (const std::size_t equals = word.find('='); word.starts_with("--") && equals != std::string_view::npos) {
-            arg = word.substr(0, equals);
-            inline_value = word.substr(equals + 1);
-        }
-        const auto value = [&](std::string_view metavar) {
-            if (inline_value ? inline_value->empty() : i + 1 >= argv.size()) {
-                throw UsageError(fmt::format("{} needs a value: {} {}", arg, arg, metavar));
-            }
-            return std::string(inline_value ? *inline_value : argv[++i]);
-        };
-        const auto flag = [&] {
-            if (inline_value) {
-                throw UsageError(fmt::format("{} takes no value", arg));
-            }
-        };
+        OptionWord option(argv, i);
+        const std::string_view arg = option.name();
         if (arg == "--ro") {
-            options.read_paths.push_back(value("PATH"));
+            options.read_paths.push_back(option.value("PATH"));
         } else if (arg == "--rw") {
-            options.write_paths.push_back(value("PATH"));
+            options.write_paths.push_back(option.value("PATH"));
         } else if (arg == "--keep-env") {
-            options.keep_env.push_back(value("NAME"));
+            options.keep_env.push_back(option.value("NAME"));
         } else if (arg == "--model") {
-            options.model = value("NAME");
+            options.model = option.value("NAME");
         } else if (arg == "--judge") {
-            options.judge = value("KIT");
+            options.judge = option.value("KIT");
         } else if (arg == "--unix-sockets") {
-            flag();
+            option.flag();
             options.unix_sockets = true;
         } else if (arg == "--no-sandbox") {
-            flag();
+            option.flag();
             options.sandbox = false;
         } else if (arg == "-q" || arg == "--quiet") {
-            flag();
+            option.flag();
             options.quiet = true;
         } else if (arg == "--no-input") {
-            flag();
+            option.flag();
             options.no_input = true;
         } else if (arg == "-h" || arg == "--help") {
             options.mode = Mode::Help;
@@ -256,20 +292,20 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             options.mode = Mode::Version;
             return options;
         } else if (arg == "--init") {
-            flag();
+            option.flag();
             if (options.mode == Mode::Script) {
                 throw UsageError("--run and --init do not go together");
             }
             options.mode = Mode::Init;
         } else if (arg == "--full") {
-            flag();
+            option.flag();
             options.full = true;
         } else if (arg == "--run") {
             if (options.mode == Mode::Init) {
                 throw UsageError("--run and --init do not go together");
             }
             options.mode = Mode::Script;
-            options.script = value("FILE");
+            options.script = option.value("FILE");
             ++i;
             break;  // the rest belongs to the script
         } else {
@@ -277,15 +313,7 @@ Options parse_args(const std::vector<std::string_view>& argv) {
         }
     }
     options.args.assign(argv.begin() + static_cast<std::ptrdiff_t>(i), argv.end());
-    if (options.full && options.mode != Mode::Init) {
-        throw UsageError("--full goes with --init");
-    }
-    if (options.mode == Mode::Init && !options.args.empty()) {
-        throw UsageError("--init takes no task");
-    }
-    if (options.judge && !options.sandbox) {
-        throw UsageError("--judge needs the wall: without it the agent could read the kit and rewrite the ledger");
-    }
+    check_combinations(options);
     return options;
 }
 
@@ -293,26 +321,12 @@ Options parse_args(const std::vector<std::string_view>& argv) {
 std::string read_file(const fs::path& path, std::error_code& ec) {
     ec.clear();
     const hx::UniqueFd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
-    if (!fd.valid()) {
+    std::string text;
+    if (!fd.valid() || hx::read_all(fd.get(), text) != hx::ReadAll::Done) {
         ec.assign(errno, std::generic_category());
         return {};
     }
-    std::string text;
-    std::array<char, 65536> buffer{};
-    for (;;) {
-        const ssize_t n = read(fd.get(), buffer.data(), buffer.size());
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-        if (n < 0) {
-            ec.assign(errno, std::generic_category());
-            return {};
-        }
-        if (n == 0) {
-            return text;
-        }
-        text.append(buffer.data(), static_cast<std::size_t>(n));
-    }
+    return text;
 }
 
 // Writes .hx/loop.luau: by default the overlay, which loads the built-in loop and changes parts of it, so fixes
@@ -399,11 +413,6 @@ Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& k
         std::memset(entry, 0, std::strlen(entry));
     }
     return secrets;
-}
-
-std::string env_or(const char* name, std::string_view fallback) {
-    const char* value = std::getenv(name);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
-    return std::string(value != nullptr && *value != '\0' ? value : fallback);
 }
 
 struct ModelChoice {
@@ -732,14 +741,106 @@ hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const 
 // A descriptor inherited from whoever started hx was opened outside the wall and would pass through it to every
 // command. Marking them close-on-exec keeps them from commands; hx itself never uses them.
 void close_inherited_fds() {
-#ifdef CLOSE_RANGE_CLOEXEC  // glibc 2.34 declares the wrapper and the flag together
-    const int done = close_range(3, ~0U, CLOSE_RANGE_CLOEXEC);
-#else  // the system call is Linux 5.11, the same number on every architecture
-    const long done = syscall(436, 3U, ~0U, 4U);
-#endif
-    if (done != 0) {
+    if (hx::cloexec_above_stderr() != 0) {
         throw std::runtime_error(fmt::format("cannot mark inherited descriptors close-on-exec: {}", hx::error_text()));
     }
+}
+
+// A misspelt effort would only come back as the endpoint's error, a round trip later.
+void check_effort() {
+    if (const std::string effort = env_or("HX_EFFORT", ""); effort.empty()) {
+        unsetenv("HX_EFFORT");  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+    } else if (std::ranges::find(kEfforts, effort) == std::end(kEfforts)) {
+        throw UsageError(fmt::format("HX_EFFORT={}: the efforts are low, medium, high, xhigh and max", effort));
+    }
+}
+
+// The base of DeepSeek's tool endpoints, without a trailing slash.
+std::string tools_base_url() {
+    std::string url = env_or("HX_TOOLS_URL", kDeepSeekToolsUrl);
+    while (url.ends_with('/')) {
+        url.pop_back();
+    }
+    return url;
+}
+
+// What host.llm and host.tool reach: host.llm posts to "llm", host.tool to the others by name. Each key goes to its
+// own URLs only.
+std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string& tools_url, const Secrets& secrets) {
+    std::vector<hx::Endpoint> endpoints;
+    endpoints.push_back({.name = "llm",
+                         .url = model.url,
+                         .auth = hx::Auth::ApiKey,
+                         .key = secrets.key,
+                         .key_env = "",  // a local proxy may need none
+                         .headers = {"anthropic-version: 2023-06-01"},
+                         .form = false});
+    for (const char* name : {"search", "fetch", "ocr"}) {
+        endpoints.push_back({.name = name,
+                             .url = fmt::format("{}/{}", tools_url, name),
+                             .auth = hx::Auth::Bearer,
+                             .key = secrets.tools_key,
+                             .key_env = kDeepSeekKeyEnv,
+                             .headers = {},
+                             .form = true});
+    }
+    endpoints.push_back({.name = "exa",
+                         .url = env_or("HX_EXA_URL", kExaUrl),
+                         .auth = hx::Auth::ApiKey,
+                         .key = secrets.exa_key,
+                         .key_env = kExaKeyEnv,
+                         .headers = {},
+                         .form = false});
+    return endpoints;
+}
+
+// libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules). The first of
+// the two that can be read: a stale variable must not hide a good one, or break every request. Empty for neither,
+// and then libcurl's own roots apply.
+std::string ca_bundle() {
+    for (const char* name : {"SSL_CERT_FILE", "CURL_CA_BUNDLE"}) {
+        if (std::string path = env_or(name, ""); !path.empty() && access(path.c_str(), R_OK) == 0) {
+            return path;
+        }
+    }
+    return {};
+}
+
+// The Host's configuration for the agent or a --run script. Takes the secrets out of the environment.
+hx::HostConfig host_config(const Options& options, const ModelChoice& model, bool interactive) {
+    hx::HostConfig config;
+    const std::string tools_url = tools_base_url();
+    const Secrets secrets = take_secrets(model.key_env, options.keep_env);
+    config.endpoints = endpoints(model, tools_url, secrets);
+    config.model = model.model;
+    config.args = options.args;
+    config.interactive = interactive;
+    config.quiet = options.quiet;
+    config.default_loop = hx::kDefaultLoop;
+    for (const auto& [name, source] : hx::kExtensions) {
+        config.extensions.emplace_back(name, source);
+    }
+    config.ca_bundle = ca_bundle();
+    return config;
+}
+
+// The source of the --run script, or nothing when there is none.
+std::optional<std::string> read_script(const Options& options) {
+    if (options.mode != Mode::Script) {
+        return std::nullopt;
+    }
+    if (options.script == "-") {
+        if (isatty(STDIN_FILENO) != 0) {
+            throw UsageError("--run - reads the script from stdin, which is a terminal; pipe the script in");
+        }
+        return std::string(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+    }
+    std::error_code ec;
+    std::string script = read_file(options.script, ec);
+    if (ec) {
+        throw UsageError(fmt::format("cannot read {}: {}", options.script, ec.message()));
+    }
+    return script;
 }
 
 int run(const std::vector<std::string_view>& argv) {
@@ -759,80 +860,14 @@ int run(const std::vector<std::string_view>& argv) {
 
     const ModelChoice endpoint = choose_endpoint(options.model);
     setenv("HX_MODEL", endpoint.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
-    // A misspelt effort would only come back as the endpoint's error, a round trip later.
-    if (const std::string effort = env_or("HX_EFFORT", ""); effort.empty()) {
-        unsetenv("HX_EFFORT");  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
-    } else if (std::ranges::find(kEfforts, effort) == std::end(kEfforts)) {
-        throw UsageError(fmt::format("HX_EFFORT={}: the efforts are low, medium, high, xhigh and max", effort));
-    }
+    check_effort();
     const bool stdin_tty = isatty(STDIN_FILENO) != 0;
     if (options.no_input && options.mode == Mode::Agent && options.args.empty() && stdin_tty) {
         throw UsageError("no task, and --no-input forbids the prompt: give the task as arguments or on stdin");
     }
-
-    hx::HostConfig config;
-    std::string tools_url = env_or("HX_TOOLS_URL", kDeepSeekToolsUrl);
-    while (tools_url.ends_with('/')) {
-        tools_url.pop_back();
-    }
-    const Secrets secrets = take_secrets(endpoint.key_env, options.keep_env);
-    // host.llm posts to "llm"; host.tool to the others by name. Each key goes to its own URLs only.
-    config.endpoints.push_back({.name = "llm",
-                                .url = endpoint.url,
-                                .auth = hx::Auth::ApiKey,
-                                .key = secrets.key,
-                                .key_env = "",  // a local proxy may need none
-                                .headers = {"anthropic-version: 2023-06-01"},
-                                .form = false});
-    for (const char* name : {"search", "fetch", "ocr"}) {
-        config.endpoints.push_back({.name = name,
-                                    .url = fmt::format("{}/{}", tools_url, name),
-                                    .auth = hx::Auth::Bearer,
-                                    .key = secrets.tools_key,
-                                    .key_env = kDeepSeekKeyEnv,
-                                    .headers = {},
-                                    .form = true});
-    }
-    config.endpoints.push_back({.name = "exa",
-                                .url = env_or("HX_EXA_URL", kExaUrl),
-                                .auth = hx::Auth::ApiKey,
-                                .key = secrets.exa_key,
-                                .key_env = kExaKeyEnv,
-                                .headers = {},
-                                .form = false});
-    config.model = endpoint.model;
-    config.args = options.args;
-    config.interactive = options.mode == Mode::Agent && options.args.empty() && stdin_tty && !options.no_input;
-    config.quiet = options.quiet;
-    config.default_loop = hx::kDefaultLoop;
-    for (const auto& [name, source] : hx::kExtensions) {
-        config.extensions.emplace_back(name, source);
-    }
-    // libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules).
-    // The first of the two that can be read: a stale variable must not hide a good one, or break every request.
-    // With neither, libcurl's own roots apply.
-    for (const char* name : {"SSL_CERT_FILE", "CURL_CA_BUNDLE"}) {
-        if (const std::string path = env_or(name, ""); !path.empty() && access(path.c_str(), R_OK) == 0) {
-            config.ca_bundle = path;
-            break;
-        }
-    }
-
-    std::optional<std::string> script;
-    if (options.mode == Mode::Script) {
-        if (options.script == "-") {
-            if (isatty(STDIN_FILENO) != 0) {
-                throw UsageError("--run - reads the script from stdin, which is a terminal; pipe the script in");
-            }
-            script = std::string(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
-        } else {
-            std::error_code ec;
-            script = read_file(options.script, ec);
-            if (ec) {
-                throw UsageError(fmt::format("cannot read {}: {}", options.script, ec.message()));
-            }
-        }
-    }
+    hx::HostConfig config = host_config(
+        options, endpoint, options.mode == Mode::Agent && options.args.empty() && stdin_tty && !options.no_input);
+    const std::optional<std::string> script = read_script(options);
 
     std::error_code ec;
     const fs::path project = fs::canonical(fs::current_path(ec), ec);

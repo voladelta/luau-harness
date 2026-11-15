@@ -34,13 +34,6 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr int kExitFailure = 1;  // hx's own status for a failed run
-
-std::string env(const char* name) {
-    const char* value = std::getenv(name);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
-    return value != nullptr ? value : "";
-}
-
 // Whether a rule lets in path, or anything under it.
 bool reaches(const std::vector<Rule>& rules, const fs::path& path) {
     return std::any_of(rules.begin(), rules.end(), [&](const Rule& rule) {
@@ -58,9 +51,9 @@ std::string_view flag_of(const Rule& rule) {
 // Makes the directory where the judge keeps the champion's patch and the ledger,
 // $XDG_STATE_HOME/hx/judge/PROJECT-TIME-XXXXXX, new for this session, and returns its canonical path.
 fs::path make_judge_state(const fs::path& project) {
-    std::string base = env("XDG_STATE_HOME");
+    std::string base = env_or("XDG_STATE_HOME");
     if (!base.starts_with('/')) {
-        base = env("HOME") + "/.local/state";
+        base = env_or("HOME") + "/.local/state";
     }
     const fs::path parent = fs::path(base) / "hx" / "judge";
     std::error_code ec;
@@ -204,8 +197,7 @@ void finish_judge(const Judge& judge) {
         if (done == judge.pid || (done < 0 && errno == ECHILD)) {
             return;  // gone, or already reaped by host.sh
         }
-        const timespec nap{0, 100'000'000};
-        nanosleep(&nap, nullptr);
+        nap(100);
     }
     fmt::print(stderr, "hx: the judge did not finish; its state is in {}\n", judge.state.string());
 }
