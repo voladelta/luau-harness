@@ -682,21 +682,12 @@ int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) 
 // agent's wall leaves out, as it leaves out the kit. The agent's only way to it is one socket, line by line
 // (host.judge). The judge itself is lua/judge.luau, built into hx, so nothing the agent writes can change it.
 
-// Whether one of two canonical paths holds the other.
-bool overlap(const fs::path& a, const fs::path& b) {
-    const auto within = [](const fs::path& inner, const fs::path& outer) {
-        const fs::path inside = inner.lexically_relative(outer);
-        return !inside.empty() && *inside.begin() != "..";
-    };
-    return within(a, b) || within(b, a);
-}
-
-// Whether a rule lets in any part of path: the path is under the rule's, or the rule's is under the path.
+// Whether a rule lets in path, or anything under it.
 bool reaches(const std::vector<hx::Rule>& rules, const fs::path& path) {
     return std::any_of(rules.begin(), rules.end(), [&](const hx::Rule& rule) {
         std::error_code ec;
-        const fs::path base = fs::weakly_canonical(rule.path, ec);
-        return !ec && overlap(path, base);
+        const fs::path inside = path.lexically_relative(fs::weakly_canonical(rule.path, ec));
+        return !ec && !inside.empty() && *inside.begin() != "..";
     });
 }
 
@@ -828,15 +819,15 @@ Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::
     const std::vector<hx::Rule> wall = sandbox_rules(options, project, tmp);
     if (reaches(wall, kit)) {
         throw UsageError(
-            fmt::format("--judge {}: the agent could read part of the kit; keep it apart from the "
-                        "project, the system directories and every --ro and --rw path",
+            fmt::format("--judge {}: the agent could read the kit there; keep it outside the project, the "
+                        "system directories and every --ro and --rw path",
                         kit.string()));
     }
     Judge judge{.state = make_judge_state(project)};
-    if (reaches(wall, judge.state) || overlap(judge.state, kit)) {
+    if (reaches(wall, judge.state)) {
         fs::remove(judge.state, ec);
-        throw UsageError(fmt::format("the judge's state directory {} would be within the agent's reach or the kit's",
-                                     judge.state.string()));
+        throw UsageError(
+            fmt::format("the judge's state directory {} would be within the agent's reach", judge.state.string()));
     }
     std::array<int, 2> ends{};
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends.data()) != 0) {

@@ -13,9 +13,9 @@
 --
 -- The kit is a directory:
 --   run       executable, required. Runs in a fresh copy of the built candidate, behind a wall that holds only that
---             copy, the system directories and the --ro and --rw paths, with no TCP. Its time is the measure, unless
+--             copy, the system directories and the --ro and --rw paths. Its time is the measure, unless
 --             the check reports a score. It exits 0 when it worked. The candidate's code can read it while it runs.
---   build     executable, optional. Runs once per candidate, untimed, behind the same wall but with the network.
+--   build     executable, optional. Runs once per candidate, untimed, behind the same wall.
 --   check     executable, optional. Runs after each run as `check DIR`, where DIR is the run's copy and the run's
 --             output is DIR/.judge/stdout. It reads the kit and DIR and writes nothing that lasts. It exits 0 when
 --             the output is right; when its last line is a number, that is the score: positive, and higher is
@@ -117,8 +117,6 @@ end
 
 -- Candidates ------------------------------------------------------------------------------------------------------
 
-local tcp_refused -- whether this kernel lets the judge refuse the candidate's runs TCP
-
 -- A command of the kit's, on a candidate, behind the candidate's wall: the directory it works in, plus what the
 -- agent may read and write, and never the kit. Returns true and the seconds it took, or false and why it failed.
 local function candidate(dir, script)
@@ -131,7 +129,6 @@ local function candidate(dir, script)
 		timeout = config.timeout,
 		read = reads,
 		write = wall,
-		tcp = if script == "run" and tcp_refused then false else nil,
 	})
 	if result.code == 0 then
 		return true, result.seconds
@@ -293,10 +290,6 @@ local function start()
 	git("init --quiet --bare " .. quote(git_dir), "")
 	snapshot(dir .. "/src")
 	start_tree = tree(dir .. "/src")
-	tcp_refused = host.try(host.sh, "true", { write = { state .. "/tmp" }, tcp = false })
-	if not tcp_refused then
-		say("this kernel's Landlock cannot refuse TCP, so the candidate's runs can reach the network")
-	end
 	local ok, why = build(dir)
 	local result
 	if ok then

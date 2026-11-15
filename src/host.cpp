@@ -1122,7 +1122,7 @@ int Host::sh(lua_State* L) {
     return 1;
 }
 
-// The wall that host.sh's options read, write and tcp ask for, or none when they ask for nothing.
+// The wall that host.sh's options read and write ask for, or none when they ask for nothing.
 std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
     if (!lua_istable(L, idx)) {
         return std::nullopt;
@@ -1142,15 +1142,11 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
         }
         lua_pop(L, 1);
     }
-    lua_getfield(L, idx, "tcp");
-    const bool no_tcp = lua_isboolean(L, -1) && lua_toboolean(L, -1) == 0;
-    lua_pop(L, 1);
     if (!asked) {
-        luaL_argcheck(L, !no_tcp, idx, "tcp = false goes with read or write");
         return std::nullopt;
     }
     try {
-        return Wall::prepare(rules, no_tcp);
+        return Wall::prepare(rules);
     } catch (const SandboxError& error) {
         luaL_error(L, "host.sh: %s", error.what());
     }

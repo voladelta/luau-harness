@@ -39,11 +39,10 @@ struct HostConfig {
 //   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr, or
 //                                                     Exa's search for "exa"; request is JSON text, or (DeepSeek
 //                                                     only) a form table whose `file` is a path
-//   host.sh(command, {timeout=120, read=, write=, tcp=}) -> {out=, code=, signal=, timed_out=, seconds=}
+//   host.sh(command, {timeout=120, read=, write=}) -> {out=, code=, signal=, timed_out=, seconds=}
 //                                                     read and write are lists of paths: given either, the command
 //                                                     runs behind a narrower wall, the system directories and those,
-//                                                     and what it leaves running is killed; tcp=false also refuses
-//                                                     it TCP. seconds: from fork to exit
+//                                                     and what it leaves running is killed. seconds: fork to exit
 //   host.judge(line?) -> {answers}, pending           sends a line to the judge, if given, and waits for what it
 //                                                     owes, until 2 s before the host.timed limit
 //   host.read(path) -> string | nil, error

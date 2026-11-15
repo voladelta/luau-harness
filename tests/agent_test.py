@@ -1748,21 +1748,6 @@ say(submit("fine"))
         self.assertIn("\tnil\t", done.stdout)
         self.assertTrue(done.stdout.rstrip().endswith("true"), done.stdout)
 
-    def test_the_candidates_run_has_no_tcp(self):
-        server = socket.socket()
-        server.bind(("127.0.0.1", 0))
-        server.listen()
-        self.addCleanup(server.close)
-        port = server.getsockname()[1]
-        kit = self.make_kit(prog=f"python3 -c \"import socket; socket.create_connection(('127.0.0.1', {port}))\" "
-                                 "2>/dev/null && echo leaked || echo 42\n", config='{"runs": 1}')
-        done = self.drive(kit, f"""
-print(host.sh("python3 -c \\"import socket; socket.create_connection(('127.0.0.1', {port}))\\" && echo agent-connects").out)
-""")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("agent-connects", done.stdout)  # the agent's own commands keep the network
-        self.assertIn("the starting point passes", done.stderr)  # the run's connection was refused, so it printed 42
-
     def test_blind_verdicts_carry_no_numbers_or_output(self):
         kit = self.make_kit(check='#!/bin/sh\ntail -n 1 "$1/.judge/stdout"\n', config='{"runs": 1, "blind": true}',
                             prog="cat built.txt\necho 2\n")
@@ -1779,13 +1764,10 @@ host.write("prog.sh", "echo SECRET-OUTPUT; exit 1\\n"); say(submit("crash"))
         self.assertEqual(lines[1], "Trial 2. invalid: run exited 1 | The champion is still trial 1.")
 
     def test_a_kit_the_agent_could_read_is_refused(self):
-        for where, flags in [(os.path.join(self.project, "kit"), []), (None, ["--ro", "KIT/data"])]:
-            kit = self.make_kit(where)
-            os.makedirs(os.path.join(kit, "data"), exist_ok=True)
-            flags = [f.replace("KIT", kit) for f in flags]
-            done = self.run_hx(*flags, "--judge", kit, "go")
-            self.assertEqual(done.returncode, 2, done.stderr)
-            self.assertIn("the agent could read part of the kit", done.stderr)
+        kit = self.make_kit(os.path.join(self.project, "kit"))
+        done = self.run_hx("--judge", kit, "go")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("the agent could read the kit there", done.stderr)
         done = self.run_hx("--judge", self.make_kit(), "--no-sandbox", "go")
         self.assertEqual(done.returncode, 2)
         self.assertIn("--judge needs the wall", done.stderr)

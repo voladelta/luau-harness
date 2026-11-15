@@ -71,9 +71,8 @@ class Sandbox {
 // rulesets stack, so a command behind it can reach only what both this wall and the process's own allow.
 class Wall {
   public:
-    // With no_tcp, commands behind it can neither bind nor connect a TCP socket (Landlock ABI 4). Throws
-    // SandboxError when the kernel cannot do what is asked or a required path cannot be had.
-    [[nodiscard]] static Wall prepare(const std::vector<Rule>& rules, bool no_tcp = false);
+    // Throws SandboxError when the kernel has no Landlock or a required path cannot be had.
+    [[nodiscard]] static Wall prepare(const std::vector<Rule>& rules);
 
     // Confines the calling thread and its descendants. System calls only, so a forked child may call it.
     [[nodiscard]] bool enter() const noexcept;
