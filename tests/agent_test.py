@@ -1082,26 +1082,32 @@ class AgentTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.project, "never.txt")))
 
     def test_a_second_signal_kills_what_the_model_started(self):
-        # host.read of a FIFO whose writer never writes goes on reading after a signal, so the first stop is never
-        # handled and the second signal leaves at once.
+        # table.sort without a comparison function runs in C, where no safepoint looks for a stop, so the first stop
+        # is not handled for the seconds it takes and the second signal leaves at once.
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("host.sh(\"setsid sh -c 'echo $$ > daemon.pid; exec sleep 300' > /dev/null 2>&1 < /dev/null &\")\n"
-                    "host.sh(\"mkfifo fifo; sh -c 'echo $$ > writer.pid; exec sleep 300' > fifo &\")\n"
-                    "host.read('fifo')\n")
+                    "local t = string.split(string.rep('b,a,c,', 8000000), ',')\n"  # built in C too: quick
+                    "host.sh(\"sh -c 'echo $$ > child.pid; exec sleep 300' > /dev/null 2>&1 &\")\n"
+                    "table.sort(t)\n")
         process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(kill_quietly, process.pid)
         daemon = self.wait_for_pid_file("daemon.pid")
-        writer = self.wait_for_pid_file("writer.pid")  # written once hx has the FIFO open
-        for pid in (daemon, writer):
+        for _ in range(600):  # building the list takes seconds under a sanitizer
+            if os.path.exists(os.path.join(self.project, "child.pid")):
+                break
+            time.sleep(0.05)
+        child = self.wait_for_pid_file("child.pid")  # written just before the sort starts
+        for pid in (daemon, child):
             self.addCleanup(kill_quietly, pid)  # against a binary that leaves them behind
-        time.sleep(0.3)  # let the read block
+        time.sleep(0.3)  # let the sort start
         process.send_signal(signal.SIGINT)
         time.sleep(0.3)
         self.assertIsNone(process.poll(), "the first signal ended the run: the test did not get hx stuck")
         process.send_signal(signal.SIGINT)
         self.assertEqual(process.wait(timeout=20), 130)
         self.assert_gone(daemon)
-        self.assert_gone(writer)
+        self.assert_gone(child)
 
     def test_without_the_sandbox_the_model_is_told_so(self):
         outside = os.path.join(self.root, "outside.txt")
