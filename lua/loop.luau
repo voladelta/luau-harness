@@ -3,7 +3,7 @@
 -- parts meant to be replaced are fields of M and are always called through M.
 --
 -- The host supplies a small kernel and nothing else:
---   host.llm(body, {timeout=, beta=}) -> status, text | nil, error     POST to the configured endpoint; the host
+--   host.llm(body, {timeout=, beta=}) -> status, text, retry_after? | nil, error     POST to the endpoint; the host
 --                                                     adds the API key, and beta as the anthropic-beta header
 --   host.sh(command, {timeout=}) -> {out=, code=, signal=, timed_out=}
 --   host.read(path), host.write(path, data), host.list(dir)
@@ -14,7 +14,7 @@
 --   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
 --   host.tty                                          stdout is a terminal
 --   host.model                                        the model --model or HX_MODEL chose, its alias resolved
---                                                     (opus is claude-opus-5-5); nil on an older hx
+--                                                     (opus is claude-opus-5-5), or the default
 --   host.tool(name, request, {timeout=}) -> status, text | nil, error     DeepSeek's search, fetch or ocr endpoint,
 --                                                     or Exa's search for "exa"; the host adds the key
 --   host.tools, host.exa                              DEEPSEEK_API_KEY, EXA_API_KEY is there
@@ -28,7 +28,7 @@
 
 local M = {}
 
-M.model = host.model or host.env("HX_MODEL") or "deepseek-flash"
+M.model = host.model
 M.max_output = 16000 -- tokens per model reply
 M.max_replies = 200 -- model replies per task before giving up
 M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
@@ -112,13 +112,14 @@ end
 
 local function counted(fn)
 	return function(...)
-		local result = fn.run(...)
+		local results = table.pack(fn.run(...))
+		local result = results[1] -- what a function shows the model; any further values pass through uncounted
 		-- A command that succeeded and printed nothing did something rather than looked at something (git add,
 		-- mkdir, a sleep between polls): that it does so again says nothing about progress. Nor does a result with
 		-- no text form, such as ext's table of functions, which is the same table each time.
 		local text = result ~= "[exit 0]" and (type(result) == "string" and result or as_json(result))
 		if not text then
-			return result
+			return table.unpack(results, 1, results.n)
 		end
 		local args = {}
 		for i = 1, select("#", ...) do
@@ -132,7 +133,7 @@ local function counted(fn)
 		if not repeats.worst or count > repeats.worst.count then
 			repeats.worst = { call = call, count = count }
 		end
-		return result
+		return table.unpack(results, 1, results.n)
 	end
 end
 
@@ -153,10 +154,13 @@ local function capture_print(...)
 	end
 end
 
+local wrappers = setmetatable({}, { __mode = "k" }) -- each function's counting wrapper, made once
 local function lookup(_, name)
 	for _, fn in M.functions do
 		if fn.name == name then
-			return counted(fn)
+			local wrapper = wrappers[fn] or counted(fn)
+			wrappers[fn] = wrapper
+			return wrapper
 		end
 	end
 	if name == "print" then
@@ -164,7 +168,6 @@ local function lookup(_, name)
 	end
 	return _G[name]
 end
-local ext_env = setmetatable({}, { __index = lookup })
 
 function M.ext(name)
 	if type(name) ~= "string" or not name:match("^[%w_%-]+$") then
@@ -181,7 +184,8 @@ function M.ext(name)
 	if cached and cached.source == source then
 		return cached.value
 	end
-	local chunk, load_err = host.load(source, (built_in and "=hx/ext/" or "=ext/") .. name, ext_env)
+	local chunk, load_err = host.load(source, (built_in and "=hx/ext/" or "=ext/") .. name,
+		setmetatable({}, { __index = lookup })) -- globals of its own: one extension's do not leak into another
 	if not chunk then
 		error(load_err, 0)
 	end
@@ -279,7 +283,9 @@ function M.skill_front_matter(text)
 					i += 1
 				end
 				if value:match('^".*"$') then
-					value = value:sub(2, -2):gsub('\\"', '"'):gsub("\\n", "\n"):gsub("\\\\", "\\")
+					value = value:sub(2, -2):gsub("\\(.)", function(c) -- one pass, so an escaped backslash is not read twice
+						return c == "n" and "\n" or c
+					end)
 				elseif value:match("^'.*'$") then
 					value = value:sub(2, -2):gsub("''", "'")
 				end
@@ -1015,7 +1021,7 @@ function M.request(system, messages, compaction)
 	local options = { beta = #betas > 0 and table.concat(betas, ",") or nil }
 	local attempts = 5
 	for attempt = 1, attempts do
-		local status, text = host.llm(body, options)
+		local status, text, retry_after = host.llm(body, options)
 		if status == 200 then
 			local reply, err = json.decode(text)
 			if type(reply) == "table" and type(reply.content) == "table" then
@@ -1033,7 +1039,8 @@ function M.request(system, messages, compaction)
 		if not transient or attempt == attempts then
 			error(("the model request failed (%s): %s"):format(tostring(status or "no response"), tostring(text):sub(1, 500)), 0)
 		end
-		local wait = 2 ^ attempt
+		-- As long as the server asks (Retry-After on a 429 or 503), within reason.
+		local wait = math.min(math.max(2 ^ attempt, retry_after or 0), 120)
 		progress(("model request failed (%s), retrying in %d s"):format(tostring(status or text), wait))
 		host.sleep(wait)
 	end
@@ -1353,7 +1360,14 @@ function M.compact(system, talk)
 	end
 	local asking = talk:fork()
 	asking:say(M.compact_prompt)
-	local summary = text_of(ask(system, asking))
+	-- A request that fails leaves the conversation as it is, to be compacted after a later reply, as on a Claude
+	-- model: losing the summary must not lose the task.
+	local ok, reply = pcall(ask, system, asking)
+	if not ok then
+		progress("  compaction failed, the conversation stays as it is: " .. tostring(reply))
+		return
+	end
+	local summary = text_of(reply)
 	if summary == "" then
 		progress("  no summary came back; keeping the conversation as it is")
 		return

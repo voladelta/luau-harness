@@ -51,7 +51,8 @@ struct HostConfig {
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
 // the VM and the system:
 //
-//   host.llm(body, {timeout=600, beta=}) -> status, text | nil, error     beta: the anthropic-beta header
+//   host.llm(body, {timeout=600, beta=}) -> status, text, retry_after? | nil, error     beta: the anthropic-beta
+//                                                     header; retry_after: the seconds a Retry-After header asked for
 //   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr, or
 //                                                     Exa's search for "exa"; request is JSON text, or (DeepSeek
 //                                                     only) a form table whose `file` is a path. Each name is an

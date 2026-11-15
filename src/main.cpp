@@ -317,13 +317,13 @@ std::string read_file(const fs::path& path, std::error_code& ec) {
 // Writes .hx/loop.luau: by default the overlay, which loads the built-in loop and changes parts of it, so fixes
 // to hx still reach the project; with `full`, a copy of the whole built-in loop, which the project then owns.
 int init_project(bool full) {
+    if (fs::exists(kProjectLoop)) {  // before anything is made
+        throw UsageError(fmt::format("{} already exists; it is yours, so it stays", kProjectLoop));
+    }
     std::error_code ec;
     fs::create_directories(".hx/ext", ec);
     if (ec) {
         throw UsageError(fmt::format(".hx/ext: {}", ec.message()));
-    }
-    if (fs::exists(kProjectLoop)) {
-        throw UsageError(fmt::format("{} already exists; it is yours, so it stays", kProjectLoop));
     }
     std::ofstream out(kProjectLoop, std::ios::binary);
     out << (full ? hx::kDefaultLoop : hx::kLoopOverlay);
@@ -405,7 +405,7 @@ std::string env_or(const char* name, std::string_view fallback) {
     return std::string(value != nullptr && *value != '\0' ? value : fallback);
 }
 
-struct Endpoint {
+struct ModelChoice {
     std::string model;
     std::string url;
     std::string key_env;
@@ -415,7 +415,7 @@ struct Endpoint {
 // models. Without either, a Claude model is asked when ANTHROPIC_API_KEY is set and DEEPSEEK_API_KEY is not, and
 // DeepSeek's otherwise. A claude-* model goes to the Claude API with ANTHROPIC_API_KEY, any other to DeepSeek with
 // DEEPSEEK_API_KEY; HX_API_URL and HX_KEY_ENV override either.
-Endpoint choose_endpoint(const std::optional<std::string>& flag) {
+ModelChoice choose_endpoint(const std::optional<std::string>& flag) {
     std::string model = flag ? *flag : env_or("HX_MODEL", "");
     for (const auto& [alias, name] : kModelAliases) {
         if (model == alias) {
@@ -742,7 +742,7 @@ int run(const std::vector<std::string_view>& argv) {
         return init_project(options.full);
     }
 
-    const Endpoint endpoint = choose_endpoint(options.model);
+    const ModelChoice endpoint = choose_endpoint(options.model);
     setenv("HX_MODEL", endpoint.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
     const bool stdin_tty = isatty(STDIN_FILENO) != 0;
     if (options.no_input && options.mode == Mode::Agent && options.args.empty() && stdin_tty) {

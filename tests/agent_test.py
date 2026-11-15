@@ -1391,7 +1391,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
         # A setting changed in it, and a function replaced in it, change what is sent.
         with open(loop, "w") as f:
-            f.write(source.replace('-- M.model = host.model or host.env("HX_MODEL") or "deepseek-v4-pro"',
+            f.write(source.replace('-- M.max_replies = 100',
                                    'M.model = "project-model"')
                     .replace("-- local built_in_prompt", "local built_in_prompt")
                     .replace("-- function M.system_prompt()", "function M.system_prompt()")
@@ -1411,7 +1411,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(source, read(REPO, "lua", "loop.luau"))
         # The copy is what runs: change it and the behaviour changes.
         with open(loop, "w") as f:
-            f.write(source.replace('M.model = host.model or host.env("HX_MODEL") or "deepseek-flash"',
+            f.write(source.replace('M.model = host.model',
                                    'M.model = "project-model"'))
         self.run_hx("go", script=[say("ok")])
         self.assertEqual(self.model.requests[0]["model"], "project-model")

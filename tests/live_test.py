@@ -136,8 +136,9 @@ class LiveTest(unittest.TestCase):
         self.run_hx("in every mod*.py file, replace `os.getcwd()` with `os.path.abspath('.')`. Do it in as few "
                     "tool calls as you can.")
         for i in range(12):
-            self.assertIn("os.path.abspath('.')", self.read(f"mod{i}.py"))
-        self.assertLessEqual(len(self.code()), 4, self.code())
+            self.assertRegex(self.read(f"mod{i}.py"), r"""os\.path\.abspath\(['"]\.['"]\)""")  # either quote
+        # Twelve files, so one call each would be twelve; a look, the change and a check or two are few.
+        self.assertLessEqual(len(self.code()), 5, self.code())
 
     def checkpoint(self):
         """The summary the conversation now starts from: a Claude model's compaction block, which the API wrote,

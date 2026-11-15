@@ -285,7 +285,7 @@ local function record(entry)
 end
 
 local function crown(trial, dir, kind, value)
-	if champion and champion.trial > 0 then
+	if champion then -- the tree it was built in; its patch stays
 		shell("rm -rf " .. quote(champion.dir))
 	end
 	shell(("rm -rf %s/built/.judge && cp %s/trials/%d.patch %s/champion.patch"):format(quote(dir), quote(state), trial,

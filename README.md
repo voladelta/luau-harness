@@ -184,7 +184,7 @@ returns everything, so code can work on an output of any size.
 
 ```lua
 local M = host.load(host.default_loop, "=loop")()
-M.model = host.model or host.env("HX_MODEL") or "deepseek-v4-pro"  -- --model and HX_MODEL still win
+M.max_replies = 100
 table.insert(M.functions, { name = "check", usage = "check() -> text: runs the tests", run = function() ... end })
 return M
 ```
@@ -339,7 +339,7 @@ prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the p
 
 ### Built in: web, ocr and exa
 
-Two extensions come with hx, in `lua/ext/`. They call DeepSeek's [Search, Fetch](https://api-docs.deepseek.com/guides/search)
+Three extensions come with hx, in `lua/ext/`. Two of them, `web` and `ocr`, call DeepSeek's [Search, Fetch](https://api-docs.deepseek.com/guides/search)
 and [OCR](https://api-docs.deepseek.com/guides/ocr) APIs with `DEEPSEEK_API_KEY`, whichever model the loop talks
 to, so a session on Claude can use them too when that key is set. The system prompt lists them only then. A
 project's own `.hx/ext/web.luau` or `.hx/ext/ocr.luau` takes the place of the built-in one.
@@ -406,7 +406,7 @@ Everything Luau can do to the machine:
 
 | Primitive | Returns |
 |---|---|
-| `host.llm(body, {timeout=600, beta=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header |
+| `host.llm(body, {timeout=600, beta=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header. A third value is the seconds a `Retry-After` header asked for, when the reply had one; `host.tool` returns it too |
 | `host.tool(name, request, {timeout=300})` | `status, text`, or `nil, error`: a POST to DeepSeek's `search`, `fetch` or `ocr` endpoint with `DEEPSEEK_API_KEY`, or, for `"exa"`, to Exa's search endpoint with `EXA_API_KEY`. A string `request` is sent as JSON; for DeepSeek, a table is sent as a form, whose `file` field is the path of a file to upload |
 | `host.sh(command, {timeout=120, read=, write=, hangup=})` | `{out, code, signal, timed_out, seconds}`; `seconds` runs from the fork to the exit. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends. With `hangup = true`, the command ends, or does not start, once stdin's writer has hung up, and `host.sh` raises `"hung up"` |
 | `host.judge(line?)` | `{lines}, pending`: sends a line to the judge, if given, and returns the answer it owes, waiting until 2 seconds before the `host.timed` limit in force; `pending` is how many it still owes. A line is refused while one is owed |

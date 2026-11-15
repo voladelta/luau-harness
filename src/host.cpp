@@ -423,8 +423,9 @@ struct CurlMimeDeleter {
 using CurlMime = std::unique_ptr<curl_mime, CurlMimeDeleter>;
 
 // Sends a POST whose body is already set on curl to endpoint, with its key, its headers and `extra`, and returns
-// status, text | nil, error. Redirects are not followed: a key goes to the URL it was meant for and nowhere else.
-// The handle is reset afterwards, so it keeps no pointer into this request; the connection stays open for the next.
+// status, text, and the seconds of a Retry-After header if there was one | nil, error. Redirects are not followed: a
+// key goes to the URL it was meant for and nowhere else. The handle is reset afterwards, so it keeps no pointer into
+// this request; the connection stays open for the next.
 int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_list<std::string_view> extra,
          double timeout, const std::string& ca_bundle) {
     Headers headers;
@@ -465,7 +466,9 @@ int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
 
     const CURLcode code = curl_easy_perform(curl);
     long status = 0;
+    curl_off_t retry_after = 0;  // seconds the server asked for in Retry-After; 0 when it sent none
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_getinfo(curl, CURLINFO_RETRY_AFTER, &retry_after);
     curl_easy_reset(curl);
     if (code != CURLE_OK) {
         raise_if_signaled(L);
@@ -473,7 +476,11 @@ int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     }
     lua_pushnumber(L, static_cast<double>(status));
     lua_pushlstring(L, response.data(), response.size());
-    return 2;
+    if (retry_after <= 0) {
+        return 2;
+    }
+    lua_pushnumber(L, static_cast<double>(retry_after));
+    return 3;
 }
 
 // --- host.sh ----------------------------------------------------------------------------------------------
@@ -1101,10 +1108,17 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
     for (const auto& [field, access] : {std::pair{"read", Access::Read}, std::pair{"write", Access::Write}}) {
         lua_getfield(L, idx, field);
         if (!lua_isnil(L, -1)) {
-            luaL_argcheck(L, lua_istable(L, -1), idx, fmt::format("{} is a list of paths", field).c_str());
+            if (!lua_istable(L, -1)) {
+                luaL_error(L, "host.sh: %s is a list of paths", field);
+            }
             asked = true;
             for (int i = 1; lua_rawgeti(L, -1, i) != LUA_TNIL; ++i) {
-                rules.push_back({check_cstring(L, -1), access, true});
+                std::size_t length = 0;
+                const char* path = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &length) : nullptr;
+                if (path == nullptr || std::strlen(path) != length) {
+                    luaL_error(L, "host.sh: %s[%d] is not a path", field, i);
+                }
+                rules.push_back({path, access, true});
                 lua_pop(L, 1);
             }
             lua_pop(L, 1);
