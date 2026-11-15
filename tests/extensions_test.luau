@@ -170,6 +170,17 @@ if not host.read(own) then
 	check("and loads", ok, true)
 end
 
+-- What an extension prints goes to the model, in the tool result, with what the model's code prints; not to
+-- stdout, which is the user's answer.
+if not host.read(".hx/ext/noisy.luau") then
+	host.write(".hx/ext/noisy.luau", "-- prints\nreturn { f = function() print('EXT-PRINT', 1) return 'value' end }\n")
+	local code = "print('before') local v = ext('noisy').f() print('after') return v"
+	local ok, result = pcall(loop.tools[1].run, { code = code })
+	host.sh("rm -f .hx/ext/noisy.luau && rmdir .hx/ext .hx")
+	check("an extension's print reaches the tool result", result, "before\nEXT-PRINT\t1\nafter\nvalue")
+	check("and the call works", ok, true)
+end
+
 if failures > 0 then
 	error(("%d check(s) failed"):format(failures), 0)
 end

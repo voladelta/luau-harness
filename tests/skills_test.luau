@@ -1,4 +1,4 @@
--- Skills: front matter, discovery, loading by name, search and the system prompt's index.
+-- Skills: front matter, discovery, loading by name, the list for an unknown name and the system prompt's index.
 -- Run with: hx --run tests/skills_test.luau
 
 local loop = assert(host.load(host.default_loop, "=loop"))()
@@ -120,27 +120,20 @@ loaded = loop.skill("PDFTools")
 has("names alike are listed, not guessed", loaded, "Several skills have a name like")
 has("with each path", loaded, second .. "pdf_tools/SKILL.md")
 
--- Search ------------------------------------------------------------------------------------------------------
+-- An unknown name ----------------------------------------------------------------------------------------------
 
 local found = loop.skill("excel spreadsheets")
-has("a search names no skill", found, 'No skill is named "excel spreadsheets"')
-has("words in a description match", found, "- xlsx: Create and edit Excel")
-lacks("unrelated skills are left out", found, "release-notes")
-
-found = loop.skill("relase notes")
-check("a misspelt name finds the skill first", found:match("\n%- ([%w%-_]+):"), "release-notes")
-
-found = loop.skill("merge pdf")
-check("the name's words rank first", found:match("\n%- ([%w%-_]+):"), "pdf-tools")
-has("and the other pdf skill follows", found, "- pdf_tools:")
-
-found = loop.skill("only when")
-lacks("hidden skills are not searched", found, "secret")
-
-found = loop.skill("kubernetes")
-has("no match says so", found, 'No skill is named "kubernetes" or matches it.')
-has("and lists the skills when there are few", found, "- xlsx:")
+has("an unknown name says so", found, 'No skill is named "excel spreadsheets".')
+has("and lists the skills to pick from", found, "- xlsx: Create and edit Excel")
+has("all of them", found, "- release-notes: Write release notes")
 lacks("but not hidden ones", found, "- secret:")
+lacks("nor a second skill of a name", found, "A second xlsx")
+
+loop.skill_listed = 2
+found = loop.skill("kubernetes")
+has("past M.skill_listed, the rest are counted", found, "and 3 more")
+check("and not listed", select(2, found:gsub("\n%- ", "")), 2)
+loop.skill_listed = 50
 
 -- Through the function the model calls, which checks its argument.
 local fn
@@ -157,7 +150,7 @@ has("the lua tool reaches it", loop.tools[1].run({ code = "return skill('xlsx')"
 
 -- A long description is cut in listings, on a character boundary.
 skill(first, "long", "name: long\ndescription: " .. string.rep("é", 400))
-found = loop.skill("long words that match nothing else")
+found = loop.skill("a name no skill has")
 has("a long description is cut", found, string.rep("é", loop.skill_description_limit) .. " ...")
 
 -- The system prompt -------------------------------------------------------------------------------------------
@@ -172,9 +165,10 @@ prompt = loop.system_prompt()
 has("many skills: names only", prompt, "There are 6: long, no-name, pdf-tools, release-notes, xlsx, pdf_tools.")
 lacks("no descriptions then", prompt, "Read, split and merge")
 
-loop.skill_index_names = 3
+loop.skill_index_full = 0
 prompt = loop.system_prompt()
-has("very many: only the count", prompt, "There are 6; skill(words) searches")
+has("however many, still their names", prompt, "There are 6: long, no-name")
+has("and how to see what they are for", prompt, "lists them with their descriptions")
 
 loop.skill_dirs = { missing }
 lacks("no skills, no part of the prompt", loop.system_prompt(), "Skills are instructions")

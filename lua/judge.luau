@@ -41,9 +41,9 @@ local function read_config()
 	if not text then
 		return result
 	end
-	local ok, given = pcall(json.decode, text)
-	if not ok or type(given) ~= "table" then
-		return nil, "kit.json is not a JSON object"
+	local given, err = json.decode(text) -- not JSON: nil and the reason, never an error raised
+	if type(given) ~= "table" then
+		return nil, "kit.json is not a JSON object" .. (err and ": " .. err or "")
 	end
 	for key, value in given do
 		if defaults[key] == nil then
@@ -455,8 +455,8 @@ local function main()
 		if not read or not line then
 			break
 		end
-		local decoded, request = pcall(json.decode, line)
-		local note = decoded and type(request) == "table" and type(request.note) == "string" and request.note or ""
+		local request = json.decode(line)
+		local note = type(request) == "table" and type(request.note) == "string" and request.note or ""
 		local done, answer = host.try(submit, note)
 		if not done then
 			local stop = answer == "hung up"
