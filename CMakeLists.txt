@@ -132,11 +132,16 @@ install(TARGETS hx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 include(CTest)
 if(BUILD_TESTING)
-  add_test(NAME json COMMAND hx -q --run ${CMAKE_CURRENT_SOURCE_DIR}/tests/json_test.luau)
-  add_test(NAME tools COMMAND hx -q --run ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools_test.luau)
-  add_test(NAME conversation COMMAND hx -q --run ${CMAKE_CURRENT_SOURCE_DIR}/tests/conversation_test.luau)
-  add_test(NAME extensions COMMAND hx -q --run ${CMAKE_CURRENT_SOURCE_DIR}/tests/extensions_test.luau)
-  add_test(NAME skills COMMAND hx -q --run ${CMAKE_CURRENT_SOURCE_DIR}/tests/skills_test.luau)
+  # Each tests/NAME_test.luau is the test NAME. Other Luau files there, such as check.luau, are what the tests
+  # share, and are not run on their own. A test runs in the build directory and reads check.luau from the source
+  # directory, so that is opened to it with --ro.
+  file(GLOB HX_LUAU_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.luau)
+  list(SORT HX_LUAU_TESTS)
+  foreach(test_file IN LISTS HX_LUAU_TESTS)
+    get_filename_component(test_name ${test_file} NAME_WE)
+    string(REGEX REPLACE "_test$" "" test_name ${test_name})
+    add_test(NAME ${test_name} COMMAND hx -q --ro ${CMAKE_CURRENT_SOURCE_DIR}/tests --run ${test_file})
+  endforeach()
   add_test(NAME agent COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/agent_test.py $<TARGET_FILE:hx>)
 
   # The type checker and linter over every Luau file, when luau-analyze is installed. It runs in the source

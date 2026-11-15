@@ -1,16 +1,13 @@
--- The tools, the extension loader and the reading of pasted messages of the built-in loop. Run with: hx --run tests/tools_test.luau
+-- The tools, the extension loader and the reading of pasted messages of the built-in loop. Run with: hx --ro tests --run tests/tools_test.luau
 -- Works in $TMPDIR, which hx creates for the run and removes afterwards.
 
 local loop = assert(host.load(host.default_loop, "=loop"))()
 local dir = host.env("TMPDIR") .. "/"
 
-local failures = 0
-local function check(name, got, want)
-	if got ~= want then
-		failures += 1
-		print(("FAIL %s\n  got:  %s\n  want: %s"):format(name, tostring(got), tostring(want)))
-	end
-end
+-- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
+local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
+local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
+local check, raises = checks.check, checks.raises
 
 local tools = {}
 for _, fn in loop.functions do
@@ -20,14 +17,6 @@ end
 -- The one tool: returns its result and whether it failed.
 local function lua(code)
 	return loop.tools[1].run({ code = code })
-end
-
-local function raises(name, fragment, fn, ...)
-	local ok, err = pcall(fn, ...)
-	check(name .. " raises", ok, false)
-	if not ok and not tostring(err):find(fragment, 1, true) then
-		check(name .. " message", err, fragment)
-	end
 end
 
 check("there is one tool", #loop.tools, 1)
@@ -343,7 +332,4 @@ check("typed text around a paste", message({ "before \27[200~a", "b\27[201~ afte
 check("a paste cut short by the end of input", message({ "\27[200~a", "b" }), "a\nb")
 check("empty lines in a paste", message({ "\27[200~a", "", "b\27[201~" }), "a\n\nb")
 
-if failures > 0 then
-	error(failures .. " tool check(s) failed", 0)
-end
-print("tools: ok")
+checks.done("tools")

@@ -1,12 +1,9 @@
--- json.encode / json.decode. Run with: hx --run tests/json_test.luau
+-- json.encode / json.decode. Run with: hx --ro tests --run tests/json_test.luau
 
-local failures = 0
-local function check(name, got, want)
-	if got ~= want then
-		failures += 1
-		print(("FAIL %s\n  got:  %s\n  want: %s"):format(name, tostring(got), tostring(want)))
-	end
-end
+-- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
+local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
+local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
+local check = checks.check
 
 -- Encoding
 check("scalars", json.encode({ true, false, 1, -2.5, "x" }), '[true,false,1,-2.5,"x"]')
@@ -88,7 +85,4 @@ rejects("[1]\0", "must not be followed")
 rejects(string.rep("[", 500), "Nesting too deep")
 check("an error names its position", select(2, json.decode("[1 2]")), "Missing a comma or ']' after an array element. (at byte 4)")
 
-if failures > 0 then
-	error(failures .. " json check(s) failed", 0)
-end
-print("json: ok")
+checks.done("json")

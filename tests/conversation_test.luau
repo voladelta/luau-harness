@@ -1,4 +1,4 @@
--- The conversation state machine of the built-in loop. Run with: hx --run tests/conversation_test.luau
+-- The conversation state machine of the built-in loop. Run with: hx --ro tests --run tests/conversation_test.luau
 --
 -- A random walk tries every operation in every state. A legal operation must leave a history that
 -- Conversation:problem() accepts; an illegal one must raise and leave the history untouched.
@@ -6,13 +6,10 @@
 local loop = assert(host.load(host.default_loop, "=loop"))()
 local Conversation = loop.Conversation
 
-local failures = 0
-local function check(name, got, want)
-	if got ~= want then
-		failures += 1
-		print(("FAIL %s\n  got:  %s\n  want: %s"):format(name, tostring(got), tostring(want)))
-	end
-end
+-- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
+local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
+local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
+local check = checks.check
 
 -- Which operations each state allows, as the table at the top of the section in loop.luau says.
 local legal = {
@@ -142,7 +139,4 @@ broken("result behind text", { { role = "user", content = "a" }, { role = "assis
 broken("result for no call", { { role = "user", content = { result } } }, "was not made")
 broken("result for another call", { { role = "user", content = "a" }, { role = "assistant", content = { use } }, { role = "user", content = { { type = "tool_result", tool_use_id = "z", content = "x" } } } }, "was not made")
 
-if failures > 0 then
-	error(failures .. " conversation check(s) failed", 0)
-end
-print("conversation: ok")
+checks.done("conversation")

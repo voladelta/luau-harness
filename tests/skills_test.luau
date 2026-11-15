@@ -1,28 +1,13 @@
 -- Skills: front matter, discovery, loading by name, the list for an unknown name and the system prompt's index.
--- Run with: hx --run tests/skills_test.luau
+-- Run with: hx --ro tests --run tests/skills_test.luau
 
 local loop = assert(host.load(host.default_loop, "=loop"))()
 host.quiet = true
 
-local failures = 0
-local function check(name, got, want)
-	if got ~= want then
-		failures += 1
-		print(("FAIL %s\n  got:  %s\n  want: %s"):format(name, tostring(got), tostring(want)))
-	end
-end
-local function has(name, text, fragment)
-	if not tostring(text):find(fragment, 1, true) then
-		failures += 1
-		print(("FAIL %s\n  got:  %s\n  want it to contain: %s"):format(name, tostring(text), fragment))
-	end
-end
-local function lacks(name, text, fragment)
-	if tostring(text):find(fragment, 1, true) then
-		failures += 1
-		print(("FAIL %s\n  got:  %s\n  want it not to contain: %s"):format(name, tostring(text), fragment))
-	end
-end
+-- check, has, lacks and the report at the end are shared, in check.luau beside this file.
+local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
+local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
+local check, has, lacks = checks.check, checks.has, checks.lacks
 
 -- Front matter ------------------------------------------------------------------------------------------------
 
@@ -175,7 +160,4 @@ lacks("no skills, no part of the prompt", loop.system_prompt(), "Skills are inst
 
 host.sh(("rm -rf '%s'"):format(root))
 
-if failures > 0 then
-	error(failures .. " failed", 0)
-end
-print("skills: all passed")
+checks.done("skills")

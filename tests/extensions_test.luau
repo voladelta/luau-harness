@@ -1,23 +1,12 @@
 -- The built-in extensions, web, ocr and exa, and the helper they share, against a stand-in for host.tool.
--- Run with: hx --run tests/extensions_test.luau
+-- Run with: hx --ro tests --run tests/extensions_test.luau
 
 local loop = assert(host.load(host.default_loop, "=loop"))()
 
-local failures = 0
-local function check(name, got, want)
-	if got ~= want then
-		failures += 1
-		print(("FAIL %s\n  got:  %s\n  want: %s"):format(name, tostring(got), tostring(want)))
-	end
-end
-
-local function raises(name, fragment, fn, ...)
-	local ok, err = pcall(fn, ...)
-	check(name .. " raises", ok, false)
-	if not ok and not tostring(err):find(fragment, 1, true) then
-		check(name .. " message", err, fragment)
-	end
-end
+-- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
+local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
+local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
+local check, raises = checks.check, checks.raises
 
 -- The stand-in answers each call with the next scripted {status, text} and records what it was asked.
 -- The seconds of each wait between tries are recorded too, instead of slept.
@@ -256,7 +245,4 @@ if not host.read(".hx/ext/noisy.luau") then
 	check("and the call works", ok, true)
 end
 
-if failures > 0 then
-	error(("%d check(s) failed"):format(failures), 0)
-end
-print("extensions: all checks passed")
+checks.done("extensions")
