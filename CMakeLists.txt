@@ -138,4 +138,17 @@ if(BUILD_TESTING)
   add_test(NAME extensions COMMAND hx -q --run ${CMAKE_CURRENT_SOURCE_DIR}/tests/extensions_test.luau)
   add_test(NAME skills COMMAND hx -q --run ${CMAKE_CURRENT_SOURCE_DIR}/tests/skills_test.luau)
   add_test(NAME agent COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/agent_test.py $<TARGET_FILE:hx>)
+
+  # The type checker and linter over every Luau file, when luau-analyze is installed. It runs in the source
+  # directory, where .luaurc names the host's globals. It exits 0 when it finds only lint warnings, so any output
+  # at all is a failure.
+  find_program(LUAU_ANALYZE luau-analyze)
+  if(LUAU_ANALYZE)
+    file(GLOB HX_LUAU_FILES CONFIGURE_DEPENDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+         ${CMAKE_CURRENT_SOURCE_DIR}/lua/*.luau ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/*.luau
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.luau)
+    list(SORT HX_LUAU_FILES)
+    add_test(NAME analyze COMMAND ${LUAU_ANALYZE} ${HX_LUAU_FILES} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(analyze PROPERTIES FAIL_REGULAR_EXPRESSION ".")
+  endif()
 endif()
