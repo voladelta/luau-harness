@@ -750,16 +750,36 @@ int run(const std::vector<std::string_view>& argv) {
     }
 
     hx::HostConfig config;
-    config.api_url = endpoint.url;
-    config.tools_url = env_or("HX_TOOLS_URL", kDeepSeekToolsUrl);
-    while (config.tools_url.ends_with('/')) {
-        config.tools_url.pop_back();
+    std::string tools_url = env_or("HX_TOOLS_URL", kDeepSeekToolsUrl);
+    while (tools_url.ends_with('/')) {
+        tools_url.pop_back();
     }
-    Secrets secrets = take_secrets(endpoint.key_env, options.keep_env);
-    config.api_key = std::move(secrets.key);
-    config.tools_key = std::move(secrets.tools_key);
-    config.exa_url = env_or("HX_EXA_URL", kExaUrl);
-    config.exa_key = std::move(secrets.exa_key);
+    const Secrets secrets = take_secrets(endpoint.key_env, options.keep_env);
+    // host.llm posts to "llm"; host.tool to the others by name. Each key goes to its own URLs only.
+    config.endpoints.push_back({.name = "llm",
+                                .url = endpoint.url,
+                                .auth = hx::Auth::ApiKey,
+                                .key = secrets.key,
+                                .key_env = "",  // a local proxy may need none
+                                .headers = {"anthropic-version: 2023-06-01"},
+                                .form = false});
+    for (const char* name : {"search", "fetch", "ocr"}) {
+        config.endpoints.push_back({.name = name,
+                                    .url = fmt::format("{}/{}", tools_url, name),
+                                    .auth = hx::Auth::Bearer,
+                                    .key = secrets.tools_key,
+                                    .key_env = kDeepSeekKeyEnv,
+                                    .headers = {},
+                                    .form = true});
+    }
+    config.endpoints.push_back({.name = "exa",
+                                .url = env_or("HX_EXA_URL", kExaUrl),
+                                .auth = hx::Auth::ApiKey,
+                                .key = secrets.exa_key,
+                                .key_env = kExaKeyEnv,
+                                .headers = {},
+                                .form = false});
+    config.model = endpoint.model;
     config.args = options.args;
     config.interactive = options.mode == Mode::Agent && options.args.empty() && stdin_tty && !options.no_input;
     config.quiet = options.quiet;
