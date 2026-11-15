@@ -14,6 +14,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -681,20 +682,22 @@ int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) 
 // agent's wall leaves out, as it leaves out the kit. The agent's only way to it is one socket, line by line
 // (host.judge). The judge itself is lua/judge.luau, built into hx, so nothing the agent writes can change it.
 
-// Whether a rule lets in path, or anything under it.
+// Whether one of two canonical paths holds the other.
+bool overlap(const fs::path& a, const fs::path& b) {
+    const auto within = [](const fs::path& inner, const fs::path& outer) {
+        const fs::path inside = inner.lexically_relative(outer);
+        return !inside.empty() && *inside.begin() != "..";
+    };
+    return within(a, b) || within(b, a);
+}
+
+// Whether a rule lets in any part of path: the path is under the rule's, or the rule's is under the path.
 bool reaches(const std::vector<hx::Rule>& rules, const fs::path& path) {
-    for (const hx::Rule& rule : rules) {
+    return std::any_of(rules.begin(), rules.end(), [&](const hx::Rule& rule) {
         std::error_code ec;
         const fs::path base = fs::weakly_canonical(rule.path, ec);
-        if (ec) {
-            continue;
-        }
-        const fs::path inside = path.lexically_relative(base);
-        if (!inside.empty() && *inside.begin() != "..") {
-            return true;
-        }
-    }
-    return false;
+        return !ec && overlap(path, base);
+    });
 }
 
 struct Judge {
@@ -703,19 +706,29 @@ struct Judge {
     fs::path state;
 };
 
-// Where the judge keeps the champion, its patch and the ledger: $XDG_STATE_HOME/hx/judge/PROJECT-TIME.
-fs::path judge_state(const fs::path& project) {
+// Makes the directory where the judge keeps the champion's patch and the ledger,
+// $XDG_STATE_HOME/hx/judge/PROJECT-TIME-XXXXXX, new for this session, and returns its canonical path.
+fs::path make_judge_state(const fs::path& project) {
     std::string base = env_or("XDG_STATE_HOME", "");
     if (!base.starts_with('/')) {
         base = env_or("HOME", "") + "/.local/state";
     }
+    const fs::path parent = fs::path(base) / "hx" / "judge";
+    std::error_code ec;
+    fs::create_directories(parent, ec);
     const std::time_t now = std::time(nullptr);
     std::tm local{};
     localtime_r(&now, &local);
     std::array<char, 32> stamp{};
     const std::size_t length = std::strftime(stamp.data(), stamp.size(), "%Y%m%d-%H%M%S", &local);
-    return fs::path(base) / "hx" / "judge" /
-           fmt::format("{}-{}", project.filename().string(), std::string_view(stamp.data(), length));
+    std::string pattern =
+        (parent / fmt::format("{}-{}-XXXXXX", project.filename().string(), std::string_view(stamp.data(), length)))
+            .string();
+    if (ec || mkdtemp(pattern.data()) == nullptr) {
+        throw UsageError(fmt::format("cannot make the judge's state directory in {}: {}", parent.string(),
+                                     ec ? ec.message() : hx::error_text()));
+    }
+    return fs::canonical(pattern);
 }
 
 [[noreturn]] void judge_main(const Options& options, int channel, const fs::path& project, const fs::path& kit,
@@ -723,6 +736,7 @@ fs::path judge_state(const fs::path& project) {
     int status = kExitFailure;
     try {
         setsid();  // the terminal's Ctrl-C is for the agent; the judge ends when its channel does
+        prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);  // and when hx dies, however it dies
         if (dup2(channel, STDIN_FILENO) < 0 || dup2(channel, STDOUT_FILENO) < 0) {
             throw std::runtime_error(fmt::format("judge: dup2: {}", hx::error_text()));
         }
@@ -750,6 +764,10 @@ fs::path judge_state(const fs::path& project) {
         }
         config.quiet = options.quiet;
         config.system_rules = system_rules();
+        // hx cannot signal the judge (Landlock keeps the agent's processes from signalling outside their
+        // domain), so when hx hangs up, the judge's command in progress ends instead, and the judge records the
+        // trial as stopped and writes its summary.
+        config.end_on_hangup = true;
         status = run_vm(std::move(config), sandbox, [](lua_State* L) { return run_module(L, hx::kJudge, "=judge"); });
     } catch (const std::exception& error) {
         fmt::print(stderr, "hx: judge: {}\n", error.what());
@@ -758,28 +776,67 @@ fs::path judge_state(const fs::path& project) {
     _exit(status);
 }
 
-// Forks the judge for --judge KIT and returns the agent's end of the channel to it.
+// The kit's scripts that exist must be executable, and run must exist.
+void check_kit(const fs::path& kit) {
+    for (const char* name : {"run", "build", "check"}) {
+        const fs::path script = kit / name;
+        const bool required = std::string_view(name) == "run";
+        if ((required || fs::exists(script)) && access(script.c_str(), X_OK) != 0) {
+            throw UsageError(fmt::format("--judge {}: {} must be an executable file", kit.string(), name));
+        }
+    }
+}
+
+// Reads the judge's first line: "ready" once it has measured the starting point, or why it cannot judge.
+void await_judge(int channel) {
+    std::string line;
+    char c = 0;
+    while (line.size() < 4096) {
+        const ssize_t n = read(channel, &c, 1);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0 || c == '\n') {
+            break;
+        }
+        line += c;
+    }
+    if (line != "ready") {
+        throw UsageError(line.empty() ? "the judge did not start" : fmt::format("the judge cannot start: {}", line));
+    }
+}
+
+// Forks the judge for --judge KIT, waits until it has measured the starting point, and returns the agent's end
+// of the channel to it.
 Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::path& project, const fs::path& tmp) {
     std::error_code ec;
     const fs::path kit = fs::canonical(kit_dir, ec);
     if (ec || !fs::is_directory(kit)) {
         throw UsageError(fmt::format("--judge {}: not a directory", kit_dir));
     }
-    if (access((kit / "run").c_str(), X_OK) != 0) {
-        throw UsageError(fmt::format("--judge {}: the kit needs an executable file named run", kit.string()));
+    check_kit(kit);
+    for (const std::string& path : options.read_paths) {
+        if (!fs::exists(path, ec)) {
+            throw UsageError(fmt::format("--ro {}: no such file or directory", path));
+        }
+    }
+    for (const std::string& path : options.write_paths) {
+        if (!fs::exists(path, ec)) {
+            throw UsageError(fmt::format("--rw {}: no such file or directory", path));
+        }
     }
     const std::vector<hx::Rule> wall = sandbox_rules(options, project, tmp);
     if (reaches(wall, kit)) {
         throw UsageError(
-            fmt::format("--judge {}: the agent could read the kit there; keep it outside the project, "
-                        "the system directories and every --ro and --rw path",
+            fmt::format("--judge {}: the agent could read part of the kit; keep it apart from the "
+                        "project, the system directories and every --ro and --rw path",
                         kit.string()));
     }
-    Judge judge{.state = judge_state(project)};
-    fs::create_directories(judge.state, ec);
-    if (ec || reaches(wall, judge.state)) {
-        throw UsageError(fmt::format("cannot keep the judge's state in {}: {}", judge.state.string(),
-                                     ec ? ec.message() : "the agent could reach it"));
+    Judge judge{.state = make_judge_state(project)};
+    if (reaches(wall, judge.state) || overlap(judge.state, kit)) {
+        fs::remove(judge.state, ec);
+        throw UsageError(fmt::format("the judge's state directory {} would be within the agent's reach or the kit's",
+                                     judge.state.string()));
     }
     std::array<int, 2> ends{};
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends.data()) != 0) {
@@ -796,22 +853,23 @@ Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::
     }
     close(ends[1]);
     judge.channel = ends[0];
+    await_judge(judge.channel);
     return judge;
 }
 
-// Tells the judge the session is over and waits for its summary. A trial in progress is finished first.
+// Tells the judge the session is over and waits for its summary. On the hang-up the judge stops a trial still
+// being measured and records it as stopped (see HostConfig::end_on_hangup).
 void finish_judge(const Judge& judge) {
-    constexpr int kWaitSeconds = 120;
+    constexpr int kWaitTicks = 300;  // 30 s, in tenths
     shutdown(judge.channel, SHUT_WR);
-    for (int tick = 0; tick < kWaitSeconds * 10; ++tick) {
+    for (int tick = 0; tick < kWaitTicks; ++tick) {
         if (waitpid(judge.pid, nullptr, WNOHANG) != 0) {
-            return;
+            return;  // gone, or already reaped by host.sh
         }
         const timespec nap{0, 100'000'000};
         nanosleep(&nap, nullptr);
     }
-    fmt::print(stderr, "hx: the judge did not finish in {} seconds; its state is in {}\n", kWaitSeconds,
-               judge.state.string());
+    fmt::print(stderr, "hx: the judge did not finish; its state is in {}\n", judge.state.string());
 }
 
 // A descriptor inherited from whoever started hx was opened outside the wall and would pass through it to every

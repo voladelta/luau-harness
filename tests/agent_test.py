@@ -1552,19 +1552,21 @@ print(host.sh("pgrep -x sleep -a").out)
 
     # --- the judge ---
 
-    def make_kit(self, where=None):
+    def make_kit(self, where=None, run="#!/bin/sh\nsh prog.sh\n",
+                 check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "wrong: $(head -c 80 "$1/.judge/stdout")"; exit 1; }\n',
+                 config='{"runs": 3}', prog="sleep 0.3\necho 42\n"):
         """A kit that times prog.sh and passes only when it prints 42."""
         kit = where or os.path.join(self.root, "kit")
         os.makedirs(kit, exist_ok=True)
-        for name, body in [("run", "#!/bin/sh\nsh prog.sh\n"),
-                           ("check", '#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "wrong: $(head -c 80 "$1/.judge/stdout")"; exit 1; }\n')]:
-            with open(os.path.join(kit, name), "w") as f:
-                f.write(body)
-            os.chmod(os.path.join(kit, name), 0o755)
+        for name, body in [("run", run), ("check", check)]:
+            if body is not None:
+                with open(os.path.join(kit, name), "w") as f:
+                    f.write(body)
+                os.chmod(os.path.join(kit, name), 0o755)
         with open(os.path.join(kit, "kit.json"), "w") as f:
-            f.write('{"runs": 3}')
+            f.write(config)
         with open(os.path.join(self.project, "prog.sh"), "w") as f:
-            f.write("sleep 0.3\necho 42\n")
+            f.write(prog)
         return kit
 
     def judge_state(self):
@@ -1572,62 +1574,227 @@ print(host.sh("pgrep -x sleep -a").out)
         (name,) = os.listdir(base)
         return os.path.join(base, name)
 
+    def ledger(self):
+        return [json.loads(line) for line in read(self.judge_state(), "ledger.jsonl").splitlines()]
+
+    def drive(self, kit, body, *flags, timeout=120):
+        """Runs a script that submits to the judge; submit(note) returns the verdict, or the pending count."""
+        with open(os.path.join(self.project, "drive.luau"), "w") as f:
+            f.write("""
+function submit(note)
+    local lines, pending = host.judge(json.encode({ note = note }))
+    return lines[1] and json.decode(lines[1]) or pending
+end
+function say(text) print((tostring(text):gsub("\\n", " | "))) end
+""" + body)
+        return subprocess.run([HX, *flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
+                              env=self.env(XDG_STATE_HOME=""), capture_output=True, text=True, timeout=timeout)
+
     def test_the_judge_keeps_only_confirmed_wins(self):
         kit = self.make_kit()
-        with open(os.path.join(self.project, "drive.luau"), "w") as f:
-            f.write(f"""
-local function submit(note, prog)
-    host.write("prog.sh", prog)
-    print((json.decode(host.judge(json.encode({{ note = note }}))):gsub("\\n", " | ")))
-end
-submit("same", "sleep 0.3\\necho 42\\n")
-submit("faster", "sleep 0.05\\necho 42\\n")
-submit("wrong", "echo 41\\n")
-submit("peek", "cat {kit}/check >/dev/null 2>&1 && echo leaked || echo 42\\n")
-submit("slower", "sleep 0.2\\necho 42\\n")
+        done = self.drive(kit, f"""
+local function try(note, prog) host.write("prog.sh", prog); say(submit(note)) end
+try("same", "sleep 0.3\\necho 42\\n")
+try("faster", "sleep 0.05\\necho 42\\n")
+try("wrong", "echo 41\\n")
+try("peek", "cat {kit}/check >/dev/null 2>&1 && echo leaked || echo 42\\n")
+try("slower", "sleep 0.2\\necho 42\\n")
 """)
-        done = self.run_hx("--judge", kit, "--run", "drive.luau", XDG_STATE_HOME="")
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
         self.assertTrue(lines[0].startswith("Trial 1. no different:"), lines[0])
         self.assertIn("The champion is still the starting point.", lines[0])
-        self.assertTrue(lines[1].startswith("Trial 2. win:"), lines[1])
+        self.assertRegex(lines[1], r"^Trial 2\. win: \+\d+\.\d% against the champion \(medians 0\.\d+ s and 0\.\d+ s\)")
         self.assertTrue(lines[2].startswith("Trial 3. invalid: the check failed: | wrong: 41"), lines[2])
         # The candidate's run cannot read the kit: had it, it would have printed "leaked" and failed the check.
         self.assertTrue(lines[3].startswith("Trial 4. win:"), lines[3])
         self.assertTrue(lines[4].startswith("Trial 5. worse:"), lines[4])
         self.assertIn("hx judge: 5 trials: 2 win, 1 no different, 1 worse, 1 invalid", done.stderr)
-        state = self.judge_state()
-        ledger = [json.loads(line) for line in read(state, "ledger.jsonl").splitlines()]
+        self.assertRegex(done.stderr, r"the champion is trial 4 \(0\.\d+ s, the start 0\.3\d+ s\)")
+        ledger = self.ledger()
         self.assertEqual([e["verdict"] for e in ledger], ["start", "no different", "win", "invalid", "win", "worse"])
         self.assertEqual(ledger[2]["note"], "faster")
-        patch = read(state, "champion.patch")
-        self.assertIn("--- a/prog.sh", patch)
-        self.assertIn("+++ b/prog.sh", patch)
-        self.assertIn("+cat", patch)
-        self.assertIn("-sleep 0.3", patch)
-        self.assertTrue(os.path.exists(os.path.join(state, "trials", "3.patch")))
+        self.assertEqual(len(ledger[2]["screen"]["mine"]), 3)
+        state = self.judge_state()
+        self.assertEqual(sorted(os.listdir(state)), ["champion.patch", "ledger.jsonl", "trials"])
+        self.assertEqual(sorted(os.listdir(os.path.join(state, "trials"))), [f"{n}.patch" for n in range(1, 6)])
+
+    def test_the_start_is_measured_before_the_agent_begins(self):
+        kit = self.make_kit()
+        done = self.drive(kit, 'host.write("prog.sh", "sleep 0.05\\necho 42\\n")\nsay(submit("fast"))\n')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stderr, r"the starting point passes \(0\.3\d+ s\)")
+        self.assertTrue(done.stdout.startswith("Trial 1. win:"), done.stdout)
+
+    def test_a_patch_carries_every_kind_of_change(self):
+        kit = self.make_kit(check=None, config='{"runs": 1}')
+        os.makedirs(os.path.join(self.project, "a dir"))
+        with open(os.path.join(self.project, "gone.txt"), "w") as f:
+            f.write("bye\n")
+        original = os.path.join(self.root, "original")
+        shutil.copytree(self.project, original, symlinks=True)
+        done = self.drive(kit, """
+host.write("fast one.sh", "echo 'quoted'\\n")
+host.sh("chmod +x 'fast one.sh' && printf '\\\\000\\\\001\\\\377' > data.bin && ln -s prog.sh link && rm gone.txt")
+host.write("a dir/it's", "x\\n")
+say(submit("all kinds"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        applied = subprocess.run(["git", "apply", os.path.join(self.judge_state(), "trials", "1.patch")], cwd=original,
+                                 capture_output=True, text=True)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        os.remove(os.path.join(self.project, "drive.luau"))
+        def content(root, name):
+            with open(os.path.join(root, name), "rb") as f:
+                return f.read()
+        for name in ["fast one.sh", "data.bin", "a dir/it's", "prog.sh"]:
+            self.assertEqual(content(original, name), content(self.project, name), name)
+        self.assertTrue(os.access(os.path.join(original, "fast one.sh"), os.X_OK))
+        self.assertEqual(os.readlink(os.path.join(original, "link")), "prog.sh")
+        self.assertFalse(os.path.exists(os.path.join(original, "gone.txt")))
+
+    def test_a_score_must_be_positive_and_finite(self):
+        kit = self.make_kit(check='#!/bin/sh\ncat "$1/.judge/stdout"\n', config='{"runs": 1}', prog="echo 2\n")
+        done = self.drive(kit, """
+for _, score in { "inf", "nan", "0", "-3", "3" } do
+    host.write("prog.sh", "echo " .. score .. "\\n")
+    say(submit(score))
+end
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.splitlines()
+        for line in lines[:4]:
+            self.assertIn("invalid: the check's score must be a positive, finite number", line)
+        self.assertTrue(lines[4].startswith("Trial 5. win: +50.0% against the champion (medians score 3 and score 2)"), lines[4])
+        self.assertEqual([e["verdict"] for e in self.ledger()], ["start", "invalid", "invalid", "invalid", "invalid", "win"])
+
+    def test_a_verdict_cut_short_comes_with_the_next_call(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="sleep 1\necho 42\n")
+        done = self.drive(kit, """
+host.write("prog.sh", "sleep 0.1\\necho 42\\n")
+local ok, lines, pending = host.timed(3, host.judge, json.encode({ note = "slow kit" }))
+print(ok, #lines, pending)
+local later, still = host.judge()
+print(#later, still, json.decode(later[1]):match("^Trial 1%. %w+"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), ["true\t0\t1", "1\t0\tTrial 1. win"])
+
+    def test_a_kit_that_cannot_judge_stops_hx_before_the_agent(self):
+        for config, message in [('{"run": 1}', "kit.json: unknown key run"), ('{"runs": "x"}', "runs must be a number"),
+                                ("[", "kit.json is not a JSON object")]:
+            kit = self.make_kit(config=config)
+            done = self.run_hx("--judge", kit, "go", XDG_STATE_HOME="")
+            self.assertEqual(done.returncode, 2, done.stderr)
+            self.assertIn(message, done.stderr)
+        kit = self.make_kit(config="{}")
+        with open(os.path.join(kit, "build"), "w") as f:
+            f.write("#!/bin/sh\n")
+        done = self.run_hx("--judge", kit, "go")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("build must be an executable file", done.stderr)
+        self.assertEqual(self.model.requests, [])
+
+    def test_a_failing_start_makes_the_first_passing_submission_champion(self):
+        kit = self.make_kit(prog="echo 41\n")
+        done = self.drive(kit, 'host.write("prog.sh", "echo 40\\n"); say(submit("still wrong"))\n'
+                               'host.write("prog.sh", "echo 42\\n"); say(submit("fixed"))\n')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point does not pass", done.stderr)
+        lines = done.stdout.splitlines()
+        self.assertTrue(lines[0].startswith("Trial 1. invalid: nothing passes yet."), lines[0])
+        self.assertTrue(lines[1].startswith("Trial 2. champion:"), lines[1])
+        self.assertEqual([e["verdict"] for e in self.ledger()], ["start fails", "invalid", "champion"])
+        self.assertIn("the champion is trial 2 (", done.stderr)
+
+    def test_a_trial_the_judge_cannot_finish_is_recorded_as_an_error(self):
+        flags = os.path.join(self.root, "flags")
+        os.makedirs(flags)
+        # Once the flag is up, the champion's code (which sleeps 0.3) fails to run; the candidate's does not.
+        kit = self.make_kit(run=f"#!/bin/sh\ntest -e {flags}/on && grep -q 0.3 prog.sh && exit 3\nsh prog.sh\n")
+        done = self.drive(kit, f'''
+host.write("prog.sh", "sleep 0.01\\necho 42\\n")
+host.write("{flags}/on", "")
+say(submit("fine"))
+''', "--rw", flags)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.startswith("Trial 1. error: the judge could not finish it"), done.stdout)
+        self.assertIn("the champion failed", done.stdout)
+        self.assertEqual([e["verdict"] for e in self.ledger()], ["start", "error"])
+        self.assertIn("1 error", done.stderr)
+        self.assertEqual(os.listdir(os.path.join(self.judge_state(), "trials")), ["1.patch"])
+
+    def test_a_stop_during_a_trial_ends_it_and_the_summary_follows(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="sleep 0.1\necho 42\n")
+        with open(os.path.join(self.project, "drive.luau"), "w") as f:
+            f.write('host.write("prog.sh", "sleep 30\\necho 42\\n")\nprint(host.judge(json.encode({ note = "slow" })))\n')
+        proc = subprocess.Popen([HX, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
+                                env=self.env(XDG_STATE_HOME=""), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(3)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=30)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertIn("hx judge: 1 trial: 1 stopped", err)
+        self.assertEqual([e["verdict"] for e in self.ledger()], ["start", "stopped"])
 
     def test_the_agent_cannot_reach_the_kit_or_the_ledger(self):
         kit = self.make_kit()
         state_base = os.path.join(self.home, ".local", "state")
-        with open(os.path.join(self.project, "peek.luau"), "w") as f:
-            f.write(f"print(host.read('{kit}/check'), host.list('{state_base}'), host.sh('ls {kit}').code ~= 0)\n")
-        done = self.run_hx("--judge", kit, "--run", "peek.luau", XDG_STATE_HOME="")
+        done = self.drive(kit, f"print(host.read('{kit}/check'), host.list('{state_base}'), host.sh('ls {kit}').code ~= 0)\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.split()[0], "nil")
         self.assertIn("\tnil\t", done.stdout)
         self.assertTrue(done.stdout.rstrip().endswith("true"), done.stdout)
 
+    def test_the_candidates_run_has_no_tcp(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        self.addCleanup(server.close)
+        port = server.getsockname()[1]
+        kit = self.make_kit(prog=f"python3 -c \"import socket; socket.create_connection(('127.0.0.1', {port}))\" "
+                                 "2>/dev/null && echo leaked || echo 42\n", config='{"runs": 1}')
+        done = self.drive(kit, f"""
+print(host.sh("python3 -c \\"import socket; socket.create_connection(('127.0.0.1', {port}))\\" && echo agent-connects").out)
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("agent-connects", done.stdout)  # the agent's own commands keep the network
+        self.assertIn("the starting point passes", done.stderr)  # the run's connection was refused, so it printed 42
+
+    def test_blind_verdicts_carry_no_numbers_or_output(self):
+        kit = self.make_kit(check='#!/bin/sh\ntail -n 1 "$1/.judge/stdout"\n', config='{"runs": 1, "blind": true}',
+                            prog="cat built.txt\necho 2\n")
+        with open(os.path.join(kit, "build"), "w") as f:
+            f.write("#!/bin/sh\necho built > built.txt\n")
+        os.chmod(os.path.join(kit, "build"), 0o755)
+        done = self.drive(kit, """
+host.write("prog.sh", "echo 3\\n"); say(submit("better"))
+host.write("prog.sh", "echo SECRET-OUTPUT; exit 1\\n"); say(submit("crash"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.splitlines()
+        self.assertEqual(lines[0], "Trial 1. win: better than the champion, and again on fresh runs. This is the champion now.")
+        self.assertEqual(lines[1], "Trial 2. invalid: run exited 1 | The champion is still trial 1.")
+
     def test_a_kit_the_agent_could_read_is_refused(self):
-        kit = self.make_kit(os.path.join(self.project, "kit"))
-        done = self.run_hx("--judge", kit, "go")
-        self.assertEqual(done.returncode, 2)
-        self.assertIn("the agent could read the kit there", done.stderr)
-        self.assertEqual(self.model.requests, [])
+        for where, flags in [(os.path.join(self.project, "kit"), []), (None, ["--ro", "KIT/data"])]:
+            kit = self.make_kit(where)
+            os.makedirs(os.path.join(kit, "data"), exist_ok=True)
+            flags = [f.replace("KIT", kit) for f in flags]
+            done = self.run_hx(*flags, "--judge", kit, "go")
+            self.assertEqual(done.returncode, 2, done.stderr)
+            self.assertIn("the agent could read part of the kit", done.stderr)
         done = self.run_hx("--judge", self.make_kit(), "--no-sandbox", "go")
         self.assertEqual(done.returncode, 2)
         self.assertIn("--judge needs the wall", done.stderr)
+        link = os.path.join(self.root, "state-link")
+        os.symlink(self.project, link)
+        done = self.run_hx("--judge", self.make_kit(), "go", XDG_STATE_HOME=link)
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("would be within the agent's reach", done.stderr)
+        self.assertEqual(self.model.requests, [])
 
     def test_submit_hands_the_project_to_the_judge(self):
         kit = self.make_kit()
@@ -1636,11 +1803,10 @@ submit("slower", "sleep 0.2\\necho 42\\n")
             call("submit", {"note": "dropped the long sleep"}, call_id="call_2"), say("It won.")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("This session is judged.", self.model.requests[0]["system"])
-        self.assertIn("submit(note)", self.model.requests[0]["tools"][0]["description"])
+        self.assertIn("submit(note?)", self.model.requests[0]["tools"][0]["description"])
         self.assertTrue(self.tool_results()[1].startswith("Trial 1. win:"), self.tool_results())
         self.assertIn("hx judge: 1 trial: 1 win", done.stderr)
-        ledger = [json.loads(line) for line in read(self.judge_state(), "ledger.jsonl").splitlines()]
-        self.assertEqual(ledger[1]["note"], "dropped the long sleep")
+        self.assertEqual(self.ledger()[1]["note"], "dropped the long sleep")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

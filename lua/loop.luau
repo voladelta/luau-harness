@@ -17,7 +17,7 @@
 --                                                     or Exa's search for "exa"; the host adds the key
 --   host.tools, host.exa                              DEEPSEEK_API_KEY, EXA_API_KEY is there
 --   host.extensions                                   the built-in extensions' sources, by name
---   host.judge(line) -> line, host.judged             the judge's channel, with --judge KIT
+--   host.judge(line?) -> {lines}, pending, host.judged     the judge's channel, with --judge KIT
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
 -- host.timed returns; a plain pcall cannot swallow them.
@@ -718,15 +718,29 @@ M.functions = {
 if host.judged then
 	table.insert(M.functions, {
 		name = "submit",
-		usage = "submit(note) -> text: hands the project as it stands to the judge, with a note on what you "
+		usage = "submit(note?) -> text: hands the project as it stands to the judge, with a note on what you "
 			.. "changed and what you expect. The judge builds and measures it beside the champion, the best version "
-			.. "so far, with a kit you cannot see, and returns its verdict. Only verdicts count.",
+			.. "so far, with a kit you cannot see, and returns its verdict. Only verdicts count. With no note, it "
+			.. "submits nothing and waits for verdicts still owed.",
 		run = function(note)
-			check("submit", note, 1, "note", "string")
-			progress("  submit " .. M.printable(note:sub(1, 100):gsub("\n", " ")))
-			local verdict = json.decode(host.judge(json.encode({ note = note })))
-			progress("  " .. M.printable(verdict:match("^[^\n]*")))
-			return verdict
+			check("submit", note, 1, "note", "string", true)
+			if note then
+				progress("  submit " .. M.printable(note:sub(1, 100):gsub("\n", " ")))
+			end
+			local lines, pending = host.judge(note and json.encode({ note = note:sub(1, 4000) }) or nil)
+			local verdicts = {}
+			for _, line in lines do
+				local verdict = json.decode(line)
+				progress("  " .. M.printable(verdict:match("^[^\n]*")))
+				table.insert(verdicts, verdict)
+			end
+			if pending > 0 then
+				table.insert(verdicts, ("The judge is still measuring %d submission%s, longer than one lua call allows. "
+					.. "Call submit() with no note to wait for the verdict."):format(pending, pending == 1 and "" or "s"))
+			elseif #verdicts == 0 then
+				table.insert(verdicts, "No verdict is owed.")
+			end
+			return table.concat(verdicts, "\n\n")
 		end,
 	})
 end

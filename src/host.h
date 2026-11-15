@@ -28,6 +28,8 @@ struct HostConfig {
     std::vector<std::pair<std::string, std::string>> extensions;  // host.extensions: built-in ones, name and source
     std::vector<Rule> system_rules;  // what every wall lets in: system directories, harmless devices, trust roots
     UniqueFd judge;                  // a line-based channel to the judge process (--judge); invalid for none
+    bool end_on_hangup = false;      // the judge's: when stdin's writer hangs up while host.sh runs a command,
+                                     // the command ends and host.sh raises "hung up"
 };
 
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
@@ -37,10 +39,13 @@ struct HostConfig {
 //   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr, or
 //                                                     Exa's search for "exa"; request is JSON text, or (DeepSeek
 //                                                     only) a form table whose `file` is a path
-//   host.sh(command, {timeout=120, read=, write=}) -> {out=, code=, signal=, timed_out=}
+//   host.sh(command, {timeout=120, read=, write=, tcp=}) -> {out=, code=, signal=, timed_out=, seconds=}
 //                                                     read and write are lists of paths: given either, the command
-//                                                     runs behind a narrower wall, the system directories and those
-//   host.judge(line) -> line                          sends one line to the judge and waits for its answer
+//                                                     runs behind a narrower wall, the system directories and those,
+//                                                     and what it leaves running is killed; tcp=false also refuses
+//                                                     it TCP. seconds: from fork to exit
+//   host.judge(line?) -> {answers}, pending           sends a line to the judge, if given, and waits for what it
+//                                                     owes, until 2 s before the host.timed limit
 //   host.read(path) -> string | nil, error
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a file by
 //                                                     renaming a new one over it, so it is never left cut short
@@ -104,7 +109,7 @@ class Host {
     double deadline_ = 0;   // the innermost host.timed limit on the monotonic clock; 0 for none
     int tries_ = 0;         // host.try and host.timed calls in progress
     std::string judge_in_;  // what the judge sent that is not yet a whole line
-    int judge_owed_ = 0;    // answers the judge still owes; those of calls a stop cut short are dropped
+    int judge_owed_ = 0;    // answers the judge still owes: a later host.judge returns them
 };
 
 // Makes SIGINT, SIGTERM and SIGHUP stop the running command or request and surface as a Luau error. A second

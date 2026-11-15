@@ -46,6 +46,10 @@ constexpr uint64_t kIoctlDev = 1ULL << 15;  // ABI 5
 // cannot refuse this, which leaves the D-Bus session bus, ssh-agent and the like within reach.
 constexpr uint64_t kResolveUnix = 1ULL << 16;  // ABI 9
 
+constexpr uint64_t kNetBindTcp = 1ULL << 0;     // ABI 4
+constexpr uint64_t kNetConnectTcp = 1ULL << 1;  // ABI 4
+constexpr int kNetAbi = 4;
+
 constexpr uint64_t kScopeAbstractUnixSocket = 1ULL << 0;  // ABI 6
 constexpr uint64_t kScopeSignal = 1ULL << 1;              // ABI 6
 
@@ -65,7 +69,7 @@ constexpr long kRestrictSelf = 446;
 
 struct RulesetAttr {
     uint64_t handled_access_fs;
-    uint64_t handled_access_net;  // ABI 4; left at zero: the network stays open
+    uint64_t handled_access_net;  // ABI 4; zero unless TCP is refused: the network stays open
     uint64_t scoped;              // ABI 6
 };
 
@@ -184,8 +188,8 @@ bool filter_unix_sockets() {
 #endif
 
 // Creates a ruleset that grants the rules and handles every right the kernel's ABI knows, so anything they do not
-// grant is denied. Returns the ruleset and the ABI.
-std::pair<UniqueFd, int> make_ruleset(const std::vector<Rule>& rules) {
+// grant is denied. With no_tcp, binding and connecting TCP sockets are denied too. Returns the ruleset and the ABI.
+std::pair<UniqueFd, int> make_ruleset(const std::vector<Rule>& rules, bool no_tcp = false) {
     const long version = syscall(kCreateRuleset, nullptr, 0, kCreateRulesetVersion);
     if (version < 1) {
         throw SandboxError("this kernel has no Landlock (needs Linux 5.13 or later with the landlock LSM enabled)");
@@ -196,6 +200,13 @@ std::pair<UniqueFd, int> make_ruleset(const std::vector<Rule>& rules) {
     attr.handled_access_fs = handled_rights(abi);
     if (abi >= 6) {
         attr.scoped = kScopeAbstractUnixSocket | kScopeSignal;
+    }
+    if (no_tcp) {
+        if (abi < kNetAbi) {
+            throw SandboxError(
+                fmt::format("this kernel's Landlock (ABI {}) cannot refuse TCP; ABI {} can", abi, kNetAbi));
+        }
+        attr.handled_access_net = kNetBindTcp | kNetConnectTcp;
     }
     // An older kernel rejects a struct larger than the one it knows, so pass only the fields its ABI has.
     size_t attr_size = sizeof(uint64_t);
@@ -258,8 +269,8 @@ Sandbox Sandbox::confine(const std::vector<Rule>& rules, bool unix_sockets) {
     return Sandbox(abi, filtered);
 }
 
-Wall Wall::prepare(const std::vector<Rule>& rules) {
-    return Wall(make_ruleset(rules).first);
+Wall Wall::prepare(const std::vector<Rule>& rules, bool no_tcp) {
+    return Wall(make_ruleset(rules, no_tcp).first);
 }
 
 bool Wall::enter() const noexcept {

@@ -8,6 +8,7 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -290,12 +291,22 @@ void kill_descendants(std::span<const pid_t> spared = {}) noexcept {
     }
 }
 
-// Every process there is now, sorted: what kill_descendants spares after a command behind a narrower wall.
-std::vector<pid_t> processes_now() {
-    std::vector<pid_t> pids;
-    for_each_process([&](int /*proc*/, std::string_view /*name*/, pid_t pid) { pids.push_back(pid); });
-    std::sort(pids.begin(), pids.end());
-    return pids;
+// The descendants of hx now, sorted: what kill_descendants spares after a command behind a narrower wall.
+std::vector<pid_t> descendants_now() {
+    std::vector<std::pair<pid_t, pid_t>> parents;  // pid, parent
+    for_each_process(
+        [&](int proc, std::string_view name, pid_t pid) { parents.emplace_back(pid, parent_of(proc, name)); });
+    std::vector<pid_t> found{getpid()};
+    for (std::size_t at = 0; at < found.size(); ++at) {
+        for (const auto& [pid, parent] : parents) {
+            if (parent == found[at]) {
+                found.push_back(pid);
+            }
+        }
+    }
+    found.erase(found.begin());
+    std::sort(found.begin(), found.end());
+    return found;
 }
 
 void on_signal(int sig) {
@@ -994,10 +1005,10 @@ int Host::sh(lua_State* L) {
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
     const std::optional<Wall> wall = host.narrower_wall(L, 2);
     // A command behind a narrower wall is not trusted to leave anything running: what it started dies with it.
-    const std::vector<pid_t> before = wall ? processes_now() : std::vector<pid_t>{};
+    const std::vector<pid_t> before = wall ? descendants_now() : std::vector<pid_t>{};
     raise_if_signaled(L);  // a stop in progress starts no command
     // Adopted orphans that have exited are zombies of hx. No command of hx's own is running now, so this cannot
-    // take the status of one.
+    // take the status of one; a judge that has exited is reaped here too, which finish_judge allows for.
     while (waitpid(-1, nullptr, WNOHANG) > 0) {
     }
 
@@ -1007,6 +1018,7 @@ int Host::sh(lua_State* L) {
     }
     UniqueFd output(pipe_fds[0]);
     UniqueFd input(pipe_fds[1]);
+    const double started = now();
     const pid_t pid = fork();
     if (pid < 0) {
         luaL_error(L, "fork: %s", error_text().c_str());
@@ -1015,6 +1027,8 @@ int Host::sh(lua_State* L) {
         exec_bash(command, input.get(), wall ? &*wall : nullptr);
     }
     input.reset();
+    // Readable when bash exits, so its end is seen at once, not at the next poll. Linux 5.3; without it, polling.
+    const UniqueFd exited(static_cast<int>(syscall(SYS_pidfd_open, pid, 0)));
     fcntl(output.get(), F_SETFL, O_NONBLOCK);
 
     Capture capture;
@@ -1035,14 +1049,22 @@ int Host::sh(lua_State* L) {
 
     // The command is Running until it exits by itself, runs out of time, or a signal arrives. The last two
     // kill its whole process group; a signal then leaves through raise_if_signaled.
-    enum class Ending : std::uint8_t { Exited, TimedOut, Signaled };
+    enum class Ending : std::uint8_t { Exited, TimedOut, Signaled, HungUp };
+    // Only a hang-up while the command runs ends it: one that came before leaves later commands alone.
+    pollfd already{STDIN_FILENO, POLLRDHUP, 0};
+    const int hangup =
+        host.config_.end_on_hangup && (poll(&already, 1, 0) <= 0 || (already.revents & (POLLRDHUP | POLLHUP)) == 0)
+            ? STDIN_FILENO
+            : -1;
     const double deadline = now() + timeout;
     int status = 0;
     bool reaped = true;  // false: killed, but stuck in uninterruptible I/O and not yet dead
     Ending ending = Ending::Exited;
+    double ended = 0;
     for (;;) {
         drain();
         if (waitpid(pid, &status, WNOHANG) == pid) {
+            ended = now();
             break;
         }
         if (g_signal != 0 || now() >= deadline) {
@@ -1051,9 +1073,19 @@ int Host::sh(lua_State* L) {
             reaped = reap_within(pid, status, kReapSeconds);
             break;
         }
-        // Wake on output, or after a short wait to notice the exit of a shell whose background job holds the pipe.
-        pollfd waiter{output.get(), POLLIN, 0};
-        poll(&waiter, at_end ? 0 : 1, kPollMs);
+        // Wake on bash's exit, a hang-up, or output; the timeout is for the deadline and signals. A negative
+        // descriptor is not watched.
+        std::array<pollfd, 3> waiters{{{exited.get(), POLLIN, 0}, {hangup, POLLRDHUP, 0}, {output.get(), POLLIN, 0}}};
+        poll(waiters.data(), at_end ? 2 : 3, kPollMs);
+        if ((waiters[1].revents & (POLLRDHUP | POLLHUP)) != 0) {
+            ending = Ending::HungUp;
+            kill_group(pid);
+            reaped = reap_within(pid, status, kReapSeconds);
+            break;
+        }
+    }
+    if (ended == 0) {
+        ended = now();
     }
     // bash is gone, or killed and left for a later reap. Whatever it left running keeps running, so do not wait
     // for the pipe to close; unless it ran behind a narrower wall, and then what it left is killed now.
@@ -1064,9 +1096,13 @@ int Host::sh(lua_State* L) {
     if (ending == Ending::Signaled) {
         raise_if_signaled(L);
     }
+    if (ending == Ending::HungUp) {
+        lua_pushstring(L, "hung up");
+        lua_error(L);
+    }
 
     const std::string text = capture.text();
-    lua_createtable(L, 0, 4);
+    lua_createtable(L, 0, 5);
     lua_pushlstring(L, text.data(), text.size());
     lua_setfield(L, -2, "out");
     if (!reaped) {
@@ -1081,10 +1117,12 @@ int Host::sh(lua_State* L) {
     }
     lua_pushboolean(L, ending == Ending::TimedOut ? 1 : 0);
     lua_setfield(L, -2, "timed_out");
+    lua_pushnumber(L, ended - started);
+    lua_setfield(L, -2, "seconds");
     return 1;
 }
 
-// The wall that host.sh's options read and write ask for, or none when they ask for nothing.
+// The wall that host.sh's options read, write and tcp ask for, or none when they ask for nothing.
 std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
     if (!lua_istable(L, idx)) {
         return std::nullopt;
@@ -1104,49 +1142,58 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
         }
         lua_pop(L, 1);
     }
+    lua_getfield(L, idx, "tcp");
+    const bool no_tcp = lua_isboolean(L, -1) && lua_toboolean(L, -1) == 0;
+    lua_pop(L, 1);
     if (!asked) {
+        luaL_argcheck(L, !no_tcp, idx, "tcp = false goes with read or write");
         return std::nullopt;
     }
     try {
-        return Wall::prepare(rules);
+        return Wall::prepare(rules, no_tcp);
     } catch (const SandboxError& error) {
         luaL_error(L, "host.sh: %s", error.what());
     }
 }
 
-// host.judge(line): one line to the judge and its one-line answer. A stop or a time limit can cut the wait short;
-// the judge still answers that call later, and the answer is dropped then.
+// host.judge(line?) -> {answers}, pending: sends line, if given, and waits for every answer the judge owes, in order.
+// A judge can take longer than a time limit allows, so the wait ends kJudgeSlack seconds before the host.timed limit
+// in force: the answers so far come back, and the rest come with a later call. A stop raises, and nothing is lost.
 int Host::judge(lua_State* L) {
+    constexpr double kJudgeSlack = 2.0;
+    constexpr std::size_t kMaxLine = std::size_t{64} << 10;
     std::size_t length = 0;
-    const char* line = luaL_checklstring(L, 1, &length);
+    const char* line = luaL_optlstring(L, 1, nullptr, &length);
     Host& host = of(L);
     if (!host.config_.judge.valid()) {
         luaL_error(L, "host.judge: no judge in this session (start hx with --judge KIT)");
     }
-    if (std::memchr(line, '\n', length) != nullptr) {
-        luaL_error(L, "host.judge: send one line, without a newline");
+    if (line != nullptr && (std::memchr(line, '\n', length) != nullptr || length > kMaxLine)) {
+        luaL_error(L, "host.judge: send one line, without a newline, of at most 64 KiB");
     }
     raise_if_signaled(L);
     const int fd = host.config_.judge.get();
-    if (!write_all(fd, std::string(line, length) + "\n")) {
-        luaL_error(L, "host.judge: the judge is gone");
+    if (line != nullptr) {
+        if (!write_all(fd, std::string(line, length) + "\n")) {
+            luaL_error(L, "host.judge: the judge is gone");
+        }
+        ++host.judge_owed_;
     }
-    ++host.judge_owed_;
+    const double until = host.deadline_ > 0 ? host.deadline_ - kJudgeSlack : 0;
     std::array<char, kBufferSize> buffer{};
+    lua_newtable(L);
+    int answers = 0;
     for (;;) {
-        if (const std::size_t end = host.judge_in_.find('\n'); end != std::string::npos) {
-            const std::string answer = host.judge_in_.substr(0, end);
+        for (std::size_t end = host.judge_in_.find('\n'); end != std::string::npos; end = host.judge_in_.find('\n')) {
+            lua_pushlstring(L, host.judge_in_.data(), end);
+            lua_rawseti(L, -2, ++answers);
             host.judge_in_.erase(0, end + 1);
-            if (--host.judge_owed_ == 0) {
-                lua_pushlstring(L, answer.data(), answer.size());
-                return 1;
-            }
-            continue;
+            --host.judge_owed_;
         }
         raise_if_signaled(L);
-        if (host.deadline_ > 0 && now() >= host.deadline_) {
-            lua_pushstring(L, "timeout");
-            lua_error(L);
+        if (host.judge_owed_ == 0 || (until > 0 && now() >= until)) {
+            lua_pushinteger(L, host.judge_owed_);
+            return 2;
         }
         pollfd waiter{fd, POLLIN, 0};
         poll(&waiter, 1, kPollMs);
