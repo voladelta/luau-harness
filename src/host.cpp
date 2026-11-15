@@ -47,9 +47,9 @@
 namespace hx {
 namespace {
 
-constexpr std::size_t kMaxFile = std::size_t{64} << 20;                // host.read refuses larger files
-constexpr std::size_t kMaxResponse = std::size_t{256} << 20;           // host.llm and host.tool abort a larger reply
-constexpr std::size_t kMaxUpload = std::size_t{100} << 20;             // the largest file DeepSeek's OCR takes
+constexpr std::size_t kMaxFile = std::size_t{64} << 20;       // host.read refuses larger files
+constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm and host.tool abort a larger reply
+constexpr std::size_t kMaxUpload = std::size_t{100} << 20;    // the largest file DeepSeek's OCR takes
 constexpr std::string_view kToolNames[] = {"search", "fetch", "ocr", "exa"};  // host.tool's endpoints
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;

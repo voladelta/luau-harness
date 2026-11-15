@@ -345,8 +345,8 @@ struct Secrets {
 
 // Returns the API key, the DeepSeek key and the Exa key, and removes all three, and every other variable that looks
 // like a secret, from the environment. Commands the model runs inherit the environment, and with the network open an
-// inherited secret is a leaked one. The entries are also wiped where they sit, because /proc/PID/environ shows the original
-// memory.
+// inherited secret is a leaked one. The entries are also wiped where they sit, because /proc/PID/environ shows the
+// original memory.
 Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& keep) {
     Secrets secrets;
     std::vector<std::pair<std::string, char*>> doomed;
