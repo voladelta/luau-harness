@@ -14,6 +14,8 @@
 #       luaL_Reg tables are C arrays by interface
 #   avoid-do-while, owning-memory
 #       triggered inside the Lua and libcurl macros
+#
+# A class whose copy is deleted cannot be moved either unless it says so, so it need not delete its moves too.
 Checks: >
   -*,
   bugprone-*,
@@ -44,5 +46,7 @@ Checks: >
   -readability-function-cognitive-complexity,
   -readability-identifier-length,
   -readability-magic-numbers
+CheckOptions:
+  cppcoreguidelines-special-member-functions.AllowMissingMoveFunctionsWhenCopyIsDeleted: true
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/src/[a-z_]+\.h$'

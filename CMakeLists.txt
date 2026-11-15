@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.28)
-project(hx VERSION 0.1.0 DESCRIPTION "A small coding-agent host: a Luau VM, five tools, one sandbox" LANGUAGES CXX)
+project(
+  hx
+  VERSION 0.1.0
+  DESCRIPTION "A small coding-agent host: a Luau VM, one tool that runs Luau, one sandbox"
+  LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "hx is Linux only: its sandbox is Landlock")
@@ -68,18 +72,38 @@ find_package(CURL REQUIRED)
 # --- hx ------------------------------------------------------------------------------------------------------
 
 # The default loop is compiled into the binary, so hx works in a directory that has no .hx/ yet and still
-# starts when a project's own loop is broken. The overlay, which `hx --init` writes, is embedded the same way.
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/loop.luau HX_LOOP_SOURCE)
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/overlay.luau HX_OVERLAY_SOURCE)
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/judge.luau HX_JUDGE_SOURCE)
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/web.luau HX_EXT_WEB_SOURCE)
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/ocr.luau HX_EXT_OCR_SOURCE)
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/exa.luau HX_EXT_EXA_SOURCE)
-configure_file(src/embedded.h.in embedded.h @ONLY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS lua/loop.luau lua/overlay.luau lua/judge.luau lua/ext/web.luau
-                                                               lua/ext/ocr.luau lua/ext/exa.luau)
+# starts when a project's own loop is broken. The overlay, which `hx --init` writes, the judge and the built-in
+# extensions are embedded the same way, each as a raw string literal in embedded.h.
 
-add_executable(hx src/main.cpp src/host.cpp src/json.cpp src/sandbox.cpp)
+# Reads a Luau file into `var`, and reconfigures when it changes.
+function(hx_embed var path)
+  file(READ ${path} source)
+  # The source goes between R"HXLUAU( and )HXLUAU"; the closing delimiter inside it would end the string early.
+  string(FIND "${source}" ")HXLUAU\"" found)
+  if(NOT found EQUAL -1)
+    message(FATAL_ERROR "${path} contains )HXLUAU\", which would end its raw string in embedded.h early")
+  endif()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${path})
+  set(${var} "${source}" PARENT_SCOPE)
+endfunction()
+
+hx_embed(HX_LOOP_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/lua/loop.luau)
+hx_embed(HX_OVERLAY_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/lua/overlay.luau)
+hx_embed(HX_JUDGE_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/lua/judge.luau)
+
+# Every lua/ext/NAME.luau is the built-in extension NAME, so adding one is adding the file. CONFIGURE_DEPENDS
+# reruns the glob at build time, so a new or removed file reconfigures too.
+file(GLOB HX_EXT_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/lua/ext/*.luau)
+list(SORT HX_EXT_FILES)
+set(HX_EXTENSIONS "")
+foreach(path IN LISTS HX_EXT_FILES)
+  get_filename_component(name ${path} NAME_WLE)
+  hx_embed(source ${path})
+  string(APPEND HX_EXTENSIONS "    {\"${name}\", R\"HXLUAU(${source})HXLUAU\"},\n")
+endforeach()
+configure_file(src/embedded.h.in embedded.h @ONLY)
+
+add_executable(hx src/main.cpp src/host.cpp src/judge.cpp src/json.cpp src/sandbox.cpp)
 target_include_directories(hx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(hx PRIVATE Luau.Compiler Luau.VM rapidjson fmt::fmt-header-only CURL::libcurl)
 target_compile_options(

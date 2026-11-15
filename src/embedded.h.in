@@ -18,12 +18,10 @@ inline constexpr std::string_view kLoopOverlay = R"HXLUAU(@HX_OVERLAY_SOURCE@)HX
 // lua/judge.luau: the judge that --judge KIT runs in a process of its own.
 inline constexpr std::string_view kJudge = R"HXLUAU(@HX_JUDGE_SOURCE@)HXLUAU";
 
-// lua/ext/*.luau: the built-in extensions, which ext(NAME) loads when the project has no .hx/ext/NAME.luau.
+// lua/ext/*.luau, in file name order: the built-in extensions, which ext(NAME) loads when the project has no
+// .hx/ext/NAME.luau. CMakeLists.txt writes one {NAME, source} line per file.
 inline constexpr std::pair<std::string_view, std::string_view> kExtensions[] = {
-    {"web", R"HXLUAU(@HX_EXT_WEB_SOURCE@)HXLUAU"},
-    {"ocr", R"HXLUAU(@HX_EXT_OCR_SOURCE@)HXLUAU"},
-    {"exa", R"HXLUAU(@HX_EXT_EXA_SOURCE@)HXLUAU"},
-};
+@HX_EXTENSIONS@};
 
 }  // namespace hx
 

@@ -3,7 +3,7 @@
 A small coding-agent host for one project at a time: a Luau VM, one tool that runs Luau, and one kernel-enforced
 wall.
 
-The host is about 2,000 lines of C++. The agent loop is one Luau file, and your project can change any part of
+The host is a few C++ files. The agent loop is one Luau file, and your project can change any part of
 it. The model can extend the harness by writing Luau modules into the project.
 
 ```
@@ -161,7 +161,7 @@ Know these before you rely on it.
 
 ## The loop
 
-`lua/loop.luau` is the whole agent: about 1,000 lines. It speaks the Anthropic Messages format, asks for adaptive
+`lua/loop.luau` is the whole agent, in one file. It speaks the Anthropic Messages format, asks for adaptive
 thinking, and sends thinking blocks back exactly as they came. It gives the model one tool, `lua`, which runs the
 code it is sent in the project directory and returns what the code prints and returns. Globals persist from one
 call to the next. The code acts through these functions:
@@ -438,12 +438,13 @@ Two rules hold across all of them:
 | File | Holds |
 |---|---|
 | `src/main.cpp` | arguments, secrets, the sandbox rules, starting the VM |
+| `src/judge.cpp` | the judge's process for `--judge`: checking the kit, forking, its wall, hanging up at the end |
 | `src/sandbox.cpp` | Landlock; `Sandbox` is the proof that confinement was decided, and a `Host` cannot be built without it |
 | `src/host.cpp` | the `host` primitives, signals, time limits |
 | `src/json.cpp` | JSON between Lua values and text, on RapidJSON's streaming reader and writer |
 | `lua/loop.luau` | the agent |
 | `lua/judge.luau` | the judge, which `--judge` runs in a process of its own |
-| `lua/ext/*.luau` | the built-in extensions |
+| `lua/ext/*.luau` | the built-in extensions, one per file; each file in `lua/ext/` is built in under its name |
 
 Development build, with AddressSanitizer, UBSan and warnings as errors:
 
