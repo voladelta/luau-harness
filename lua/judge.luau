@@ -196,10 +196,11 @@ local function record(entry)
 	counts[entry.verdict] = (counts[entry.verdict] or 0) + 1
 end
 
--- Writes dir's patch from the start: what the agent changed, ready for `patch -p1` in the project.
+-- Writes dir's patch from the start: what the agent changed, with a/ and b/ paths, for `patch -p1` in the project.
 local function patch(dir, to)
-	host.sh(("cd %s && diff -ruN --no-dereference start/src %s > %s"):format(quote(state),
-		quote(dir:sub(#state + 2) .. "/src"), quote(to)))
+	local from = dir:sub(#state + 2) .. "/src/"
+	host.sh(("cd %s && diff -ruN --no-dereference start/src %s | sed -e 's#^--- start/src/#--- a/#' -e 's#^+++ %s#+++ b/#' > %s")
+		:format(quote(state), quote(from), from:gsub("[#\\.]", "\\%0"), quote(to)))
 end
 
 local function crown(trial, dir, total)
