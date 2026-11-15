@@ -14,7 +14,6 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
-#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -727,7 +726,6 @@ fs::path make_judge_state(const fs::path& project) {
     int status = kExitFailure;
     try {
         setsid();  // the terminal's Ctrl-C is for the agent; the judge ends when its channel does
-        prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);  // and when hx dies, however it dies
         if (dup2(channel, STDIN_FILENO) < 0 || dup2(channel, STDOUT_FILENO) < 0) {
             throw std::runtime_error(fmt::format("judge: dup2: {}", hx::error_text()));
         }
@@ -755,10 +753,6 @@ fs::path make_judge_state(const fs::path& project) {
         }
         config.quiet = options.quiet;
         config.system_rules = system_rules();
-        // hx cannot signal the judge (Landlock keeps the agent's processes from signalling outside their
-        // domain), so when hx hangs up, the judge's command in progress ends instead, and the judge records the
-        // trial as stopped and writes its summary.
-        config.end_on_hangup = true;
         status = run_vm(std::move(config), sandbox, [](lua_State* L) { return run_module(L, hx::kJudge, "=judge"); });
     } catch (const std::exception& error) {
         fmt::print(stderr, "hx: judge: {}\n", error.what());
@@ -772,9 +766,12 @@ void check_kit(const fs::path& kit) {
     for (const char* name : {"run", "build", "check"}) {
         const fs::path script = kit / name;
         const bool required = std::string_view(name) == "run";
-        if ((required || fs::exists(script)) && access(script.c_str(), X_OK) != 0) {
+        if ((required || fs::exists(script)) && (!fs::is_regular_file(script) || access(script.c_str(), X_OK) != 0)) {
             throw UsageError(fmt::format("--judge {}: {} must be an executable file", kit.string(), name));
         }
+    }
+    if (fs::exists(kit / "kit.json") && !fs::is_regular_file(kit / "kit.json")) {
+        throw UsageError(fmt::format("--judge {}: kit.json must be a file", kit.string()));
     }
 }
 
@@ -848,13 +845,15 @@ Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::
     return judge;
 }
 
-// Tells the judge the session is over and waits for its summary. On the hang-up the judge stops a trial still
-// being measured and records it as stopped (see HostConfig::end_on_hangup).
+// Tells the judge the session is over and waits for its summary. hx cannot signal the judge (Landlock keeps the
+// agent's processes from signalling outside their domain), so it hangs up: the judge's trial commands end on the
+// hang-up (host.sh's hangup option), and it records the trial as stopped, judges nothing more and writes its summary.
 void finish_judge(const Judge& judge) {
     constexpr int kWaitTicks = 300;  // 30 s, in tenths
     shutdown(judge.channel, SHUT_WR);
     for (int tick = 0; tick < kWaitTicks; ++tick) {
-        if (waitpid(judge.pid, nullptr, WNOHANG) != 0) {
+        const pid_t done = waitpid(judge.pid, nullptr, WNOHANG);
+        if (done == judge.pid || (done < 0 && errno == ECHILD)) {
             return;  // gone, or already reaped by host.sh
         }
         const timespec nap{0, 100'000'000};

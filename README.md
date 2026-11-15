@@ -266,9 +266,9 @@ A **kit** is the judge's half of the project, a directory with up to four files:
 | File | Does |
 |---|---|
 | `run` | required, executable. Runs in a fresh copy of the built candidate and is timed by hx from outside; it exits 0 when it worked |
-| `build` | optional, executable. Runs once per candidate before any run, untimed |
-| `check` | optional, executable. Runs as `check DIR` after each run, where `DIR/.judge/stdout` is what the run printed. It exits 0 when the output is right. A number on its last line is the score: positive, and higher is better; without one, the measure is the run's time. What it prints when it fails goes to the model |
-| `kit.json` | optional: `{"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}`: pairs per round (1 suits a score that does not vary), the smallest relative gain that counts, the seconds one build, run or check may take, and whether the model hears verdicts without numbers and without the candidate's own output, so that it cannot fit what the kit holds back by reading them. An unknown key or a wrong type stops hx before the model is asked anything |
+| `build` | optional, executable. Runs once per candidate before any run, untimed, at the same path the runs use, so a build that records where it is still runs |
+| `check` | optional, executable. Runs as `check DIR` after each run, where `DIR/.judge/stdout` is what the run printed; links in `DIR` are removed first, so the run cannot point the check at the kit. It exits 0 when the output is right. A number on its last line is the score: positive, and higher is better; without one, the measure is the run's time. What it prints when it fails goes to the model, unless `blind` is on |
+| `kit.json` | optional: `{"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}`: pairs per round (1 suits a score that does not vary), the smallest relative gain that counts, the seconds one build, run or check may take, and whether the model hears verdicts without numbers and without the candidate's or the check's words, so that it cannot fit what the kit holds back by reading them. An unknown key or a wrong type stops hx before the model is asked anything |
 
 The model gets one more function, `submit(note?)`, and a paragraph in its prompt that says how judging works.
 Before the model begins, the judge copies the project and measures it as it is. That is the first champion; if it
@@ -277,15 +277,15 @@ does not pass, the first submission that does is. Each submission then goes thro
 1. **Copied.** The judge copies the project as it stands, without `.git` and `.hx`, and writes its patch.
 2. **Built**, by the kit's `build`, if there is one. A build that fails is `broken`.
 3. **Screened.** The candidate and the champion run in pairs, each pair in a random order, and each run in a fresh
-   copy of its build. A run or check that fails is `invalid`. The change is better when the median pair and all
-   pairs but one favour it, by more than the margin. Otherwise it is `no different` or `worse`.
+   copy of its build. A run or check that fails is `invalid`. The change is better when the median pair favours it
+   by more than the margin, and all pairs but one favour it at all. Otherwise it is `no different` or `worse`.
 4. **Confirmed.** A change that looks better is measured again in fresh pairs and judged on those alone: `win`, or
    `not confirmed`.
 
 A trial the judge cannot finish through no fault of the submission, such as a champion that stops passing, is an
-`error`; one that the end of the session cuts short is `stopped`. A submission can take longer than one `lua` call
-allows (`M.call_seconds`, 600): `submit` then says the judge is still measuring, and the verdict comes with the next
-`submit`, or with `submit()`, which waits for it. When the session ends, hx prints a summary with the champion's
+`error`; one that the end of the session cuts short is `stopped`. The judge takes one submission at a time. One
+can take longer than a `lua` call allows (`M.call_seconds`, 600): `submit` then says the judge is still measuring,
+and `submit()`, with no note, waits for the verdict; a new note is refused until it comes. When the session ends, hx prints a summary with the champion's
 measure and the start's. The judge's state directory, `$XDG_STATE_HOME/hx/judge/PROJECT-TIME-XXXXXX`
 (`~/.local/state` by default), keeps `ledger.jsonl` (every trial: its note, verdict, and each pair's measures),
 `champion.patch` and `trials/N.patch` for every trial, whatever its verdict. A patch is against the start, from
@@ -295,7 +295,8 @@ The walls are what make the verdicts worth having:
 
 - **The judge is its own process.** hx forks it before the agent's wall goes up. It confines itself to reading the
   project and the kit and writing its state directory; the agent's wall leaves out the kit and the state
-  directory, and hx refuses a kit or state directory that the agent could read. The two talk over
+  directory, and hx refuses a kit or state directory inside a path the agent can read. It does not stop you
+  handing the agent part of the kit with `--ro`. The two talk over
   one socket, a line each way, through `host.judge`. The agent sends only a note; the judge copies the project
   itself.
 - **The candidate cannot read the kit's other files.** `build` and `run` run behind a narrower wall still: their
@@ -307,8 +308,9 @@ The walls are what make the verdicts worth having:
 - **The judge is built into hx** (`lua/judge.luau`). A project's loop can change everything about the agent, but
   not the judge.
 
-Limits: the candidate's code can read `run` and what it reads, so keep answers in `check`; candidates are not cut
-off from the network or from each other's SysV IPC; and a check that accepts a wrong answer lets it win, so try a
+Limits: the candidate's code can read `run` and what it reads, so keep answers in `check`. Candidates are not cut
+off from the network or from SysV IPC, so a helper the agent leaves running can carry results between runs, and
+the agent can lower the priority of the judge's runs. A check that accepts a wrong answer lets it win, so try a
 kit on the unchanged project and on a known-bad change before trusting it.
 
 ## Extensions
@@ -401,8 +403,8 @@ Everything Luau can do to the machine:
 |---|---|
 | `host.llm(body, {timeout=600, beta=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header |
 | `host.tool(name, request, {timeout=300})` | `status, text`, or `nil, error`: a POST to DeepSeek's `search`, `fetch` or `ocr` endpoint with `DEEPSEEK_API_KEY`, or, for `"exa"`, to Exa's search endpoint with `EXA_API_KEY`. A string `request` is sent as JSON; for DeepSeek, a table is sent as a form, whose `file` field is the path of a file to upload |
-| `host.sh(command, {timeout=120, read=, write=})` | `{out, code, signal, timed_out, seconds}`; `seconds` runs from the fork to the exit. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends |
-| `host.judge(line?)` | `{lines}, pending`: sends a line to the judge, if given, and returns every answer it owes, waiting until 2 seconds before the `host.timed` limit in force; `pending` is how many it still owes |
+| `host.sh(command, {timeout=120, read=, write=, hangup=})` | `{out, code, signal, timed_out, seconds}`; `seconds` runs from the fork to the exit. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends. With `hangup = true`, the command ends, or does not start, once stdin's writer has hung up, and `host.sh` raises `"hung up"` |
+| `host.judge(line?)` | `{lines}, pending`: sends a line to the judge, if given, and returns the answer it owes, waiting until 2 seconds before the `host.timed` limit in force; `pending` is how many it still owes. A line is refused while one is owed |
 | `host.read(path)` | the contents, or `nil, error` |
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed or killed write leaves the old content; its owner, mode, extended attributes and ACLs stay, and a link stays a link. A device, a FIFO, a file with other hard links, one whose attributes cannot be copied, or one in a directory that refuses a new file is written in place |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |

@@ -720,8 +720,8 @@ if host.judged then
 		name = "submit",
 		usage = "submit(note?) -> text: hands the project as it stands to the judge, with a note on what you "
 			.. "changed and what you expect. The judge builds and measures it beside the champion, the best version "
-			.. "so far, with a kit you cannot see, and returns its verdict. Only verdicts count. With no note, it "
-			.. "submits nothing and waits for verdicts still owed.",
+			.. "so far, with a kit you cannot see, and returns its verdict. Only verdicts count. One submission at a "
+			.. "time: with no note, it submits nothing and waits for a verdict still owed.",
 		run = function(note)
 			check("submit", note, 1, "note", "string", true)
 			if note then
@@ -1103,7 +1103,8 @@ function M.system_prompt()
 			.. "Your own measurements guide you; only submit() decides. Work one idea at a time: make the change, "
 			.. "check with your own tests that it still works, then submit it. After a win, commit it with git so "
 			.. "you can come back to it; after any other verdict, put the project back to the last win before the "
-			.. "next idea, unless you mean to build on this one. Keep going while you have ideas with a real chance, "
+			.. "next idea, unless you mean to build on this one. Work that was never submitted does not count, so do "
+			.. "not finish without a verdict on your best change. Keep going while you have ideas with a real chance, "
 			.. "then report each verdict and what the champion holds.")
 	end
 	local extensions = extension_index()

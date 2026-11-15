@@ -28,8 +28,6 @@ struct HostConfig {
     std::vector<std::pair<std::string, std::string>> extensions;  // host.extensions: built-in ones, name and source
     std::vector<Rule> system_rules;  // what every wall lets in: system directories, harmless devices, trust roots
     UniqueFd judge;                  // a line-based channel to the judge process (--judge); invalid for none
-    bool end_on_hangup = false;      // the judge's: when stdin's writer hangs up while host.sh runs a command,
-                                     // the command ends and host.sh raises "hung up"
 };
 
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
@@ -42,9 +40,12 @@ struct HostConfig {
 //   host.sh(command, {timeout=120, read=, write=}) -> {out=, code=, signal=, timed_out=, seconds=}
 //                                                     read and write are lists of paths: given either, the command
 //                                                     runs behind a narrower wall, the system directories and those,
-//                                                     and what it leaves running is killed. seconds: fork to exit
+//                                                     and what it leaves running is killed. seconds: fork to exit.
+//                                                     hangup=true: once stdin's writer hangs up, the command ends
+//                                                     (or does not start) and host.sh raises "hung up"
 //   host.judge(line?) -> {answers}, pending           sends a line to the judge, if given, and waits for what it
-//                                                     owes, until 2 s before the host.timed limit
+//                                                     owes, until 2 s before the host.timed limit; a line is
+//                                                     refused while an answer is owed
 //   host.read(path) -> string | nil, error
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a file by
 //                                                     renaming a new one over it, so it is never left cut short

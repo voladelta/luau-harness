@@ -1004,9 +1004,22 @@ int Host::sh(lua_State* L) {
     const Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
     const std::optional<Wall> wall = host.narrower_wall(L, 2);
+    bool on_hangup = false;  // {hangup = true}: the command ends when stdin's writer hangs up
+    if (lua_istable(L, 2)) {
+        lua_getfield(L, 2, "hangup");
+        on_hangup = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+    }
     // A command behind a narrower wall is not trusted to leave anything running: what it started dies with it.
     const std::vector<pid_t> before = wall ? descendants_now() : std::vector<pid_t>{};
     raise_if_signaled(L);  // a stop in progress starts no command
+    if (on_hangup) {
+        pollfd already{STDIN_FILENO, POLLRDHUP, 0};
+        if (poll(&already, 1, 0) > 0 && (already.revents & (POLLRDHUP | POLLHUP)) != 0) {
+            lua_pushstring(L, "hung up");
+            lua_error(L);
+        }
+    }
     // Adopted orphans that have exited are zombies of hx. No command of hx's own is running now, so this cannot
     // take the status of one; a judge that has exited is reaped here too, which finish_judge allows for.
     while (waitpid(-1, nullptr, WNOHANG) > 0) {
@@ -1050,12 +1063,7 @@ int Host::sh(lua_State* L) {
     // The command is Running until it exits by itself, runs out of time, or a signal arrives. The last two
     // kill its whole process group; a signal then leaves through raise_if_signaled.
     enum class Ending : std::uint8_t { Exited, TimedOut, Signaled, HungUp };
-    // Only a hang-up while the command runs ends it: one that came before leaves later commands alone.
-    pollfd already{STDIN_FILENO, POLLRDHUP, 0};
-    const int hangup =
-        host.config_.end_on_hangup && (poll(&already, 1, 0) <= 0 || (already.revents & (POLLRDHUP | POLLHUP)) == 0)
-            ? STDIN_FILENO
-            : -1;
+    const int hangup = on_hangup ? STDIN_FILENO : -1;
     const double deadline = now() + timeout;
     int status = 0;
     bool reaped = true;  // false: killed, but stuck in uninterruptible I/O and not yet dead
@@ -1152,7 +1160,8 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
     }
 }
 
-// host.judge(line?) -> {answers}, pending: sends line, if given, and waits for every answer the judge owes, in order.
+// host.judge(line?) -> {answers}, pending: sends line, if given, and waits for the answer the judge owes. One line
+// at a time: a line is refused while an answer is owed, so each submission is the project as it was when sent.
 // A judge can take longer than a time limit allows, so the wait ends kJudgeSlack seconds before the host.timed limit
 // in force: the answers so far come back, and the rest come with a later call. A stop raises, and nothing is lost.
 int Host::judge(lua_State* L) {
@@ -1169,6 +1178,9 @@ int Host::judge(lua_State* L) {
     }
     raise_if_signaled(L);
     const int fd = host.config_.judge.get();
+    if (line != nullptr && host.judge_owed_ > 0) {
+        luaL_error(L, "host.judge: the judge is still judging the last submission; wait for its verdict first");
+    }
     if (line != nullptr) {
         if (!write_all(fd, std::string(line, length) + "\n")) {
             luaL_error(L, "host.judge: the judge is gone");

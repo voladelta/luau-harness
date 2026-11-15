@@ -79,8 +79,9 @@ local function tail(text, limit)
 end
 
 -- A command of the judge's own, in its own wall. Raises when it fails: that is the judge's fault, not the trial's.
+-- Its time limit is the judge's, not the kit's, and it ends when hx hangs up.
 local function shell(command)
-	local result = host.sh("set -o pipefail; " .. command, { timeout = config.timeout })
+	local result = host.sh("set -o pipefail; " .. command, { timeout = 3600, hangup = true })
 	if result.code ~= 0 then
 		error(("%s: %s"):format(command, tail(result.out, 500)), 0)
 	end
@@ -102,7 +103,7 @@ end
 -- The tree of a directory's files, every one of them, as git stores it.
 local function tree(dir)
 	local index = state .. "/index"
-	shell("rm -f " .. quote(index))
+	shell(("rm -f %s %s.lock"):format(quote(index), quote(index)))
 	local env = ("cd %s && GIT_INDEX_FILE=%s "):format(quote(dir), quote(index))
 	git("--work-tree=. add --all --force .", env)
 	return git("write-tree", env):match("%x+")
@@ -129,6 +130,7 @@ local function candidate(dir, script)
 		timeout = config.timeout,
 		read = reads,
 		write = wall,
+		hangup = true,
 	})
 	if result.code == 0 then
 		return true, result.seconds
@@ -148,20 +150,27 @@ local function snapshot(dir)
 		quote(dir), quote(dir), quote(project), quote(dir)))
 end
 
+-- Every build and run happens at this one path, so a build that records where it is (cmake, a virtualenv)
+-- still works when its copy is run.
+local workdir = state .. "/run"
+
 -- Builds the source in dir/src into dir/built. Returns true, or false and why.
 local function build(dir)
-	shell(("rm -rf %s/built && cp -a %s/src %s/built"):format(quote(dir), quote(dir), quote(dir)))
-	if not host.read(kit .. "/build") then
-		return true
+	shell(("rm -rf %s %s/built && cp -a %s/src %s"):format(quote(workdir), quote(dir), quote(dir), quote(workdir)))
+	if host.read(kit .. "/build") then
+		local ok, why = candidate(workdir, "build")
+		if not ok then
+			return false, why
+		end
 	end
-	local ok, why = candidate(dir .. "/built", "build")
-	return ok, not ok and why or nil
+	shell(("mv %s %s/built"):format(quote(workdir), quote(dir)))
+	return true
 end
 
 -- One measurement of a built tree, in a fresh copy of it, so no run sees the files an earlier one left. Returns
 -- {kind, value}, where kind is "seconds" (lower is better) or "score" (higher is better), or nil and why.
 local function measure(built)
-	local dir = state .. "/run"
+	local dir = workdir
 	shell(("rm -rf %s && cp -a %s %s"):format(quote(dir), quote(built), quote(dir)))
 	local ok, seconds = candidate(dir, "run")
 	if not ok then
@@ -170,16 +179,19 @@ local function measure(built)
 	if not host.read(kit .. "/check") then
 		return { kind = "seconds", value = seconds }
 	end
+	-- The check can read the kit, so it must not follow a link the candidate left into it.
+	shell(("find %s -type l -delete"):format(quote(dir)))
 	local wall = table.clone(reads)
 	table.insert(wall, kit)
 	table.insert(wall, dir)
 	table.move(writes, 1, #writes, #wall + 1, wall)
 	local result = host.sh(("cd %s && TMPDIR=%s %s %s"):format(quote(dir), quote(state .. "/tmp"),
-		quote(kit .. "/check"), quote(dir)), { timeout = config.timeout, read = wall, write = { state .. "/tmp" } })
+		quote(kit .. "/check"), quote(dir)),
+		{ timeout = config.timeout, read = wall, write = { state .. "/tmp" }, hangup = true })
 	if result.timed_out then
 		return nil, ("the check timed out after %g s"):format(config.timeout)
 	elseif result.code ~= 0 then
-		return nil, "the check failed:\n" .. tail(result.out, 1500)
+		return nil, config.blind and "the check failed" or "the check failed:\n" .. tail(result.out, 1500)
 	end
 	local last = result.out:match("([^\n]*)%s*$")
 	local score = tonumber(last)
@@ -187,7 +199,7 @@ local function measure(built)
 		return { kind = "seconds", value = seconds }
 	end
 	if not (score > 0 and score < math.huge) then
-		return nil, "the check's score must be a positive, finite number, not " .. last
+		return nil, "the check's score must be a positive, finite number" .. (config.blind and "" or ", not " .. last)
 	end
 	return { kind = "score", value = score }
 end
@@ -240,8 +252,8 @@ local function round(built, champion)
 		if not a then
 			return nil, why
 		end
-		if a.kind ~= b.kind then
-			return nil, "the check reported a score for one and not the other"
+		if a.kind ~= b.kind or (kind and a.kind ~= kind) then
+			return nil, "the check reported a score for some runs and not others"
 		end
 		kind = a.kind
 		table.insert(gains, gain(a, b))
@@ -290,6 +302,7 @@ local function start()
 	git("init --quiet --bare " .. quote(git_dir), "")
 	snapshot(dir .. "/src")
 	start_tree = tree(dir .. "/src")
+	write_patch(start_tree, "champion.patch") -- empty: the start is the champion until something beats it
 	local ok, why = build(dir)
 	local result
 	if ok then
@@ -362,11 +375,12 @@ local function submit(note)
 	snapshot(dir .. "/src")
 	write_patch(tree(dir .. "/src"), ("trials/%d.patch"):format(trial))
 	local answer, crowned = judge(entry, dir)
-	record(entry)
-	current = nil
 	if crowned then
 		crown(trial, dir, crowned.kind, crowned.value)
-	else
+	end
+	record(entry)
+	current = nil
+	if not crowned then
 		shell("rm -rf " .. quote(dir))
 		if champion then
 			answer ..= ("\nThe champion is still %s."):format(champion_name())
@@ -418,7 +432,7 @@ end
 -- Prints the summary and leaves only the ledger and the patches: the trees were copies.
 local function summary()
 	host.log(summary_text())
-	host.sh(("cd %s && rm -rf run tmp git index start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
+	host.sh(("cd %s && rm -rf run tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
 		:format(quote(state)))
 end
 
@@ -445,7 +459,11 @@ local function main()
 		local note = decoded and type(request) == "table" and type(request.note) == "string" and request.note or ""
 		local done, answer = host.try(submit, note)
 		if not done then
+			local stop = answer == "hung up"
 			answer = abandon(answer)
+			if stop then
+				break -- hx is gone: judge nothing more
+			end
 		end
 		print(json.encode(answer))
 	end
