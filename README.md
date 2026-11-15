@@ -406,7 +406,7 @@ Everything Luau can do to the machine:
 | `host.sh(command, {timeout=120, read=, write=, hangup=})` | `{out, code, signal, timed_out, seconds}`; `seconds` runs from the fork to the exit. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends. With `hangup = true`, the command ends, or does not start, once stdin's writer has hung up, and `host.sh` raises `"hung up"` |
 | `host.judge(line?)` | `{lines}, pending`: sends a line to the judge, if given, and returns the answer it owes, waiting until 2 seconds before the `host.timed` limit in force; `pending` is how many it still owes. A line is refused while one is owed |
 | `host.read(path)` | the contents, or `nil, error` |
-| `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A file is replaced by renaming a new one over it, so a failed or killed write leaves the old content; its owner, mode, extended attributes and ACLs stay, and a link stays a link. A device, a FIFO, a file with other hard links, one whose attributes cannot be copied, or one in a directory that refuses a new file is written in place |
+| `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A regular file is replaced by renaming a new one over it, so a failed write leaves the old content (a killed one can leave the new file beside it); the mode stays and a link stays a link, but owner, extended attributes and ACLs are not carried over. A device, a FIFO, a file with other hard links, a dangling link, or a file in a directory that refuses a new file is written in place |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
 | `host.load(source, name, env)` | a function, or `nil, error` |
 | `host.try(fn, ...)` | `true, ...`, or `false, error`: a `pcall` that is also where a stop ends |
@@ -415,6 +415,7 @@ Everything Luau can do to the machine:
 | `host.log(text)`, `host.sleep(seconds)`, `host.env(name)` | |
 | `host.args`, `host.cwd`, `host.interactive`, `host.sandboxed`, `host.default_loop` | |
 | `host.quiet` | `true` with `--quiet`: leave out progress lines |
+| `host.model` | the model name `host.llm`'s requests are meant for, after `--model`, `HX_MODEL` and the aliases |
 | `host.tty` | `true` when stdout is a terminal |
 | `host.tools` | `true` when hx has a `DEEPSEEK_API_KEY` for `host.tool` |
 | `host.exa` | `true` when hx has an `EXA_API_KEY` for `host.tool("exa")` |

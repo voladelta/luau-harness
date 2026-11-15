@@ -5,12 +5,10 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/prctl.h>
-#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
-#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -44,13 +42,18 @@
 #include "lualib.h"
 #include "sys.h"
 
+// The host functions raise Luau errors with C++ objects alive on the stack, which only an error thrown as a C++
+// exception destroys; a longjmp would skip their destructors.
+#if LUA_USE_LONGJMP
+#error "hx needs Luau built to raise errors as C++ exceptions, not with longjmp"
+#endif
+
 namespace hx {
 namespace {
 
 constexpr std::size_t kMaxFile = std::size_t{64} << 20;       // host.read refuses larger files
 constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm and host.tool abort a larger reply
 constexpr std::size_t kMaxUpload = std::size_t{100} << 20;    // the largest file DeepSeek's OCR takes
-constexpr std::string_view kToolNames[] = {"search", "fetch", "ocr", "exa"};  // host.tool's endpoints
 constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;  // host.sh keeps this much of each end of the output
 constexpr std::size_t kBufferSize = 65536;
 constexpr int kPollMs = 50;
@@ -153,8 +156,6 @@ class TryScope {
     explicit TryScope(int& depth) noexcept : depth_(depth) { ++depth_; }
     TryScope(const TryScope&) = delete;
     TryScope& operator=(const TryScope&) = delete;
-    TryScope(TryScope&&) = delete;
-    TryScope& operator=(TryScope&&) = delete;
     ~TryScope() { --depth_; }
 
   private:
@@ -169,8 +170,6 @@ class DeadlineScope {
     }
     DeadlineScope(const DeadlineScope&) = delete;
     DeadlineScope& operator=(const DeadlineScope&) = delete;
-    DeadlineScope(DeadlineScope&&) = delete;
-    DeadlineScope& operator=(DeadlineScope&&) = delete;
     ~DeadlineScope() { slot_ = outer_; }
 
   private:
@@ -340,19 +339,12 @@ int on_progress(void* /*user*/, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/, cu
     return g_signal != 0 ? 1 : 0;  // non-zero aborts the transfer
 }
 
-struct CurlEasyDeleter {
-    void operator()(CURL* handle) const noexcept { curl_easy_cleanup(handle); }
-};
-using CurlEasy = std::unique_ptr<CURL, CurlEasyDeleter>;
-
 // An owned list of request headers.
 class Headers {
   public:
     Headers() = default;
     Headers(const Headers&) = delete;
     Headers& operator=(const Headers&) = delete;
-    Headers(Headers&&) = delete;
-    Headers& operator=(Headers&&) = delete;
     ~Headers() { curl_slist_free_all(list_); }
 
     void add(const std::string& header) {
@@ -374,15 +366,34 @@ struct CurlMimeDeleter {
 };
 using CurlMime = std::unique_ptr<curl_mime, CurlMimeDeleter>;
 
-// Sends a POST whose body is already set on curl, and returns status, text | nil, error. Redirects are not
-// followed: a key goes to the URL it was meant for and nowhere else.
-int post(lua_State* L, CURL* curl, const std::string& url, const Headers& headers, double timeout,
-         const std::string& ca_bundle) {
+// Sends a POST whose body is already set on curl to endpoint, with its key, its headers and `extra`, and returns
+// status, text | nil, error. Redirects are not followed: a key goes to the URL it was meant for and nowhere else.
+// The handle is reset afterwards, so it keeps no pointer into this request; the connection stays open for the next.
+int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_list<std::string_view> extra,
+         double timeout, const std::string& ca_bundle) {
+    Headers headers;
+    if (!endpoint.key.empty()) {
+        headers.add(endpoint.auth == Auth::Bearer ? fmt::format("Authorization: Bearer {}", endpoint.key)
+                                                  : fmt::format("x-api-key: {}", endpoint.key));
+    }
+    for (const std::string& header : endpoint.headers) {
+        headers.add(header);
+    }
+    for (const std::string_view header : extra) {
+        if (!header.empty()) {
+            headers.add(std::string(header));
+        }
+    }
     std::string response;
     std::array<char, CURL_ERROR_SIZE> error_buffer{};
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, endpoint.url.c_str());
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
+    // A model can take minutes to answer a non-streaming request, with nothing on the wire meanwhile; probes keep
+    // a NAT or a proxy on the way from dropping the connection as idle.
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_progress);
@@ -397,12 +408,13 @@ int post(lua_State* L, CURL* curl, const std::string& url, const Headers& header
     }
 
     const CURLcode code = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_reset(curl);
     if (code != CURLE_OK) {
         raise_if_signaled(L);
         return fail(L, error_buffer.front() != '\0' ? error_buffer.data() : curl_easy_strerror(code));
     }
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     lua_pushnumber(L, static_cast<double>(status));
     lua_pushlstring(L, response.data(), response.size());
     return 2;
@@ -481,11 +493,19 @@ bool reap_within(pid_t pid, int& status, double seconds) {
         _exit(126);
     }
     const int null = open("/dev/null", O_RDONLY);
-    if (null >= 0) {
+    if (null > STDIN_FILENO) {
         dup2(null, STDIN_FILENO);
+        close(null);  // only the copy on stdin is for the command
     }
     dup2(output, STDOUT_FILENO);
     dup2(output, STDERR_FILENO);
+    // Nothing else hx holds is for the command: libcurl keeps the connection it reuses, and its wake-up pipe, open
+    // between requests, and does not make them close-on-exec. If this fails, the exec still goes ahead.
+#ifdef CLOSE_RANGE_CLOEXEC  // glibc 2.34 declares the wrapper and the flag together
+    close_range(3, ~0U, CLOSE_RANGE_CLOEXEC);
+#else  // the system call is Linux 5.11, the same number on every architecture; main checks it works
+    syscall(436, 3U, ~0U, 4U);
+#endif
     for (const int sig : {SIGINT, SIGTERM, SIGHUP, SIGPIPE}) {
         static_cast<void>(std::signal(sig, SIG_DFL));
     }
@@ -557,165 +577,32 @@ mode_t new_file_mode() {
     return 0666 & ~mask;
 }
 
-// Reads a list or a value whose size is not known: asks for the size, then reads, and again if it grew meanwhile.
-template <typename Get>
-bool read_sized(const Get& get, std::string& out) {
-    for (;;) {
-        ssize_t n = get(nullptr, 0);
-        if (n < 0) {
-            return false;
-        }
-        out.resize(static_cast<std::size_t>(n));
-        n = get(out.data(), out.size());
-        if (n >= 0) {
-            out.resize(static_cast<std::size_t>(n));
-            return true;
-        }
-        if (errno != ERANGE) {
-            return false;
-        }
-    }
-}
-
-// The extended attribute names in a list from listxattr, which ends each one with a NUL.
-std::vector<std::string_view> attribute_names(std::string_view list) {
-    std::vector<std::string_view> names;
-    while (!list.empty()) {
-        const std::size_t end = std::min(list.find('\0'), list.size());
-        names.push_back(list.substr(0, end));
-        list.remove_prefix(std::min(end + 1, list.size()));
-    }
-    return names;
-}
-
-// Gives the new file at `to` the extended attributes of the file at `from`, ACLs included, and none it has of its
-// own. A file system without them has none to copy. False when one cannot be read or set (an SELinux label this
-// user may not give, a trusted.* attribute): the new file could not stand in for the old one.
-bool copy_attributes(const char* from, int to) {
-    std::string list;
-    std::string own;
-    if (!read_sized([&](char* b, std::size_t s) { return listxattr(from, b, s); }, list)) {
-        if (errno != ENOTSUP) {
-            return false;
-        }
-        list.clear();
-    }
-    if (!read_sized([&](char* b, std::size_t s) { return flistxattr(to, b, s); }, own)) {
-        if (errno != ENOTSUP) {
-            return false;
-        }
-        own.clear();
-    }
-    const std::vector<std::string_view> names = attribute_names(list);
-    std::string value;
-    std::string current;
-    for (const std::string_view view : names) {
-        const std::string name(view);
-        // Writing to a file drops its capabilities, so a new file does not take them over.
-        if (name == "security.capability") {
-            continue;
-        }
-        if (!read_sized([&](char* b, std::size_t s) { return getxattr(from, name.c_str(), b, s); }, value)) {
-            return false;
-        }
-        if (read_sized([&](char* b, std::size_t s) { return fgetxattr(to, name.c_str(), b, s); }, current) &&
-            current == value) {
-            continue;  // the label or default ACL the new file was born with is already the same
-        }
-        if (fsetxattr(to, name.c_str(), value.data(), value.size(), 0) != 0) {
-            return false;
-        }
-    }
-    // Whatever the new file has that the old one did not, such as an ACL from its directory's default, goes.
-    return std::ranges::all_of(attribute_names(own), [&](std::string_view view) {
-        return std::ranges::find(names, view) != names.end() || fremovexattr(to, std::string(view).c_str()) == 0;
-    });
-}
-
-// Gives an unnamed file (O_TMPFILE) the name `temp`, a free name of the form .NAME.hx-XXXXXX beside target, and
-// stores that name in temp. False when the file cannot be linked: no /proc, or a sandbox that refuses it.
-bool link_unnamed(int file, const std::filesystem::path& target, std::string& temp) {
-    constexpr std::string_view kLetters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    const std::string source = fmt::format("/proc/self/fd/{}", file);
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        std::array<unsigned char, 6> random{};
-        if (getrandom(random.data(), random.size(), 0) != static_cast<ssize_t>(random.size())) {
-            return false;
-        }
-        std::string suffix;
-        for (const unsigned char byte : random) {
-            suffix.push_back(kLetters[byte % kLetters.size()]);
-        }
-        temp = (target.parent_path() / fmt::format(".{}.hx-{}", target.filename().string(), suffix)).string();
-        if (linkat(AT_FDCWD, source.c_str(), AT_FDCWD, temp.c_str(), AT_SYMLINK_FOLLOW) == 0) {
-            return true;
-        }
-        if (errno != EEXIST) {
-            return false;
-        }
-    }
-    return false;
-}
-
-enum class Replaced : std::uint8_t {
-    Yes,
-    Unable,  // this way cannot replace the file; nothing was changed
-    Failed,  // errno says why
-};
-
-// Replaces target with a new file holding data, which gets old's owner, group, mode and extended attributes when
-// old is given. An unnamed file (O_TMPFILE) has no name until it is complete, so a killed hx leaves nothing
-// behind; a named one (mkostemp) serves where the file system or the sandbox refuses an unnamed one, and is left
-// behind by a hx killed while writing it.
-Replaced replace_file(const std::filesystem::path& target, const struct stat* old, std::string_view data,
-                      bool unnamed) {
-    const std::filesystem::path parent = target.parent_path().empty() ? "." : target.parent_path();
+// Writes data to a new file beside target, gives it `mode` and renames it over target. False, with errno set, when
+// the write or the rename failed: target is then as it was. `unable` is also set when no new file could be made
+// (a directory that refuses one), so nothing was tried.
+bool replace_file(const std::filesystem::path& target, mode_t mode, std::string_view data, bool& unable) {
     std::string temp = (target.parent_path() / fmt::format(".{}.hx-XXXXXX", target.filename().string())).string();
-    // A new file is created as open would create it, umask and default ACL alike.
-    const UniqueFd file(unnamed ? open(parent.c_str(), O_TMPFILE | O_WRONLY | O_CLOEXEC, old != nullptr ? 0600 : 0666)
-                                : mkostemp(temp.data(), O_CLOEXEC));
-    if (!file.valid()) {
-        return Replaced::Unable;
-    }
-    bool named = !unnamed;  // a name to remove on every way out but the rename
-    const auto discard = [&](Replaced result) {
+    const UniqueFd file(mkostemp(temp.data(), O_CLOEXEC));
+    unable = !file.valid() || fchmod(file.get(), mode) != 0;
+    if (unable || !write_all(file.get(), data) || rename(temp.c_str(), target.c_str()) != 0) {
         const int error = errno;
-        if (named) {
+        if (file.valid()) {
             unlink(temp.c_str());
         }
         errno = error;
-        return result;
-    };
-    if (old != nullptr) {
-        if (fchown(file.get(), old->st_uid, old->st_gid) != 0 || fchmod(file.get(), old->st_mode & 07777) != 0 ||
-            !copy_attributes(target.c_str(), file.get())) {
-            return discard(Replaced::Unable);
-        }
-    } else if (!unnamed && fchmod(file.get(), new_file_mode()) != 0) {
-        return discard(Replaced::Unable);
+        return false;
     }
-    if (!write_all(file.get(), data)) {
-        return discard(Replaced::Failed);
-    }
-    if (unnamed) {
-        if (!link_unnamed(file.get(), target, temp)) {
-            return Replaced::Unable;
-        }
-        named = true;
-    }
-    if (rename(temp.c_str(), target.c_str()) != 0) {
-        return discard(Replaced::Failed);
-    }
-    return Replaced::Yes;
+    return true;
 }
 
-// A file is written by writing a new file beside it and renaming that over it, so a full disk or a killed hx leaves
-// the old content or the new, never a file cut short. Nothing is synced: a power loss can still lose both, and
-// that is not what this guards against. Where a new file could not stand in for the old one, the file is written
-// in place instead: something other than a regular file (/dev/null, a FIFO), a file with other names that must go
-// on seeing it, a dangling link, a directory that refuses a new file (a lone --rw file), a file whose owner,
-// group or extended attributes the new one cannot be given, or a file that may not be written (a rename would not
-// ask it, so the open is left to refuse).
+// A regular file is written by writing a new file beside it and renaming that over it, so a full disk or a failed
+// write leaves the old content or the new, never a file cut short; a hx killed mid-write can leave the new file
+// behind. Nothing is synced: a power loss can still lose both, and that is not what this guards against. The new
+// file gets the old one's mode, not its owner or extended attributes: git is the way back. A link is followed, so
+// the file it names is replaced and the link stays. What a new file cannot stand in for is written in place:
+// something other than a regular file (/dev/null, a FIFO), a file with other names that must go on seeing it, a
+// dangling link, a file in a directory that refuses a new file (a lone --rw file), and a file that may not be
+// written (a rename would not ask it, so the open is left to refuse).
 int l_write(lua_State* L) {
     const char* path = check_cstring(L, 1);
     std::size_t length = 0;
@@ -736,20 +623,14 @@ int l_write(lua_State* L) {
     const bool exists = stat(path, &st) == 0;
     const bool missing = !exists && errno == ENOENT && lstat(path, &entry) != 0;  // not even a dangling link
     if ((exists && S_ISREG(st.st_mode) && st.st_nlink == 1 && access(path, W_OK) == 0) || missing) {
-        // A link is followed, so the file it names is replaced and the link stays.
         const std::filesystem::path target = exists ? std::filesystem::canonical(path, ec) : path;
-        for (const bool unnamed : {true, false}) {
-            if (ec) {
-                break;
-            }
-            const Replaced result = replace_file(target, exists ? &st : nullptr, data, unnamed);
-            if (result == Replaced::Yes) {
-                lua_pushboolean(L, 1);
-                return 1;
-            }
-            if (result == Replaced::Failed) {
-                return fail(L, fmt::format("{}: {}", path, error_text(errno)));
-            }
+        bool unable = false;
+        if (!ec && replace_file(target, exists ? st.st_mode & 07777 : new_file_mode(), data, unable)) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        if (!ec && !unable) {
+            return fail_errno(L, path);
         }
     }
 
@@ -870,78 +751,111 @@ Host& Host::of(lua_State* L) {
 }
 
 // Runs at VM safepoints (loop back edges, calls). Luau code cannot block these, so a signal or an expired time
-// limit always reaches the code that is running.
+// limit always reaches the code that is running. A signal is checked at every one. Reading the clock at every one
+// made a tight loop several times slower, so under a time limit it is read about once a millisecond: every
+// stride_ safepoints, where stride_ follows how fast they have been coming, up to kMaxStride.
 void Host::on_interrupt(lua_State* L, int gc) {
+    // Safepoints in a tight loop come every few nanoseconds and a clock read takes tens. A larger stride costs less
+    // there, but where safepoints turn slow all at once, the limit can be overrun by up to this many of them.
+    constexpr int kMaxStride = 64;
+    constexpr double kCheckEvery = 1e-3;  // seconds
     if (gc >= 0) {
         return;  // inside the collector: raising here is not allowed
     }
     raise_if_signaled(L);
-    const Host& host = of(L);
-    if (host.deadline_ > 0 && now() >= host.deadline_) {
+    Host& host = of(L);
+    if (host.deadline_ <= 0 || --host.countdown_ > 0) {
+        return;
+    }
+    const double at = now();
+    if (at >= host.deadline_) {
         lua_pushstring(L, "timeout");
         lua_error(L);
     }
+    const double took = at - host.checked_;  // since the last read, which may be long ago: then the stride drops
+    const double scaled = took > 0 ? host.stride_ * kCheckEvery / took : kMaxStride;
+    host.stride_ = static_cast<int>(std::clamp(scaled, 1.0, static_cast<double>(kMaxStride)));
+    host.countdown_ = host.stride_;
+    host.checked_ = at;
+}
+
+const Endpoint* Host::endpoint(std::string_view name) const {
+    const auto found = std::ranges::find(config_.endpoints, name, &Endpoint::name);
+    return found == config_.endpoints.end() ? nullptr : &*found;
+}
+
+void Host::CurlDeleter::operator()(CURL* handle) const noexcept {
+    curl_easy_cleanup(handle);
+}
+
+CURL* Host::curl() {
+    if (!curl_) {
+        curl_.reset(curl_easy_init());
+    } else {
+        curl_easy_reset(curl_.get());  // post resets it too, but a request that failed before reaching post may not
+    }
+    return curl_.get();
 }
 
 int Host::llm(lua_State* L) {
     std::size_t length = 0;
     const char* body = luaL_checklstring(L, 1, &length);
-    const Host& host = of(L);
+    Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 600));
     raise_if_signaled(L);  // a stop in progress starts no request
-    const HostConfig& config = host.config_;
-
-    const CurlEasy curl(curl_easy_init());
-    if (!curl) {
+    const std::string beta = beta_option(L, 2);
+    const Endpoint* endpoint = host.endpoint("llm");
+    CURL* curl = host.curl();
+    if (endpoint == nullptr || curl == nullptr) {
         return fail(L, "cannot start an HTTP request");
     }
-    const std::string beta = beta_option(L, 2);
-    Headers headers;
-    headers.add("Content-Type: application/json");
-    headers.add("anthropic-version: 2023-06-01");
-    if (!beta.empty()) {
-        headers.add(fmt::format("anthropic-beta: {}", beta));
-    }
-    if (!config.api_key.empty()) {
-        headers.add(fmt::format("x-api-key: {}", config.api_key));
-    }
-    curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body);
-    curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(length));
-    return post(L, curl.get(), config.api_url, headers, timeout, config.ca_bundle);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(length));
+    return post(L, curl, *endpoint,
+                {"Content-Type: application/json", beta.empty() ? "" : fmt::format("anthropic-beta: {}", beta)},
+                timeout, host.config_.ca_bundle);
 }
 
-// host.tool(name, request, {timeout=300}): a request to one of DeepSeek's tool endpoints, HX_TOOLS_URL/NAME, with
-// DEEPSEEK_API_KEY as a bearer token, or, for "exa", to Exa's search endpoint, HX_EXA_URL, with EXA_API_KEY as
-// x-api-key. Only the names in kToolNames are taken, so each key reaches its own endpoints and nothing else. A
-// string request is sent as JSON; a table is sent as a multipart form, in which `file` names a file to upload and
-// every other field is a text field. Exa takes JSON only.
+// host.tool(name, request, {timeout=300}): a request to the endpoint of that name, other than host.llm's. Only the
+// endpoints' names are taken, so each key reaches its own URL and nothing else. A string request is sent as JSON;
+// for an endpoint that takes a form, a table is sent as a multipart form, in which `file` names a file to upload
+// and every other field is a text field.
 int Host::tool(lua_State* L) {
     const std::string_view name = check_cstring(L, 1);
-    if (std::ranges::find(kToolNames, name) == std::end(kToolNames)) {
-        luaL_error(L, "host.tool: no tool %s; the tools are search, fetch, ocr and exa", std::string(name).c_str());
+    Host& host = of(L);
+    const Endpoint* endpoint = name == "llm" ? nullptr : host.endpoint(name);
+    if (endpoint == nullptr) {
+        std::vector<std::string_view> names;
+        for (const Endpoint& each : host.config_.endpoints) {
+            if (each.name != "llm") {
+                names.push_back(each.name);
+            }
+        }
+        std::string known;  // "a, b and c"
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            if (i > 0) {
+                known += i + 1 == names.size() ? " and " : ", ";
+            }
+            known += names[i];
+        }
+        luaL_error(L, "host.tool: no tool %s; the tools are %s", std::string(name).c_str(), known.c_str());
     }
-    const bool exa = name == "exa";
-    const bool form = !exa && lua_istable(L, 2);
+    const bool form = endpoint->form && lua_istable(L, 2);
     if (!form) {
         luaL_checktype(L, 2, LUA_TSTRING);
     }
-    const Host& host = of(L);
     const double timeout = host.within_limit(option(L, 3, "timeout", 300));
     raise_if_signaled(L);
-    const HostConfig& config = host.config_;
-    if (exa ? config.exa_key.empty() : config.tools_key.empty()) {
-        return fail(L, exa ? "no EXA_API_KEY: hx was started without one, so Exa cannot be used"
-                           : "no DEEPSEEK_API_KEY: hx was started without one, so the DeepSeek tools cannot be used");
+    if (endpoint->key.empty() && !endpoint->key_env.empty()) {
+        return fail(L, fmt::format("no {}: hx was started without one, so host.tool(\"{}\") cannot be used",
+                                   endpoint->key_env, endpoint->name));
     }
 
-    const CurlEasy curl(curl_easy_init());
-    if (!curl) {
+    CURL* curl = host.curl();
+    if (curl == nullptr) {
         return fail(L, "cannot start an HTTP request");
     }
-    Headers headers;
-    headers.add(exa ? fmt::format("x-api-key: {}", config.exa_key)
-                    : fmt::format("Authorization: Bearer {}", config.tools_key));
-    const CurlMime mime(form ? curl_mime_init(curl.get()) : nullptr);
+    const CurlMime mime(form ? curl_mime_init(curl) : nullptr);
     if (form) {
         if (!mime) {
             return fail(L, "cannot start an HTTP request");
@@ -987,21 +901,19 @@ int Host::tool(lua_State* L) {
                 return fail(L, fmt::format("{}: cannot be attached", value));
             }
         }
-        curl_easy_setopt(curl.get(), CURLOPT_MIMEPOST, mime.get());
-    } else {
-        std::size_t length = 0;
-        const char* body = lua_tolstring(L, 2, &length);
-        headers.add("Content-Type: application/json");
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body);
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(length));
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime.get());
+        return post(L, curl, *endpoint, {}, timeout, host.config_.ca_bundle);
     }
-    const std::string url = exa ? config.exa_url : fmt::format("{}/{}", config.tools_url, name);
-    return post(L, curl.get(), url, headers, timeout, config.ca_bundle);
+    std::size_t length = 0;
+    const char* body = lua_tolstring(L, 2, &length);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(length));
+    return post(L, curl, *endpoint, {"Content-Type: application/json"}, timeout, host.config_.ca_bundle);
 }
 
 int Host::sh(lua_State* L) {
     const char* command = check_cstring(L, 1);
-    const Host& host = of(L);
+    Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
     const std::optional<Wall> wall = host.narrower_wall(L, 2);
     bool on_hangup = false;  // {hangup = true}: the command ends when stdin's writer hangs up
@@ -1215,11 +1127,12 @@ int Host::judge(lua_State* L) {
     }
 }
 
-double Host::within_limit(double seconds) const {
+double Host::within_limit(double seconds) {
     seconds = duration(seconds);
     if (deadline_ <= 0) {
         return seconds;
     }
+    countdown_ = 1;
     return std::clamp(deadline_ - now(), 0.0, seconds);
 }
 
@@ -1315,9 +1228,16 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "default_loop");
     lua_pushboolean(L, isatty(STDOUT_FILENO) != 0 ? 1 : 0);
     lua_setfield(L, -2, "tty");
-    lua_pushboolean(L, config_.tools_key.empty() ? 0 : 1);
+    lua_pushlstring(L, config_.model.data(), config_.model.size());
+    lua_setfield(L, -2, "model");
+    // host.tools speaks for DeepSeek's endpoints, which share one key, and host.exa for Exa's.
+    const auto has_key = [this](std::string_view name) {
+        const Endpoint* found = endpoint(name);
+        return found != nullptr && !found->key.empty();
+    };
+    lua_pushboolean(L, has_key("search") ? 1 : 0);
     lua_setfield(L, -2, "tools");
-    lua_pushboolean(L, config_.exa_key.empty() ? 0 : 1);
+    lua_pushboolean(L, has_key("exa") ? 1 : 0);
     lua_setfield(L, -2, "exa");
     lua_pushboolean(L, config_.judge.valid() ? 1 : 0);
     lua_setfield(L, -2, "judged");
