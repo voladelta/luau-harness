@@ -253,7 +253,9 @@ prompt says that ripgrep is installed and to use it rather than plain grep, sinc
 Some habits of the model are handled in the loop rather than left to the prompt: a function call that gets the same
 result for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to
 try something else only when it knows an action that will change the result (results are compared by length and a
-hash, so a long one is not kept); a reply with nothing in it is retried like a busy server; and a task that runs out of replies gets one more, to report where it stands.
+hash, so a long one is not kept); a reply with nothing in it is retried like a busy server; a function called by
+its name as if it were a tool gets an error that says it is a function and how code sent to `lua` calls it; and a
+task that runs out of replies gets one more, to report where it stands.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
 ### Claude models

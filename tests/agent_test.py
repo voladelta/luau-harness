@@ -267,8 +267,9 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
         self.assertIn("not an object", results[0])
-        # A model used to the old tools may still call one by name.
-        self.assertEqual(results[1], "error: there is no tool named bash")
+        # A model used to one tool per action may call a function by its name: it is told where the function is.
+        self.assertEqual(results[1], "error: there is no tool named bash: bash is a function, for code sent to the "
+                         "lua tool to call, as in bash(command, timeout?)")
         self.assertEqual(results[2], "error: there is no tool named nope")
         self.assertEqual(results[3], 'error: missing argument "code": lua takes code')
         self.assertEqual(results[4], "error: read: argument 1 (path) must be a string, not table; usage: read(path, offset?, limit?)")

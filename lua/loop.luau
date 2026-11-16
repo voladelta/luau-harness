@@ -1171,7 +1171,15 @@ end
 local function run_tool(call: Block): (string, boolean)
 	local tool = find_tool(call.name)
 	if not tool then
-		return "error: there is no tool named " .. tostring(call.name), true
+		local problem = "error: there is no tool named " .. tostring(call.name)
+		-- A model used to one tool per action may call a function by its name. It is told where the function is.
+		for _, fn in M.functions do
+			if fn.name == call.name and find_tool("lua") then
+				problem ..= (": %s is a function, for code sent to the lua tool to call, as in %s")
+					:format(fn.name, fn.usage:match("^[^>]*%)") or fn.name .. "(...)")
+			end
+		end
+		return problem, true
 	end
 	local args = call.input
 	if type(args) ~= "table" then
