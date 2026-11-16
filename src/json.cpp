@@ -214,6 +214,8 @@ std::string_view escape(unsigned char c, std::array<char, 6>& buffer) {
     }
 }
 
+constexpr int kValues = 2;
+
 class Encoder {
   public:
     explicit Encoder(lua_State* L) : L_(L) {}
@@ -303,17 +305,21 @@ class Encoder {
         luaL_checkstack(L_, 4, "json nesting");
 
         const auto length = static_cast<std::size_t>(lua_objlen(L_, idx));
+        const std::size_t base = members_.size();
         std::size_t count = 0;
         std::size_t indices = 0;
-        std::vector<std::string_view> keys;
         lua_pushnil(L_);
         while (lua_next(L_, idx) != 0) {
             ++count;
             if (lua_type(L_, -2) == LUA_TSTRING) {
                 std::size_t key_length = 0;
                 const char* key = lua_tolstring(L_, -2, &key_length);
-                keys.emplace_back(key, key_length);
-            } else if (lua_type(L_, -2) == LUA_TNUMBER) {
+                const auto slot = static_cast<int>(members_.size()) + 1;
+                members_.push_back({{key, key_length}, slot});
+                lua_rawseti(L_, kValues, slot);
+                continue;
+            }
+            if (lua_type(L_, -2) == LUA_TNUMBER) {
                 const double key = lua_tonumber(L_, -2);
                 if (key >= 1 && key <= static_cast<double>(length) && std::floor(key) == key) {
                     ++indices;
@@ -340,33 +346,41 @@ class Encoder {
             return;
         }
 
-        if (keys.size() != count) {
+        if (members_.size() - base != count) {
             luaL_error(L_, "json.encode: a table is neither an array (keys 1..n) nor an object (string keys)");
         }
-        std::sort(keys.begin(), keys.end());
+        const auto first = members_.begin() + static_cast<std::ptrdiff_t>(base);
+        std::sort(first, members_.end(), [](const Member& a, const Member& b) { return a.key < b.key; });
         out_ += '{';
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-            const std::string_view key = keys[i];
-            if (i > 0) {
+        for (std::size_t i = base; i < members_.size(); ++i) {
+            const Member member = members_[i];
+            if (i > base) {
                 out_ += ',';
             }
-            string(key);
+            string(member.key);
             out_ += ':';
-            lua_pushlstring(L_, key.data(), key.size());
-            lua_rawget(L_, idx);
+            lua_rawgeti(L_, kValues, member.slot);
             value(lua_gettop(L_), depth + 1);
             lua_pop(L_, 1);
         }
+        members_.resize(base);
         out_ += '}';
     }
 
+    struct Member {
+        std::string_view key;
+        int slot = 0;
+    };
+
     lua_State* L_;
     std::string out_;
+    std::vector<Member> members_;
 };
 
 int l_encode(lua_State* L) {
     luaL_checkany(L, 1);
     lua_settop(L, 1);
+    lua_newtable(L);
     Encoder encoder(L);
     encoder.value(1, 0);
     lua_pushlstring(L, encoder.text().data(), encoder.text().size());
