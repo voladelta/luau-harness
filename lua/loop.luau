@@ -1211,11 +1211,10 @@ end
 -- (text, thinking, tool_use, tool_result), and tools given as {name, description, input_schema}. To use another
 -- wire format, replace M.request and M.turn.
 
--- What the loop sends to the Claude models it knows, by model name: Claude's from 5.5 on, and none before. Every
--- claude-* model, listed or not, is sent thinking {type = "adaptive"}, so no Claude model runs without thinking,
--- whatever its own default; one too old for adaptive thinking is refused by the API rather than run without it.
--- A Claude model newer than this list gets that and nothing else it might reject. DeepSeek's models get no
--- thinking field: they think by default.
+-- What the loop sends to the Claude models it knows, by model name: Claude's from 5.5 on. Every claude-* model,
+-- listed or not, is sent thinking {type = "adaptive"}: thinking is always on, said aloud. A Claude model newer
+-- than this list gets that and nothing else it might reject. DeepSeek's models get no thinking field: they think
+-- by default.
 --   effort     sent when M.effort is unset: these models think by effort alone, and the API's own default
 --              differs between them (medium on Opus and Haiku 5.5, high on Sonnet 5.5); medium is where
 --              Anthropic suggests starting agentic coding on all three
@@ -1334,8 +1333,8 @@ end
 function M.request(system: string, messages: { Message }, compaction: { [string]: any }?): Reply
 	local is_claude, features = claude_model()
 	-- Thinking is always on and is not the loop's to turn off: effort is the one control. DeepSeek's models think
-	-- by default. A Claude model is always asked for adaptive thinking out loud, rather than trusting its default,
-	-- which before 5.5 was no thinking at all; a model the loop knows gets the options below on top.
+	-- by default. A Claude model is always asked for adaptive thinking out loud; a model the loop knows gets the
+	-- options below on top.
 	local thinking = { type = "adaptive" }
 	local betas = {}
 	local fallbacks = nil

@@ -172,8 +172,9 @@ Know these before you rely on it.
 
 `lua/loop.luau` is the whole agent, in one file. It speaks the Anthropic Messages format and sends thinking blocks
 back exactly as they came. Thinking is always on and is not a setting of hx's: `HX_EFFORT` is the one control.
-Every `claude-*` request carries `thinking: {type: "adaptive"}`, so no Claude model runs without it whatever its own
-default; DeepSeek's models think by default and get no thinking field. It gives the model one tool, `lua`, which runs the
+Every `claude-*` request carries `thinking: {type: "adaptive"}`; DeepSeek's models think by default and get no
+thinking field. Claude requests use the latest API version, `anthropic-version: 2026-10-21`; DeepSeek's endpoint
+gets `2023-06-01`. It gives the model one tool, `lua`, which runs the
 code it is sent in the project directory and returns what the code prints and returns. Globals persist from one
 call to the next. The code acts through these functions:
 

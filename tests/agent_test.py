@@ -401,6 +401,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         sent = self.model.requests[0]
         self.assertEqual(sent["model"], "claude-opus-5-5")
+        self.assertEqual(self.model.headers[0]["anthropic-version"], "2026-10-21")
         self.assertEqual(sent["output_config"], {"effort": "medium"})
         self.assertEqual(sent["fallbacks"], "default")
         self.assertEqual(sent["thinking"], {"type": "adaptive", "display": "updates",
@@ -465,6 +466,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual([r["model"] for r in deepseek.requests], ["deepseek-flash", "deepseek-flash"])
         for sent, headers in zip(deepseek.requests, deepseek.headers):
             self.assertEqual(headers["x-api-key"], ds_key)
+            self.assertEqual(headers["anthropic-version"], "2023-06-01")
             self.assertNotIn("anthropic-beta", headers)
             self.assertEqual(sent["system"], "the sub-agent's system prompt")
             self.assertNotIn("thinking", sent)
@@ -758,7 +760,7 @@ class AgentTest(unittest.TestCase):
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.model.headers[0]["x-api-key"], KEY)
-        self.assertEqual(self.model.headers[0]["anthropic-version"], "2023-06-01")
+        self.assertEqual(self.model.headers[0]["anthropic-version"], "2023-06-01")  # DeepSeek's
         sent = json.dumps(self.model.requests)
         self.assertNotIn(KEY, sent)
         self.assertNotIn("hunter2-token", sent)

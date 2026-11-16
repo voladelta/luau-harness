@@ -124,6 +124,9 @@ constexpr const char* kExaUrl = "https://api.exa.ai/search";
 constexpr const char* kAnthropicUrl = "https://api.anthropic.com/v1/messages";
 constexpr const char* kAnthropicKeyEnv = "ANTHROPIC_API_KEY";
 constexpr const char* kAnthropicModel = "claude-opus-5-5";
+// The Claude API version hx speaks: the latest. DeepSeek's endpoint keeps the one it documents.
+constexpr const char* kAnthropicVersion = "anthropic-version: 2026-10-21";
+constexpr const char* kDeepSeekVersion = "anthropic-version: 2023-06-01";
 
 // Short names for the current Claude models.
 constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
@@ -777,7 +780,7 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string&
                          .auth = hx::Auth::ApiKey,
                          .key = secrets.key,
                          .key_env = "",  // a local proxy may need none
-                         .headers = {"anthropic-version: 2023-06-01"},
+                         .headers = {model.model.starts_with("claude-") ? kAnthropicVersion : kDeepSeekVersion},
                          .form = false,
                          .model = true});
     // DeepSeek's Messages endpoint with DeepSeek's key, whatever the session's model: a session on a Claude model
@@ -787,7 +790,7 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string&
                          .auth = hx::Auth::ApiKey,
                          .key = secrets.tools_key,
                          .key_env = kDeepSeekKeyEnv,
-                         .headers = {"anthropic-version: 2023-06-01"},
+                         .headers = {kDeepSeekVersion},
                          .form = false,
                          .model = true});
     for (const char* name : {"search", "fetch", "ocr"}) {
