@@ -568,10 +568,13 @@ leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set
 ## Limits
 
 - One model endpoint per run, which must accept the Anthropic Messages format and an `x-api-key` header: the Claude
-  API for a `claude-*` model, DeepSeek's otherwise. The model is fixed at start: a project loop that changes
-  `M.model` to a Claude model still talks to the endpoint `--model` or `HX_MODEL` chose. The Claude settings have
-  been checked against a stand-in server, and `tests/live_test.py` passes against the live API on Sonnet 5.5; Opus
-  and Haiku have not been run live.
+  API for a `claude-*` model, DeepSeek's otherwise. The endpoint is fixed at start: a project loop that changes
+  `M.model` to a Claude model still talks to the endpoint `--model` or `HX_MODEL` chose. Within that endpoint the
+  model can change: a sub-agent's turn runs on Sonnet under an Opus session when `M.model` is set for the turn
+  and put back after it, and each request gets its own model's settings from `M.claude`. The Claude settings have
+  been checked against a stand-in server, and `tests/live_test.py` passes against the live API on Opus 5.5 and
+  Sonnet 5.5. Haiku 5.5 fails one of its fifteen checks: told to use the edit function, it sometimes calls a tool
+  named `edit`, which does not exist, before it goes through `lua`; the file still comes out right.
 - No streaming: a reply appears when it is complete.
 - Tool calls in one reply run one after another.
 - The whole conversation is encoded again for every request. At 5 MB that takes 16 ms.
