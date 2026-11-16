@@ -733,7 +733,7 @@ local function git_files(): { string }?
 end
 
 -- The system prompt's part on the project's files, or nil for none. A project that wants another picture
--- replaces this, say with what a tree command it has prints.
+-- replaces this.
 function M.layout(): string?
 	if M.layout_lines < 1 then
 		return nil

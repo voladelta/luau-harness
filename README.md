@@ -232,14 +232,9 @@ with the number of files below it. When the top level alone does not fit, the tr
 many more there are. Where git lists no files (no repository, or one whose `.git` is above the project directory
 and so outside the wall), the tree is the project directory's own entries, one level. It is made once per run,
 like the list of skills, so it does not upset the prompt cache, and it says that it shows the start of the
-session. `M.layout_lines = 0` leaves it out, `M.tree(paths, limit)` draws any list of paths the same way, and a
-project that wants another picture replaces `M.layout`, say with [eza](https://eza.rocks)'s:
-
-```lua
-function M.layout()
-	return "The project's files:\n" .. host.sh("eza --tree --level 2 --git-ignore").out
-end
-```
+session. It needs nothing but git: no tree command has to be installed. `M.layout_lines = 0` leaves it out,
+`M.tree(paths, limit)` draws any list of paths the same way, and a project that wants another picture replaces
+`M.layout`.
 
 A project function may run a `lua` call inside the running one (`M.tools[1].run`), or a whole `M.turn` on another
 `Conversation`, as a sub-agent. The nested call keeps the outer call's printed lines, and the nested turn counts
