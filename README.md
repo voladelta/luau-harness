@@ -85,7 +85,7 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 | `HX_MODEL` | model name; `opus`, `sonnet` and `haiku` stand for `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` | `deepseek-flash`, or `claude-opus-5-5` when `ANTHROPIC_API_KEY` is set and `DEEPSEEK_API_KEY` is not |
 | `HX_API_URL` | Anthropic Messages endpoint | `https://api.anthropic.com/v1/messages` for a `claude-*` model, `https://api.deepseek.com/anthropic/v1/messages` otherwise |
 | `HX_KEY_ENV` | name of the variable holding the API key | `ANTHROPIC_API_KEY` for a `claude-*` model, `DEEPSEEK_API_KEY` otherwise |
-| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
+| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked. DeepSeek has three levels: it takes `medium` and `xhigh` for `high` | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
 | `HX_TOOLS_URL` | base of DeepSeek's Search, Fetch and OCR endpoints, which the built-in `web` and `ocr` extensions call with `DEEPSEEK_API_KEY`, whatever the model | `https://api.deepseek.com/v1/tools` |
 | `HX_EXA_URL` | Exa's search endpoint, which the built-in `exa` extension calls with `EXA_API_KEY`, whatever the model | `https://api.exa.ai/search` |
 | `HX_DEEPSEEK_URL` | DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude model is asked through, a sub-agent say, with `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1/messages` |
@@ -170,8 +170,10 @@ Know these before you rely on it.
 
 ## The loop
 
-`lua/loop.luau` is the whole agent, in one file. It speaks the Anthropic Messages format, asks for adaptive
-thinking, and sends thinking blocks back exactly as they came. It gives the model one tool, `lua`, which runs the
+`lua/loop.luau` is the whole agent, in one file. It speaks the Anthropic Messages format and sends thinking blocks
+back exactly as they came. Thinking is on at both endpoints and is not a setting of hx's: a DeepSeek model thinks
+by default and is sent no thinking field, a Claude model is sent `adaptive`, its only mode, and `HX_EFFORT` is the
+one control. It gives the model one tool, `lua`, which runs the
 code it is sent in the project directory and returns what the code prints and returns. Globals persist from one
 call to the next. The code acts through these functions:
 

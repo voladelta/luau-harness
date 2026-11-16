@@ -422,7 +422,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(self.model.headers[1]["anthropic-beta"], "thinking-binding-controls-2026-08-01,compact-2026-09-04")
         # Another model gets the plain request.
         done = self.run_hx("--model", "deepseek-flash", "go", script=[say("ok")])
-        self.assertEqual(self.model.requests[2]["thinking"], {"type": "adaptive"})
+        self.assertNotIn("thinking", self.model.requests[2])
         self.assertNotIn("fallbacks", self.model.requests[2])
         self.assertNotIn("anthropic-beta", self.model.headers[2])
         # DeepSeek caches by itself and ignores cache_control: the system prompt goes as the plain string.
