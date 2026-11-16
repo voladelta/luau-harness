@@ -98,6 +98,8 @@ type Repeats = { counts: { [string]: number }, worst: { call: string, count: num
 local live: {
 	usage: { replies: number, input: number, cached: number, written: number, output: number },
 	spills: number,
+	subs: number,
+	turns: number,
 	ext_cache: { [string]: { source: string, value: any } },
 	wrappers: { [Function]: (...any) -> ...any },
 	repeats: Repeats,
@@ -106,6 +108,8 @@ local live: {
 	-- For the whole run, from when the module loads:
 	usage = { replies = 0, input = 0, cached = 0, written = 0, output = 0 }, -- tokens, for the line at the end
 	spills = 0, -- files that clipped results went to, so the next one has a name of its own
+	subs = 0, -- sub-agents whose conversations have a log, so the next one has a name of its own
+	turns = 0, -- turns running, one inside another: above 1, the innermost is a sub-agent's
 	ext_cache = {}, -- each extension loaded, by name, with the source it was loaded from
 	wrappers = {}, -- each function's counting wrapper, made once; weak keys, below
 	-- For one turn, set by M.turn: each function call's count by what it was asked and what it returned, and the
@@ -1821,31 +1825,59 @@ local function turn(system: string, talk: Conversation): Reply
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
 end
 
--- Runs the model until it answers without asking for a tool. The turn counts repeats afresh, and puts the outer
--- turn's counts back when it ends, however it ends: as with printed lines in the lua tool, before any other call.
-function M.turn(system: string, talk: Conversation)
-	local outer = live.repeats
-	live.repeats = { counts = {}, worst = nil }
-	local ok, err = pcall(turn, system, talk)
-	live.repeats = outer
-	if not ok then
-		error(err, 0)
-	end
-end
-
 -- With a .hx directory, each session's conversation is kept in .hx/log/ as JSON. The name starts with the time, so
 -- the logs sort by it, and ends with the random part of this run's $TMPDIR (hx-XXXXXX), which no other running hx
 -- shares, so two sessions started in the same second keep two logs. Whether .hx exists is asked at each save, not
 -- once at the start: a session that makes it, say by writing its first extension, keeps its log too.
 local log_path = (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
 	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0")
-local function save(system: string, messages: { Message })
+local function save(system: string, messages: { Message }, path: string)
 	if host.list(".hx") then
 		-- Logs hold file contents, so the directory keeps itself out of git, however .hx/ came to exist.
 		if not host.read(".hx/log/.gitignore") then
 			host.write(".hx/log/.gitignore", "*\n")
 		end
-		host.write(log_path, json.encode({ system = system, messages = messages }))
+		host.write(path, json.encode({ system = system, messages = messages }))
+	end
+end
+
+-- A sub-agent's conversation, one whose turn runs inside another turn, is kept beside the session's, as
+-- NAME-sub-N.json: N counts the sub-agents in the order each first ran, and a conversation that has several turns
+-- keeps its file. The name sorts ahead of the session's own, so the session's log is still the last of its time.
+local sub_logs: { [Conversation]: string } = {}
+setmetatable(sub_logs, { __mode = "k" })
+local function sub_log(talk: Conversation): string
+	local path = sub_logs[talk]
+	if not path then
+		live.subs += 1
+		path = (log_path:gsub("%.json$", ("-sub-%d.json"):format(live.subs)))
+		sub_logs[talk] = path
+	end
+	return path
+end
+
+-- Runs the model until it answers without asking for a tool. The turn counts repeats afresh, and puts the outer
+-- turn's counts back when it ends, however it ends: as with printed lines in the lua tool, before any other call.
+-- A turn inside another is a sub-agent's: its conversation is saved as the session's own is, after every reply
+-- that called tools and when the turn ends. A stop skips that last save, since no call runs once it has begun.
+function M.turn(system: string, talk: Conversation)
+	local outer = live.repeats
+	local path: string? = if live.turns > 0 then sub_log(talk) else nil
+	if path and not talk.on_answer then
+		talk.on_answer = function()
+			save(system, talk.messages, path)
+		end
+	end
+	live.repeats = { counts = {}, worst = nil }
+	live.turns += 1
+	local ok, err = pcall(turn, system, talk)
+	live.turns -= 1
+	live.repeats = outer
+	if path then
+		save(system, talk.messages, path)
+	end
+	if not ok then
+		error(err, 0)
 	end
 end
 
@@ -1887,7 +1919,7 @@ function M.main(): number
 	local talk = Conversation.new()
 	-- Encoding even a long conversation takes milliseconds, next to seconds for a reply.
 	talk.on_answer = function()
-		save(system, talk.messages)
+		save(system, talk.messages, log_path)
 	end
 	local task = table.concat(host.args, " ")
 
@@ -1904,7 +1936,7 @@ function M.main(): number
 		end
 		talk:say(task)
 		local ok, err = host.try(M.turn, system, talk)
-		save(system, talk.messages)
+		save(system, talk.messages, log_path)
 		report()
 		if not ok then
 			error(err, 0)
@@ -1935,7 +1967,7 @@ function M.main(): number
 			local ok, err = host.try(M.turn, system, talk)
 			if not ok then
 				if err == "terminated" then
-					save(system, talk.messages)
+					save(system, talk.messages, log_path)
 					host.log(PASTE_OFF)
 					error(err, 0)
 				end
@@ -1948,7 +1980,7 @@ function M.main(): number
 					host.log(M.printable("[the turn failed: " .. tostring(err) .. "]"))
 				end
 			end
-			save(system, talk.messages)
+			save(system, talk.messages, log_path)
 		end
 	end
 	host.log(PASTE_OFF)

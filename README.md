@@ -290,8 +290,10 @@ from the cache and written to it.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON, after every reply that
 called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. Whether
-the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. The logs
-hold file contents, so that directory carries a `.gitignore` that keeps all of it out of git.
+the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. A
+sub-agent's conversation, one whose turn runs inside another turn, is saved the same way beside the session's,
+under the session's name with `-sub-1`, `-sub-2` and so on. The logs hold file contents, so that directory
+carries a `.gitignore` that keeps all of it out of git.
 
 ### The conversation is a state machine
 

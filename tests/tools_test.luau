@@ -316,8 +316,23 @@ local same = "return bash('echo same')"
 replies = { calls(same), calls(same), calls("return subagent()"), calls(same), done, calls(same), done }
 local talk = loop.Conversation.new()
 talk:say("the task")
+host.write(".hx/here", "") -- with a .hx directory, conversations are logged
 loop.turn("system", talk)
 check("the script was played to the end", #replies, 0)
+-- The sub-agent's conversation has a log of its own. The outer turn here has none: the session's log is M.main's.
+local logged = {}
+for _, name in host.list(".hx/log") or {} do
+	if name:match("%.json$") then
+		table.insert(logged, name)
+	end
+end
+check("a sub-agent's conversation is logged, and only its", #logged, 1)
+check("under the session's name and its number", (logged[1] or ""):match("%-sub%-1%.json$"), "-sub-1.json")
+local sub = json.decode(host.read(".hx/log/" .. (logged[1] or "")) or "{}")
+check("with the system prompt it ran on", sub.system, "system")
+check("from its task", sub.messages and sub.messages[1].content, "a sub-task")
+check("to its last reply", sub.messages and #sub.messages, 4)
+host.sh("rm -rf .hx")
 local reminders = {}
 for _, message in talk.messages do
 	for _, block in if type(message.content) == "table" then message.content else {} do

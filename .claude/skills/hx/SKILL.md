@@ -59,7 +59,8 @@ hx --judge KIT [options] TASK...      the agent, with a judge (see "The judge")
   reads text nobody vouches for, run hx in a clone and pull from it, since hooks and `.git/config` do not show
   in a diff.
 - To see what a session did, read its log: where a `.hx` directory exists, each session's conversation is saved
-  as JSON in `.hx/log/`. It holds the main conversation only, so a sub-agent shows there as one call and its result.
+  as JSON in `.hx/log/TIME-ID.json`, and each sub-agent's beside it as `TIME-ID-sub-N.json`. A project with no
+  `.hx` directory keeps no log.
 - `hx --help` has every option and variable.
 
 ## From inside a session
@@ -163,8 +164,7 @@ return M
 - `usage` is the one line the model reads about a function, in the `lua` tool's description, not in the system
   prompt; `run` returns what the model should see and raises to report failure.
 - A sub-agent shares the model's globals and the wall. Its words also go to stdout, its replies are counted in
-  the line at the end of the run, and its conversation is not logged: to keep it, write
-  `json.encode(talk.messages)` to a file after its turn.
+  the line at the end of the run, and its conversation has a log of its own (see "Running hx").
 - A sub-agent runs on another model of the same endpoint, Sonnet under Opus say, when `M.model` is set for its
   turn and put back however the turn ends:
   `local outer = M.model; M.model = "claude-sonnet-5-5"; local ok, err = pcall(M.turn, system, talk); M.model = outer`,
