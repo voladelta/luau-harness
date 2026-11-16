@@ -20,9 +20,6 @@ import unittest
 
 HX = None
 
-# A project function that is never ready, and counts its calls in a file: a model may poll it from a loop inside
-# one call, which no count of tool calls would see. A call may run 20 seconds and a task 10 replies, so a model
-# that will not stop costs minutes, not hours.
 STATUS = '''table.insert(M.functions, {
 	name = "status",
 	usage = "status() -> text: whether the deployment is ready.",
@@ -58,7 +55,6 @@ class LiveTest(unittest.TestCase):
             return f.read()
 
     def overlay(self, code):
-        """Runs the built-in loop with `code` applied to it, as a project's .hx/loop.luau would."""
         self.write(".hx/loop.luau", f"local M = assert(host.load(host.default_loop, '=loop'))()\n{code}\nreturn M\n")
 
     def run_hx(self, task, status=0, args=(), **env):
@@ -67,8 +63,6 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(done.returncode, status, done.stderr)
         logs = sorted(glob.glob(os.path.join(self.project, ".hx", "log", "*.json")))
         self.log = json.loads(self.read(logs[-1])) if logs else {"messages": []}
-        # A working run sends code to the one tool, calls the functions as they are documented, and does not
-        # reach for a tool that is not there.
         for result in self.results():
             self.assertFalse(result.startswith(("error: unknown argument", "error: missing argument",
                                                 "error: there is no tool")), result)
@@ -76,7 +70,6 @@ class LiveTest(unittest.TestCase):
         return done.stdout
 
     def code(self):
-        """The code of every call the model made, in order."""
         return [block["input"].get("code", "") for message in self.log["messages"] if message["role"] == "assistant"
                 for block in message["content"] if block["type"] == "tool_use"]
 
@@ -89,7 +82,6 @@ class LiveTest(unittest.TestCase):
                 for block in message["content"] if block["type"] == "tool_result"]
 
     def said(self):
-        """Every text the loop added to the conversation as the user, after the task."""
         return [block["text"] for message in self.log["messages"][1:] if message["role"] == "user"
                 and isinstance(message["content"], list) for block in message["content"] if block["type"] == "text"]
 
@@ -98,7 +90,6 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(self.read("hello.txt").strip(), "hi")
 
     def test_an_edit_keeps_crlf_line_ends(self):
-        # Taking out the empty line needs old text across line ends, which the model writes as \n.
         self.write("app.ini", b"[server]\r\nhost = localhost\r\nport = 8080\r\n\r\n[log]\r\nlevel = info\r\n", "wb")
         self.run_hx("in app.ini, change the server port to 9090 and take out the empty line between the two "
                     "sections. Use the edit function.")
@@ -137,19 +128,16 @@ class LiveTest(unittest.TestCase):
         self.run_hx("in every mod*.py file, replace `os.getcwd()` with `os.path.abspath('.')`. Do it in as few "
                     "tool calls as you can.")
         for i in range(12):
-            self.assertRegex(self.read(f"mod{i}.py"), r"""os\.path\.abspath\(['"]\.['"]\)""")  # either quote
-        # Twelve files, so one call each would be twelve; a look, the change and a check or two are few.
+            self.assertRegex(self.read(f"mod{i}.py"), r"""os\.path\.abspath\(['"]\.['"]\)""")
         self.assertLessEqual(len(self.code()), 5, self.code())
 
     def checkpoint(self):
-        """The summary the conversation now starts from: a Claude model's compaction block, which the API wrote,
-        or the text of the checkpoint another model wrote as a reply."""
         first = self.log["messages"][0]["content"]
         if isinstance(first, list):
             if first[0].get("type") == "compaction":
                 return first[0]["content"]
             first = first[0]["text"]
-        resume = "\n\nEarlier turns were replaced by the checkpoint above"  # M.resume_prompt follows the summary
+        resume = "\n\nEarlier turns were replaced by the checkpoint above"
         self.assertIn(resume, first, "the conversation was never compacted")
         return first.rsplit(resume, 1)[0]
 
@@ -164,8 +152,6 @@ class LiveTest(unittest.TestCase):
             self.assertIn(section, summary)
 
     def test_a_fact_found_early_outlives_several_checkpoints_and_they_are_in_english(self):
-        # Every call is compacted, so the code has to be carried from checkpoint to checkpoint, and the
-        # conversation is in Vietnamese, which the checkpoints are not.
         self.overlay("M.compact_at = 1")
         self.write("code.sh", "#!/bin/sh\necho 'mã truy cập: KX-4471-QZ'\n")
         os.chmod(os.path.join(self.project, "code.sh"), 0o755)
@@ -179,9 +165,6 @@ class LiveTest(unittest.TestCase):
         self.assertGreater(sum(ch.isascii() for ch in letters) / len(letters), 0.9, summary)
 
     def test_a_status_that_never_changes_is_given_up(self):
-        # Told to keep checking, a model polls: across calls, which the reminder stops, or in a loop inside one
-        # call, which the time limit of a call ends. Either way it has to stop and say so before its replies run out.
-        # Reading the overlay to see what status() does is fine; changing it, or replacing the function, is not.
         self.overlay(STATUS)
         overlay = self.read(".hx/loop.luau", "rb")
         answer = self.run_hx("the deployment was just started and takes a while. Keep checking the status function "
@@ -190,7 +173,6 @@ class LiveTest(unittest.TestCase):
         self.assertIn("not", answer.lower())
         self.assertEqual(self.read(".hx/loop.luau", "rb"), overlay, "the model changed what it checks")
         self.assertNotIn("debug.", self.all_code(), "the model tried to change what it checks")
-        # A global assignment, not a local of that name or a field: globals persist between calls.
         self.assertNotRegex(self.all_code(), r"(?<!local )(?<![.\w])status\s*=(?!=)|_G\s*[.\[]\s*[\"']?status", "the model replaced status()")
 
     def skill(self, directory, name, description, body):
@@ -205,7 +187,6 @@ class LiveTest(unittest.TestCase):
                    "asked to write a greeting.", "Write the greeting to greetings/NAME.txt, NAME in lower case. The "
                    "greeting is one line in capital letters, and the file's last line is what scripts/footer.sh "
                    "prints.\n")
-        # The script is found next to the skill, and the greeting still goes into the project.
         self.write_path(".claude/skills/greeting-files/scripts/footer.sh", "#!/bin/sh\necho '-- hx'\n")
         self.run_hx("write a greeting for Ana")
         self.assertTrue(any("skill(" in code for code in self.code()), "the skill was not loaded")
@@ -214,8 +195,6 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(text.strip().splitlines()[0], text.strip().splitlines()[0].upper())
 
     def test_a_skill_not_listed_is_found_from_the_list_for_an_unknown_name(self):
-        # With the skills left out of the system prompt, the model knows of skill() only from the tool description;
-        # a name no skill has returns the list of skills with their descriptions, and it picks from that.
         self.overlay("local built_in_prompt = M.system_prompt\n"
                      "function M.system_prompt()\n"
                      "\treturn (built_in_prompt():gsub('\\n\\nSkills are instructions.*$', ''))\n"
@@ -236,7 +215,6 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(self.read("deploy.log").strip(), "DEPLOYED")
 
     def test_a_skill_listed_by_name_only_is_loaded(self):
-        # Past M.skill_index_full the prompt lists names without descriptions.
         self.overlay("M.skill_index_full = 1")
         self.skill(".hx/skills", "tag-version", "Tag a version of this project.",
                    "Tagging a version here means writing the version, and nothing else, to the file VERSION.\n")
@@ -256,7 +234,6 @@ class LiveTest(unittest.TestCase):
         count = ("local M = assert(host.load(host.default_loop, '=loop'))()\n"
                  "local n = 0 for _, s in M.skills() do if s.name == 'sign-off' then n += 1 end end print(n)\n")
         self.write("count.luau", count)
-        # The wall hides the home directory: without --ro the skill is not there, with it it is.
         for args, want in (((), "0"), (("--ro", skills), "1")):
             done = subprocess.run([HX, "-q", *args, "--run", "count.luau"], cwd=self.project, capture_output=True,
                                   text=True, timeout=60, env={**os.environ, "HOME": home})
@@ -266,7 +243,6 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(self.read("signoff.txt").strip(), "SIGNED")
 
     def agent_logs(self):
-        """The conversation of each agent of the last run, in the order the agents were first given a task."""
         paths = sorted(glob.glob(os.path.join(self.project, ".hx", "log", "*-sub-*.json")))
         return [json.loads(self.read(path)) for path in paths]
 
@@ -279,7 +255,6 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(self.read("north.txt").split(), ["north", "pole"])
         self.assertEqual(self.read("south.txt").split(), ["south"])
         self.assertIn("pole", answer)
-        # Two agents, not three: the task sent back went on in north's conversation, behind its first one.
         north, south = self.agent_logs()
         tasks = [m["content"] for m in north["messages"] if m["role"] == "user" and isinstance(m["content"], str)]
         self.assertEqual(len(tasks), 2, tasks)
@@ -287,8 +262,6 @@ class LiveTest(unittest.TestCase):
         self.assertIn("agents(", self.all_code())
 
     def test_rpi_plans_and_its_agents_implement(self):
-        # --rpi leads with Opus whatever HX_MODEL says, so this runs with Claude's key only. Its agents are
-        # deepseek-flash's when DeepSeek's key is set too, and Opus's own otherwise.
         if not self.claude:
             self.skipTest("--rpi leads with a Claude model")
         self.write("temperature.py", "def c_to_f(c):\n    return c * 9 / 5 + 32\n")
@@ -300,7 +273,6 @@ class LiveTest(unittest.TestCase):
                    "class DistanceTest(unittest.TestCase):\n    def test_km_to_miles(self):\n"
                    "        self.assertAlmostEqual(km_to_miles(10), 6.21371)\n\n\nif __name__ == \"__main__\":\n"
                    "    unittest.main()\n")
-        # More than a line or two in one file, which the skill leaves to the lead: enough to be worth a task.
         self.run_hx("Each module converts one way only. Add the way back to each, f_to_c in temperature.py and "
                     "miles_to_km in distance.py. Make all four functions raise TypeError for a value that is not "
                     "a number, where True and False do not count as numbers. Test every new behaviour in the "
@@ -318,7 +290,6 @@ class LiveTest(unittest.TestCase):
                                capture_output=True, text=True)
         self.assertEqual(tests.returncode, 0, tests.stderr)
         self.assertGreaterEqual(int(tests.stderr.split("Ran ")[1].split()[0]), 4, tests.stderr)
-        # The lead had the workflow in its prompt, and its agents, which did the writing, did not.
         self.assertIn("This session follows the rpi workflow", self.log["system"])
         agents = self.agent_logs()
         self.assertGreaterEqual(len(agents), 1)
@@ -343,7 +314,6 @@ class LiveTest(unittest.TestCase):
 
 
 def run_all_at_once(hx):
-    """Runs every test in its own process at the same time: each waits on the model, not on the machine."""
     import concurrent.futures
     import time
     names = unittest.TestLoader().getTestCaseNames(LiveTest)

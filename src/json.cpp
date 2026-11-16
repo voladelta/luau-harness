@@ -25,12 +25,10 @@ namespace {
 
 constexpr std::size_t kMaxDepth = 200;
 constexpr char kArrayMeta[] = "hx.json.array";
-constexpr std::string_view kReplacement = "\xEF\xBF\xBD";  // U+FFFD
-// Largest magnitude below which every integral double is an exact integer.
+constexpr std::string_view kReplacement = "\xEF\xBF\xBD";
 constexpr double kExactIntegerLimit = 9007199254740992.0;
 
-// The light userdata behind json.null. Only its address is used; nothing reads or writes it.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): lua_pushlightuserdata takes a void*
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 constinit char null_tag = 0;
 
 bool is_null(lua_State* L, int idx) {
@@ -52,10 +50,6 @@ bool is_marked_array(lua_State* L, int idx) {
     return same;
 }
 
-// --- decoding ---------------------------------------------------------------------------------------------
-
-// RapidJSON SAX handler that builds the decoded value on the Lua stack while the reader walks the text, so no
-// intermediate document is allocated. The method names are the ones the reader calls.
 class LuaBuilder : public rapidjson::BaseReaderHandler<rapidjson::UTF8<>, LuaBuilder> {
   public:
     explicit LuaBuilder(lua_State* L) : L_(L) {}
@@ -91,7 +85,7 @@ class LuaBuilder : public rapidjson::BaseReaderHandler<rapidjson::UTF8<>, LuaBui
   private:
     struct Frame {
         bool array;
-        int next;  // index of the next element, for arrays
+        int next;
     };
 
     bool number(double value) {
@@ -102,7 +96,7 @@ class LuaBuilder : public rapidjson::BaseReaderHandler<rapidjson::UTF8<>, LuaBui
     bool open(bool array) {
         if (frames_.size() >= kMaxDepth) {
             too_deep_ = true;
-            return false;  // stops the reader
+            return false;
         }
         luaL_checkstack(L_, 4, "json nesting");
         lua_newtable(L_);
@@ -118,7 +112,6 @@ class LuaBuilder : public rapidjson::BaseReaderHandler<rapidjson::UTF8<>, LuaBui
         return attach();
     }
 
-    // Stores the value on top of the stack into the container being built. The root value stays where it is.
     bool attach() {
         if (frames_.empty()) {
             return true;
@@ -127,7 +120,7 @@ class LuaBuilder : public rapidjson::BaseReaderHandler<rapidjson::UTF8<>, LuaBui
         if (frame.array) {
             lua_rawseti(L_, -2, frame.next++);
         } else if (is_null(L_, -1)) {
-            lua_pop(L_, 2);  // a null member is an absent key
+            lua_pop(L_, 2);
         } else {
             lua_rawset(L_, -3);
         }
@@ -148,10 +141,8 @@ int l_decode(lua_State* L) {
     rapidjson::MemoryStream memory(text, length);
     rapidjson::EncodedInputStream<rapidjson::UTF8<>, rapidjson::MemoryStream> stream(memory);
     rapidjson::Reader reader;
-    // Iterative: nesting depth cannot overflow the C stack. Full precision: numbers round-trip exactly.
     const rapidjson::ParseResult result =
         reader.Parse<rapidjson::kParseIterativeFlag | rapidjson::kParseFullPrecisionFlag>(stream, builder);
-    // The reader takes a NUL byte for the end of the text, so make sure it really was the end.
     const bool stopped_early = !result.IsError() && memory.Tell() < length;
     if (!result.IsError() && !stopped_early) {
         return 1;
@@ -172,9 +163,6 @@ int l_decode(lua_State* L) {
     return 2;
 }
 
-// --- encoding ---------------------------------------------------------------------------------------------
-
-// Length of the well-formed UTF-8 sequence at the start of s (1 to 4), or 0 when the bytes there are not one.
 std::size_t utf8_length(std::string_view s) {
     const auto byte = [&](std::size_t i) { return static_cast<unsigned char>(s[i]); };
     const unsigned char lead = byte(0);
@@ -189,10 +177,10 @@ std::size_t utf8_length(std::string_view s) {
     } else if (lead >= 0xE0 && lead <= 0xEF) {
         length = 3;
         if (lead == 0xE0) {
-            low = 0xA0;  // no overlong forms
+            low = 0xA0;
         }
         if (lead == 0xED) {
-            high = 0x9F;  // no surrogates
+            high = 0x9F;
         }
     } else if (lead >= 0xF0 && lead <= 0xF4) {
         length = 4;
@@ -200,7 +188,7 @@ std::size_t utf8_length(std::string_view s) {
             low = 0x90;
         }
         if (lead == 0xF4) {
-            high = 0x8F;  // nothing above U+10FFFF
+            high = 0x8F;
         }
     } else {
         return 0;
@@ -216,8 +204,6 @@ std::size_t utf8_length(std::string_view s) {
     return length;
 }
 
-// Returns s itself when it is valid UTF-8. Otherwise fills `scratch` with a copy in which every bad byte is
-// U+FFFD, and returns a view of that.
 std::string_view valid_utf8(std::string_view s, std::string& scratch) {
     std::size_t i = 0;
     while (i < s.size()) {
@@ -245,12 +231,10 @@ std::string_view valid_utf8(std::string_view s, std::string& scratch) {
     return scratch;
 }
 
-// Walks a Lua value and feeds it to a RapidJSON writer.
 class Encoder {
   public:
     explicit Encoder(lua_State* L) : L_(L), writer_(buffer_) {}
 
-    // Writes the value at absolute stack index idx. On false, error() says why.
     bool value(int idx, std::size_t depth) {
         switch (lua_type(L_, idx)) {
             case LUA_TNIL:
@@ -291,7 +275,6 @@ class Encoder {
         if (!std::isfinite(n)) {
             return fail("cannot encode nan or inf");
         }
-        // An exact integer is written as one: no exponent and no ".0".
         if (std::floor(n) == n && std::fabs(n) < kExactIntegerLimit) {
             return writer_.Int64(static_cast<std::int64_t>(n));
         }
@@ -313,12 +296,10 @@ class Encoder {
         }
         luaL_checkstack(L_, 4, "json nesting");
 
-        // The length is a border, not a count: {1, 2, nil, 4, x = 5} may have length 4 and four keys. So a table
-        // is an array only when every key is an integer in 1..length and there are length of them.
         const auto length = static_cast<std::size_t>(lua_objlen(L_, idx));
         std::size_t count = 0;
-        std::size_t indices = 0;             // keys that are integers in 1..length
-        std::vector<std::string_view> keys;  // views into strings the table keeps alive
+        std::size_t indices = 0;
+        std::vector<std::string_view> keys;
         lua_pushnil(L_);
         while (lua_next(L_, idx) != 0) {
             ++count;
@@ -355,7 +336,7 @@ class Encoder {
         if (keys.size() != count) {
             return fail("a table is neither an array (keys 1..n) nor an object (string keys)");
         }
-        std::sort(keys.begin(), keys.end());  // equal values always produce the same bytes
+        std::sort(keys.begin(), keys.end());
         writer_.StartObject();
         for (const std::string_view key : keys) {
             if (!string(key, true)) {

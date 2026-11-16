@@ -1,5 +1,3 @@
-// The judge's process: forking it, its wall, and the session's end. What it does is lua/judge.luau.
-
 #include "judge.h"
 
 #include <sys/prctl.h>
@@ -34,7 +32,6 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Whether a rule lets in path, or anything under it.
 bool reaches(const std::vector<Rule>& rules, const fs::path& path) {
     return std::any_of(rules.begin(), rules.end(), [&](const Rule& rule) {
         std::error_code ec;
@@ -43,13 +40,10 @@ bool reaches(const std::vector<Rule>& rules, const fs::path& path) {
     });
 }
 
-// The flag that adds a user rule: --ro or --rw.
 std::string_view flag_of(const Rule& rule) {
     return rule.access == Access::Write ? "--rw" : "--ro";
 }
 
-// Makes the directory where the judge keeps the champion's patch and the ledger,
-// $XDG_STATE_HOME/hx/judge/PROJECT-TIME-XXXXXX, new for this session, and returns its canonical path.
 fs::path make_judge_state(const fs::path& project) {
     std::string base = env_or("XDG_STATE_HOME");
     if (!base.starts_with('/')) {
@@ -77,7 +71,7 @@ fs::path make_judge_state(const fs::path& project) {
                              const fs::path& kit, const fs::path& state) {
     int status = kExitFailure;
     try {
-        setsid();  // the terminal's Ctrl-C is for the agent; the judge ends when its channel does
+        setsid();
         if (dup2(channel, STDIN_FILENO) < 0 || dup2(channel, STDOUT_FILENO) < 0) {
             throw std::runtime_error(fmt::format("judge: dup2: {}", error_text()));
         }
@@ -85,7 +79,7 @@ fs::path make_judge_state(const fs::path& project) {
         static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
         const fs::path tmp = state / "tmp";
         fs::create_directories(tmp);
-        setenv("TMPDIR", tmp.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): one thread
+        setenv("TMPDIR", tmp.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
 
         std::vector<Rule> rules = walls.system;
         rules.push_back({project.string(), Access::Read, true});
@@ -107,7 +101,6 @@ fs::path make_judge_state(const fs::path& project) {
     _exit(status);
 }
 
-// The kit's scripts that exist must be executable, and run must exist.
 void check_kit(const fs::path& kit) {
     for (const char* name : {"run", "build", "check"}) {
         const fs::path script = kit / name;
@@ -121,7 +114,6 @@ void check_kit(const fs::path& kit) {
     }
 }
 
-// Reads the judge's first line: "ready" once it has measured the starting point, or why it cannot judge.
 void await_judge(int channel) {
     std::string line;
     char c = 0;
@@ -171,7 +163,7 @@ Judge spawn_judge(const std::string& kit_dir, const fs::path& project, const Jud
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends.data()) != 0) {
         throw std::runtime_error(fmt::format("socketpair: {}", error_text()));
     }
-    static_cast<void>(std::fflush(nullptr));  // or the child would write out the parent's buffers again
+    static_cast<void>(std::fflush(nullptr));
     judge.pid = fork();
     if (judge.pid < 0) {
         throw std::runtime_error(fmt::format("fork: {}", error_text()));
@@ -186,16 +178,13 @@ Judge spawn_judge(const std::string& kit_dir, const fs::path& project, const Jud
     return judge;
 }
 
-// hx cannot signal the judge (Landlock keeps the agent's processes from signalling outside their domain), so it
-// hangs up: the judge's trial commands end on the hang-up (host.sh's hangup option), and it records the trial as
-// stopped, judges nothing more and writes its summary.
 void finish_judge(const Judge& judge) {
-    constexpr int kWaitTicks = 300;  // 30 s, in tenths
+    constexpr int kWaitTicks = 300;
     shutdown(judge.channel, SHUT_WR);
     for (int tick = 0; tick < kWaitTicks; ++tick) {
         const pid_t done = waitpid(judge.pid, nullptr, WNOHANG);
         if (done == judge.pid || (done < 0 && errno == ECHILD)) {
-            return;  // gone, or already reaped by host.sh
+            return;
         }
         nap(100);
     }

@@ -1,19 +1,15 @@
 -- searches the web and fetches pages, through DeepSeek: search(query, {count?, content?, question?}) -> results, fetch(url) -> markdown
 --!strict
---
--- Built into hx; a project's own .hx/ext/web.luau takes its place. Both calls go to DeepSeek's Search and Fetch
--- APIs with DEEPSEEK_API_KEY, whatever model the loop talks to. hx adds the key; this code never sees it.
 
 local http = ext("_http")
 local note, check = http.note, http.check
 
 local M = {}
 
-M.attempts = 3 -- a request that fails with 408, 429 or 5xx, or gets no answer, is tried this many times
-M.timeout = 60 -- seconds per request
-M.summary_limit = 800 -- characters of a result's summary shown when results are printed; the field keeps all of it
+M.attempts = 3
+M.timeout = 60
+M.summary_limit = 800
 
--- One search result, as search returns it.
 type Result = {
 	title: string,
 	url: string,
@@ -28,8 +24,6 @@ type Result = {
 
 type SearchOptions = { count: number?, content: boolean?, question: string? }
 
--- Posts a request to DeepSeek's tool endpoint `name` and returns the decoded answer. Retries what is worth
--- retrying, then raises.
 local function call(name: string, request: { [string]: unknown }): { [string]: any }
 	if not host.tools then
 		error(name .. ": hx was started without DEEPSEEK_API_KEY, so DeepSeek's " .. name .. " cannot be used", 0)
@@ -42,11 +36,10 @@ local function call(name: string, request: { [string]: unknown }): { [string]: a
 		label = name,
 		what = name,
 		sender = "DeepSeek",
-		body_error = {}, -- an answer that carries an error failed, and another try would not change it
+		body_error = {},
 	})
 end
 
--- What printing a list of search results shows: one block per result, best first.
 local function results_text(results: { Result }): string
 	if #results == 0 then
 		return "[no results]"
@@ -64,7 +57,6 @@ local function results_text(results: { Result }): string
 			lines[1] ..= " (" .. table.concat(about, ", ") .. ")"
 		end
 		table.insert(lines, "   " .. r.url)
-		-- The whole summary stays in the result.
 		local text: string = http.clip(r.summary ~= "" and r.summary or r.snippet, M.summary_limit)
 		if text ~= "" then
 			table.insert(lines, "   " .. text)
@@ -78,12 +70,6 @@ local function results_text(results: { Result }): string
 end
 local Results = { __tostring = results_text }
 
--- search(query, {count = 10, content = false, question = nil}) -> results
---
--- query takes site:, -site:, lang:, after:, before: and "exact phrases", and is at most 128 characters. count is
--- 1 to 50. content = true asks for each page's text too. question is the user's own words, which helps ranking.
--- The results are a list, best first, of {title, url, snippet, summary, content?, site_name?, date?, rerank_score
--- (0-3; 1.5 and up is good), authority (-1 unknown, 3 and up is authoritative)}. Printed, they read as text.
 function M.search(query: string, options: SearchOptions?)
 	check("web.search", query, 1, "query", "string")
 	check("web.search", options, 2, "options", "table", true)
@@ -101,9 +87,8 @@ function M.search(query: string, options: SearchOptions?)
 		check("web.search", question, 2, "options.question", "string")
 		local characters = utf8.len(question)
 		if not characters then
-			question = nil -- not UTF-8: it would only get the whole search refused
+			question = nil
 		elseif characters > 128 then
-			-- The API takes 128 characters. A text of more than 128 has a 129th, so utf8.offset finds it.
 			question = question:sub(1, (utf8.offset(question, 129) :: number) - 1)
 		end
 	end
@@ -131,8 +116,6 @@ function M.search(query: string, options: SearchOptions?)
 	return setmetatable(results, Results)
 end
 
--- fetch(url) -> text: the page as Markdown. When the page has a title that its first lines do not already show,
--- it comes first as a heading.
 function M.fetch(url: string): string
 	check("web.fetch", url, 1, "url", "string")
 	if not url:match("^[Hh][Tt][Tt][Pp][Ss]?://[^/%s]") or #url > 8192 then

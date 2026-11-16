@@ -284,5 +284,5 @@ luau-analyze lua/*.luau lua/ext/*.luau tests/*.luau                          # p
   `hx --run`, and `tests/agent_test.py`, which drives the whole agent against a scripted model. A new behaviour
   gets a check in one of them.
 - One runs by hand from a scratch directory: `hx -q --ro /path/to/tests --run /path/to/tests/skills_test.luau`.
-- Comments and commit messages say what is true now, in plain sentences: `loop: an edit in a \r\n file keeps its
-  line ends`.
+- No explanatory comments; `AGENTS.md` lists the few comments that stay. Commit messages say what is true now, in
+  plain sentences: `loop: an edit in a \r\n file keeps its line ends`.

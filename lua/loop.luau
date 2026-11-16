@@ -1,48 +1,5 @@
 --!strict
--- The hx loop, built into hx. A project changes it in .hx/loop.luau, which loads this module, replaces some of
--- its fields and returns it (`hx --init` writes such a file), or owns all of it as a copy (`hx --init --full`). The
--- parts meant to be replaced are fields of M and are always called through M.
---
--- The host supplies a small kernel and nothing else:
---   host.llm(body, {timeout=, beta=, endpoint=}) -> status, text, retry_after? | nil, error     POST to the endpoint;
---                                                     the host adds the API key, and beta as the anthropic-beta
---                                                     header. endpoint = "deepseek" is DeepSeek's, with its key,
---                                                     whatever model the session started on
---   host.sh(command, {timeout=}) -> {out=, code=, signal=, timed_out=}
---   host.read(path), host.write(path, data), host.list(dir)
---   host.clip(text, limit) -> text | head, tail       text when it fits in limit bytes; else up to limit // 2 from
---                                                     each end, cut at a line or a character, as host.sh's output
---   host.load(source, name, env) -> function | nil, error
---   host.try(fn, ...) -> true, ... | false, error     a pcall that is also where a stop ends
---   host.timed(seconds, fn, ...) -> true, ... | false, error     host.try with a time limit
---   host.input(prompt), host.log(text), host.sleep(seconds), host.env(name)
---   host.args, host.cwd, host.interactive, host.quiet, host.sandboxed, host.default_loop
---   host.tty                                          stdout is a terminal
---   host.model                                        the model --model or HX_MODEL chose, its alias resolved
---                                                     (opus is claude-opus-5-5), or the default
---   host.tool(name, request, {timeout=}) -> status, text | nil, error     DeepSeek's search, fetch or ocr endpoint,
---                                                     or Exa's search for "exa"; the host adds the key
---   host.tools, host.exa                              DEEPSEEK_API_KEY, EXA_API_KEY is there
---   host.extensions                                   the built-in extensions' sources, by name
---   host.skills                                       the built-in skills' SKILL.md texts, by name
---   host.judge(line?) -> {lines}, pending, host.judged     the judge's channel, with --judge KIT
---   host.spawn(fn, ...) -> id                         forks hx: the child runs fn(...) in a copy of this VM, behind
---                                                     the same wall, while this process goes on
---   host.wait(seconds?) -> id, ok, text | nil, running    the first child that has ended, with the string its
---                                                     function returned or the error it raised; or nil when none
---                                                     ends in time, and how many are still running
---   host.workflow                                     the skill the session is led by: "rpi" with --rpi, else nil
---   json.encode, json.decode, json.array, json.null
--- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
--- host.timed returns; a plain pcall cannot swallow them.
--- The whole process sits inside one Landlock ruleset, so nothing in this file can reach more of the machine
--- than the model's own shell can.
 
--- The shapes the loop is built on. host and json are untyped, so what they return is `any`: a local that holds it
--- is annotated with what the primitive says it returns, so that a check of it narrows the type.
-
--- A block of a message's content, as the API sends it: text, thinking, tool_use, tool_result, compaction,
--- fallback and others. Blocks go back exactly as they came, so a block keeps fields the loop never names.
 type Block = {
 	type: string,
 	text: string?,
@@ -56,9 +13,7 @@ type Block = {
 	from: any,
 	to: any,
 }
--- The user's content may be a plain string; the model's is always a list of blocks.
 type Message = { role: string, content: string | { Block } }
--- What a reply's usage says: tokens, and for a compaction the summarization call's in iterations.
 type Usage = {
 	input_tokens: number?,
 	cache_read_input_tokens: number?,
@@ -66,44 +21,30 @@ type Usage = {
 	output_tokens: number?,
 	iterations: { Usage }?,
 }
--- A decoded reply from the model.
 type Reply = { content: { Block }, stop_reason: string?, stop_details: any, usage: Usage? }
--- A function the model's code calls (see M.functions).
 type Function = { name: string, usage: string, run: (...any) -> ...any }
--- The JSON schema of a tool's arguments, as far as the loop reads it.
 type Schema = { type: string?, properties: { [string]: any }?, required: { string }? }
--- A tool the model is offered (see M.tools): the text of its result, and whether it failed.
 type Tool = {
 	name: string,
 	description: string | () -> string,
 	parameters: Schema?,
 	run: ({ [string]: any }) -> (string, boolean?),
 }
--- A skill found in one of M.skill_dirs, or built into hx (see M.skills). A built-in one has no directory: its
--- SKILL.md is `source`, and `path` says where it is from instead of naming a file.
 type Skill = { name: string, description: string, dir: string, path: string, hidden: boolean, source: string? }
--- What M.claude says of a model the loop knows.
 type Features = { effort: string?, fallbacks: string?, display: string?, compaction: boolean? }
 
 local M = {}
 
 M.model = host.model
-M.max_output = 16000 -- tokens per model reply
-M.max_replies = 200 -- model replies per task before giving up
-M.compact_at = 150000 -- prompt tokens at which the conversation is replaced by a summary of itself
-M.output_limit = 30000 -- bytes of a tool result shown to the model
-M.call_seconds = 600 -- time limit of one `lua` tool call, commands and all
-M.effort = host.env("HX_EFFORT") -- low, medium, high, xhigh or max: how hard the model thinks; nil leaves it to
--- the model's entry in M.claude, or else to the endpoint
-M.repeat_reminders = { 3, 5, 8 } -- a function call with the same result this many times in a task gets a reminder
+M.max_output = 16000
+M.max_replies = 200
+M.compact_at = 150000
+M.output_limit = 30000
+M.call_seconds = 600
+M.effort = host.env("HX_EFFORT")
+M.repeat_reminders = { 3, 5, 8 }
 
--- Everything the loop changes as it runs, in one place, by how long it lives. A project function or extension can
--- run a `lua` call inside another, or a turn on another Conversation inside a turn (a sub-agent), so whatever lives
--- for one call or one turn is set on the way in and the outer value put back on the way out, however it ends: a
--- nested call or turn leaves its parent's state as it found it. The globals of the model's code are the model's,
--- not the loop's, and live in `scratch` (see the lua tool).
 type Repeats = { counts: { [string]: number }, worst: { call: string, count: number }? }
--- What one model was sent and wrote in this run.
 type Count = { model: string, replies: number, input: number, cached: number, written: number, output: number }
 local live: {
 	usage: { Count },
@@ -116,30 +57,18 @@ local live: {
 	printed: { string }?,
 	agent: { name: string, run: number }?,
 } = {
-	-- For the whole run, from when the module loads:
-	-- Tokens, for the lines at the end: by model, in the order each first replied. A sub-agent may run on
-	-- another model at another price, so one sum for the run would say little about what it cost.
 	usage = {},
-	spills = 0, -- files that clipped results went to, so the next one has a name of its own
-	subs = 0, -- sub-agents whose conversations have a log, so the next one has a name of its own
-	turns = 0, -- turns running, one inside another: above 1, the innermost is a sub-agent's
-	ext_cache = {}, -- each extension loaded, by name, with the source it was loaded from
-	wrappers = {}, -- each function's counting wrapper, made once; weak keys, below
-	-- For one turn, set by M.turn: each function call's count by what it was asked and what it returned, and the
-	-- call repeated most. Outside any turn (a test calling the functions), one set for the run.
+	spills = 0,
+	subs = 0,
+	turns = 0,
+	ext_cache = {},
+	wrappers = {},
 	repeats = { counts = {}, worst = nil },
-	-- For one `lua` call, set by the tool: the lines it printed. nil outside any call.
 	printed = nil,
-	-- In the process of an agent at work (see Agents), for as long as it lives: its name, and which of its runs
-	-- this is. nil in the session's own process.
 	agent = nil,
 }
--- A function a project takes out of M.functions takes its wrapper with it.
 setmetatable(live.wrappers, { __mode = "k" })
 
--- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
--- Its text is made printable here, once: it carries file names, skill names and server replies, none of them hx's.
--- Each line of an agent's starts with its name, since several agents write them at once.
 local function progress(text: string)
 	if not host.quiet then
 		local agent = live.agent
@@ -151,12 +80,6 @@ local function progress(text: string)
 	end
 end
 
--- Keeps the start and the end of a long result: the start says what ran, the end says how it went. Only the result
--- the model is sent is clipped, once; the functions return everything, so code can work on all of it. host.clip
--- cuts it, as host.sh cuts a command's output, at a line where one is near and never inside a character. The whole
--- text goes to a file in $TMPDIR (hx makes one for every run, inside the wall), so what was left out can still be
--- read or searched. Agents share that directory and count their files from where the session's count stood, so
--- an agent's file also carries its name and its run.
 local function clip(text: string): string
 	local head: string, tail: string? = host.clip(text, M.output_limit)
 	if tail == nil then
@@ -171,46 +94,23 @@ local function clip(text: string): string
 		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail
 end
 
--- Removes control characters but newline and tab. Escape sequences in text from the model would otherwise
--- reach the terminal, which they can retitle, scramble or (OSC 52) use to write the clipboard. The C1 controls
--- (U+0080 to U+009F, which some terminals take for escape sequences too) and the characters that reverse the
--- direction of text (U+202A to U+202E, U+2066 to U+2069) go as well.
 function M.printable(text: string): string
 	return (text:gsub("[\0-\8\11-\31\127]", ""):gsub("\194[\128-\159]", ""):gsub("\226\128[\170-\174]", "")
 		:gsub("\226\129[\166-\169]", ""))
 end
 
--- Extensions ------------------------------------------------------------------------------------------------
---
--- An extension is a Luau module in .hx/ext/NAME.luau that returns a table of functions. The model writes them
--- with write() and calls them from its code, so the tool never changes. A module is loaded again whenever its
--- file has changed. Extensions see the same functions the model's code does, and what they print goes into the
--- tool result with what that code prints. hx has some built in
--- (host.extensions: web, ocr and exa); a project's file of the same name takes the place of one.
-
 local ext_dir = ".hx/ext/"
 
--- Every function call is counted by what it was asked and what it returned. A call that returns what it returned
--- before is going nowhere, whatever ran in between and whether the model repeats it across tool calls or in a loop
--- inside one: that is the unit the repeat reminder counts, not the tool call, whose code may print a counter or a
--- clock and so never repeat exactly. A command rerun after a fix returns something new, so it does not count. The
--- counts are live.repeats, the running turn's.
-
--- A value as JSON, nil as null; nil for a value with no JSON form, such as a table of functions.
 local function as_json(value: any): string?
 	local ok, text = pcall(json.encode, value == nil and json.null or value)
 	return ok and text or nil
 end
 
--- A short stand-in for a text, so that the counts do not keep every result of the turn (a bash call returns up to a
--- mebibyte): a short text itself, a longer one its length and a hash of all of it, read four bytes at a time.
--- Different texts of the same length rarely share a hash, and when they do it costs only an early reminder.
 local function digest(text: string): string
 	if #text <= 256 then
 		return text
 	end
 	local data, hash, tail = buffer.fromstring(text), 0, #text - #text % 4
-	-- 65599 times a hash below the prime 4294967291, plus a 32-bit word, stays below 2^53, so it is exact.
 	for at = 0, tail - 4, 4 do
 		hash = (hash * 65599 + buffer.readu32(data, at)) % 4294967291
 	end
@@ -223,10 +123,7 @@ end
 local function counted(fn: Function): (...any) -> ...any
 	return function(...)
 		local results = table.pack(fn.run(...))
-		local result = results[1] -- what a function shows the model; any further values pass through uncounted
-		-- A command that succeeded and printed nothing did something rather than looked at something (git add,
-		-- mkdir, a sleep between polls): that it does so again says nothing about progress. Nor does a result with
-		-- no text form, such as ext's table of functions, which is the same table each time.
+		local result = results[1]
 		local text: string? = nil
 		if result ~= "[exit 0]" then
 			text = if type(result) == "string" then result else as_json(result)
@@ -251,9 +148,6 @@ local function counted(fn: Function): (...any) -> ...any
 	end
 end
 
--- Where print goes: into the result of the `lua` call that is running, which is what the model sees, whether the
--- model's code prints or an extension it called does. Outside a call (a test calling an extension), to stderr, never
--- to stdout, which carries only the answer, and as text only, since stderr may be a terminal.
 local function capture_print(...: any)
 	local parts = table.pack(...)
 	for i = 1, parts.n do
@@ -267,12 +161,6 @@ local function capture_print(...: any)
 	end
 end
 
--- Code from the model and from extensions sees the host's tables (host, json, string, table and the other
--- libraries) only through read-only views. The loop shares those tables: `host.sh = nil` or `json.encode = nil` in
--- one call would otherwise break every later call, and the loop with them, for the rest of the session. A view
--- reads through to its table at each access, so what the host or a test puts there later is seen, and an
--- assignment raises. rawset, getfenv and debug still reach the tables themselves: the views stop mistakes, not
--- code that digs on purpose.
 local function read_only(name: string, real: { [any]: any }, own: { [string]: any }?): any
 	local view = {}
 	return setmetatable(view, {
@@ -286,7 +174,6 @@ local function read_only(name: string, real: { [any]: any }, own: { [string]: an
 		__newindex = function(_, key: any)
 			error(("%s is read-only: %s.%s cannot be assigned"):format(name, name, tostring(key)), 2)
 		end,
-		-- `for name, value in host.extensions` and the like iterate the table itself, with the view's values.
 		__iter = function()
 			local key = nil
 			return function(): (any, any)
@@ -304,10 +191,6 @@ local function read_only(name: string, real: { [any]: any }, own: { [string]: an
 	})
 end
 
--- What differs in the view of `host`. host.log and host.input write to a terminal, so the text they are given is
--- made printable, as the loop's own lines are; the loop itself keeps the real host, because it writes escape
--- sequences (bracketed paste) on purpose. A chunk that host.load gives no environment gets globals of its own
--- that read these views, as an extension does, not the real ones.
 local function host_view_parts(real: { [any]: any }, fresh_globals: () -> any): { [string]: any }
 	return {
 		log = function(text: any, ...: any)
@@ -322,12 +205,8 @@ local function host_view_parts(real: { [any]: any }, fresh_globals: () -> any): 
 	}
 end
 
--- Each table's view, by the table, made once, so that a view is the same value from call to call.
 local views: { [any]: any } = {}
 
--- The globals of code from the model and from extensions: the functions of M.functions (looked up when used, so a
--- project's changes to the list count at once), print, the views above, and the other Luau globals. `env` is the
--- code's own table of globals, which is also its _G.
 local function lookup(env: any, name: string): any
 	for _, fn in M.functions do
 		if fn.name == name then
@@ -372,7 +251,7 @@ function M.ext(name: string): any
 		return cached.value
 	end
 	local chunk: (() -> any)?, load_err: string? = host.load(source, (built_in and "=hx/ext/" or "=ext/") .. name,
-		setmetatable({}, { __index = lookup })) -- globals of its own: one extension's do not leak into another
+		setmetatable({}, { __index = lookup }))
 	if not chunk then
 		error(load_err, 0)
 	end
@@ -381,10 +260,6 @@ function M.ext(name: string): any
 	return value
 end
 
--- One line per extension: its name and the comment on its first line. The built-in ones are listed when the key
--- they need is there (EXA_API_KEY for exa, DEEPSEEK_API_KEY for the rest), unless the project has its own of that
--- name. A name that starts with _ is a helper, code that other extensions share: ext() loads it, but it is not
--- listed, the project's or built in.
 local function extension_index(): { string }
 	local lines, own = {}, {}
 	local function add(name: string, source: string, mark: string)
@@ -414,17 +289,6 @@ local function extension_index(): { string }
 	return lines
 end
 
--- Skills ----------------------------------------------------------------------------------------------------
---
--- A skill is instructions for one kind of task, in the Agent Skills format: a directory with a SKILL.md, whose
--- YAML front matter has a name and a description, and whatever scripts and references the text points to. The
--- system prompt lists them; skill(name) returns one's text, and a name no skill has returns the list to pick from.
--- Only name, description and disable-model-invocation are read: hx has one tool and one wall, so allowed-tools,
--- model and hooks mean nothing here. Directories are searched in this order, and the first skill of a name wins.
--- A directory in the home directory is outside the wall unless hx was started with --ro for it; then it is
--- simply not found. hx has one skill built in (host.skills: hx, on using and extending hx itself), which comes
--- after every directory, so a skill of the same name in any of them takes its place.
-
 local home = host.env("HOME")
 M.skill_dirs = { ".hx/skills/", ".agents/skills/", ".claude/skills/" }
 if home and home:sub(1, 1) == "/" then
@@ -432,21 +296,18 @@ if home and home:sub(1, 1) == "/" then
 	table.insert(M.skill_dirs, home .. "/.agents/skills/")
 	table.insert(M.skill_dirs, home .. "/.claude/skills/")
 end
-M.skill_index_full = 30 -- up to this many skills, the system prompt lists each with its description; past it, names
-M.skill_listed = 50 -- skills, with their descriptions, that skill() lists for a name no skill has
-M.skill_description_limit = 250 -- characters of a description in those lists
+M.skill_index_full = 30
+M.skill_listed = 50
+M.skill_description_limit = 250
 
 local function trim(text: string): string
 	return (text:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
--- The fields of a SKILL.md's front matter that are plain or block scalars, and the text after it. Enough YAML for
--- what skills put there: `key: value`, quoted values, values continued on indented lines, and | and > blocks.
--- Nested maps are read as text and ignored.
 function M.skill_front_matter(text: string): ({ [string]: string }, string)
 	text = text:gsub("^\239\187\191", ""):gsub("\r\n", "\n")
 	local head, rest = text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*\n(.*)$")
-	head = head or text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*$") -- front matter with nothing after it
+	head = head or text:match("^%-%-%-[ \t]*\n(.-)\n%-%-%-[ \t]*$")
 	if not head then
 		return {}, text
 	end
@@ -455,7 +316,7 @@ function M.skill_front_matter(text: string): ({ [string]: string }, string)
 	while i <= #lines do
 		local key, matched = lines[i]:match("^([%w_%-]+):%s*(.-)%s*$")
 		i += 1
-		if key and matched then -- both or neither
+		if key and matched then
 			local value: string = matched
 			if value:match("^[|>][-+]?%d*$") then
 				local folded, block = value:sub(1, 1) == ">", {}
@@ -473,7 +334,7 @@ function M.skill_front_matter(text: string): ({ [string]: string }, string)
 					i += 1
 				end
 				if value:match('^".*"$') then
-					value = value:sub(2, -2):gsub("\\(.)", function(c) -- one pass, so an escaped backslash is not read twice
+					value = value:sub(2, -2):gsub("\\(.)", function(c)
 						return c == "n" and "\n" or c
 					end)
 				elseif value:match("^'.*'$") then
@@ -486,17 +347,12 @@ function M.skill_front_matter(text: string): ({ [string]: string }, string)
 	return fields, body
 end
 
--- Lower case, without - _ . and spaces: pdf-tools, PDF_Tools and pdftools are one name.
 local function skill_key(name: string): string
 	return (name:lower():gsub("[%-_%.%s]", ""))
 end
 
--- Every skill that can be found now: {name, description, dir, path, hidden, source?}, in the order of M.skill_dirs
--- and then by directory name, and after those the ones built into hx, by name. Found anew on each call, so a skill
--- written in this session is found too.
 function M.skills(): { Skill }
 	local skills: { Skill }, seen = {}, {}
-	-- `text` is a SKILL.md; `fallback` names the skill when its front matter does not.
 	local function add(text: string, fallback: string, dir: string, path: string, source: string?)
 		local fields = M.skill_front_matter(text)
 		local name = trim(fields.name or "")
@@ -542,7 +398,7 @@ local function cut(text: string, limit: number): string
 	local length = utf8.len(text)
 	if length and length > limit then
 		text = text:sub(1, utf8.offset(text, limit + 1) - 1) .. " ..."
-	elseif not length and #text > limit then -- not UTF-8, so by bytes
+	elseif not length and #text > limit then
 		text = text:sub(1, limit) .. " ..."
 	end
 	return text
@@ -554,10 +410,8 @@ local function skill_line(skill: Skill): string
 	return ("- %s%s: %s"):format(skill.name, skill.source and " (built in)" or "", description)
 end
 
-M.skill_files_shown = 30 -- files of a loaded skill named, with their paths, in its heading
+M.skill_files_shown = 30
 
--- The files of a skill other than SKILL.md, as paths from the project directory, so that the model can use them as
--- they are: up to M.skill_files_shown, three directories deep.
 local function skill_files(dir: string): { string }
 	local files = {}
 	local function walk(path: string, depth: number)
@@ -578,7 +432,6 @@ local function skill_files(dir: string): { string }
 	return files
 end
 
--- The skills the model is told about: all but those marked disable-model-invocation.
 local function listed_skills(): { Skill }
 	local listed = {}
 	for _, skill in M.skills() do
@@ -589,12 +442,9 @@ local function listed_skills(): { Skill }
 	return listed
 end
 
--- What skill(name) returns: the skill of that name, or the skills whose names differ from it only in case, -, _, .
--- and spaces when there are several, or else the list of skills to pick from. No guessing past that: the model
--- reads the list and picks better than a fuzzy match would.
 function M.skill(name: string): string
 	local skills = M.skills()
-	if #skills == 0 then -- only where hx has none built in, or a project took them out of host.skills
+	if #skills == 0 then
 		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
 			.. table.concat(M.skill_dirs, ", ") .. "."
 	end
@@ -623,7 +473,7 @@ function M.skill(name: string): string
 		end
 		local _, body = M.skill_front_matter(source)
 		progress("  skill " .. skill.name)
-		if skill.source then -- no directory, so no files and no paths of its own
+		if skill.source then
 			return ("[skill %s, built into hx. Every path in it is the project's.]\n\n%s"):format(skill.name, trim(body))
 		end
 		local files = skill_files(skill.dir)
@@ -656,8 +506,6 @@ function M.skill(name: string): string
 	return table.concat(lines, "\n")
 end
 
--- The system prompt's part on skills: each with its description, or past M.skill_index_full only their names, which
--- keeps the prompt short; skill() with a name no skill has gives the descriptions.
 local function skill_index(): string?
 	local listed = listed_skills()
 	if #listed == 0 then
@@ -680,28 +528,15 @@ local function skill_index(): string?
 		.. "which lists them with their descriptions."):format(head, #listed, table.concat(names, ", "))
 end
 
--- The layout ------------------------------------------------------------------------------------------------
---
--- The system prompt shows the project's files as a tree, so that the model's first call need not be a listing.
--- The files are the ones git lists: tracked, or new and not ignored, which leaves out build output and the like.
--- Where git lists none (no repository, no git, nothing in it yet, or a tree it cannot walk in ten seconds), the
--- tree is the project directory's own entries, one level. It is made when the session starts, like the rest of
--- the prompt, so it does not upset the prompt cache, and says so, since files come and go after that.
+M.layout_lines = 60
 
-M.layout_lines = 60 -- entries of the project's file tree in the system prompt; 0 leaves the tree out
-
--- A directory of the tree: the names in it, which of them are directories, and its files at any depth.
 type Dir = { names: { string }, dirs: { [string]: Dir }, files: number }
 
--- A list of paths as a tree: one name per line, indented under its directory, directories before files, at most
--- `limit` lines. Directories are opened level by level, each one whose entries still fit; one that stays closed
--- is a line with the number of files below it. A path that ends in / is a directory with nothing known to be in
--- it. When the top level alone does not fit, the tree is its first `limit` entries and how many more there are.
 function M.tree(paths: { string }, limit: number): string
 	local root: Dir = { names = {}, dirs = {}, files = 0 }
 	local previous: string? = nil
 	for _, path in paths do
-		if path ~= previous then -- git lists a file in a merge conflict once for each side
+		if path ~= previous then
 			previous = path
 			local parts = path:split("/")
 			local is_file = parts[#parts] ~= ""
@@ -726,7 +561,7 @@ function M.tree(paths: { string }, limit: number): string
 	local open: { [Dir]: boolean } = { [root] = true }
 	local queue, shown = { root }, math.min(#root.names, limit)
 	local at = 0
-	while at < #queue do -- the queue grows as it is read: a level's directories come before the next level's
+	while at < #queue do
 		at += 1
 		local dir = queue[at]
 		table.sort(dir.names, function(a: string, b: string): boolean
@@ -749,12 +584,11 @@ function M.tree(paths: { string }, limit: number): string
 	local lines: { string } = {}
 	local function walk(dir: Dir, indent: string)
 		for i, name in dir.names do
-			if #lines == limit then -- the top level alone: nothing else is opened past what fits
+			if #lines == limit then
 				table.insert(lines, ("... and %d more"):format(#dir.names - i + 1))
 				return
 			end
 			local sub = dir.dirs[name]
-			-- A file's name is not hx's: what a terminal would obey goes, and a line break in it is a space.
 			local line = indent .. (M.printable(name):gsub("%s+", " "))
 			if not sub then
 				table.insert(lines, line)
@@ -772,8 +606,6 @@ function M.tree(paths: { string }, limit: number): string
 	return table.concat(lines, "\n")
 end
 
--- The files git lists in the project directory, as paths from it, or nil when it lists none. The list goes
--- through a file in $TMPDIR, because host.sh keeps only both ends of a long output.
 local function git_files(): { string }?
 	local result = host.sh('git ls-files -z --cached --others --exclude-standard 2>/dev/null >"$TMPDIR/hx-files"',
 		{ timeout = 10 })
@@ -787,8 +619,6 @@ local function git_files(): { string }?
 	return #files > 0 and files or nil
 end
 
--- The system prompt's part on the project's files, or nil for none. A project that wants another picture
--- replaces this.
 function M.layout(): string?
 	if M.layout_lines < 1 then
 		return nil
@@ -806,19 +636,10 @@ function M.layout(): string?
 		.. M.tree(entries, M.layout_lines)
 end
 
--- Functions -------------------------------------------------------------------------------------------------
---
--- The model has one tool, `lua`, and acts by calling functions from the code it sends. Each function is
--- {name, usage, run}: `usage` is the line the model reads about it, `run` takes the arguments and returns a value,
--- usually the text the model is meant to see, and reports failure by raising. The same functions are there for
--- extensions. Add project functions to this list; the order is the order the model reads them in.
-
--- The start of a command or a note, on one line, for its progress line.
 local function headline(text: string): string
 	return M.printable((text:sub(1, 100):gsub("\n", " ")))
 end
 
--- What a host primitive returns, when it worked: its value, or `nil, error`, which raises the error.
 local function or_raise<T>(value: T?, err: string?): T
 	if not value then
 		error(err, 0)
@@ -826,14 +647,12 @@ local function or_raise<T>(value: T?, err: string?): T
 	return value
 end
 
--- Checks one argument, and names the call's whole shape when it is wrong: a model used to JSON tools may pass a
--- table of named arguments where a string belongs.
 local function check(fname: string, value: any, position: number, name: string, kind: string, optional: boolean?)
 	if value == nil and optional then
 		return
 	end
 	local got = type(value)
-	if kind == "whole number" then -- a line number or a count: 2.5, inf and nan are numbers too
+	if kind == "whole number" then
 		if got == "number" and value % 1 == 0 then
 			return
 		end
@@ -901,8 +720,6 @@ M.functions = {
 			if text:sub(-1) == "\n" then
 				table.remove(lines)
 			end
-			-- A \r\n line end is shown as a plain one. Shown, the \r reaches the model as the text \r, which it then
-			-- types into an edit as a backslash and an r; edit finds plain \n text in a \r\n file anyway.
 			for i, line in lines do
 				if line:sub(-1) == "\r" then
 					lines[i] = line:sub(1, -2)
@@ -913,8 +730,6 @@ M.functions = {
 			if first > #lines then
 				error(("offset %d is past the end: the file has %d lines"):format(first, #lines), 0)
 			end
-			-- Whole lines up to the byte limit, never head and tail, so the range says exactly what was left out. The
-			-- limit leaves room for the range line, so that a read on its own is never cut when the result is.
 			local budget = M.output_limit - 200
 			local function numbered(i)
 				return ("%d: %s"):format(i, lines[i])
@@ -932,7 +747,6 @@ M.functions = {
 			end
 			local body
 			if #lines[first] > budget then
-				-- A line longer than the limit still counts as read, so the next offset moves past it.
 				last = first
 				body = ("%d: %s"):format(first, lines[first]:sub(1, budget))
 					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], budget)
@@ -981,7 +795,7 @@ M.functions = {
 				local pieces, count, at = {}, 0, 1
 				while true do
 					local from, to = text:find(from_text, at, true)
-					if not from or not to then -- both or neither
+					if not from or not to then
 						break
 					end
 					table.insert(pieces, text:sub(at, from - 1))
@@ -992,9 +806,6 @@ M.functions = {
 				table.insert(pieces, text:sub(at))
 				return pieces, count
 			end
-			-- Models write line ends as \n. In a file whose line ends are \r\n (its first line's are), new gets them
-			-- too, so the file keeps one kind. Where old is not found as written and the file has \r\n ends at all,
-			-- old is looked for with them, and new takes them like the text it replaces.
 			local function crlf(s: string): string
 				return (s:gsub("\r?\n", "\r\n"))
 			end
@@ -1034,7 +845,6 @@ M.functions = {
 	},
 }
 
--- With --judge, one more function: the only way a change counts.
 if host.judged then
 	table.insert(M.functions, {
 		name = "submit",
@@ -1065,25 +875,11 @@ if host.judged then
 	})
 end
 
--- Tools -----------------------------------------------------------------------------------------------------
---
--- The tools the model is offered. The built-in loop has one, `lua`, and a project rarely needs more: a function in
--- M.functions is usually the better choice, since code can call it in a loop or with other calls, and so can
--- extensions. M.tools is still a real extension point, for a tool the model should call directly rather than from
--- code (one a model was trained on, say); a project adds one with
--- table.insert(M.tools, {...}), and the loop checks its arguments against its schema and runs it like `lua`.
--- Each tool is {name, description (text, or a function that returns it), parameters (a JSON schema),
--- run(args) -> text, failed?}. A tool may also report failure by raising; the message goes back to the model.
-
--- The globals of `lua` code live here, across calls, for the whole run. It is the model's workspace rather than
--- the loop's state, so a nested call shares it on purpose: code a project function runs as a `lua` call sees the
--- globals the model set, as the model's own next call would. A sub-agent's turn shares it too: a call is not told
--- which conversation it answers.
 local scratch = setmetatable({}, { __index = lookup })
 
 local function show(value: any): string
 	local meta = getmetatable(value)
-	if type(meta) == "table" and meta.__tostring then -- a value that says how it reads, as search results do
+	if type(meta) == "table" and meta.__tostring then
 		return tostring(value)
 	end
 	local text = if type(value) == "table" then as_json(value) else nil
@@ -1125,13 +921,11 @@ local tools: { Tool } = {
 				error('argument "code" must be a string', 0)
 			end
 			local lines: { string } = {}
-			scratch.print = capture_print -- again each call, in case the model's code assigned print
+			scratch.print = capture_print
 			local chunk: (() -> ...any)?, err: string? = host.load(args.code, "=lua", scratch)
 			if not chunk then
 				return "error: " .. tostring(err), true
 			end
-			-- The outer call's lines are put back before any other call or return: on a stop the host raises again
-			-- at the first of those, and this call's lines must not be left in the outer call's place.
 			local outer = live.printed
 			live.printed = lines
 			local ok, results = host.timed(M.call_seconds, function()
@@ -1152,9 +946,6 @@ local tools: { Tool } = {
 }
 M.tools = tools
 
--- Checks a call's argument names against the tool's own schema. The message names what was sent and what the
--- tool takes, so a model that reached for another harness's names can see its mistake. Returns nil or it. A
--- schema without `properties` names no arguments, so then any name is accepted.
 local function argument_problem(tool: Tool, args: { [string]: any }): string?
 	local schema: Schema = tool.parameters or {}
 	local properties, required: { string } = schema.properties, schema.required or {}
@@ -1191,13 +982,10 @@ local function find_tool(name: string?): Tool?
 	return nil
 end
 
--- Runs one tool_use block from the model. Returns the text of the result and whether it is an error. Nothing a
--- tool does can end the run; a stop does, because the host raises it again as soon as this returns.
 local function run_tool(call: Block): (string, boolean)
 	local tool = find_tool(call.name)
 	if not tool then
 		local problem = "error: there is no tool named " .. tostring(call.name)
-		-- A model used to one tool per action may call a function by its name. It is told where the function is.
 		for _, fn in M.functions do
 			if fn.name == call.name and find_tool("lua") then
 				problem ..= (": %s is a function, for code sent to the lua tool to call, as in %s")
@@ -1210,7 +998,7 @@ local function run_tool(call: Block): (string, boolean)
 	if type(args) ~= "table" then
 		return "error: the tool input is not an object", true
 	end
-	if tool.name ~= "lua" then -- the functions the code calls say what they do
+	if tool.name ~= "lua" then
 		progress("  " .. tool.name)
 	end
 	local problem = argument_problem(tool, args)
@@ -1224,52 +1012,20 @@ local function run_tool(call: Block): (string, boolean)
 	return "error: " .. tostring(result), true
 end
 
--- The model --------------------------------------------------------------------------------------------------
---
--- This speaks the Anthropic Messages format: a `system` string, messages whose content is a list of blocks
--- (text, thinking, tool_use, tool_result), and tools given as {name, description, input_schema}. To use another
--- wire format, replace M.request and M.turn.
-
--- What the loop sends to the Claude models it knows, by model name: Claude's from 5.5 on. Every claude-* model,
--- listed or not, is sent thinking {type = "adaptive"}: thinking is always on, said aloud. A Claude model newer
--- than this list gets that and nothing else it might reject. DeepSeek's models get no thinking field: they think
--- by default.
---   effort     sent when M.effort is unset: these models think by effort alone, and the API's own default
---              differs between them (medium on Opus and Haiku 5.5, high on Sonnet 5.5); medium is where
---              Anthropic suggests starting agentic coding on all three
---   fallbacks  a declined request is run again on another model, chosen by why it was declined, in the same
---              round trip; Haiku 5.5 has no fallback
---   display    "updates": the notes the model writes between tool calls come back in thinking blocks, which
---              the loop shows as progress lines; without it they come back empty
---   compaction the API writes the summary when the conversation grows too long (on-demand compaction, the
---              kind Anthropic says to use wherever it is available), instead of the loop asking for one as an
---              ordinary reply; see M.compact
--- Every listed model checks that a thinking block goes back after the same history it was written after. The
--- loop only ever appends, but a project may change it: block_binding drop_block then drops a stale block instead
--- of failing the request.
 M.claude = {
 	["claude-opus-5-5"] = { effort = "medium", fallbacks = "default", display = "updates", compaction = true },
 	["claude-sonnet-5-5"] = { effort = "medium", fallbacks = "default", display = "updates", compaction = true },
 	["claude-haiku-5-5"] = { effort = "medium", compaction = true },
 }
 
--- What the loop knows of M.model, the one place that decides. "Is this Claude" has two answers, and each use
--- needs a different one:
---   any claude-* model speaks the Claude API, so it gets the system prompt as a block with cache_control, which
---     every Claude model accepts (DeepSeek ignores the field and gets a plain string)
---   only a model listed in M.claude gets the features of its entry; one newer than the list gets none until it
---     is added
--- Returns whether the model is Claude, and its M.claude entry or nil.
 local function claude_model(): (boolean, Features?)
 	return M.model:match("^claude%-") ~= nil, M.claude[M.model]
 end
 
--- Tokens a request put in front of the model, cached or not.
 local function prompt_tokens(counts: Usage): number
 	return (counts.input_tokens or 0) + (counts.cache_read_input_tokens or 0) + (counts.cache_creation_input_tokens or 0)
 end
 
--- The run's count for a model, begun at its first reply.
 local function count_of(model: string): Count
 	for _, count in live.usage do
 		if count.model == model then
@@ -1281,8 +1037,6 @@ local function count_of(model: string): Count
 	return count
 end
 
--- Adds a reply's tokens to the run's count for the model that was asked. A compaction reply has zero at the top
--- and the summarization call in usage.iterations; where iterations are given, they are what was billed.
 local function count_usage(reply: Reply)
 	local counts: Usage = type(reply.usage) == "table" and reply.usage or {}
 	local iterations = counts.iterations
@@ -1298,7 +1052,7 @@ local function count_usage(reply: Reply)
 end
 
 local function tool_specs(): { any }
-	local specs = json.array({}) -- a list even when a project has taken every tool away
+	local specs = json.array({})
 	for _, tool in M.tools do
 		local description = type(tool.description) == "function" and tool.description() or tool.description
 		table.insert(specs, { name = tool.name, description = description, input_schema = tool.parameters })
@@ -1306,8 +1060,6 @@ local function tool_specs(): { any }
 	return specs
 end
 
--- Whether a reply has anything in it. Thinking alone counts; an empty text block does not. A reply cut off by
--- the output limit (the loop asks it to go on) or refused (that is the answer) counts however empty it is.
 local function has_content(reply: Reply): boolean
 	if reply.stop_reason == "max_tokens" or reply.stop_reason == "refusal" then
 		return true
@@ -1320,9 +1072,6 @@ local function has_content(reply: Reply): boolean
 	return false
 end
 
--- A reply a fallback model finished carries a `fallback` block where the switch happened. What the declining model
--- wrote before the last one is not its to send back: its thinking, tool calls and other model-internal blocks are
--- dropped, and the fallback block stays where it is, because the API checks the thinking around it by its place.
 local internal_before_fallback = { thinking = true, redacted_thinking = true, tool_use = true, server_tool_use = true }
 local function after_fallback(reply: Reply)
 	local last = nil
@@ -1345,15 +1094,8 @@ local function after_fallback(reply: Reply)
 	reply.content = kept
 end
 
--- Sends the conversation and returns the decoded reply. Retries what is worth retrying, then raises. The endpoint
--- sometimes answers 200 with nothing in it; that is retried like a busy server, since the same request may well
--- get a real reply. `compaction`, given, asks a Claude model for a summary in place of a reply (see M.compact);
--- that reply comes back however empty it is, since an empty one is an answer too.
 function M.request(system: string, messages: { Message }, compaction: { [string]: any }?): Reply
 	local is_claude, features = claude_model()
-	-- Thinking is always on and is not the loop's to turn off: effort is the one control. DeepSeek's models think
-	-- by default. A Claude model is always asked for adaptive thinking out loud; a model the loop knows gets the
-	-- options below on top.
 	local thinking = { type = "adaptive" }
 	local betas = {}
 	local fallbacks = nil
@@ -1368,26 +1110,11 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 			fallbacks = features.fallbacks
 			table.insert(betas, "server-side-fallback-2026-07-01")
 		end
-		-- On every request, not only the one that asks for the summary: a request that carries the block needs it.
 		if features.compaction then
 			table.insert(betas, "compact-2026-09-04")
 		end
 	end
 	local effort = M.effort or (features and features.effort)
-	-- Caching. The Claude API caches a prefix only up to a breakpoint, and a request reads only what an earlier one
-	-- wrote at a breakpoint. Two of them, both with the default five-minute life, which every request in a running
-	-- loop refreshes:
-	--   on the system prompt: tools and system, which never change in a run, get an entry of their own. A
-	--     compaction replaces every message; without this entry it would pay for tools and system again too. A
-	--     new run in the same project within five minutes reads it as well.
-	--   top-level, automatic: the API puts it on the last block and moves it forward as the conversation grows, so
-	--     each request reads everything the one before it sent and writes only what was added since.
-	-- Everything ahead of a breakpoint has to be byte for byte the same, request after request: the system prompt
-	-- is built once per run, the tool description is the same each time, json.encode sorts keys, the conversation
-	-- is only ever appended to (a reminder is a text block behind the tool results, never taken out again), and
-	-- thinking and effort are fixed for the run.
-	-- DeepSeek caches every prefix by itself and ignores cache_control, so any model that is not Claude gets the
-	-- system prompt as the plain string; the same stable prefix is what makes its cache hits.
 	local system_field: string | { { [string]: any } } = system
 	if is_claude then
 		system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
@@ -1404,10 +1131,6 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 		tools = tool_specs(),
 		compaction = compaction,
 	})
-	-- The session's endpoint is the one hx picked for host.model, the model it started with. M.model can differ for
-	-- a turn, a sub-agent's say. Among Claude's models nothing else changes. A model of DeepSeek's under a session
-	-- on a Claude model goes to DeepSeek's own endpoint, which the host reaches with DEEPSEEK_API_KEY. The other
-	-- way round has no endpoint: a session on DeepSeek holds no key of Claude's.
 	local options = {
 		beta = #betas > 0 and table.concat(betas, ",") or nil,
 		endpoint = if not is_claude and host.model:match("^claude%-") then "deepseek" else nil,
@@ -1432,7 +1155,6 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 		if not transient or attempt == attempts then
 			error(("the model request failed (%s): %s"):format(tostring(status or "no response"), tostring(text):sub(1, 500)), 0)
 		end
-		-- As long as the server asks (Retry-After on a 429 or 503), within reason.
 		local wait = math.min(math.max(2 ^ attempt, retry_after or 0), 120)
 		progress(("model request failed (%s), retrying in %d s"):format(tostring(status or text), wait))
 		host.sleep(wait)
@@ -1441,7 +1163,6 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 end
 
 function M.system_prompt(): string
-	-- hx does not bring ripgrep. Where it is installed, the model is told: none reaches for it unasked.
 	local ripgrep = host.sh("command -v rg", { timeout = 10 }).code == 0
 	local parts = {
 		("You are a coding agent working in %s. You act by running Luau code with the lua tool; the code calls "
@@ -1462,8 +1183,6 @@ function M.system_prompt(): string
 			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore. "
 			.. "A procedure you will follow again, rather than code, is a skill: .hx/skills/NAME/SKILL.md, with front "
 			.. "matter giving its name and a description of when to use it."
-			-- The skill hx is built with says the rest. Without the pointer a model takes this paragraph for all
-			-- there is to know, and never loads it.
 			.. (host.skills.hx and " skill(\"hx\") says which of these a need calls for and how each is written "
 				.. "and tried, and covers the loop, sub-agents and scripts: load it before you add to the harness." or ""),
 		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
@@ -1503,42 +1222,20 @@ function M.system_prompt(): string
 	return table.concat(parts, "\n\n")
 end
 
--- The conversation -------------------------------------------------------------------------------------------
---
--- The Messages API accepts one shape of history only: it starts with the user, roles alternate, and a reply
--- that calls tools is answered by the very next message with exactly one result per call, results first. So a
--- conversation is always in one of three states, read off its last message, and each operation is legal in
--- some of them only:
---
---   state     the last message is                 legal operations
---   "idle"    nothing, or a finished reply        say
---   "ready"   the user's: the model may run       say (adds to that message), reply
---   "owing"   a reply that called tools           answer, abandon
---
---   say:    idle -> ready, ready -> ready         reply:   ready -> owing, idle, or ready (an empty reply)
---   answer: owing -> ready                        abandon: owing -> ready
---
--- Every change to the history goes through these functions. An operation that is illegal in the current state
--- raises and changes nothing, so a history the API would reject cannot be built.
-
 local Conversation = {}
 Conversation.__index = Conversation
 M.Conversation = Conversation
--- Written with typeof(setmetatable(...)) rather than setmetatable<...>, which only the new type solver knows.
 type ConversationFields = { messages: { Message }, on_answer: ((Conversation) -> ())? }
 type Conversation = typeof(setmetatable({} :: ConversationFields, Conversation))
 type State = "idle" | "ready" | "owing"
 
--- on_answer, if set, is called with the conversation after each answer: after every reply that called tools and
--- their results. M.main sets it to save the log, so a run killed half-way still leaves one; it is here rather than
--- in M.turn so that it goes on when a project replaces M.turn. A fork does not carry it.
 function Conversation.new(): Conversation
 	return setmetatable({ messages = {}, on_answer = nil }, Conversation)
 end
 
 local function tool_calls(message: Message): { Block }
 	local calls = {}
-	for _, block in message.content :: { Block } do -- only a reply is asked, and a reply's content is a list
+	for _, block in message.content :: { Block } do
 		if block.type == "tool_use" then
 			table.insert(calls, block)
 		end
@@ -1569,7 +1266,6 @@ local function expect(self: Conversation, operation: string, ...: State)
 	error(("conversation: cannot %s while %s"):format(operation, now), 3)
 end
 
--- Adds text from the user. After tool results or earlier text it joins that message, behind what is there.
 function Conversation.say(self: Conversation, text: string)
 	expect(self, "say", "idle", "ready")
 	local last = self.messages[#self.messages]
@@ -1583,8 +1279,6 @@ function Conversation.say(self: Conversation, text: string)
 	table.insert(blocks, { type = "text", text = text })
 end
 
--- Records the model's reply exactly as it came (thinking blocks have to go back unchanged) and returns its
--- tool calls. An empty reply records nothing: the user's message is still the last word.
 function Conversation.reply(self: Conversation, content: { Block }): { Block }
 	expect(self, "reply", "ready")
 	if #content == 0 then
@@ -1595,14 +1289,12 @@ function Conversation.reply(self: Conversation, content: { Block }): { Block }
 	return tool_calls(message)
 end
 
--- Answers every tool call of the last reply with what run(call) returns: the result text, and whether it is an
--- error. If run raises, nothing is recorded and the calls are still owed.
 function Conversation.answer(self: Conversation, run: (Block) -> (string, boolean?))
 	expect(self, "answer", "owing")
 	local results: { Block } = {}
 	for _, call in tool_calls(self.messages[#self.messages]) do
 		local text, failed = run(call)
-		local is_error: boolean? = failed or nil -- the field is left out, not false, when the call worked
+		local is_error: boolean? = failed or nil
 		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = is_error })
 	end
 	table.insert(self.messages, { role = "user", content = results })
@@ -1611,7 +1303,6 @@ function Conversation.answer(self: Conversation, run: (Block) -> (string, boolea
 	end
 end
 
--- Answers whatever is owed with an error, so a turn stopped half-way leaves a history that can continue.
 function Conversation.abandon(self: Conversation, reason: string)
 	if self:state() == "owing" then
 		self:answer(function()
@@ -1620,22 +1311,18 @@ function Conversation.abandon(self: Conversation, reason: string)
 	end
 end
 
--- Forgets everything and starts again from one user message.
 function Conversation.restart(self: Conversation, text: string)
 	expect(self, "restart", "idle", "ready")
 	table.clear(self.messages)
 	self:say(text)
 end
 
--- Forgets everything and starts again from a compaction block, which the API reads in place of the messages it
--- summarized, followed by one user message. The block goes first in the first message, exactly as it came.
 function Conversation.resume(self: Conversation, block: Block, text: string)
 	expect(self, "resume", "idle", "ready")
 	table.clear(self.messages)
 	table.insert(self.messages, { role = "user", content = { block, { type = "text", text = text } } })
 end
 
--- A copy to try something on. It shares the old messages; the last one, which say() may extend, is its own.
 function Conversation.fork(self: Conversation): Conversation
 	local copy = Conversation.new()
 	copy.messages = table.clone(self.messages)
@@ -1646,10 +1333,8 @@ function Conversation.fork(self: Conversation): Conversation
 	return copy
 end
 
--- Checks the whole history against the rules above. Returns nil, or what is wrong. The functions above keep it
--- nil; this is the independent check, run before every request and by the tests.
 function Conversation.problem(self: Conversation): string?
-	local owed: { Block }? = nil -- the calls the next message has to answer
+	local owed: { Block }? = nil
 	for i, message in self.messages do
 		local expected = i % 2 == 1 and "user" or "assistant"
 		if message.role ~= expected then
@@ -1663,7 +1348,7 @@ function Conversation.problem(self: Conversation): string?
 		else
 			local answered = 0
 			local content = message.content
-			local blocks: { Block } = if type(content) == "table" then content else {} -- text alone answers nothing
+			local blocks: { Block } = if type(content) == "table" then content else {}
 			for j, block in blocks do
 				if block.type == "tool_result" then
 					answered += 1
@@ -1694,7 +1379,6 @@ local function text_of(reply: Reply): string
 	return table.concat(parts, "\n")
 end
 
--- Sends the conversation to the model. Only a conversation that is ready, and sound, is ever sent.
 local function ask(system: string, talk: Conversation, compaction: { [string]: any }?): Reply
 	local problem = talk:state() ~= "ready" and "it is " .. talk:state() .. ", not ready" or talk:problem()
 	if problem then
@@ -1703,10 +1387,6 @@ local function ask(system: string, talk: Conversation, compaction: { [string]: a
 	return M.request(system, talk.messages, compaction)
 end
 
--- The request for the summary: a Claude model with on-demand compaction gets it as the `instructions`; any other
--- model gets it behind the whole conversation, as the last user message, so the request reuses the cached prefix.
--- The summary is in English whatever the conversation's language: it becomes the start
--- of everything after it, and a summary in another language pulls the model's own reasoning into that language.
 M.compact_prompt = table.concat({
 	"The conversation is about to be replaced by a summary, and you will continue from that summary alone. "
 		.. "Write it now as a checkpoint, without calling tools, in concise English, with exactly these sections "
@@ -1732,12 +1412,9 @@ M.compact_prompt = table.concat({
 		.. "true, drop what is not, and do not copy it over unchanged.",
 }, "\n")
 
--- What follows a compaction block, so that the model goes on with the work.
 M.resume_prompt = "Earlier turns were replaced by the checkpoint above, written by you. Treat it as established "
 	.. "and continue the work from it directly, without restating or acknowledging it."
 
--- Sends the request for a summary. One that fails leaves the conversation as it is, to be compacted after a later
--- reply, on any model: losing the summary must not lose the task. Returns the reply, or nil.
 local function ask_for_summary(system: string, talk: Conversation, compaction: { [string]: any }?): Reply?
 	local ok, reply = pcall(ask, system, talk, compaction)
 	if not ok then
@@ -1747,13 +1424,6 @@ local function ask_for_summary(system: string, talk: Conversation, compaction: {
 	return reply
 end
 
--- On-demand compaction, for the Claude models whose M.claude entry says so. The request is the conversation as it
--- stands, with the same model, system, tools, thinking and effort, so it reads the cached prefix, plus
--- `compaction`; M.compact_prompt is its `instructions`, which replace the API's own summarization prompt. The API
--- writes the summary into a signed `compaction` block and no reply. The block then takes the place of every
--- message it summarized: it goes first, exactly as it came, and is sent with every later request. A newer block
--- summarizes the old one with what came after it. A request that brings no block (cut off, refused, a tool call)
--- or fails leaves the conversation as it is, to be compacted after a later reply, as the docs advise.
 local function compact_on_server(system: string, talk: Conversation)
 	local reply = ask_for_summary(system, talk, { type = "summarize", instructions = M.compact_prompt })
 	if not reply then
@@ -1774,9 +1444,6 @@ local function compact_on_server(system: string, talk: Conversation)
 	talk:resume(block, M.resume_prompt)
 end
 
--- Replaces the conversation with the model's own summary of what happened. A Claude model that has on-demand
--- compaction gets it; any other model, DeepSeek's included, is asked for the summary as an ordinary reply,
--- behind the whole conversation so that the request reuses the cached prefix.
 function M.compact(system: string, talk: Conversation)
 	progress("  compacting the conversation")
 	local _, features = claude_model()
@@ -1795,12 +1462,9 @@ function M.compact(system: string, talk: Conversation)
 		progress("  no summary came back; keeping the conversation as it is")
 		return
 	end
-	talk:restart(summary .. "\n\n" .. M.resume_prompt) -- the same words as behind a compaction block
+	talk:restart(summary .. "\n\n" .. M.resume_prompt)
 end
 
--- What the model is told when a function call has returned the same result `count` times in this task (see
--- `counted`), as `call`, the call written out. `first` is true at the lowest threshold of M.repeat_reminders; a
--- loop inside one call that passes several at once gets the later wording.
 function M.repeat_reminder(call: string, count: number, first: boolean): string
 	if #call > 500 then
 		call = call:sub(1, 500) .. ("... (%d more bytes)"):format(#call - 500)
@@ -1815,16 +1479,12 @@ function M.repeat_reminder(call: string, count: number, first: boolean): string
 		.. "action that will change the result, finish now and say what you found."):format(call, count)
 end
 
--- Prints the text of a reply: the model's words are the answer, on stdout. A model asked for progress updates
--- (M.claude's display) writes its notes between tool calls into thinking blocks; those are progress lines. So are
--- an agent's words: they are for the lead, which gets the last of them as the agent's report, and stdout is the
--- session's answer alone.
 local function show_text(reply: Reply)
 	local _, features = claude_model()
 	local updates = features and features.display == "updates"
 	for _, block in reply.content do
 		if block.type == "text" and block.text ~= "" then
-			local text = block.text :: string -- a text block has its text
+			local text = block.text :: string
 			if live.agent then
 				progress(text)
 			else
@@ -1836,23 +1496,17 @@ local function show_text(reply: Reply)
 	end
 end
 
--- The names of the agents at work or waiting to start, for the session's own turn to ask; defined with the agents,
--- further down.
 local at_work: () -> { string }
 
--- What the lead is told when it answers while agents are still at work: its answer would end the session, and
--- the session's end kills them where they are.
 function M.agents_reminder(names: { string }): string
 	return ("Your agents are still at work: %s. What they are doing ends half done when this session does. Wait for "
 		.. "their reports with agents(), check the work, then finish. If you mean to stop without them, say so in "
 		.. "your answer."):format(table.concat(names, ", "))
 end
 
--- The body of M.turn, which gives it a count of repeats of its own. Returns the reply that ended the turn, which
--- M.turn does not pass on: it is there so that the type of pcall(turn, ...) has a second value, the error.
 local function turn(system: string, talk: Conversation): Reply
-	local reminded = 0 -- the highest count already reminded of
-	local waited = false -- the lead was told once in this turn that its agents are still at work
+	local reminded = 0
+	local waited = false
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
 		local cut_off = reply.stop_reason == "max_tokens"
@@ -1865,15 +1519,13 @@ local function turn(system: string, talk: Conversation): Reply
 				end
 				return run_tool(call)
 			end)
-			-- One reminder for the highest threshold the worst call has passed since the last one, however many
-			-- times a loop inside one call passed.
 			local worst, due = live.repeats.worst, nil
 			for i, at in M.repeat_reminders do
 				if worst and worst.count >= at and at > reminded then
 					due = i
 				end
 			end
-			if due and worst then -- due is set only when there is a worst
+			if due and worst then
 				reminded = M.repeat_reminders[due]
 				talk:say(M.repeat_reminder(worst.call, worst.count, due == 1))
 			end
@@ -1888,8 +1540,6 @@ local function turn(system: string, talk: Conversation): Reply
 				local category = type(details.category) == "string" and " (" .. details.category .. ")" or ""
 				host.log("[the model declined to answer" .. category .. "]")
 			end
-			-- The session's own turn, not a sub-agent's inside it, and not an agent's, whose copy of the list
-			-- names itself: told once, the lead either waits or answers again, and that answer stands.
 			local busy = if live.turns == 1 and not live.agent and not waited then at_work() else {}
 			if #busy == 0 then
 				return reply
@@ -1898,7 +1548,6 @@ local function turn(system: string, talk: Conversation): Reply
 			talk:say(M.agents_reminder(busy))
 		end
 	end
-	-- Out of replies. The model gets one more, to say where the work stands, rather than none.
 	talk:say(("You have used all %d replies this task allows. Do not call any more tools. Write your final "
 		.. "report now: what you changed, what you checked, what is left."):format(M.max_replies))
 	local reply = ask(system, talk)
@@ -1909,15 +1558,10 @@ local function turn(system: string, talk: Conversation): Reply
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
 end
 
--- With a .hx directory, each session's conversation is kept in .hx/log/ as JSON. The name starts with the time, so
--- the logs sort by it, and ends with the random part of this run's $TMPDIR (hx-XXXXXX), which no other running hx
--- shares, so two sessions started in the same second keep two logs. Whether .hx exists is asked at each save, not
--- once at the start: a session that makes it, say by writing its first extension, keeps its log too.
 local log_path = (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
 	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0")
 local function save(system: string, messages: { Message }, path: string)
 	if host.list(".hx") then
-		-- Logs hold file contents, so the directory keeps itself out of git, however .hx/ came to exist.
 		if not host.read(".hx/log/.gitignore") then
 			host.write(".hx/log/.gitignore", "*\n")
 		end
@@ -1925,9 +1569,6 @@ local function save(system: string, messages: { Message }, path: string)
 	end
 end
 
--- A sub-agent's conversation, one whose turn runs inside another turn, is kept beside the session's, as
--- NAME-sub-N.json: N counts the sub-agents in the order each first ran, and a conversation that has several turns
--- keeps its file. The name sorts ahead of the session's own, so the session's log is still the last of its time.
 local sub_logs: { [Conversation]: string } = {}
 setmetatable(sub_logs, { __mode = "k" })
 local function sub_log(talk: Conversation): string
@@ -1940,10 +1581,6 @@ local function sub_log(talk: Conversation): string
 	return path
 end
 
--- Runs the model until it answers without asking for a tool. The turn counts repeats afresh, and puts the outer
--- turn's counts back when it ends, however it ends: as with printed lines in the lua tool, before any other call.
--- A turn inside another is a sub-agent's: its conversation is saved as the session's own is, after every reply
--- that called tools and when the turn ends. A stop skips that last save, since no call runs once it has begun.
 function M.turn(system: string, talk: Conversation)
 	local outer = live.repeats
 	local path: string? = if live.turns > 0 then sub_log(talk) else nil
@@ -1965,27 +1602,10 @@ function M.turn(system: string, talk: Conversation)
 	end
 end
 
--- Agents ----------------------------------------------------------------------------------------------------
---
--- An agent is a model with a conversation of its own, given tasks by the session's model, the lead, through the
--- agents function. Several work at the same time. Each run of an agent is a process of its own: a fork of hx as it
--- is when the task is sent (host.spawn), behind the same wall, in the same directory, with the same functions. The
--- child runs one turn on M.agent_model and sends back the conversation as it then stands. The lead's process keeps
--- it, so a later task for the same agent forks again with that conversation: an agent that gets its work sent back
--- still knows what it did. The lead's own conversation holds tasks and reports, and none of the agents' steps.
---
--- What a child changes in the VM is its own: globals, extensions it loaded. Files are shared, which is why agents
--- at work together must not write the same ones; the lead is told so. An agent has no agents of its own and no
--- judge to submit to, and what its commands leave running ends with its run.
-
-M.agent_model = nil :: string? -- nil: deepseek-flash when hx has a DeepSeek key, the session's model otherwise
-M.agent_limit = 8 -- agents at work at once; more wait their turn
--- Seconds the agents function waits for reports before it returns with those it has. The lead's next request then
--- comes inside the five minutes that Claude keeps its prompt cache; a wait of ten would pay for the whole
--- conversation again. It is also well inside M.call_seconds, the limit of the `lua` call the function runs in.
+M.agent_model = nil :: string?
+M.agent_limit = 8
 M.agent_wait = 270
-M.agent_seconds = 1800 -- time limit of one run of an agent
--- What an agent's system prompt says after the session's own.
+M.agent_seconds = 1800
 M.agent_prompt = "You are one of several agents at work in this directory at the same time, each on a task from "
 	.. "the lead agent. The lead reads your last message as your report, checks your work, and sends it back "
 	.. "to you if something is wrong. The other agents are changing other files right now. Change only what your "
@@ -2000,15 +1620,12 @@ type Agent = {
 	name: string,
 	talk: Conversation,
 	state: "idle" | "waiting" | "working",
-	task: string, -- what it was last sent
-	runs: number, -- how many tasks it has been sent
-	id: number?, -- host.spawn's, while it works
-	started: number, -- os.clock() when it began to work
-	report: string?, -- what it sent back, until the lead has been given it
+	task: string,
+	runs: number,
+	id: number?,
+	started: number,
+	report: string?,
 }
--- Every agent of this session, in the order each was first given a task, and those waiting for one of
--- M.agent_limit places. `system` is the agents' system prompt, built at the first task, once, so that every agent
--- and every run reads the same cached prompt.
 local fleet: { agents: { Agent }, waiting: { Agent }, system: string? } = { agents = {}, waiting = {}, system = nil }
 
 function at_work(): { string }
@@ -2025,7 +1642,6 @@ local function agent_model(): string
 	return M.agent_model or (if host.tools then "deepseek-flash" else M.model)
 end
 
--- The agent of that name, made at its first task.
 local function agent_named(name: string): Agent
 	for _, agent in fleet.agents do
 		if agent.name == name then
@@ -2042,20 +1658,15 @@ local function agent_named(name: string): Agent
 		started = 0,
 		report = nil,
 	}
-	-- Its log gets its name here, in the lead's process, where the count of sub-agents is one count.
 	sub_log(agent.talk)
 	table.insert(fleet.agents, agent)
 	return agent
 end
 
--- One run of an agent, in its child process: one turn on the agents' model with the task as the next message, and
--- then the conversation, the tokens it took and how it ended, as JSON, for the lead's process to keep. A turn that
--- failed is a result too: the agent may have changed files, and the lead should hear how far it got. A stop is
--- not: it raises through here, and the lead's copy of the conversation stays as it was before the task.
 local function work(agent: Agent, system: string): string
 	local began = os.clock()
 	live.agent = { name = agent.name, run = agent.runs }
-	live.usage = {} -- this run's tokens alone: the lead's process adds them to the session's
+	live.usage = {}
 	for i = #M.functions, 1, -1 do
 		local name = M.functions[i].name
 		if name == "agents" or name == "submit" then
@@ -2077,7 +1688,6 @@ local function work(agent: Agent, system: string): string
 end
 
 local function start(agent: Agent)
-	-- Under --judge the session's prompt says how judging works and to submit; an agent has no submit.
 	local system = fleet.system or (M.system_prompt() .. "\n\n" .. M.agent_prompt
 		.. (if host.judged then " The judge is the lead's to submit to, not yours: you submit nothing." else ""))
 	fleet.system = system
@@ -2087,8 +1697,6 @@ local function start(agent: Agent)
 	progress(("  agent %s: %s"):format(agent.name, headline(agent.task)))
 end
 
--- Takes in what an agent's run sent back, or that it sent nothing, and writes the report the lead will read: a
--- line that says how the run ended, then the agent's last words.
 local function finish(agent: Agent, returned: boolean, text: string)
 	agent.state, agent.id = "idle", nil
 	local done: { messages: { Message }, usage: { Count }, seconds: number, error: string? }? = nil
@@ -2131,14 +1739,13 @@ local function finish(agent: Agent, returned: boolean, text: string)
 		if #words > 0 then table.concat(words, "\n") else "(it said nothing)")
 end
 
--- The tasks of one agents call as {name, task} pairs, checked: nothing is sent when one of them is wrong.
 local function checked_tasks(tasks: any): { { name: string, task: string } }
 	check("agents", tasks, 1, "tasks", "table", true)
 	if not tasks then
 		return {}
 	end
 	if type(tasks.name) == "string" and type(tasks.task) == "string" then
-		tasks = { tasks } -- one task, not in a list
+		tasks = { tasks }
 	elseif #tasks == 0 and next(tasks) ~= nil then
 		error('agents: tasks is a list, as in agents({ { name = "parser", task = "..." } })', 0)
 	end
@@ -2200,8 +1807,6 @@ table.insert(M.functions, {
 		end
 		local until_time = os.clock() + M.agent_wait
 		while true do
-			-- Those that have ended, some of them perhaps since an earlier call; then the places they left go to
-			-- those waiting.
 			while true do
 				local id: number?, returned: boolean, text: string = host.wait(0)
 				if not id then
@@ -2220,7 +1825,7 @@ table.insert(M.functions, {
 			end
 			local id: number?, returned: boolean, text: string = host.wait(left)
 			if not id then
-				break -- the wait is over, or the limit of this `lua` call is near
+				break
 			end
 			take_in(id, returned, text)
 		end
@@ -2255,18 +1860,8 @@ table.insert(M.functions, {
 	end,
 })
 
--- Workflows -------------------------------------------------------------------------------------------------
---
--- A workflow is a skill that leads the whole session rather than one the model picks for a task: its text is in
--- the lead's system prompt from the start, so it holds for every message, is cached with the prompt and outlasts
--- a compaction. `hx --rpi` starts the session under the skill rpi, and a project's loop can set M.workflow to any
--- skill's name. The agents' prompt is M.system_prompt and M.agent_prompt, without it: a workflow is for the one
--- that leads.
-
 M.workflow = host.workflow :: string?
 
--- The lead's part of the system prompt, or nil where no workflow leads. A workflow whose skill is not there is an
--- error, not a session without it: the user asked for that way of working.
 function M.lead_prompt(): string?
 	local name = M.workflow
 	if not name then
@@ -2282,9 +1877,6 @@ function M.lead_prompt(): string?
 end
 
 local function report()
-	-- A healthy run reads most of what goes in from the cache and writes little of it. DeepSeek reports no writes.
-	-- A run on one model gets one line. One that used several, a sub-agent on another say, gets a line for each
-	-- under its name: their prices differ, so a sum would not say what the run cost.
 	local used: { Count } = live.usage
 	if #used == 0 then
 		used = { { model = M.model, replies = 0, input = 0, cached = 0, written = 0, output = 0 } }
@@ -2295,16 +1887,9 @@ local function report()
 	end
 end
 
--- Bracketed paste. While it is on, the terminal wraps pasted text in the two markers, so a pasted message of many
--- lines can be told from lines typed one by one. A terminal that does not know the sequences ignores them, and
--- its lines carry no markers. The terminal stays in line mode, so it echoes the markers as ^[[200~ and ^[[201~.
 local PASTE_ON, PASTE_OFF = "\27[?2004h", "\27[?2004l"
 local PASTE_START, PASTE_END = "\27[200~", "\27[201~"
 
--- Reads one message with read(), which returns a line or nil at the end of input. A line is a message, unless it
--- carries the start of a paste: then lines are read up to the one that carries its end, and the message is all
--- of them, joined with newlines, without the markers. Text typed before or after the markers belongs to it. A
--- paste cut short by the end of input is the message so far. Returns nil at the end of input.
 function M.read_message(read: () -> string?): string?
 	local line = read()
 	if not line or not line:find(PASTE_START, 1, true) then
@@ -2328,7 +1913,6 @@ function M.main(): number
 		system ..= "\n\n" .. lead
 	end
 	local talk = Conversation.new()
-	-- Encoding even a long conversation takes milliseconds, next to seconds for a reply.
 	talk.on_answer = function()
 		save(system, talk.messages, log_path)
 	end
@@ -2357,9 +1941,6 @@ function M.main(): number
 
 	progress(("hx: %s in %s. Ctrl-C stops a turn, Ctrl-D leaves."):format(M.model, host.cwd))
 	while true do
-		-- Paste is turned on with every prompt, in case a command the model ran turned it off. Only the first
-		-- line of a message gets a prompt. The read is its own host.try so that a stop there can turn paste off
-		-- before it ends the run.
 		local prompt = PASTE_ON .. "> "
 		local read_ok, line = host.try(M.read_message, function()
 			local text = host.input(prompt)
@@ -2382,7 +1963,6 @@ function M.main(): number
 					host.log(PASTE_OFF)
 					error(err, 0)
 				end
-				-- Any other failure ends the turn, not the session: what is owed is answered and the prompt comes back.
 				if err == "interrupted" then
 					talk:abandon("interrupted by the user")
 					host.log("[interrupted]")

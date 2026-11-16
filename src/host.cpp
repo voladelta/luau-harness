@@ -1,6 +1,3 @@
-// The Host and the VM: the `host` table, stops and time limits at safepoints, host.try and host.timed, and the
-// small primitives. The rest of the primitives are in the host_*.cpp files.
-
 #include "host.h"
 
 #include <sys/prctl.h>
@@ -31,8 +28,6 @@
 #include "sys.h"
 
 namespace hx {
-
-// --- between Luau and the host --------------------------------------------------------------------------------
 
 int fail(lua_State* L, std::string_view message) {
     lua_pushnil(L);
@@ -94,9 +89,6 @@ void push_strings(lua_State* L, const std::vector<std::string>& strings) {
 
 namespace {
 
-// --- cutting a long text: see cut_head and cut_tail in host_internal.h -----------------------------------------
-
-// A byte that continues a UTF-8 character rather than starting one.
 bool continues(char c) {
     return (static_cast<unsigned char>(c) & 0xC0U) == 0x80U;
 }
@@ -111,7 +103,7 @@ std::string_view cut_head(std::string_view head) {
         head.remove_suffix(1);
     }
     if (!head.empty() && static_cast<unsigned char>(head.back()) >= 0xC0U) {
-        head.remove_suffix(1);  // the lead byte of the character that was cut
+        head.remove_suffix(1);
     }
     return head;
 }
@@ -129,9 +121,6 @@ std::string_view cut_tail(std::string_view tail) {
 
 namespace {
 
-// --- time limits ----------------------------------------------------------------------------------------------
-
-// Counts a host.try or host.timed call for as long as it runs.
 class TryScope {
   public:
     explicit TryScope(int& depth) noexcept : depth_(depth) { ++depth_; }
@@ -143,7 +132,6 @@ class TryScope {
     int& depth_;
 };
 
-// A timer that raises SIGALRM, and whether the kernel gave one.
 struct LimitTimer {
     timer_t timer{};
     bool made = false;
@@ -158,32 +146,26 @@ LimitTimer make_limit_timer() noexcept {
     return timer;
 }
 
-// The process's one timer, made at its first use, and again in a forked child (see renew_limit_timer).
 LimitTimer& the_limit_timer() noexcept {
     static LimitTimer timer = make_limit_timer();
     return timer;
 }
 
-// The process's one timer, which raises SIGALRM at the time limit in force, or null when the kernel gave none.
 timer_t* limit_timer() noexcept {
     LimitTimer& timer = the_limit_timer();
     return timer.made ? &timer.timer : nullptr;
 }
 
-// Sets the timer to fire at deadline, a time on the monotonic clock; 0 turns it off. A deadline already past fires
-// at once. The VM is interrupted by a flag the signal sets, so a tight loop pays for no clock read, and the limit is
-// as exact as the next safepoint, however slow the steps between safepoints are.
 void arm_limit(double deadline) noexcept {
     timer_t* timer = limit_timer();
     if (timer == nullptr) {
-        return;  // g_expired stays set, and every safepoint reads the clock
+        return;
     }
     const auto whole = static_cast<time_t>(deadline);
     const itimerspec at{{0, 0}, {whole, static_cast<long>((deadline - static_cast<double>(whole)) * 1e9)}};
     timer_settime(*timer, TIMER_ABSTIME, &at, nullptr);
 }
 
-// Tightens a time limit for as long as the scope lives, then puts the outer limit back. A limit of 0 means none.
 class DeadlineScope {
   public:
     DeadlineScope(double& slot, double limit) noexcept : slot_(slot), outer_(slot) {
@@ -202,8 +184,6 @@ class DeadlineScope {
     double outer_;
 };
 
-// --- small primitives -----------------------------------------------------------------------------------------
-
 int l_load(lua_State* L) {
     std::size_t length = 0;
     const char* source = luaL_checklstring(L, 1, &length);
@@ -218,7 +198,6 @@ int l_load(lua_State* L) {
     if (!bytecode) {
         luaL_error(L, "out of memory compiling %s", name);
     }
-    // A syntax error travels inside the bytecode and comes out of luau_load as its message.
     if (luau_load(L, name, bytecode.get(), bytecode_size, 0) != 0) {
         lua_pushnil(L);
         lua_insert(L, -2);
@@ -239,8 +218,6 @@ int l_input(lua_State* L) {
     std::string line;
     if (!std::getline(std::cin, line)) {
         if (g_signal != 0) {
-            // The read was cut short, not ended. Left as it is, the stream would report the end of input to
-            // every later call, and a loop that outlives the stop could never read again.
             std::cin.clear();
             std::clearerr(stdin);
             raise_if_signaled(L);
@@ -251,9 +228,6 @@ int l_input(lua_State* L) {
     return 1;
 }
 
-// host.clip(text, limit): text when it is at most limit bytes; otherwise its head and its tail, at most limit // 2
-// bytes each, cut as cut_head and cut_tail cut them. The caller says what is missing between them, and in its own
-// words: the loop names the file it kept the whole text in.
 int l_clip(lua_State* L) {
     std::size_t length = 0;
     const char* raw = luaL_checklstring(L, 1, &length);
@@ -262,7 +236,6 @@ int l_clip(lua_State* L) {
         lua_settop(L, 1);
         return 1;
     }
-    // Below length here, so it fits; a negative limit (or nan) keeps nothing.
     const std::size_t half = limit > 0 ? static_cast<std::size_t>(limit / 2) : 0;
     const std::string_view text(raw, length);
     const std::string_view head = cut_head(text.substr(0, half));
@@ -280,7 +253,7 @@ int l_log(lua_State* L) {
 }
 
 int l_env(lua_State* L) {
-    const char* value = std::getenv(check_cstring(L, 1));  // NOLINT(concurrency-mt-unsafe): single-threaded
+    const char* value = std::getenv(check_cstring(L, 1));  // NOLINT(concurrency-mt-unsafe)
     if (value == nullptr) {
         return 0;
     }
@@ -292,14 +265,10 @@ int l_env(lua_State* L) {
 
 void renew_limit_timer() noexcept {
     the_limit_timer() = make_limit_timer();
-    g_expired = 1;  // the next safepoint reads the clock, and clears this where there is a timer to set it again
+    g_expired = 1;
 }
 
-// --- the Host -------------------------------------------------------------------------------------------------
-
 Host::Host(HostConfig config, const Sandbox& sandbox) : config_(std::move(config)), sandboxed_(sandbox.confined()) {
-    // An orphan comes to hx instead of init, whatever session it moved to, so every process a command started stays
-    // a descendant of hx and ~Host can find it.
     prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 }
 
@@ -313,8 +282,6 @@ Host& Host::of(lua_State* L) {
 
 namespace {
 
-// The allocator has refused a request since the last full collection (see vm_memory_refused). The allocator is
-// given no Host to keep it in, and a process has one VM.
 bool g_memory_refused = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 }  // namespace
@@ -323,16 +290,11 @@ void vm_memory_refused() noexcept {
     g_memory_refused = true;
 }
 
-// Runs at VM safepoints (loop back edges, calls). Luau code cannot block these, so a signal or an expired time
-// limit always reaches the code that is running. Both are flags a signal handler sets, and the allocator sets a
-// third, so a safepoint costs three loads; the clock is read only once the limit's timer has fired (see arm_limit).
 void Host::on_interrupt(lua_State* L, int gc) {
     if (gc >= 0) {
-        return;  // inside the collector: raising here is not allowed, nor is collecting
+        return;
     }
     if (g_memory_refused) {
-        // The request that was refused has raised its error by now, so what that code held is garbage. Cleared
-        // first: a collection that is itself refused memory asks for the next one.
         g_memory_refused = false;
         lua_gc(L, LUA_GCCOLLECT, 0);
     }
@@ -340,12 +302,10 @@ void Host::on_interrupt(lua_State* L, int gc) {
     if (g_expired == 0) {
         return;
     }
-    // Cleared before the clock is read, so a timer that fires meanwhile is not lost. It may have fired for a limit
-    // that has ended since; then the clock says so and nothing is raised.
     g_expired = limit_timer() != nullptr ? 0 : 1;
     const Host& host = of(L);
     if (host.deadline_ > 0 && now() >= host.deadline_) {
-        g_expired = 1;  // raised again at every safepoint until the limit's call returns, so no pcall swallows it
+        g_expired = 1;
         raise_error(L, "timeout");
     }
 }
@@ -366,16 +326,12 @@ int Host::sleep(lua_State* L) {
         if (left <= 0) {
             break;
         }
-        wait_for({}, left);  // a signal ends it at once
+        wait_for({}, left);
     }
     raise_if_signaled(L);
     return 0;
 }
 
-// Calls the function at stack index fn with the arguments above it, under a time limit (0 for none), and returns
-// true and its results or false and its error. This is where a stop ends: a call that returns while a stop is in
-// progress returns false and the stop's error, whatever the function did, and the outermost such call also ends
-// the stop.
 int Host::protect(lua_State* L, int fn, double deadline) {
     luaL_checktype(L, fn, LUA_TFUNCTION);
     Host& host = of(L);
@@ -383,7 +339,7 @@ int Host::protect(lua_State* L, int fn, double deadline) {
     {
         const DeadlineScope limit(host.deadline_, deadline);
         const TryScope scope(host.tries_);
-        if (g_signal == 0) {  // a stop in progress does not start the function
+        if (g_signal == 0) {
             status = lua_pcall(L, lua_gettop(L) - fn, LUA_MULTRET, 0);
         }
     }
@@ -401,14 +357,10 @@ int Host::protect(lua_State* L, int fn, double deadline) {
     return lua_gettop(L) - fn + 1;
 }
 
-// host.try(fn, ...): a pcall that is also where a stop ends.
 int Host::try_(lua_State* L) {
     return protect(L, 1, 0);
 }
 
-// host.timed(seconds, fn, ...): host.try whose callee is stopped with the error "timeout" once the limit passes.
-// Limits nest: an inner call cannot outlast the outer one. llm, sh and sleep give up when the limit passes, and
-// the error is raised as soon as Luau code runs again.
 int Host::timed(lua_State* L) {
     const double seconds = duration(luaL_checknumber(L, 1));
     return protect(L, 2, now() + seconds);
@@ -446,7 +398,6 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "tty");
     lua_pushlstring(L, config_.model.data(), config_.model.size());
     lua_setfield(L, -2, "model");
-    // host.tools speaks for DeepSeek's endpoints, which share one key, and host.exa for Exa's.
     const auto has_key = [this](std::string_view name) {
         const Endpoint* found = endpoint(name);
         return found != nullptr && !found->key.empty();
@@ -461,7 +412,6 @@ void Host::open(lua_State* L) {
         lua_pushlstring(L, config_.workflow.data(), config_.workflow.size());
         lua_setfield(L, -2, "workflow");
     }
-    // The built-in extensions and skills, each a table of texts by name.
     for (const auto& [field, texts] :
          {std::pair{"extensions", &config_.extensions}, std::pair{"skills", &config_.skills}}) {
         lua_createtable(L, 0, static_cast<int>(texts->size()));

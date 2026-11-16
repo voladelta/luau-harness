@@ -1,29 +1,19 @@
 -- researches a question on the web with Exa's Deep Search: deep(query, objective, {queries?, schema?, count?}) -> answer and sources
 --!strict
---
--- Built into hx; a project's own .hx/ext/exa.luau takes its place. The call goes to Exa's /search endpoint with
--- type "deep" and EXA_API_KEY, whatever model the loop talks to. hx adds the key; this code never sees it.
---
--- Deep Search plans several searches, reads what they find, searches again where the evidence is thin or
--- contradicts itself, and writes a grounded answer from the pages it kept. Use it when finding the answer takes
--- research: comparisons, lists of items that each need their own search, multi-hop questions. For one
--- well-formed lookup, ext("web").search is quicker and cheaper.
 
 local http = ext("_http")
 local note = http.note
 
 local M = {}
 
-M.attempts = 3 -- a request that fails with 408, 429 or 5xx, or gets no answer, is tried this many times
-M.timeout = 180 -- seconds per request; deep takes 4 to 15 seconds and synthesis a few more, but can run longer
-M.highlight_limit = 600 -- characters of each result's highlights shown when printed; the field keeps all of them
+M.attempts = 3
+M.timeout = 180
+M.highlight_limit = 600
 M.answer = "A grounded answer to the query that serves the objective: the specific facts and figures, "
 	.. "with what disagrees between sources said plainly"
 
--- One source of the research, as deep returns it.
 type Source = { title: string, url: string, date: string?, author: string?, highlights: { string } }
 
--- What deep returns. The answer is text, or a table shaped by the schema; grounding is Exa's, as it sent it.
 type Research = {
 	answer: unknown,
 	grounding: { any },
@@ -34,12 +24,10 @@ type Research = {
 
 type DeepOptions = { queries: { string }?, schema: { [string]: any }?, count: number? }
 
--- Raises when an argument of deep is not of its kind.
 local function check(value: unknown, position: number, name: string, kind: string, optional: boolean?)
 	http.check("exa.deep", value, position, name, kind, optional)
 end
 
--- Posts the request to Exa's /search and returns the decoded answer. Retries what is worth retrying, then raises.
 local function call(request: { [string]: unknown }): { [string]: any }
 	if not host.exa then
 		error("exa: hx was started without EXA_API_KEY, so Exa's Deep Search cannot be used", 0)
@@ -56,7 +44,6 @@ local function call(request: { [string]: unknown }): { [string]: any }
 	})
 end
 
--- What printing a research result shows: the answer, the notices, then the sources, best first.
 local function research_text(r: Research): string
 	local parts: { string } = {}
 	local answer = r.answer
@@ -99,18 +86,6 @@ local function research_text(r: Research): string
 end
 local ResearchText = { __tostring = research_text }
 
--- deep(query, objective, {queries = nil, schema = nil, count = 10}) -> research
---
--- query says what to research, in plain words: the subject, and any source type or period that changes what a
--- good page looks like. objective is the goal this search serves: which documents should rank first, which should
--- be left out, and what specific facts or figures to pull from them. queries is a list of up to 10 further
--- searches to start from, each a different direction, not a rephrasing. schema is an Exa output schema of type
--- "object" (at most 10 properties in all, 2 levels deep, every array with items), for an answer as a table; by
--- default the answer is text. count is how many sources come back, 1 to 100 (the price covers 10).
---
--- The research is {answer (text, or a table for a schema), grounding ({field, citations = {{url, title}},
--- confidence}), results ({title, url, date?, author?, highlights}), notices (strings), cost (dollars or nil)}.
--- Printed or returned from lua, it reads as the answer and a numbered list of sources.
 function M.deep(query: string, objective: string, options: DeepOptions?)
 	check(query, 1, "query", "string")
 	check(objective, 2, "objective", "string")
@@ -180,7 +155,6 @@ function M.deep(query: string, objective: string, options: DeepOptions?)
 			table.insert(notices, n.message)
 		end
 	end
-	-- Warnings describe the request, for whoever maintains this code, not for the model.
 	for _, w in type(answer.warnings) == "table" and answer.warnings or {} do
 		if type(w) == "table" and type(w.message) == "string" then
 			note("  exa warning: " .. w.message)

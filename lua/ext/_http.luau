@@ -1,21 +1,14 @@
 -- what the built-in extensions that call a web API share: progress lines, error messages, retries, argument checks
 --!strict
---
--- Built into hx, for web, exa and ocr, which load it with ext("_http"). A name that starts with _ marks an
--- extension that is there for other extensions, not for the model. The --!strict line comes second because the
--- first line is what the system prompt shows.
 
 local M = {}
 
--- A progress line on stderr, unless hx runs with --quiet.
 function M.note(text: string)
 	if not host.quiet then
 		host.log(text)
 	end
 end
 
--- The message of an error body, {"error": "..."} or {"error": {"message": ...}}, or the start of the text. Exa
--- may also put its message at the top, {"message": ...}, which `top` takes too.
 function M.message(text: string?, top: boolean?): string
 	local ok, body = pcall(json.decode, text or "")
 	if ok and type(body) == "table" then
@@ -31,7 +24,6 @@ function M.message(text: string?, top: boolean?): string
 	return tostring(text):sub(1, 300)
 end
 
--- Raises when an argument is not of its kind: "web.search: argument 1 (query) must be a string, not table".
 function M.check(fname: string, value: unknown, position: number, name: string, kind: string, optional: boolean?)
 	if type(value) == kind or value == nil and optional then
 		return
@@ -39,9 +31,6 @@ function M.check(fname: string, value: unknown, position: number, name: string, 
 	error(("%s: argument %d (%s) must be a %s, not %s"):format(fname, position, name, kind, type(value)), 0)
 end
 
--- The text with its runs of white space made one space, cut to `limit` characters with " ..." when it has more
--- than `limit` characters. The cut falls on a character boundary, so a cut text is still UTF-8. Text that is not
--- valid UTF-8 has no characters to count, so it is counted and cut by bytes, as the loop's own listings do.
 function M.clip(text: string, limit: number): string
 	text = text:gsub("%s+", " ")
 	local length = utf8.len(text)
@@ -54,23 +43,18 @@ function M.clip(text: string, limit: number): string
 end
 
 type Request = {
-	endpoint: string, -- host.tool's name for the API
-	body: string | { [string]: string }, -- what host.tool sends: JSON text, or a form
+	endpoint: string,
+	body: string | { [string]: string },
 	attempts: number,
 	timeout: number,
-	label: string, -- names the call in a progress line and in the error for an answer that is not JSON
-	what: string, -- what failed, in the error raised when the request does
-	sender: string, -- who answered: "DeepSeek" or "Exa"
-	top_message: boolean?, -- the error body may carry its message at the top (see message)
-	first_wait: number?, -- seconds before the second try, doubled for each try after it; 2 by default
-	-- A 200 whose body has an `error` is an answer like any other when this is nil. Otherwise the request failed.
-	-- Without a `status`, the error raised says only that, and there is no other try; with one, the error names
-	-- it, and the request is tried again when `retry` says so.
+	label: string,
+	what: string,
+	sender: string,
+	top_message: boolean?,
+	first_wait: number?,
 	body_error: { status: string?, retry: ((err: any) -> boolean)? }?,
 }
 
--- Sends the request and returns the decoded answer. A request is worth another try when it got no answer or 408,
--- 429 or 5xx; after the last try, or a failure that another try would not change, it raises.
 function M.call(request: Request): { [string]: any }
 	for attempt = 1, request.attempts do
 		local status: (number | string)?, text: string? = host.tool(request.endpoint, request.body, {

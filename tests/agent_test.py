@@ -27,10 +27,6 @@ KEY = "sk-test-0123456789"
 
 
 class Model(http.server.ThreadingHTTPServer):
-    """Answers each request with the next scripted reply and records what was asked.
-
-    Agents ask at the same time, in no fixed order, so a script cannot serve them: `answer`, when set, is given each
-    request and returns the reply for it, or None to leave the request to the script."""
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), Handler)
@@ -54,7 +50,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.headers.append({name.lower(): value for name, value in self.headers.items()})
         answer = self.server.answer(request) if self.server.answer else None
         status, reply = answer or (self.server.script.pop(0) if self.server.script else (500, {"error": "script ran out"}))
-        if status == "hang":  # hold the request open until the client gives up
+        if status == "hang":
             self.server.hanging.set()
             time.sleep(reply)
             return
@@ -70,7 +66,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class Tools(http.server.ThreadingHTTPServer):
-    """A stand-in for DeepSeek's tool endpoints: answers by path and records each request, body as bytes."""
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), ToolsHandler)
@@ -140,8 +135,6 @@ def text(words):
     return {"type": "text", "text": words}
 
 
-# The model has one tool, lua, and calls the functions from its code. A scripted bash, read, write or edit call
-# becomes the code a model would send for it: `return bash("...")`.
 FUNCTIONS = {"bash": ["command", "timeout"], "read": ["path", "offset", "limit"], "write": ["path", "content"],
              "edit": ["path", "old", "new", "all"], "submit": ["note"]}
 
@@ -182,8 +175,6 @@ def say(words, **kw):
 
 
 def agent_answers(scripts):
-    """A Model's `answer` that serves agents: `scripts` maps the task an agent was first given to its replies in
-    order. A request whose first message is none of those tasks is left to the model's script."""
     def answer(request):
         first = request["messages"][0]["content"]
         replies = scripts.get(first if isinstance(first, str) else first[0].get("text"))
@@ -210,7 +201,6 @@ class AgentTest(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def env(self, **extra):
-        # Without the caller's own hx settings, or a test's result would depend on the shell it was run from.
         env = {k: v for k, v in os.environ.items()
                if not k.lower().endswith("_proxy") and not k.startswith("HX_") and k != "ANTHROPIC_API_KEY"}
         env.update(HOME=self.home, HX_API_URL=self.model.url, HX_KEY_ENV="HX_TEST_KEY", HX_TEST_KEY=KEY,
@@ -224,8 +214,6 @@ class AgentTest(unittest.TestCase):
                               capture_output=True, text=True, timeout=60)
 
     def tool_results(self, requests=None):
-        """The content of every tool result the model was sent, in order, without repeats; or of those in
-        `requests`, where the model's requests are not all one conversation's."""
         seen, out = set(), []
         for request in self.model.requests if requests is None else requests:
             for message in request["messages"]:
@@ -236,8 +224,6 @@ class AgentTest(unittest.TestCase):
                         seen.add(block["tool_use_id"])
                         out.append(block["content"])
         return out
-
-    # --- the loop ---
 
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
@@ -250,13 +236,12 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(first["messages"], [{"role": "user", "content": "make a file"}])
         self.assertEqual([t["name"] for t in first["tools"]], ["lua"])
         self.assertEqual(set(first["tools"][0]), {"name", "description", "input_schema"})
-        self.assertNotIn("thinking", first)  # DeepSeek's models think by default: nothing to ask for
+        self.assertNotIn("thinking", first)
         self.assertIn("[2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]", done.stderr)
         self.assertEqual(second["messages"][1:], [
             {"role": "assistant", "content": [use("bash", {"command": "echo hi > out.txt; echo made"})]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "made\n[exit 0]"}]},
         ])
-        # Everything before the new messages is resent unchanged, which is what prompt caching needs.
         self.assertEqual(second["messages"][0], first["messages"][0])
         self.assertEqual((second["system"], second["tools"]), (first["system"], first["tools"]))
 
@@ -266,7 +251,7 @@ class AgentTest(unittest.TestCase):
         done = self.run_hx("go", script=[reply(blocks, stop="tool_use"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.model.requests[1]["messages"][1], {"role": "assistant", "content": blocks})
-        self.assertEqual(done.stdout, "Looking.\nok\n")  # thinking is not printed
+        self.assertEqual(done.stdout, "Looking.\nok\n")
 
     def test_several_calls_in_one_reply_are_answered_in_one_message(self):
         done = self.run_hx("go", script=[reply([use("bash", {"command": f"echo {i}"}, f"c{i}") for i in range(3)], stop="tool_use"),
@@ -285,7 +270,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
         self.assertIn("not an object", results[0])
-        # A model used to one tool per action may call a function by its name: it is told where the function is.
         self.assertEqual(results[1], "error: there is no tool named bash: bash is a function, for code sent to the "
                          "lua tool to call, as in bash(command, timeout?)")
         self.assertEqual(results[2], "error: there is no tool named nope")
@@ -314,7 +298,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(len(self.model.requests), 1)
 
     def reminders(self):
-        """The text the loop added behind the tool results of each request after the first."""
         return [[b["text"] for b in r["messages"][-1]["content"] if b["type"] == "text"] for r in self.model.requests[1:]]
 
     def test_a_repeated_call_gets_a_reminder(self):
@@ -327,19 +310,17 @@ class AgentTest(unittest.TestCase):
         self.assertIn('bash("echo same", 5) has returned the same result 5 times in this task', reminders[4][0])
 
     def test_a_silent_command_that_succeeds_is_not_counted(self):
-        # git add, mkdir or a sleep between steps does something; doing it again is not a sign of being stuck.
         same = [call("bash", {"command": "true"}, f"c{i}") for i in range(5)]
         done = self.run_hx("go", script=[*same, say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual([len(r) for r in self.reminders()], [0, 0, 0, 0, 0])
 
     def test_a_loop_inside_one_call_is_counted_too(self):
-        # The model's code prints a counter, so no two tool results are alike; the function results are.
         loop = "for i = 1, 6 do print(i, bash('echo not ready')) end"
         done = self.run_hx("go", script=[call("lua", {"code": loop}), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         reminders = self.reminders()
-        self.assertEqual([len(r) for r in reminders], [1])  # one reminder, for the highest count passed: 5
+        self.assertEqual([len(r) for r in reminders], [1])
         self.assertIn('bash("echo not ready") has returned the same result 6 times', reminders[0][0])
 
     def test_a_call_polled_between_other_calls_still_counts(self):
@@ -350,14 +331,12 @@ class AgentTest(unittest.TestCase):
         self.assertEqual([len(r) for r in self.reminders()], [0, 0, 0, 0, 1])
 
     def test_a_call_whose_result_changes_does_not_count(self):
-        # A test run again after each fix: the same call, a different result each time.
         runs = [call("bash", {"command": "echo x >> log; wc -l < log"}, f"c{i}") for i in range(4)]
         done = self.run_hx("go", script=[*runs, say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual([len(r) for r in self.reminders()], [0, 0, 0, 0])
 
     def test_a_long_result_is_counted_by_all_of_it(self):
-        # Long results are counted by a digest, not kept: one byte changed in the middle is still a new result.
         loop = ('local a = string.rep("a", 300000) '
                 'for i = 1, 4 do write("big", a:sub(1, 150000) .. i .. a:sub(150002)) bash("cat big") end '
                 'for i = 1, 3 do bash("cat big") end')
@@ -368,7 +347,6 @@ class AgentTest(unittest.TestCase):
         self.assertIn('bash("cat big") has now returned the same result 4 times', reminders[0][0])
 
     def test_loading_an_extension_again_is_not_counted(self):
-        # ext returns the same table of functions each time, which says nothing about progress.
         done = self.run_hx("go", script=[call("lua", {"code": "for i = 1, 6 do ext('web') end return 'ok'"}),
                                          say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -376,7 +354,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual([len(r) for r in self.reminders()], [0])
 
     def test_the_log_is_saved_during_the_turn(self):
-        # A run killed half-way leaves its log up to the last tool call, not nothing.
         os.makedirs(os.path.join(self.project, ".hx"))
         done = self.run_hx("go", script=[call("bash", {"command": "echo first"}, "c1"),
                                          call("bash", {"command": "cat .hx/log/*.json"}, "c2"), say("ok")])
@@ -425,12 +402,10 @@ class AgentTest(unittest.TestCase):
                                             "block_binding": {"prefix_mismatch_behavior": "drop_block"}})
         self.assertEqual(self.model.headers[0]["anthropic-beta"], "thinking-binding-controls-2026-08-01,"
                          "thinking-display-updates-2026-08-18,server-side-fallback-2026-07-01,compact-2026-09-04")
-        # Two cache breakpoints: one on the system prompt, which outlives a compaction, and the automatic one.
         self.assertEqual(sent["cache_control"], {"type": "ephemeral"})
         self.assertEqual(len(sent["system"]), 1)
         self.assertEqual(sent["system"][0]["cache_control"], {"type": "ephemeral"})
         self.assertIn("coding agent", sent["system"][0]["text"])
-        # Haiku 5.5 has no server-side fallback; HX_EFFORT still wins.
         done = self.run_hx("go", script=[say("ok")], HX_MODEL="haiku", HX_EFFORT="low")
         self.assertEqual(done.returncode, 0, done.stderr)
         sent = self.model.requests[1]
@@ -438,15 +413,11 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(sent["output_config"], {"effort": "low"})
         self.assertNotIn("fallbacks", sent)
         self.assertEqual(self.model.headers[1]["anthropic-beta"], "thinking-binding-controls-2026-08-01,compact-2026-09-04")
-        # Another model gets the plain request.
         done = self.run_hx("--model", "deepseek-flash", "go", script=[say("ok")])
         self.assertNotIn("thinking", self.model.requests[2])
         self.assertNotIn("fallbacks", self.model.requests[2])
         self.assertNotIn("anthropic-beta", self.model.headers[2])
-        # DeepSeek caches by itself and ignores cache_control: the system prompt goes as the plain string.
         self.assertIsInstance(self.model.requests[2]["system"], str)
-        # A Claude model newer than the loop's list is still asked for adaptive thinking, and gets the system prompt
-        # as Claude's API caches it, and nothing else it might not take.
         done = self.run_hx("--model", "claude-opus-9", "go", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         sent = self.model.requests[3]
@@ -479,7 +450,6 @@ class AgentTest(unittest.TestCase):
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results()[0], "flash is done")
-        # The sub-agent's two requests went to DeepSeek's endpoint, with DeepSeek's key and the plain request.
         self.assertEqual([r["model"] for r in deepseek.requests], ["deepseek-flash", "deepseek-flash"])
         for sent, headers in zip(deepseek.requests, deepseek.headers):
             self.assertEqual(headers["x-api-key"], ds_key)
@@ -488,21 +458,17 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(sent["system"], "the sub-agent's system prompt")
             self.assertNotIn("thinking", sent)
             self.assertNotIn("fallbacks", sent)
-        # Each model's tokens are counted on a line of its own: their prices differ.
         self.assertIn("[claude-opus-5-5: 3 replies, 30 tokens in (0 read from cache, 0 written to it), 15 out]\n"
                       "[deepseek-flash: 2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]",
                       done.stderr)
         self.assertEqual(deepseek.requests[0]["messages"], [{"role": "user", "content": "a sub-task"}])
-        # The session's own stayed on Claude's, with its key and its settings, before the sub-agent and after it.
         self.assertEqual([r["model"] for r in self.model.requests], ["claude-opus-5-5"] * 3)
         for headers in self.model.headers:
             self.assertEqual(headers["x-api-key"], KEY)
             self.assertIn("server-side-fallback", headers["anthropic-beta"])
-        # Neither key reaches the other endpoint, a model or a command.
         self.assertNotIn(ds_key, json.dumps(self.model.requests))
         self.assertNotIn(KEY, json.dumps(deepseek.requests))
         self.assertNotIn(ds_key, self.tool_results()[1])
-        # host.llm takes an endpoint by name only, and says so for one it has none of or no key for.
         script = ("print(pcall(host.llm, '{}', { endpoint = 'search' }))\n"
                   "print(pcall(host.llm, '{}', { endpoint = 'https://example.com' }))\n"
                   "print(host.llm('{}', { endpoint = 'deepseek' }))\n"
@@ -516,11 +482,7 @@ class AgentTest(unittest.TestCase):
                          "the deepseek endpoint")
         self.assertIn("no tool deepseek; the tools are search, fetch, ocr and exa", lines[3])
 
-    # --- agents and the rpi workflow ---
-
     def agents_model(self, scripts):
-        """A stand-in for the agents' model. `scripts` maps the task an agent was first given to its replies, in
-        order: the request's first message says whose it is, and how many replies it holds says which comes next."""
         model = Model()
         self.addCleanup(model.server_close)
         self.addCleanup(model.shutdown)
@@ -537,14 +499,10 @@ class AgentTest(unittest.TestCase):
         done = self.run_hx("--model", "opus", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY="ds-key-1",
                            script=[call("lua", {"code": tasks}, "c1"), say("both are made")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        # The lead gets each agent's last words as its report, in the order the agents were named.
         self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\na\.txt is made\n\n"
                          r"\[agent b: done in \d+ s\]\nb\.txt is made$")
         self.assertEqual((read(self.project, "a.txt"), read(self.project, "b.txt")), ("a\n", "b\n"))
-        # They worked at the same time: both had asked once before either asked again.
         self.assertEqual([len(r["messages"]) for r in deepseek.requests], [1, 1, 3, 3])
-        # Each ran on DeepSeek's model through DeepSeek's endpoint, under the session's prompt and the agents'
-        # paragraph, with the functions but agents.
         for sent, headers in zip(deepseek.requests, deepseek.headers):
             self.assertEqual(sent["model"], "deepseek-flash")
             self.assertEqual(headers["x-api-key"], "ds-key-1")
@@ -556,16 +514,13 @@ class AgentTest(unittest.TestCase):
         lead = self.model.requests[0]
         self.assertIn("- agents(tasks) -> text", lead["tools"][0]["description"])
         self.assertNotIn("one of several agents", lead["system"][0]["text"])
-        # Only the lead's words are the answer. The agents' are progress lines, under their names.
         self.assertEqual(done.stdout, "both are made\n")
         for line in ("  agent a: make a.txt", "[a] bash sleep 1; echo a > a.txt; echo made a", "[a] a.txt is made",
                      "[b] b.txt is made"):
             self.assertIn(line + "\n", done.stderr)
-        # Their tokens are counted with the session's, by model.
         self.assertIn("[claude-opus-5-5: 2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]\n"
                       "[deepseek-flash: 4 replies, 40 tokens in (0 read from cache, 0 written to it), 20 out]",
                       done.stderr)
-        # And each one's conversation has a log beside the session's.
         logs = sorted(os.listdir(os.path.join(self.project, ".hx", "log")))
         self.assertEqual([name.split("-", 3)[3] for name in logs if "-sub-" in name], ["sub-1.json", "sub-2.json"])
         first = json.loads(read(self.project, ".hx", "log", next(name for name in logs if "-sub-1" in name)))
@@ -573,7 +528,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(first["messages"][-1]["content"], [text("a.txt is made")])
 
     def test_work_sent_back_goes_to_the_agent_that_did_it(self):
-        # With no DeepSeek key the agents run on the session's model, through the session's endpoint.
         self.model.answer = agent_answers({"make a.txt": [say("made it"), say("now it is right")]})
         done = self.run_hx("go", script=[
             call("lua", {"code": 'return agents({ { name = "a", task = "make a.txt" } })'}, "c1"),
@@ -583,14 +537,13 @@ class AgentTest(unittest.TestCase):
         first, second = self.tool_results()
         self.assertRegex(first, r"^\[agent a: done in \d+ s\]\nmade it$")
         self.assertRegex(second, r"^\[agent a: done in \d+ s\]\nnow it is right$")
-        # The second task went on in the first one's conversation.
         asked = [r for r in self.model.requests if "one of several agents" in r["system"]]
         self.assertEqual([r["model"] for r in asked], ["deepseek-flash"] * 2)
         self.assertEqual(asked[1]["messages"], [
             {"role": "user", "content": "make a.txt"},
             {"role": "assistant", "content": [text("made it")]},
             {"role": "user", "content": "it is empty: fill it"}])
-        self.assertIn("[5 replies, 50 tokens in", done.stderr)  # one model, one line: the lead's three and the agent's two
+        self.assertIn("[5 replies, 50 tokens in", done.stderr)
 
     def test_a_lead_that_answers_while_its_agents_work_is_told_to_wait(self):
         os.makedirs(os.path.join(self.project, ".hx"))
@@ -604,12 +557,10 @@ class AgentTest(unittest.TestCase):
             call("lua", {"code": "host.sleep(3) return agents()"}, "c2"),
             say("Now it is.")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        # The call returns when its wait is over, and says who is still at work and how to wait.
         lead = [r for r in self.model.requests if "one of several agents" not in r["system"]]
         still, report = self.tool_results(lead)
         self.assertRegex(still, r"^\[agent slow: still at work, \d+ s so far\]\n\n"
                          r"agents\(\) with no tasks waits for the agents still at work\.$")
-        # An answer now would end the session and the agent with it, half way: the lead is told, once.
         self.assertEqual(lead[2]["messages"][-1], {"role": "user", "content":
                          "Your agents are still at work: slow. What they are doing ends half done when this session "
                          "does. Wait for their reports with agents(), check the work, then finish. If you mean to "
@@ -617,7 +568,6 @@ class AgentTest(unittest.TestCase):
         self.assertRegex(report, r"^\[agent slow: done in \d+ s\]\nlate\.txt is made$")
         self.assertEqual(read(self.project, "late.txt"), "late\n")
         self.assertEqual(done.stdout, "All done.\nNow it is.\n")
-        # Told once, a lead that answers again is taken at its word, and the session's end ends the agent.
         self.model.requests.clear()
         self.model.answer = agent_answers({
             "wait": [call("bash", {"command": "echo $$ > agent.pid; sleep 300"}, "a1"), say("never")]})
@@ -641,7 +591,6 @@ class AgentTest(unittest.TestCase):
         self.assert_gone(pid)
 
     def test_rpi_leads_on_opus_by_the_rpi_skill(self):
-        # HX_MODEL says what a session's one model is; --rpi names the lead of a workflow, and that is Opus.
         done = self.run_hx("--rpi", "go", HX_MODEL="deepseek-flash", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         sent = self.model.requests[0]
@@ -651,16 +600,13 @@ class AgentTest(unittest.TestCase):
         body = read(REPO, "lua", "skills", "rpi", "SKILL.md").split("---\n", 2)[2].strip()
         self.assertTrue(system.endswith("[skill rpi, built into hx. Every path in it is the project's.]\n\n" + body))
         self.assertIn("  skill rpi\n", done.stderr)
-        # --model names another lead.
         done = self.run_hx("--model", "sonnet", "--rpi", "go", script=[say("ok")])
         self.assertEqual(self.model.requests[1]["model"], "claude-sonnet-5-5")
         self.assertIn("follows the rpi workflow", self.model.requests[1]["system"][0]["text"])
-        # Without --rpi the skill is one of those the prompt lists, for the model to load when asked.
         done = self.run_hx("go", script=[call("lua", {"code": "return skill('rpi')"}, "c1"), say("ok")])
         self.assertNotIn("follows the rpi workflow", self.model.requests[2]["system"])
         self.assertIn("\n- rpi (built in): The rpi workflow (research, plan, implement).", self.model.requests[2]["system"])
         self.assertEqual(self.tool_results()[0], "[skill rpi, built into hx. Every path in it is the project's.]\n\n" + body)
-        # --rpi is for a task.
         for args in (["--rpi", "--run", "s.luau"], ["--rpi", "--init"], ["--init", "--rpi"]):
             done = self.run_hx(*args)
             self.assertEqual(done.returncode, 2, done.stderr)
@@ -680,12 +626,10 @@ class AgentTest(unittest.TestCase):
         self.assertTrue(system.endswith("Plan twice."), system[-200:])
         self.assertNotIn("# rpi: research, plan, implement", system)
         self.assertEqual(self.model.requests[1]["system"], self.model.requests[0]["system"])
-        # The workflow is the lead's: an agent has the session's prompt without it.
         agent = deepseek.requests[0]["system"]
         self.assertNotIn("follows the rpi workflow", agent)
         self.assertNotIn("Plan twice.", agent)
         self.assertIn("- rpi: This project's way.", agent)
-        # A workflow whose skill is gone is an error, not a session without it.
         with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
             f.write('local M = host.load(host.default_loop, "=loop")()\nM.workflow = "review"\nreturn M\n')
         done = self.run_hx("go")
@@ -739,8 +683,6 @@ class AgentTest(unittest.TestCase):
         done = self.run_hx(stdin="")
         self.assertEqual(done.returncode, 1)
         self.assertIn("no task", done.stderr)
-
-    # --- the command line ---
 
     def test_help_and_version_go_to_stdout(self):
         done = self.run_hx("--help")
@@ -812,14 +754,13 @@ class AgentTest(unittest.TestCase):
                                                say("SUMMARY TEXT"), say("finished")])
         self.assertEqual(done.returncode, 0, done.stderr)
         _, ask, after = self.model.requests
-        # The request for the summary rides on the message that carries the tool result, after the result.
         self.assertEqual([m["role"] for m in ask["messages"]], ["user", "assistant", "user"])
         self.assertEqual([b["type"] for b in ask["messages"][2]["content"]], ["tool_result", "text"])
         self.assertIn("replaced by a summary", ask["messages"][2]["content"][1]["text"])
         self.assertEqual([m["role"] for m in after["messages"]], ["user"])
         self.assertIn("SUMMARY TEXT", after["messages"][0]["content"])
         self.assertEqual(after["system"], ask["system"])
-        self.assertEqual(done.stdout, "finished\n")  # the summary itself is not printed as an answer
+        self.assertEqual(done.stdout, "finished\n")
 
     def test_a_claude_model_compacts_on_the_server(self):
         block = {"type": "compaction", "content": "SUMMARY TEXT", "signature": "sig-c"}
@@ -831,7 +772,6 @@ class AgentTest(unittest.TestCase):
             call("bash", {"command": "echo big"}, input_tokens=200000), compacted, say("finished")])
         self.assertEqual(done.returncode, 0, done.stderr)
         first, ask, after = self.model.requests
-        # The same request as the conversation's, with `compaction` and the loop's own summarization prompt.
         self.assertEqual(ask["compaction"]["type"], "summarize")
         self.assertIn("## Next step", ask["compaction"]["instructions"])
         self.assertEqual(ask["messages"][0], first["messages"][0])
@@ -839,7 +779,6 @@ class AgentTest(unittest.TestCase):
         for key in ("system", "tools", "thinking", "output_config", "model"):
             self.assertEqual(ask[key], first[key])
         self.assertIn("compact-2026-09-04", self.model.headers[1]["anthropic-beta"].split(","))
-        # The block goes first, exactly as it came, and stands for everything it summarized.
         self.assertEqual(len(after["messages"]), 1)
         self.assertEqual(after["messages"][0]["role"], "user")
         self.assertEqual(after["messages"][0]["content"][0], block)
@@ -847,7 +786,6 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("compaction", after)
         self.assertIn("compact-2026-09-04", self.model.headers[2]["anthropic-beta"].split(","))
         self.assertEqual(done.stdout, "finished\n")
-        # What the summary cost is counted from usage.iterations.
         self.assertIn("3 replies", done.stderr)
         self.assertIn("80 out]", done.stderr)
 
@@ -861,8 +799,6 @@ class AgentTest(unittest.TestCase):
         _, ask, after = self.model.requests
         self.assertEqual(after["messages"], ask["messages"])
         self.assertNotIn("compaction", after)
-
-    # --- the walls ---
 
     def test_the_model_cannot_leave_the_project(self):
         with open(os.path.join(self.home, "secret"), "w") as f:
@@ -884,10 +820,10 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("TOP-SECRET", json.dumps(self.model.requests))
         for i in range(5):
             self.assertIn("Permission denied", results[i], i)
-        self.assertIn("/dev/pts': Permission denied", results[5])  # the user's terminals are out of reach
+        self.assertIn("/dev/pts': Permission denied", results[5])
         self.assertNotIn("\n[exit 0]", results[5])
         self.assertEqual(results[6], "in\nt\nfine\n[exit 0]")
-        self.assertEqual(results[7], "out\nerr\nsub\n3\n[exit 0]")  # the ordinary plumbing still works
+        self.assertEqual(results[7], "out\nerr\nsub\n3\n[exit 0]")
         self.assertFalse(os.path.exists(outside))
         self.assertFalse(os.path.exists(os.path.join(self.home, "planted")))
 
@@ -938,7 +874,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn("refusing to treat", done.stderr)
         self.assertEqual(self.model.requests, [])
-        # A sibling of the home directory is an ordinary project.
         sibling = os.path.join(self.root, "home2")
         os.makedirs(sibling)
         self.model.script = [say("ok")]
@@ -953,11 +888,11 @@ class AgentTest(unittest.TestCase):
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.model.headers[0]["x-api-key"], KEY)
-        self.assertEqual(self.model.headers[0]["anthropic-version"], "2023-06-01")  # DeepSeek's
+        self.assertEqual(self.model.headers[0]["anthropic-version"], "2023-06-01")
         sent = json.dumps(self.model.requests)
         self.assertNotIn(KEY, sent)
         self.assertNotIn("hunter2-token", sent)
-        self.assertIn("GIT_CONFIG_KEY_0=not-a-secret", self.tool_results()[0])  # only secrets are removed
+        self.assertIn("GIT_CONFIG_KEY_0=not-a-secret", self.tool_results()[0])
 
     def test_an_inherited_descriptor_does_not_pass_the_wall(self):
         outside = os.path.join(self.root, "outside.txt")
@@ -984,18 +919,16 @@ class AgentTest(unittest.TestCase):
             done = self.run_hx("go", script=[call("bash", {"command": f'python3 -c "{connect}"'}, "c1"),
                                              call("bash", {"command": f'python3 -c "{pair}"'}, "c2"), say("ok")])
             listener.setblocking(False)
-            with self.assertRaises(BlockingIOError):  # nothing is waiting to be accepted
+            with self.assertRaises(BlockingIOError):
                 listener.accept()
         self.assertEqual(done.returncode, 0, done.stderr)
         refused, paired = self.tool_results()
-        # Before Landlock ABI 9 the filter refuses the socket; from ABI 9 Landlock refuses the connection.
         self.assertIn("PermissionError", refused)
         self.assertNotIn("[exit 0]", refused)
         self.assertEqual(paired, "pair\n[exit 0]")
-        self.assertNotIn("unix sockets", done.stderr)  # the wall is whole, so there is no note
+        self.assertNotIn("unix sockets", done.stderr)
 
     def test_a_datagram_pair_cannot_reach_a_socket_outside(self):
-        # A datagram socket is never tied to its peer: one end of a pair could send to any path.
         path = os.path.join(self.root, "outside-datagram.sock")
         send = (f"import socket; a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM); "
                 f"a.sendto(b'leak', '{path}'); print('sent')")
@@ -1003,7 +936,7 @@ class AgentTest(unittest.TestCase):
             listener.bind(path)
             done = self.run_hx("go", script=[call("bash", {"command": f'python3 -c "{send}"'}), say("ok")])
             listener.setblocking(False)
-            with self.assertRaises(BlockingIOError):  # nothing arrived
+            with self.assertRaises(BlockingIOError):
                 listener.recv(16)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("PermissionError", self.tool_results()[0])
@@ -1033,8 +966,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual({name: shown.get(name) for name in kept}, kept)
         self.assertIn("PWD", shown)
 
-    # --- processes ---
-
     def test_a_command_that_runs_too_long_is_killed_with_its_children(self):
         started = time.monotonic()
         self.run_hx("go", script=[
@@ -1044,8 +975,6 @@ class AgentTest(unittest.TestCase):
         self.assert_gone(int(read(self.project, "child.pid")))
 
     def frozen_cgroup(self):
-        """A cgroup v1 freezer group, frozen once a process is put in it. A frozen process ignores SIGKILL until it
-        is thawed, as one stuck in uninterruptible I/O does until the I/O returns."""
         group = os.path.join("/sys/fs/cgroup/freezer", os.path.basename(self.root))
         try:
             os.mkdir(group)
@@ -1072,7 +1001,7 @@ class AgentTest(unittest.TestCase):
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(kill_quietly, process.pid)
         pid = self.wait_for_pid_file("sh.pid")
-        group = self.frozen_cgroup()  # its cleanup runs first, so a binary that hangs here is let go
+        group = self.frozen_cgroup()
         with open(os.path.join(group, "cgroup.procs"), "w") as f:
             f.write(str(pid))
         with open(os.path.join(group, "freezer.state"), "w") as f:
@@ -1104,7 +1033,6 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             sessions = self.tool_results()[1].split()[:2]
             self.assertNotEqual(sessions[0], sessions[1], "the daemon left the command's session")
-            # The model is told, so it does not report a server as left running.
             self.assertIn("nothing you start outlives it", self.model.requests[0]["tools"][0]["description"])
             self.assert_gone(int(read(self.project, "daemon.pid")))
             os.remove(os.path.join(self.project, "daemon.pid"))
@@ -1143,7 +1071,7 @@ class AgentTest(unittest.TestCase):
             self.assert_gone(pid)
             os.write(master, b"go on\n")
             self.assertEqual(process.stdout.readline(), "after the interrupt\n")
-            os.write(master, b"\x04")  # Ctrl-D
+            os.write(master, b"\x04")
             process.stdout.close()
             self.assertEqual(process.wait(timeout=20), 0)
         finally:
@@ -1169,14 +1097,13 @@ class AgentTest(unittest.TestCase):
             process.send_signal(signal.SIGINT)
             os.write(master, b"again\n")
             self.assertEqual(process.stdout.readline(), "after the interrupt\n")
-            self.assertLess(time.monotonic() - started, 10)  # the request was cut, not waited out
+            self.assertLess(time.monotonic() - started, 10)
             os.write(master, b"\x04")
             process.stdout.close()
             self.assertEqual(process.wait(timeout=20), 0)
         finally:
             process.kill()
             os.close(master)
-        # The interrupted message was never answered, so the next one joins it: roles still alternate.
         self.assertEqual(self.model.requests[1]["messages"], [
             {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "again"}]}])
 
@@ -1190,7 +1117,7 @@ class AgentTest(unittest.TestCase):
             os.close(slave)
             try:
                 os.write(master, b"hello\n")
-                os.write(master, b"again\n")  # read once the failed turn is over
+                os.write(master, b"again\n")
                 self.assertEqual(process.stdout.readline(), "after the failure\n")
                 os.write(master, b"\x04")
                 process.stdout.close()
@@ -1235,7 +1162,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(self.model.requests[0]["messages"], [{"role": "user", "content": "first line\nsecond line\nthird"}])
         self.assertEqual(self.model.requests[1]["messages"][2], {"role": "user", "content": "plain"})
         self.assertEqual(self.model.requests[2]["messages"][4], {"role": "user", "content": "before a\nb after"})
-        # Paste is turned on at the prompt and off when the session ends.
         self.assertIn(b"\x1b[?2004h> ", written)
         self.assertGreater(written.rfind(b"\x1b[?2004l"), written.rfind(b"\x1b[?2004h"))
 
@@ -1266,7 +1192,7 @@ class AgentTest(unittest.TestCase):
                 while "> " not in read(errors.name) and time.monotonic() < deadline:
                     time.sleep(0.05)
                 os.write(master, b"\x1b[200~half a paste\n")
-                time.sleep(0.3)  # let it block in the read of the next line
+                time.sleep(0.3)
                 process.send_signal(signal.SIGINT)
                 self.assertEqual(process.wait(timeout=20), 130)
             finally:
@@ -1303,7 +1229,6 @@ class AgentTest(unittest.TestCase):
         ])
 
     def run_interrupted(self, source):
-        """Runs a script, interrupts it once the command it starts has written cmd.pid, and returns the result."""
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write(source)
         process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(), stdout=subprocess.PIPE,
@@ -1329,9 +1254,8 @@ class AgentTest(unittest.TestCase):
         process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(), stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(process.stdout.readline(), "ready\n")
-        time.sleep(0.3)  # let it block in the read
+        time.sleep(0.3)
         process.send_signal(signal.SIGINT)
-        # Wait for the stop to end before writing: a line that arrives before hx wakes is read and then dropped.
         self.assertEqual(process.stdout.readline(), "false\tinterrupted\n")
         out, _ = process.communicate("a line\n", timeout=20)
         self.assertEqual((process.returncode, out), (0, "a line\n"))
@@ -1348,25 +1272,23 @@ class AgentTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.project, "never.txt")))
 
     def test_a_second_signal_kills_what_the_model_started(self):
-        # table.sort without a comparison function runs in C, where no safepoint looks for a stop, so the first stop
-        # is not handled for the seconds it takes and the second signal leaves at once.
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("host.sh(\"setsid sh -c 'echo $$ > daemon.pid; exec sleep 300' > /dev/null 2>&1 < /dev/null &\")\n"
-                    "local t = string.split(string.rep('b,a,c,', 8000000), ',')\n"  # built in C too: quick
+                    "local t = string.split(string.rep('b,a,c,', 8000000), ',')\n"
                     "host.sh(\"sh -c 'echo $$ > child.pid; exec sleep 300' > /dev/null 2>&1 &\")\n"
                     "table.sort(t)\n")
         process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(kill_quietly, process.pid)
         daemon = self.wait_for_pid_file("daemon.pid")
-        for _ in range(600):  # building the list takes seconds under a sanitizer
+        for _ in range(600):
             if os.path.exists(os.path.join(self.project, "child.pid")):
                 break
             time.sleep(0.05)
-        child = self.wait_for_pid_file("child.pid")  # written just before the sort starts
+        child = self.wait_for_pid_file("child.pid")
         for pid in (daemon, child):
-            self.addCleanup(kill_quietly, pid)  # against a binary that leaves them behind
-        time.sleep(0.3)  # let the sort start
+            self.addCleanup(kill_quietly, pid)
+        time.sleep(0.3)
         process.send_signal(signal.SIGINT)
         time.sleep(0.3)
         self.assertIsNone(process.poll(), "the first signal ended the run: the test did not get hx stuck")
@@ -1389,7 +1311,7 @@ class AgentTest(unittest.TestCase):
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return
-            try:  # a zombie still answers kill(0); it is gone once its state says so
+            try:
                 if read(f"/proc/{pid}/stat").rsplit(")", 1)[1].split()[0] == "Z":
                     return
             except FileNotFoundError:
@@ -1397,15 +1319,11 @@ class AgentTest(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"process {pid} is still alive")
 
-    # --- files ---
-
     def test_a_write_that_fails_part_way_leaves_the_old_content(self):
         with open(os.path.join(self.project, "f.txt"), "w") as f:
             f.write("old\n")
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("print(host.write('f.txt', string.rep('x', 100000)))\nprint(table.concat(host.list('.'), ' '))\n")
-        # A file size limit of 1 KiB makes the write fail after its first kilobyte, whoever owns what. SIGXFSZ is
-        # ignored, so the write returns EFBIG instead of killing hx.
         done = subprocess.run(["bash", "-c", 'ulimit -f 1 && trap "" XFSZ && exec "$0" --run s.luau', HX],
                               cwd=self.project, env=self.env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1416,7 +1334,7 @@ class AgentTest(unittest.TestCase):
         target = os.path.join(self.project, "f.txt")
         with open(target, "w") as f:
             f.write("old")
-        os.chmod(target, 0o640)  # not what a new file gets
+        os.chmod(target, 0o640)
         before = os.stat(target)
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("print(host.write('f.txt', 'new'))\n")
@@ -1429,7 +1347,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(after.st_mode, before.st_mode)
 
     def test_a_write_killed_part_way_leaves_the_file_whole(self):
-        # Each write takes long enough that a kill lands inside one. The temporary file may be left beside it.
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("local big = string.rep('x', 32 * 1024 * 1024)\n"
                     "while true do host.write('f.txt', big) end\n")
@@ -1446,7 +1363,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(os.path.getsize(os.path.join(self.project, "f.txt")), 32 * 1024 * 1024)
 
     def test_a_lone_rw_file_is_written_in_place(self):
-        # Its directory is outside the wall, so no temporary file can be made beside it.
         outside = os.path.join(self.root, "lone.txt")
         with open(outside, "w") as f:
             f.write("old")
@@ -1457,8 +1373,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.root)), ["home", "lone.txt", "project"])
 
     def as_ordinary_user(self):
-        """The command prefix that runs hx as a user file permissions apply to. Root is not one, so as root the
-        test directories are handed to nobody and hx runs as nobody."""
         if os.geteuid() != 0:
             return []
         os.chmod(self.root, 0o755)
@@ -1467,14 +1381,13 @@ class AgentTest(unittest.TestCase):
         return ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"]
 
     def test_a_read_only_file_is_not_replaced(self):
-        # Renaming a new file over it would not ask the file's own permission, so the write must refuse as before.
         become = self.as_ordinary_user()
         target = os.path.join(self.project, "ro.txt")
         with open(target, "w") as f:
             f.write("old")
         os.chmod(target, 0o444)
         owner = os.stat(self.project)
-        os.chown(target, owner.st_uid, owner.st_gid)  # the same owner and group, so only the mode stands in the way
+        os.chown(target, owner.st_uid, owner.st_gid)
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("print(host.write('ro.txt', 'new'))\n")
         done = subprocess.run([*become, HX, "--run", "s.luau"], cwd=self.project, env=self.env(TMPDIR=self.home),
@@ -1485,7 +1398,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.project)), ["ro.txt", "s.luau"])
 
     def test_a_trust_root_out_of_reach_does_not_stop_hx(self):
-        # The variable names a file in a directory this user cannot enter: there is nothing to allow, so no rule.
         become = self.as_ordinary_user()
         locked = os.path.join(self.root, "locked")
         os.makedirs(locked)
@@ -1502,7 +1414,7 @@ class AgentTest(unittest.TestCase):
             done = subprocess.run([*become, HX, "--run", "s.luau"], cwd=self.project, env=env, capture_output=True,
                                   text=True, timeout=60)
         finally:
-            os.chmod(locked, 0o700)  # so that tearDown can remove it
+            os.chmod(locked, 0o700)
         self.assertEqual((done.returncode, done.stdout), (0, "true\n"), done.stderr)
 
     def test_a_fifo_is_read_and_written_within_the_time_limit(self):
@@ -1513,13 +1425,12 @@ class AgentTest(unittest.TestCase):
                   "print(host.timed(10, host.read, 'fifo'))\n"
                   "host.sh('cat fifo > got.txt &')\n"
                   "print(host.timed(10, host.write, 'fifo', string.rep('y', 200000)))\n"
-                  "host.sh('(exec 3<fifo; sleep 30) & sleep 0.2')\n"  # a reader that never reads: the pipe fills
+                  "host.sh('(exec 3<fifo; sleep 30) & sleep 0.2')\n"
                   "print(host.timed(1, host.write, 'fifo', string.rep('y', 200000)))\n"
                   "print(host.read('/dev/null'), host.write('/dev/null', 'x'))\n")
         started = time.monotonic()
         done = self.run_hx("--run", "-", stdin=script)
         self.assertEqual(done.returncode, 0, done.stderr)
-        # A wait cut short by the limit returns its own error; no Luau runs after it to raise "timeout".
         self.assertEqual(done.stdout, "true\tnil\tfifo: timed out\n" * 2 + "true\tone two\ntrue\ttrue\n"
                                       "true\tnil\tfifo: timed out\n\ttrue\n")
         self.assertLess(time.monotonic() - started, 20)
@@ -1537,15 +1448,13 @@ class AgentTest(unittest.TestCase):
     def test_clip_keeps_both_ends_cut_at_a_line_or_a_character(self):
         script = ("local function show(...) print(select('#', ...), json.encode({...})) end\n"
                   "show(host.clip('abc', 3))\n"
-                  "show(host.clip(string.rep('xxxxxxx\\n', 4), 20))\n"  # a line near each cut
-                  "show(host.clip('a\\nbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\nc', 12))\n"  # lines too far: cut at a character
-                  "show(host.clip(string.rep('\\u{e9}', 10), 7))\n")  # each cut falls inside an é
+                  "show(host.clip(string.rep('xxxxxxx\\n', 4), 20))\n"
+                  "show(host.clip('a\\nbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\nc', 12))\n"
+                  "show(host.clip(string.rep('\\u{e9}', 10), 7))\n")
         done = self.run_hx("--run", "-", stdin=script)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.splitlines(), [
             '1\t["abc"]', '2\t["xxxxxxx\\n","xxxxxxx\\n"]', '2\t["a\\nbbbb","bbbb\\nc"]', '2\t["é","é"]'])
-
-    # --- extensions and the project's own loop ---
 
     def test_the_model_extends_itself_and_the_extension_stays(self):
         module = "-- shouts a word\nreturn { shout = function(w) return w:upper() .. '!' end }\n"
@@ -1556,19 +1465,15 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results()[1], "HEY!")
         self.assertNotIn("Extensions:", self.model.requests[0]["system"])
-        # It is told what runs it, not that a file which may not exist does.
         self.assertIn("the loop built into hx", self.model.requests[0]["system"])
         self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system"])
-        # A later session is told about it.
         self.run_hx("again", script=[say("ok")])
         self.assertIn("- shout: shouts a word", self.model.requests[-1]["system"])
-        # Each session's conversation was saved, the first one's too, though .hx did not exist when it started.
         logs = [json.loads(read(self.project, ".hx", "log", name))
                 for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
         self.assertEqual(sorted(log["messages"][0]["content"] for log in logs), ["again", "go"])
         saved = next(log for log in logs if log["messages"][0]["content"] == "again")
         self.assertEqual(saved["system"], self.model.requests[-1]["system"])
-        # The logs hold file contents, so git does not see them, though nothing but the model made .hx/.
         self.assertEqual(read(self.project, ".hx", "log", ".gitignore"), "*\n")
         git = dict(cwd=self.project, env=self.env(), capture_output=True, text=True, check=True)
         subprocess.run(["git", "init", "-q"], **git)
@@ -1596,7 +1501,6 @@ class AgentTest(unittest.TestCase):
         self.assertIn("1. Luau\n   https://luau.org\n   A small fast language.", result)
         self.assertIn("# Luau\n\nA small fast language.", result)
         self.assertEqual(result.count("Recognized words"), 2)
-        # Each call went to its endpoint, with the DeepSeek key as a bearer token.
         self.assertEqual([r["path"] for r in tools.requests],
                          ["/v1/tools/search", "/v1/tools/fetch", "/v1/tools/ocr", "/v1/tools/ocr"])
         for r in tools.requests:
@@ -1604,18 +1508,15 @@ class AgentTest(unittest.TestCase):
             self.assertNotIn("x-api-key", r["headers"])
         self.assertEqual(json.loads(tools.requests[0]["body"]), {"query": "luau language", "count": 3})
         self.assertEqual(json.loads(tools.requests[1]["body"]), {"url": "https://luau.org"})
-        # OCR uploads the file as a form, with the purpose the file's kind calls for.
         pdf, png = tools.requests[2], tools.requests[3]
         self.assertTrue(pdf["headers"]["content-type"].startswith("multipart/form-data; boundary="))
         self.assertIn(b'name="file"; filename="scan.pdf"', pdf["body"])
         self.assertIn(b"%PDF-1.7 not really\x00\xff", pdf["body"])
         self.assertIn(b'name="purpose"\r\n\r\nrich_layout_recognition', pdf["body"])
         self.assertIn(b'name="purpose"\r\n\r\ntext_recognition', png["body"])
-        # The model's endpoint gets its own key, and neither key reaches the model or the commands.
         self.assertEqual(self.model.headers[0]["x-api-key"], KEY)
         self.assertNotIn(ds_key, json.dumps(self.model.requests))
         self.assertNotIn(ds_key, self.tool_results()[1])
-        # The built-in extensions are listed, since the key is there.
         self.assertIn("- web (built in): searches the web", self.model.requests[0]["system"])
         self.assertIn("- ocr (built in): reads the text", self.model.requests[0]["system"])
 
@@ -1638,7 +1539,6 @@ class AgentTest(unittest.TestCase):
         self.assertIn("Luau is a fast, small, gradually typed language.\n\nnotice: site: removed.\n\nSources:\n"
                       "1. Luau (2026-08-26)\n   https://luau.org\n"
                       "   Luau is a small fast language. ... It has gradual types.", results[0])
-        # One request, to Exa, with its key as x-api-key, asking for deep research with highlights and a text answer.
         self.assertEqual([r["path"] for r in tools.requests], ["/exa/search"])
         request = tools.requests[0]
         self.assertEqual(request["headers"]["x-api-key"], exa_key)
@@ -1650,14 +1550,11 @@ class AgentTest(unittest.TestCase):
                           "additionalQueries": ["luau gradual typing"], "type": "deep", "numResults": 10,
                           "contents": {"highlights": True}})
         self.assertEqual(body["outputSchema"]["type"], "text")
-        # The warning is logged for whoever runs hx; the model does not see it.
         self.assertIn("exa warning: x is ignored.", done.stderr)
         self.assertNotIn("x is ignored", json.dumps(self.model.requests))
-        # The Exa key does not open DeepSeek's tools, and reaches neither the model nor the commands.
         self.assertIn("without DEEPSEEK_API_KEY", results[1])
         self.assertNotIn(exa_key, json.dumps(self.model.requests))
         self.assertNotIn(exa_key, results[2])
-        # Only exa is listed, since only its key is there.
         system = self.model.requests[0]["system"]
         self.assertIn("- exa (built in): researches a question", system)
         self.assertNotIn("- web (built in)", system)
@@ -1679,7 +1576,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("without DEEPSEEK_API_KEY", results[3])
         self.assertIn("without EXA_API_KEY", results[4])
         self.assertIn("no EXA_API_KEY", results[5])
-        self.assertNotIn("Extensions:", self.model.requests[0]["system"])  # none is listed without its key
+        self.assertNotIn("Extensions:", self.model.requests[0]["system"])
 
     def test_ocr_of_a_file_outside_the_wall_is_refused_before_sending(self):
         tools = Tools()
@@ -1707,15 +1604,10 @@ class AgentTest(unittest.TestCase):
     def test_the_hx_skill_is_built_in_and_a_project_s_own_takes_its_place(self):
         done = self.run_hx("go", script=[call("lua", {"code": "return skill('hx')"}, "c1"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        # No directory here holds a skill, and the prompt still lists the one hx is built with.
         self.assertIn("\n- hx (built in): Use, extend or change hx", self.model.requests[0]["system"])
-        # The paragraph on extending hx points to it: a model that is not told loads nothing and works from that
-        # paragraph alone.
         self.assertIn('skill("hx") says which of these a need calls for', self.model.requests[0]["system"])
-        # It loads whole: the text after the front matter of the file Claude Code reads in this repository.
         body = read(REPO, ".claude", "skills", "hx", "SKILL.md").split("---\n", 2)[2].strip()
         self.assertEqual(self.tool_results()[0], "[skill hx, built into hx. Every path in it is the project's.]\n\n" + body)
-        # A project's own skill of that name takes its place.
         os.makedirs(os.path.join(self.project, ".hx", "skills", "hx"))
         with open(os.path.join(self.project, ".hx", "skills", "hx", "SKILL.md"), "w") as f:
             f.write("---\nname: hx\ndescription: This project's own.\n---\nOurs.\n")
@@ -1740,19 +1632,17 @@ class AgentTest(unittest.TestCase):
         subprocess.run(["git", "add", "src", "README.md", ".gitignore"], **git)
         self.run_hx("go", script=[say("ok")])
         system = self.model.requests[0]["system"]
-        # Tracked files and a new one that is not ignored, directories first; what .gitignore names is left out.
         self.assertIn("5 in all, as git lists them", system)
         self.assertIn("\nsrc/\n  util/\n    text.c\n  main.c\n.gitignore\nREADME.md\nnew.txt", system)
         self.assertNotIn("build/", system)
         self.assertNotIn("out.o", system)
-        # A project that wants no tree, or fewer lines of it, says so in its loop.
         self.run_hx("--init")
         loop = os.path.join(self.project, ".hx", "loop.luau")
         source = read(loop)
         with open(loop, "w") as f:
             f.write(source.replace("-- M.max_replies = 100", "M.layout_lines = 0"))
         done = self.run_hx("go", script=[say("ok")])
-        self.assertNotIn("loop.luau", done.stderr)  # the project's loop loaded
+        self.assertNotIn("loop.luau", done.stderr)
         self.assertNotIn("main.c", self.model.requests[-1]["system"])
 
     def test_without_git_the_system_prompt_shows_the_project_directory(self):
@@ -1769,11 +1659,9 @@ class AgentTest(unittest.TestCase):
         source = read(loop)
         self.assertEqual(source, read(REPO, "lua", "overlay.luau"))
         self.assertIn("host.load(host.default_loop", source)
-        self.assertEqual(self.run_hx("--init").returncode, 2)  # never overwrites
-        # Unchanged, it behaves as the built-in loop does.
+        self.assertEqual(self.run_hx("--init").returncode, 2)
         done = self.run_hx("go", script=[say("ok")])
         self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
-        # A setting changed in it, and a function replaced in it, change what is sent.
         with open(loop, "w") as f:
             f.write(source.replace('-- M.max_replies = 100',
                                    'M.model = "project-model"')
@@ -1793,7 +1681,6 @@ class AgentTest(unittest.TestCase):
         loop = os.path.join(self.project, ".hx", "loop.luau")
         source = read(loop)
         self.assertEqual(source, read(REPO, "lua", "loop.luau"))
-        # The copy is what runs: change it and the behaviour changes.
         with open(loop, "w") as f:
             f.write(source.replace('M.model = host.model',
                                    'M.model = "project-model"'))
@@ -1890,13 +1777,10 @@ class AgentTest(unittest.TestCase):
 
     def test_control_characters_reach_a_terminal_only_as_text(self):
         words = "\x1b]52;c;aGk=\x07red\x1b[31m!"
-        # The model's own code writes to the terminal through host.log and host.input, and prints through _G.print.
         writes = ('host.log("log\\27]0;pwned\\7") _G.print("print\\27]0;pwned\\7") '
                   'return host.input("ask\\27]0;pwned\\7")')
         script = [call("bash", {"command": "true # \x1b]0;title\x07"}, "c1"), call("lua", {"code": writes}, "c2"),
                   say(words)]
-        # Into a pipe, the model's words are passed on unchanged; the progress line never carries the escapes, nor
-        # does what the model's code writes there.
         done = self.run_hx("go", script=script, stdin="typed\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, words + "\n")
@@ -1904,9 +1788,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("log]0;pwned", done.stderr)
         self.assertIn("ask]0;pwned", done.stderr)
         self.assertNotIn("\x1b", done.stderr)
-        # _G.print is the print that goes to the model, which reads the text as it is; no terminal sees it.
         self.assertEqual(self.tool_results()[1], "print\x1b]0;pwned\x07\ntyped")
-        # On a terminal they are stripped.
         self.model.script = list(script)
         master, slave = pty.openpty()
         process = subprocess.Popen([HX, "go"], cwd=self.project, env=self.env(), stdin=subprocess.DEVNULL, stdout=slave,
@@ -1917,7 +1799,7 @@ class AgentTest(unittest.TestCase):
             while True:
                 try:
                     chunk = os.read(master, 4096)
-                except OSError:  # EIO once the child has closed the terminal
+                except OSError:
                     break
                 if not chunk:
                     break
@@ -1929,7 +1811,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(out, b"]52;c;aGk=red[31m!\r\n")
 
     def test_a_session_that_makes_hx_keeps_its_log(self):
-        # No .hx when the session starts: the model makes it by writing its first extension.
         module = "-- says hi\nreturn { hi = function() return 'hi' end }\n"
         done = self.run_hx("go", script=[call("write", {"path": ".hx/ext/hi.luau", "content": module}), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1981,12 +1862,9 @@ print(host.sh("pgrep -x sleep -a").out)
         self.assertIn("sleep 61", done.stdout)
         self.assertNotIn("sleep 62", done.stdout)
 
-    # --- the judge ---
-
     def make_kit(self, where=None, run="#!/bin/sh\nsh prog.sh\n",
                  check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "wrong: $(head -c 80 "$1/.judge/stdout")"; exit 1; }\n',
                  config='{"runs": 3}', prog="sleep 0.3\necho 42\n"):
-        """A kit that times prog.sh and passes only when it prints 42."""
         kit = where or os.path.join(self.root, "kit")
         os.makedirs(kit, exist_ok=True)
         for name, body in [("run", run), ("check", check)]:
@@ -2009,7 +1887,6 @@ print(host.sh("pgrep -x sleep -a").out)
         return [json.loads(line) for line in read(self.judge_state(), "ledger.jsonl").splitlines()]
 
     def drive(self, kit, body, *flags, timeout=120):
-        """Runs a script that submits to the judge; submit(note) returns the verdict, or the pending count."""
         with open(os.path.join(self.project, "drive.luau"), "w") as f:
             f.write("""
 function submit(note)
@@ -2037,7 +1914,6 @@ try("slower", "sleep 0.2\\necho 42\\n")
         self.assertIn("The champion is still the starting point.", lines[0])
         self.assertRegex(lines[1], r"^Trial 2\. win: \+\d+\.\d% against the champion \(medians 0\.\d+ s and 0\.\d+ s\)")
         self.assertTrue(lines[2].startswith("Trial 3. invalid: the check failed: | wrong: 41"), lines[2])
-        # The candidate's run cannot read the kit: had it, it would have printed "leaked" and failed the check.
         self.assertTrue(lines[3].startswith("Trial 4. win:"), lines[3])
         self.assertTrue(lines[4].startswith("Trial 5. worse:"), lines[4])
         self.assertIn("hx judge: 5 trials: 2 win, 1 no different, 1 worse, 1 invalid", done.stderr)
@@ -2147,7 +2023,6 @@ print(#later, still, json.decode(later[1]):match("^Trial 1%. %w+"))
     def test_judge_a_trial_it_cannot_finish_is_recorded_as_an_error(self):
         flags = os.path.join(self.root, "flags")
         os.makedirs(flags)
-        # Once the flag is up, the champion's code (which sleeps 0.3) fails to run; the candidate's does not.
         kit = self.make_kit(run=f"#!/bin/sh\ntest -e {flags}/on && grep -q 0.3 prog.sh && exit 3\nsh prog.sh\n")
         done = self.drive(kit, f'''
 host.write("prog.sh", "sleep 0.01\\necho 42\\n")
@@ -2191,7 +2066,7 @@ say(submit("a link into the kit, and no work"))
 """)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed"), done.stdout)
-        self.assertEqual(read(self.judge_state(), "champion.patch"), "")  # the start is still the champion
+        self.assertEqual(read(self.judge_state(), "champion.patch"), "")
 
     def test_judge_blind_withholds_the_checks_words_too(self):
         kit = self.make_kit(config='{"runs": 1, "blind": true}',
@@ -2220,7 +2095,7 @@ print((json.decode(later[1]):match("^Trial 1%. %w+")))
     def test_judge_builds_and_runs_at_one_path(self):
         kit = self.make_kit(config='{"runs": 1}', run="#!/bin/sh\nsh made.sh\n")
         with open(os.path.join(kit, "build"), "w") as f:
-            f.write('#!/bin/sh\nprintf "cd %s && sh prog.sh\\n" "$PWD" > made.sh\n')  # records where it was built
+            f.write('#!/bin/sh\nprintf "cd %s && sh prog.sh\\n" "$PWD" > made.sh\n')
         os.chmod(os.path.join(kit, "build"), 0o755)
         done = self.drive(kit, 'host.write("prog.sh", "sleep 0.05\\necho 42\\n"); say(submit("fast"))\n')
         self.assertEqual(done.returncode, 0, done.stderr)

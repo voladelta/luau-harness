@@ -1,15 +1,9 @@
--- The layout: a list of paths as a tree that fits in a number of lines, and the system prompt's part made of it.
--- Run with: hx --ro tests --run tests/layout_test.luau
-
 local loop = assert(host.load(host.default_loop, "=loop"))()
 host.quiet = true
 
--- check, has, lacks and the report at the end are shared, in check.luau beside this file.
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check, has, lacks = checks.check, checks.has, checks.lacks
-
--- The tree ----------------------------------------------------------------------------------------------------
 
 local paths = { "README.md", "src/main.c", "src/util/text.c", "src/util/list.c", "docs/guide.md", ".gitignore" }
 
@@ -25,7 +19,6 @@ check("all of it, when it fits: directories first, then files, each by name", lo
 	"README.md",
 }, "\n"))
 
--- Nine lines in all. With eight, the deepest directory stays closed; the level above it is opened first.
 check("a level is opened before the one below it", loop.tree(paths, 8), table.concat({
 	"docs/",
 	"  guide.md",
@@ -36,7 +29,6 @@ check("a level is opened before the one below it", loop.tree(paths, 8), table.co
 	"README.md",
 }, "\n"))
 
--- docs/ has one entry and src/ two: after the four of the top level, six lines hold docs/ and not src/ as well.
 check("a directory that does not fit stays closed, and a smaller one after it still opens", loop.tree(paths, 6),
 	table.concat({ "docs/", "  guide.md", "src/ (3 files)", ".gitignore", "README.md" }, "\n"))
 
@@ -62,15 +54,9 @@ check("a path listed twice in a row counts once", loop.tree({ "a/x", "a/x", "b" 
 
 check("no paths, no tree", loop.tree({}, 60), "")
 
--- A file's name is whatever its author chose: it cannot start a line of its own or reach the terminal.
 local tree = loop.tree({ "odd\nname\27[2J.txt" }, 60)
 check("a line break in a name is a space, and an escape character goes", tree, "odd name[2J.txt")
 
--- The system prompt -------------------------------------------------------------------------------------------
-
--- This test runs wherever it may write: in a build directory git ignores, or a scratch directory with no
--- repository, where the layout is the directory's own entries, or in a repository, where it is git's list. A new
--- file is in all of them.
 assert(host.write("hx-layout-test/file.txt", "x"))
 loop.layout_lines = 100000
 has("the layout names what is in the project directory", loop.layout(), "hx-layout-test/")
@@ -81,7 +67,6 @@ loop.layout_lines = 0
 check("no lines, no layout", loop.layout(), nil)
 lacks("and none in the prompt", loop.system_prompt(), "hx-layout-test")
 
--- A project draws its own.
 loop.layout = function()
 	return "Files: just the one."
 end

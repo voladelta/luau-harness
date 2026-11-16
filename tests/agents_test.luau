@@ -1,6 +1,3 @@
--- The agents function of the built-in loop: agents at work side by side, each in a child of hx. Run with: hx --ro tests --run tests/agents_test.luau
--- No model is asked: loop.request is a stand-in here, and the children inherit it.
-
 local loop = assert(host.load(host.default_loop, "=loop"))()
 local dir = host.env("TMPDIR") .. "/"
 
@@ -15,13 +12,6 @@ for _, fn in loop.functions do
 	end
 end
 
--- The stand-in model does what the last thing it was told says:
---   run: COMMAND    runs the command with bash, and then says what it printed
---   say: WORDS      says the words
---   count           says how many messages its conversation holds
---   functions       says which functions it has
---   global          says what the global `mark` holds, and sets it
---   fail            the request fails
 mark = "nobody's"
 local systems = {}
 loop.system_prompt = function()
@@ -63,7 +53,6 @@ end
 
 check("with no agents, it says so", agents(), "You have no agents yet: give agents a list of tasks.")
 
--- Tasks are checked before any is sent.
 raises("tasks that are no table", "argument 1 (tasks) must be a table, not string", agents, "do it")
 raises("a table that is no list", "tasks is a list", agents, { parser = "do it" })
 raises("a task without a name", 'task 2 must be a table { name = "...", task = "..." }', agents,
@@ -73,7 +62,6 @@ raises("an empty task", "the task for a is empty", agents, { { name = "a", task 
 raises("one name twice", "a is given two tasks in one call", agents, { { name = "a", task = "say: 1" }, { name = "a", task = "say: 2" } })
 check("a call that fails sends nothing", agents(), "You have no agents yet: give agents a list of tasks.")
 
--- Two agents work at the same time, and each one's last words are its report.
 local began = os.clock()
 local reports = agents({
 	{ name = "first", task = ("run: sleep 1; echo one > %sone.txt; echo made one"):format(dir) },
@@ -86,8 +74,6 @@ check("the first did its work", host.read(dir .. "one.txt"), "one\n")
 check("and the second", host.read(dir .. "two.txt"), "two\n")
 check("the agents' prompt was built once", #systems, 1)
 
--- A task for an agent that exists goes on in its conversation; a new name starts a new one. One task need not be
--- in a list.
 reports = agents({ { name = "first", task = "count" }, { name = "third", task = "count" } })
 has("the agent sent more has what it did", reports, "[agent first: done in 0 s]\n5 messages")
 has("a new one starts empty", reports, "[agent third: done in 0 s]\n1 messages")
@@ -95,7 +81,6 @@ has("one task alone", agents({ name = "third", task = "say: again" }), "again")
 check("a report is given once", agents(),
 	"No agent is at work, and you have every report. Your agents so far: first, second, third.")
 
--- An agent has the session's prompt and its own paragraph, runs on the agents' model, and has no agents of its own.
 loop.agent_model = "some-model"
 local told = agents({ { name = "first", task = "functions" } })
 has("an agent has the functions", told, "bash read write edit skill ext on some-model")
@@ -105,30 +90,25 @@ has("its prompt is the session's and the agents' paragraph", told,
 check("the lead keeps its model", loop.model, host.model)
 check("and its functions", loop.functions[#loop.functions].name, "agents")
 
--- What an agent sets is its own: each run starts from the lead's globals as they are then.
 mark = "the lead's"
 has("an agent sees the lead's globals", agents({ { name = "first", task = "global" } }), "mark was the lead's")
 check("and does not change them", mark, "the lead's")
 has("nor does its next run see what its last one set", agents({ { name = "first", task = "global" } }), "mark was the lead's")
 
--- A turn that fails is reported, and the agent can be sent more.
 local failed = agents({ { name = "second", task = "fail" } })
 has("a failed turn says why", failed, "[agent second: failed after 0 s: the model request failed (500): no]\n(it said nothing)")
 has("and the agent goes on from there", agents({ { name = "second", task = "count" } }), "5 messages")
 
--- A run that takes too long is stopped, and leaves a conversation that goes on.
 loop.agent_seconds = 1
 local late = agents({ { name = "slow", task = "run: sleep 20; echo never" } })
 has("a run past its time is stopped", late, "[agent slow: stopped at the 1 s one run may take]")
 loop.agent_seconds = 1800
 has("and the agent can still be sent more", agents({ { name = "slow", task = "count" } }), "3 messages")
 
--- An agent whose process is killed keeps the conversation it had.
 local killed = agents({ { name = "slow", task = "run: kill -9 $PPID" } })
 has("a killed agent is reported", killed, "[agent slow: stopped after 0 s (the child ended without a result")
 has("and has the conversation it had before", agents({ { name = "slow", task = "count" } }), "5 messages")
 
--- More agents than places: the rest wait their turn. The call returns when the wait is over, and agents() waits on.
 loop.agent_limit = 1
 loop.agent_wait = 0.3
 local busy = agents({ { name = "first", task = "run: sleep 1; echo a" }, { name = "second", task = "run: sleep 1; echo b" } })

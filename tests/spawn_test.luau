@@ -1,13 +1,9 @@
--- host.spawn and host.wait: children that run a function in a copy of the VM. Run with: hx --ro tests --run tests/spawn_test.luau
--- Works in $TMPDIR, which hx creates for the run and removes afterwards.
-
 local dir = host.env("TMPDIR") .. "/"
 
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check, has, raises = checks.check, checks.has, checks.raises
 
--- Every child that has ended or ends within `seconds`, by id: {ok, text}.
 local function wait_all(seconds: number): { [number]: { ok: boolean, text: string } }
 	local done = {}
 	while true do
@@ -23,7 +19,6 @@ check("with no child, wait returns nil and none running", select("#", host.wait(
 check("nil", (host.wait(0)), nil)
 check("none running", select(2, host.wait()), 0)
 
--- What a child returns or raises comes back, by its id, and what it changed in the VM does not.
 shared = "the parent's"
 local returns = host.spawn(function(a, b)
 	shared = "the child's"
@@ -40,7 +35,7 @@ local returns_number = host.spawn(function()
 	return 5
 end)
 local big = host.spawn(function()
-	return string.rep("x", 3000000) -- far more than a pipe holds: the parent reads while the child writes
+	return string.rep("x", 3000000)
 end)
 check("ids count up from 1", returns, 1)
 local done = wait_all(10)
@@ -56,7 +51,6 @@ check("as an error", done[returns_number].ok, false)
 check("a long result comes back whole", #done[big].text, 3000000)
 check("the parent's globals are its own", shared, "the parent's")
 
--- Children run at the same time as each other and as the parent.
 local began = os.clock()
 for _ = 1, 4 do
 	host.spawn(function()
@@ -68,7 +62,6 @@ check("and says how many still run", select(2, host.wait(0)), 4)
 wait_all(10)
 check("four children that sleep a second take about one", os.clock() - began < 3, true)
 
--- A child is on its own: no time limit of the parent's, a working one of its own, no stdin, no children.
 local ok, inner = host.timed(0.3, function()
 	local id = host.spawn(function()
 		host.sleep(1)
@@ -91,7 +84,6 @@ end)
 done = wait_all(10)
 check("a child reads no stdin and cannot spawn", done[lone].text, "nil|false|host.spawn: a spawned child cannot spawn")
 
--- wait returns before a time limit in force, so that its caller can still say what it waited for.
 local slow = host.spawn(function()
 	host.sleep(4)
 end)
@@ -104,7 +96,6 @@ check("with nothing", waited, nil)
 check("and the child still running", running, 1)
 check("two seconds before the limit", os.clock() - began < 2, true)
 
--- A child that is killed leaves no result, and what a child's commands left running ends with it.
 local killed = host.spawn(function()
 	host.sh("kill -9 $PPID")
 	host.sleep(10)

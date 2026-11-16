@@ -1,45 +1,13 @@
 --!strict
--- The judge, built into hx. With --judge KIT, hx forks a process for it before the agent's wall goes up; the process
--- puts up a wall of its own, which reads the project and the kit and writes only the judge's state directory. The
--- agent cannot read the kit or the state, and reaches the judge only through host.judge: each line in is a
--- submission, {"note": text}, and each line out is its verdict, as a JSON string. hx waits for the first line,
--- "ready" once the starting point is measured, or why the judge cannot start, before the agent begins.
---
--- The rule it keeps: the agent proposes, the kit measures. A submission is a copy of the project as it stands. The
--- kit's build makes it, the kit's run is timed by hx from outside, and the kit's check decides whether the output
--- is right and may report a score. The candidate and the champion, the best version so far, are measured in pairs
--- that alternate in a random order, so both meet the same machine. A change wins when it is better by more than
--- the margin in the median pair and in all pairs but one, and then again on fresh pairs. Only then is it the
--- champion. Every trial goes into the ledger with its patch, whatever its verdict, errors included.
---
--- The kit is a directory:
---   run       executable, required. Runs in a fresh copy of the built candidate, behind a wall that holds only that
---             copy, the system directories and the --ro and --rw paths. Its time is the measure, unless
---             the check reports a score. It exits 0 when it worked. The candidate's code can read it while it runs.
---   build     executable, optional. Runs once per candidate, untimed, behind the same wall.
---   check     executable, optional. Runs after each run as `check DIR`, where DIR is the run's copy and the run's
---             output is DIR/.judge/stdout. It reads the kit and DIR and writes nothing that lasts. It exits 0 when
---             the output is right; when its last line is a number, that is the score: positive, and higher is
---             better. What it prints when it fails goes to the agent.
---   kit.json  optional: {"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}: pairs per round, the
---             smallest relative gain that counts, seconds allowed for one build, run or check, and whether the
---             agent is told verdicts without numbers or the candidate's own output, so that it cannot fit what the
---             kit holds back by reading them.
 
--- What kit.json sets.
 type Config = { runs: number, margin: number, timeout: number, blind: boolean }
 
--- One measurement of a candidate: its time ("seconds", lower is better) or the check's "score" (higher is better).
 type Measure = { kind: string, value: number }
 
--- A round of pairs: the median gain of the candidate over the champion, and each side's values.
 type Round = { gain: number, kind: string, mine: { number }, theirs: { number } }
 
--- The best version so far: its trial (0 for the start), the tree it was built in, the build, and its latest
--- measured median.
 type Champion = { trial: number, dir: string, built: string, kind: string, value: number }
 
--- A line of the ledger. The verdict and what goes with it are added as the trial goes on.
 type Entry = {
 	trial: number,
 	time: number?,
@@ -53,24 +21,21 @@ type Entry = {
 
 local kit: string, state: string = host.args[1], host.args[2]
 local project: string = host.cwd
-local reads: { string }, writes: { string } = {}, {} -- --ro and --rw: the candidate's commands get what the agent's get
+local reads: { string }, writes: { string } = {}, {}
 for i = 3, #host.args, 2 do
 	table.insert(host.args[i] == "--ro" and reads or writes, host.args[i + 1])
 end
 
--- kit.json's keys, each with the value it takes when left out. A key's type is the type of its value here.
 local defaults: { [string]: number | boolean } = { runs = 5, margin = 0.02, timeout = 600, blind = false }
-local config: Config -- set by main, before anything is measured
+local config: Config
 
--- The kit's config, or nil and why kit.json is wrong. The result is a Config: it has every key of defaults, each
--- with a value of the type of the default.
 local function read_config(): (Config?, ...string)
 	local result: { [string]: any } = table.clone(defaults)
 	local text = host.read(kit .. "/kit.json")
 	if not text then
 		return result :: Config
 	end
-	local given, err = json.decode(text) -- not JSON: nil and the reason, never an error raised
+	local given, err = json.decode(text)
 	if type(given) ~= "table" then
 		return nil, "kit.json is not a JSON object" .. (err and ": " .. err or "")
 	end
@@ -92,9 +57,6 @@ local function read_config(): (Config?, ...string)
 	return result :: Config
 end
 
--- Removes control characters but newline and tab, as M.printable in loop.luau does: a failing run's output and a
--- trial's reason are the candidate's words, and they go to the same terminal as the agent's. The judge runs in a
--- VM of its own and shares no code with the loop, so it keeps its own copy.
 local function printable(text: string): string
 	return (text:gsub("[\0-\8\11-\31\127]", ""):gsub("\194[\128-\159]", ""):gsub("\226\128[\170-\174]", "")
 		:gsub("\226\129[\166-\169]", ""))
@@ -115,8 +77,6 @@ local function tail(text: string, limit: number): string
 	return #text <= limit and text or "..." .. text:sub(-limit)
 end
 
--- A command of the judge's own, in its own wall. Raises when it fails: that is the judge's fault, not the trial's.
--- Its time limit is the judge's, not the kit's, and it ends when hx hangs up.
 local function shell(command: string): string
 	local result = host.sh("set -o pipefail; " .. command, { timeout = 3600, hangup = true })
 	if result.code ~= 0 then
@@ -125,11 +85,6 @@ local function shell(command: string): string
 	return result.out
 end
 
--- Trees and patches -----------------------------------------------------------------------------------------------
---
--- Each snapshot is stored in a git repository of the judge's own, so a patch carries what a plain diff loses:
--- binary files, symbolic links, modes and odd names. `git apply` takes it in the project.
-
 local git_dir = state .. "/git"
 
 local function git(args: string, env: string?): string
@@ -137,27 +92,21 @@ local function git(args: string, env: string?): string
 		.. "-c core.fileMode=true %s"):format(env or "", quote(git_dir), args))
 end
 
--- The tree of a directory's files, every one of them, as git stores it.
 local function tree(dir: string): string
 	local index = state .. "/index"
 	shell(("rm -f %s %s.lock"):format(quote(index), quote(index)))
 	local env = ("cd %s && GIT_INDEX_FILE=%s "):format(quote(dir), quote(index))
 	git("--work-tree=. add --all --force .", env)
-	-- write-tree prints the tree's hash; had it failed, git would have raised.
 	return git("write-tree", env):match("%x+") :: string
 end
 
-local start_tree: string -- set by start, before any patch is written
+local start_tree: string
 
 local function write_patch(to_tree: string, name: string)
 	git(("diff --binary --full-index --no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ %s %s > %s")
 		:format(start_tree, to_tree, quote(state .. "/" .. name)))
 end
 
--- Candidates ------------------------------------------------------------------------------------------------------
-
--- A command of the kit's, on a candidate, behind the candidate's wall: the directory it works in, plus what the
--- agent may read and write, and never the kit. Returns the seconds it took, or nil and why it failed.
 local function candidate(dir: string, script: string): (number?, ...string)
 	local wall = table.clone(writes)
 	table.insert(wall, dir)
@@ -182,17 +131,13 @@ local function candidate(dir: string, script: string): (number?, ...string)
 	return nil, ("%s %s:\n%s"):format(script, how, tail(host.read(dir .. "/.judge/stdout") or "", 1500))
 end
 
--- Copies the project as it stands, without .git and .hx, to dir.
 local function snapshot(dir: string)
 	shell(("rm -rf %s && mkdir -p %s && tar -C %s --exclude=./.git --exclude=./.hx -cf - . | tar -C %s -xf -"):format(
 		quote(dir), quote(dir), quote(project), quote(dir)))
 end
 
--- Every build and run happens at this one path, so a build that records where it is (cmake, a virtualenv)
--- still works when its copy is run.
 local workdir = state .. "/run"
 
--- Builds the source in dir/src into dir/built. Returns true, or false and why.
 local function build(dir: string): (boolean, ...string)
 	shell(("rm -rf %s %s/built && cp -a %s/src %s"):format(quote(workdir), quote(dir), quote(dir), quote(workdir)))
 	if host.read(kit .. "/build") then
@@ -205,8 +150,6 @@ local function build(dir: string): (boolean, ...string)
 	return true
 end
 
--- One measurement of a built tree, in a fresh copy of it, so no run sees the files an earlier one left. Returns
--- {kind, value}, where kind is "seconds" (lower is better) or "score" (higher is better), or nil and why.
 local function measure(built: string): (Measure?, ...string)
 	local dir = workdir
 	shell(("rm -rf %s && cp -a %s %s"):format(quote(dir), quote(built), quote(dir)))
@@ -217,7 +160,6 @@ local function measure(built: string): (Measure?, ...string)
 	if not host.read(kit .. "/check") then
 		return { kind = "seconds", value = seconds }
 	end
-	-- The check can read the kit, so it must not follow a link the candidate left into it.
 	shell(("find %s -type l -delete"):format(quote(dir)))
 	local wall = table.clone(reads)
 	table.insert(wall, kit)
@@ -242,7 +184,6 @@ local function measure(built: string): (Measure?, ...string)
 	return { kind = "score", value = score }
 end
 
--- How much better a is than b, as a fraction: a speed-up for times, a relative difference for scores.
 local function gain(a: Measure, b: Measure): number
 	if a.kind == "seconds" then
 		return a.value > 0 and b.value / a.value - 1 or 0
@@ -265,9 +206,6 @@ local function show(kind: string, value: number): string
 	return kind == "seconds" and ("%.3f s"):format(value) or ("score %.6g"):format(value)
 end
 
--- Measures the candidate beside the champion in config.runs pairs. Returns "better", "worse" or "same", and the
--- round: the median gain and each side's values; or nil, nil and why the candidate failed. A champion that fails
--- raises: that is the kit's or the machine's fault, not the candidate's.
 local function round(built: string, champion: Champion): (string?, Round?, ...string?)
 	local gains: { number }, mine: { number }, theirs: { number }, kind: string? = {}, {}, {}, nil
 	for _ = 1, config.runs do
@@ -302,7 +240,6 @@ local function round(built: string, champion: Champion): (string?, Round?, ...st
 	for _, g in gains do
 		ahead += g > 0 and 1 or 0
 	end
-	-- config.runs is at least 1, so there was a pair, and the kind is known.
 	local result: Round = { gain = middle, kind = kind :: string, mine = mine, theirs = theirs }
 	if middle > config.margin and ahead >= #gains - 1 then
 		return "better", result
@@ -310,23 +247,21 @@ local function round(built: string, champion: Champion): (string?, Round?, ...st
 	return middle < -config.margin and "worse" or "same", result
 end
 
--- The state of the judge -----------------------------------------------------------------------------------------
-
-local champion: Champion? -- nil until something passes
-local start_value: Measure? -- when the starting point passed
+local champion: Champion?
+local start_value: Measure?
 local trials, ledger: { string }, counts: { [string]: number } = 0, {}, {}
-local current: { entry: Entry, dir: string }? -- the trial being judged
+local current: { entry: Entry, dir: string }?
 
 local function record(entry: Entry)
 	local line: string = json.encode(entry)
 	table.insert(ledger, line)
 	host.write(state .. "/ledger.jsonl", table.concat(ledger, "\n") .. "\n")
-	local verdict = entry.verdict :: string -- a trial has its verdict by the time it is recorded
+	local verdict = entry.verdict :: string
 	counts[verdict] = (counts[verdict] or 0) + 1
 end
 
 local function crown(trial: number, dir: string, kind: string, value: number)
-	if champion then -- the tree it was built in; its patch stays
+	if champion then
 		shell("rm -rf " .. quote(champion.dir))
 	end
 	shell(("rm -rf %s/built/.judge && cp %s/trials/%d.patch %s/champion.patch"):format(quote(dir), quote(state), trial,
@@ -343,7 +278,7 @@ local function start()
 	git("init --quiet --bare " .. quote(git_dir), "")
 	snapshot(dir .. "/src")
 	start_tree = tree(dir .. "/src")
-	write_patch(start_tree, "champion.patch") -- empty: the start is the champion until something beats it
+	write_patch(start_tree, "champion.patch")
 	local ok, why = build(dir)
 	local result: Measure?
 	if ok then
@@ -429,13 +364,12 @@ local function submit(note: string): string
 			answer ..= ("\nThe champion is still %s."):format(champion_name(champion))
 		end
 	end
-	say(("trial %d: %s"):format(trial, entry.verdict :: string)) -- judge gave every trial its verdict
+	say(("trial %d: %s"):format(trial, entry.verdict :: string))
 	return ("Trial %d. %s"):format(trial, answer)
 end
 
--- A trial the judge could not finish, through no fault of the submission, or that a stop cut short.
 local function abandon(err: unknown): string
-	if not current then -- the verdict is in the ledger already; what failed came after it
+	if not current then
 		return "the judge failed after recording its verdict: " .. tostring(err)
 	end
 	local entry, dir = current.entry, current.dir
@@ -472,7 +406,6 @@ local function summary_text(): string
 	return table.concat(lines, "\n")
 end
 
--- Prints the summary and leaves only the ledger and the patches: the trees were copies.
 local function summary()
 	host.log(printable(summary_text()))
 	host.sh(("cd %s && rm -rf run tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
@@ -505,7 +438,7 @@ local function main(): number
 			local stop = answer == "hung up"
 			answer = abandon(answer)
 			if stop then
-				break -- hx is gone: judge nothing more
+				break
 			end
 		end
 		print(json.encode(answer))

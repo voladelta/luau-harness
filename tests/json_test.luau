@@ -1,11 +1,7 @@
--- json.encode / json.decode. Run with: hx --ro tests --run tests/json_test.luau
-
--- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check = checks.check
 
--- Encoding
 check("scalars", json.encode({ true, false, 1, -2.5, "x" }), '[true,false,1,-2.5,"x"]')
 check("integers have no exponent", json.encode(1e15), "1000000000000000")
 check("large floats round-trip", json.decode(json.encode(1.7976931348623157e308)), 1.7976931348623157e308)
@@ -33,7 +29,6 @@ fails("function", { f = print }, "cannot encode a function")
 fails("mixed table", { 1, 2, x = 3 }, "neither an array")
 fails("number keys", { [1.5] = 1 }, "neither an array")
 fails("sparse marked array", json.array({ [3] = 1 }), "keys 1..n")
--- The length of a table with a hole is a border, and here it equals the number of keys: no key may be dropped.
 fails("a hole and a string key", { 1, 2, nil, 4, x = "dropped" }, "neither an array")
 fails("a hole and a fractional key", { 1, 2, nil, 4, [1.5] = "dropped" }, "neither an array")
 fails("a marked array with a string key", json.array({ 1, 2, x = 3 }), "keys 1..n")
@@ -43,7 +38,6 @@ local cycle = {}
 cycle.self = cycle
 fails("cycle", cycle, "too deep")
 
--- Decoding
 local value = json.decode(' {"a": [1, 2.5e2, -3, true, false, null], "b": {"c": "d"}, "n": null, "e": [], "o": {}} ')
 check("number", value.a[2], 250)
 check("negative", value.a[3], -3)

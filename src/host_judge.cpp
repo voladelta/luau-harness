@@ -1,5 +1,3 @@
-// host.judge: the agent's end of the line-based channel to the judge process.
-
 #include <poll.h>
 #include <sys/socket.h>
 
@@ -18,10 +16,6 @@
 
 namespace hx {
 
-// host.judge(line?) -> {answers}, pending: sends line, if given, and waits for the answer the judge owes. One line
-// at a time: a line is refused while an answer is owed, so each submission is the project as it was when sent.
-// A judge can take longer than a time limit allows, so the wait ends kJudgeSlack seconds before the host.timed limit
-// in force: the answers so far come back, and the rest come with a later call. A stop raises, and nothing is lost.
 int Host::judge(lua_State* L) {
     constexpr double kJudgeSlack = 2.0;
     constexpr std::size_t kMaxLine = std::size_t{64} << 10;

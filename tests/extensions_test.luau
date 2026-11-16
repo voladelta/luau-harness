@@ -1,15 +1,9 @@
--- The built-in extensions, web, ocr and exa, and the helper they share, against a stand-in for host.tool.
--- Run with: hx --ro tests --run tests/extensions_test.luau
-
 local loop = assert(host.load(host.default_loop, "=loop"))()
 
--- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check, raises = checks.check, checks.raises
 
--- The stand-in answers each call with the next scripted {status, text} and records what it was asked.
--- The seconds of each wait between tries are recorded too, instead of slept.
 local calls, answers, waits = {}, {}, {}
 host.tool = function(name, request, options)
 	table.insert(calls, { name = name, request = request, options = options })
@@ -26,7 +20,6 @@ local function script(...)
 	answers = { ... }
 end
 
--- Without the key, the built-in extensions load but say what is missing.
 host.tools = false
 raises("search without a key", "without DEEPSEEK_API_KEY", loop.ext("web").search, "luau")
 raises("ocr without a key", "without DEEPSEEK_API_KEY", loop.ext("ocr").read, "a.pdf")
@@ -37,7 +30,6 @@ local web, ocr = loop.ext("web"), loop.ext("ocr")
 check("the web extension loads", type(web.search), "function")
 check("it is loaded once", loop.ext("web"), web)
 
--- search
 script({ 200, json.encode({ results = {
 	{ rerank_score = 2.4, title = "Luau", url = "https://luau.org", snippet = "short", summary = "A fast,\nsmall language.",
 		content = "", site_name = "luau.org", date = "2026-06-01T00:00:00Z", authority = 3 },
@@ -65,7 +57,6 @@ check("results read as text", tostring(results), table.concat({
 	"   https://example.com",
 	"   just a snippet",
 }, "\n"))
--- The lua tool shows such a value as it reads, not as JSON.
 script({ 200, '{"results": []}' })
 check("the tool shows results as text", loop.tools[1].run({ code = "return ext('web').search('x')" }), "[no results]")
 
@@ -78,7 +69,6 @@ script({ 200, json.encode({ results = { { title = "T", url = "u", snippet = "", 
 check("content is shown when asked for", tostring(web.search("q", { content = true })):find("content:\nbody", 1, true) ~= nil, true)
 check("content is asked for", json.decode(calls[1].request).need_content, true)
 
--- A long question is cut to 128 characters, on a character boundary.
 script({ 200, '{"results": []}' })
 web.search("q", { question = string.rep("é", 200) })
 check("the question is cut to 128 characters", utf8.len(json.decode(calls[1].request).ori_question), 128)
@@ -88,7 +78,6 @@ raises("a long query", "1 to 128 characters", web.search, string.rep("a", 129))
 raises("a bad count", "count must be", web.search, "q", { count = 51 })
 raises("a query that is not a string", "must be a string, not table", web.search, { query = "q" })
 
--- Transient failures are retried; others are not.
 script({ 503, '{"error": {"message": "busy"}}' }, { 429, "slow down" }, { 200, '{"results": []}' })
 web.search("q")
 check("503 and 429 are retried", #calls, 3)
@@ -106,7 +95,6 @@ check("no answer is retried", #calls, 3)
 script({ 200, "<html>" })
 raises("an answer that is not JSON", "not JSON", web.search, "q")
 
--- fetch
 script({ 200, json.encode({ title = "Your First API Call", content = "# Your First API Call\n\nHello." }) })
 check("fetch returns the content", web.fetch("https://example.com/a"), "# Your First API Call\n\nHello.")
 check("fetch asks the fetch endpoint", calls[1].name, "fetch")
@@ -118,7 +106,6 @@ check("an empty page says so", web.fetch("http://example.com"), "[the page has n
 raises("fetch of a file url", "http:// or https://", web.fetch, "file:///etc/passwd")
 raises("fetch of no host", "http:// or https://", web.fetch, "https://")
 
--- ocr
 check("a pdf keeps its layout", ocr.purpose("docs/Scan.PDF"), "rich_layout_recognition")
 check("an image is plain text", ocr.purpose("photo.png"), "text_recognition")
 check("a word file is plain text", ocr.purpose("notes.docx"), "text_recognition")
@@ -163,7 +150,6 @@ script({ 413, '{"error": {"message": "file too large"}}' })
 raises("a file too large", "(413): file too large", ocr.read, "big.pdf")
 raises("ocr of a path that is not a string", "ocr.read: argument 1 (path) must be a string, not number", ocr.read, 1)
 
--- exa
 host.exa = false
 raises("exa without a key", "without EXA_API_KEY", loop.ext("exa").deep, "luau", "why")
 host.exa = true
@@ -206,7 +192,6 @@ raises("deep with an objective that is not a string", "exa.deep: argument 2 (obj
 	exa.deep, "q")
 raises("a schema that is not an object", 'of type "object"', exa.deep, "q", "o", { schema = { type = "array" } })
 
--- _http, the helper the three share
 local http = loop.ext("_http")
 check("an error's message", http.message('{"error": {"message": "m"}}'), "m")
 check("an error as text", http.message('{"error": "e"}'), "e")
@@ -221,8 +206,6 @@ check("a text of exactly the limit is whole", http.clip(string.rep("é", 3), 3),
 check("text that is not UTF-8 is counted in bytes", http.clip(string.rep("\255", 5), 3), "\255\255\255 ...")
 check("and is whole within the limit", http.clip("\255\255", 3), "\255\255")
 
--- A project's own extension of the same name takes the place of the built-in one. ext() reads .hx/ext in the
--- current directory, the build directory here, so the file is removed again.
 local own = ".hx/ext/web.luau"
 if not host.read(own) then
 	host.write(own, "-- mine\nreturn { search = function() return 'own' end }\n")
@@ -234,8 +217,6 @@ if not host.read(own) then
 	check("and loads", ok, true)
 end
 
--- What an extension prints goes to the model, in the tool result, with what the model's code prints; not to
--- stdout, which is the user's answer.
 if not host.read(".hx/ext/noisy.luau") then
 	host.write(".hx/ext/noisy.luau", "-- prints\nreturn { f = function() print('EXT-PRINT', 1) return 'value' end }\n")
 	local code = "print('before') local v = ext('noisy').f() print('after') return v"

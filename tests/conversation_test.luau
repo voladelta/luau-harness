@@ -1,17 +1,10 @@
--- The conversation state machine of the built-in loop. Run with: hx --ro tests --run tests/conversation_test.luau
---
--- A random walk tries every operation in every state. A legal operation must leave a history that
--- Conversation:problem() accepts; an illegal one must raise and leave the history untouched.
-
 local loop = assert(host.load(host.default_loop, "=loop"))()
 local Conversation = loop.Conversation
 
--- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check = checks.check
 
--- Which operations each state allows, as the table at the top of the section in loop.luau says.
 local legal = {
 	idle = { say = true, restart = true },
 	ready = { say = true, reply = true, restart = true },
@@ -22,7 +15,7 @@ local next_id = 0
 local function random_reply()
 	local content = {}
 	if math.random() < 0.1 then
-		return content -- an empty reply
+		return content
 	end
 	if math.random() < 0.5 then
 		table.insert(content, { type = "thinking", thinking = "", signature = "s" })
@@ -89,7 +82,6 @@ for step = 1, 5000 do
 end
 check("the walk visited every state", seen.idle > 100 and seen.ready > 100 and seen.owing > 100, true)
 
--- The shapes the loop depends on, spelled out.
 local t = Conversation.new()
 check("starts idle", t:state(), "idle")
 t:say("task")
@@ -120,7 +112,6 @@ fork:say("only in the fork")
 check("a fork does not change the original", #t.messages[3].content, 3)
 check("the fork has it", #fork.messages[3].content, 4)
 
--- problem() notices each way a history can be wrong.
 local function broken(name, messages, fragment)
 	local c = Conversation.new()
 	c.messages = messages

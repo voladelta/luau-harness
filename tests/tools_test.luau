@@ -1,10 +1,6 @@
--- The tools, the extension loader and the reading of pasted messages of the built-in loop. Run with: hx --ro tests --run tests/tools_test.luau
--- Works in $TMPDIR, which hx creates for the run and removes afterwards.
-
 local loop = assert(host.load(host.default_loop, "=loop"))()
 local dir = host.env("TMPDIR") .. "/"
 
--- check, has, lacks, raises and the report at the end are shared, in check.luau beside this file.
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check, raises = checks.check, checks.raises
@@ -14,19 +10,16 @@ for _, fn in loop.functions do
 	tools[fn.name] = fn.run
 end
 
--- The one tool: returns its result and whether it failed.
 local function lua(code)
 	return loop.tools[1].run({ code = code })
 end
 
 check("there is one tool", #loop.tools, 1)
--- Every tool has a schema that names its required arguments as a JSON array.
 for _, tool in loop.tools do
 	local schema = json.encode(tool.parameters)
 	check(tool.name .. " schema lists required", schema:find('"required":%[') ~= nil, true)
 end
 
--- write, read
 check("write", tools.write(dir .. "a/b/file.txt", "one\ntwo\nthree\n"), ("wrote 14 bytes to %sa/b/file.txt"):format(dir))
 check("read", tools.read(dir .. "a/b/file.txt"), "1: one\n2: two\n3: three")
 check("read a range", tools.read(dir .. "a/b/file.txt", 2, 1), "2: two\n[lines 2-2 of 3; offset=3 goes on]")
@@ -37,7 +30,6 @@ raises("read without a path", "read: argument 1 (path) must be a string, not nil
 raises("named arguments, as a JSON tool takes them", "must be a string, not table", tools.read, { file_path = dir .. "a/b/file.txt" })
 tools.write(dir .. "empty", "")
 check("read an empty file", tools.read(dir .. "empty"), "[empty file]")
--- A long file comes back as whole lines up to the byte limit, and says where to go on.
 host.sh(("seq 1 1000 > %sseq.txt"):format(dir))
 local function numbers(from, to)
 	local lines = {}
@@ -46,7 +38,7 @@ local function numbers(from, to)
 	end
 	return table.concat(lines, "\n")
 end
-loop.output_limit = 300 -- read keeps 200 bytes of it for the range line
+loop.output_limit = 300
 check("read stops at the byte limit", tools.read(dir .. "seq.txt"), numbers(1, 17) .. "\n[lines 1-17 of 1000; offset=18 goes on]")
 check("read goes on from the next offset", tools.read(dir .. "seq.txt", 37, 3), numbers(37, 39) .. "\n[lines 37-39 of 1000; offset=40 goes on]")
 check("read the last lines", tools.read(dir .. "seq.txt", 999), numbers(999, 1000) .. "\n[lines 999-1000 of 1000]")
@@ -59,7 +51,6 @@ check("a file of one long line", tools.read(dir .. "one.txt"), "1: " .. string.r
 loop.output_limit = 30000
 check("a file within the limits comes back whole", tools.read(dir .. "seq.txt", nil, 5000), numbers(1, 1000))
 
--- host.write replaces a file through a temporary one, and the file stays what it was
 local w = dir .. "w/"
 local function sh(command)
 	return host.sh(command:format(w, w)).out
@@ -88,7 +79,6 @@ check("write through a dangling link", host.write(w .. "dangling.txt", "made"), 
 check("makes the file it names", host.read(w .. "gone.txt"), "made")
 check("no temporary file is left", table.concat(host.list(w), " "), "dangling.txt gone.txt link.txt new.txt one.txt real.txt run.sh two.txt")
 
--- edit
 tools.write(dir .. "e.txt", "alpha beta\nalpha gamma\n")
 check("edit", tools.edit(dir .. "e.txt", "beta", "BETA"), ("replaced 1 occurrence in %se.txt"):format(dir))
 check("edit result", host.read(dir .. "e.txt"), "alpha BETA\nalpha gamma\n")
@@ -101,12 +91,10 @@ raises("edit with an empty old", "must not be empty", tools.edit, dir .. "e.txt"
 raises("edit that changes nothing", "change nothing", tools.edit, dir .. "e.txt", "BETA", "BETA")
 raises("a missing text says how to recover", "read the file again", tools.edit, dir .. "e.txt", "zzz", "x")
 raises("line numbers from read are named", "without the line numbers", tools.edit, dir .. "e.txt", "1: %1 BETA", "x")
--- A file with \r\n line ends is edited with the \n ends models write, and keeps its own.
 tools.write(dir .. "crlf.txt", "one\r\ntwo\r\nthree\n")
 check("edit across \\r\\n ends", tools.edit(dir .. "crlf.txt", "one\ntwo", "1\n2"), ("replaced 1 occurrence in %scrlf.txt"):format(dir))
 check("keeps the file's ends", host.read(dir .. "crlf.txt"), "1\r\n2\r\nthree\n")
 check("read shows \\r\\n ends as plain ones", tools.read(dir .. "crlf.txt"), "1: 1\n2: 2\n3: three")
--- In a file whose line ends are \r\n, the text that goes in gets them, though old was found as written.
 tools.write(dir .. "crlf2.txt", "one\r\ntwo\r\nthree\r\n")
 tools.edit(dir .. "crlf2.txt", "two", "2\n2b")
 check("new text takes the file's \\r\\n ends", host.read(dir .. "crlf2.txt"), "one\r\n2\r\n2b\r\nthree\r\n")
@@ -116,7 +104,6 @@ tools.write(dir .. "lf.txt", "one\ntwo\n")
 tools.edit(dir .. "lf.txt", "two", "2\n2b")
 check("a file with \\n ends keeps them", host.read(dir .. "lf.txt"), "one\n2\n2b\n")
 
--- bash
 check("bash", tools.bash("echo out; echo err >&2; exit 3"), "out\nerr\n[exit 3]")
 check("bash adds a newline before the status", tools.bash("printf x"), "x\n[exit 0]")
 check("bash with no output", tools.bash("true"), "[exit 0]")
@@ -136,11 +123,9 @@ check("which holds all of it", spill and host.read(spill), host.sh("seq 1 1000")
 check("it is clipped once, so it says so once", select(2, clipped:gsub("bytes omitted", "")), 1)
 loop.output_limit = 30000
 
--- printable
 check("printable keeps text, newlines and tabs", loop.printable("a\tb\nc é"), "a\tb\nc é")
 check("printable drops escape sequences' control bytes", loop.printable("\27]52;c;aGk=\7x\27[2Jy\r\0\127z"), "]52;c;aGk=x[2Jyz")
 
--- the one tool
 local function failed(code)
 	return select(2, lua(code))
 end
@@ -160,7 +145,6 @@ check("lua time limit", lua("while true do end"), "error: timeout")
 check("the limit holds inside pcall", lua("while true do pcall(function() while true do end end) end"), "error: timeout")
 loop.call_seconds = 600
 
--- the functions, as the model's code calls them
 check("code calls the functions", lua(("write(%q, 'x\\n') return read(%q)"):format(dir .. "f.txt", dir .. "f.txt")), "1: x")
 check("a failure keeps what was printed before it",
 	lua(("print('first') print(edit(%q, 'nope', 'y')) print('never')"):format(dir .. "f.txt")),
@@ -175,8 +159,6 @@ check("a global named like a function shadows it", lua("return type(read)"), "st
 lua("read = nil")
 check("and gives it back once cleared", lua("return type(read)"), "function")
 
--- The model's code sees the host's tables read-only: an assignment raises and names the reason, and later calls
--- still work, the loop's own included.
 for _, assignment in { "host.sh = nil", "json.encode = nil", "_G.host.sh = nil", "string.format = nil",
 	"host.load('host.sh = nil')()" } do
 	local result, broke = lua(assignment)
@@ -206,14 +188,12 @@ end
 check("the description is the same each time, for the cache", loop.tools[1].description(), description)
 check("ext is described once", select(2, description:gsub("ext%(name%)", "")), 1)
 
--- the host's limits
 local started = os.time()
 check("a time limit ends a sleep", select(2, host.timed(0.2, function() host.sleep(30) end)), "timeout")
 check("a time limit ends a command", select(2, host.timed(0.2, function() return host.sh("sleep 30") end)), "timeout")
 check("an inner limit cannot outlast the outer one", select(2, host.timed(0.2, function() return host.timed(30, function() host.sleep(30) end) end)), "timeout")
 check("none of that waited", os.time() - started < 5, true)
 check("a limit that is not reached changes nothing", select(2, host.timed(5, function() return host.sh("echo ok").out end)), "ok\n")
--- A negative duration is an empty one, inside a limit or not.
 check("a negative sleep", select(2, host.timed(5, function() host.sleep(-1); return "slept" end)), "slept")
 check("a negative timeout", select(2, host.timed(5, function() return host.sh("sleep 30", { timeout = -1 }).timed_out end)), true)
 check("a negative timeout outside a limit", host.sh("sleep 30", { timeout = -1 }).timed_out, true)
@@ -230,11 +210,8 @@ end)
 check("a script that eats memory is stopped", hog_ok, false)
 check("with an ordinary error", tostring(hog_err):find("not enough memory", 1, true) ~= nil, true)
 check("and the harness lives on", json.encode({ 1 }), "[1]")
--- What the script held is collected at once. Left to itself the collector would not start again under the
--- ceiling, and the rest of this test would run in whatever the last refused request left over.
 check("with its memory back", gcinfo() < 64 * 1024, true)
 
--- extensions (relative to the working directory, like the real thing)
 check("this test runs where it can write", host.write(".hx/ext/greet.luau", "-- greets\nreturn { hello = function(n) return 'hello ' .. n end }\n"), true)
 check("ext", loop.ext("greet").hello("x"), "hello x")
 check("ext is cached", loop.ext("greet"), loop.ext("greet"))
@@ -252,7 +229,6 @@ host.write(".hx/ext/broken.luau", "return {")
 raises("a broken extension", "ext/broken", loop.ext, "broken")
 raises("a missing extension", "no extension nope", loop.ext, "nope")
 raises("a path as an extension name", "letters, digits", loop.ext, "../x")
--- A name that starts with _ is a helper other extensions share: it loads, but the model is not told of it.
 host.write(".hx/ext/_x.luau", "-- shared code\nreturn { two = function() return 2 end }\n")
 check("a helper extension loads", loop.ext("_x").two(), 2)
 local prompt = loop.system_prompt()
@@ -260,7 +236,6 @@ check("the prompt lists the other extensions", prompt:find("- greet: greets", 1,
 check("but not a helper", prompt:find("_x", 1, true), nil)
 host.sh("rm -rf .hx")
 
--- The prompt says that ripgrep is there, and to prefer it, only where it is installed.
 local real_sh = host.sh
 local function with_rg(found: boolean): string
 	host.sh = function(command: string, options: any): any
@@ -277,9 +252,6 @@ check("with rg, the prompt prefers it to grep",
 	with_rg(true):find("use rg through bash rather than plain grep", 1, true) ~= nil, true)
 check("without rg, the prompt does not name it", with_rg(false):find("ripgrep", 1, true), nil)
 
--- Nesting. A project function can run a `lua` call inside the running one, or a whole turn on another
--- Conversation, as a sub-agent. Either leaves the outer call's printed lines and the outer turn's repeat counts
--- as it found them.
 table.insert(loop.functions, { name = "nested", usage = "nested(code, seconds?) -> text", run = function(code, seconds)
 	local outer = loop.call_seconds
 	loop.call_seconds = seconds or outer
@@ -294,7 +266,6 @@ check("and so does one that fails",
 check("or runs out of time",
 	lua("print('outer 1') local inner = nested('print(1) while true do end', 0.2) print('outer 2') return inner"),
 	"outer 1\nouter 2\n1\nerror: timeout")
--- A scripted model: each request takes the next reply.
 local replies, next_id = {}, 0
 local function calls(code)
 	next_id += 1
@@ -312,14 +283,12 @@ table.insert(loop.functions, { name = "subagent", usage = "subagent() -> text", 
 	return "the sub-agent is done"
 end })
 local same = "return bash('echo same')"
--- The outer turn runs the same call twice, then a sub-agent whose turn runs it once, then the call a third time.
 replies = { calls(same), calls(same), calls("return subagent()"), calls(same), done, calls(same), done }
 local talk = loop.Conversation.new()
 talk:say("the task")
-host.write(".hx/here", "") -- with a .hx directory, conversations are logged
+host.write(".hx/here", "")
 loop.turn("system", talk)
 check("the script was played to the end", #replies, 0)
--- The sub-agent's conversation has a log of its own. The outer turn here has none: the session's log is M.main's.
 local logged = {}
 for _, name in host.list(".hx/log") or {} do
 	if name:match("%.json$") then
@@ -348,7 +317,6 @@ loop.request = request
 table.remove(loop.functions)
 table.remove(loop.functions)
 
--- read_message joins the lines of a bracketed paste into one message.
 local function message(lines)
 	local i = 0
 	local got = loop.read_message(function()

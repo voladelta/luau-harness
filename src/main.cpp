@@ -1,9 +1,3 @@
-// hx: a small host for a per-project coding agent.
-//
-// The host is a Luau VM plus a handful of primitives (model call, shell, files). The agent loop itself is a
-// Luau file the project owns. Before any of that runs, the process confines itself with Landlock, so the VM,
-// the file primitives and every command the model starts share one set of walls.
-
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <sys/prctl.h>
@@ -130,23 +124,21 @@ constexpr const char* kExaUrl = "https://api.exa.ai/search";
 constexpr const char* kAnthropicUrl = "https://api.anthropic.com/v1/messages";
 constexpr const char* kAnthropicKeyEnv = "ANTHROPIC_API_KEY";
 constexpr const char* kAnthropicModel = "claude-opus-5-5";
-// The Claude API version hx speaks: the latest. DeepSeek's endpoint keeps the one it documents.
 constexpr const char* kAnthropicVersion = "anthropic-version: 2026-10-21";
 constexpr const char* kDeepSeekVersion = "anthropic-version: 2023-06-01";
 
-// Short names for the current Claude models.
 constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
     {"opus", "claude-opus-5-5"},
     {"sonnet", "claude-sonnet-5-5"},
     {"haiku", "claude-haiku-5-5"},
 };
-constexpr std::string_view kRpiLead = "opus";  // the model --rpi leads with, unless --model names another
-constexpr const char* kRpiWorkflow = "rpi";    // the skill --rpi leads by: host.workflow
-constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh", "max"};  // what HX_EFFORT may be
+constexpr std::string_view kRpiLead = "opus";
+constexpr const char* kRpiWorkflow = "rpi";
+constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh", "max"};
 constexpr const char* kProjectLoop = ".hx/loop.luau";
 
-constexpr int kExitInterrupted = 130;  // 128 + SIGINT, as a shell reports it
-constexpr int kExitTerminated = 143;   // 128 + SIGTERM
+constexpr int kExitInterrupted = 130;
+constexpr int kExitTerminated = 143;
 
 using hx::env_or;
 using hx::kExitFailure;
@@ -157,28 +149,26 @@ enum class Mode : std::uint8_t { Agent, Script, Init, Help, Version };
 
 struct Options {
     Mode mode = Mode::Agent;
-    std::string script;  // --run FILE; "-" is stdin
+    std::string script;
     std::vector<std::string> args;
     std::vector<std::string> read_paths;
     std::vector<std::string> write_paths;
     std::vector<std::string> keep_env;
     std::optional<std::string> model;
-    std::optional<std::string> judge;  // --judge KIT
-    bool rpi = false;                  // --rpi: the session is led by the rpi workflow
+    std::optional<std::string> judge;
+    bool rpi = false;
     bool sandbox = true;
     bool unix_sockets = false;
-    bool full = false;  // --init --full: copy the whole built-in loop, not the overlay
+    bool full = false;
     bool quiet = false;
     bool no_input = false;
 };
 
-// Every option hx knows, for the suggestion after a misspelt one.
 constexpr std::string_view kOptionNames[] = {
     "--model", "--ro",   "--rw",  "--keep-env", "--unix-sockets", "--no-sandbox", "--quiet", "--no-input",
     "--init",  "--full", "--run", "--help",     "--version",      "--judge",      "--rpi",
 };
 
-// Edit distance, for "did you mean".
 std::size_t distance(std::string_view a, std::string_view b) {
     std::vector<std::size_t> row(b.size() + 1);
     for (std::size_t j = 0; j <= b.size(); ++j) {
@@ -198,7 +188,7 @@ std::size_t distance(std::string_view a, std::string_view b) {
 
 UsageError unknown_option(std::string_view arg) {
     std::string_view best;
-    std::size_t best_distance = 3;  // further than two edits away is not a typo
+    std::size_t best_distance = 3;
     for (const std::string_view name : kOptionNames) {
         if (const std::size_t d = distance(arg, name); d < best_distance) {
             best = name;
@@ -213,12 +203,9 @@ UsageError unknown_option(std::string_view arg) {
     return UsageError{message};
 }
 
-// One option word, --name, -n or --name=value, and the value it may take: after the =, or the next word.
 class OptionWord {
   public:
-    // The word is argv[at]; a value taken from the next word moves at past it.
     OptionWord(const std::vector<std::string_view>& argv, std::size_t& at) : argv_(argv), at_(at), name_(argv[at]) {
-        // --name=value is the same as --name value.
         if (const std::size_t equals = name_.find('='); name_.starts_with("--") && equals != std::string_view::npos) {
             inline_value_ = name_.substr(equals + 1);
             name_ = name_.substr(0, equals);
@@ -230,7 +217,6 @@ class OptionWord {
 
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
-    // The value of an option that takes one; metavar names it in the error when it is missing.
     std::string value(std::string_view metavar) {
         if (inline_value_ ? inline_value_->empty() : at_ + 1 >= argv_.size()) {
             throw UsageError(fmt::format("{} needs a value: {} {}", name_, name_, metavar));
@@ -238,7 +224,6 @@ class OptionWord {
         return std::string(inline_value_ ? *inline_value_ : argv_[++at_]);
     }
 
-    // Refuses a value given to an option that takes none.
     void flag() const {
         if (inline_value_) {
             throw UsageError(fmt::format("{} takes no value", name_));
@@ -252,7 +237,6 @@ class OptionWord {
     std::optional<std::string_view> inline_value_;
 };
 
-// The options that cannot be judged one word at a time.
 void check_combinations(const Options& options) {
     if (options.full && options.mode != Mode::Init) {
         throw UsageError("--full goes with --init");
@@ -278,7 +262,7 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             break;
         }
         if (word.size() < 2 || !word.starts_with('-')) {
-            break;  // the task starts here
+            break;
         }
         OptionWord option(argv, i);
         const std::string_view arg = option.name();
@@ -329,7 +313,7 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             options.mode = Mode::Script;
             options.script = option.value("FILE");
             ++i;
-            break;  // the rest belongs to the script
+            break;
         } else {
             throw unknown_option(arg);
         }
@@ -339,7 +323,6 @@ Options parse_args(const std::vector<std::string_view>& argv) {
     return options;
 }
 
-// The whole file, or the error that kept it from being read.
 std::string read_file(const fs::path& path, std::error_code& ec) {
     ec.clear();
     const hx::UniqueFd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
@@ -351,10 +334,8 @@ std::string read_file(const fs::path& path, std::error_code& ec) {
     return text;
 }
 
-// Writes .hx/loop.luau: by default the overlay, which loads the built-in loop and changes parts of it, so fixes
-// to hx still reach the project; with `full`, a copy of the whole built-in loop, which the project then owns.
 int init_project(bool full) {
-    if (fs::exists(kProjectLoop)) {  // before anything is made
+    if (fs::exists(kProjectLoop)) {
         throw UsageError(fmt::format("{} already exists; it is yours, so it stays", kProjectLoop));
     }
     std::error_code ec;
@@ -376,10 +357,6 @@ int init_project(bool full) {
     return 0;
 }
 
-// A variable whose name ends in one of these words is treated as a secret, with or without an underscore before
-// it: MY_API_KEY, OPENAI_APIKEY, PGPASSWORD. Matching the end, not any part, keeps plumbing such as GIT_CONFIG_KEY_0
-// or AWS_ACCESS_KEY_ID in place. PAT and PWD are short enough to end ordinary words, and PWD and OLDPWD are no
-// secrets, so those two count only after an underscore: GITHUB_PAT, MYSQL_PWD.
 bool looks_secret(std::string name) {
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -392,19 +369,15 @@ bool looks_secret(std::string name) {
 }
 
 struct Secrets {
-    std::string key;        // the model endpoint's
-    std::string tools_key;  // DEEPSEEK_API_KEY, for DeepSeek's tool and Messages endpoints whatever the model
-    std::string exa_key;    // EXA_API_KEY, for Exa's search endpoint whatever the model
+    std::string key;
+    std::string tools_key;
+    std::string exa_key;
 };
 
-// Returns the API key, the DeepSeek key and the Exa key, and removes all three, and every other variable that looks
-// like a secret, from the environment. Commands the model runs inherit the environment, and with the network open an
-// inherited secret is a leaked one. The entries are also wiped where they sit, because /proc/PID/environ shows the
-// original memory.
 Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& keep) {
     Secrets secrets;
     std::vector<std::pair<std::string, char*>> doomed;
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic): environ is a null-terminated C array
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     for (char** entry = environ; *entry != nullptr; ++entry) {
         const std::string_view text(*entry);
         const std::size_t equals = text.find('=');
@@ -430,7 +403,7 @@ Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& k
         }
     }
     for (const auto& [name, entry] : doomed) {
-        unsetenv(name.c_str());  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+        unsetenv(name.c_str());  // NOLINT(concurrency-mt-unsafe)
         std::memset(entry, 0, std::strlen(entry));
     }
     return secrets;
@@ -442,12 +415,6 @@ struct ModelChoice {
     std::string key_env;
 };
 
-// The model, and where to send it. --model wins over HX_MODEL, and opus, sonnet and haiku name the current Claude
-// models. Without either, a Claude model is asked when ANTHROPIC_API_KEY is set and DEEPSEEK_API_KEY is not, and
-// DeepSeek's otherwise. A claude-* model goes to the Claude API with ANTHROPIC_API_KEY, any other to DeepSeek with
-// DEEPSEEK_API_KEY; HX_API_URL and HX_KEY_ENV override either. With --rpi the model is the lead of a workflow that
-// is made for Opus to lead: it is Opus unless --model names another, and HX_MODEL, which says what a session's one
-// model is, is not asked.
 ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
     std::string model = rpi ? std::string(kRpiLead) : env_or("HX_MODEL", "");
     if (flag) {
@@ -470,7 +437,6 @@ ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
     };
 }
 
-// A private temporary directory, exported as TMPDIR and removed with everything in it at exit.
 class TempDir {
   public:
     TempDir() {
@@ -480,7 +446,7 @@ class TempDir {
             throw UsageError(fmt::format("cannot create a temporary directory: {}", hx::error_text()));
         }
         path_ = std::move(pattern);
-        setenv("TMPDIR", path_.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+        setenv("TMPDIR", path_.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
     }
     TempDir(const TempDir&) = delete;
     TempDir& operator=(const TempDir&) = delete;
@@ -495,7 +461,6 @@ class TempDir {
     fs::path path_;
 };
 
-// libcurl's process-wide setup and teardown.
 class CurlGlobal {
   public:
     CurlGlobal() {
@@ -508,7 +473,6 @@ class CurlGlobal {
     ~CurlGlobal() { curl_global_cleanup(); }
 };
 
-// What every wall lets in: system directories to read, harmless devices, git's configuration and trust roots.
 std::vector<hx::Rule> system_rules() {
     using hx::Access;
     std::vector<hx::Rule> rules;
@@ -516,19 +480,13 @@ std::vector<hx::Rule> system_rules() {
                              "/sys", "/nix/store", "/run/systemd/resolve"}) {
         rules.push_back({path, Access::Read, false});
     }
-    // Of /dev only the harmless nodes. Terminals stay out: a command that could open /dev/pts could read what is
-    // typed into the user's other terminals and write to them.
     for (const char* path : {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"}) {
         rules.push_back({path, Access::Device, false});
     }
-    // git refuses to run when it cannot read its configuration, and git is how the model's work is undone.
     if (const std::string home = env_or("HOME", ""); home.starts_with('/')) {
         rules.push_back({home + "/.gitconfig", Access::Read, false});
         rules.push_back({home + "/.config/git", Access::Read, false});
     }
-    // Trust roots, often a proxy's and often in the home directory, so that hx's own requests and the curl, git,
-    // pip or npm the model runs can verify TLS. These variables are the user's statement of where the roots live,
-    // and nothing inside the wall can change them.
     for (const char* name :
          {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
           "GIT_SSL_CAINFO", "CARGO_HTTP_CAINFO", "AWS_CA_BUNDLE", "NIX_SSL_CERT_FILE"}) {
@@ -539,7 +497,6 @@ std::vector<hx::Rule> system_rules() {
     return rules;
 }
 
-// The --ro and --rw paths.
 std::vector<hx::Rule> user_rules(const Options& options) {
     std::vector<hx::Rule> rules;
     rules.reserve(options.read_paths.size() + options.write_paths.size());
@@ -552,8 +509,6 @@ std::vector<hx::Rule> user_rules(const Options& options) {
     return rules;
 }
 
-// The walls: system directories are readable, the project and a private temporary directory are writable, and
-// the rest of the machine (the home directory above all) cannot be opened at all.
 std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& project, const fs::path& tmp) {
     using hx::Access;
     std::vector<hx::Rule> rules = system_rules();
@@ -564,7 +519,6 @@ std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& proj
     return rules;
 }
 
-// True when the project is the home directory or contains it: the model could then write anywhere in home.
 bool holds_home(const fs::path& project) {
     std::error_code ec;
     const fs::path home = fs::canonical(env_or("HOME", ""), ec);
@@ -582,7 +536,6 @@ hx::Sandbox confine(const Options& options, const fs::path& project, const fs::p
                         "Run hx inside a project directory.",
                         project.string()));
     }
-    // The same for a path the wall is asked to let in: --rw ~ is one slip away from --rw ~/src.
     for (const auto& [flag, paths] :
          {std::pair{"--ro", &options.read_paths}, std::pair{"--rw", &options.write_paths}}) {
         for (const std::string& path : *paths) {
@@ -605,9 +558,7 @@ hx::Sandbox confine(const Options& options, const fs::path& project, const fs::p
 
 constexpr std::size_t kMaxVmMemory = std::size_t{1} << 30;
 
-// The VM's allocator, with a ceiling: a script that runs away gets "not enough memory" as a Luau error instead
-// of taking the machine down. `user` points at the number of bytes in use.
-// NOLINTBEGIN(cppcoreguidelines-no-malloc): this is the allocator
+// NOLINTBEGIN(cppcoreguidelines-no-malloc)
 void* limited_alloc(void* user, void* block, std::size_t old_size, std::size_t new_size) {
     auto& used = *static_cast<std::size_t*>(user);
     if (new_size == 0) {
@@ -616,7 +567,7 @@ void* limited_alloc(void* user, void* block, std::size_t old_size, std::size_t n
         return nullptr;
     }
     if (new_size > old_size && used + (new_size - old_size) > kMaxVmMemory) {
-        hx::vm_memory_refused();  // the next safepoint collects, or nothing ever would again
+        hx::vm_memory_refused();
         return nullptr;
     }
     void* grown = std::realloc(block, new_size);
@@ -634,7 +585,6 @@ using LuaState = std::unique_ptr<lua_State, StateCloser>;
 
 using Bytecode = std::unique_ptr<char, hx::FreeDeleter>;
 
-// Compiles a chunk and pushes it as a function. On false, the error message is on the stack instead.
 bool load_chunk(lua_State* L, std::string_view source, const std::string& name) {
     std::size_t size = 0;
     const Bytecode bytecode(luau_compile(source.data(), source.size(), nullptr, &size));
@@ -653,14 +603,12 @@ std::string pop_message(lua_State* L) {
     return message;
 }
 
-// Whether the error on top of the stack is a stop signal, which ends the run whatever was running.
 bool is_stop(lua_State* L) {
     const char* text = lua_tostring(L, -1);
     const std::string_view message = text != nullptr ? text : "";
     return message == "interrupted" || message == "terminated";
 }
 
-// Turns the error on top of the stack into an exit status, and reports it unless it is a stop signal.
 int failure(lua_State* L) {
     const std::string message = pop_message(L);
     if (message == "interrupted") {
@@ -673,7 +621,6 @@ int failure(lua_State* L) {
     return kExitFailure;
 }
 
-// Whether the value on top of the stack is a module: a table with a `main` function.
 bool is_module(lua_State* L) {
     if (!lua_istable(L, -1)) {
         return false;
@@ -684,7 +631,6 @@ bool is_module(lua_State* L) {
     return module;
 }
 
-// Calls main() of the module on top of the stack. Its numeric result is the exit status.
 int run_main(lua_State* L) {
     lua_getfield(L, -1, "main");
     if (lua_pcall(L, 0, 1, 0) != 0) {
@@ -693,8 +639,6 @@ int run_main(lua_State* L) {
     return lua_isnumber(L, -1) != 0 ? lua_tointeger(L, -1) : 0;
 }
 
-// Runs a loop or script. A chunk that returns a table with a `main` function is a module: main() is called and
-// its numeric result is the exit status. Anything else is a plain script that has already done its work.
 int run_module(lua_State* L, std::string_view source, const std::string& name) {
     if (!load_chunk(L, source, name) || lua_pcall(L, 0, 1, 0) != 0) {
         return failure(L);
@@ -702,9 +646,6 @@ int run_module(lua_State* L, std::string_view source, const std::string& name) {
     return is_module(L) ? run_main(L) : 0;
 }
 
-// Runs the project's loop when it loads and returns a module, the built-in one otherwise, so a loop the model
-// broke cannot keep the next session from starting. An error inside main() is a real error, not a reason to
-// fall back, and neither is a stop signal while the project's loop loads.
 int run_loop(lua_State* L) {
     std::error_code ec;
     if (const std::string project = read_file(kProjectLoop, ec); ec != std::errc::no_such_file_or_directory) {
@@ -729,13 +670,11 @@ int run_loop(lua_State* L) {
     return run_module(L, hx::kDefaultLoop, "=loop");
 }
 
-// Runs body in a fresh VM that has the host primitives. The Host outlives the VM, and kills what the VM's commands
-// left running when it goes.
 template <typename Body>
 int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) {
     hx::install_signal_handlers();
     hx::Host host(std::move(config), sandbox);
-    std::size_t vm_memory = 0;  // declared before the state, which frees through it
+    std::size_t vm_memory = 0;
     const LuaState state(lua_newstate(limited_alloc, &vm_memory));
     if (!state) {
         throw std::runtime_error("cannot create a Luau state");
@@ -747,7 +686,6 @@ int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) 
     return body(L);
 }
 
-// Forks the judge for --judge KIT. It runs lua/judge.luau in a VM of its own, behind its own wall.
 hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::path& project,
                       const fs::path& tmp) {
     const hx::JudgeWalls walls{
@@ -765,24 +703,20 @@ hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const 
     });
 }
 
-// A descriptor inherited from whoever started hx was opened outside the wall and would pass through it to every
-// command. Marking them close-on-exec keeps them from commands; hx itself never uses them.
 void close_inherited_fds() {
     if (hx::cloexec_above_stderr() != 0) {
         throw std::runtime_error(fmt::format("cannot mark inherited descriptors close-on-exec: {}", hx::error_text()));
     }
 }
 
-// A misspelt effort would only come back as the endpoint's error, a round trip later.
 void check_effort() {
     if (const std::string effort = env_or("HX_EFFORT", ""); effort.empty()) {
-        unsetenv("HX_EFFORT");  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+        unsetenv("HX_EFFORT");  // NOLINT(concurrency-mt-unsafe)
     } else if (std::ranges::find(kEfforts, effort) == std::end(kEfforts)) {
         throw UsageError(fmt::format("HX_EFFORT={}: the efforts are low, medium, high, xhigh and max", effort));
     }
 }
 
-// The base of DeepSeek's tool endpoints, without a trailing slash.
 std::string tools_base_url() {
     std::string url = env_or("HX_TOOLS_URL", kDeepSeekToolsUrl);
     while (url.ends_with('/')) {
@@ -791,20 +725,16 @@ std::string tools_base_url() {
     return url;
 }
 
-// What host.llm and host.tool reach: host.llm posts to "llm", the session's model endpoint, or to "deepseek" when
-// asked; host.tool to the others by name. Each key goes to its own URLs only.
 std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string& tools_url, const Secrets& secrets) {
     std::vector<hx::Endpoint> endpoints;
     endpoints.push_back({.name = "llm",
                          .url = model.url,
                          .auth = hx::Auth::ApiKey,
                          .key = secrets.key,
-                         .key_env = "",  // a local proxy may need none
+                         .key_env = "",
                          .headers = {model.model.starts_with("claude-") ? kAnthropicVersion : kDeepSeekVersion},
                          .form = false,
                          .model = true});
-    // DeepSeek's Messages endpoint with DeepSeek's key, whatever the session's model: a session on a Claude model
-    // hands a sub-agent's turn to a DeepSeek model through it.
     endpoints.push_back({.name = "deepseek",
                          .url = env_or("HX_DEEPSEEK_URL", kDeepSeekUrl),
                          .auth = hx::Auth::ApiKey,
@@ -834,9 +764,6 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string&
     return endpoints;
 }
 
-// libcurl does not read these variables itself; the wall lets the file be read (see sandbox_rules). The first of
-// the two that can be read: a stale variable must not hide a good one, or break every request. Empty for neither,
-// and then libcurl's own roots apply.
 std::string ca_bundle() {
     for (const char* name : {"SSL_CERT_FILE", "CURL_CA_BUNDLE"}) {
         if (std::string path = env_or(name, ""); !path.empty() && access(path.c_str(), R_OK) == 0) {
@@ -846,7 +773,6 @@ std::string ca_bundle() {
     return {};
 }
 
-// The Host's configuration for the agent or a --run script. Takes the secrets out of the environment.
 hx::HostConfig host_config(const Options& options, const ModelChoice& model, bool interactive) {
     hx::HostConfig config;
     const std::string tools_url = tools_base_url();
@@ -870,7 +796,6 @@ hx::HostConfig host_config(const Options& options, const ModelChoice& model, boo
     return config;
 }
 
-// The source of the --run script, or nothing when there is none.
 std::optional<std::string> read_script(const Options& options) {
     if (options.mode != Mode::Script) {
         return std::nullopt;
@@ -905,7 +830,7 @@ int run(const std::vector<std::string_view>& argv) {
     }
 
     const ModelChoice endpoint = choose_endpoint(options.model, options.rpi);
-    setenv("HX_MODEL", endpoint.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
+    setenv("HX_MODEL", endpoint.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
     check_effort();
     const bool stdin_tty = isatty(STDIN_FILENO) != 0;
     if (options.no_input && options.mode == Mode::Agent && options.args.empty() && stdin_tty) {
@@ -922,7 +847,6 @@ int run(const std::vector<std::string_view>& argv) {
     }
     const TempDir tmp;
 
-    // The model's words go to stdout and progress to stderr; line buffering keeps the two in order in a pipe.
     static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
     const std::optional<hx::Judge> judge =
         options.judge ? std::optional(spawn_judge(options, *options.judge, project, tmp.path())) : std::nullopt;
@@ -934,7 +858,6 @@ int run(const std::vector<std::string_view>& argv) {
                    "such as the D-Bus session bus or ssh-agent; ABI {} can. See \"The wall\" in the README.\n",
                    sandbox.abi(), hx::Sandbox::kUnixSocketAbi);
     }
-    // Keeps the commands the model runs from reading the key out of this process's memory.
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     config.system_rules = system_rules();
     if (judge) {
@@ -949,7 +872,6 @@ int run(const std::vector<std::string_view>& argv) {
     });
 }
 
-// Reports a fatal error without being able to fail itself.
 int report(const char* message, int status) noexcept {
     static_cast<void>(std::fputs("hx: ", stderr));
     static_cast<void>(std::fputs(message, stderr));
@@ -961,7 +883,7 @@ int report(const char* message, int status) noexcept {
 
 int main(int argc, char** argv) {
     try {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic): argv is the C entry-point array
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
         return run(std::vector<std::string_view>(argv + std::min(argc, 1), argv + argc));
     } catch (const UsageError& error) {
         return report(error.what(), kExitUsage);

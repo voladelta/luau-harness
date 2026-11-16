@@ -1,21 +1,12 @@
--- Skills: front matter, discovery, loading by name, the list for an unknown name, the system prompt's index, and
--- the skills built into hx.
--- Run with: hx --ro tests --run tests/skills_test.luau
-
 local loop = assert(host.load(host.default_loop, "=loop"))()
 host.quiet = true
 
--- hx has skills built in (host.skills), which every project gets. The checks of directories are made without
--- them; the last section puts them back.
 local built_in = host.skills
 host.skills = {}
 
--- check, has, lacks and the report at the end are shared, in check.luau beside this file.
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check, has, lacks = checks.check, checks.has, checks.lacks
-
--- Front matter ------------------------------------------------------------------------------------------------
 
 local fields, body = loop.skill_front_matter("---\nname: pdf-tools\ndescription: Reads PDFs.\n---\n# Body\n")
 check("name", fields.name, "pdf-tools")
@@ -47,8 +38,6 @@ check("no front matter, all body", body, "no front matter")
 
 fields = loop.skill_front_matter("---\nname: nested\nmetadata:\n  author: me\n---\n")
 check("a nested map does not leak a key", fields.author, nil)
-
--- Discovery ---------------------------------------------------------------------------------------------------
 
 local root = (host.env("TMPDIR") or "/tmp") .. "/hx-skills-test-" .. tostring(os.clock()):gsub("%.", "")
 local first, second, missing = root .. "/one/", root .. "/two/", root .. "/none/"
@@ -82,8 +71,6 @@ check("a skill without a name takes its directory's", skills[1].name, "no-name")
 check("hidden is read", skills[4].hidden, true)
 check("the path", skills[2].path, first .. "pdf-tools/SKILL.md")
 
--- Loading -----------------------------------------------------------------------------------------------------
-
 local loaded = loop.skill("xlsx")
 has("an exact name loads", loaded, "[skill xlsx, in " .. first .. "xlsx/.")
 has("the body is there", loaded, "Do the thing.")
@@ -111,8 +98,6 @@ loaded = loop.skill("PDFTools")
 has("names alike are listed, not guessed", loaded, "Several skills have a name like")
 has("with each path", loaded, second .. "pdf_tools/SKILL.md")
 
--- An unknown name ----------------------------------------------------------------------------------------------
-
 local found = loop.skill("excel spreadsheets")
 has("an unknown name says so", found, 'No skill is named "excel spreadsheets".')
 has("and lists the skills to pick from", found, "- xlsx: Create and edit Excel")
@@ -126,7 +111,6 @@ has("past M.skill_listed, the rest are counted", found, "and 3 more")
 check("and not listed", select(2, found:gsub("\n%- ", "")), 2)
 loop.skill_listed = 50
 
--- Through the function the model calls, which checks its argument.
 local fn
 for _, f in loop.functions do
 	if f.name == "skill" then
@@ -139,12 +123,9 @@ check("a table is refused", pcall(fn.run, { name = "xlsx" }), false)
 check("an empty name is refused", pcall(fn.run, "  "), false)
 has("the lua tool reaches it", loop.tools[1].run({ code = "return skill('xlsx')" }), "[skill xlsx,")
 
--- A long description is cut in listings, on a character boundary.
 skill(first, "long", "name: long\ndescription: " .. string.rep("é", 400))
 found = loop.skill("a name no skill has")
 has("a long description is cut", found, string.rep("é", loop.skill_description_limit) .. " ...")
-
--- The system prompt -------------------------------------------------------------------------------------------
 
 local prompt = loop.system_prompt()
 has("the prompt lists skills", prompt, "- pdf-tools: Read, split and merge PDF files.")
@@ -165,9 +146,6 @@ loop.skill_dirs = { missing }
 lacks("no skills, no part of the prompt", loop.system_prompt(), "Skills are instructions")
 lacks("and no pointer to a skill that is not there", loop.system_prompt(), 'skill("hx")')
 
--- Built in ----------------------------------------------------------------------------------------------------
-
--- A built-in skill is the text of a SKILL.md, with no directory.
 loop.skill_index_full = 30
 host.skills = {
 	xlsx = "---\nname: xlsx\ndescription: The built-in xlsx, which loses to a project's.\n---\nBuilt-in sheets.\n",
@@ -190,7 +168,6 @@ check("they come after every directory, and a directory's skill of a name takes 
 has("the project's xlsx is the one that loads", loop.skill("xlsx"), "[skill xlsx, in " .. first .. "xlsx/.")
 lacks("and the one that is listed", loop.skill("nothing"), "- xlsx (built in)")
 
--- The skill hx is built with, on using and extending hx itself.
 host.skills = built_in
 loop.skill_dirs = { missing }
 fields = loop.skill_front_matter(built_in.hx or "")

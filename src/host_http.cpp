@@ -1,5 +1,3 @@
-// host.llm and host.tool: HTTP requests to the configured endpoints, each with its own key and nowhere else.
-
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -28,14 +26,14 @@
 namespace hx {
 namespace {
 
-constexpr std::size_t kMaxResponse = std::size_t{256} << 20;  // host.llm and host.tool abort a larger reply
-constexpr std::size_t kMaxUpload = std::size_t{100} << 20;    // the largest file DeepSeek's OCR takes
+constexpr std::size_t kMaxResponse = std::size_t{256} << 20;
+constexpr std::size_t kMaxUpload = std::size_t{100} << 20;
 
 std::size_t on_body(char* data, std::size_t size, std::size_t count, void* user) noexcept {
     auto* body = static_cast<std::string*>(user);
     const std::size_t bytes = size * count;
     if (body->size() + bytes > kMaxResponse) {
-        return 0;  // a short count aborts the transfer
+        return 0;
     }
     try {
         body->append(data, bytes);
@@ -47,10 +45,9 @@ std::size_t on_body(char* data, std::size_t size, std::size_t count, void* user)
 
 int on_progress(void* /*user*/, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/, curl_off_t /*ultotal*/,
                 curl_off_t /*ulnow*/) noexcept {
-    return g_signal != 0 ? 1 : 0;  // non-zero aborts the transfer
+    return g_signal != 0 ? 1 : 0;
 }
 
-// An owned list of request headers.
 class Headers {
   public:
     Headers() = default;
@@ -77,7 +74,6 @@ struct CurlMimeDeleter {
 };
 using CurlMime = std::unique_ptr<curl_mime, CurlMimeDeleter>;
 
-// A string field of the options table at idx, or `fallback` when there is no table or no such field.
 std::string string_option(lua_State* L, int idx, const char* field, std::string_view fallback) {
     if (lua_isnoneornil(L, idx)) {
         return std::string(fallback);
@@ -94,8 +90,6 @@ std::string string_option(lua_State* L, int idx, const char* field, std::string_
     return value;
 }
 
-// The `beta` field of host.llm's options: the anthropic-beta header, a comma-separated list of beta names. Only
-// letters, digits, '-', '_' and ',' are taken, so the value cannot end the header and start another.
 std::string beta_option(lua_State* L, int idx) {
     const std::string value = string_option(L, idx, "beta", "");
     for (const char c : value) {
@@ -106,10 +100,6 @@ std::string beta_option(lua_State* L, int idx) {
     return value;
 }
 
-// Sends a POST whose body is already set on curl to endpoint, with its key, its headers and `extra`, and returns
-// status, text, and the seconds of a Retry-After header if there was one | nil, error. Redirects are not followed: a
-// key goes to the URL it was meant for and nowhere else. The handle is reset afterwards, so it keeps no pointer into
-// this request; the connection stays open for the next.
 int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_list<std::string_view> extra,
          double timeout, const std::string& ca_bundle) {
     Headers headers;
@@ -130,8 +120,6 @@ int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     curl_easy_setopt(curl, CURLOPT_URL, endpoint.url.c_str());
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
-    // A model can take minutes to answer a non-streaming request, with nothing on the wire meanwhile; probes keep
-    // a NAT or a proxy on the way from dropping the connection as idle.
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
@@ -141,7 +129,6 @@ int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    // Zero would mean "no limit" to libcurl, so an exhausted limit becomes the shortest one.
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, std::max(1L, static_cast<long>(timeout * 1000)));
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
     if (!ca_bundle.empty()) {
@@ -150,7 +137,7 @@ int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
 
     const CURLcode code = curl_easy_perform(curl);
     long status = 0;
-    curl_off_t retry_after = 0;  // seconds the server asked for in Retry-After; 0 when it sent none
+    curl_off_t retry_after = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_easy_getinfo(curl, CURLINFO_RETRY_AFTER, &retry_after);
     curl_easy_reset(curl);
@@ -167,13 +154,11 @@ int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     return 3;
 }
 
-// Sets the request's body. libcurl does not copy it, so it must live until the request is done.
 void set_body(CURL* curl, std::string_view body) {
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
 }
 
-// Raises the error for a host.tool name that is not a tool, naming those that are.
 [[noreturn]] void no_such_tool(lua_State* L, std::string_view name, const std::vector<Endpoint>& endpoints) {
     std::vector<std::string_view> names;
     for (const Endpoint& each : endpoints) {
@@ -181,7 +166,7 @@ void set_body(CURL* curl, std::string_view body) {
             names.push_back(each.name);
         }
     }
-    std::string known;  // "a, b and c"
+    std::string known;
     for (std::size_t i = 0; i < names.size(); ++i) {
         if (i > 0) {
             known += i + 1 == names.size() ? " and " : ", ";
@@ -191,8 +176,6 @@ void set_body(CURL* curl, std::string_view body) {
     luaL_error(L, "host.tool: no tool %s; the tools are %s", std::string(name).c_str(), known.c_str());
 }
 
-// The fields of the form table at idx, sorted by name, so a request is the same whatever order the table was built
-// in.
 std::vector<std::pair<std::string, std::string>> form_fields(lua_State* L, int idx) {
     std::vector<std::pair<std::string, std::string>> fields;
     lua_pushnil(L);
@@ -211,8 +194,6 @@ std::vector<std::pair<std::string, std::string>> form_fields(lua_State* L, int i
     return fields;
 }
 
-// Attaches the file at path to part. Checked here, so a file that cannot be sent is reported as such rather than as
-// a failed transfer: the error, or nothing when it is attached.
 std::optional<std::string> attach_file(curl_mimepart* part, const std::string& path) {
     if (path.find('\0') != std::string::npos) {
         return "host.tool: the file name contains a NUL byte";
@@ -234,8 +215,6 @@ std::optional<std::string> attach_file(curl_mimepart* part, const std::string& p
     return std::nullopt;
 }
 
-// Fills mime with the form table at idx: `file` names a file to upload, and every other field is a text field.
-// The error, or nothing when the form is complete.
 std::optional<std::string> fill_form(lua_State* L, curl_mime* mime, int idx) {
     for (const auto& [key, value] : form_fields(L, idx)) {
         curl_mimepart* part = curl_mime_addpart(mime);
@@ -264,7 +243,7 @@ CURL* Host::curl() {
     if (!curl_) {
         curl_.reset(curl_easy_init());
     } else {
-        curl_easy_reset(curl_.get());  // post resets it too, but a request that failed before reaching post may not
+        curl_easy_reset(curl_.get());
     }
     return curl_.get();
 }
@@ -274,10 +253,8 @@ int Host::llm(lua_State* L) {
     const char* body = luaL_checklstring(L, 1, &length);
     Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 600));
-    raise_if_signaled(L);  // a stop in progress starts no request
+    raise_if_signaled(L);
     const std::string beta = beta_option(L, 2);
-    // The session's endpoint, or another model endpoint by its name. Only names are taken, as in host.tool, so each
-    // key reaches its own URL and nothing else.
     const std::string name = string_option(L, 2, "endpoint", "llm");
     const Endpoint* endpoint = host.endpoint(name);
     if (endpoint == nullptr || !endpoint->model) {
@@ -297,10 +274,6 @@ int Host::llm(lua_State* L) {
                 timeout, host.config_.ca_bundle);
 }
 
-// host.tool(name, request, {timeout=300}): a request to the endpoint of that name, other than host.llm's. Only the
-// endpoints' names are taken, so each key reaches its own URL and nothing else. A string request is sent as JSON;
-// for an endpoint that takes a form, a table is sent as a multipart form, in which `file` names a file to upload
-// and every other field is a text field.
 int Host::tool(lua_State* L) {
     const std::string_view name = check_cstring(L, 1);
     Host& host = of(L);
