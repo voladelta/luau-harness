@@ -427,13 +427,14 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("anthropic-beta", self.model.headers[2])
         # DeepSeek caches by itself and ignores cache_control: the system prompt goes as the plain string.
         self.assertIsInstance(self.model.requests[2]["system"], str)
-        # A Claude model newer than the loop's list thinks by default too: it gets the system prompt as Claude's
-        # API caches it, and nothing it might not take.
+        # A Claude model newer than the loop's list is still asked for adaptive thinking, and gets the system prompt
+        # as Claude's API caches it, and nothing else it might not take.
         done = self.run_hx("--model", "claude-opus-9", "go", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         sent = self.model.requests[3]
         self.assertEqual(sent["model"], "claude-opus-9")
-        for field in ("thinking", "output_config", "fallbacks"):
+        self.assertEqual(sent["thinking"], {"type": "adaptive"})
+        for field in ("output_config", "fallbacks"):
             self.assertNotIn(field, sent)
         self.assertNotIn("anthropic-beta", self.model.headers[3])
         self.assertEqual(sent["system"][0]["cache_control"], {"type": "ephemeral"})

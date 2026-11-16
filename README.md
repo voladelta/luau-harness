@@ -171,9 +171,9 @@ Know these before you rely on it.
 ## The loop
 
 `lua/loop.luau` is the whole agent, in one file. It speaks the Anthropic Messages format and sends thinking blocks
-back exactly as they came. Thinking is on at both endpoints and is not a setting of hx's: every model hx is for
-thinks by default, and `HX_EFFORT` is the one control. A request names thinking only to carry the options a Claude
-model in `M.claude` gets, below. It gives the model one tool, `lua`, which runs the
+back exactly as they came. Thinking is always on and is not a setting of hx's: `HX_EFFORT` is the one control.
+Every `claude-*` request carries `thinking: {type: "adaptive"}`, so no Claude model runs without it whatever its own
+default; DeepSeek's models think by default and get no thinking field. It gives the model one tool, `lua`, which runs the
 code it is sent in the project directory and returns what the code prints and returns. Globals persist from one
 call to the next. The code acts through these functions:
 
@@ -270,8 +270,8 @@ For notes to the model that need no code, write `.hx/prompt.md`.
 
 `M.claude` lists what the loop adds for the Claude models it knows, which are the 5.5 family: hx is not for the
 models before it. Any other model, DeepSeek's included, gets the plain request. A `claude-*` model newer than the
-list gets the system prompt as a block with `cache_control` and nothing else, until it is added; only a listed
-one gets the features below. The settings follow Anthropic's guidance for these models:
+list gets adaptive thinking and the system prompt as a block with `cache_control`, and nothing else, until it is
+added; only a listed one gets the features below. The settings follow Anthropic's guidance for these models:
 
 | | Opus 5.5 | Sonnet 5.5 | Haiku 5.5 |
 |---|---|---|---|
