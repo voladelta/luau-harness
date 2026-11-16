@@ -1,10 +1,10 @@
 #include "json.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -32,18 +32,7 @@ struct DocDeleter {
     void operator()(yyjson_doc* doc) const { yyjson_doc_free(doc); }
 };
 
-struct MutDocDeleter {
-    void operator()(yyjson_mut_doc* doc) const { yyjson_mut_doc_free(doc); }
-};
-
-struct TextDeleter {
-    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-    void operator()(char* text) const { std::free(text); }
-};
-
 using Doc = std::unique_ptr<yyjson_doc, DocDeleter>;
-using MutDoc = std::unique_ptr<yyjson_mut_doc, MutDocDeleter>;
-using Text = std::unique_ptr<char, TextDeleter>;
 
 bool is_null(lua_State* L, int idx) {
     return lua_islightuserdata(L, idx) && lua_touserdata(L, idx) == &null_tag;
@@ -84,6 +73,7 @@ void push_scalar(lua_State* L, const yyjson_val* value) {
 struct Frame {
     yyjson_val* next;
     std::size_t left;
+    bool array;
     int index;
 };
 
@@ -107,7 +97,7 @@ int l_decode(lua_State* L) {
             return;
         }
         Frame& frame = frames.back();
-        if (frame.index != 0) {
+        if (frame.array) {
             lua_rawseti(L, -2, frame.index++);
         } else if (is_null(L, -1)) {
             lua_pop(L, 2);
@@ -127,7 +117,7 @@ int l_decode(lua_State* L) {
             if (array) {
                 mark_array(L);
             }
-            frames.push_back({unsafe_yyjson_get_first(value), count, array ? 1 : 0});
+            frames.push_back({unsafe_yyjson_get_first(value), count, array, 1});
         } else {
             push_scalar(L, value);
             attach();
@@ -142,7 +132,7 @@ int l_decode(lua_State* L) {
         }
         Frame& frame = frames.back();
         --frame.left;
-        if (frame.index == 0) {
+        if (!frame.array) {
             lua_pushlstring(L, yyjson_get_str(frame.next), yyjson_get_len(frame.next));
             frame.next = unsafe_yyjson_get_next(frame.next);
         }
@@ -192,55 +182,66 @@ std::size_t utf8_length(std::string_view s) {
     return length;
 }
 
-std::string_view valid_utf8(std::string_view s, std::string& scratch) {
-    std::size_t i = 0;
-    while (i < s.size()) {
-        const std::size_t length = utf8_length(s.substr(i));
-        if (length == 0) {
-            break;
-        }
-        i += length;
+constexpr std::array<bool, 256> kPlain = [] {
+    std::array<bool, 256> plain{};
+    for (std::size_t c = 0x20; c < 0x80; ++c) {
+        plain.at(c) = c != '"' && c != '\\';
     }
-    if (i == s.size()) {
-        return s;
-    }
+    return plain;
+}();
 
-    scratch.assign(s.substr(0, i));
-    while (i < s.size()) {
-        const std::size_t length = utf8_length(s.substr(i));
-        if (length == 0) {
-            scratch.append(kReplacement);
-            ++i;
-        } else {
-            scratch.append(s.substr(i, length));
-            i += length;
+std::string_view escape(unsigned char c, std::array<char, 6>& buffer) {
+    switch (c) {
+        case '"':
+            return "\\\"";
+        case '\\':
+            return "\\\\";
+        case '\b':
+            return "\\b";
+        case '\f':
+            return "\\f";
+        case '\n':
+            return "\\n";
+        case '\r':
+            return "\\r";
+        case '\t':
+            return "\\t";
+        default: {
+            constexpr std::string_view kHex = "0123456789ABCDEF";
+            buffer = {'\\', 'u', '0', '0', kHex[c >> 4], kHex[c & 0xF]};
+            return {buffer.data(), buffer.size()};
         }
     }
-    return scratch;
 }
 
 class Encoder {
   public:
-    Encoder(lua_State* L, yyjson_mut_doc* doc) : L_(L), doc_(doc) {}
+    explicit Encoder(lua_State* L) : L_(L) {}
 
-    yyjson_mut_val* value(int idx, std::size_t depth) {
+    void value(int idx, std::size_t depth) {
         switch (lua_type(L_, idx)) {
             case LUA_TNIL:
-                return check(yyjson_mut_null(doc_));
+                out_ += "null";
+                return;
             case LUA_TBOOLEAN:
-                return check(yyjson_mut_bool(doc_, lua_toboolean(L_, idx) != 0));
+                out_ += lua_toboolean(L_, idx) != 0 ? "true" : "false";
+                return;
             case LUA_TNUMBER:
-                return number(lua_tonumber(L_, idx));
+                number(lua_tonumber(L_, idx));
+                return;
             case LUA_TSTRING: {
                 std::size_t length = 0;
                 const char* text = lua_tolstring(L_, idx, &length);
-                return string({text, length});
+                string({text, length});
+                return;
             }
             case LUA_TTABLE:
-                return table(idx, depth);
+                table(idx, depth);
+                return;
             case LUA_TLIGHTUSERDATA:
                 if (is_null(L_, idx)) {
-                    return check(yyjson_mut_null(doc_));
+                    out_ += "null";
+                    return;
                 }
                 [[fallthrough]];
             default:
@@ -248,32 +249,54 @@ class Encoder {
         }
     }
 
-  private:
-    yyjson_mut_val* check(yyjson_mut_val* value) {
-        if (value == nullptr) {
-            luaL_error(L_, "json.encode: out of memory");
-        }
-        return value;
-    }
+    [[nodiscard]] const std::string& text() const { return out_; }
 
-    yyjson_mut_val* number(double n) {
+  private:
+    void number(double n) {
         if (!std::isfinite(n)) {
             luaL_error(L_, "json.encode: cannot encode nan or inf");
         }
+        yyjson_val number{};
         if (std::floor(n) == n && std::fabs(n) < kExactIntegerLimit) {
-            return check(yyjson_mut_sint(doc_, static_cast<std::int64_t>(n)));
+            yyjson_set_sint(&number, static_cast<std::int64_t>(n));
+        } else {
+            yyjson_set_real(&number, n);
         }
-        return check(yyjson_mut_real(doc_, n));
+        std::array<char, 40> digits{};
+        char* end = yyjson_write_number(&number, digits.data());
+        out_.append(digits.data(), end);
     }
 
-    yyjson_mut_val* string(std::string_view s) {
-        const std::string_view clean = valid_utf8(s, scratch_);
-        const bool copied = clean.data() == scratch_.data();
-        return check(copied ? yyjson_mut_strncpy(doc_, clean.data(), clean.size())
-                            : yyjson_mut_strn(doc_, clean.data(), clean.size()));
+    void string(std::string_view s) {
+        out_ += '"';
+        std::array<char, 6> buffer{};
+        const char* run = s.data();
+        const char* p = run;
+        const char* const end = p + s.size();
+        while (true) {
+            while (p != end && kPlain.at(static_cast<unsigned char>(*p))) {
+                ++p;
+            }
+            if (p == end) {
+                break;
+            }
+            const auto c = static_cast<unsigned char>(*p);
+            if (c >= 0x80) {
+                const std::size_t length = utf8_length({p, static_cast<std::size_t>(end - p)});
+                if (length > 0) {
+                    p += length;
+                    continue;
+                }
+                out_.append(run, p).append(kReplacement);
+            } else {
+                out_.append(run, p).append(escape(c, buffer));
+            }
+            run = ++p;
+        }
+        out_.append(run, end) += '"';
     }
 
-    yyjson_mut_val* table(int idx, std::size_t depth) {
+    void table(int idx, std::size_t depth) {
         if (depth >= kMaxDepth) {
             luaL_error(L_, "json.encode: nesting too deep (a table that contains itself?)");
         }
@@ -304,53 +327,49 @@ class Encoder {
             if (!array) {
                 luaL_error(L_, "json.encode: a json.array may only have the keys 1..n");
             }
-            yyjson_mut_val* result = check(yyjson_mut_arr(doc_));
+            out_ += '[';
             for (std::size_t i = 1; i <= length; ++i) {
+                if (i > 1) {
+                    out_ += ',';
+                }
                 lua_rawgeti(L_, idx, static_cast<int>(i));
-                yyjson_mut_val* element = value(lua_gettop(L_), depth + 1);
+                value(lua_gettop(L_), depth + 1);
                 lua_pop(L_, 1);
-                yyjson_mut_arr_append(result, element);
             }
-            return result;
+            out_ += ']';
+            return;
         }
 
         if (keys.size() != count) {
             luaL_error(L_, "json.encode: a table is neither an array (keys 1..n) nor an object (string keys)");
         }
         std::sort(keys.begin(), keys.end());
-        yyjson_mut_val* result = check(yyjson_mut_obj(doc_));
-        for (const std::string_view key : keys) {
-            yyjson_mut_val* name = string(key);
+        out_ += '{';
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            const std::string_view key = keys[i];
+            if (i > 0) {
+                out_ += ',';
+            }
+            string(key);
+            out_ += ':';
             lua_pushlstring(L_, key.data(), key.size());
             lua_rawget(L_, idx);
-            yyjson_mut_val* member = value(lua_gettop(L_), depth + 1);
+            value(lua_gettop(L_), depth + 1);
             lua_pop(L_, 1);
-            yyjson_mut_obj_add(result, name, member);
         }
-        return result;
+        out_ += '}';
     }
 
     lua_State* L_;
-    yyjson_mut_doc* doc_;
-    std::string scratch_;
+    std::string out_;
 };
 
 int l_encode(lua_State* L) {
     luaL_checkany(L, 1);
     lua_settop(L, 1);
-    const MutDoc doc(yyjson_mut_doc_new(nullptr));
-    if (doc == nullptr) {
-        luaL_error(L, "json.encode: out of memory");
-    }
-    Encoder encoder(L, doc.get());
-    yyjson_mut_doc_set_root(doc.get(), encoder.value(1, 0));
-    std::size_t length = 0;
-    yyjson_write_err error{};
-    const Text text(yyjson_mut_write_opts(doc.get(), YYJSON_WRITE_NOFLAG, nullptr, &length, &error));
-    if (text == nullptr) {
-        luaL_error(L, "json.encode: %s", error.msg);
-    }
-    lua_pushlstring(L, text.get(), length);
+    Encoder encoder(L);
+    encoder.value(1, 0);
+    lua_pushlstring(L, encoder.text().data(), encoder.text().size());
     return 1;
 }
 
