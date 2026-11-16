@@ -48,6 +48,7 @@ struct HostConfig {
     std::vector<std::pair<std::string, std::string>> skills;      // host.skills: built-in ones, name and SKILL.md
     std::vector<Rule> system_rules;  // what every wall lets in: system directories, harmless devices, trust roots
     UniqueFd judge;                  // a line-based channel to the judge process (--judge); invalid for none
+    std::string workflow;            // host.workflow: the skill the session is led by (--rpi: "rpi"); empty for none
 };
 
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
@@ -109,6 +110,7 @@ struct HostConfig {
 //   host.extensions                                   the built-in extensions' sources, by name
 //   host.skills                                       the built-in skills' SKILL.md texts, by name
 //   host.judged                                      a judge is there for host.judge
+//   host.workflow                                     the skill this session is led by: "rpi" with --rpi, else nil
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
 // SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input,

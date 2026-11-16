@@ -457,6 +457,10 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "exa");
     lua_pushboolean(L, config_.judge.valid() ? 1 : 0);
     lua_setfield(L, -2, "judged");
+    if (!config_.workflow.empty()) {
+        lua_pushlstring(L, config_.workflow.data(), config_.workflow.size());
+        lua_setfield(L, -2, "workflow");
+    }
     // The built-in extensions and skills, each a table of texts by name.
     for (const auto& [field, texts] :
          {std::pair{"extensions", &config_.extensions}, std::pair{"skills", &config_.skills}}) {

@@ -61,9 +61,12 @@ usage:
                                       with --full, a copy of the whole built-in loop
   hx --judge KIT [options] [TASK...]  run the agent with a judge: only changes it submits and the kit's
                                       measurements confirm count; KIT must lie outside the wall
+  hx --rpi [options] [TASK...]        run the agent as a lead, on Opus: it researches and plans, agents
+                                      on deepseek-flash implement side by side, and it verifies their work
 
 examples:
   hx "add a --json flag to the export command and test it"
+  hx --rpi "move the config loader to TOML, with its tests and docs"
   { echo review this change; git diff; } | hx
   hx --ro ~/.rustup --ro ~/.cargo --rw ~/.cargo/registry "fix the failing test"
   hx -q "summarise the README" > summary.txt
@@ -73,7 +76,10 @@ options:
   --judge KIT       judge the agent's changes with the kit in directory KIT (run, and optionally build
                     and check); the agent cannot read the kit, and the champion, its patch and the
                     ledger go to a directory outside the wall
-  --ro PATH         also allow reading PATH (a toolchain in your home directory, for example)
+  --rpi             lead the task by the rpi workflow (research, plan, implement): the model is opus
+                    unless --model names another, whatever HX_MODEL says, and its agents run on
+                    deepseek-flash when DEEPSEEK_API_KEY is set, on the lead's model otherwise
+  --ro PATH        also allow reading PATH (a toolchain in your home directory, for example)
   --rw PATH         also allow writing PATH
   --keep-env NAME   keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET,
                     PASSWORD, PASSWD, CREDENTIALS, _PAT or _PWD) in the environment of commands
@@ -134,6 +140,8 @@ constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
     {"sonnet", "claude-sonnet-5-5"},
     {"haiku", "claude-haiku-5-5"},
 };
+constexpr std::string_view kRpiLead = "opus";  // the model --rpi leads with, unless --model names another
+constexpr const char* kRpiWorkflow = "rpi";    // the skill --rpi leads by: host.workflow
 constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh", "max"};  // what HX_EFFORT may be
 constexpr const char* kProjectLoop = ".hx/loop.luau";
 
@@ -156,6 +164,7 @@ struct Options {
     std::vector<std::string> keep_env;
     std::optional<std::string> model;
     std::optional<std::string> judge;  // --judge KIT
+    bool rpi = false;                  // --rpi: the session is led by the rpi workflow
     bool sandbox = true;
     bool unix_sockets = false;
     bool full = false;  // --init --full: copy the whole built-in loop, not the overlay
@@ -165,8 +174,8 @@ struct Options {
 
 // Every option hx knows, for the suggestion after a misspelt one.
 constexpr std::string_view kOptionNames[] = {
-    "--model",    "--ro",   "--rw",   "--keep-env", "--unix-sockets", "--no-sandbox", "--quiet",
-    "--no-input", "--init", "--full", "--run",      "--help",         "--version",    "--judge",
+    "--model", "--ro",   "--rw",  "--keep-env", "--unix-sockets", "--no-sandbox", "--quiet", "--no-input",
+    "--init",  "--full", "--run", "--help",     "--version",      "--judge",      "--rpi",
 };
 
 // Edit distance, for "did you mean".
@@ -251,6 +260,9 @@ void check_combinations(const Options& options) {
     if (options.mode == Mode::Init && !options.args.empty()) {
         throw UsageError("--init takes no task");
     }
+    if (options.rpi && options.mode != Mode::Agent) {
+        throw UsageError("--rpi leads the agent on a task: it goes with neither --run nor --init");
+    }
     if (options.judge && !options.sandbox) {
         throw UsageError("--judge needs the wall: without it the agent could read the kit and rewrite the ledger");
     }
@@ -280,6 +292,9 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             options.model = option.value("NAME");
         } else if (arg == "--judge") {
             options.judge = option.value("KIT");
+        } else if (arg == "--rpi") {
+            option.flag();
+            options.rpi = true;
         } else if (arg == "--unix-sockets") {
             option.flag();
             options.unix_sockets = true;
@@ -430,9 +445,14 @@ struct ModelChoice {
 // The model, and where to send it. --model wins over HX_MODEL, and opus, sonnet and haiku name the current Claude
 // models. Without either, a Claude model is asked when ANTHROPIC_API_KEY is set and DEEPSEEK_API_KEY is not, and
 // DeepSeek's otherwise. A claude-* model goes to the Claude API with ANTHROPIC_API_KEY, any other to DeepSeek with
-// DEEPSEEK_API_KEY; HX_API_URL and HX_KEY_ENV override either.
-ModelChoice choose_endpoint(const std::optional<std::string>& flag) {
-    std::string model = flag ? *flag : env_or("HX_MODEL", "");
+// DEEPSEEK_API_KEY; HX_API_URL and HX_KEY_ENV override either. With --rpi the model is the lead of a workflow that
+// is made for Opus to lead: it is Opus unless --model names another, and HX_MODEL, which says what a session's one
+// model is, is not asked.
+ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
+    std::string model = rpi ? std::string(kRpiLead) : env_or("HX_MODEL", "");
+    if (flag) {
+        model = *flag;
+    }
     for (const auto& [alias, name] : kModelAliases) {
         if (model == alias) {
             model = name;
@@ -844,6 +864,9 @@ hx::HostConfig host_config(const Options& options, const ModelChoice& model, boo
         config.skills.emplace_back(name, text);
     }
     config.ca_bundle = ca_bundle();
+    if (options.rpi) {
+        config.workflow = kRpiWorkflow;
+    }
     return config;
 }
 
@@ -881,7 +904,7 @@ int run(const std::vector<std::string_view>& argv) {
         return init_project(options.full);
     }
 
-    const ModelChoice endpoint = choose_endpoint(options.model);
+    const ModelChoice endpoint = choose_endpoint(options.model, options.rpi);
     setenv("HX_MODEL", endpoint.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe): no other thread exists yet
     check_effort();
     const bool stdin_tty = isatty(STDIN_FILENO) != 0;

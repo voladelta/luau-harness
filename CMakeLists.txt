@@ -112,6 +112,17 @@ foreach(name IN LISTS HX_SKILL_NAMES)
   hx_embed(source ${CMAKE_CURRENT_SOURCE_DIR}/.claude/skills/${name}/SKILL.md)
   string(APPEND HX_SKILLS "    {\"${name}\", R\"HXLUAU(${source})HXLUAU\"},\n")
 endforeach()
+# Every lua/skills/NAME/SKILL.md is the built-in skill NAME too, as every file in lua/ext/ is an extension. These
+# are for the model hx runs and nobody else: in .claude/skills/ one would be Claude Code's as well, here, and Claude
+# Code has no agents function to follow rpi with.
+file(GLOB HX_SKILL_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/lua/skills/*/SKILL.md)
+list(SORT HX_SKILL_FILES)
+foreach(path IN LISTS HX_SKILL_FILES)
+  get_filename_component(dir ${path} DIRECTORY)
+  get_filename_component(name ${dir} NAME)
+  hx_embed(source ${path})
+  string(APPEND HX_SKILLS "    {\"${name}\", R\"HXLUAU(${source})HXLUAU\"},\n")
+endforeach()
 configure_file(src/embedded.h.in embedded.h @ONLY)
 
 add_executable(hx src/main.cpp src/host.cpp src/host_files.cpp src/host_http.cpp src/host_judge.cpp src/host_proc.cpp src/host_sh.cpp src/host_spawn.cpp src/judge.cpp src/json.cpp src/sandbox.cpp)

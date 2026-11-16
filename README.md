@@ -11,6 +11,7 @@ cd my-project
 export DEEPSEEK_API_KEY=...         # or ANTHROPIC_API_KEY=... for Claude
 hx "add a --json flag to the export command and test it"
 hx --model sonnet "same, on Claude Sonnet 5.5"
+hx --rpi "move the config loader to TOML"   # Opus researches and plans, deepseek-flash agents implement
 ```
 
 ## The idea
@@ -29,6 +30,10 @@ hx --model sonnet "same, on Claude Sonnet 5.5"
   check and no command needs to be judged by its text.
 - **A change counts when a judge says so.** With `--judge KIT`, a second process, behind a wall of its own,
   measures what the model submits with a kit the model cannot read, and keeps only gains that hold up twice.
+- **A lead and its agents.** The model can give tasks to agents, each a model with a conversation of its own in a
+  fork of hx behind the same wall, and they work at the same time. With `--rpi`, Opus leads by the rpi workflow:
+  it researches and plans, agents on `deepseek-flash` implement, and it verifies their work and sends back what
+  fails.
 - **Extensions have no more power than the model.** An extension is Luau running in the same confined process.
   It can do nothing the model's own shell could not, so nothing needs to be approved, staged or trusted.
 
@@ -55,6 +60,7 @@ hx [options] [TASK...]              run the agent; without a task, read it from 
 hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives (FILE - reads stdin)
 hx --init [--full]                  write .hx/loop.luau, which starts from the built-in loop (--full: a copy)
 hx --judge KIT [options] [TASK...]  run the agent with a judge: only what it submits and the kit confirms counts
+hx --rpi [options] [TASK...]        run the agent as a lead: it plans, its agents implement, it verifies
 hx --help | --version
 ```
 
@@ -71,6 +77,7 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 |---|---|
 | `--judge KIT` | judge the model's work with the kit in directory `KIT`, which must lie outside the wall (see "The judge") |
 | `--model NAME` | the model to ask; overrides `HX_MODEL`. `opus`, `sonnet` and `haiku` are the current Claude models |
+| `--rpi` | lead the task by the rpi workflow (see "Agents"): the model is `opus` unless `--model` names another, whatever `HX_MODEL` says |
 | `--ro PATH` | also allow reading `PATH` |
 | `--rw PATH` | also allow writing `PATH` |
 | `--keep-env NAME` | keep a secret-looking variable in the environment of commands |
@@ -186,6 +193,7 @@ call to the next. The code acts through these functions:
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
 | `skill(name)` | a skill's instructions, by name; for a name no skill has, the list of skills to pick from (see "Skills") |
 | `ext(name)` | an extension's table of functions |
+| `agents(tasks)` | gives each task to an agent, all at work at the same time, and returns their reports (see "Agents") |
 
 `host.*` and `json.*` are there too, for working on raw data. A function that fails raises, and the error goes
 back to the model with what the code printed before it. Only the result is clipped, once: past `M.output_limit`
@@ -223,15 +231,15 @@ repository fits whole; in 19 lines it is:
 ```
 .claude/
   skills/
-    hx/
-      SKILL.md
+    hx/ (1 file)
 lua/
   ext/ (4 files)
+  skills/ (1 file)
   judge.luau
   loop.luau
   overlay.luau
-src/ (18 files)
-tests/ (9 files)
+src/ (19 files)
+tests/ (11 files)
 .clang-format
 .clang-tidy
 .gitignore
@@ -253,7 +261,9 @@ session. It needs nothing but git: no tree command has to be installed. `M.layou
 
 A project function may run a `lua` call inside the running one (`M.tools[1].run`), or a whole `M.turn` on another
 `Conversation`, as a sub-agent. The nested call keeps the outer call's printed lines, and the nested turn counts
-repeats on its own and leaves the outer turn's counts alone. The model's globals are shared by both.
+repeats on its own and leaves the outer turn's counts alone. The model's globals are shared by both. Such a
+sub-agent runs inside the session's process, while the session waits for it; the `agents` function runs several
+at once, each in a process of its own (see "Agents").
 
 hx does not bring a search tool: the model searches through `bash`. Where `rg` is on the `PATH`, the system
 prompt says that ripgrep is installed and to use it rather than plain grep, since it is faster and skips what
@@ -263,8 +273,9 @@ Some habits of the model are handled in the loop rather than left to the prompt:
 result for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to
 try something else only when it knows an action that will change the result (results are compared by length and a
 hash, so a long one is not kept); a reply with nothing in it is retried like a busy server; a function called by
-its name as if it were a tool gets an error that says it is a function and how code sent to `lua` calls it; and a
-task that runs out of replies gets one more, to report where it stands.
+its name as if it were a tool gets an error that says it is a function and how code sent to `lua` calls it; a
+task that runs out of replies gets one more, to report where it stands; and a model that answers while its agents
+are still at work is told once that its answer would end them half way.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
 ### Claude models
@@ -306,7 +317,8 @@ When a `.hx` directory exists, each session's conversation is saved to `.hx/log/
 called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. Whether
 the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. A
 sub-agent's conversation, one whose turn runs inside another turn, is saved the same way beside the session's,
-under the session's name with `-sub-1`, `-sub-2` and so on. The logs hold file contents, so that directory
+under the session's name with `-sub-1`, `-sub-2` and so on; so is each agent's, in the order the agents were
+first given a task. The logs hold file contents, so that directory
 carries a `.gitignore` that keeps all of it out of git.
 
 ### The conversation is a state machine
@@ -324,6 +336,86 @@ in a `Conversation` whose state is read off its last message, and each operation
 An illegal operation raises and changes nothing, so an interrupt, a cut-off reply or a compaction cannot leave
 a history the API would reject. `tests/conversation_test.luau` checks this with a random walk over every
 operation in every state.
+
+## Agents
+
+One model working down a list is slow where the list could be split. `agents` splits it: the session's model, the
+**lead**, gives each task to an agent, the agents work at the same time, and the lead gets their reports.
+
+```lua
+return agents({
+	{ name = "parser", task = "In src/parse.c, make parse_line accept CRLF line ends. ... Check with make test-parse." },
+	{ name = "docs", task = "In README.md, document the --strict flag. ..." },
+})
+```
+
+```
+[agent parser: done in 142 s]
+Changed src/parse.c: parse_line strips a trailing \r. make test-parse: 14 passed.
+
+[agent docs: done in 38 s]
+README.md has a "Strict mode" section.
+```
+
+An agent is a model with a conversation of its own. Each run of one is a child process: a fork of hx as it is when
+the task is sent (`host.spawn`), so it stands behind the same wall, in the same directory, with the same
+functions, extensions and skills, and needs no key passed to it. It runs one turn and sends back its
+conversation, which the lead's process keeps. The lead's own conversation holds tasks and reports and none of
+the agents' steps, which is what keeps a long job inside its context.
+
+- **The model.** Agents run on `M.agent_model`: `deepseek-flash` when `DEEPSEEK_API_KEY` is set, whatever the
+  lead's model, and the lead's own model otherwise. Their tokens are counted with the session's, on the line of
+  their model.
+- **The prompt.** An agent gets the session's system prompt and `M.agent_prompt` after it: that it is one of
+  several, to change only what its task gives it, to leave git's index and branches alone, to check its own work
+  narrowly, and to end with a report. It knows nothing of the lead's conversation, so the task has to carry what
+  it needs; the `agents` line in the tool's description tells the lead so.
+- **Sending work back.** A task for a name that already has an agent is the lead's next message in that agent's
+  conversation, with everything the agent did still there. A new name is a new agent.
+- **Waiting.** The call returns when every agent has reported, or after `M.agent_wait` (270) seconds with the
+  reports so far and a line for each agent still at work; `agents()` with no tasks waits again. The wait is short
+  on purpose: the lead's next request then falls inside the five minutes Claude keeps its prompt cache, and well
+  inside `M.call_seconds`. A report is given once. An agent at work takes no second task until it has reported.
+- **How many.** `M.agent_limit` (8) agents work at once; more wait their turn. One run of an agent may take
+  `M.agent_seconds` (1800), and is then stopped and reported as stopped, with its conversation intact.
+- **What is shared.** Files, and nothing else. What an agent sets in the VM, globals and loaded extensions, is its
+  own and gone with its run; what its commands left running is killed when the run ends. Agents write the one
+  project directory, so two that edit the same file overwrite each other: the lead is told to give each task its
+  own files, and hx does not check that it did.
+- **What an agent lacks.** It has no `agents` function, so agents do not multiply, and no `submit` under
+  `--judge`: the lead submits. Its words go to stderr as progress lines headed by its name, `[parser] bash make
+  test-parse`, and only the lead's words are the answer on stdout.
+- **Stopping.** Ctrl-C reaches the agents as it reaches hx, and each ends its run; an agent stopped that way keeps
+  the conversation it had before the task. When hx exits, every agent still at work is killed with what it
+  started. A lead that answers while agents are at work would end them that way, so it is told once, and its next
+  answer stands.
+
+### The rpi workflow
+
+`hx --rpi TASK` runs the task by **rpi**: research, plan, implement. The lead is Opus 5.5, unless `--model`
+names another, and its agents are `deepseek-flash`'s, when both keys are set: the expensive model reads, decides
+and judges, and the cheap ones type.
+
+1. **Research.** The lead reads the code the task touches, and runs the project's build and tests once to know
+   where it starts. It changes nothing.
+2. **Plan.** It splits the change into tasks that each own their files, fixes the seams between them itself
+   (names, arguments, formats), orders what depends on what, and gives each task a check narrow enough to run
+   while the others are half way.
+3. **Implement.** It sends a round of tasks with one `agents` call. Each task names the goal, the files, the
+   seams, what the lead learned that the agent would otherwise look up again, and the check.
+4. **Verify.** It reads the whole diff against the plan and runs the whole build and tests itself. What fails
+   goes back to the agent that wrote it, under its name, with the failing output; then it verifies again.
+
+The procedure is a skill, `rpi`, built into hx (`lua/skills/rpi/SKILL.md`). `--rpi` puts its text into the lead's
+system prompt, so it holds for every message of the session, is cached with the prompt and outlasts a compaction;
+the agents' prompt does not carry it. Without the flag the skill is listed like any other, and a session on any
+model follows it when asked: `hx "use the rpi skill to ..."`. A project's own `.hx/skills/rpi/SKILL.md` takes its
+place in both cases, so a project can say how its own work is to be split and checked.
+
+`--rpi` is one case of a **workflow**: a skill that leads the whole session rather than one the model picks.
+`M.workflow` names it (`host.workflow`, which is `"rpi"` with the flag), and a project's `.hx/loop.luau` can set
+it to any skill, to start every session there under that skill. A workflow whose skill is missing stops hx
+rather than running without it.
 
 ## The judge
 
@@ -476,14 +568,20 @@ from its code:
 Scripts in a skill run through `bash`, inside the wall like any other command. A skill in the project can be
 written by the model, and a skill in a repository you cloned is text from whoever wrote it, like its README.
 
-### Built in: hx
+### Built in: hx and rpi
 
-One skill comes with hx, `hx`, on using and extending hx itself: starting it from a shell, scripts with `--run`,
-the judge, and what to make for which need, from an extension or a skill to a function or a sub-agent in
-`.hx/loop.luau` to a change in hx's source. Every session's prompt lists it, marked `(built in)`, and the prompt's
-paragraph on extending hx points to it, because a model that is not pointed there takes that paragraph for all
-there is to know and loads nothing. Built-in skills come after every skill directory, so a project's own skill
-named `hx` takes its place. Having no directory, a built-in skill is one text with no files beside it.
+Two skills come with hx, and every session's prompt lists them, marked `(built in)`. Built-in skills come after
+every skill directory, so a project's own skill of the same name takes the place of one. Having no directory, a
+built-in skill is one text with no files beside it.
+
+`rpi` is the workflow `hx --rpi` leads by (see "Agents"). Its text is `lua/skills/rpi/SKILL.md`, and every
+`lua/skills/NAME/SKILL.md` is built in under its name: that directory is for skills meant for the model hx runs
+and for nobody else.
+
+`hx` is on using and extending hx itself: starting it from a shell, scripts with `--run`, the judge, agents and
+the rpi workflow, and what to make for which need, from an extension or a skill to a function or a sub-agent in
+`.hx/loop.luau` to a change in hx's source. The prompt's paragraph on extending hx points to it, because a model
+that is not pointed there takes that paragraph for all there is to know and loads nothing.
 
 Its text is `.claude/skills/hx/SKILL.md` in this repository, compiled into the binary. Claude Code looks there
 too, so when it works on hx it follows the same file. To give the skill to Claude Code everywhere, so that it can
@@ -523,6 +621,7 @@ Everything Luau can do to the machine:
 | `host.tools` | `true` when hx has a `DEEPSEEK_API_KEY` for `host.tool` |
 | `host.exa` | `true` when hx has an `EXA_API_KEY` for `host.tool("exa")` |
 | `host.judged` | `true` when there is a judge for `host.judge` |
+| `host.workflow` | the skill the session is led by: `"rpi"` with `--rpi`, otherwise `nil` |
 | `host.extensions` | the built-in extensions' sources, by name |
 | `host.skills` | the built-in skills' `SKILL.md` texts, by name |
 | `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | |
@@ -559,6 +658,7 @@ Two rules hold across all of them:
 | `lua/judge.luau` | the judge, which `--judge` runs in a process of its own |
 | `lua/ext/*.luau` | the built-in extensions, one per file; each file in `lua/ext/` is built in under its name |
 | `.claude/skills/hx/SKILL.md` | the built-in skill `hx`, which is also this repository's own skill for hx and for Claude Code |
+| `lua/skills/*/SKILL.md` | the other built-in skills, one directory each, for the model hx runs alone: `rpi` |
 
 Development build, with AddressSanitizer, UBSan and warnings as errors:
 
@@ -579,9 +679,11 @@ installed, `ctest` runs it over every Luau file as the test `analyze`, and anyth
 
 `tests/live_test.py` runs the agent against the real endpoint: making and editing files, reading a line range,
 noticing a failed command, following a long output to its file, compacting a Vietnamese conversation into English
-checkpoints that keep a fact, giving up a status polled between sleeps, reporting when out of replies, and
-following a skill: one listed in the prompt, one listed by name only, one found by searching, and one in the home
-directory that only `--ro` makes reachable. It costs tokens, so ctest
+checkpoints that keep a fact, giving up a status polled between sleeps, reporting when out of replies,
+following a skill (one listed in the prompt, one listed by name only, one found by searching, and one in the home
+directory that only `--ro` makes reachable), and leading agents: two at work side by side, with a task sent back
+to the one that did the work, and, on a Claude model only, `--rpi` planning a change that its agents write. It
+costs tokens, so ctest
 leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set, or with `ANTHROPIC_API_KEY` and `HX_MODEL=sonnet`
 (or `opus`, `haiku`).
 
@@ -600,6 +702,8 @@ leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set
   still comes out right. More effort does not help it: at `HX_EFFORT=high` two runs passed 13. Anthropic places
   Haiku for high-volume and sub-agent work, and that is where it fits here: under a Sonnet or Opus session, not
   as the session's own model.
+- Agents share one project directory. Nothing keeps two of them from writing the same file or from building in
+  the same directory at once but the lead's plan; there is no worktree or copy per agent.
 - No streaming: a reply appears when it is complete.
 - Tool calls in one reply run one after another.
 - The whole conversation is encoded again for every request. At 5 MB that takes 16 ms.

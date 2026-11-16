@@ -27,11 +27,15 @@ KEY = "sk-test-0123456789"
 
 
 class Model(http.server.ThreadingHTTPServer):
-    """Answers each request with the next scripted reply and records what was asked."""
+    """Answers each request with the next scripted reply and records what was asked.
+
+    Agents ask at the same time, in no fixed order, so a script cannot serve them: `answer`, when set, is given each
+    request and returns the reply for it, or None to leave the request to the script."""
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), Handler)
         self.script = []
+        self.answer = None
         self.requests = []
         self.headers = []
         self.hanging = threading.Event()
@@ -45,9 +49,11 @@ class Model(http.server.ThreadingHTTPServer):
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
-        self.server.requests.append(json.loads(body))
+        request = json.loads(body)
+        self.server.requests.append(request)
         self.server.headers.append({name.lower(): value for name, value in self.headers.items()})
-        status, reply = self.server.script.pop(0) if self.server.script else (500, {"error": "script ran out"})
+        answer = self.server.answer(request) if self.server.answer else None
+        status, reply = answer or (self.server.script.pop(0) if self.server.script else (500, {"error": "script ran out"}))
         if status == "hang":  # hold the request open until the client gives up
             self.server.hanging.set()
             time.sleep(reply)
@@ -175,6 +181,16 @@ def say(words, **kw):
     return reply([text(words)], **kw)
 
 
+def agent_answers(scripts):
+    """A Model's `answer` that serves agents: `scripts` maps the task an agent was first given to its replies in
+    order. A request whose first message is none of those tasks is left to the model's script."""
+    def answer(request):
+        first = request["messages"][0]["content"]
+        replies = scripts.get(first if isinstance(first, str) else first[0].get("text"))
+        return replies[sum(1 for m in request["messages"] if m["role"] == "assistant")] if replies else None
+    return answer
+
+
 def call(name, args, call_id="call_1", stop="tool_use", **kw):
     return reply([use(name, args, call_id)], stop=stop, **kw)
 
@@ -207,10 +223,11 @@ class AgentTest(unittest.TestCase):
         return subprocess.run([HX, *args], cwd=self.project, env=self.env(**env), input=stdin,
                               capture_output=True, text=True, timeout=60)
 
-    def tool_results(self):
-        """The content of every tool result the model was sent, in order, without repeats."""
+    def tool_results(self, requests=None):
+        """The content of every tool result the model was sent, in order, without repeats; or of those in
+        `requests`, where the model's requests are not all one conversation's."""
         seen, out = set(), []
-        for request in self.model.requests:
+        for request in self.model.requests if requests is None else requests:
             for message in request["messages"]:
                 if message["role"] != "user" or isinstance(message["content"], str):
                     continue
@@ -498,6 +515,182 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(lines[2], "nil\tno DEEPSEEK_API_KEY: hx was started without one, so host.llm cannot reach "
                          "the deepseek endpoint")
         self.assertIn("no tool deepseek; the tools are search, fetch, ocr and exa", lines[3])
+
+    # --- agents and the rpi workflow ---
+
+    def agents_model(self, scripts):
+        """A stand-in for the agents' model. `scripts` maps the task an agent was first given to its replies, in
+        order: the request's first message says whose it is, and how many replies it holds says which comes next."""
+        model = Model()
+        self.addCleanup(model.server_close)
+        self.addCleanup(model.shutdown)
+        model.answer = agent_answers(scripts)
+        return model
+
+    def test_agents_work_side_by_side_on_deepseek_and_report_to_the_lead(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        deepseek = self.agents_model({
+            "make a.txt": [call("bash", {"command": "sleep 1; echo a > a.txt; echo made a"}, "a1"), say("a.txt is made")],
+            "make b.txt": [call("bash", {"command": "sleep 1; echo b > b.txt; echo made b"}, "b1"), say("b.txt is made")],
+        })
+        tasks = 'return agents({ { name = "a", task = "make a.txt" }, { name = "b", task = "make b.txt" } })'
+        done = self.run_hx("--model", "opus", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY="ds-key-1",
+                           script=[call("lua", {"code": tasks}, "c1"), say("both are made")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # The lead gets each agent's last words as its report, in the order the agents were named.
+        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\na\.txt is made\n\n"
+                         r"\[agent b: done in \d+ s\]\nb\.txt is made$")
+        self.assertEqual((read(self.project, "a.txt"), read(self.project, "b.txt")), ("a\n", "b\n"))
+        # They worked at the same time: both had asked once before either asked again.
+        self.assertEqual([len(r["messages"]) for r in deepseek.requests], [1, 1, 3, 3])
+        # Each ran on DeepSeek's model through DeepSeek's endpoint, under the session's prompt and the agents'
+        # paragraph, with the functions but agents.
+        for sent, headers in zip(deepseek.requests, deepseek.headers):
+            self.assertEqual(sent["model"], "deepseek-flash")
+            self.assertEqual(headers["x-api-key"], "ds-key-1")
+            self.assertIn("You are a coding agent working in", sent["system"])
+            self.assertIn("You are one of several agents at work in this directory", sent["system"])
+            self.assertIn("- bash(command", sent["tools"][0]["description"])
+            self.assertNotIn("agents(tasks)", sent["tools"][0]["description"])
+        self.assertEqual(deepseek.requests[0]["system"], deepseek.requests[1]["system"])
+        lead = self.model.requests[0]
+        self.assertIn("- agents(tasks) -> text", lead["tools"][0]["description"])
+        self.assertNotIn("one of several agents", lead["system"][0]["text"])
+        # Only the lead's words are the answer. The agents' are progress lines, under their names.
+        self.assertEqual(done.stdout, "both are made\n")
+        for line in ("  agent a: make a.txt", "[a] bash sleep 1; echo a > a.txt; echo made a", "[a] a.txt is made",
+                     "[b] b.txt is made"):
+            self.assertIn(line + "\n", done.stderr)
+        # Their tokens are counted with the session's, by model.
+        self.assertIn("[claude-opus-5-5: 2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]\n"
+                      "[deepseek-flash: 4 replies, 40 tokens in (0 read from cache, 0 written to it), 20 out]",
+                      done.stderr)
+        # And each one's conversation has a log beside the session's.
+        logs = sorted(os.listdir(os.path.join(self.project, ".hx", "log")))
+        self.assertEqual([name.split("-", 3)[3] for name in logs if "-sub-" in name], ["sub-1.json", "sub-2.json"])
+        first = json.loads(read(self.project, ".hx", "log", next(name for name in logs if "-sub-1" in name)))
+        self.assertEqual(first["messages"][0], {"role": "user", "content": "make a.txt"})
+        self.assertEqual(first["messages"][-1]["content"], [text("a.txt is made")])
+
+    def test_work_sent_back_goes_to_the_agent_that_did_it(self):
+        # With no DeepSeek key the agents run on the session's model, through the session's endpoint.
+        self.model.answer = agent_answers({"make a.txt": [say("made it"), say("now it is right")]})
+        done = self.run_hx("go", script=[
+            call("lua", {"code": 'return agents({ { name = "a", task = "make a.txt" } })'}, "c1"),
+            call("lua", {"code": 'return agents({ { name = "a", task = "it is empty: fill it" } })'}, "c2"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        first, second = self.tool_results()
+        self.assertRegex(first, r"^\[agent a: done in \d+ s\]\nmade it$")
+        self.assertRegex(second, r"^\[agent a: done in \d+ s\]\nnow it is right$")
+        # The second task went on in the first one's conversation.
+        asked = [r for r in self.model.requests if "one of several agents" in r["system"]]
+        self.assertEqual([r["model"] for r in asked], ["deepseek-flash"] * 2)
+        self.assertEqual(asked[1]["messages"], [
+            {"role": "user", "content": "make a.txt"},
+            {"role": "assistant", "content": [text("made it")]},
+            {"role": "user", "content": "it is empty: fill it"}])
+        self.assertIn("[5 replies, 50 tokens in", done.stderr)  # one model, one line: the lead's three and the agent's two
+
+    def test_a_lead_that_answers_while_its_agents_work_is_told_to_wait(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write('local M = host.load(host.default_loop, "=loop")()\nM.agent_wait = 0.3\nreturn M\n')
+        self.model.answer = agent_answers({
+            "make late.txt": [call("bash", {"command": "sleep 2; echo late > late.txt"}, "a1"), say("late.txt is made")]})
+        done = self.run_hx("go", script=[
+            call("lua", {"code": 'return agents({ { name = "slow", task = "make late.txt" } })'}, "c1"),
+            say("All done."),
+            call("lua", {"code": "host.sleep(3) return agents()"}, "c2"),
+            say("Now it is.")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # The call returns when its wait is over, and says who is still at work and how to wait.
+        lead = [r for r in self.model.requests if "one of several agents" not in r["system"]]
+        still, report = self.tool_results(lead)
+        self.assertRegex(still, r"^\[agent slow: still at work, \d+ s so far\]\n\n"
+                         r"agents\(\) with no tasks waits for the agents still at work\.$")
+        # An answer now would end the session and the agent with it, half way: the lead is told, once.
+        self.assertEqual(lead[2]["messages"][-1], {"role": "user", "content":
+                         "Your agents are still at work: slow. What they are doing ends half done when this session "
+                         "does. Wait for their reports with agents(), check the work, then finish. If you mean to "
+                         "stop without them, say so in your answer."})
+        self.assertRegex(report, r"^\[agent slow: done in \d+ s\]\nlate\.txt is made$")
+        self.assertEqual(read(self.project, "late.txt"), "late\n")
+        self.assertEqual(done.stdout, "All done.\nNow it is.\n")
+        # Told once, a lead that answers again is taken at its word, and the session's end ends the agent.
+        self.model.requests.clear()
+        self.model.answer = agent_answers({
+            "wait": [call("bash", {"command": "echo $$ > agent.pid; sleep 300"}, "a1"), say("never")]})
+        done = self.run_hx("go", script=[
+            call("lua", {"code": 'local told = agents({ { name = "slow", task = "wait" } })\n'
+                                 'while not host.read("agent.pid") do host.sleep(0.05) end\nreturn told'}, "c1"),
+            say("Stopping."), say("Stopping without it.")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "Stopping.\nStopping without it.\n")
+        self.assert_gone(int(read(self.project, "agent.pid")))
+
+    def test_a_stop_ends_the_agents_and_what_they_run(self):
+        self.model.answer = agent_answers({
+            "wait": [call("bash", {"command": "echo $$ > agent.pid; sleep 300"}, "a1"), say("never")]})
+        self.model.script = [call("lua", {"code": 'return agents({ { name = "a", task = "wait" } })'}, "c1"), say("never")]
+        process = subprocess.Popen([HX, "go"], cwd=self.project, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pid = self.wait_for_pid_file("agent.pid")
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 130)
+        self.assert_gone(pid)
+
+    def test_rpi_leads_on_opus_by_the_rpi_skill(self):
+        # HX_MODEL says what a session's one model is; --rpi names the lead of a workflow, and that is Opus.
+        done = self.run_hx("--rpi", "go", HX_MODEL="deepseek-flash", script=[say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        sent = self.model.requests[0]
+        self.assertEqual(sent["model"], "claude-opus-5-5")
+        system = sent["system"][0]["text"]
+        self.assertIn("This session follows the rpi workflow, whatever the task", system)
+        body = read(REPO, "lua", "skills", "rpi", "SKILL.md").split("---\n", 2)[2].strip()
+        self.assertTrue(system.endswith("[skill rpi, built into hx. Every path in it is the project's.]\n\n" + body))
+        self.assertIn("  skill rpi\n", done.stderr)
+        # --model names another lead.
+        done = self.run_hx("--model", "sonnet", "--rpi", "go", script=[say("ok")])
+        self.assertEqual(self.model.requests[1]["model"], "claude-sonnet-5-5")
+        self.assertIn("follows the rpi workflow", self.model.requests[1]["system"][0]["text"])
+        # Without --rpi the skill is one of those the prompt lists, for the model to load when asked.
+        done = self.run_hx("go", script=[call("lua", {"code": "return skill('rpi')"}, "c1"), say("ok")])
+        self.assertNotIn("follows the rpi workflow", self.model.requests[2]["system"])
+        self.assertIn("\n- rpi (built in): The rpi workflow (research, plan, implement).", self.model.requests[2]["system"])
+        self.assertEqual(self.tool_results()[0], "[skill rpi, built into hx. Every path in it is the project's.]\n\n" + body)
+        # --rpi is for a task.
+        for args in (["--rpi", "--run", "s.luau"], ["--rpi", "--init"], ["--init", "--rpi"]):
+            done = self.run_hx(*args)
+            self.assertEqual(done.returncode, 2, done.stderr)
+            self.assertIn("--rpi leads the agent on a task", done.stderr)
+        done = self.run_hx("--rpi=opus", "go")
+        self.assertEqual((done.returncode, done.stderr), (2, "hx: --rpi takes no value\n"))
+
+    def test_the_rpi_lead_s_agents_do_not_get_the_workflow_and_a_project_s_own_takes_its_place(self):
+        os.makedirs(os.path.join(self.project, ".hx", "skills", "rpi"))
+        with open(os.path.join(self.project, ".hx", "skills", "rpi", "SKILL.md"), "w") as f:
+            f.write("---\nname: rpi\ndescription: This project's way.\n---\nPlan twice.\n")
+        deepseek = self.agents_model({"do it": [say("did it")]})
+        done = self.run_hx("--rpi", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY="ds-key-1", script=[
+            call("lua", {"code": 'return agents({ { name = "a", task = "do it" } })'}, "c1"), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        system = self.model.requests[0]["system"][0]["text"]
+        self.assertTrue(system.endswith("Plan twice."), system[-200:])
+        self.assertNotIn("# rpi: research, plan, implement", system)
+        self.assertEqual(self.model.requests[1]["system"], self.model.requests[0]["system"])
+        # The workflow is the lead's: an agent has the session's prompt without it.
+        agent = deepseek.requests[0]["system"]
+        self.assertNotIn("follows the rpi workflow", agent)
+        self.assertNotIn("Plan twice.", agent)
+        self.assertIn("- rpi: This project's way.", agent)
+        # A workflow whose skill is gone is an error, not a session without it.
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write('local M = host.load(host.default_loop, "=loop")()\nM.workflow = "review"\nreturn M\n')
+        done = self.run_hx("go")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("hx: the workflow review needs a skill of that name, and there is none", done.stderr)
 
     def test_the_model_follows_the_key_that_is_set(self):
         show = ["--run", "-"]
@@ -1528,7 +1721,7 @@ class AgentTest(unittest.TestCase):
             f.write("---\nname: hx\ndescription: This project's own.\n---\nOurs.\n")
         self.run_hx("again", script=[call("lua", {"code": "return skill('hx')"}, "c2"), say("ok")])
         self.assertIn("\n- hx: This project's own.", self.model.requests[-2]["system"])
-        self.assertNotIn("(built in)", self.model.requests[-2]["system"])
+        self.assertNotIn("hx (built in)", self.model.requests[-2]["system"])
         self.assertEqual(self.tool_results()[1], "[skill hx, in .hx/skills/hx/. A path in it that names one of the skill's "
                          "own files is relative to that directory; everything else is the project's.]\n\nOurs.")
 

@@ -42,6 +42,7 @@ class LiveTest(unittest.TestCase):
         key_env = os.environ.get("HX_KEY_ENV", "ANTHROPIC_API_KEY" if claude else "DEEPSEEK_API_KEY")
         if not os.environ.get(key_env):
             self.skipTest(f"no {key_env}")
+        self.claude = claude
         self.project = tempfile.mkdtemp(prefix="hx-live-")
         os.makedirs(os.path.join(self.project, ".hx"))
 
@@ -263,6 +264,71 @@ class LiveTest(unittest.TestCase):
         self.run_hx("sign off the work", args=("--ro", skills), HOME=home)
         self.assertIn("skill(", "\n".join(self.code()))
         self.assertEqual(self.read("signoff.txt").strip(), "SIGNED")
+
+    def agent_logs(self):
+        """The conversation of each agent of the last run, in the order the agents were first given a task."""
+        paths = sorted(glob.glob(os.path.join(self.project, ".hx", "log", "*-sub-*.json")))
+        return [json.loads(self.read(path)) for path in paths]
+
+    def test_agents_work_side_by_side_and_work_sent_back_stays_with_its_agent(self):
+        answer = self.run_hx("Use the agents function for this, and write no file yourself. In one call, give two "
+                             "agents a task each: the agent named north writes the single word north to north.txt, "
+                             "and the agent named south writes the single word south to south.txt. When both have "
+                             "reported, send north one more task: to add a second line, pole, to its file. Then "
+                             "tell me what the two files hold.")
+        self.assertEqual(self.read("north.txt").split(), ["north", "pole"])
+        self.assertEqual(self.read("south.txt").split(), ["south"])
+        self.assertIn("pole", answer)
+        # Two agents, not three: the task sent back went on in north's conversation, behind its first one.
+        north, south = self.agent_logs()
+        tasks = [m["content"] for m in north["messages"] if m["role"] == "user" and isinstance(m["content"], str)]
+        self.assertEqual(len(tasks), 2, tasks)
+        self.assertIn("one of several agents", north["system"])
+        self.assertIn("agents(", self.all_code())
+
+    def test_rpi_plans_and_its_agents_implement(self):
+        # --rpi leads with Opus whatever HX_MODEL says, so this runs with Claude's key only. Its agents are
+        # deepseek-flash's when DeepSeek's key is set too, and Opus's own otherwise.
+        if not self.claude:
+            self.skipTest("--rpi leads with a Claude model")
+        self.write("temperature.py", "def c_to_f(c):\n    return c * 9 / 5 + 32\n")
+        self.write("distance.py", "def km_to_miles(km):\n    return km * 0.621371\n")
+        self.write("test_temperature.py", "import unittest\n\nfrom temperature import c_to_f\n\n\n"
+                   "class TemperatureTest(unittest.TestCase):\n    def test_c_to_f(self):\n"
+                   "        self.assertEqual(c_to_f(100), 212)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n")
+        self.write("test_distance.py", "import unittest\n\nfrom distance import km_to_miles\n\n\n"
+                   "class DistanceTest(unittest.TestCase):\n    def test_km_to_miles(self):\n"
+                   "        self.assertAlmostEqual(km_to_miles(10), 6.21371)\n\n\nif __name__ == \"__main__\":\n"
+                   "    unittest.main()\n")
+        # More than a line or two in one file, which the skill leaves to the lead: enough to be worth a task.
+        self.run_hx("Each module converts one way only. Add the way back to each, f_to_c in temperature.py and "
+                    "miles_to_km in distance.py. Make all four functions raise TypeError for a value that is not "
+                    "a number, where True and False do not count as numbers. Test every new behaviour in the "
+                    "module's own test file.", args=("--rpi",))
+        check = subprocess.run([sys.executable, "-c", "from temperature import f_to_c; from distance import miles_to_km\n"
+                                "assert abs(f_to_c(212) - 100) < 1e-3 and abs(miles_to_km(6.21371) - 10) < 1e-3\n"
+                                "for convert in (f_to_c, miles_to_km):\n"
+                                "    for bad in ('1', True, None):\n"
+                                "        try:\n            convert(bad)\n"
+                                "        except TypeError:\n            continue\n"
+                                "        raise SystemExit(f'{convert.__name__}({bad!r}) raised no TypeError')\n"],
+                               cwd=self.project, capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        tests = subprocess.run([sys.executable, "-m", "unittest", "discover", "-p", "test_*.py"], cwd=self.project,
+                               capture_output=True, text=True)
+        self.assertEqual(tests.returncode, 0, tests.stderr)
+        self.assertGreaterEqual(int(tests.stderr.split("Ran ")[1].split()[0]), 4, tests.stderr)
+        # The lead had the workflow in its prompt, and its agents, which did the writing, did not.
+        self.assertIn("This session follows the rpi workflow", self.log["system"])
+        agents = self.agent_logs()
+        self.assertGreaterEqual(len(agents), 1)
+        for agent in agents:
+            self.assertNotIn("follows the rpi workflow", agent["system"])
+        self.assertIn("agents(", self.all_code())
+        written = "\n".join(block["input"].get("code", "") for agent in agents for message in agent["messages"]
+                            if message["role"] == "assistant" for block in message["content"]
+                            if block["type"] == "tool_use")
+        self.assertRegex(written, r"\b(write|edit)\(", "no agent wrote anything")
 
     def test_running_out_of_replies_ends_with_a_report(self):
         self.overlay("M.max_replies = 2")

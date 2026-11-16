@@ -26,6 +26,12 @@
 --   host.extensions                                   the built-in extensions' sources, by name
 --   host.skills                                       the built-in skills' SKILL.md texts, by name
 --   host.judge(line?) -> {lines}, pending, host.judged     the judge's channel, with --judge KIT
+--   host.spawn(fn, ...) -> id                         forks hx: the child runs fn(...) in a copy of this VM, behind
+--                                                     the same wall, while this process goes on
+--   host.wait(seconds?) -> id, ok, text | nil, running    the first child that has ended, with the string its
+--                                                     function returned or the error it raised; or nil when none
+--                                                     ends in time, and how many are still running
+--   host.workflow                                     the skill the session is led by: "rpi" with --rpi, else nil
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
 -- host.timed returns; a plain pcall cannot swallow them.
@@ -108,6 +114,7 @@ local live: {
 	wrappers: { [Function]: (...any) -> ...any },
 	repeats: Repeats,
 	printed: { string }?,
+	agent: { name: string, run: number }?,
 } = {
 	-- For the whole run, from when the module loads:
 	-- Tokens, for the lines at the end: by model, in the order each first replied. A sub-agent may run on
@@ -123,14 +130,23 @@ local live: {
 	repeats = { counts = {}, worst = nil },
 	-- For one `lua` call, set by the tool: the lines it printed. nil outside any call.
 	printed = nil,
+	-- In the process of an agent at work (see Agents), for as long as it lives: its name, and which of its runs
+	-- this is. nil in the session's own process.
+	agent = nil,
 }
 -- A function a project takes out of M.functions takes its wrapper with it.
 setmetatable(live.wrappers, { __mode = "k" })
 
 -- A progress line on stderr: what the loop is doing, left out with --quiet. Warnings and errors use host.log.
 -- Its text is made printable here, once: it carries file names, skill names and server replies, none of them hx's.
+-- Each line of an agent's starts with its name, since several agents write them at once.
 local function progress(text: string)
 	if not host.quiet then
+		local agent = live.agent
+		if agent then
+			local head = ("[%s] "):format(agent.name)
+			text = head .. text:gsub("^%s+", ""):gsub("\n", "\n" .. head)
+		end
 		host.log(M.printable(text))
 	end
 end
@@ -139,14 +155,17 @@ end
 -- the model is sent is clipped, once; the functions return everything, so code can work on all of it. host.clip
 -- cuts it, as host.sh cuts a command's output, at a line where one is near and never inside a character. The whole
 -- text goes to a file in $TMPDIR (hx makes one for every run, inside the wall), so what was left out can still be
--- read or searched.
+-- read or searched. Agents share that directory and count their files from where the session's count stood, so
+-- an agent's file also carries its name and its run.
 local function clip(text: string): string
 	local head: string, tail: string? = host.clip(text, M.output_limit)
 	if tail == nil then
 		return text
 	end
 	live.spills += 1
-	local path = ("%s/hx-output-%d.txt"):format(host.env("TMPDIR"), live.spills)
+	local agent = live.agent
+	local path = ("%s/hx-output-%s%d.txt"):format(host.env("TMPDIR"),
+		if agent then ("%s-%d-"):format(agent.name, agent.run) else "", live.spills)
 	local where: string = host.write(path, text) and "; the whole output is in " .. path or ""
 	return head .. (head:sub(-1) == "\n" and "" or "\n")
 		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail
@@ -1797,24 +1816,43 @@ function M.repeat_reminder(call: string, count: number, first: boolean): string
 end
 
 -- Prints the text of a reply: the model's words are the answer, on stdout. A model asked for progress updates
--- (M.claude's display) writes its notes between tool calls into thinking blocks; those are progress lines.
+-- (M.claude's display) writes its notes between tool calls into thinking blocks; those are progress lines. So are
+-- an agent's words: they are for the lead, which gets the last of them as the agent's report, and stdout is the
+-- session's answer alone.
 local function show_text(reply: Reply)
 	local _, features = claude_model()
 	local updates = features and features.display == "updates"
 	for _, block in reply.content do
 		if block.type == "text" and block.text ~= "" then
 			local text = block.text :: string -- a text block has its text
-			print(host.tty and M.printable(text) or text)
+			if live.agent then
+				progress(text)
+			else
+				print(host.tty and M.printable(text) or text)
+			end
 		elseif updates and block.type == "thinking" and type(block.thinking) == "string" and block.thinking ~= "" then
 			progress("  " .. M.printable(block.thinking))
 		end
 	end
 end
 
+-- The names of the agents at work or waiting to start, for the session's own turn to ask; defined with the agents,
+-- further down.
+local at_work: () -> { string }
+
+-- What the lead is told when it answers while agents are still at work: its answer would end the session, and
+-- the session's end kills them where they are.
+function M.agents_reminder(names: { string }): string
+	return ("Your agents are still at work: %s. What they are doing ends half done when this session does. Wait for "
+		.. "their reports with agents(), check the work, then finish. If you mean to stop without them, say so in "
+		.. "your answer."):format(table.concat(names, ", "))
+end
+
 -- The body of M.turn, which gives it a count of repeats of its own. Returns the reply that ended the turn, which
 -- M.turn does not pass on: it is there so that the type of pcall(turn, ...) has a second value, the error.
 local function turn(system: string, talk: Conversation): Reply
 	local reminded = 0 -- the highest count already reminded of
+	local waited = false -- the lead was told once in this turn that its agents are still at work
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
 		local cut_off = reply.stop_reason == "max_tokens"
@@ -1850,7 +1888,14 @@ local function turn(system: string, talk: Conversation): Reply
 				local category = type(details.category) == "string" and " (" .. details.category .. ")" or ""
 				host.log("[the model declined to answer" .. category .. "]")
 			end
-			return reply
+			-- The session's own turn, not a sub-agent's inside it, and not an agent's, whose copy of the list
+			-- names itself: told once, the lead either waits or answers again, and that answer stands.
+			local busy = if live.turns == 1 and not live.agent and not waited then at_work() else {}
+			if #busy == 0 then
+				return reply
+			end
+			waited = true
+			talk:say(M.agents_reminder(busy))
 		end
 	end
 	-- Out of replies. The model gets one more, to say where the work stands, rather than none.
@@ -1920,6 +1965,322 @@ function M.turn(system: string, talk: Conversation)
 	end
 end
 
+-- Agents ----------------------------------------------------------------------------------------------------
+--
+-- An agent is a model with a conversation of its own, given tasks by the session's model, the lead, through the
+-- agents function. Several work at the same time. Each run of an agent is a process of its own: a fork of hx as it
+-- is when the task is sent (host.spawn), behind the same wall, in the same directory, with the same functions. The
+-- child runs one turn on M.agent_model and sends back the conversation as it then stands. The lead's process keeps
+-- it, so a later task for the same agent forks again with that conversation: an agent that gets its work sent back
+-- still knows what it did. The lead's own conversation holds tasks and reports, and none of the agents' steps.
+--
+-- What a child changes in the VM is its own: globals, extensions it loaded. Files are shared, which is why agents
+-- at work together must not write the same ones; the lead is told so. An agent has no agents of its own and no
+-- judge to submit to, and what its commands leave running ends with its run.
+
+M.agent_model = nil :: string? -- nil: deepseek-flash when hx has a DeepSeek key, the session's model otherwise
+M.agent_limit = 8 -- agents at work at once; more wait their turn
+-- Seconds the agents function waits for reports before it returns with those it has. The lead's next request then
+-- comes inside the five minutes that Claude keeps its prompt cache; a wait of ten would pay for the whole
+-- conversation again. It is also well inside M.call_seconds, the limit of the `lua` call the function runs in.
+M.agent_wait = 270
+M.agent_seconds = 1800 -- time limit of one run of an agent
+-- What an agent's system prompt says after the session's own.
+M.agent_prompt = "You are one of several agents at work in this directory at the same time, each on a task from "
+	.. "the lead agent. The lead reads your last message as your report, checks your work, and sends it back "
+	.. "to you if something is wrong. The other agents are changing other files right now. Change only what your "
+	.. "task gives you, and leave git's index, branches and stash as they are: no commit, checkout, reset or "
+	.. "stash. Check your own work as the task says; where it does not say, check narrowly, your own files and "
+	.. "tests, since a whole build or test run may trip over what the others have half written. If the task "
+	.. "cannot be done as given, or needs a change outside it, stop and say so in your report rather than work "
+	.. "around it. Finish with the report: what you changed, file by file, what you ran to check it and what "
+	.. "that showed, and what is left."
+
+type Agent = {
+	name: string,
+	talk: Conversation,
+	state: "idle" | "waiting" | "working",
+	task: string, -- what it was last sent
+	runs: number, -- how many tasks it has been sent
+	id: number?, -- host.spawn's, while it works
+	started: number, -- os.clock() when it began to work
+	report: string?, -- what it sent back, until the lead has been given it
+}
+-- Every agent of this session, in the order each was first given a task, and those waiting for one of
+-- M.agent_limit places. `system` is the agents' system prompt, built at the first task, once, so that every agent
+-- and every run reads the same cached prompt.
+local fleet: { agents: { Agent }, waiting: { Agent }, system: string? } = { agents = {}, waiting = {}, system = nil }
+
+function at_work(): { string }
+	local names = {}
+	for _, agent in fleet.agents do
+		if agent.state ~= "idle" then
+			table.insert(names, agent.name)
+		end
+	end
+	return names
+end
+
+local function agent_model(): string
+	return M.agent_model or (if host.tools then "deepseek-flash" else M.model)
+end
+
+-- The agent of that name, made at its first task.
+local function agent_named(name: string): Agent
+	for _, agent in fleet.agents do
+		if agent.name == name then
+			return agent
+		end
+	end
+	local agent: Agent = {
+		name = name,
+		talk = Conversation.new(),
+		state = "idle",
+		task = "",
+		runs = 0,
+		id = nil,
+		started = 0,
+		report = nil,
+	}
+	-- Its log gets its name here, in the lead's process, where the count of sub-agents is one count.
+	sub_log(agent.talk)
+	table.insert(fleet.agents, agent)
+	return agent
+end
+
+-- One run of an agent, in its child process: one turn on the agents' model with the task as the next message, and
+-- then the conversation, the tokens it took and how it ended, as JSON, for the lead's process to keep. A turn that
+-- failed is a result too: the agent may have changed files, and the lead should hear how far it got. A stop is
+-- not: it raises through here, and the lead's copy of the conversation stays as it was before the task.
+local function work(agent: Agent, system: string): string
+	local began = os.clock()
+	live.agent = { name = agent.name, run = agent.runs }
+	live.usage = {} -- this run's tokens alone: the lead's process adds them to the session's
+	for i = #M.functions, 1, -1 do
+		local name = M.functions[i].name
+		if name == "agents" or name == "submit" then
+			table.remove(M.functions, i)
+		end
+	end
+	M.model = agent_model()
+	agent.talk:say(agent.task)
+	local ok, err = host.timed(M.agent_seconds, M.turn, system, agent.talk)
+	if not ok then
+		agent.talk:abandon("the turn ended: " .. tostring(err))
+	end
+	return json.encode({
+		messages = agent.talk.messages,
+		usage = live.usage,
+		seconds = os.clock() - began,
+		error = if ok then nil else tostring(err),
+	})
+end
+
+local function start(agent: Agent)
+	-- Under --judge the session's prompt says how judging works and to submit; an agent has no submit.
+	local system = fleet.system or (M.system_prompt() .. "\n\n" .. M.agent_prompt
+		.. (if host.judged then " The judge is the lead's to submit to, not yours: you submit nothing." else ""))
+	fleet.system = system
+	agent.id = host.spawn(work, agent, system)
+	agent.state = "working"
+	agent.started = os.clock()
+	progress(("  agent %s: %s"):format(agent.name, headline(agent.task)))
+end
+
+-- Takes in what an agent's run sent back, or that it sent nothing, and writes the report the lead will read: a
+-- line that says how the run ended, then the agent's last words.
+local function finish(agent: Agent, returned: boolean, text: string)
+	agent.state, agent.id = "idle", nil
+	local done: { messages: { Message }, usage: { Count }, seconds: number, error: string? }? = nil
+	if returned then
+		local decoded: any = json.decode(text)
+		if type(decoded) == "table" and type(decoded.messages) == "table" then
+			done = decoded
+		end
+	end
+	if not done then
+		agent.report = ("[agent %s: stopped after %.0f s (%s). It has the conversation it had before this task, "
+			.. "and may have changed files.]"):format(agent.name, os.clock() - agent.started,
+			if returned then "its result could not be read" else text)
+		return
+	end
+	agent.talk.messages = done.messages
+	for _, count in done.usage do
+		local mine = count_of(count.model)
+		mine.replies += count.replies
+		mine.input += count.input
+		mine.cached += count.cached
+		mine.written += count.written
+		mine.output += count.output
+	end
+	local last, words = done.messages[#done.messages], {}
+	if last and last.role == "assistant" and type(last.content) == "table" then
+		for _, block in last.content do
+			if block.type == "text" and block.text ~= "" then
+				table.insert(words, block.text :: string)
+			end
+		end
+	end
+	local how, failure = ("done in %.0f s"):format(done.seconds), done.error
+	if failure == "timeout" then
+		how = ("stopped at the %.0f s one run may take"):format(M.agent_seconds)
+	elseif failure then
+		how = ("failed after %.0f s: %s"):format(done.seconds, failure)
+	end
+	agent.report = ("[agent %s: %s]\n%s"):format(agent.name, how,
+		if #words > 0 then table.concat(words, "\n") else "(it said nothing)")
+end
+
+-- The tasks of one agents call as {name, task} pairs, checked: nothing is sent when one of them is wrong.
+local function checked_tasks(tasks: any): { { name: string, task: string } }
+	check("agents", tasks, 1, "tasks", "table", true)
+	if not tasks then
+		return {}
+	end
+	if type(tasks.name) == "string" and type(tasks.task) == "string" then
+		tasks = { tasks } -- one task, not in a list
+	elseif #tasks == 0 and next(tasks) ~= nil then
+		error('agents: tasks is a list, as in agents({ { name = "parser", task = "..." } })', 0)
+	end
+	local sends, seen = {}, {}
+	for i, item in ipairs(tasks) do
+		if type(item) ~= "table" or type(item.name) ~= "string" or type(item.task) ~= "string" then
+			error(('agents: task %d must be a table { name = "...", task = "..." }'):format(i), 0)
+		end
+		local name: string, task: string = item.name, item.task
+		if not name:match("^[%w_%-]+$") or #name > 40 then
+			error(("agents: task %d: a name is up to 40 letters, digits, _ and -, not %q"):format(i, name), 0)
+		end
+		if task:match("^%s*$") then
+			error(("agents: the task for %s is empty"):format(name), 0)
+		end
+		if seen[name] then
+			error(("agents: %s is given two tasks in one call; an agent takes one at a time"):format(name), 0)
+		end
+		seen[name] = true
+		for _, agent in fleet.agents do
+			if agent.name == name and agent.state ~= "idle" then
+				error(("agents: %s is still at work on its last task. Wait for its report, with agents() and no "
+					.. "tasks, before you send it more."):format(name), 0)
+			end
+		end
+		table.insert(sends, { name = name, task = task })
+	end
+	return sends
+end
+
+table.insert(M.functions, {
+	name = "agents",
+	usage = "agents(tasks) -> text: gives each task to an agent and returns the agents' reports. An agent is a "
+		.. "model with a conversation of its own, at work in this directory with these functions; all of them work "
+		.. 'at the same time. tasks is a list of { name = "...", task = "..." }. An agent knows nothing of your '
+		.. "conversation: its task has to say all it needs, the files to change, what to leave alone and how to "
+		.. "check the work. Agents at work together must not write the same files. A task for a name that already "
+		.. "has an agent goes to that agent as your next message to it, with all it did still in its "
+		.. "conversation: that is how work goes back to be fixed. The call returns after a few minutes at most, "
+		.. "with the reports so far and the names of the agents still at work; agents() with no tasks waits for "
+		.. "those.",
+	run = function(tasks: any): string
+		if live.agent then
+			error("agents: an agent has no agents of its own", 0)
+		end
+		for _, send in checked_tasks(tasks) do
+			local agent = agent_named(send.name)
+			agent.task, agent.state, agent.report = send.task, "waiting", nil
+			agent.runs += 1
+			table.insert(fleet.waiting, agent)
+		end
+
+		local function take_in(id: number, returned: boolean, text: string)
+			for _, agent in fleet.agents do
+				if agent.id == id then
+					finish(agent, returned, text)
+				end
+			end
+		end
+		local until_time = os.clock() + M.agent_wait
+		while true do
+			-- Those that have ended, some of them perhaps since an earlier call; then the places they left go to
+			-- those waiting.
+			while true do
+				local id: number?, returned: boolean, text: string = host.wait(0)
+				if not id then
+					break
+				end
+				take_in(id, returned, text)
+			end
+			local working = #at_work() - #fleet.waiting
+			while #fleet.waiting > 0 and working < math.max(M.agent_limit, 1) do
+				start(table.remove(fleet.waiting, 1) :: Agent)
+				working += 1
+			end
+			local left = until_time - os.clock()
+			if working == 0 or left <= 0 then
+				break
+			end
+			local id: number?, returned: boolean, text: string = host.wait(left)
+			if not id then
+				break -- the wait is over, or the limit of this `lua` call is near
+			end
+			take_in(id, returned, text)
+		end
+
+		local lines: { string } = {}
+		local busy = 0
+		for _, agent in fleet.agents do
+			if agent.report then
+				table.insert(lines, agent.report)
+				agent.report = nil
+			elseif agent.state == "working" then
+				busy += 1
+				table.insert(lines, ("[agent %s: still at work, %.0f s so far]"):format(agent.name, os.clock() - agent.started))
+			elseif agent.state == "waiting" then
+				busy += 1
+				table.insert(lines, ("[agent %s: waiting for one of the %d places at work]"):format(agent.name,
+					math.max(M.agent_limit, 1)))
+			end
+		end
+		if busy > 0 then
+			table.insert(lines, "agents() with no tasks waits for the agents still at work.")
+		elseif #lines == 0 then
+			local names = {}
+			for _, agent in fleet.agents do
+				table.insert(names, agent.name)
+			end
+			return if #names > 0
+				then "No agent is at work, and you have every report. Your agents so far: " .. table.concat(names, ", ") .. "."
+				else "You have no agents yet: give agents a list of tasks."
+		end
+		return table.concat(lines, "\n\n")
+	end,
+})
+
+-- Workflows -------------------------------------------------------------------------------------------------
+--
+-- A workflow is a skill that leads the whole session rather than one the model picks for a task: its text is in
+-- the lead's system prompt from the start, so it holds for every message, is cached with the prompt and outlasts
+-- a compaction. `hx --rpi` starts the session under the skill rpi, and a project's loop can set M.workflow to any
+-- skill's name. The agents' prompt is M.system_prompt and M.agent_prompt, without it: a workflow is for the one
+-- that leads.
+
+M.workflow = host.workflow :: string?
+
+-- The lead's part of the system prompt, or nil where no workflow leads. A workflow whose skill is not there is an
+-- error, not a session without it: the user asked for that way of working.
+function M.lead_prompt(): string?
+	local name = M.workflow
+	if not name then
+		return nil
+	end
+	for _, skill in M.skills() do
+		if skill.name == name then
+			return ("This session follows the %s workflow, whatever the task: its instructions are below, already "
+				.. "loaded, and they are yours to follow from the first step.\n\n%s"):format(name, M.skill(name))
+		end
+	end
+	error(("the workflow %s needs a skill of that name, and there is none"):format(name), 0)
+end
+
 local function report()
 	-- A healthy run reads most of what goes in from the cache and writes little of it. DeepSeek reports no writes.
 	-- A run on one model gets one line. One that used several, a sub-agent on another say, gets a line for each
@@ -1962,6 +2323,10 @@ end
 
 function M.main(): number
 	local system = M.system_prompt()
+	local lead = M.lead_prompt()
+	if lead then
+		system ..= "\n\n" .. lead
+	end
 	local talk = Conversation.new()
 	-- Encoding even a long conversation takes milliseconds, next to seconds for a reply.
 	talk.on_answer = function()

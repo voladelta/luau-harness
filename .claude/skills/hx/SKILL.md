@@ -40,6 +40,7 @@ hx [options] < task.txt               with no task words, the task is all of std
 hx [options] --run FILE [ARGS...]     a Luau script with the host primitives; FILE - reads the script from stdin
 hx --init [--full]                    write .hx/loop.luau (see "The loop")
 hx --judge KIT [options] TASK...      the agent, with a judge (see "The judge")
+hx --rpi [options] TASK...            the agent as the lead of agents (see "Agents")
 ```
 
 - Start it in the project directory. It refuses `/`, the home directory and any directory that holds it.
@@ -60,7 +61,7 @@ hx --judge KIT [options] TASK...      the agent, with a judge (see "The judge")
   reads text nobody vouches for, run hx in a clone and pull from it, since hooks and `.git/config` do not show
   in a diff.
 - To see what a session did, read its log: where a `.hx` directory exists, each session's conversation is saved
-  as JSON in `.hx/log/TIME-ID.json`, and each sub-agent's beside it as `TIME-ID-sub-N.json`. A project with no
+  as JSON in `.hx/log/TIME-ID.json`, and each agent's or sub-agent's beside it as `TIME-ID-sub-N.json`. A project with no
   `.hx` directory keeps no log.
 - `hx --help` has every option and variable.
 
@@ -69,11 +70,40 @@ hx --judge KIT [options] TASK...      the agent, with a judge (see "The judge")
 - An extension or a skill you write is there at once: call it in the session that wrote it. A change to
   `.hx/loop.luau` or `.hx/prompt.md` waits for the next session.
 - Commands you start do not have the API key, so a nested `hx TASK` cannot reach the model. To hand work to
-  another conversation, add a sub-agent function to the loop (below). A nested `hx --run FILE` works when the `hx`
-  binary is inside the wall, as one installed under `/usr` is.
+  other conversations, call `agents` (below). A nested `hx --run FILE` works when the `hx` binary is inside the
+  wall, as one installed under `/usr` is.
 - `host.default_loop` is the built-in loop's source, the reference for everything `M` has:
   `host.write(host.env("TMPDIR") .. "/loop.luau", host.default_loop)`, then `read` or `rg` it. From outside,
   `echo 'print(host.default_loop)' | hx --run -` prints it.
+
+## Agents
+
+`agents(tasks)` is a function every session has. It gives each task to an agent, a model with a conversation of its
+own in a fork of hx, behind the same wall and with the same functions. All of them work at the same time, and
+the call returns their reports, each one's last words:
+
+```lua
+return agents({
+	{ name = "parser", task = [==[In src/parse.c, make parse_line accept CRLF line ends. ... Check with make test-parse.]==] },
+	{ name = "docs", task = [==[In README.md, document the --strict flag. ...]==] },
+})
+```
+
+- An agent knows only what its task says: name the files, what to change and leave alone, and the check to run.
+- Agents share the project's files and nothing else, so tasks at work together must not write the same files.
+- A task for a name that already has an agent goes on in that agent's conversation: send work back to be fixed
+  under the name that did it. A new name starts a new agent.
+- The call returns after `M.agent_wait` seconds at most (270), with the reports so far and a line for each
+  agent still at work; `agents()` with no tasks waits again. A report is given once.
+- Agents run on `deepseek-flash` when hx was started with `DEEPSEEK_API_KEY`, and on the session's model
+  otherwise. They have no `agents` of their own, and their words go to stderr, not into the answer.
+- `hx --rpi TASK`, from outside, leads the whole task that way by the built-in skill `rpi` (research, plan,
+  implement): the lead, Opus unless `--model` names another, researches and plans, agents implement, and it
+  verifies and sends back what fails. It needs `ANTHROPIC_API_KEY`, and `DEEPSEEK_API_KEY` for agents on
+  `deepseek-flash`. Inside any session, `skill("rpi")` is the same procedure.
+- In `.hx/loop.luau`: `M.agent_model`, `M.agent_limit` (8 at once), `M.agent_wait`, `M.agent_seconds` (1800 a
+  run) and `M.agent_prompt`. `M.workflow = "NAME"` starts every session under that skill, as `--rpi` does under
+  `rpi`, and a project's own `.hx/skills/rpi/SKILL.md` takes the built-in one's place.
 
 ## Extensions
 
@@ -164,6 +194,8 @@ return M
 
 - `usage` is the one line the model reads about a function, in the `lua` tool's description, not in the system
   prompt; `run` returns what the model should see and raises to report failure.
+- This sub-agent runs inside the session's process while the session waits, one at a time. For several at once,
+  each in a process of its own, `agents` is already there (see "Agents").
 - A sub-agent shares the model's globals and the wall. Its words also go to stdout, its replies are counted in
   the line at the end of the run, and its conversation has a log of its own (see "Running hx").
 - A sub-agent runs on another model when `M.model` is set for its turn and put back however the turn ends:
@@ -232,6 +264,7 @@ changes its paragraph too.
 | What `hx --init` writes | `lua/overlay.luau` |
 | A built-in extension (each file is one, by its name) | `lua/ext/NAME.luau` |
 | This skill, which is built into hx | `.claude/skills/hx/SKILL.md` |
+| A built-in skill for hx's model alone, such as `rpi` (each directory is one, by its name) | `lua/skills/NAME/SKILL.md` |
 | A primitive | `src/host*.cpp`, and the lists in `src/host.h`, `lua/loop.luau` and the README |
 | Options, secrets, what the wall lets in | `src/main.cpp`, `src/sandbox.cpp` |
 | The judge | `lua/judge.luau`, `src/judge.cpp` |
