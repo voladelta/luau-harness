@@ -240,6 +240,10 @@ A project function may run a `lua` call inside the running one (`M.tools[1].run`
 `Conversation`, as a sub-agent. The nested call keeps the outer call's printed lines, and the nested turn counts
 repeats on its own and leaves the outer turn's counts alone. The model's globals are shared by both.
 
+hx does not bring a search tool: the model searches through `bash`. Where `rg` is on the `PATH`, the system
+prompt says that ripgrep is installed and to use it rather than plain grep, since it is faster and skips what
+`.gitignore` names; where it is not, the prompt does not name it.
+
 Some habits of the model are handled in the loop rather than left to the prompt: a function call that gets the same
 result for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to
 try something else only when it knows an action that will change the result (results are compared by length and a

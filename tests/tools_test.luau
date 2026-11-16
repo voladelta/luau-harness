@@ -257,6 +257,23 @@ check("the prompt lists the other extensions", prompt:find("- greet: greets", 1,
 check("but not a helper", prompt:find("_x", 1, true), nil)
 host.sh("rm -rf .hx")
 
+-- The prompt says that ripgrep is there, and to prefer it, only where it is installed.
+local real_sh = host.sh
+local function with_rg(found: boolean): string
+	host.sh = function(command: string, options: any): any
+		if command == "command -v rg" then
+			return { out = "", code = found and 0 or 1 }
+		end
+		return real_sh(command, options)
+	end
+	local text = loop.system_prompt()
+	host.sh = real_sh
+	return text
+end
+check("with rg, the prompt prefers it to grep",
+	with_rg(true):find("use rg through bash rather than plain grep", 1, true) ~= nil, true)
+check("without rg, the prompt does not name it", with_rg(false):find("ripgrep", 1, true), nil)
+
 -- Nesting. A project function can run a `lua` call inside the running one, or a whole turn on another
 -- Conversation, as a sub-agent. Either leaves the outer call's printed lines and the outer turn's repeat counts
 -- as it found them.

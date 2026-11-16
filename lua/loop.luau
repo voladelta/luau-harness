@@ -1353,6 +1353,8 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 end
 
 function M.system_prompt(): string
+	-- hx does not bring ripgrep. Where it is installed, the model is told: none reaches for it unasked.
+	local ripgrep = host.sh("command -v rg", { timeout = 10 }).code == 0
 	local parts = {
 		("You are a coding agent working in %s. You act by running Luau code with the lua tool; the code calls "
 			.. "the functions the tool lists. Put several steps in one call when you know what each will do, and take "
@@ -1374,7 +1376,9 @@ function M.system_prompt(): string
 			.. "matter giving its name and a description of when to use it.",
 		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
 			.. "range of lines or go on through a large file. Read a file before you edit it, unless "
-			.. "you wrote or edited it yourself in this session.",
+			.. "you wrote or edited it yourself in this session."
+			.. (ripgrep and " To search, ripgrep is installed: use rg through bash rather than plain grep. It is "
+				.. "faster, and it skips what .gitignore names." or ""),
 		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
 	}
 	if host.judged then
