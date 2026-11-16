@@ -132,8 +132,10 @@ Also in force:
   code never sees the key: the host adds it to requests for the configured endpoint only, and commands cannot
   read it out of the host's memory. `DEEPSEEK_API_KEY` is kept the same way for DeepSeek's tool endpoints, and is
   sent only to `HX_TOOLS_URL/search`, `/fetch` and `/ocr`; `EXA_API_KEY` too, sent only to `HX_EXA_URL`.
-- The VM has a memory ceiling of 1 GiB, and every process a command started is killed when `hx` exits, a
-  daemon that called `setsid` included: `hx` is a child subreaper, so all of them stay its descendants.
+- The VM has a memory ceiling of 1 GiB. Code that runs into it gets the error "not enough memory", and what it
+  held is collected at the next step, so the session goes on with its memory back.
+- Every process a command started is killed when `hx` exits, a daemon that called `setsid` included: `hx` is a
+  child subreaper, so all of them stay its descendants.
 
 ### What the wall does not do
 

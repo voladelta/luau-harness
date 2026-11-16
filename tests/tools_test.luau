@@ -230,6 +230,9 @@ end)
 check("a script that eats memory is stopped", hog_ok, false)
 check("with an ordinary error", tostring(hog_err):find("not enough memory", 1, true) ~= nil, true)
 check("and the harness lives on", json.encode({ 1 }), "[1]")
+-- What the script held is collected at once. Left to itself the collector would not start again under the
+-- ceiling, and the rest of this test would run in whatever the last refused request left over.
+check("with its memory back", gcinfo() < 64 * 1024, true)
 
 -- extensions (relative to the working directory, like the real thing)
 check("this test runs where it can write", host.write(".hx/ext/greet.luau", "-- greets\nreturn { hello = function(n) return 'hello ' .. n end }\n"), true)

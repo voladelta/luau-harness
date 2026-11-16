@@ -291,12 +291,30 @@ Host& Host::of(lua_State* L) {
     return *static_cast<Host*>(lua_callbacks(L)->userdata);
 }
 
+namespace {
+
+// The allocator has refused a request since the last full collection (see vm_memory_refused). The allocator is
+// given no Host to keep it in, and a process has one VM.
+bool g_memory_refused = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+}  // namespace
+
+void vm_memory_refused() noexcept {
+    g_memory_refused = true;
+}
+
 // Runs at VM safepoints (loop back edges, calls). Luau code cannot block these, so a signal or an expired time
-// limit always reaches the code that is running. Both are flags a signal handler sets, so a safepoint costs two
-// loads; the clock is read only once the limit's timer has fired (see arm_limit).
+// limit always reaches the code that is running. Both are flags a signal handler sets, and the allocator sets a
+// third, so a safepoint costs three loads; the clock is read only once the limit's timer has fired (see arm_limit).
 void Host::on_interrupt(lua_State* L, int gc) {
     if (gc >= 0) {
-        return;  // inside the collector: raising here is not allowed
+        return;  // inside the collector: raising here is not allowed, nor is collecting
+    }
+    if (g_memory_refused) {
+        // The request that was refused has raised its error by now, so what that code held is garbage. Cleared
+        // first: a collection that is itself refused memory asks for the next one.
+        g_memory_refused = false;
+        lua_gc(L, LUA_GCCOLLECT, 0);
     }
     raise_if_signaled(L);
     if (g_expired == 0) {

@@ -158,6 +158,12 @@ class Host {
 // signal that arrives before the first was handled kills every descendant, as ~Host would, and exits at once.
 void install_signal_handlers();
 
+// For the VM's allocator to call when it refuses a request because the VM is at its memory ceiling. Luau raises
+// "not enough memory" for that request, and the next safepoint collects all garbage, so what the failed code held
+// is free again. Luau starts a collection only once the heap has grown to twice what the last one left; under a
+// ceiling that is less than twice that, it would never start one again, and every later request would be refused.
+void vm_memory_refused() noexcept;
+
 }  // namespace hx
 
 #endif  // HX_HOST_H_

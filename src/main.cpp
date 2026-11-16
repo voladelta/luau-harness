@@ -589,6 +589,7 @@ void* limited_alloc(void* user, void* block, std::size_t old_size, std::size_t n
         return nullptr;
     }
     if (new_size > old_size && used + (new_size - old_size) > kMaxVmMemory) {
+        hx::vm_memory_refused();  // the next safepoint collects, or nothing ever would again
         return nullptr;
     }
     void* grown = std::realloc(block, new_size);
