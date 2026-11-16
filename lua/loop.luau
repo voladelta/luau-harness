@@ -625,6 +625,132 @@ local function skill_index(): string?
 		.. "which lists them with their descriptions."):format(head, #listed, table.concat(names, ", "))
 end
 
+-- The layout ------------------------------------------------------------------------------------------------
+--
+-- The system prompt shows the project's files as a tree, so that the model's first call need not be a listing.
+-- The files are the ones git lists: tracked, or new and not ignored, which leaves out build output and the like.
+-- Where git lists none (no repository, no git, nothing in it yet, or a tree it cannot walk in ten seconds), the
+-- tree is the project directory's own entries, one level. It is made when the session starts, like the rest of
+-- the prompt, so it does not upset the prompt cache, and says so, since files come and go after that.
+
+M.layout_lines = 60 -- entries of the project's file tree in the system prompt; 0 leaves the tree out
+
+-- A directory of the tree: the names in it, which of them are directories, and its files at any depth.
+type Dir = { names: { string }, dirs: { [string]: Dir }, files: number }
+
+-- A list of paths as a tree: one name per line, indented under its directory, directories before files, at most
+-- `limit` lines. Directories are opened level by level, each one whose entries still fit; one that stays closed
+-- is a line with the number of files below it. A path that ends in / is a directory with nothing known to be in
+-- it. When the top level alone does not fit, the tree is its first `limit` entries and how many more there are.
+function M.tree(paths: { string }, limit: number): string
+	local root: Dir = { names = {}, dirs = {}, files = 0 }
+	local previous: string? = nil
+	for _, path in paths do
+		if path ~= previous then -- git lists a file in a merge conflict once for each side
+			previous = path
+			local parts = path:split("/")
+			local is_file = parts[#parts] ~= ""
+			local dir = root
+			for i = 1, #parts - 1 do
+				dir.files += is_file and 1 or 0
+				local sub = dir.dirs[parts[i]]
+				if not sub then
+					sub = { names = {}, dirs = {}, files = 0 }
+					dir.dirs[parts[i]] = sub
+					table.insert(dir.names, parts[i])
+				end
+				dir = sub
+			end
+			if is_file then
+				dir.files += 1
+				table.insert(dir.names, parts[#parts])
+			end
+		end
+	end
+
+	local open: { [Dir]: boolean } = { [root] = true }
+	local queue, shown = { root }, math.min(#root.names, limit)
+	local at = 0
+	while at < #queue do -- the queue grows as it is read: a level's directories come before the next level's
+		at += 1
+		local dir = queue[at]
+		table.sort(dir.names, function(a: string, b: string): boolean
+			local a_dir, b_dir = dir.dirs[a] ~= nil, dir.dirs[b] ~= nil
+			if a_dir ~= b_dir then
+				return a_dir
+			end
+			return a < b
+		end)
+		for _, name in dir.names do
+			local sub = dir.dirs[name]
+			if sub and #sub.names > 0 and shown + #sub.names <= limit then
+				open[sub] = true
+				shown += #sub.names
+				table.insert(queue, sub)
+			end
+		end
+	end
+
+	local lines: { string } = {}
+	local function walk(dir: Dir, indent: string)
+		for i, name in dir.names do
+			if #lines == limit then -- the top level alone: nothing else is opened past what fits
+				table.insert(lines, ("... and %d more"):format(#dir.names - i + 1))
+				return
+			end
+			local sub = dir.dirs[name]
+			-- A file's name is not hx's: what a terminal would obey goes, and a line break in it is a space.
+			local line = indent .. (M.printable(name):gsub("%s+", " "))
+			if not sub then
+				table.insert(lines, line)
+			elseif open[sub] then
+				table.insert(lines, line .. "/")
+				walk(sub, indent .. "  ")
+			elseif sub.files > 0 then
+				table.insert(lines, ("%s/ (%d %s)"):format(line, sub.files, sub.files == 1 and "file" or "files"))
+			else
+				table.insert(lines, line .. "/")
+			end
+		end
+	end
+	walk(root, "")
+	return table.concat(lines, "\n")
+end
+
+-- The files git lists in the project directory, as paths from it, or nil when it lists none. The list goes
+-- through a file in $TMPDIR, because host.sh keeps only both ends of a long output.
+local function git_files(): { string }?
+	local result = host.sh('git ls-files -z --cached --others --exclude-standard 2>/dev/null >"$TMPDIR/hx-files"',
+		{ timeout = 10 })
+	local text: string? = result.code == 0 and host.read((host.env("TMPDIR") or "") .. "/hx-files") or nil
+	local files = {}
+	for _, path in (text or ""):split("\0") do
+		if path ~= "" then
+			table.insert(files, path)
+		end
+	end
+	return #files > 0 and files or nil
+end
+
+-- The system prompt's part on the project's files, or nil for none. A project that wants another picture
+-- replaces this, say with what a tree command it has prints.
+function M.layout(): string?
+	if M.layout_lines < 1 then
+		return nil
+	end
+	local files = git_files()
+	if files then
+		return ("The project's files as this session starts, %d in all, as git lists them: tracked, or new and not "
+			.. "ignored. A directory with a count is not opened here.\n%s"):format(#files, M.tree(files, M.layout_lines))
+	end
+	local entries: { string }? = host.list(".")
+	if not entries or #entries == 0 then
+		return nil
+	end
+	return "The project directory as this session starts, its own entries only, since git lists no files here.\n"
+		.. M.tree(entries, M.layout_lines)
+end
+
 -- Functions -------------------------------------------------------------------------------------------------
 --
 -- The model has one tool, `lua`, and acts by calling functions from the code it sends. Each function is
@@ -1269,6 +1395,10 @@ function M.system_prompt(): string
 	local skills = skill_index()
 	if skills then
 		table.insert(parts, skills)
+	end
+	local layout = M.layout()
+	if layout then
+		table.insert(parts, layout)
 	end
 	local notes = host.read(".hx/prompt.md")
 	if notes and notes ~= "" then

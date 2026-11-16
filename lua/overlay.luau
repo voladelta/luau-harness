@@ -21,7 +21,8 @@ local M = host.load(host.default_loop, "=loop")()
 -- 	end,
 -- })
 
--- A part replaced, here by wrapping it. The others that can be replaced are M.request, M.turn and M.compact.
+-- A part replaced, here by wrapping it. The others that can be replaced are M.layout (the file tree in the
+-- prompt), M.request, M.turn and M.compact.
 -- local built_in_prompt = M.system_prompt
 -- function M.system_prompt()
 -- 	return built_in_prompt() .. "\n\nRun `make check` before you report."

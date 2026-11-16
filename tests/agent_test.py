@@ -1438,6 +1438,43 @@ class AgentTest(unittest.TestCase):
         self.run_hx("go", script=[say("ok")])
         self.assertIn("Run the tests with make check.", self.model.requests[0]["system"])
 
+    def write_files(self, *paths):
+        for path in paths:
+            os.makedirs(os.path.dirname(os.path.join(self.project, path)), exist_ok=True)
+            with open(os.path.join(self.project, path), "w") as f:
+                f.write("x\n")
+
+    def test_the_system_prompt_shows_the_files_git_lists(self):
+        git = dict(cwd=self.project, env=self.env(), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "init", "-q"], **git)
+        self.write_files("src/main.c", "src/util/text.c", "README.md", "new.txt", "build/out.o")
+        with open(os.path.join(self.project, ".gitignore"), "w") as f:
+            f.write("build/\n")
+        subprocess.run(["git", "add", "src", "README.md", ".gitignore"], **git)
+        self.run_hx("go", script=[say("ok")])
+        system = self.model.requests[0]["system"]
+        # Tracked files and a new one that is not ignored, directories first; what .gitignore names is left out.
+        self.assertIn("5 in all, as git lists them", system)
+        self.assertIn("\nsrc/\n  util/\n    text.c\n  main.c\n.gitignore\nREADME.md\nnew.txt", system)
+        self.assertNotIn("build/", system)
+        self.assertNotIn("out.o", system)
+        # A project that wants no tree, or fewer lines of it, says so in its loop.
+        self.run_hx("--init")
+        loop = os.path.join(self.project, ".hx", "loop.luau")
+        source = read(loop)
+        with open(loop, "w") as f:
+            f.write(source.replace("-- M.max_replies = 100", "M.layout_lines = 0"))
+        done = self.run_hx("go", script=[say("ok")])
+        self.assertNotIn("loop.luau", done.stderr)  # the project's loop loaded
+        self.assertNotIn("main.c", self.model.requests[-1]["system"])
+
+    def test_without_git_the_system_prompt_shows_the_project_directory(self):
+        self.write_files("src/main.c", "notes.txt")
+        self.run_hx("go", script=[say("ok")])
+        system = self.model.requests[0]["system"]
+        self.assertIn("its own entries only, since git lists no files here.\nsrc/\nnotes.txt", system)
+        self.assertNotIn("main.c", system)
+
     def test_init_writes_an_overlay_on_the_built_in_loop(self):
         done = self.run_hx("--init")
         self.assertEqual(done.returncode, 0, done.stderr)
