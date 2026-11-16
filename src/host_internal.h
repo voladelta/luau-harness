@@ -56,6 +56,9 @@ const char* stop_error(int sig);
 void raise_if_signaled(lua_State* L);
 // Pushes a Luau list of the strings.
 void push_strings(lua_State* L, const std::vector<std::string>& strings);
+// Makes the time limit's timer again. A forked child has none of its parent's timers, and without one of its own
+// no host.timed limit in it would ever fire.
+void renew_limit_timer() noexcept;
 
 // What host.sh and host.clip keep of a long text: its start and its end, each cut where a reader loses least. A part
 // ends or starts at a line when that keeps more than half of it; otherwise it is cut at a character, never inside

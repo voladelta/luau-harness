@@ -143,16 +143,31 @@ class TryScope {
     int& depth_;
 };
 
+// A timer that raises SIGALRM, and whether the kernel gave one.
+struct LimitTimer {
+    timer_t timer{};
+    bool made = false;
+};
+
+LimitTimer make_limit_timer() noexcept {
+    LimitTimer timer;
+    sigevent event{};
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGALRM;
+    timer.made = timer_create(CLOCK_MONOTONIC, &event, &timer.timer) == 0;
+    return timer;
+}
+
+// The process's one timer, made at its first use, and again in a forked child (see renew_limit_timer).
+LimitTimer& the_limit_timer() noexcept {
+    static LimitTimer timer = make_limit_timer();
+    return timer;
+}
+
 // The process's one timer, which raises SIGALRM at the time limit in force, or null when the kernel gave none.
 timer_t* limit_timer() noexcept {
-    static timer_t timer{};
-    static const bool made = [] {
-        sigevent event{};
-        event.sigev_notify = SIGEV_SIGNAL;
-        event.sigev_signo = SIGALRM;
-        return timer_create(CLOCK_MONOTONIC, &event, &timer) == 0;
-    }();
-    return made ? &timer : nullptr;
+    LimitTimer& timer = the_limit_timer();
+    return timer.made ? &timer.timer : nullptr;
 }
 
 // Sets the timer to fire at deadline, a time on the monotonic clock; 0 turns it off. A deadline already past fires
@@ -274,6 +289,11 @@ int l_env(lua_State* L) {
 }
 
 }  // namespace
+
+void renew_limit_timer() noexcept {
+    the_limit_timer() = make_limit_timer();
+    g_expired = 1;  // the next safepoint reads the clock, and clears this where there is a timer to set it again
+}
 
 // --- the Host -------------------------------------------------------------------------------------------------
 
@@ -400,10 +420,10 @@ void Host::open(lua_State* L) {
     callbacks->interrupt = on_interrupt;
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"llm", llm},        {"tool", tool},        {"sh", sh},       {"try", try_},    {"timed", timed},
-        {"read", read_file}, {"write", write_file}, {"list", l_list}, {"load", l_load}, {"input", l_input},
-        {"log", l_log},      {"sleep", sleep},      {"env", l_env},   {"judge", judge}, {"clip", l_clip},
-        {nullptr, nullptr},
+        {"llm", llm},        {"tool", tool},        {"sh", sh},         {"try", try_},    {"timed", timed},
+        {"read", read_file}, {"write", write_file}, {"list", l_list},   {"load", l_load}, {"input", l_input},
+        {"log", l_log},      {"sleep", sleep},      {"env", l_env},     {"judge", judge}, {"clip", l_clip},
+        {"spawn", spawn},    {"wait", wait},        {nullptr, nullptr},
     };
     luaL_register(L, "host", kFunctions);
 

@@ -194,6 +194,8 @@ function is a module: `main()` runs, and the number it returns is the exit statu
 | `host.read(path)`, `host.write(path, data)`, `host.list(dir)` | the value, or `nil, error`: they do not raise. `write` makes missing directories |
 | `host.load(source, name, env?)` | a function, or `nil, error` |
 | `host.try(fn, ...)`, `host.timed(seconds, fn, ...)` | `true, ...` or `false, error` |
+| `host.spawn(fn, ...)` | an id: forks hx, and the child runs `fn(...)` in a copy of the VM while the parent goes on. Only files and the string `fn` returns reach the parent |
+| `host.wait(seconds?)` | `id, ok, text` for the first child that has ended (`text` is what `fn` returned or raised), or `nil, running` when none ends in time |
 | `host.clip(text, limit)` | `text`, or `head, tail` when it is longer |
 | `host.log(text)`, `host.input(prompt)` | a line to stderr; a line from stdin, or `nil` at its end |
 | `host.sleep(seconds)`, `host.env(name)` | |

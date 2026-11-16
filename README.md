@@ -504,6 +504,8 @@ Everything Luau can do to the machine:
 | `host.llm(body, {timeout=600, beta=, endpoint=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header. A third value is the seconds a `Retry-After` header asked for, when the reply had one; `host.tool` returns it too. The request goes to the session's endpoint, or with `endpoint = "deepseek"` to DeepSeek's Messages endpoint with `DEEPSEEK_API_KEY`; no other name is taken |
 | `host.tool(name, request, {timeout=300})` | `status, text`, or `nil, error`: a POST to DeepSeek's `search`, `fetch` or `ocr` endpoint with `DEEPSEEK_API_KEY`, or, for `"exa"`, to Exa's search endpoint with `EXA_API_KEY`. A string `request` is sent as JSON; for DeepSeek, a table is sent as a form, whose `file` field is the path of a file to upload |
 | `host.sh(command, {timeout=120, read=, write=, hangup=})` | `{out, code, signal, timed_out, seconds}`; `seconds` runs from the fork to the exit. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends. With `hangup = true`, the command ends, or does not start, once stdin's writer has hung up, and `host.sh` raises `"hung up"` |
+| `host.spawn(fn, ...)` | an id, counting from 1: forks hx. The child is the process as it is, VM and wall and all, and runs `fn(...)` while the parent goes on. What it changes in the VM is its own: only files, and the string `fn` returns, reach the parent. The child is under no time limit of the parent's (its own `host.timed` works), reads no stdin, has no judge and cannot spawn. A stop ends it, and so does the parent's exit; what its commands left running is killed when `fn` ends. At most 64 children run or wait to be waited for |
+| `host.wait(seconds?)` | `id, ok, text` for the first child that has ended, in the order they were spawned: `ok` is whether `fn` returned, `text` what it returned (a string, or nothing for `""`) or the error it raised. A child that was killed is `false` and says so. When none has ended it waits, for at most `seconds` and until 2 seconds before the `host.timed` limit in force, and then, or when there is no child, returns `nil, running`: how many are still at work |
 | `host.judge(line?)` | `{lines}, pending`: sends a line to the judge, if given, and returns the answer it owes, waiting until 2 seconds before the `host.timed` limit in force; `pending` is how many it still owes. A line is refused while one is owed |
 | `host.read(path)` | the contents, or `nil, error`. A FIFO or a device is read without blocking: waiting for a writer, or for more, ends with the `host.timed` limit in force (`nil, "PATH: timed out"`) or a stop |
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A regular file is replaced by renaming a new one over it, so a failed write leaves the old content (a killed one can leave the new file beside it); the mode stays and a link stays a link, but owner, extended attributes and ACLs are not carried over. A device, a FIFO, a file with other hard links, a dangling link, or a file in a directory that refuses a new file is written in place; waiting for a FIFO's reader, or for room, ends as `host.read`'s waits do |
@@ -532,7 +534,8 @@ Two rules hold across all of them:
   `false, "interrupted"`. That is the only place a stop ends, so a plain `pcall` cannot make it go away: outside
   any `host.try` it ends the run. SIGTERM and SIGHUP raise `"terminated"` the same way.
 - **A time limit reaches blocking calls.** Inside `host.timed`, `llm`, `sh` and `sleep` give up when the limit
-  passes, and so do `read` and `write` waiting on a FIFO or a device; limits nest.
+  passes, and so do `read` and `write` waiting on a FIFO or a device; limits nest. `judge` and `wait` return two
+  seconds before it, with what they have.
 
 `json.encode` writes object keys in sorted order, so equal values always produce the same bytes.
 
@@ -549,6 +552,7 @@ Two rules hold across all of them:
 | `src/host_http.cpp` | `host.llm` and `host.tool`: requests to the endpoints, each key to its own URLs only |
 | `src/host_files.cpp` | `host.read`, `host.write` and `host.list` |
 | `src/host_judge.cpp` | `host.judge`: the agent's end of the channel to the judge |
+| `src/host_spawn.cpp` | `host.spawn` and `host.wait`: children of hx that run a Luau function in a copy of the VM, which the loop's agents are |
 | `src/host_internal.h`, `src/sys.h` | what the `host*.cpp` files share, and the small system helpers every file uses |
 | `src/json.cpp` | JSON between Lua values and text, on RapidJSON's streaming reader and writer |
 | `lua/loop.luau` | the agent |

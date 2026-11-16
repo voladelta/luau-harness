@@ -70,7 +70,17 @@ struct HostConfig {
 //   host.judge(line?) -> {answers}, pending           sends a line to the judge, if given, and waits for what it
 //                                                     owes, until 2 s before the host.timed limit; a line is
 //                                                     refused while an answer is owed
-//   host.read(path) -> string | nil, error            a FIFO or a device is read without blocking, and a wait for
+//   host.spawn(fn, ...) -> id                         forks hx: the child, a copy of this process behind the same
+//                                                     wall, runs fn(...) while the parent goes on, and ends when fn
+//                                                     does, with whatever its commands left running. What it changes
+//                                                     in the VM is its own; files and its result reach the parent.
+//                                                     It is under no time limit of the parent's, reads no stdin,
+//                                                     has no judge and cannot spawn; a stop ends it
+//   host.wait(seconds?) -> id, ok, text | nil, running    the first child that has ended: whether fn returned, and
+//                                                     the string it returned or the error it raised. Otherwise it
+//                                                     waits for one, for at most `seconds` and until 2 s before the
+//                                                     host.timed limit in force, then returns nil and how many run
+//   host.read(path) -> string | nil, error           a FIFO or a device is read without blocking, and a wait for
 //                                                     a writer or for more ends with the host.timed limit
 //                                                     ("PATH: timed out") or a stop, as for write's below
 //   host.write(path, data) -> true | nil, error       creates missing parent directories; replaces a regular file
@@ -109,7 +119,7 @@ struct HostConfig {
 // limit raises "timeout" the same way, until its call returns.
 //
 // The Host makes hx a child subreaper, so whatever a command leaves running stays a descendant of hx, even after
-// setsid. Destroying the Host kills every descendant.
+// setsid. Destroying the Host kills every descendant, the children host.spawn made and theirs included.
 class Host {
   public:
     // The Sandbox is required as evidence that confinement was decided before anything can run.
@@ -134,6 +144,10 @@ class Host {
     static int read_file(lua_State* L);
     static int write_file(lua_State* L);
     static int judge(lua_State* L);
+    static int spawn(lua_State* L);
+    static int wait(lua_State* L);
+    // The child's side of host.spawn: runs the function and its arguments on L's stack, and leaves.
+    [[noreturn]] void run_child(lua_State* L, int result_fd) noexcept;
 
     // Shortens a wait so that it ends no later than the host.timed limit in force. A negative wait is an empty one.
     [[nodiscard]] double within_limit(double seconds) const;
@@ -149,14 +163,27 @@ class Host {
         void operator()(CURL* handle) const noexcept;
     };
 
+    // A child host.spawn made, until host.wait has returned it.
+    struct Spawned {
+        int id = 0;
+        UniqueFd result;     // the read end of the pipe the child writes its result to as it ends
+        std::string data;    // what has come through it
+        bool ended = false;  // the pipe is at its end, so the child is gone
+    };
+    // Reads what the child's pipe holds now, without waiting for more.
+    static void drain(Spawned& child);
+
     HostConfig config_;
     bool sandboxed_;
     // Made at the first request.
     std::unique_ptr<CURL, CurlDeleter> curl_;
-    double deadline_ = 0;   // the innermost host.timed limit on the monotonic clock; 0 for none
-    int tries_ = 0;         // host.try and host.timed calls in progress
-    std::string judge_in_;  // what the judge sent that is not yet a whole line
-    int judge_owed_ = 0;    // answers the judge still owes: a later host.judge returns them
+    double deadline_ = 0;           // the innermost host.timed limit on the monotonic clock; 0 for none
+    int tries_ = 0;                 // host.try and host.timed calls in progress
+    std::string judge_in_;          // what the judge sent that is not yet a whole line
+    int judge_owed_ = 0;            // answers the judge still owes: a later host.judge returns them
+    std::vector<Spawned> spawned_;  // host.spawn's children, in the order they were made
+    int spawn_count_ = 0;           // children made so far: the last one's id
+    bool child_ = false;            // this process is one of them
 };
 
 // Makes SIGINT, SIGTERM and SIGHUP stop the running command or request and surface as a Luau error. A second
