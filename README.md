@@ -293,8 +293,10 @@ Prompt caching follows each provider's docs. Every model gets a prefix that only
 once per run, the tool description never changes, JSON keys are sorted, and the history is only appended to. A
 Claude model gets two cache breakpoints: one on the system prompt, so tools and system are still read from the
 cache after a compaction, and the top-level automatic one, which moves forward with the conversation. DeepSeek
-caches every prefix by itself and ignores `cache_control`. The line at the end of a run gives the tokens read
-from the cache and written to it.
+caches every prefix by itself and ignores `cache_control`. The line at the end of a run gives the replies, the
+tokens in, those read from the cache and written to it, and the tokens out. A run that used several models, a
+sub-agent on another say, gets such a line for each, headed by the model's name: their prices differ, so one sum
+would not say what the run cost.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON, after every reply that
 called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. Whether

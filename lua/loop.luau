@@ -97,8 +97,10 @@ M.repeat_reminders = { 3, 5, 8 } -- a function call with the same result this ma
 -- nested call or turn leaves its parent's state as it found it. The globals of the model's code are the model's,
 -- not the loop's, and live in `scratch` (see the lua tool).
 type Repeats = { counts: { [string]: number }, worst: { call: string, count: number }? }
+-- What one model was sent and wrote in this run.
+type Count = { model: string, replies: number, input: number, cached: number, written: number, output: number }
 local live: {
-	usage: { replies: number, input: number, cached: number, written: number, output: number },
+	usage: { Count },
 	spills: number,
 	subs: number,
 	turns: number,
@@ -108,7 +110,9 @@ local live: {
 	printed: { string }?,
 } = {
 	-- For the whole run, from when the module loads:
-	usage = { replies = 0, input = 0, cached = 0, written = 0, output = 0 }, -- tokens, for the line at the end
+	-- Tokens, for the lines at the end: by model, in the order each first replied. A sub-agent may run on
+	-- another model at another price, so one sum for the run would say little about what it cost.
+	usage = {},
 	spills = 0, -- files that clipped results went to, so the next one has a name of its own
 	subs = 0, -- sub-agents whose conversations have a log, so the next one has a name of its own
 	turns = 0, -- turns running, one inside another: above 1, the innermost is a sub-agent's
@@ -1243,13 +1247,25 @@ local function prompt_tokens(counts: Usage): number
 	return (counts.input_tokens or 0) + (counts.cache_read_input_tokens or 0) + (counts.cache_creation_input_tokens or 0)
 end
 
--- Adds a reply's tokens to the run's count. A compaction reply has zero at the top and the summarization call in
--- usage.iterations; where iterations are given, they are what was billed.
+-- The run's count for a model, begun at its first reply.
+local function count_of(model: string): Count
+	for _, count in live.usage do
+		if count.model == model then
+			return count
+		end
+	end
+	local count: Count = { model = model, replies = 0, input = 0, cached = 0, written = 0, output = 0 }
+	table.insert(live.usage, count)
+	return count
+end
+
+-- Adds a reply's tokens to the run's count for the model that was asked. A compaction reply has zero at the top
+-- and the summarization call in usage.iterations; where iterations are given, they are what was billed.
 local function count_usage(reply: Reply)
 	local counts: Usage = type(reply.usage) == "table" and reply.usage or {}
 	local iterations = counts.iterations
 	local parts: { Usage } = if type(iterations) == "table" and #iterations > 0 then iterations else { counts }
-	local usage = live.usage
+	local usage = count_of(M.model)
 	usage.replies += 1
 	for _, part in parts do
 		usage.input += prompt_tokens(part)
@@ -1900,9 +1916,16 @@ end
 
 local function report()
 	-- A healthy run reads most of what goes in from the cache and writes little of it. DeepSeek reports no writes.
-	local usage = live.usage
-	progress(("[%d replies, %d tokens in (%d read from cache, %d written to it), %d out]"):format(usage.replies,
-		usage.input, usage.cached, usage.written, usage.output))
+	-- A run on one model gets one line. One that used several, a sub-agent on another say, gets a line for each
+	-- under its name: their prices differ, so a sum would not say what the run cost.
+	local used: { Count } = live.usage
+	if #used == 0 then
+		used = { { model = M.model, replies = 0, input = 0, cached = 0, written = 0, output = 0 } }
+	end
+	for _, usage in used do
+		progress(("[%s%d replies, %d tokens in (%d read from cache, %d written to it), %d out]"):format(
+			#used > 1 and usage.model .. ": " or "", usage.replies, usage.input, usage.cached, usage.written, usage.output))
+	end
 end
 
 -- Bracketed paste. While it is on, the terminal wraps pasted text in the two markers, so a pasted message of many

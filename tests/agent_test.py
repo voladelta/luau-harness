@@ -233,7 +233,8 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(first["messages"], [{"role": "user", "content": "make a file"}])
         self.assertEqual([t["name"] for t in first["tools"]], ["lua"])
         self.assertEqual(set(first["tools"][0]), {"name", "description", "input_schema"})
-        self.assertEqual(first["thinking"], {"type": "adaptive"})
+        self.assertNotIn("thinking", first)  # DeepSeek's models think by default: nothing to ask for
+        self.assertIn("[2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]", done.stderr)
         self.assertEqual(second["messages"][1:], [
             {"role": "assistant", "content": [use("bash", {"command": "echo hi > out.txt; echo made"})]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "made\n[exit 0]"}]},
@@ -455,8 +456,12 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(headers["x-api-key"], ds_key)
             self.assertNotIn("anthropic-beta", headers)
             self.assertEqual(sent["system"], "the sub-agent's system prompt")
-            self.assertEqual(sent["thinking"], {"type": "adaptive"})
+            self.assertNotIn("thinking", sent)
             self.assertNotIn("fallbacks", sent)
+        # Each model's tokens are counted on a line of its own: their prices differ.
+        self.assertIn("[claude-opus-5-5: 3 replies, 30 tokens in (0 read from cache, 0 written to it), 15 out]\n"
+                      "[deepseek-flash: 2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]",
+                      done.stderr)
         self.assertEqual(deepseek.requests[0]["messages"], [{"role": "user", "content": "a sub-task"}])
         # The session's own stayed on Claude's, with its key and its settings, before the sub-agent and after it.
         self.assertEqual([r["model"] for r in self.model.requests], ["claude-opus-5-5"] * 3)
