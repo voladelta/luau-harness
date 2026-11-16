@@ -50,8 +50,7 @@ cmake --install build             # optional
 ```
 
 The first configure downloads three pinned dependencies: [Luau](https://github.com/luau-lang/luau) (the VM and
-compiler), [RapidJSON](https://github.com/Tencent/rapidjson) and [{fmt}](https://github.com/fmtlib/fmt) (both
-header-only).
+compiler), [yyjson](https://github.com/ibireme/yyjson) and [{fmt}](https://github.com/fmtlib/fmt) (header-only).
 
 ## Use
 
@@ -653,7 +652,7 @@ Two rules hold across all of them:
 | `src/host_judge.cpp` | `host.judge`: the agent's end of the channel to the judge |
 | `src/host_spawn.cpp` | `host.spawn` and `host.wait`: children of hx that run a Luau function in a copy of the VM, which the loop's agents are |
 | `src/host_internal.h`, `src/sys.h` | what the `host*.cpp` files share, and the small system helpers every file uses |
-| `src/json.cpp` | JSON between Lua values and text, on RapidJSON's streaming reader and writer |
+| `src/json.cpp` | JSON between Lua values and text, on yyjson's reader and writer |
 | `lua/loop.luau` | the agent |
 | `lua/judge.luau` | the judge, which `--judge` runs in a process of its own |
 | `lua/ext/*.luau` | the built-in extensions, one per file; each file in `lua/ext/` is built in under its name |

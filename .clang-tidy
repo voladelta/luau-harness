@@ -7,7 +7,7 @@
 #   easily-swappable-parameters, use-trailing-return-type, use-ranges
 #       noise, or not available with the C++20 standard library in use
 #   misc-include-cleaner
-#       does not understand the Luau and RapidJSON umbrella headers
+#       does not understand the Luau umbrella headers
 #   misc-no-recursion
 #       the JSON encoder recurses to a bounded depth
 #   avoid-c-arrays

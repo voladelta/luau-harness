@@ -278,7 +278,7 @@ luau-analyze lua/*.luau lua/ext/*.luau tests/*.luau                          # p
 ```
 
 - A build needs a C++20 compiler, CMake 3.28, Ninja and libcurl's headers (`libcurl4-openssl-dev` on Debian and
-  Ubuntu). The first configure downloads Luau, RapidJSON and {fmt}.
+  Ubuntu). The first configure downloads Luau, yyjson and {fmt}.
 - The Luau sources and this skill are compiled into the binary, so build again after editing one.
 - Luau files are `--!strict`. Tests are `tests/NAME_test.luau`, which share `tests/check.luau` and run through
   `hx --run`, and `tests/agent_test.py`, which drives the whole agent against a scripted model. A new behaviour

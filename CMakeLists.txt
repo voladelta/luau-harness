@@ -39,12 +39,16 @@ FetchContent_Declare(
   GIT_TAG c87565b8b0db5d5d5bfd2b8b00ad6573e5d06d9f
   EXCLUDE_FROM_ALL SYSTEM)
 
+set(YYJSON_READER_DEPTH_LIMIT 200 CACHE STRING "" FORCE)
+set(YYJSON_INSTALL OFF CACHE BOOL "" FORCE)
+set(YYJSON_DISABLE_INCR_READER ON CACHE BOOL "" FORCE)
+set(YYJSON_DISABLE_FILE ON CACHE BOOL "" FORCE)
+set(YYJSON_DISABLE_UTILS ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
-  rapidjson
-  GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
-  GIT_TAG 297637bc0a0f00dc504dbc1a47ebdaa577f8ae19
-  GIT_SUBMODULES ""
-  SOURCE_SUBDIR not-configured)
+  yyjson
+  GIT_REPOSITORY https://github.com/ibireme/yyjson.git
+  GIT_TAG 6447536015f3d600f3d65323b10976103b337ca7
+  EXCLUDE_FROM_ALL SYSTEM)
 
 FetchContent_Declare(
   fmt
@@ -52,10 +56,7 @@ FetchContent_Declare(
   GIT_TAG 208219daff58f2a7438f6931cc2ddc358acf33ef
   EXCLUDE_FROM_ALL SYSTEM)
 
-FetchContent_MakeAvailable(luau rapidjson fmt)
-
-add_library(rapidjson INTERFACE)
-target_include_directories(rapidjson SYSTEM INTERFACE ${rapidjson_SOURCE_DIR}/include)
+FetchContent_MakeAvailable(luau yyjson fmt)
 
 find_package(CURL REQUIRED)
 
@@ -100,7 +101,7 @@ configure_file(src/embedded.h.in embedded.h @ONLY)
 
 add_executable(hx src/main.cpp src/host.cpp src/host_files.cpp src/host_http.cpp src/host_judge.cpp src/host_proc.cpp src/host_sh.cpp src/host_spawn.cpp src/judge.cpp src/json.cpp src/sandbox.cpp)
 target_include_directories(hx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(hx PRIVATE Luau.Compiler Luau.VM rapidjson fmt::fmt-header-only CURL::libcurl)
+target_link_libraries(hx PRIVATE Luau.Compiler Luau.VM yyjson fmt::fmt-header-only CURL::libcurl)
 target_compile_options(
   hx
   PRIVATE -Wall
