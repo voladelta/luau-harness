@@ -581,8 +581,11 @@ leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set
   model can change: a sub-agent's turn runs on Sonnet under an Opus session when `M.model` is set for the turn
   and put back after it, and each request gets its own model's settings from `M.claude`. The Claude settings have
   been checked against a stand-in server, and `tests/live_test.py` passes against the live API on Opus 5.5 and
-  Sonnet 5.5. Haiku 5.5 fails one of its fifteen checks: told to use the edit function, it sometimes calls a tool
-  named `edit`, which does not exist, before it goes through `lua`; the file still comes out right.
+  Sonnet 5.5. Haiku 5.5 passes 13 to 15 of its fifteen checks from run to run: told to use the edit function, it
+  often tries a tool named `edit` first, which does not exist, is told so, and then goes through `lua`; the file
+  still comes out right. More effort does not help it: at `HX_EFFORT=high` two runs passed 13. Anthropic places
+  Haiku for high-volume and sub-agent work, and that is where it fits here: under a Sonnet or Opus session, not
+  as the session's own model.
 - No streaming: a reply appears when it is complete.
 - Tool calls in one reply run one after another.
 - The whole conversation is encoded again for every request. At 5 MB that takes 16 ms.
