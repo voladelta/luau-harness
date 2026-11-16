@@ -1211,9 +1211,9 @@ end
 -- (text, thinking, tool_use, tool_result), and tools given as {name, description, input_schema}. To use another
 -- wire format, replace M.request and M.turn.
 
--- What the loop sends to the Claude models it knows, beyond adaptive thinking, by model name. A model not listed
--- gets the plain request, so DeepSeek and older Claude models see nothing they might reject. DeepSeek's is plainer
--- still, with no thinking field: its models think by default.
+-- What the loop sends to the Claude models it knows, by model name: Claude's from 5.5 on, and none before. A
+-- model not listed gets the plain request, with no thinking field, since it thinks by default: DeepSeek's, and a
+-- Claude model newer than this list, which then sees nothing it might reject.
 --   effort     sent when M.effort is unset: these models think by effort alone, and the API's own default
 --              differs between them (medium on Opus and Haiku 5.5, high on Sonnet 5.5); medium is where
 --              Anthropic suggests starting agentic coding on all three
@@ -1237,7 +1237,8 @@ M.claude = {
 -- needs a different one:
 --   any claude-* model speaks the Claude API, so it gets the system prompt as a block with cache_control, which
 --     every Claude model accepts (DeepSeek ignores the field and gets a plain string)
---   only a model listed in M.claude gets the newer features of its entry; an older Claude model gets none
+--   only a model listed in M.claude gets the features of its entry; one newer than the list gets none until it
+--     is added
 -- Returns whether the model is Claude, and its M.claude entry or nil.
 local function claude_model(): (boolean, Features?)
 	return M.model:match("^claude%-") ~= nil, M.claude[M.model]
@@ -1330,9 +1331,9 @@ end
 -- that reply comes back however empty it is, since an empty one is an answer too.
 function M.request(system: string, messages: { Message }, compaction: { [string]: any }?): Reply
 	local is_claude, features = claude_model()
-	-- Thinking is on at both endpoints and is not the loop's to turn on or off: effort is the one control. A
-	-- DeepSeek model thinks by default, at high effort, so its request names no thinking at all. A Claude model is
-	-- sent `adaptive`, its only mode: the options below ride on it, and an older Claude model does not think unasked.
+	-- Thinking is on at both endpoints and is not the loop's to turn on or off: effort is the one control. Every
+	-- model hx is for thinks by default, DeepSeek's and Claude's from 5.5 on, so a request names thinking only to
+	-- carry the options below, for a model the loop knows; `adaptive` there is the default said aloud.
 	local thinking = { type = "adaptive" }
 	local betas = {}
 	local fallbacks = nil
@@ -1374,7 +1375,7 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 	local body = json.encode({
 		model = M.model,
 		max_tokens = M.max_output,
-		thinking = if is_claude then thinking else nil,
+		thinking = if features then thinking else nil,
 		output_config = effort and { effort = effort } or nil,
 		fallbacks = fallbacks,
 		cache_control = { type = "ephemeral" },
