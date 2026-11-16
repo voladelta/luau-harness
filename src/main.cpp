@@ -102,6 +102,9 @@ environment:
                     https://api.deepseek.com/v1/tools)
   HX_EXA_URL        Exa's search endpoint, which the built-in exa extension uses for deep search with
                     EXA_API_KEY, whatever the model (default https://api.exa.ai/search)
+  HX_DEEPSEEK_URL   DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude
+                    model is asked through, a sub-agent say, with DEEPSEEK_API_KEY (default
+                    https://api.deepseek.com/anthropic/v1/messages)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.
@@ -372,7 +375,7 @@ bool looks_secret(std::string name) {
 
 struct Secrets {
     std::string key;        // the model endpoint's
-    std::string tools_key;  // DEEPSEEK_API_KEY, for DeepSeek's tool endpoints whatever the model
+    std::string tools_key;  // DEEPSEEK_API_KEY, for DeepSeek's tool and Messages endpoints whatever the model
     std::string exa_key;    // EXA_API_KEY, for Exa's search endpoint whatever the model
 };
 
@@ -765,8 +768,8 @@ std::string tools_base_url() {
     return url;
 }
 
-// What host.llm and host.tool reach: host.llm posts to "llm", host.tool to the others by name. Each key goes to its
-// own URLs only.
+// What host.llm and host.tool reach: host.llm posts to "llm", the session's model endpoint, or to "deepseek" when
+// asked; host.tool to the others by name. Each key goes to its own URLs only.
 std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string& tools_url, const Secrets& secrets) {
     std::vector<hx::Endpoint> endpoints;
     endpoints.push_back({.name = "llm",
@@ -775,7 +778,18 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string&
                          .key = secrets.key,
                          .key_env = "",  // a local proxy may need none
                          .headers = {"anthropic-version: 2023-06-01"},
-                         .form = false});
+                         .form = false,
+                         .model = true});
+    // DeepSeek's Messages endpoint with DeepSeek's key, whatever the session's model: a session on a Claude model
+    // hands a sub-agent's turn to a DeepSeek model through it.
+    endpoints.push_back({.name = "deepseek",
+                         .url = env_or("HX_DEEPSEEK_URL", kDeepSeekUrl),
+                         .auth = hx::Auth::ApiKey,
+                         .key = secrets.tools_key,
+                         .key_env = kDeepSeekKeyEnv,
+                         .headers = {"anthropic-version: 2023-06-01"},
+                         .form = false,
+                         .model = true});
     for (const char* name : {"search", "fetch", "ocr"}) {
         endpoints.push_back({.name = name,
                              .url = fmt::format("{}/{}", tools_url, name),
@@ -783,7 +797,8 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string&
                              .key = secrets.tools_key,
                              .key_env = kDeepSeekKeyEnv,
                              .headers = {},
-                             .form = true});
+                             .form = true,
+                             .model = false});
     }
     endpoints.push_back({.name = "exa",
                          .url = env_or("HX_EXA_URL", kExaUrl),
@@ -791,7 +806,8 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string&
                          .key = secrets.exa_key,
                          .key_env = kExaKeyEnv,
                          .headers = {},
-                         .form = false});
+                         .form = false,
+                         .model = false});
     return endpoints;
 }
 

@@ -88,6 +88,7 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 | `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
 | `HX_TOOLS_URL` | base of DeepSeek's Search, Fetch and OCR endpoints, which the built-in `web` and `ocr` extensions call with `DEEPSEEK_API_KEY`, whatever the model | `https://api.deepseek.com/v1/tools` |
 | `HX_EXA_URL` | Exa's search endpoint, which the built-in `exa` extension calls with `EXA_API_KEY`, whatever the model | `https://api.exa.ai/search` |
+| `HX_DEEPSEEK_URL` | DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude model is asked through, a sub-agent say, with `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1/messages` |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
 Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143
@@ -134,8 +135,9 @@ Also in force:
   `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS` (`MY_API_KEY`, `OPENAI_APIKEY`, `PGPASSWORD`),
   or in `_PAT` or `_PWD` (`GITHUB_PAT`, `MYSQL_PWD`; `PWD` and `OLDPWD` stay). `--keep-env NAME` keeps one. Luau
   code never sees the key: the host adds it to requests for the configured endpoint only, and commands cannot
-  read it out of the host's memory. `DEEPSEEK_API_KEY` is kept the same way for DeepSeek's tool endpoints, and is
-  sent only to `HX_TOOLS_URL/search`, `/fetch` and `/ocr`; `EXA_API_KEY` too, sent only to `HX_EXA_URL`.
+  read it out of the host's memory. `DEEPSEEK_API_KEY` is kept the same way, whatever the model, and is sent only
+  to DeepSeek's tool endpoints, `HX_TOOLS_URL/search`, `/fetch` and `/ocr`, and to its Messages endpoint,
+  `HX_DEEPSEEK_URL`; `EXA_API_KEY` too, sent only to `HX_EXA_URL`.
 - The VM has a memory ceiling of 1 GiB. Code that runs into it gets the error "not enough memory", and what it
   held is collected at the next step, so the session goes on with its memory back.
 - Every process a command started is killed when `hx` exits, a daemon that called `setsid` included: `hx` is a
@@ -493,7 +495,7 @@ Everything Luau can do to the machine:
 
 | Primitive | Returns |
 |---|---|
-| `host.llm(body, {timeout=600, beta=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header. A third value is the seconds a `Retry-After` header asked for, when the reply had one; `host.tool` returns it too |
+| `host.llm(body, {timeout=600, beta=, endpoint=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header. A third value is the seconds a `Retry-After` header asked for, when the reply had one; `host.tool` returns it too. The request goes to the session's endpoint, or with `endpoint = "deepseek"` to DeepSeek's Messages endpoint with `DEEPSEEK_API_KEY`; no other name is taken |
 | `host.tool(name, request, {timeout=300})` | `status, text`, or `nil, error`: a POST to DeepSeek's `search`, `fetch` or `ocr` endpoint with `DEEPSEEK_API_KEY`, or, for `"exa"`, to Exa's search endpoint with `EXA_API_KEY`. A string `request` is sent as JSON; for DeepSeek, a table is sent as a form, whose `file` field is the path of a file to upload |
 | `host.sh(command, {timeout=120, read=, write=, hangup=})` | `{out, code, signal, timed_out, seconds}`; `seconds` runs from the fork to the exit. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends. With `hangup = true`, the command ends, or does not start, once stdin's writer has hung up, and `host.sh` raises `"hung up"` |
 | `host.judge(line?)` | `{lines}, pending`: sends a line to the judge, if given, and returns the answer it owes, waiting until 2 seconds before the `host.timed` limit in force; `pending` is how many it still owes. A line is refused while one is owed |
@@ -575,11 +577,13 @@ leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set
 
 ## Limits
 
-- One model endpoint per run, which must accept the Anthropic Messages format and an `x-api-key` header: the Claude
-  API for a `claude-*` model, DeepSeek's otherwise. The endpoint is fixed at start: a project loop that changes
-  `M.model` to a Claude model still talks to the endpoint `--model` or `HX_MODEL` chose. Within that endpoint the
-  model can change: a sub-agent's turn runs on Sonnet under an Opus session when `M.model` is set for the turn
-  and put back after it, and each request gets its own model's settings from `M.claude`. The Claude settings have
+- A session's endpoint is fixed at start. It must accept the Anthropic Messages format and an `x-api-key` header:
+  the Claude API for a `claude-*` model, DeepSeek's otherwise. The model can change for a turn, a sub-agent's
+  say, when `M.model` is set for the turn and put back after it. Under an Opus session a turn then runs on
+  Sonnet, with its own model's settings from `M.claude`, or on a DeepSeek model, which is asked through
+  DeepSeek's endpoint with `DEEPSEEK_API_KEY` and gets the plain request: Opus leads and `deepseek-flash` does
+  the sub-agents' work. The other way round is not there: a session on DeepSeek holds no key of Claude's, and a
+  project loop that changes `M.model` to a Claude model there still talks to DeepSeek. The Claude settings have
   been checked against a stand-in server, and `tests/live_test.py` passes against the live API on Opus 5.5 and
   Sonnet 5.5. Haiku 5.5 passes 13 to 15 of its fifteen checks from run to run: told to use the edit function, it
   often tries a tool named `edit` first, which does not exist, is told so, and then goes through `lua`; the file

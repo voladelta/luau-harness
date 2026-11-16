@@ -4,8 +4,10 @@
 -- parts meant to be replaced are fields of M and are always called through M.
 --
 -- The host supplies a small kernel and nothing else:
---   host.llm(body, {timeout=, beta=}) -> status, text, retry_after? | nil, error     POST to the endpoint; the host
---                                                     adds the API key, and beta as the anthropic-beta header
+--   host.llm(body, {timeout=, beta=, endpoint=}) -> status, text, retry_after? | nil, error     POST to the endpoint;
+--                                                     the host adds the API key, and beta as the anthropic-beta
+--                                                     header. endpoint = "deepseek" is DeepSeek's, with its key,
+--                                                     whatever model the session started on
 --   host.sh(command, {timeout=}) -> {out=, code=, signal=, timed_out=}
 --   host.read(path), host.write(path, data), host.list(dir)
 --   host.clip(text, limit) -> text | head, tail       text when it fits in limit bytes; else up to limit // 2 from
@@ -1361,7 +1363,14 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 		tools = tool_specs(),
 		compaction = compaction,
 	})
-	local options = { beta = #betas > 0 and table.concat(betas, ",") or nil }
+	-- The session's endpoint is the one hx picked for host.model, the model it started with. M.model can differ for
+	-- a turn, a sub-agent's say. Among Claude's models nothing else changes. A model of DeepSeek's under a session
+	-- on a Claude model goes to DeepSeek's own endpoint, which the host reaches with DEEPSEEK_API_KEY. The other
+	-- way round has no endpoint: a session on DeepSeek holds no key of Claude's.
+	local options = {
+		beta = #betas > 0 and table.concat(betas, ",") or nil,
+		endpoint = if not is_claude and host.model:match("^claude%-") then "deepseek" else nil,
+	}
 	local attempts = 5
 	for attempt = 1, attempts do
 		local status, text, retry_after = host.llm(body, options)

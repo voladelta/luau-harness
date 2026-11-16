@@ -427,6 +427,60 @@ class AgentTest(unittest.TestCase):
         # DeepSeek caches by itself and ignores cache_control: the system prompt goes as the plain string.
         self.assertIsInstance(self.model.requests[2]["system"], str)
 
+    def test_a_deepseek_sub_agent_under_a_claude_session_goes_to_deepseek_with_its_key(self):
+        deepseek = Model()
+        self.addCleanup(deepseek.server_close)
+        self.addCleanup(deepseek.shutdown)
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write('local M = host.load(host.default_loop, "=loop")()\n'
+                    'table.insert(M.functions, { name = "delegate", usage = "delegate(model, task) -> text", '
+                    'run = function(model, task)\n'
+                    '\tlocal talk = M.Conversation.new()\n\ttalk:say(task)\n'
+                    '\tlocal outer = M.model\n\tM.model = model\n'
+                    '\tlocal ok, err = pcall(M.turn, "the sub-agent\'s system prompt", talk)\n'
+                    '\tM.model = outer\n\tif not ok then error(err, 0) end\n'
+                    '\treturn talk.messages[#talk.messages].content[1].text\nend })\nreturn M\n')
+        ds_key = "ds-model-key-7"
+        deepseek.script = [call("bash", {"command": "echo from flash"}, "s1"), say("flash is done")]
+        done = self.run_hx("--model", "opus", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY=ds_key, script=[
+            call("lua", {"code": "return delegate('deepseek-flash', 'a sub-task')"}, "c1"),
+            call("bash", {"command": "env"}, "c2"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tool_results()[0], "flash is done")
+        # The sub-agent's two requests went to DeepSeek's endpoint, with DeepSeek's key and the plain request.
+        self.assertEqual([r["model"] for r in deepseek.requests], ["deepseek-flash", "deepseek-flash"])
+        for sent, headers in zip(deepseek.requests, deepseek.headers):
+            self.assertEqual(headers["x-api-key"], ds_key)
+            self.assertNotIn("anthropic-beta", headers)
+            self.assertEqual(sent["system"], "the sub-agent's system prompt")
+            self.assertEqual(sent["thinking"], {"type": "adaptive"})
+            self.assertNotIn("fallbacks", sent)
+        self.assertEqual(deepseek.requests[0]["messages"], [{"role": "user", "content": "a sub-task"}])
+        # The session's own stayed on Claude's, with its key and its settings, before the sub-agent and after it.
+        self.assertEqual([r["model"] for r in self.model.requests], ["claude-opus-5-5"] * 3)
+        for headers in self.model.headers:
+            self.assertEqual(headers["x-api-key"], KEY)
+            self.assertIn("server-side-fallback", headers["anthropic-beta"])
+        # Neither key reaches the other endpoint, a model or a command.
+        self.assertNotIn(ds_key, json.dumps(self.model.requests))
+        self.assertNotIn(KEY, json.dumps(deepseek.requests))
+        self.assertNotIn(ds_key, self.tool_results()[1])
+        # host.llm takes an endpoint by name only, and says so for one it has none of or no key for.
+        script = ("print(pcall(host.llm, '{}', { endpoint = 'search' }))\n"
+                  "print(pcall(host.llm, '{}', { endpoint = 'https://example.com' }))\n"
+                  "print(host.llm('{}', { endpoint = 'deepseek' }))\n"
+                  "print(pcall(host.tool, 'deepseek', '{}'))\n")
+        done = self.run_hx("--run", "-", stdin=script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.splitlines()
+        self.assertIn("no endpoint search", lines[0])
+        self.assertIn("no endpoint https://example.com", lines[1])
+        self.assertEqual(lines[2], "nil\tno DEEPSEEK_API_KEY: hx was started without one, so host.llm cannot reach "
+                         "the deepseek endpoint")
+        self.assertIn("no tool deepseek; the tools are search, fetch, ocr and exa", lines[3])
+
     def test_the_model_follows_the_key_that_is_set(self):
         show = ["--run", "-"]
         script = "print(host.env('HX_MODEL'))"

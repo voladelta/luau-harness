@@ -26,13 +26,14 @@ enum class Auth : std::uint8_t {
 // A URL that host.llm or host.tool posts to, with the key that goes to it and nowhere else. Luau code never sees a
 // key.
 struct Endpoint {
-    std::string name;                  // "llm" for host.llm; for host.tool, the name Luau asks for
+    std::string name;                  // "llm" or "deepseek" for host.llm; for host.tool, the name Luau asks for
     std::string url;                   // posted to as it is; a redirect is not followed
     Auth auth = Auth::ApiKey;          // how the key is sent
     std::string key;                   // empty for none, and then no key header is sent
     std::string key_env;               // where the key comes from; when set, a request without a key is refused
     std::vector<std::string> headers;  // more request headers, each "Name: value"
     bool form = false;                 // a table request is sent as a multipart form; otherwise JSON text only
+    bool model = false;                // a model's Messages endpoint: host.llm's, and none of host.tool's
 };
 
 struct HostConfig {
@@ -52,8 +53,10 @@ struct HostConfig {
 // The machine as Luau sees it. open() registers the global `host` table, which is the whole interface between
 // the VM and the system:
 //
-//   host.llm(body, {timeout=600, beta=}) -> status, text, retry_after? | nil, error     beta: the anthropic-beta
-//                                                     header; retry_after: the seconds a Retry-After header asked for
+//   host.llm(body, {timeout=600, beta=, endpoint=}) -> status, text, retry_after? | nil, error     beta: the
+//                                                     anthropic-beta header; retry_after: the seconds a Retry-After
+//                                                     header asked for; endpoint: "deepseek" for DeepSeek's Messages
+//                                                     endpoint with its key, whatever the session's model
 //   host.tool(name, request, {timeout=300}) -> status, text | nil, error    DeepSeek's search, fetch or ocr, or
 //                                                     Exa's search for "exa"; request is JSON text, or (DeepSeek
 //                                                     only) a form table whose `file` is a path. Each name is an

@@ -77,21 +77,27 @@ struct CurlMimeDeleter {
 };
 using CurlMime = std::unique_ptr<curl_mime, CurlMimeDeleter>;
 
-// The `beta` field of host.llm's options: the anthropic-beta header, a comma-separated list of beta names. Only
-// letters, digits, '-', '_' and ',' are taken, so the value cannot end the header and start another.
-std::string beta_option(lua_State* L, int idx) {
+// A string field of the options table at idx, or `fallback` when there is no table or no such field.
+std::string string_option(lua_State* L, int idx, const char* field, std::string_view fallback) {
     if (lua_isnoneornil(L, idx)) {
-        return {};
+        return std::string(fallback);
     }
     luaL_checktype(L, idx, LUA_TTABLE);
-    lua_getfield(L, idx, "beta");
-    std::string value;
+    lua_getfield(L, idx, field);
+    std::string value(fallback);
     if (!lua_isnil(L, -1)) {
         std::size_t length = 0;
         const char* text = luaL_checklstring(L, -1, &length);
         value.assign(text, length);
     }
     lua_pop(L, 1);
+    return value;
+}
+
+// The `beta` field of host.llm's options: the anthropic-beta header, a comma-separated list of beta names. Only
+// letters, digits, '-', '_' and ',' are taken, so the value cannot end the header and start another.
+std::string beta_option(lua_State* L, int idx) {
+    const std::string value = string_option(L, idx, "beta", "");
     for (const char c : value) {
         if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '-' && c != '_' && c != ',') {
             luaL_error(L, "host.llm: beta is beta names separated by commas, not %s", value.c_str());
@@ -171,7 +177,7 @@ void set_body(CURL* curl, std::string_view body) {
 [[noreturn]] void no_such_tool(lua_State* L, std::string_view name, const std::vector<Endpoint>& endpoints) {
     std::vector<std::string_view> names;
     for (const Endpoint& each : endpoints) {
-        if (each.name != "llm") {
+        if (!each.model) {
             names.push_back(each.name);
         }
     }
@@ -270,9 +276,19 @@ int Host::llm(lua_State* L) {
     const double timeout = host.within_limit(option(L, 2, "timeout", 600));
     raise_if_signaled(L);  // a stop in progress starts no request
     const std::string beta = beta_option(L, 2);
-    const Endpoint* endpoint = host.endpoint("llm");
+    // The session's endpoint, or another model endpoint by its name. Only names are taken, as in host.tool, so each
+    // key reaches its own URL and nothing else.
+    const std::string name = string_option(L, 2, "endpoint", "llm");
+    const Endpoint* endpoint = host.endpoint(name);
+    if (endpoint == nullptr || !endpoint->model) {
+        luaL_error(L, "host.llm: no endpoint %s; the endpoints are llm, the session's own, and deepseek", name.c_str());
+    }
+    if (endpoint->key.empty() && !endpoint->key_env.empty()) {
+        return fail(L, fmt::format("no {}: hx was started without one, so host.llm cannot reach the {} endpoint",
+                                   endpoint->key_env, endpoint->name));
+    }
     CURL* curl = host.curl();
-    if (endpoint == nullptr || curl == nullptr) {
+    if (curl == nullptr) {
         return fail(L, "cannot start an HTTP request");
     }
     set_body(curl, {body, length});
@@ -288,8 +304,8 @@ int Host::llm(lua_State* L) {
 int Host::tool(lua_State* L) {
     const std::string_view name = check_cstring(L, 1);
     Host& host = of(L);
-    const Endpoint* endpoint = name == "llm" ? nullptr : host.endpoint(name);
-    if (endpoint == nullptr) {
+    const Endpoint* endpoint = host.endpoint(name);
+    if (endpoint == nullptr || endpoint->model) {
         no_such_tool(L, name, host.config_.endpoints);
     }
     const bool form = endpoint->form && lua_istable(L, 2);
