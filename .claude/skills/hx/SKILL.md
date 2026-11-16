@@ -49,8 +49,9 @@ hx --judge KIT [options] TASK...      the agent, with a judge (see "The judge")
 - The answer goes to stdout, progress and errors to stderr: `hx -q "..." > answer.txt`. Exit status: 0 done, 1 the
   run failed, 2 bad usage or hx cannot start here, 130 interrupted, 143 terminated.
 - When no person is at the terminal, pass `--no-input` and the task as words or on stdin. Stdin is read only when
-  there are no task words: `git diff | hx review this` sends the words alone. A task takes minutes, so give the
-  command a long timeout or run it in the background.
+  there are no task words: `git diff | hx review this` sends the words alone, and
+  `{ echo review this change; git diff; } | hx` sends both. A task takes minutes, so give the command a long
+  timeout or run it in the background.
 - The wall: hx writes only the project directory and its own `$TMPDIR`, and reads those plus the system
   directories. A toolchain in the home directory needs `--ro PATH` or `--rw PATH`. Variables that look like
   secrets are taken out of the environment of commands; `--keep-env NAME` keeps one. The network is open.

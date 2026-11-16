@@ -63,6 +63,10 @@ word that is not an option on, everything is the task, and `--` ends the options
 every word goes to the script, even one that starts with `-`. A value can follow its option as the next word or
 after `=`: `--ro /opt/sdk` and `--ro=/opt/sdk` are the same (the shell does not expand `~` after `=`).
 
+With a task on the command line, stdin is not read: it stays there for the model's code, which reads a line of
+it with `host.input`. Text that goes with an instruction goes on stdin with it:
+`{ echo review this change; git diff; } | hx`.
+
 | Option | Meaning |
 |---|---|
 | `--judge KIT` | judge the model's work with the kit in directory `KIT`, which must lie outside the wall (see "The judge") |

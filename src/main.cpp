@@ -53,7 +53,8 @@ constexpr std::string_view kUsage = R"(hx: a coding agent for the project in the
 
 usage:
   hx [options] [TASK...]              run the agent on TASK; with no task, read it from stdin, or
-                                      start a prompt when stdin is a terminal
+                                      start a prompt when stdin is a terminal. With a task, stdin
+                                      is not read: it is left for the model's code
   hx [options] --run FILE [ARGS...]   run a Luau script with the host primitives (FILE - reads stdin);
                                       every word after FILE goes to the script, even one starting with -
   hx --init [--full]                  write .hx/loop.luau, a loop that starts from the built-in one;
@@ -63,7 +64,7 @@ usage:
 
 examples:
   hx "add a --json flag to the export command and test it"
-  git diff | hx review this change
+  { echo review this change; git diff; } | hx
   hx --ro ~/.rustup --ro ~/.cargo --rw ~/.cargo/registry "fix the failing test"
   hx -q "summarise the README" > summary.txt
 
