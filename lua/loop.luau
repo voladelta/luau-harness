@@ -22,6 +22,7 @@
 --                                                     or Exa's search for "exa"; the host adds the key
 --   host.tools, host.exa                              DEEPSEEK_API_KEY, EXA_API_KEY is there
 --   host.extensions                                   the built-in extensions' sources, by name
+--   host.skills                                       the built-in skills' SKILL.md texts, by name
 --   host.judge(line?) -> {lines}, pending, host.judged     the judge's channel, with --judge KIT
 --   json.encode, json.decode, json.array, json.null
 -- Ctrl-C raises "interrupted" and SIGTERM "terminated", again at every step, until the outermost host.try or
@@ -70,8 +71,9 @@ type Tool = {
 	parameters: Schema?,
 	run: ({ [string]: any }) -> (string, boolean?),
 }
--- A skill found in one of M.skill_dirs (see M.skills).
-type Skill = { name: string, description: string, dir: string, path: string, hidden: boolean }
+-- A skill found in one of M.skill_dirs, or built into hx (see M.skills). A built-in one has no directory: its
+-- SKILL.md is `source`, and `path` says where it is from instead of naming a file.
+type Skill = { name: string, description: string, dir: string, path: string, hidden: boolean, source: string? }
 -- What M.claude says of a model the loop knows.
 type Features = { effort: string?, fallbacks: string?, display: string?, compaction: boolean? }
 
@@ -391,7 +393,8 @@ end
 -- Only name, description and disable-model-invocation are read: hx has one tool and one wall, so allowed-tools,
 -- model and hooks mean nothing here. Directories are searched in this order, and the first skill of a name wins.
 -- A directory in the home directory is outside the wall unless hx was started with --ro for it; then it is
--- simply not found.
+-- simply not found. hx has one skill built in (host.skills: hx, on using and extending hx itself), which comes
+-- after every directory, so a skill of the same name in any of them takes its place.
 
 local home = host.env("HOME")
 M.skill_dirs = { ".hx/skills/", ".agents/skills/", ".claude/skills/" }
@@ -459,31 +462,48 @@ local function skill_key(name: string): string
 	return (name:lower():gsub("[%-_%.%s]", ""))
 end
 
--- Every skill that can be found now: {name, description, dir, path, hidden}, in the order of M.skill_dirs and then
--- by directory name. Found anew on each call, so a skill written in this session is found too.
+-- Every skill that can be found now: {name, description, dir, path, hidden, source?}, in the order of M.skill_dirs
+-- and then by directory name, and after those the ones built into hx, by name. Found anew on each call, so a skill
+-- written in this session is found too.
 function M.skills(): { Skill }
 	local skills: { Skill }, seen = {}, {}
+	-- `text` is a SKILL.md; `fallback` names the skill when its front matter does not.
+	local function add(text: string, fallback: string, dir: string, path: string, source: string?)
+		local fields = M.skill_front_matter(text)
+		local name = trim(fields.name or "")
+		name = name ~= "" and name or fallback
+		if not seen[name] then
+			seen[name] = true
+			table.insert(skills, {
+				name = name,
+				description = trim(M.printable(fields.description or "")),
+				dir = dir,
+				path = path,
+				hidden = fields["disable-model-invocation"] == "true",
+				source = source,
+			})
+		end
+	end
 	for _, dir in M.skill_dirs do
 		for _, entry in host.list(dir) or {} do
-			local dir_name = entry:match("^(.+)/$")
-			local path = dir_name and dir .. dir_name .. "/SKILL.md"
-			local text: string? = path and host.read(path)
-			if text then
-				local fields = M.skill_front_matter(text)
-				local name = trim(fields.name or "")
-				name = name ~= "" and name or dir_name
-				if not seen[name] then
-					seen[name] = true
-					table.insert(skills, {
-						name = name,
-						description = trim(M.printable(fields.description or "")),
-						dir = dir .. dir_name .. "/",
-						path = path,
-						hidden = fields["disable-model-invocation"] == "true",
-					})
+			local dir_name: string? = entry:match("^(.+)/$")
+			if dir_name then
+				local path = dir .. dir_name .. "/SKILL.md"
+				local text: string? = host.read(path)
+				if text then
+					add(text, dir_name, dir .. dir_name .. "/", path, nil)
 				end
 			end
 		end
+	end
+	local built_in: { string } = {}
+	for name in host.skills do
+		table.insert(built_in, name)
+	end
+	table.sort(built_in)
+	for _, name in built_in do
+		local text: string = host.skills[name]
+		add(text, name, "", "built into hx", text)
 	end
 	return skills
 end
@@ -502,7 +522,7 @@ end
 local function skill_line(skill: Skill): string
 	local description = skill.description ~= "" and cut(skill.description, M.skill_description_limit)
 		or "(no description)"
-	return ("- %s: %s"):format(skill.name, description)
+	return ("- %s%s: %s"):format(skill.name, skill.source and " (built in)" or "", description)
 end
 
 M.skill_files_shown = 30 -- files of a loaded skill named, with their paths, in its heading
@@ -545,7 +565,7 @@ end
 -- reads the list and picks better than a fuzzy match would.
 function M.skill(name: string): string
 	local skills = M.skills()
-	if #skills == 0 then
+	if #skills == 0 then -- only where hx has none built in, or a project took them out of host.skills
 		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
 			.. table.concat(M.skill_dirs, ", ") .. "."
 	end
@@ -565,12 +585,18 @@ function M.skill(name: string): string
 	end
 	if #found == 1 then
 		local skill = found[1]
-		local source: string?, err: string? = host.read(skill.path)
+		local source: string?, err: string? = skill.source, nil
+		if not source then
+			source, err = host.read(skill.path)
+		end
 		if not source then
 			error(("skill: %s: %s"):format(skill.path, tostring(err)), 0)
 		end
 		local _, body = M.skill_front_matter(source)
 		progress("  skill " .. skill.name)
+		if skill.source then -- no directory, so no files and no paths of its own
+			return ("[skill %s, built into hx. Every path in it is the project's.]\n\n%s"):format(skill.name, trim(body))
+		end
 		local files = skill_files(skill.dir)
 		local head = ("[skill %s, in %s. A path in it that names one of the skill's own files is relative to that "
 			.. "directory; everything else is the project's."):format(skill.name, skill.dir)
@@ -1373,7 +1399,11 @@ function M.system_prompt(): string
 			.. "a table of functions. Call one from your code as ext(\"NAME\").fn(...); write it with write(). Extensions stay with "
 			.. "the project, so write one when you notice a chore you will meet again, and keep it as small as the chore. "
 			.. "A procedure you will follow again, rather than code, is a skill: .hx/skills/NAME/SKILL.md, with front "
-			.. "matter giving its name and a description of when to use it.",
+			.. "matter giving its name and a description of when to use it."
+			-- The skill hx is built with says the rest. Without the pointer a model takes this paragraph for all
+			-- there is to know, and never loads it.
+			.. (host.skills.hx and " skill(\"hx\") says which of these a need calls for and how each is written "
+				.. "and tried, and covers the loop, sub-agents and scripts: load it before you add to the harness." or ""),
 		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
 			.. "range of lines or go on through a large file. Read a file before you edit it, unless "
 			.. "you wrote or edited it yourself in this session."

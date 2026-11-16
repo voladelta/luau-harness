@@ -44,6 +44,7 @@ struct HostConfig {
     bool quiet = false;               // host.quiet: --quiet, so the loop leaves out progress lines
     std::string default_loop;         // host.default_loop: the built-in loop's source
     std::vector<std::pair<std::string, std::string>> extensions;  // host.extensions: built-in ones, name and source
+    std::vector<std::pair<std::string, std::string>> skills;      // host.skills: built-in ones, name and SKILL.md
     std::vector<Rule> system_rules;  // what every wall lets in: system directories, harmless devices, trust roots
     UniqueFd judge;                  // a line-based channel to the judge process (--judge); invalid for none
 };
@@ -93,7 +94,8 @@ struct HostConfig {
 //   host.tools                                        a DeepSeek key is there for host.tool
 //   host.exa                                          an Exa key is there for host.tool("exa")
 //   host.extensions                                   the built-in extensions' sources, by name
-//   host.judged                                       a judge is there for host.judge
+//   host.skills                                       the built-in skills' SKILL.md texts, by name
+//   host.judged                                      a judge is there for host.judge
 //
 // A signal starts a stop, which behaves like a time limit that has already passed. SIGINT raises "interrupted",
 // SIGTERM and SIGHUP raise "terminated", and every VM safepoint and every blocking call (llm, sh, sleep, input,

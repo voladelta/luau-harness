@@ -73,9 +73,9 @@ find_package(CURL REQUIRED)
 
 # The default loop is compiled into the binary, so hx works in a directory that has no .hx/ yet and still
 # starts when a project's own loop is broken. The overlay, which `hx --init` writes, the judge and the built-in
-# extensions are embedded the same way, each as a raw string literal in embedded.h.
+# extensions and skills are embedded the same way, each as a raw string literal in embedded.h.
 
-# Reads a Luau file into `var`, and reconfigures when it changes.
+# Reads a file into `var`, and reconfigures when it changes.
 function(hx_embed var path)
   file(READ ${path} source)
   # The source goes between R"HXLUAU( and )HXLUAU"; the closing delimiter inside it would end the string early.
@@ -100,6 +100,17 @@ foreach(path IN LISTS HX_EXT_FILES)
   get_filename_component(name ${path} NAME_WLE)
   hx_embed(source ${path})
   string(APPEND HX_EXTENSIONS "    {\"${name}\", R\"HXLUAU(${source})HXLUAU\"},\n")
+endforeach()
+
+# The built-in skills, by name. Each is the SKILL.md of this repository's own skill of that name, in
+# .claude/skills/, where Claude Code and hx both find it when they work here: one text for both, and for every
+# project hx runs in. A skill is listed here, not globbed, because a skill for working on this repository alone
+# does not belong in every project.
+set(HX_SKILL_NAMES hx)
+set(HX_SKILLS "")
+foreach(name IN LISTS HX_SKILL_NAMES)
+  hx_embed(source ${CMAKE_CURRENT_SOURCE_DIR}/.claude/skills/${name}/SKILL.md)
+  string(APPEND HX_SKILLS "    {\"${name}\", R\"HXLUAU(${source})HXLUAU\"},\n")
 endforeach()
 configure_file(src/embedded.h.in embedded.h @ONLY)
 

@@ -23,6 +23,11 @@ inline constexpr std::string_view kJudge = R"HXLUAU(@HX_JUDGE_SOURCE@)HXLUAU";
 inline constexpr std::pair<std::string_view, std::string_view> kExtensions[] = {
 @HX_EXTENSIONS@};
 
+// The built-in skills, in name order: the text of each one's SKILL.md, which skill(NAME) loads when no skill
+// directory has one of that name. CMakeLists.txt writes one {NAME, text} line per skill it lists.
+inline constexpr std::pair<std::string_view, std::string_view> kSkills[] = {
+@HX_SKILLS@};
+
 }  // namespace hx
 
 #endif  // HX_EMBEDDED_H_

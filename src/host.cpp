@@ -437,12 +437,16 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "exa");
     lua_pushboolean(L, config_.judge.valid() ? 1 : 0);
     lua_setfield(L, -2, "judged");
-    lua_createtable(L, 0, static_cast<int>(config_.extensions.size()));
-    for (const auto& [name, source] : config_.extensions) {
-        lua_pushlstring(L, source.data(), source.size());
-        lua_setfield(L, -2, name.c_str());
+    // The built-in extensions and skills, each a table of texts by name.
+    for (const auto& [field, texts] :
+         {std::pair{"extensions", &config_.extensions}, std::pair{"skills", &config_.skills}}) {
+        lua_createtable(L, 0, static_cast<int>(texts->size()));
+        for (const auto& [name, text] : *texts) {
+            lua_pushlstring(L, text.data(), text.size());
+            lua_setfield(L, -2, name.c_str());
+        }
+        lua_setfield(L, -2, field);
     }
-    lua_setfield(L, -2, "extensions");
     lua_pop(L, 1);
 }
 

@@ -1413,7 +1413,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("without DEEPSEEK_API_KEY", results[3])
         self.assertIn("without EXA_API_KEY", results[4])
         self.assertIn("no EXA_API_KEY", results[5])
-        self.assertNotIn("(built in)", self.model.requests[0]["system"])
+        self.assertNotIn("Extensions:", self.model.requests[0]["system"])  # none is listed without its key
 
     def test_ocr_of_a_file_outside_the_wall_is_refused_before_sending(self):
         tools = Tools()
@@ -1437,6 +1437,27 @@ class AgentTest(unittest.TestCase):
             f.write("Run the tests with make check.")
         self.run_hx("go", script=[say("ok")])
         self.assertIn("Run the tests with make check.", self.model.requests[0]["system"])
+
+    def test_the_hx_skill_is_built_in_and_a_project_s_own_takes_its_place(self):
+        done = self.run_hx("go", script=[call("lua", {"code": "return skill('hx')"}, "c1"), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # No directory here holds a skill, and the prompt still lists the one hx is built with.
+        self.assertIn("\n- hx (built in): Use, extend or change hx", self.model.requests[0]["system"])
+        # The paragraph on extending hx points to it: a model that is not told loads nothing and works from that
+        # paragraph alone.
+        self.assertIn('skill("hx") says which of these a need calls for', self.model.requests[0]["system"])
+        # It loads whole: the text after the front matter of the file Claude Code reads in this repository.
+        body = read(REPO, ".claude", "skills", "hx", "SKILL.md").split("---\n", 2)[2].strip()
+        self.assertEqual(self.tool_results()[0], "[skill hx, built into hx. Every path in it is the project's.]\n\n" + body)
+        # A project's own skill of that name takes its place.
+        os.makedirs(os.path.join(self.project, ".hx", "skills", "hx"))
+        with open(os.path.join(self.project, ".hx", "skills", "hx", "SKILL.md"), "w") as f:
+            f.write("---\nname: hx\ndescription: This project's own.\n---\nOurs.\n")
+        self.run_hx("again", script=[call("lua", {"code": "return skill('hx')"}, "c2"), say("ok")])
+        self.assertIn("\n- hx: This project's own.", self.model.requests[-2]["system"])
+        self.assertNotIn("(built in)", self.model.requests[-2]["system"])
+        self.assertEqual(self.tool_results()[1], "[skill hx, in .hx/skills/hx/. A path in it that names one of the skill's "
+                         "own files is relative to that directory; everything else is the project's.]\n\nOurs.")
 
     def write_files(self, *paths):
         for path in paths:

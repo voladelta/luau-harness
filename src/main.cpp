@@ -820,6 +820,9 @@ hx::HostConfig host_config(const Options& options, const ModelChoice& model, boo
     for (const auto& [name, source] : hx::kExtensions) {
         config.extensions.emplace_back(name, source);
     }
+    for (const auto& [name, text] : hx::kSkills) {
+        config.skills.emplace_back(name, text);
+    }
     config.ca_bundle = ca_bundle();
     return config;
 }

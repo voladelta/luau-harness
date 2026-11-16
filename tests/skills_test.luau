@@ -1,8 +1,14 @@
--- Skills: front matter, discovery, loading by name, the list for an unknown name and the system prompt's index.
+-- Skills: front matter, discovery, loading by name, the list for an unknown name, the system prompt's index, and
+-- the skills built into hx.
 -- Run with: hx --ro tests --run tests/skills_test.luau
 
 local loop = assert(host.load(host.default_loop, "=loop"))()
 host.quiet = true
+
+-- hx has skills built in (host.skills), which every project gets. The checks of directories are made without
+-- them; the last section puts them back.
+local built_in = host.skills
+host.skills = {}
 
 -- check, has, lacks and the report at the end are shared, in check.luau beside this file.
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
@@ -157,6 +163,47 @@ has("and how to see what they are for", prompt, "lists them with their descripti
 
 loop.skill_dirs = { missing }
 lacks("no skills, no part of the prompt", loop.system_prompt(), "Skills are instructions")
+lacks("and no pointer to a skill that is not there", loop.system_prompt(), 'skill("hx")')
+
+-- Built in ----------------------------------------------------------------------------------------------------
+
+-- A built-in skill is the text of a SKILL.md, with no directory.
+loop.skill_index_full = 30
+host.skills = {
+	xlsx = "---\nname: xlsx\ndescription: The built-in xlsx, which loses to a project's.\n---\nBuilt-in sheets.\n",
+	tour = "---\ndescription: Shows a newcomer round.\n---\nStart at the door.\n",
+}
+check("with no directory, the built-in skills are the skills", #loop.skills(), 2)
+has("the prompt lists one, marked", loop.system_prompt(), "- tour (built in): Shows a newcomer round.")
+check("one without a name takes the name it is built in under, and loads with no directory", loop.skill("tour"),
+	"[skill tour, built into hx. Every path in it is the project's.]\n\nStart at the door.")
+has("case does not matter here either", loop.skill("Tour"), "Start at the door.")
+has("an unknown name lists them, marked", loop.skill("nothing"), "- xlsx (built in): The built-in xlsx")
+
+loop.skill_dirs = { first, second, missing }
+names = {}
+for _, s in loop.skills() do
+	table.insert(names, s.name)
+end
+check("they come after every directory, and a directory's skill of a name takes the place of one",
+	table.concat(names, " "), "long no-name pdf-tools release-notes secret xlsx pdf_tools tour")
+has("the project's xlsx is the one that loads", loop.skill("xlsx"), "[skill xlsx, in " .. first .. "xlsx/.")
+lacks("and the one that is listed", loop.skill("nothing"), "- xlsx (built in)")
+
+-- The skill hx is built with, on using and extending hx itself.
+host.skills = built_in
+loop.skill_dirs = { missing }
+fields = loop.skill_front_matter(built_in.hx or "")
+check("hx is built in, under its own name", fields.name, "hx")
+check("its description fits a listing uncut", (utf8.len(fields.description or "") or 0) <= loop.skill_description_limit,
+	true)
+check("and is there", (fields.description or "") ~= "", true)
+loaded = loop.skill("hx")
+has("it loads", loaded, "[skill hx, built into hx.")
+check("and fits a tool result unclipped", #loaded < loop.output_limit, true)
+has("the prompt lists it", loop.system_prompt(), "- hx (built in): ")
+has("and points to it where it says how hx is extended", loop.system_prompt(),
+	'skill("hx") says which of these a need calls for')
 
 host.sh(("rm -rf '%s'"):format(root))
 

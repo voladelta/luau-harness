@@ -188,8 +188,8 @@ an assignment such as `host.sh = nil` raises "host is read-only" instead of brea
 text such code passes to `host.log` and `host.input` is made printable, so it cannot send an escape sequence to
 the terminal. `_G` there is the code's own globals, and a chunk loaded with `host.load` and no environment gets
 globals of its own. `for key, value in view` iterates a view; `pairs` and `next` see nothing in one. The views
-stop mistakes, not code that digs with `rawset` or `debug` on purpose, and `host.extensions` and `host.args` are
-still the tables themselves. The loop, a project's `.hx/loop.luau` and `--run` scripts use the real host.
+stop mistakes, not code that digs with `rawset` or `debug` on purpose, and `host.extensions`, `host.skills` and
+`host.args` are still the tables themselves. The loop, a project's `.hx/loop.luau` and `--run` scripts use the real host.
 
 `hx --init` writes `.hx/loop.luau` from `lua/overlay.luau`:
 
@@ -209,9 +209,13 @@ starts as `host.model`, the model `--model` or `HX_MODEL` chose with its alias r
 
 The system prompt shows the project's layout, so the model's first call need not be a listing: the files git
 lists, tracked or new and not ignored, as a tree of at most `M.layout_lines` (60) lines, directories first. This
-repository fits whole; in 15 lines it is:
+repository fits whole; in 19 lines it is:
 
 ```
+.claude/
+  skills/
+    hx/
+      SKILL.md
 lua/
   ext/ (4 files)
   judge.luau
@@ -438,7 +442,7 @@ Group commits by area, newest first. Run scripts/authors.sh for the credits line
 ```
 
 hx looks in `.hx/skills/`, `.agents/skills/` and `.claude/skills/` in the project, then `~/.agents/skills/` and
-`~/.claude/skills/`, and the first skill of a name wins. The two in your home directory are outside the wall, so
+`~/.claude/skills/`, then among the skills built into it (below), and the first skill of a name wins. The two in your home directory are outside the wall, so
 they are found only when you open them: `hx --ro ~/.claude/skills "..."`. A skill with
 `disable-model-invocation: true` is left out of the prompt and of the list, but still loads by its name. Other
 fields, such as `allowed-tools`, `model` and `hooks`, are ignored: there is one tool, and the wall is the same for
@@ -455,6 +459,25 @@ from its code:
 
 Scripts in a skill run through `bash`, inside the wall like any other command. A skill in the project can be
 written by the model, and a skill in a repository you cloned is text from whoever wrote it, like its README.
+
+### Built in: hx
+
+One skill comes with hx, `hx`, on using and extending hx itself: starting it from a shell, scripts with `--run`,
+the judge, and what to make for which need, from an extension or a skill to a function or a sub-agent in
+`.hx/loop.luau` to a change in hx's source. Every session's prompt lists it, marked `(built in)`, and the prompt's
+paragraph on extending hx points to it, because a model that is not pointed there takes that paragraph for all
+there is to know and loads nothing. Built-in skills come after every skill directory, so a project's own skill
+named `hx` takes its place. Having no directory, a built-in skill is one text with no files beside it.
+
+Its text is `.claude/skills/hx/SKILL.md` in this repository, compiled into the binary. Claude Code looks there
+too, so when it works on hx it follows the same file. To give the skill to Claude Code everywhere, so that it can
+hand a task to hx or write an extension for it in any project, write it out of the binary, from any project
+directory:
+
+```
+mkdir -p ~/.claude/skills/hx
+echo 'print(host.skills.hx)' | hx --run - > ~/.claude/skills/hx/SKILL.md
+```
 
 ## Host primitives
 
@@ -483,6 +506,7 @@ Everything Luau can do to the machine:
 | `host.exa` | `true` when hx has an `EXA_API_KEY` for `host.tool("exa")` |
 | `host.judged` | `true` when there is a judge for `host.judge` |
 | `host.extensions` | the built-in extensions' sources, by name |
+| `host.skills` | the built-in skills' `SKILL.md` texts, by name |
 | `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | |
 
 Two rules hold across all of them:
@@ -514,6 +538,7 @@ Two rules hold across all of them:
 | `lua/loop.luau` | the agent |
 | `lua/judge.luau` | the judge, which `--judge` runs in a process of its own |
 | `lua/ext/*.luau` | the built-in extensions, one per file; each file in `lua/ext/` is built in under its name |
+| `.claude/skills/hx/SKILL.md` | the built-in skill `hx`, which is also this repository's own skill for hx and for Claude Code |
 
 Development build, with AddressSanitizer, UBSan and warnings as errors:
 
