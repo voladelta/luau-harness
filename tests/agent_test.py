@@ -1630,6 +1630,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("Permission denied", self.tool_results()[0])
         self.assertIn("not a regular file", self.tool_results()[1])
         self.assertEqual(tools.requests, [])
+        self.assertNotIn("retrying", done.stderr)
 
     def test_project_notes_reach_the_system_prompt(self):
         os.makedirs(os.path.join(self.project, ".hx"))

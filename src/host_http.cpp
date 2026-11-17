@@ -196,7 +196,7 @@ std::vector<std::pair<std::string, std::string>> form_fields(lua_State* L, int i
 
 std::optional<std::string> attach_file(curl_mimepart* part, const std::string& path) {
     if (path.find('\0') != std::string::npos) {
-        return "host.tool: the file name contains a NUL byte";
+        return "the file name contains a NUL byte";
     }
     const UniqueFd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
     struct stat st{};
@@ -307,7 +307,7 @@ int Host::tool(lua_State* L) {
         return fail(L, "cannot start an HTTP request");
     }
     if (const std::optional<std::string> error = fill_form(L, mime.get(), 2)) {
-        return fail(L, *error);
+        luaL_error(L, "host.tool: %s", error->c_str());
     }
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime.get());
     return post(L, curl, *endpoint, {}, timeout, host.config_.ca_bundle);
