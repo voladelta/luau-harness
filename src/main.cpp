@@ -964,7 +964,7 @@ int run(const std::vector<std::string_view>& argv) {
     if (sandbox.confined() && !sandbox.blocks_unix_sockets()) {
         fmt::print(stderr,
                    "hx: note: this kernel's Landlock (ABI {}) cannot stop commands from connecting to unix sockets "
-                   "such as the D-Bus session bus or ssh-agent; ABI {} can. See \"The wall\" in the README.\n",
+                   "such as the D-Bus session bus or ssh-agent; ABI {} can. See docs/wall.md.\n",
                    sandbox.abi(), hx::Sandbox::kUnixSocketAbi);
     }
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);

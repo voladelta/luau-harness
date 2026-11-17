@@ -257,8 +257,8 @@ could otherwise make the number only look better.
 
 ## Changing hx itself
 
-In hx's repository, `README.md` is the reference: it describes every behaviour, and a change that alters one
-changes its paragraph too.
+In hx's repository, `README.md` and `docs/` are the reference: they describe every behaviour, and a change
+that alters one changes its paragraph too.
 
 | To change | Edit |
 |---|---|
@@ -267,7 +267,7 @@ changes its paragraph too.
 | A built-in extension (each file is one, by its name) | `lua/ext/NAME.luau` |
 | This skill, which is built into hx | `.claude/skills/hx/SKILL.md` |
 | A built-in skill for hx's model alone, such as `rpi` (each directory is one, by its name) | `lua/skills/NAME/SKILL.md` |
-| A primitive | `src/host*.cpp`, and the lists in `src/host.h`, `lua/loop.luau` and the README |
+| A primitive | `src/host*.cpp`, and the lists in `src/host.h`, `lua/loop.luau` and `docs/host.md` |
 | Options, secrets, what the wall lets in | `src/main.cpp`, `src/sandbox.cpp` |
 | The judge | `lua/judge.luau`, `src/judge.cpp` |
 

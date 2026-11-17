@@ -1795,7 +1795,7 @@ class AgentTest(unittest.TestCase):
 
     def test_the_binary_writes_out_its_skill_and_its_loop_as_the_docs_say(self):
         skill = read(REPO, ".claude", "skills", "hx", "SKILL.md")
-        done = self.shell(fenced(read(REPO, "README.md"), "print(host.skills.hx)"))
+        done = self.shell(fenced(read(REPO, "docs", "skills.md"), "print(host.skills.hx)"))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(read(self.home, ".claude", "skills", "hx", "SKILL.md"), skill + "\n")
         done = self.shell(re.search(r"`(echo 'print\(host\.default_loop\)' [^`]+)`", skill).group(1))
