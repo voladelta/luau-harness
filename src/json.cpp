@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <yyjson.h>
 
+#include "host_internal.h"
 #include "lua.h"
 #include "lualib.h"
 
@@ -215,10 +216,11 @@ std::string_view escape(unsigned char c, std::array<char, 6>& buffer) {
 }
 
 constexpr int kValues = 2;
+constexpr int kMaxIndent = 16;
 
 class Encoder {
   public:
-    explicit Encoder(lua_State* L) : L_(L) {}
+    Encoder(lua_State* L, std::size_t indent) : L_(L), indent_(indent) {}
 
     void value(int idx, std::size_t depth) {
         switch (lua_type(L_, idx)) {
@@ -338,9 +340,13 @@ class Encoder {
                 if (i > 1) {
                     out_ += ',';
                 }
+                newline(depth + 1);
                 lua_rawgeti(L_, idx, static_cast<int>(i));
                 value(lua_gettop(L_), depth + 1);
                 lua_pop(L_, 1);
+            }
+            if (length > 0) {
+                newline(depth);
             }
             out_ += ']';
             return;
@@ -357,14 +363,25 @@ class Encoder {
             if (i > base) {
                 out_ += ',';
             }
+            newline(depth + 1);
             string(member.key);
-            out_ += ':';
+            out_ += indent_ > 0 ? ": " : ":";
             lua_rawgeti(L_, kValues, member.slot);
             value(lua_gettop(L_), depth + 1);
             lua_pop(L_, 1);
         }
+        if (count > 0) {
+            newline(depth);
+        }
         members_.resize(base);
         out_ += '}';
+    }
+
+    void newline(std::size_t depth) {
+        if (indent_ > 0) {
+            out_ += '\n';
+            out_.append(depth * indent_, ' ');
+        }
     }
 
     struct Member {
@@ -373,15 +390,20 @@ class Encoder {
     };
 
     lua_State* L_;
+    std::size_t indent_;
     std::string out_;
     std::vector<Member> members_;
 };
 
 int l_encode(lua_State* L) {
     luaL_checkany(L, 1);
+    const double indent = option(L, 2, "indent", 0);
+    if (indent < 0 || indent > kMaxIndent || std::floor(indent) != indent) {
+        luaL_error(L, "json.encode: indent is a whole number of spaces from 0 to %d", kMaxIndent);
+    }
     lua_settop(L, 1);
     lua_newtable(L);
-    Encoder encoder(L);
+    Encoder encoder(L, static_cast<std::size_t>(indent));
     encoder.value(1, 0);
     lua_pushlstring(L, encoder.text().data(), encoder.text().size());
     return 1;

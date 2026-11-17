@@ -59,4 +59,29 @@ raises("a field past the end", "bytes 5 to 12 are not inside the 8 bytes given",
 raises("a width of no bytes", "not inside", bytes.uint, "12", 1, 0)
 raises("data that is not text", "bytes.uint: argument 1 (data) must be a string, not nil", bytes.uint)
 
+local function sums(algo: string, data: string): string
+	local file = host.env("TMPDIR") .. "/bytes-sum"
+	host.write(file, data)
+	return (host.sh({ algo .. "sum", file }).out:match("^%x+"))
+end
+for _, length in { 0, 3, 55, 56, 63, 64, 111, 112, 127, 128, 1000 } do
+	local data = string.rep("abc\0\255", 200):sub(1, length)
+	for _, algo in { "sha1", "sha256", "sha512", "md5" } do
+		check(("%s of %d bytes, as %ssum has it"):format(algo, length, algo), bytes.hex(bytes[algo](data)), sums(algo, data))
+	end
+end
+
+check("hmac sha256, RFC 4231 case 1", bytes.hex(bytes.hmac("sha256", string.rep("\11", 20), "Hi There")),
+	"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+check("hmac sha512 with a key longer than the block, RFC 4231 case 6",
+	bytes.hex(bytes.hmac("sha512", string.rep("\170", 131), "Test Using Larger Than Block-Size Key - Hash Key First")),
+	"80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f352"
+		.. "6b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598")
+check("hmac md5", bytes.hex(bytes.hmac("md5", "key", "The quick brown fox jumps over the lazy dog")),
+	"80070713463e7749b90c2dc24911e275")
+check("hmac sha1", bytes.hex(bytes.hmac("sha1", "key", "The quick brown fox jumps over the lazy dog")),
+	"de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9")
+raises("hmac with an unknown hash", 'bytes.hmac: "sha3" is not sha256, sha512, sha1 or md5', bytes.hmac, "sha3", "k", "d")
+raises("sha512 of nothing given", "bytes.sha512: argument 1 (data) must be a string, not nil", bytes.sha512)
+
 checks.done("bytes")

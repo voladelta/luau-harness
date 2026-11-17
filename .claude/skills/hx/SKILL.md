@@ -126,8 +126,8 @@ return {
   globals are its own, and what it prints goes into the tool result.
 - Report failure with `error(message, 0)`. Return text, or a table: a table shows as JSON, unless its metatable
   has `__tostring`.
-- A name that starts with `_` is a helper for other extensions and is not listed. `bytes`, `web`, `ocr`, `exa` and `_http`
-  are built in; a project's file of the same name takes the place of one.
+- A name that starts with `_` is a helper for other extensions and is not listed. `bytes`, `text`, `path`, `http`, `web`,
+  `ocr`, `exa` and `_http` are built in; a project's file of the same name takes the place of one.
 - Keep it as small as the chore. Try it before you report: from inside, call it; from outside,
 
 ```
@@ -223,8 +223,9 @@ function is a module: `main()` runs, and the number it returns is the exit statu
 
 | Primitive | Returns |
 |---|---|
-| `host.sh(command, {timeout=120, input=})` | `{out, code, signal, timed_out, seconds}`: `out` whole up to 16 MiB. `command` is a bash string, or `{program, arg, ...}` with no quoting needed; `input` goes to stdin |
+| `host.sh(command, {timeout=120, input=, cwd=, env=})` | `{out, code, signal, timed_out, seconds}`: `out` whole up to 16 MiB. `command` is a bash string, or `{program, arg, ...}` with no quoting needed; `input` goes to stdin; `cwd` is where it runs; `env` sets variables, `false` takes one away |
 | `host.read(path)`, `host.write(path, data)`, `host.list(dir)` | the value, or `nil, error`: they do not raise. `write` makes missing directories |
+| `host.walk(dir, {glob=, depth=})`, `host.stat(path)` | every path under `dir`, sorted, `.git` left out, `"**/*.luau"`; `{type, size, mtime, mode, target}` of a path, a link not followed. Or `nil, error` |
 | `host.load(source, name, env?)` | a function, or `nil, error` |
 | `host.try(fn, ...)`, `host.timed(seconds, fn, ...)` | `true, ...` or `false, error` |
 | `host.spawn(fn, ...)` | an id: forks hx, and the child runs `fn(...)` in a copy of the VM while the parent goes on. Only files and the string `fn` returns reach the parent |
@@ -233,7 +234,7 @@ function is a module: `main()` runs, and the number it returns is the exit statu
 | `host.log(text)`, `host.input(prompt)` | a line to stderr; a line from stdin, or `nil` at its end |
 | `host.sleep(seconds)`, `host.env(name)` | |
 | `host.args`, `host.cwd`, `host.model`, `host.sandboxed`, `host.quiet`, `host.default_loop` | values, not calls |
-| `json.encode(value)`, `json.decode(text)`, `json.array(t)`, `json.null` | keys are written sorted |
+| `json.encode(value, {indent=})`, `json.decode(text)`, `json.array(t)`, `json.null` | keys are written sorted; `indent` puts a member on each line |
 
 Ctrl-C raises `"interrupted"` again at every step until the outermost `host.try` or `host.timed` returns, so a
 plain `pcall` cannot swallow a stop. Inside `host.timed`, `sh`, `sleep` and the model call give up when the limit

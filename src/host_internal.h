@@ -41,6 +41,8 @@ std::string_view cut_head(std::string_view head);
 std::string_view cut_tail(std::string_view tail);
 
 int l_list(lua_State* L);
+int l_stat(lua_State* L);
+int l_walk(lua_State* L);
 
 double now() noexcept;
 void wait_for(std::span<pollfd> fds, double seconds) noexcept;

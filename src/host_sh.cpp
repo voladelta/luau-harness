@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -161,13 +162,27 @@ bool reap_within(pid_t pid, int& status, double seconds) {
     }
 }
 
-[[noreturn]] void exec_bash(const char* command, int stdin_fd, int output, const Wall* wall) {
+struct Place {
+    const char* cwd = nullptr;
+    char** environment = nullptr;
+};
+
+[[noreturn]] void exec_bash(const char* command, int stdin_fd, int output, const Wall* wall, Place place) {
     setsid();
     if (wall != nullptr && !wall->enter()) {
         constexpr std::string_view message = "hx: cannot put up the command's wall\n";
         if (write(output, message.data(), message.size()) < 0) {
         }
         _exit(126);
+    }
+    if (place.cwd != nullptr && chdir(place.cwd) != 0) {
+        constexpr std::string_view message = "hx: cannot enter the command's cwd\n";
+        if (write(output, message.data(), message.size()) < 0) {
+        }
+        _exit(126);
+    }
+    if (place.environment != nullptr) {
+        environ = place.environment;
     }
     const int in = stdin_fd >= 0 ? stdin_fd : open("/dev/null", O_RDONLY);
     if (in > STDIN_FILENO) {
@@ -201,7 +216,7 @@ std::pair<UniqueFd, UniqueFd> make_pipe(lua_State* L) {
     return {UniqueFd(fds[0]), UniqueFd(fds[1])};
 }
 
-Child start(lua_State* L, const char* command, bool with_input, const std::optional<Wall>& wall) {
+Child start(lua_State* L, const char* command, bool with_input, const std::optional<Wall>& wall, Place place) {
     auto [output, output_end] = make_pipe(L);
     auto [input_end, input] = with_input ? make_pipe(L) : std::pair<UniqueFd, UniqueFd>{};
     const double started = now();
@@ -210,7 +225,7 @@ Child start(lua_State* L, const char* command, bool with_input, const std::optio
         luaL_error(L, "fork: %s", error_text().c_str());
     }
     if (pid == 0) {
-        exec_bash(command, input_end.get(), output_end.get(), wall ? &*wall : nullptr);
+        exec_bash(command, input_end.get(), output_end.get(), wall ? &*wall : nullptr, place);
     }
     return {.pid = pid, .output = std::move(output), .input = std::move(input), .started = started};
 }
@@ -283,6 +298,80 @@ Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, d
     }
 }
 
+std::optional<std::string> cwd_of(lua_State* L, int idx) {
+    lua_getfield(L, idx, "cwd");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return std::nullopt;
+    }
+    std::size_t length = 0;
+    const char* path = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &length) : nullptr;
+    if (path == nullptr || std::strlen(path) != length) {
+        luaL_error(L, "host.sh: cwd is the path of a directory");
+    }
+    std::string cwd(path, length);
+    lua_pop(L, 1);
+    struct stat st {};
+    if (stat(cwd.c_str(), &st) != 0) {
+        luaL_error(L, "host.sh: cwd %s: %s", cwd.c_str(), error_text().c_str());
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        luaL_error(L, "host.sh: cwd %s is not a directory", cwd.c_str());
+    }
+    return cwd;
+}
+
+std::vector<std::string> environment_of(lua_State* L, int idx) {
+    lua_getfield(L, idx, "env");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return {};
+    }
+    if (!lua_istable(L, -1)) {
+        luaL_error(L, "host.sh: env is a table of names and values");
+    }
+    std::vector<std::pair<std::string, std::optional<std::string>>> changes;
+    lua_pushnil(L);
+    while (lua_next(L, -2) != 0) {
+        std::size_t name_length = 0;
+        const char* name = lua_type(L, -2) == LUA_TSTRING ? lua_tolstring(L, -2, &name_length) : nullptr;
+        if (name == nullptr || name_length == 0 || std::strlen(name) != name_length ||
+            std::strchr(name, '=') != nullptr) {
+            luaL_error(L, "host.sh: env has a name that is not a variable's");
+        }
+        std::size_t length = 0;
+        const char* value =
+            lua_type(L, -1) == LUA_TSTRING || lua_type(L, -1) == LUA_TNUMBER ? lua_tolstring(L, -1, &length) : nullptr;
+        const bool removed = lua_type(L, -1) == LUA_TBOOLEAN && lua_toboolean(L, -1) == 0;
+        if (value == nullptr && !removed) {
+            luaL_error(L, "host.sh: env.%s is text, or false to remove it", name);
+        }
+        if (value != nullptr && std::strlen(value) != length) {
+            luaL_error(L, "host.sh: env.%s contains a NUL byte", name);
+        }
+        changes.emplace_back(name, value == nullptr ? std::nullopt : std::optional<std::string>(value));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    std::vector<std::string> entries;
+    for (char* const* each = environ; *each != nullptr; ++each) {
+        const std::string_view entry(*each);
+        const std::string_view name = entry.substr(0, entry.find('='));
+        if (std::none_of(changes.begin(), changes.end(), [&](const auto& change) { return change.first == name; })) {
+            entries.emplace_back(entry);
+        }
+    }
+    for (const auto& [name, value] : changes) {
+        if (value) {
+            entries.push_back(name + "=" + *value);
+        }
+    }
+    if (entries.empty()) {
+        entries.emplace_back();
+    }
+    return entries;
+}
+
 bool hung_up() {
     pollfd already{STDIN_FILENO, POLLRDHUP, 0};
     return poll(&already, 1, 0) > 0 && (already.revents & (POLLRDHUP | POLLHUP)) != 0;
@@ -321,7 +410,11 @@ int Host::sh(lua_State* L) {
     const std::optional<Wall> wall = host.narrower_wall(L, 2);
     bool on_hangup = false;
     std::optional<std::string_view> data;
+    std::optional<std::string> cwd;
+    std::vector<std::string> entries;
     if (lua_istable(L, 2)) {
+        cwd = cwd_of(L, 2);
+        entries = environment_of(L, 2);
         lua_getfield(L, 2, "hangup");
         on_hangup = lua_toboolean(L, -1) != 0;
         lua_pop(L, 1);
@@ -342,7 +435,16 @@ int Host::sh(lua_State* L) {
     }
     reap_exited();
 
-    Child child = start(L, command.c_str(), data.has_value(), wall);
+    std::vector<char*> environment;
+    for (std::string& entry : entries) {
+        if (!entry.empty()) {
+            environment.push_back(entry.data());
+        }
+    }
+    environment.push_back(nullptr);
+    const Place place{.cwd = cwd ? cwd->c_str() : nullptr,
+                      .environment = entries.empty() ? nullptr : environment.data()};
+    Child child = start(L, command.c_str(), data.has_value(), wall, place);
     Output output(std::move(child.output));
     Input input(std::move(child.input), data.value_or(std::string_view{}));
     const Outcome outcome = wait_for_command(child.pid, output, input, on_hangup, timeout);

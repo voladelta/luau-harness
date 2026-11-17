@@ -899,17 +899,22 @@ local function lua_description(): string
 	for _, fn in M.functions do
 		table.insert(lines, "- " .. fn.usage)
 	end
-	table.insert(lines, "- host.sh(command, {input?, timeout?}) -> {out, code}: runs a command for its output as "
-		.. "data, stdout and stderr together, whole up to 16 MiB; send more to a file and host.read it. command "
-		.. "is a bash string, or a list {program, arg, ...} whose words reach the program as they are, with no "
-		.. "quoting; input is text for its stdin.")
-	table.insert(lines, "- host.read(path) -> text, host.write(path, text), host.list(dir), json.encode(value), "
-		.. "json.decode(text): the other plain primitives, for working on data.")
+	table.insert(lines, "- host.sh(command, {input?, timeout?, cwd?, env?}) -> {out, code}: runs a command for its "
+		.. "output as data, stdout and stderr together, whole up to 16 MiB; send more to a file and host.read it. "
+		.. "command is a bash string, or a list {program, arg, ...} whose words reach the program as they are, with "
+		.. "no quoting; input is text for its stdin; cwd is the directory it runs in; env is {NAME = value} to set, "
+		.. "false to take one away.")
+	table.insert(lines, "- host.walk(dir, {glob?, depth?}) -> {path}: every path under dir, sorted, .git left out, "
+		.. "directories ending in /; glob as \"**/*.luau\". host.stat(path) -> {type, size, mtime, mode}, or nil.")
+	table.insert(lines, "- host.read(path) -> text, host.write(path, text), host.list(dir), json.encode(value, "
+		.. "{indent?}), json.decode(text): the other plain primitives, for working on data.")
 	table.insert(lines, "")
 	table.insert(lines, "Do the work in Luau: parsing, counting, deciding and building text and files belong in "
 		.. "your code, with string patterns, string.pack and string.unpack for binary data, ext(\"bytes\") for hex, "
-		.. "base64, base58, sha256 and exact integers wider than 2^53, and os.date. Commands run programs: the "
-		.. "build, tests, git, rg, curl, and tools that turn data into data, such as bc for exact arithmetic on "
+		.. "base64, base58, sha256, hmac and exact integers wider than 2^53, ext(\"text\") to replace literal "
+		.. "text without pattern traps, ext(\"path\") for paths, ext(\"http\") for HTTP as data, and os.date. "
+		.. "Commands run programs: the build, tests, git, rg, curl, and tools that turn data into data, such as bc "
+		.. "for exact arithmetic on "
 		.. "large integers. Join them in Luau: json.decode(host.sh({\"curl\", \"-sfL\", url}).out), or "
 		.. "host.sh({\"bc\"}, {input = expression}).out. "
 		.. "Write a script in another language only for a library the job needs that neither Luau nor the "

@@ -137,4 +137,13 @@ rejects(nest_arrays(201), "depth limit exceeded (at byte 202)")
 rejects(nest_objects(201), "depth limit exceeded")
 check("an error names its position", select(2, json.decode("[1 2]")), "unexpected character, expected ',' or ']' (at byte 4)")
 
+local nested = { b = { 1, {} }, a = { x = json.array() }, c = "s" }
+check("indent writes as Python's json.dumps(indent=2, sort_keys=True)", json.encode(nested, { indent = 2 }),
+	'{\n  "a": {\n    "x": []\n  },\n  "b": [\n    1,\n    {}\n  ],\n  "c": "s"\n}')
+check("an indent of 0 is the compact form", json.encode(nested, { indent = 0 }), json.encode(nested))
+check("indent keeps a scalar as it is", json.encode("x", { indent = 4 }), '"x"')
+check("indented text decodes to the same", json.encode(json.decode(json.encode(nested, { indent = 3 }))), json.encode(nested))
+checks.raises("a negative indent", "indent is a whole number of spaces from 0 to 16", json.encode, {}, { indent = -1 })
+checks.raises("a fractional indent", "indent is a whole number", json.encode, {}, { indent = 1.5 })
+
 checks.done("json")

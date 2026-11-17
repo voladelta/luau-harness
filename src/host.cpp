@@ -372,10 +372,10 @@ void Host::open(lua_State* L) {
     callbacks->interrupt = on_interrupt;
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"llm", llm},        {"tool", tool},        {"sh", sh},         {"try", try_},    {"timed", timed},
-        {"read", read_file}, {"write", write_file}, {"list", l_list},   {"load", l_load}, {"input", l_input},
-        {"log", l_log},      {"sleep", sleep},      {"env", l_env},     {"judge", judge}, {"clip", l_clip},
-        {"spawn", spawn},    {"wait", wait},        {nullptr, nullptr},
+        {"llm", llm},        {"tool", tool},        {"sh", sh},       {"try", try_},    {"timed", timed},
+        {"read", read_file}, {"write", write_file}, {"list", l_list}, {"load", l_load}, {"input", l_input},
+        {"log", l_log},      {"sleep", sleep},      {"env", l_env},   {"judge", judge}, {"clip", l_clip},
+        {"spawn", spawn},    {"wait", wait},        {"stat", l_stat}, {"walk", l_walk}, {nullptr, nullptr},
     };
     luaL_register(L, "host", kFunctions);
 
