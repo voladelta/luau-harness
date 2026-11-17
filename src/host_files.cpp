@@ -41,7 +41,7 @@ bool wait_ready(lua_State* L, int fd, short events, double until) {
         if (left <= 0) {
             return false;
         }
-        pollfd waiter{fd, events, 0};
+        pollfd waiter{.fd = fd, .events = events, .revents = 0};
         wait_for({&waiter, 1}, left);
         if (waiter.revents != 0) {
             return true;
@@ -200,7 +200,7 @@ int Host::read_file(lua_State* L) {
     if (!file.valid()) {
         return fail_errno(L, path);
     }
-    struct stat st {};
+    struct stat st{};
     if (fstat(file.get(), &st) != 0) {
         return fail_errno(L, path);
     }
@@ -243,8 +243,8 @@ int Host::write_file(lua_State* L) {
         }
     }
 
-    struct stat st {};
-    struct stat entry {};
+    struct stat st{};
+    struct stat entry{};
     const bool exists = stat(path, &st) == 0;
     const bool missing = !exists && errno == ENOENT && lstat(path, &entry) != 0;
     if ((exists && S_ISREG(st.st_mode) && st.st_nlink == 1 && access(path, W_OK) == 0) || missing) {
@@ -260,7 +260,7 @@ int Host::write_file(lua_State* L) {
     }
 
     const UniqueFd file = open_in_place(L, path, exists && S_ISFIFO(st.st_mode), until);
-    struct stat opened {};
+    struct stat opened{};
     if (!file.valid() || fstat(file.get(), &opened) != 0) {
         return fail_wait(L, path);
     }
@@ -300,7 +300,7 @@ int l_list(lua_State* L) {
 
 int l_stat(lua_State* L) {
     const char* path = check_cstring(L, 1);
-    struct stat st {};
+    struct stat st{};
     if (lstat(path, &st) != 0) {
         return fail_errno(L, path);
     }

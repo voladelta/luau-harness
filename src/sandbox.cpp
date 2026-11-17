@@ -120,10 +120,10 @@ constexpr uint32_t kX32Bit = 0x40000000U;
 constexpr uint32_t kIoUringSetup = 425;
 
 constexpr sock_filter stmt(uint32_t code, uint32_t k) {
-    return {static_cast<uint16_t>(code), 0, 0, k};
+    return {.code = static_cast<uint16_t>(code), .jt = 0, .jf = 0, .k = k};
 }
 constexpr sock_filter jump(uint32_t code, uint32_t k, uint8_t if_true, uint8_t if_false) {
-    return {static_cast<uint16_t>(code), if_true, if_false, k};
+    return {.code = static_cast<uint16_t>(code), .jt = if_true, .jf = if_false, .k = k};
 }
 
 bool filter_unix_sockets() {
@@ -149,7 +149,7 @@ bool filter_unix_sockets() {
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
     }};
-    const sock_fprog fprog{static_cast<unsigned short>(program.size()), program.data()};
+    const sock_fprog fprog{.len = static_cast<unsigned short>(program.size()), .filter = program.data()};
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog, 0, 0) != 0) {
         fail("PR_SET_SECCOMP");
     }
@@ -196,7 +196,7 @@ std::pair<UniqueFd, int> make_ruleset(const std::vector<Rule>& rules) {
             }
             fail(rule.path);
         }
-        struct stat st {};
+        struct stat st{};
         if (fstat(target.get(), &st) != 0) {
             fail(rule.path);
         }
@@ -209,7 +209,7 @@ std::pair<UniqueFd, int> make_ruleset(const std::vector<Rule>& rules) {
             continue;
         }
 
-        const PathBeneathAttr beneath{rights, target.get()};
+        const PathBeneathAttr beneath{.allowed_access = rights, .parent_fd = target.get()};
         if (syscall(kAddRule, ruleset.get(), kRulePathBeneath, &beneath, 0) != 0) {
             fail(fmt::format("landlock_add_rule {}", rule.path));
         }

@@ -55,7 +55,7 @@ int Host::judge(lua_State* L) {
             lua_pushinteger(L, host.judge_owed_);
             return 2;
         }
-        pollfd waiter{fd, POLLIN, 0};
+        pollfd waiter{.fd = fd, .events = POLLIN, .revents = 0};
         wait_for({&waiter, 1}, until > 0 ? std::max(until - now(), 0.0) : -1.0);
         const ssize_t n = recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
         if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {

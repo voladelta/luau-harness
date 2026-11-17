@@ -382,7 +382,7 @@ Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& k
     Secrets secrets;
     std::vector<std::pair<std::string, char*>> doomed;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-    for (char** entry = environ; *entry != nullptr; ++entry) {
+    for (char* const* entry = environ; *entry != nullptr; ++entry) {
         const std::string_view text(*entry);
         const std::size_t equals = text.find('=');
         if (equals == std::string_view::npos) {
@@ -679,7 +679,7 @@ void* limited_alloc(void* user, void* block, std::size_t old_size, std::size_t n
         hx::vm_memory_refused();
         return nullptr;
     }
-    void* grown = std::realloc(block, new_size);
+    void* const grown = std::realloc(block, new_size);  // NOLINT(misc-const-correctness)
     if (grown != nullptr) {
         used = used - old_size + new_size;
     }

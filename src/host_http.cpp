@@ -155,7 +155,7 @@ int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
 }
 
 void set_body(CURL* curl, std::string_view body) {
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());  // NOLINT(bugprone-suspicious-stringview-data-usage)
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
 }
 
@@ -199,14 +199,14 @@ std::optional<std::string> attach_file(curl_mimepart* part, const std::string& p
         return "host.tool: the file name contains a NUL byte";
     }
     const UniqueFd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
-    struct stat st {};
+    struct stat st{};
     if (!file.valid() || fstat(file.get(), &st) != 0) {
         return fmt::format("{}: {}", path, error_text());
     }
     if (!S_ISREG(st.st_mode)) {
         return fmt::format("{}: not a regular file", path);
     }
-    if (static_cast<std::size_t>(st.st_size) > kMaxUpload) {
+    if (std::cmp_greater(st.st_size, kMaxUpload)) {
         return fmt::format("{}: larger than 100 MiB", path);
     }
     if (curl_mime_filedata(part, path.c_str()) != CURLE_OK) {

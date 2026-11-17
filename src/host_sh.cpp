@@ -283,10 +283,10 @@ Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, d
         if (g_signal != 0 || now() >= deadline) {
             return give_up(g_signal != 0 ? Ending::Signaled : Ending::TimedOut);
         }
-        std::array<pollfd, 4> waiters{{{exited.get(), POLLIN, 0},
-                                       {hangup_fd, POLLRDHUP, 0},
-                                       {output.at_end() ? -1 : output.fd(), POLLIN, 0},
-                                       {input.fd(), POLLOUT, 0}}};
+        std::array<pollfd, 4> waiters{{{.fd = exited.get(), .events = POLLIN, .revents = 0},
+                                       {.fd = hangup_fd, .events = POLLRDHUP, .revents = 0},
+                                       {.fd = output.at_end() ? -1 : output.fd(), .events = POLLIN, .revents = 0},
+                                       {.fd = input.fd(), .events = POLLOUT, .revents = 0}}};
         const double left = std::max(deadline - now(), 0.0);
         wait_for(waiters, exited.valid() ? left : std::min(left, kNoPidfdPoll));
         if ((waiters[1].revents & (POLLRDHUP | POLLHUP)) != 0) {
@@ -311,7 +311,7 @@ std::optional<std::string> cwd_of(lua_State* L, int idx) {
     }
     std::string cwd(path, length);
     lua_pop(L, 1);
-    struct stat st {};
+    struct stat st{};
     if (stat(cwd.c_str(), &st) != 0) {
         luaL_error(L, "host.sh: cwd %s: %s", cwd.c_str(), error_text().c_str());
     }
@@ -373,7 +373,7 @@ std::vector<std::string> environment_of(lua_State* L, int idx) {
 }
 
 bool hung_up() {
-    pollfd already{STDIN_FILENO, POLLRDHUP, 0};
+    pollfd already{.fd = STDIN_FILENO, .events = POLLRDHUP, .revents = 0};
     return poll(&already, 1, 0) > 0 && (already.revents & (POLLRDHUP | POLLHUP)) != 0;
 }
 

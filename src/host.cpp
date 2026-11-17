@@ -157,12 +157,14 @@ timer_t* limit_timer() noexcept {
 }
 
 void arm_limit(double deadline) noexcept {
-    timer_t* timer = limit_timer();
+    const timer_t* const timer = limit_timer();
     if (timer == nullptr) {
         return;
     }
     const auto whole = static_cast<time_t>(deadline);
-    const itimerspec at{{0, 0}, {whole, static_cast<long>((deadline - static_cast<double>(whole)) * 1e9)}};
+    const itimerspec at{
+        .it_interval = {.tv_sec = 0, .tv_nsec = 0},
+        .it_value = {.tv_sec = whole, .tv_nsec = static_cast<long>((deadline - static_cast<double>(whole)) * 1e9)}};
     timer_settime(*timer, TIMER_ABSTIME, &at, nullptr);
 }
 

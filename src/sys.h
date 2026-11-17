@@ -115,7 +115,7 @@ inline long cloexec_above_stderr() noexcept {
 }
 
 inline void nap(long milliseconds) noexcept {
-    const timespec duration{0, milliseconds * 1'000'000};
+    const timespec duration{.tv_sec = 0, .tv_nsec = milliseconds * 1'000'000};
     nanosleep(&duration, nullptr);
 }
 

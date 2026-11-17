@@ -70,7 +70,7 @@ bool for_each_process(const Fn& fn) noexcept {
             return true;
         }
         std::size_t at = 0;
-        while (at < static_cast<std::size_t>(n)) {
+        while (std::cmp_less(at, n)) {
             unsigned short size = 0;
             std::memcpy(&size, entries.data() + at + offsetof(dirent64, d_reclen), sizeof(size));
             const std::string_view name(entries.data() + at + offsetof(dirent64, d_name));
@@ -101,7 +101,7 @@ void on_alarm(int /*sig*/) {
 double now() noexcept {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+    return static_cast<double>(ts.tv_sec) + (static_cast<double>(ts.tv_nsec) * 1e-9);
 }
 
 void wait_for(std::span<pollfd> fds, double seconds) noexcept {
@@ -115,7 +115,8 @@ void wait_for(std::span<pollfd> fds, double seconds) noexcept {
     if (g_signal == 0) {
         seconds = std::min(seconds, kLongest);
         const auto whole = static_cast<time_t>(seconds);
-        const timespec limit{whole, static_cast<long>((seconds - static_cast<double>(whole)) * 1e9)};
+        const timespec limit{.tv_sec = whole,
+                             .tv_nsec = static_cast<long>((seconds - static_cast<double>(whole)) * 1e9)};
         ppoll(fds.data(), fds.size(), seconds < 0 ? nullptr : &limit, &before);
     }
     pthread_sigmask(SIG_SETMASK, &before, nullptr);
@@ -185,7 +186,7 @@ void reap_exited() noexcept {
 }
 
 void install_signal_handlers() {
-    struct sigaction action {};
+    struct sigaction action{};
     action.sa_handler = on_signal;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
