@@ -1464,7 +1464,7 @@ class AgentTest(unittest.TestCase):
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results()[1], "HEY!")
-        self.assertNotIn("Extensions:", self.model.requests[0]["system"])
+        self.assertNotIn("- shout", self.model.requests[0]["system"])
         self.assertIn("the loop built into hx", self.model.requests[0]["system"])
         self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system"])
         self.run_hx("again", script=[say("ok")])
@@ -1576,7 +1576,10 @@ class AgentTest(unittest.TestCase):
         self.assertIn("without DEEPSEEK_API_KEY", results[3])
         self.assertIn("without EXA_API_KEY", results[4])
         self.assertIn("no EXA_API_KEY", results[5])
-        self.assertNotIn("Extensions:", self.model.requests[0]["system"])
+        system = self.model.requests[0]["system"]
+        self.assertIn("- bytes (built in):", system)
+        for keyed in ("- web", "- ocr", "- exa"):
+            self.assertNotIn(keyed, system)
 
     def test_ocr_of_a_file_outside_the_wall_is_refused_before_sending(self):
         tools = Tools()

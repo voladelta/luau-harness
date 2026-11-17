@@ -125,7 +125,7 @@ return {
   globals are its own, and what it prints goes into the tool result.
 - Report failure with `error(message, 0)`. Return text, or a table: a table shows as JSON, unless its metatable
   has `__tostring`.
-- A name that starts with `_` is a helper for other extensions and is not listed. `web`, `ocr`, `exa` and `_http`
+- A name that starts with `_` is a helper for other extensions and is not listed. `bytes`, `web`, `ocr`, `exa` and `_http`
   are built in; a project's file of the same name takes the place of one.
 - Keep it as small as the chore. Try it before you report: from inside, call it; from outside,
 

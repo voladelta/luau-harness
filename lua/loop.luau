@@ -275,8 +275,9 @@ local function extension_index(): { string }
 		end
 	end
 	local names = {}
+	local keyed = { exa = host.exa, web = host.tools, ocr = host.tools }
 	for name in host.extensions do
-		if if name == "exa" then host.exa else host.tools then
+		if keyed[name] ~= false then
 			table.insert(names, name)
 		end
 	end
@@ -906,10 +907,11 @@ local function lua_description(): string
 		.. "json.decode(text): the other plain primitives, for working on data.")
 	table.insert(lines, "")
 	table.insert(lines, "Do the work in Luau: parsing, counting, deciding and building text and files belong in "
-		.. "your code, with string patterns, string.pack and string.unpack for binary data, and os.date. Commands "
-		.. "run programs: the build, tests, git, rg, curl, and tools that turn data into data, such as base64, "
-		.. "sha256sum or bc for numbers past 2^53. Join them in Luau: "
-		.. "json.decode(host.sh({\"curl\", \"-sfL\", url}).out), or host.sh({\"base64\", \"-d\"}, {input = text}).out. "
+		.. "your code, with string patterns, string.pack and string.unpack for binary data, ext(\"bytes\") for hex, "
+		.. "base64, base58, sha256 and exact integers wider than 2^53, and os.date. Commands run programs: the "
+		.. "build, tests, git, rg, curl, and tools that turn data into data, such as bc for exact arithmetic on "
+		.. "large integers. Join them in Luau: json.decode(host.sh({\"curl\", \"-sfL\", url}).out), or "
+		.. "host.sh({\"bc\"}, {input = expression}).out. "
 		.. "Write a script in another language only for a library the job needs that neither Luau nor the "
 		.. "system's tools have, and pass it its data through input or a file.")
 	table.insert(lines, "")

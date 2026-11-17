@@ -506,9 +506,20 @@ prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the p
 An extension whose name starts with `_` is a helper for other extensions: `ext()` loads it like any other, and
 the system prompt does not list it.
 
-### Built in: web, ocr and exa
+### Built in: bytes, web, ocr and exa
 
-Three extensions come with hx, in `lua/ext/`. Two of them, `web` and `ocr`, call DeepSeek's [Search, Fetch](https://api-docs.deepseek.com/guides/search)
+Four extensions come with hx, in `lua/ext/`. `bytes` needs no key and is always listed. It does in Luau what a
+model would otherwise reach for Python's standard library to do with binary data:
+
+| Call | Returns |
+|---|---|
+| `ext("bytes").hex(data)`, `.unhex(text)` | lower-case hex; and back, taking upper case, a `0x` and spaces |
+| `ext("bytes").base64(data)`, `.unbase64(text)` | standard base64 with padding; and back, taking the URL-safe alphabet, missing padding and line breaks |
+| `ext("bytes").base58(data)`, `.unbase58(text)` | base58 in the Bitcoin alphabet, which Solana addresses use, each leading zero byte a `1`; and back |
+| `ext("bytes").sha256(data)` | the 32-byte digest, raw: `hex(sha256(data))` reads as `sha256sum` prints it |
+| `ext("bytes").uint(data, at?, width?)`, `.int(...)` | the little-endian integer of `width` bytes from byte `at` (default all of `data` from byte 1), unsigned or two's complement, as exact decimal text of any width: `tonumber` makes it a number when 2^53 is enough, and `bc` computes with it exactly |
+
+Of the other three, two, `web` and `ocr`, call DeepSeek's [Search, Fetch](https://api-docs.deepseek.com/guides/search)
 and [OCR](https://api-docs.deepseek.com/guides/ocr) APIs with `DEEPSEEK_API_KEY`, whichever model the loop talks
 to, so a session on Claude can use them too when that key is set. The system prompt lists them only then. A
 project's own `.hx/ext/web.luau` or `.hx/ext/ocr.luau` takes the place of the built-in one.
