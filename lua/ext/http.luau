@@ -18,7 +18,7 @@ local function check(value: unknown, name: string, kind: string, required: boole
 end
 
 local function last_block(text: string): (number, { [string]: string })
-	local status, headers = 0, {}
+	local status: number, headers: { [string]: string } = 0, {}
 	for line in (text .. "\n"):gmatch("([^\n]*)\n") do
 		line = line:gsub("\r$", "")
 		local code = line:match("^HTTP/[%d.]+ (%d%d%d)")
