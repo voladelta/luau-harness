@@ -4,8 +4,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -612,16 +614,68 @@ hx::Sandbox confine(const Options& options, const fs::path& project, const fs::p
 }
 
 constexpr std::size_t kMaxVmMemory = std::size_t{1} << 30;
+constexpr std::size_t kVmStep = std::size_t{64} << 20;
+constexpr std::size_t kSystemReserve = std::size_t{128} << 20;
+
+std::optional<std::size_t> system_available() noexcept {
+    const hx::UniqueFd file(open("/proc/meminfo", O_RDONLY | O_CLOEXEC));
+    std::array<char, 4096> buffer{};
+    const ssize_t n = file.valid() ? read(file.get(), buffer.data(), buffer.size()) : -1;
+    if (n <= 0) {
+        return std::nullopt;
+    }
+    const std::string_view text(buffer.data(), static_cast<std::size_t>(n));
+    constexpr std::string_view kField = "MemAvailable:";
+    std::size_t at = text.find(kField);
+    if (at == std::string_view::npos) {
+        return std::nullopt;
+    }
+    at = text.find_first_not_of(' ', at + kField.size());
+    std::size_t kib = 0;
+    const auto [end, error] = std::from_chars(text.data() + at, text.data() + text.size(), kib);
+    if (error != std::errc()) {
+        return std::nullopt;
+    }
+    return kib * 1024;
+}
+
+struct VmMemory {
+    std::size_t used = 0;
+    std::size_t granted = 0;
+};
+
+bool grant(VmMemory& memory, std::size_t growth) noexcept {
+    const std::size_t need = memory.used + growth;
+    if (need <= memory.granted) {
+        return true;
+    }
+    if (need > kMaxVmMemory) {
+        return false;
+    }
+    const std::optional<std::size_t> available = system_available();
+    if (!available) {
+        memory.granted = kMaxVmMemory;
+        return true;
+    }
+    const std::size_t room = *available > kSystemReserve ? *available - kSystemReserve : 0;
+    if (growth > room) {
+        return false;
+    }
+    memory.granted = std::min(kMaxVmMemory, memory.used + std::min(room, std::max(growth, kVmStep)));
+    return true;
+}
 
 // NOLINTBEGIN(cppcoreguidelines-no-malloc)
 void* limited_alloc(void* user, void* block, std::size_t old_size, std::size_t new_size) {
-    auto& used = *static_cast<std::size_t*>(user);
+    auto& memory = *static_cast<VmMemory*>(user);
+    std::size_t& used = memory.used;
     if (new_size == 0) {
         std::free(block);
         used -= old_size;
+        memory.granted = std::min(memory.granted, used + kVmStep);
         return nullptr;
     }
-    if (new_size > old_size && used + (new_size - old_size) > kMaxVmMemory) {
+    if (new_size > old_size && !grant(memory, new_size - old_size)) {
         hx::vm_memory_refused();
         return nullptr;
     }
@@ -729,7 +783,7 @@ template <typename Body>
 int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) {
     hx::install_signal_handlers();
     hx::Host host(std::move(config), sandbox);
-    std::size_t vm_memory = 0;
+    VmMemory vm_memory;
     const LuaState state(lua_newstate(limited_alloc, &vm_memory));
     if (!state) {
         throw std::runtime_error("cannot create a Luau state");

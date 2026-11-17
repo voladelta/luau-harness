@@ -152,8 +152,10 @@ Also in force:
   read it out of the host's memory. `DEEPSEEK_API_KEY` is kept the same way, whatever the model, and is sent only
   to DeepSeek's tool endpoints, `HX_TOOLS_URL/search`, `/fetch` and `/ocr`, and to its Messages endpoint,
   `HX_DEEPSEEK_URL`; `EXA_API_KEY` too, sent only to `HX_EXA_URL`.
-- The VM has a memory ceiling of 1 GiB. Code that runs into it gets the error "not enough memory", and what it
-  held is collected at the next step, so the session goes on with its memory back.
+- The VM has a memory ceiling of 1 GiB, and below it takes only what the system can spare: each time it grows by
+  64 MiB it reads `MemAvailable` in `/proc/meminfo` again, and it refuses to grow into the last 128 MiB, so that
+  it runs out before the kernel's out-of-memory killer acts. Code that runs into either gets the error "not
+  enough memory", and what it held is collected at the next step, so the session goes on with its memory back.
 - Every process a command started is killed when `hx` exits, a daemon that called `setsid` included: `hx` is a
   child subreaper, so all of them stay its descendants.
 
