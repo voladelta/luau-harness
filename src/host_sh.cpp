@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -30,8 +29,13 @@
 namespace hx {
 namespace {
 
-constexpr std::size_t kCaptureHalf = std::size_t{512} << 10;
+constexpr std::size_t kCaptureHalf = std::size_t{8} << 20;
 constexpr double kNoPidfdPoll = 0.05;
+
+struct Captured {
+    std::string text;
+    std::size_t omitted;
+};
 
 class Capture {
   public:
@@ -52,15 +56,16 @@ class Capture {
         }
     }
 
-    [[nodiscard]] std::string text() const {
+    [[nodiscard]] Captured result() const {
         if (head_.size() + tail_.size() <= 2 * kCaptureHalf) {
-            return head_ + tail_;
+            return {.text = head_ + tail_, .omitted = 0};
         }
         const std::string_view head = cut_head(head_);
         const std::string_view tail = cut_tail(std::string_view(tail_).substr(tail_.size() - kCaptureHalf));
         const std::size_t omitted = dropped_ + head_.size() + tail_.size() - head.size() - tail.size();
-        return fmt::format("{}{}[... {} bytes of output omitted ...]\n{}", head, head.ends_with('\n') ? "" : "\n",
-                           omitted, tail);
+        return {.text = fmt::format("{}{}[... {} bytes of output omitted ...]\n{}", head,
+                                    head.ends_with('\n') ? "" : "\n", omitted, tail),
+                .omitted = omitted};
     }
 
   private:
@@ -89,12 +94,42 @@ class Output {
 
     [[nodiscard]] int fd() const noexcept { return pipe_.get(); }
     [[nodiscard]] bool at_end() const noexcept { return at_end_; }
-    [[nodiscard]] std::string text() const { return capture_.text(); }
+    [[nodiscard]] Captured result() const { return capture_.result(); }
 
   private:
     UniqueFd pipe_;
     Capture capture_;
     bool at_end_ = false;
+};
+
+class Input {
+  public:
+    Input(UniqueFd pipe, std::string_view data) noexcept : pipe_(std::move(pipe)), rest_(data) {
+        if (pipe_.valid()) {
+            fcntl(pipe_.get(), F_SETFL, O_NONBLOCK);
+            feed();
+        }
+    }
+
+    void feed() noexcept {
+        while (pipe_.valid() && !rest_.empty()) {
+            const ssize_t n = write(pipe_.get(), rest_.data(), rest_.size());
+            if (n > 0) {
+                rest_.remove_prefix(static_cast<std::size_t>(n));
+            } else if (n < 0 && errno == EAGAIN) {
+                return;
+            } else if (n < 0 && errno != EINTR) {
+                break;
+            }
+        }
+        pipe_.reset();
+    }
+
+    [[nodiscard]] int fd() const noexcept { return pipe_.get(); }
+
+  private:
+    UniqueFd pipe_;
+    std::string_view rest_;
 };
 
 enum class Ending : std::uint8_t { Exited, TimedOut, Signaled, HungUp };
@@ -126,7 +161,7 @@ bool reap_within(pid_t pid, int& status, double seconds) {
     }
 }
 
-[[noreturn]] void exec_bash(const char* command, int output, const Wall* wall) {
+[[noreturn]] void exec_bash(const char* command, int stdin_fd, int output, const Wall* wall) {
     setsid();
     if (wall != nullptr && !wall->enter()) {
         constexpr std::string_view message = "hx: cannot put up the command's wall\n";
@@ -134,10 +169,9 @@ bool reap_within(pid_t pid, int& status, double seconds) {
         }
         _exit(126);
     }
-    const int null = open("/dev/null", O_RDONLY);
-    if (null > STDIN_FILENO) {
-        dup2(null, STDIN_FILENO);
-        close(null);
+    const int in = stdin_fd >= 0 ? stdin_fd : open("/dev/null", O_RDONLY);
+    if (in > STDIN_FILENO) {
+        dup2(in, STDIN_FILENO);
     }
     dup2(output, STDOUT_FILENO);
     dup2(output, STDERR_FILENO);
@@ -155,28 +189,65 @@ bool reap_within(pid_t pid, int& status, double seconds) {
 struct Child {
     pid_t pid;
     UniqueFd output;
+    UniqueFd input;
     double started;
 };
 
-Child start(lua_State* L, const char* command, const std::optional<Wall>& wall) {
-    std::array<int, 2> pipe_fds{};
-    if (pipe2(pipe_fds.data(), O_CLOEXEC) != 0) {
+std::pair<UniqueFd, UniqueFd> make_pipe(lua_State* L) {
+    std::array<int, 2> fds{};
+    if (pipe2(fds.data(), O_CLOEXEC) != 0) {
         luaL_error(L, "pipe: %s", error_text().c_str());
     }
-    UniqueFd output(pipe_fds[0]);
-    const UniqueFd input(pipe_fds[1]);
+    return {UniqueFd(fds[0]), UniqueFd(fds[1])};
+}
+
+Child start(lua_State* L, const char* command, bool with_input, const std::optional<Wall>& wall) {
+    auto [output, output_end] = make_pipe(L);
+    auto [input_end, input] = with_input ? make_pipe(L) : std::pair<UniqueFd, UniqueFd>{};
     const double started = now();
     const pid_t pid = fork();
     if (pid < 0) {
         luaL_error(L, "fork: %s", error_text().c_str());
     }
     if (pid == 0) {
-        exec_bash(command, input.get(), wall ? &*wall : nullptr);
+        exec_bash(command, input_end.get(), output_end.get(), wall ? &*wall : nullptr);
     }
-    return {.pid = pid, .output = std::move(output), .started = started};
+    return {.pid = pid, .output = std::move(output), .input = std::move(input), .started = started};
 }
 
-Outcome wait_for_command(pid_t pid, Output& output, bool hangup, double timeout) {
+std::string quote(std::string_view word) {
+    std::string quoted = "'";
+    for (const char c : word) {
+        quoted += c == '\'' ? std::string_view("'\\''") : std::string_view(&c, 1);
+    }
+    return quoted + "'";
+}
+
+std::string command_of(lua_State* L) {
+    if (!lua_istable(L, 1)) {
+        return check_cstring(L, 1);
+    }
+    std::string command;
+    for (int i = 1; lua_rawgeti(L, 1, i) != LUA_TNIL; ++i) {
+        std::size_t length = 0;
+        const char* word = lua_isstring(L, -1) != 0 ? lua_tolstring(L, -1, &length) : nullptr;
+        if (word == nullptr) {
+            luaL_error(L, "host.sh: command[%d] is a %s, not a string", i, luaL_typename(L, -1));
+        }
+        if (std::strlen(word) != length) {
+            luaL_error(L, "host.sh: command[%d] contains a NUL byte", i);
+        }
+        command += (i == 1 ? "" : " ") + quote({word, length});
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    if (command.empty()) {
+        luaL_error(L, "host.sh: the command list is empty; give the program and its arguments");
+    }
+    return command;
+}
+
+Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, double timeout) {
     const UniqueFd exited(static_cast<int>(syscall(SYS_pidfd_open, pid, 0)));
     const int hangup_fd = hangup ? STDIN_FILENO : -1;
     const double deadline = now() + timeout;
@@ -197,12 +268,17 @@ Outcome wait_for_command(pid_t pid, Output& output, bool hangup, double timeout)
         if (g_signal != 0 || now() >= deadline) {
             return give_up(g_signal != 0 ? Ending::Signaled : Ending::TimedOut);
         }
-        std::array<pollfd, 3> waiters{{{exited.get(), POLLIN, 0}, {hangup_fd, POLLRDHUP, 0}, {output.fd(), POLLIN, 0}}};
+        std::array<pollfd, 4> waiters{{{exited.get(), POLLIN, 0},
+                                       {hangup_fd, POLLRDHUP, 0},
+                                       {output.at_end() ? -1 : output.fd(), POLLIN, 0},
+                                       {input.fd(), POLLOUT, 0}}};
         const double left = std::max(deadline - now(), 0.0);
-        wait_for(std::span(waiters).first(output.at_end() ? 2 : 3),
-                 exited.valid() ? left : std::min(left, kNoPidfdPoll));
+        wait_for(waiters, exited.valid() ? left : std::min(left, kNoPidfdPoll));
         if ((waiters[1].revents & (POLLRDHUP | POLLHUP)) != 0) {
             return give_up(Ending::HungUp);
+        }
+        if (waiters[3].revents != 0) {
+            input.feed();
         }
     }
 }
@@ -212,10 +288,14 @@ bool hung_up() {
     return poll(&already, 1, 0) > 0 && (already.revents & (POLLRDHUP | POLLHUP)) != 0;
 }
 
-void push_result(lua_State* L, const std::string& text, const Outcome& outcome, double seconds) {
-    lua_createtable(L, 0, 5);
-    lua_pushlstring(L, text.data(), text.size());
+void push_result(lua_State* L, const Captured& output, const Outcome& outcome, double seconds) {
+    lua_createtable(L, 0, 6);
+    lua_pushlstring(L, output.text.data(), output.text.size());
     lua_setfield(L, -2, "out");
+    if (output.omitted > 0) {
+        lua_pushnumber(L, static_cast<double>(output.omitted));
+        lua_setfield(L, -2, "omitted");
+    }
     if (!outcome.reaped) {
         lua_pushnumber(L, SIGKILL);
         lua_setfield(L, -2, "signal");
@@ -235,15 +315,25 @@ void push_result(lua_State* L, const std::string& text, const Outcome& outcome, 
 }  // namespace
 
 int Host::sh(lua_State* L) {
-    const char* command = check_cstring(L, 1);
+    const std::string command = command_of(L);
     const Host& host = of(L);
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
     const std::optional<Wall> wall = host.narrower_wall(L, 2);
     bool on_hangup = false;
+    std::optional<std::string_view> data;
     if (lua_istable(L, 2)) {
         lua_getfield(L, 2, "hangup");
         on_hangup = lua_toboolean(L, -1) != 0;
         lua_pop(L, 1);
+        lua_getfield(L, 2, "input");
+        if (!lua_isnil(L, -1)) {
+            std::size_t length = 0;
+            const char* text = lua_isstring(L, -1) != 0 ? lua_tolstring(L, -1, &length) : nullptr;
+            if (text == nullptr) {
+                luaL_error(L, "host.sh: input is the text to send to the command's stdin");
+            }
+            data = std::string_view(text, length);
+        }
     }
     const std::vector<pid_t> before = wall ? descendants_now() : std::vector<pid_t>{};
     raise_if_signaled(L);
@@ -252,9 +342,10 @@ int Host::sh(lua_State* L) {
     }
     reap_exited();
 
-    Child child = start(L, command, wall);
+    Child child = start(L, command.c_str(), data.has_value(), wall);
     Output output(std::move(child.output));
-    const Outcome outcome = wait_for_command(child.pid, output, on_hangup, timeout);
+    Input input(std::move(child.input), data.value_or(std::string_view{}));
+    const Outcome outcome = wait_for_command(child.pid, output, input, on_hangup, timeout);
     if (wall) {
         kill_descendants(before);
     }
@@ -265,7 +356,7 @@ int Host::sh(lua_State* L) {
     if (outcome.ending == Ending::HungUp) {
         raise_error(L, "hung up");
     }
-    push_result(L, output.text(), outcome, outcome.ended - child.started);
+    push_result(L, output.result(), outcome, outcome.ended - child.started);
     return 1;
 }
 

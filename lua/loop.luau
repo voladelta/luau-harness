@@ -675,7 +675,8 @@ M.functions = {
 		usage = "bash(command, timeout?) -> text: runs a bash command in the project directory, a new shell each "
 			.. "time, and returns stdout and stderr together, then [exit N]. That last line is hx's, not the "
 			.. "command's: to use the output as data, as in a file or a string you build, take host.sh(command).out "
-			.. "instead. The command is killed after timeout "
+			.. "instead, and parse it in your code, with json.decode or string patterns, not in a python or jq "
+			.. "pipeline. The command is killed after timeout "
 			.. "seconds (default 120). A process left in the background must send its output to a file, and is "
 			.. "killed when this session ends, daemons included: nothing you start outlives it.",
 		run = function(command: any, timeout: any): string
@@ -897,8 +898,20 @@ local function lua_description(): string
 	for _, fn in M.functions do
 		table.insert(lines, "- " .. fn.usage)
 	end
-	table.insert(lines, "- host.sh(command) -> {out, code}, host.read(path) -> text, host.write(path, text), "
-		.. "host.list(dir), json.encode, json.decode: the plain primitives, for working on data.")
+	table.insert(lines, "- host.sh(command, {input?, timeout?}) -> {out, code}: runs a command for its output as "
+		.. "data, stdout and stderr together, whole up to 16 MiB; send more to a file and host.read it. command "
+		.. "is a bash string, or a list {program, arg, ...} whose words reach the program as they are, with no "
+		.. "quoting; input is text for its stdin.")
+	table.insert(lines, "- host.read(path) -> text, host.write(path, text), host.list(dir), json.encode(value), "
+		.. "json.decode(text): the other plain primitives, for working on data.")
+	table.insert(lines, "")
+	table.insert(lines, "Do the work in Luau: parsing, counting, deciding and building text and files belong in "
+		.. "your code, with string patterns, string.pack and string.unpack for binary data, and os.date. Commands "
+		.. "run programs: the build, tests, git, rg, curl, and tools that turn data into data, such as base64, "
+		.. "sha256sum or bc for numbers past 2^53. Join them in Luau: "
+		.. "json.decode(host.sh({\"curl\", \"-sfL\", url}).out), or host.sh({\"base64\", \"-d\"}, {input = text}).out. "
+		.. "Write a script in another language only for a library the job needs that neither Luau nor the "
+		.. "system's tools have, and pass it its data through input or a file.")
 	table.insert(lines, "")
 	table.insert(lines, "A function that fails raises an error, which stops the code there: what ran before it "
 		.. "has happened, and what it printed is shown with the error. Put text with quotes, backslashes or "
@@ -1172,7 +1185,8 @@ function M.system_prompt(): string
 				and "The kernel confines you: you can write inside this project directory and $TMPDIR, and read those "
 					.. "plus the system directories. \"Permission denied\" anywhere else is that wall. Do not refuse "
 					.. "in advance: try what the task needs, and only when the wall denies it, say so and stop "
-					.. "rather than looking for a way around it."
+					.. "rather than looking for a way around it. When a program the task needs is denied, name the path it "
+					.. "needs, which the user can open by starting hx with --ro PATH."
 			or "Nothing confines you in this session: you act with the user's full access to this machine. Stay "
 				.. "inside this project directory unless the task says otherwise.",
 		"You can extend yourself. You run on the loop built into hx; .hx/loop.luau, if the project has one, starts "

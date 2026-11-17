@@ -222,7 +222,7 @@ function is a module: `main()` runs, and the number it returns is the exit statu
 
 | Primitive | Returns |
 |---|---|
-| `host.sh(command, {timeout=120})` | `{out, code, signal, timed_out, seconds}` |
+| `host.sh(command, {timeout=120, input=})` | `{out, code, signal, timed_out, seconds}`: `out` whole up to 16 MiB. `command` is a bash string, or `{program, arg, ...}` with no quoting needed; `input` goes to stdin |
 | `host.read(path)`, `host.write(path, data)`, `host.list(dir)` | the value, or `nil, error`: they do not raise. `write` makes missing directories |
 | `host.load(source, name, env?)` | a function, or `nil, error` |
 | `host.try(fn, ...)`, `host.timed(seconds, fn, ...)` | `true, ...` or `false, error` |

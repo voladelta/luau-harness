@@ -186,7 +186,7 @@ call to the next. The code acts through these functions:
 
 | Function | Does |
 |---|---|
-| `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout. The status line is for reading: output used as data comes from `host.sh(command).out` |
+| `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout. The status line is for reading: output used as data comes from `host.sh(command).out`, and the usage asks for it to be parsed in Luau rather than in a python or jq pipeline |
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
@@ -194,7 +194,11 @@ call to the next. The code acts through these functions:
 | `ext(name)` | an extension's table of functions |
 | `agents(tasks)` | gives each task to an agent, all at work at the same time, and returns their reports (see "Agents") |
 
-`host.*` and `json.*` are there too, for working on raw data. A function that fails raises, and the error goes
+`host.*` and `json.*` are there too, for working on raw data. The tool's description asks the model to do a
+task's logic and data in Luau, to run programs for what programs do, joining them through `host.sh`'s list form
+and `input`, and to write a script in another language only for a library neither Luau nor the system's tools
+have. The system prompt asks the model, when the wall denies a program the task needs, to name the path for
+`--ro`. A function that fails raises, and the error goes
 back to the model with what the code printed before it. Only the result is clipped, once: past `M.output_limit`
 it keeps the start and the end, and the whole of it goes to a file in `$TMPDIR` whose path it names. A function
 returns everything, so code can work on an output of any size.
@@ -600,7 +604,7 @@ Everything Luau can do to the machine:
 |---|---|
 | `host.llm(body, {timeout=600, beta=, endpoint=})` | `status, text`, or `nil, error`; `beta` is sent as the `anthropic-beta` header. A third value is the seconds a `Retry-After` header asked for, when the reply had one; `host.tool` returns it too. The request goes to the session's endpoint, or with `endpoint = "deepseek"` to DeepSeek's Messages endpoint with `DEEPSEEK_API_KEY`; no other name is taken |
 | `host.tool(name, request, {timeout=300})` | `status, text`, or `nil, error`: a POST to DeepSeek's `search`, `fetch` or `ocr` endpoint with `DEEPSEEK_API_KEY`, or, for `"exa"`, to Exa's search endpoint with `EXA_API_KEY`. A string `request` is sent as JSON; for DeepSeek, a table is sent as a form, whose `file` field is the path of a file to upload |
-| `host.sh(command, {timeout=120, read=, write=, hangup=})` | `{out, code, signal, timed_out, seconds}`; `seconds` runs from the fork to the exit. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends. With `hangup = true`, the command ends, or does not start, once stdin's writer has hung up, and `host.sh` raises `"hung up"` |
+| `host.sh(command, {timeout=120, input=, read=, write=, hangup=})` | `{out, code, signal, timed_out, seconds, omitted}`; `seconds` runs from the fork to the exit. `command` is a bash command, or a list of a program and its arguments, which are quoted for bash so that each reaches the program as it is; a number in the list is taken as its text. `input` is text written to the command's stdin, which is otherwise `/dev/null`; a command that stops reading it early is not an error. `out` is stdout and stderr together, all of it up to 16 MiB, and a larger output belongs in a file that `host.read` reads; past that the middle is cut, as `host.clip` cuts, a line in its place says how many bytes are gone, and `omitted` is that number. Given `read` or `write`, lists of paths, the command runs behind a narrower wall: the system directories and those paths, inside the wall already in force, and whatever it starts is killed when it ends. With `hangup = true`, the command ends, or does not start, once stdin's writer has hung up, and `host.sh` raises `"hung up"` |
 | `host.spawn(fn, ...)` | an id, counting from 1: forks hx. The child is the process as it is, VM and wall and all, and runs `fn(...)` while the parent goes on. What it changes in the VM is its own: only files, and the string `fn` returns, reach the parent. The child is under no time limit of the parent's (its own `host.timed` works), reads no stdin, has no judge and cannot spawn. A stop ends it, and so does the parent's exit; what its commands left running is killed when `fn` ends. At most 64 children run or wait to be waited for |
 | `host.wait(seconds?)` | `id, ok, text` for the first child that has ended, in the order they were spawned: `ok` is whether `fn` returned, `text` what it returned (a string, or nothing for `""`) or the error it raised. A child that was killed is `false` and says so. When none has ended it waits, for at most `seconds` and until 2 seconds before the `host.timed` limit in force, and then, or when there is no child, returns `nil, running`: how many are still at work |
 | `host.judge(line?)` | `{lines}, pending`: sends a line to the judge, if given, and returns the answer it owes, waiting until 2 seconds before the `host.timed` limit in force; `pending` is how many it still owes. A line is refused while one is owed |
