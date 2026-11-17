@@ -206,10 +206,13 @@ call to the next. The code acts through these functions:
 task's logic and data in Luau, to run programs for what programs do, joining them through `host.sh`'s list form
 and `input`, and to write a script in another language only for a library neither Luau nor the system's tools
 have. The system prompt asks the model, when the wall denies a program the task needs, to name the path for
-`--ro`. A function that fails raises, and the error goes
-back to the model with what the code printed before it. Only the result is clipped, once: past `M.output_limit`
-it keeps the start and the end, and the whole of it goes to a file in `$TMPDIR` whose path it names. A function
-returns everything, so code can work on an output of any size.
+`--ro`. It asks it to do the task as its instructions say and, when the task is unclear or would take a step
+it did not ask for, to stop and end its reply with a question; never to sleep or poll for something outside its
+control, such as a market or a deploy, but to report and ask whether to wait.
+
+A function that fails raises, and the error goes back to the model with what the code printed before it. Only
+the result is clipped, once: past `M.output_limit` it keeps the start and the end, and the whole of it goes to a
+file in `$TMPDIR` whose path it names. A function returns everything, so code can work on an output of any size.
 
 Code from the model and from extensions sees `host`, `json` and the standard libraries through read-only views:
 an assignment such as `host.sh = nil` raises "host is read-only" instead of breaking every later call, and the
@@ -244,13 +247,13 @@ repository fits whole; in 19 lines it is:
   skills/
     hx/ (1 file)
 lua/
-  ext/ (4 files)
+  ext/ (5 files)
   skills/ (1 file)
   judge.luau
   loop.luau
   overlay.luau
 src/ (19 files)
-tests/ (11 files)
+tests/ (12 files)
 .clang-format
 .clang-tidy
 .gitignore

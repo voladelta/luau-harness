@@ -1206,6 +1206,10 @@ function M.system_prompt(): string
 			.. "you wrote or edited it yourself in this session."
 			.. (ripgrep and " To search, ripgrep is installed: use rg through bash rather than plain grep. It is "
 				.. "faster, and it skips what .gitignore names." or ""),
+		"Do the task you were given, as its instructions say. When it is unclear, or doing it would take a step it "
+			.. "did not ask for, stop and ask: end your reply with the question. Never sleep or poll to wait for "
+			.. "something outside your control, such as a market, a deploy or a person: report what you found and "
+			.. "ask whether to wait.",
 		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
 	}
 	if host.judged then

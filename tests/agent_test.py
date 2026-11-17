@@ -1499,6 +1499,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(self.tool_results()[1], "HEY!")
         self.assertNotIn("- shout", self.model.requests[0]["system"])
         self.assertIn("the loop built into hx", self.model.requests[0]["system"])
+        self.assertIn("Never sleep or poll to wait for something outside your control", self.model.requests[0]["system"])
         self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system"])
         self.run_hx("again", script=[say("ok")])
         self.assertIn("- shout: shouts a word", self.model.requests[-1]["system"])
