@@ -1185,10 +1185,10 @@ function M.system_prompt(): string
 			.. "one step at a time when the next depends on what the last returned."):format(host.cwd),
 		host.sandboxed
 				and "The kernel confines you: you can write inside this project directory and $TMPDIR, and read those "
-					.. "plus the system directories. \"Permission denied\" anywhere else is that wall. Do not refuse "
-					.. "in advance: try what the task needs, and only when the wall denies it, say so and stop "
-					.. "rather than looking for a way around it. When a program the task needs is denied, name the path it "
-					.. "needs, which the user can open by starting hx with --ro PATH."
+					.. "plus the system directories and the programs on PATH. \"Permission denied\" anywhere else is "
+					.. "that wall. Do not refuse in advance: try what the task needs, and only when the wall denies it, "
+					.. "say so and stop rather than looking for a way around it. When a program the task needs is "
+					.. "denied, name the path it needs, which the user can open by starting hx with --ro PATH."
 			or "Nothing confines you in this session: you act with the user's full access to this machine. Stay "
 				.. "inside this project directory unless the task says otherwise.",
 		"You can extend yourself. You run on the loop built into hx; .hx/loop.luau, if the project has one, starts "

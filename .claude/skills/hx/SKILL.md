@@ -54,7 +54,8 @@ hx --rpi [options] TASK...            the agent as the lead of agents (see "Agen
   `{ echo review this change; git diff; } | hx` sends both. A task takes minutes, so give the command a long
   timeout or run it in the background.
 - The wall: hx writes only the project directory and its own `$TMPDIR`, and reads those plus the system
-  directories. A toolchain in the home directory needs `--ro PATH` or `--rw PATH`. Variables that look like
+  directories and the programs on `PATH` (each directory on it, and where its links point). What a toolchain
+  needs beyond its programs, such as `~/.rustup`, needs `--ro PATH` or `--rw PATH`. Variables that look like
   secrets are taken out of the environment of commands; `--keep-env NAME` keeps one. The network is open.
   `--no-sandbox` takes the wall away: do not pass it unless the user asked.
 - Nothing asks before a file changes, and git is the undo: commit first, then read `git diff`. For a task that

@@ -108,13 +108,21 @@ supports bracketed paste); Ctrl-C stops the current turn and Ctrl-D leaves.
 | | Allowed |
 |---|---|
 | Write | the project directory (where you start `hx`), a private `$TMPDIR` that is removed on exit, `--rw` paths |
-| Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /nix/store`, your git configuration, trust roots (below), `--ro` paths |
+| Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /nix/store`, the directories on your `PATH` (below), your git configuration, trust roots (below), `--ro` paths |
 | Devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom` |
 | Everything else | cannot be opened: the rest of your home directory, other terminals, other projects |
 
-Toolchains installed in your home directory need a flag, for example
-`hx --ro ~/.rustup --ro ~/.cargo --rw ~/.cargo/registry "..."`. The flags are on the command line on purpose:
-nothing inside the project, which the model can write, can widen the wall.
+A program on your `PATH` runs inside, wherever it is installed. Each absolute directory on `PATH` is readable,
+and so is the directory that each symbolic link in it points into, with that directory's `lib`, `lib64` and
+`libexec` beside it when it is a `bin`: `~/.bun/bin/bun` runs, and `~/.local/bin/python3` linked into a uv-managed
+Python finds its library. Nothing next to them opens: not `~/.bun` or `~/.local`, nor anything else in the home
+directory. A `PATH` entry that is `/`, the home directory or a directory that holds it is left out, as are
+relative entries. To run with a narrower wall, narrow `PATH`: `PATH=/usr/bin:/bin hx "..."`.
+
+What a toolchain needs beyond its programs takes a flag, for example
+`hx --ro ~/.rustup --rw ~/.cargo/registry "..."` for rustup's toolchains and cargo's downloads. The flags and
+`PATH` come from your command line and environment on purpose: nothing inside the project, which the model can
+write, can widen the wall.
 
 Behind a TLS-intercepting proxy the trust roots often live in your home directory. The file or directory named
 by each of `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,

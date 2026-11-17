@@ -19,6 +19,8 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -473,6 +475,68 @@ class CurlGlobal {
     ~CurlGlobal() { curl_global_cleanup(); }
 };
 
+bool holds_home(const fs::path& project) {
+    std::error_code ec;
+    const fs::path home = fs::canonical(env_or("HOME", ""), ec);
+    if (ec || home.empty()) {
+        return false;
+    }
+    const fs::path inside = home.lexically_relative(project);
+    return !inside.empty() && *inside.begin() != "..";
+}
+
+bool beneath(const fs::path& path, const fs::path& dir) {
+    const fs::path inside = path.lexically_relative(dir);
+    return !inside.empty() && *inside.begin() != "..";
+}
+
+void add_path_rules(std::vector<hx::Rule>& rules) {
+    std::vector<fs::path> readable;
+    for (const hx::Rule& rule : rules) {
+        std::error_code ec;
+        if (fs::path whole = fs::canonical(rule.path, ec); !ec) {
+            readable.push_back(std::move(whole));
+        }
+    }
+    std::set<fs::path> opened;
+    const auto open = [&](const fs::path& dir) {
+        std::error_code ec;
+        const fs::path whole = fs::canonical(dir, ec);
+        const bool covered = std::ranges::any_of(readable, [&](const fs::path& r) { return beneath(whole, r); });
+        if (!ec && fs::is_directory(whole, ec) && whole != "/" && !holds_home(whole) && !covered) {
+            opened.insert(whole);
+        }
+    };
+    for (const auto part : std::views::split(env_or("PATH", ""), ':')) {
+        if (const std::string_view entry(part.begin(), part.end()); entry.starts_with('/')) {
+            open(entry);
+        }
+    }
+    const std::set<fs::path> listed = opened;
+    for (const fs::path& dir : listed) {
+        std::error_code ec;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code link_ec;
+            if (!it->is_symlink(link_ec)) {
+                continue;
+            }
+            const fs::path home = fs::canonical(it->path(), link_ec).parent_path();
+            if (link_ec || listed.contains(home)) {
+                continue;
+            }
+            open(home);
+            if (home.filename() == "bin") {
+                for (const char* sibling : {"lib", "lib64", "libexec"}) {
+                    open(home.parent_path() / sibling);
+                }
+            }
+        }
+    }
+    for (const fs::path& dir : opened) {
+        rules.push_back({dir.string(), hx::Access::Read, false});
+    }
+}
+
 std::vector<hx::Rule> system_rules() {
     using hx::Access;
     std::vector<hx::Rule> rules;
@@ -494,6 +558,7 @@ std::vector<hx::Rule> system_rules() {
             rules.push_back({std::move(path), Access::Read, false});
         }
     }
+    add_path_rules(rules);
     return rules;
 }
 
@@ -517,16 +582,6 @@ std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& proj
     const std::vector<hx::Rule> user = user_rules(options);
     rules.insert(rules.end(), user.begin(), user.end());
     return rules;
-}
-
-bool holds_home(const fs::path& project) {
-    std::error_code ec;
-    const fs::path home = fs::canonical(env_or("HOME", ""), ec);
-    if (ec || home.empty()) {
-        return false;
-    }
-    const fs::path inside = home.lexically_relative(project);
-    return !inside.empty() && *inside.begin() != "..";
 }
 
 hx::Sandbox confine(const Options& options, const fs::path& project, const fs::path& tmp) {

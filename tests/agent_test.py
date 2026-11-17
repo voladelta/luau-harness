@@ -863,6 +863,39 @@ class AgentTest(unittest.TestCase):
         self.assertIn("beside.pem: Permission denied", result)
         self.assertNotIn("NOT-THIS", result)
 
+    def test_programs_on_path_run_and_nothing_beside_them_opens(self):
+        def program(path, body):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+
+        def note(path, text):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+
+        program(os.path.join(self.home, ".tool/bin/tool"), "echo tool ran")
+        note(os.path.join(self.home, ".tool/secret"), "TOOL-SECRET")
+        prefix = os.path.join(self.home, "opt/linked")
+        program(os.path.join(prefix, "bin/linked"), 'cat "$(dirname "$(readlink -f "$0")")/../lib/data"')
+        note(os.path.join(prefix, "lib/data"), "from its lib")
+        note(os.path.join(prefix, "secret"), "PREFIX-SECRET")
+        os.makedirs(os.path.join(self.home, ".local/bin"))
+        os.symlink(os.path.join(prefix, "bin/linked"), os.path.join(self.home, ".local/bin/linked"))
+        note(os.path.join(self.home, "top.txt"), "HOME-FILE")
+        path = ":".join([f"{self.home}/.tool/bin", f"{self.home}/.local/bin", self.home, "relative", "",
+                         os.environ["PATH"]])
+        done = self.run_hx("go", PATH=path, script=[call("bash", {"command": (
+            f"tool; linked; cat {self.home}/.tool/secret {prefix}/secret {self.home}/top.txt")}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = self.tool_results()[0]
+        self.assertIn("tool ran\nfrom its lib", result)
+        for secret in (".tool/secret", "opt/linked/secret", "top.txt"):
+            self.assertIn(f"{secret}: Permission denied", result)
+        self.assertNotIn("SECRET", result)
+        self.assertNotIn("HOME-FILE", result)
+
     def test_the_home_directory_is_not_a_project(self):
         done = subprocess.run([HX, "go"], cwd=self.home, env=self.env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 2)
