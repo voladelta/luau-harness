@@ -722,7 +722,14 @@ luau-analyze lua/*.luau lua/ext/*.luau tests/*.luau     # prints nothing when al
 
 The Luau tests are `tests/*_test.luau`, and share their checks in `tests/check.luau`. One runs by hand from a
 scratch directory, with absolute paths, as `hx -q --ro /path/to/tests --run /path/to/tests/tools_test.luau`: the
-`--ro` lets the test read `check.luau` through the wall.
+`--ro` lets the test read `check.luau` through the wall. The directory a test starts in is its project: `ctest`
+gives each an empty one of its own under `test-projects/` in the build directory, so they can run side by side
+(`ctest -j`), and a test that writes a `.hx` directory and removes it refuses to start where there is one already.
+
+`tests/agent_test.py` drives the whole binary against a stand-in model server, a fresh project and home directory
+for each test. Besides the loop, the wall and the judge, it runs the examples of the `hx` skill as they are
+written there, the extension, the loop check and the sub-agent, so a change that breaks what the skill tells a
+model to type fails a test.
 
 The Luau files in `lua/` are `--!strict`; an extension carries that on its second line, because its first is the
 description the system prompt shows. `.luaurc` names the globals the host provides. When `luau-analyze` is

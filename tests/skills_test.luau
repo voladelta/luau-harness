@@ -117,7 +117,6 @@ for _, f in loop.functions do
 		fn = f
 	end
 end
-check("skill is a function", fn ~= nil, true)
 has("the function trims", fn.run("  xlsx \n"), "[skill xlsx,")
 check("a table is refused", pcall(fn.run, { name = "xlsx" }), false)
 check("an empty name is refused", pcall(fn.run, "  "), false)

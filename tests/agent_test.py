@@ -11,6 +11,7 @@ import http.server
 import json
 import os
 import pty
+import re
 import shutil
 import signal
 import socket
@@ -49,13 +50,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.requests.append(request)
         self.server.headers.append({name.lower(): value for name, value in self.headers.items()})
         answer = self.server.answer(request) if self.server.answer else None
-        status, reply = answer or (self.server.script.pop(0) if self.server.script else (500, {"error": "script ran out"}))
+        entry = answer or (self.server.script.pop(0) if self.server.script else (500, {"error": "script ran out"}))
+        status, reply, headers = (*entry, {})[:3]
         if status == "hang":
             self.server.hanging.set()
             time.sleep(reply)
             return
         data = json.dumps(reply).encode()
         self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -116,6 +120,13 @@ class ToolsHandler(http.server.BaseHTTPRequestHandler):
 def read(*path):
     with open(os.path.join(*path)) as f:
         return f.read()
+
+
+def fenced(text, marker):
+    for block in text.split("```")[1::2]:
+        if marker in block:
+            return block.split("\n", 1)[1]
+    raise AssertionError(f"no code block holds {marker!r}")
 
 
 def kill_quietly(pid):
@@ -211,6 +222,11 @@ class AgentTest(unittest.TestCase):
     def run_hx(self, *args, script=(), stdin=None, **env):
         self.model.script = list(script)
         return subprocess.run([HX, *args], cwd=self.project, env=self.env(**env), input=stdin,
+                              capture_output=True, text=True, timeout=60)
+
+    def shell(self, command):
+        path = os.path.dirname(HX) + ":" + os.environ["PATH"]
+        return subprocess.run(["bash", "-c", command], cwd=self.project, env=self.env(PATH=path),
                               capture_output=True, text=True, timeout=60)
 
     def tool_results(self, requests=None):
@@ -383,12 +399,17 @@ class AgentTest(unittest.TestCase):
         self.assertIn("stopped after 2 model replies", done.stderr)
         self.assertIn("Write your final report now", self.model.requests[2]["messages"][-1]["content"][-1]["text"])
 
-    def test_effort_is_sent_when_set(self):
+    def test_effort_is_sent_when_set_and_refused_when_it_is_no_effort(self):
         done = self.run_hx("go", script=[say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
         self.assertNotIn("output_config", self.model.requests[0])
         done = self.run_hx("go", script=[say("ok")], HX_EFFORT="max")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.model.requests[1]["output_config"], {"effort": "max"})
+        done = self.run_hx("go", script=[say("never")], HX_EFFORT="extreme")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("hx: HX_EFFORT=extreme: the efforts are low, medium, high, xhigh and max", done.stderr)
+        self.assertEqual(len(self.model.requests), 2)
 
     def test_a_claude_model_gets_its_effort_fallbacks_and_betas(self):
         done = self.run_hx("--model", "opus", "go", script=[say("ok")])
@@ -684,6 +705,21 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("no task", done.stderr)
 
+    def test_no_input_fails_at_a_terminal_instead_of_waiting_for_a_person(self):
+        master, slave = pty.openpty()
+        try:
+            done = subprocess.run([HX, "--no-input"], cwd=self.project, env=self.env(), stdin=slave,
+                                  capture_output=True, text=True, timeout=60)
+        finally:
+            os.close(master)
+            os.close(slave)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--no-input forbids the prompt", done.stderr)
+        self.assertEqual(self.model.requests, [])
+        done = self.run_hx("--no-input", stdin="the task, piped\n", script=[say("ok")])
+        self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
+        self.assertEqual(self.model.requests[0]["messages"][0]["content"], "the task, piped")
+
     def test_help_and_version_go_to_stdout(self):
         done = self.run_hx("--help")
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -741,6 +777,14 @@ class AgentTest(unittest.TestCase):
         done = self.run_hx("go", script=[(500, {"error": "busy"}), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(len(self.model.requests), 2)
+        self.assertEqual(self.model.requests[0], self.model.requests[1])
+
+    def test_a_rate_limited_request_waits_as_long_as_the_server_asks(self):
+        started = time.monotonic()
+        done = self.run_hx("go", script=[(429, {"error": {"message": "slow down"}}, {"Retry-After": "3"}), say("ok")])
+        self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
+        self.assertIn("model request failed (429), retrying in 3 s", done.stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 3)
         self.assertEqual(self.model.requests[0], self.model.requests[1])
 
     def test_a_rejected_request_ends_the_run(self):
@@ -912,6 +956,30 @@ class AgentTest(unittest.TestCase):
         self.model.script = [say("ok")]
         done = subprocess.run([HX, "go"], cwd=sibling, env=self.env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_ro_and_rw_do_not_open_the_home_directory(self):
+        for flag in ("--ro", "--rw"):
+            for path in (self.home, self.root, "/"):
+                done = self.run_hx(flag, path, "go", script=[say("never")])
+                self.assertEqual(done.returncode, 2, (flag, path))
+                self.assertIn(f"refusing {flag} {path}: it would open your whole home directory", done.stderr)
+        self.assertEqual(self.model.requests, [])
+
+    def test_a_skill_in_the_home_directory_is_found_once_ro_opens_it(self):
+        skills = os.path.join(self.home, ".claude", "skills")
+        os.makedirs(os.path.join(skills, "sign-off"))
+        with open(os.path.join(skills, "sign-off", "SKILL.md"), "w") as f:
+            f.write("---\nname: sign-off\ndescription: How to sign off a piece of work.\n---\nWrite SIGNED to signoff.txt.\n")
+        load = call("lua", {"code": "return skill('sign-off')"})
+        done = self.run_hx("go", script=[load, say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("sign-off", self.model.requests[0]["system"])
+        self.assertIn('No skill is named "sign-off".', self.tool_results()[0])
+        self.model.requests.clear()
+        done = self.run_hx("--ro", skills, "go", script=[load, say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("\n- sign-off: How to sign off a piece of work.", self.model.requests[0]["system"])
+        self.assertTrue(self.tool_results()[0].endswith("\n\nWrite SIGNED to signoff.txt."), self.tool_results())
 
     def test_the_api_key_reaches_the_endpoint_and_nothing_else(self):
         done = self.run_hx("go", OTHER_SECRET_TOKEN="hunter2-token", GIT_CONFIG_KEY_0="not-a-secret", script=[
@@ -1087,6 +1155,26 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(process.returncode, 130)
         self.assert_gone(pid)
         self.assertEqual(len(self.model.requests), 1)
+
+    def test_sigterm_and_sighup_end_the_run_with_143_and_leave_its_log(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        for sent in (signal.SIGTERM, signal.SIGHUP):
+            self.model.script = [call("bash", {"command": "echo $$ > cmd.pid; sleep 300"}), say("never")]
+            process = subprocess.Popen([HX, "the task"], cwd=self.project, env=self.env(), stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            pid = self.wait_for_pid_file("cmd.pid")
+            process.send_signal(sent)
+            out, err = process.communicate(timeout=20)
+            self.assertEqual((process.returncode, out), (143, ""), err)
+            self.assert_gone(pid)
+            os.remove(os.path.join(self.project, "cmd.pid"))
+            self.assertIn("[1 replies, 10 tokens in", err)
+        logs = [json.loads(read(self.project, ".hx", "log", name))
+                for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
+        self.assertEqual(len(logs), 2)
+        for log in logs:
+            self.assertEqual([m["role"] for m in log["messages"]], ["user", "assistant"])
+            self.assertEqual(log["messages"][0]["content"], "the task")
 
     def test_an_interrupted_turn_leaves_a_conversation_that_continues(self):
         self.model.script = [say("first answer"), call("bash", {"command": "echo $$ > cmd.pid; sleep 300"}),
@@ -1475,7 +1563,9 @@ class AgentTest(unittest.TestCase):
 
     def test_a_stop_reaches_a_read_of_a_fifo(self):
         code, out = self.run_interrupted(
-            "host.sh('mkfifo fifo; echo $$ > cmd.pid')\nprint(host.try(host.read, 'fifo'))\nprint('after')\n")
+            "host.sh('mkfifo fifo')\n"
+            "host.sh(\"sh -c 'exec 3> fifo; echo $$ > cmd.pid; exec sleep 300' > /dev/null 2>&1 &\")\n"
+            "print(host.try(host.read, 'fifo'))\nprint('after')\n")
         self.assertEqual((code, out), (0, "false\tinterrupted\nafter\n"))
 
     def test_clip_keeps_both_ends_cut_at_a_line_or_a_character(self):
@@ -1654,6 +1744,62 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("hx (built in)", self.model.requests[-2]["system"])
         self.assertEqual(self.tool_results()[1], "[skill hx, in .hx/skills/hx/. A path in it that names one of the skill's "
                          "own files is relative to that directory; everything else is the project's.]\n\nOurs.")
+
+    def test_the_hx_skill_s_extension_example_works_as_written(self):
+        skill = read(REPO, ".claude", "skills", "hx", "SKILL.md")
+        os.makedirs(os.path.join(self.project, "src"))
+        for name, source in (("a.c", "// TODO one\nint a; // TODO two\n"), ("b.c", "int b;\n")):
+            with open(os.path.join(self.project, "src", name), "w") as f:
+                f.write(source)
+        os.makedirs(os.path.join(self.project, ".hx", "ext"))
+        with open(os.path.join(self.project, ".hx", "ext", "todo.luau"), "w") as f:
+            f.write(fenced(skill, "counts TODO comments per file"))
+        tried = self.shell(fenced(skill, 'loop.ext("NAME").count("src")').replace("NAME", "todo"))
+        self.assertEqual((tried.returncode, tried.stdout), (0, "src/a.c:2\n\n"), tried.stderr)
+        done = self.run_hx("go", script=[call("lua", {"code": 'return ext("todo").count("src")'}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("\n- todo: counts TODO comments per file: count(dir) -> text\n", self.model.requests[0]["system"])
+        self.assertEqual(self.tool_results(), ["src/a.c:2\n"])
+
+    def test_the_hx_skill_s_loop_check_tells_a_loop_that_loads_from_one_that_does_not(self):
+        check = fenced(read(REPO, ".claude", "skills", "hx", "SKILL.md"), 'print("loop ok")')
+        self.assertEqual(self.run_hx("--init").returncode, 0)
+        done = self.shell(check)
+        self.assertEqual((done.returncode, done.stdout), (0, "loop ok\n"), done.stderr)
+        for broken in ("local M = {\n", "return {}\n", "error('no')\n"):
+            with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+                f.write(broken)
+            done = self.shell(check)
+            self.assertEqual((done.returncode, done.stdout), (1, ""), broken)
+
+    def test_the_hx_skill_s_sub_agent_example_works_as_written(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write(fenced(read(REPO, ".claude", "skills", "hx", "SKILL.md"), 'name = "delegate"'))
+        self.model.answer = agent_answers({
+            "count the files": [call("bash", {"command": "echo 3"}, "s1"), say("there are three")]})
+        done = self.run_hx("go", script=[call("lua", {"code": 'return delegate("count the files")'}, "c1"), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("using the built-in loop", done.stderr)
+        lead = [r for r in self.model.requests if r["messages"][0]["content"] == "go"]
+        sub = [r for r in self.model.requests if r["messages"][0]["content"] == "count the files"]
+        self.assertEqual((len(lead), len(sub)), (2, 2))
+        self.assertIn("- delegate(task) -> text", lead[0]["tools"][0]["description"])
+        self.assertEqual(self.tool_results(sub), ["3\n[exit 0]"])
+        self.assertEqual(self.tool_results(lead), ["there are three"])
+        self.assertEqual((sub[0]["system"], sub[0]["tools"]), (lead[0]["system"], lead[0]["tools"]))
+        self.assertEqual(done.stdout, "there are three\nok\n")
+        self.assertIn("[4 replies, 40 tokens in", done.stderr)
+        logs = sorted(os.listdir(os.path.join(self.project, ".hx", "log")))
+        self.assertEqual(len([name for name in logs if name.endswith("-sub-1.json")]), 1)
+
+    def test_the_binary_writes_out_its_skill_and_its_loop_as_the_docs_say(self):
+        skill = read(REPO, ".claude", "skills", "hx", "SKILL.md")
+        done = self.shell(fenced(read(REPO, "README.md"), "print(host.skills.hx)"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(read(self.home, ".claude", "skills", "hx", "SKILL.md"), skill + "\n")
+        done = self.shell(re.search(r"`(echo 'print\(host\.default_loop\)' [^`]+)`", skill).group(1))
+        self.assertEqual((done.returncode, done.stdout), (0, read(REPO, "lua", "loop.luau") + "\n"), done.stderr)
 
     def write_files(self, *paths):
         for path in paths:
@@ -1863,6 +2009,10 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, '["a","--b"]\thi\n\n')
 
+    def test_a_script_that_returns_main_exits_with_what_main_returns(self):
+        done = self.run_hx("--run", "-", "a", stdin="return { main = function() print('ran', host.args[1]) return 3 end }")
+        self.assertEqual((done.returncode, done.stdout), (3, "ran\ta\n"), done.stderr)
+
     def test_a_task_may_start_with_any_word(self):
         done = self.run_hx("run", "the", "tests", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1871,6 +2021,9 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.model.requests[-1]["messages"][0]["content"], "init")
         self.assertFalse(os.path.exists(os.path.join(self.project, ".hx", "loop.luau")))
+        done = self.run_hx("-q", "--", "--verbose", "is", "ignored:", "why?", script=[say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[-1]["messages"][0]["content"], "--verbose is ignored: why?")
 
     def test_a_script_error_is_reported(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
@@ -1886,19 +2039,33 @@ class AgentTest(unittest.TestCase):
         with open(os.path.join(self.project, "wall.luau"), "w") as f:
             f.write("""
 local box = host.env("TMPDIR") .. "/box"
-host.sh("mkdir -p " .. box)
-host.sh("sleep 61 > /dev/null 2>&1 &")  -- an ordinary background job
-print(host.sh("cat secret.txt", { write = { box } }).code ~= 0)
-print(host.sh("echo inside > " .. box .. "/f && cat " .. box .. "/f", { write = { box } }).out)
-host.sh("setsid sleep 62 > /dev/null 2>&1 & echo left", { write = { box } })
-print(host.sh("pgrep -x sleep -a").out)
+local walled = { write = { box } }
+local function daemon(pid_file)
+	return ("setsid sh -c 'echo $$ > %s; exec sleep 300' > /dev/null 2>&1 < /dev/null & "
+		.. "while [ ! -s %s ]; do sleep 0.05; done"):format(pid_file, pid_file)
+end
+local function state(pid_file)
+	return host.sh("ps -o stat= -p $(cat " .. pid_file .. ")").out:sub(1, 1)
+end
+host.sh({ "mkdir", "-p", box })
+host.sh(daemon("plain.pid"))
+print(host.sh("cat secret.txt", walled).out)
+print(host.sh("echo inside > " .. box .. "/f && cat " .. box .. "/f", walled).out)
+host.sh(daemon(box .. "/walled.pid"), walled)
+for _ = 1, 100 do
+	if state(box .. "/walled.pid") ~= "S" then
+		break
+	end
+	host.sleep(0.05)
+end
+print(state("plain.pid") == "S", state(box .. "/walled.pid") == "S")
 """)
         done = self.run_hx("--run", "wall.luau")
         self.assertEqual(done.returncode, 0, done.stderr)
-        lines = done.stdout.splitlines()
-        self.assertEqual(lines[:2], ["true", "inside"])
-        self.assertIn("sleep 61", done.stdout)
-        self.assertNotIn("sleep 62", done.stdout)
+        denied, inside, alive = (line for line in done.stdout.splitlines() if line)
+        self.assertIn("secret.txt: Permission denied", denied)
+        self.assertEqual((inside, alive), ("inside", "true\tfalse"))
+        self.assertNotIn("s3cret", done.stdout)
 
     def make_kit(self, where=None, run="#!/bin/sh\nsh prog.sh\n",
                  check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "wrong: $(head -c 80 "$1/.judge/stdout")"; exit 1; }\n',
@@ -2076,11 +2243,19 @@ say(submit("fine"))
 
     def test_judge_a_stop_during_a_trial_ends_it_and_the_summary_follows(self):
         kit = self.make_kit(config='{"runs": 1}', prog="sleep 0.1\necho 42\n")
+        flags = os.path.join(self.root, "flags")
+        os.makedirs(flags)
         with open(os.path.join(self.project, "drive.luau"), "w") as f:
-            f.write('host.write("prog.sh", "sleep 30\\necho 42\\n")\nprint(host.judge(json.encode({ note = "slow" })))\n')
-        proc = subprocess.Popen([HX, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
+            f.write(f'host.write("prog.sh", "touch {flags}/running\\nsleep 30\\necho 42\\n")\n'
+                    'print(host.judge(json.encode({ note = "slow" })))\n')
+        proc = subprocess.Popen([HX, "--rw", flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
                                 env=self.env(XDG_STATE_HOME=""), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(3)
+        self.addCleanup(kill_quietly, proc.pid)
+        for _ in range(400):
+            if os.path.exists(os.path.join(flags, "running")):
+                break
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(os.path.join(flags, "running")), "the trial's run never began")
         started = time.monotonic()
         proc.send_signal(signal.SIGINT)
         out, err = proc.communicate(timeout=30)

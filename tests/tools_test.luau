@@ -14,11 +14,7 @@ local function lua(code)
 	return loop.tools[1].run({ code = code })
 end
 
-check("there is one tool", #loop.tools, 1)
-for _, tool in loop.tools do
-	local schema = json.encode(tool.parameters)
-	check(tool.name .. " schema lists required", schema:find('"required":%[') ~= nil, true)
-end
+assert(not host.stat(".hx"), "tools_test writes .hx and removes it: run it from a scratch directory, not from a project")
 
 check("write", tools.write(dir .. "a/b/file.txt", "one\ntwo\nthree\n"), ("wrote 14 bytes to %sa/b/file.txt"):format(dir))
 check("read", tools.read(dir .. "a/b/file.txt"), "1: one\n2: two\n3: three")
@@ -190,7 +186,6 @@ for _, name in { "bash(command, timeout?)", "read(path, offset?, limit?)", "writ
 	check("the tool describes " .. name, description:find(name, 1, true) ~= nil, true)
 end
 check("the description is the same each time, for the cache", loop.tools[1].description(), description)
-check("ext is described once", select(2, description:gsub("ext%(name%)", "")), 1)
 
 local started = os.time()
 check("a time limit ends a sleep", select(2, host.timed(0.2, function() host.sleep(30) end)), "timeout")

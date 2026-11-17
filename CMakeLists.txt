@@ -130,7 +130,10 @@ if(BUILD_TESTING)
   foreach(test_file IN LISTS HX_LUAU_TESTS)
     get_filename_component(test_name ${test_file} NAME_WE)
     string(REGEX REPLACE "_test$" "" test_name ${test_name})
-    add_test(NAME ${test_name} COMMAND hx -q --ro ${CMAKE_CURRENT_SOURCE_DIR}/tests --run ${test_file})
+    set(test_dir ${CMAKE_CURRENT_BINARY_DIR}/test-projects/${test_name})
+    file(MAKE_DIRECTORY ${test_dir})
+    add_test(NAME ${test_name} COMMAND hx -q --ro ${CMAKE_CURRENT_SOURCE_DIR}/tests --run ${test_file}
+             WORKING_DIRECTORY ${test_dir})
   endforeach()
   add_test(NAME agent COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/agent_test.py $<TARGET_FILE:hx>)
 

@@ -6,8 +6,8 @@ local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. 
 local check = checks.check
 
 local legal = {
-	idle = { say = true, restart = true },
-	ready = { say = true, reply = true, restart = true },
+	idle = { say = true, restart = true, resume = true },
+	ready = { say = true, reply = true, restart = true, resume = true },
 	owing = { answer = true },
 }
 
@@ -48,8 +48,11 @@ local operations = {
 	restart = function(talk)
 		talk:restart("summary")
 	end,
+	resume = function(talk)
+		talk:resume({ type = "compaction", content = "summary", signature = "s" }, "go on")
+	end,
 }
-local names = { "say", "reply", "answer", "restart" }
+local names = { "say", "reply", "answer", "restart", "resume" }
 
 math.randomseed(20261114)
 local talk = Conversation.new()

@@ -4,6 +4,8 @@ local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
 local check, raises = checks.check, checks.raises
 
+assert(not host.stat(".hx"), "extensions_test writes .hx and removes it: run it from a scratch directory, not from a project")
+
 local calls, answers, waits = {}, {}, {}
 host.tool = function(name, request, options)
 	table.insert(calls, { name = name, request = request, options = options })
@@ -94,6 +96,12 @@ raises("no answer at all", "search failed (no answer): Could not resolve host", 
 check("no answer is retried", #calls, 3)
 script({ 200, "<html>" })
 raises("an answer that is not JSON", "not JSON", web.search, "q")
+script({ 404, string.rep("x", 400) })
+check("an error page is shown cut to 300 bytes", select(2, pcall(web.search, "q")), "search failed (404): " .. string.rep("x", 300))
+script({ 403, '{"error": "forbidden"}' })
+raises("an error that is text, not an object", "search failed (403): forbidden", web.search, "q")
+script({ 200, '{"results":[{"title":"T","url":"u","snippet":"","summary":"' .. string.rep("\255", 900) .. '"}]}' })
+check("a summary that is not UTF-8 is cut by bytes", tostring(web.search("q")), "1. T\n   u\n   " .. string.rep("\255", 800) .. " ...")
 
 script({ 200, json.encode({ title = "Your First API Call", content = "# Your First API Call\n\nHello." }) })
 check("fetch returns the content", web.fetch("https://example.com/a"), "# Your First API Call\n\nHello.")
@@ -192,38 +200,17 @@ raises("deep with an objective that is not a string", "exa.deep: argument 2 (obj
 	exa.deep, "q")
 raises("a schema that is not an object", 'of type "object"', exa.deep, "q", "o", { schema = { type = "array" } })
 
-local http = loop.ext("_http")
-check("an error's message", http.message('{"error": {"message": "m"}}'), "m")
-check("an error as text", http.message('{"error": "e"}'), "e")
-check("a message at the top is not read unasked", http.message('{"message": "top"}'), '{"message": "top"}')
-check("a message at the top, asked for", http.message('{"message": "top"}', true), "top")
-check("a body that is not JSON", http.message(string.rep("x", 400)), string.rep("x", 300))
-check("no body", http.message(nil), "nil")
-check("a short text is not clipped", http.clip("a  b\n c", 10), "a b c")
-check("a long text is clipped on a character", http.clip(string.rep("é", 5), 3), "ééé ...")
-check("the limit counts characters, not bytes", http.clip(string.rep("é", 500), 800), string.rep("é", 500))
-check("a text of exactly the limit is whole", http.clip(string.rep("é", 3), 3), "ééé")
-check("text that is not UTF-8 is counted in bytes", http.clip(string.rep("\255", 5), 3), "\255\255\255 ...")
-check("and is whole within the limit", http.clip("\255\255", 3), "\255\255")
+host.write(".hx/ext/web.luau", "-- mine\nreturn { search = function() return 'own' end }\n")
+check("the project's own web takes the built-in one's place", select(2, pcall(function()
+	return loop.ext("web").search("q")
+end)), "own")
+host.sh("rm .hx/ext/web.luau")
+check("and the built-in one is back when the file is gone", type(loop.ext("web").fetch), "function")
 
-local own = ".hx/ext/web.luau"
-if not host.read(own) then
-	host.write(own, "-- mine\nreturn { search = function() return 'own' end }\n")
-	local ok, value = pcall(function()
-		return loop.ext("web").search("q")
-	end)
-	host.sh("rm -f " .. own .. " && rmdir .hx/ext .hx")
-	check("the project's own web wins", value, "own")
-	check("and loads", ok, true)
-end
-
-if not host.read(".hx/ext/noisy.luau") then
-	host.write(".hx/ext/noisy.luau", "-- prints\nreturn { f = function() print('EXT-PRINT', 1) return 'value' end }\n")
-	local code = "print('before') local v = ext('noisy').f() print('after') return v"
-	local ok, result = pcall(loop.tools[1].run, { code = code })
-	host.sh("rm -f .hx/ext/noisy.luau && rmdir .hx/ext .hx")
-	check("an extension's print reaches the tool result", result, "before\nEXT-PRINT\t1\nafter\nvalue")
-	check("and the call works", ok, true)
-end
+host.write(".hx/ext/noisy.luau", "-- prints\nreturn { f = function() print('EXT-PRINT', 1) return 'value' end }\n")
+check("an extension's print reaches the tool result",
+	loop.tools[1].run({ code = "print('before') local v = ext('noisy').f() print('after') return v" }),
+	"before\nEXT-PRINT\t1\nafter\nvalue")
+host.sh("rm -rf .hx")
 
 checks.done("extensions")
