@@ -4,7 +4,7 @@
 usage: agent_test.py PATH_TO_HX [unittest arguments]
 
 Each test gets a fresh project directory and a fresh fake home, and scripts the model's replies. The sandbox
-checks need a kernel with Landlock.
+checks need a kernel with Landlock. Tests run side by side, HX_TEST_JOBS at a time (default twice the CPUs).
 """
 
 import http.server
@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 HX = None
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2366,8 +2367,38 @@ host.write("prog.sh", "echo SECRET-OUTPUT; exit 1\\n"); say(submit("crash"))
         self.assertIn("hx judge: 1 trial: 1 win", done.stderr)
         self.assertEqual(self.ledger()[1]["note"], "dropped the long sleep")
 
+
+JOBS = int(os.environ.get("HX_TEST_JOBS") or 2 * (os.cpu_count() or 1))
+
+
+class ParallelSuite(unittest.TestSuite):
+    def run(self, result, debug=False):
+        with ThreadPoolExecutor(JOBS) as pool:
+            list(pool.map(lambda test: test(result), self))
+        return result
+
+
+class LockedResult(unittest.TextTestResult):
+    lock = threading.Lock()
+
+
+def locked(method):
+    def guarded(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return guarded
+
+
+for name in ("startTest", "stopTest", "addSuccess", "addError", "addFailure", "addSkip", "addExpectedFailure",
+             "addUnexpectedSuccess", "addSubTest", "addDuration"):
+    if hasattr(unittest.TextTestResult, name):
+        setattr(LockedResult, name, locked(getattr(unittest.TextTestResult, name)))
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     HX = os.path.abspath(sys.argv.pop(1))
-    unittest.main(verbosity=1)
+    loader = unittest.TestLoader()
+    loader.suiteClass = ParallelSuite
+    unittest.main(testLoader=loader, testRunner=unittest.TextTestRunner(resultclass=LockedResult), verbosity=1)
