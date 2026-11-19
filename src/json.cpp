@@ -93,7 +93,7 @@ int l_decode(lua_State* L) {
     }
 
     std::vector<Frame> frames;
-    const auto attach = [&]() {
+    const auto attach = [&] {
         if (frames.empty()) {
             return;
         }

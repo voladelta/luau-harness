@@ -166,7 +166,7 @@ constexpr Service kServices[] = {
 };
 
 const Vendor& vendor_of(std::string_view model) {
-    const auto found = std::ranges::find(kVendors, hx::vendor_of(model), &Vendor::name);
+    const auto* const found = std::ranges::find(kVendors, hx::vendor_of(model), &Vendor::name);
     return found != std::end(kVendors) ? *found : kDeepSeek;
 }
 
@@ -670,6 +670,9 @@ std::optional<std::size_t> system_available() noexcept {
         return std::nullopt;
     }
     at = text.find_first_not_of(' ', at + kField.size());
+    if (at == std::string_view::npos) {
+        return std::nullopt;
+    }
     std::size_t kib = 0;
     const auto [end, error] = std::from_chars(text.data() + at, text.data() + text.size(), kib);
     if (error != std::errc()) {
