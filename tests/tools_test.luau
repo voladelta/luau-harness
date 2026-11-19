@@ -121,6 +121,9 @@ loop.output_limit = 30000
 
 check("printable keeps text, newlines and tabs", loop.printable("a\tb\nc é"), "a\tb\nc é")
 check("printable drops escape sequences' control bytes", loop.printable("\27]52;c;aGk=\7x\27[2Jy\r\0\127z"), "]52;c;aGk=x[2Jyz")
+check("printable drops the marks that reorder text", loop.printable("a\226\128\174b\226\129\166c\194\155d"), "abcd")
+check("and one that what it drops would leave behind",
+	loop.printable("a\226\128\0\174b\226\194\155\128\174c\226\226\128\174\129\166d"), "abcd")
 
 local function failed(code)
 	return select(2, lua(code))

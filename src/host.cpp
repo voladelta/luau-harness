@@ -252,12 +252,9 @@ bool starts(std::string_view text, unsigned char lead, unsigned char next, unsig
     return text.size() >= 3 && at(0) == lead && at(1) == next && at(2) >= low && at(2) <= high;
 }
 
-int l_printable(lua_State* L) {
-    std::size_t length = 0;
-    const char* raw = luaL_checklstring(L, 1, &length);
-    std::string_view text(raw, length);
+std::string without_controls(std::string_view text) {
     std::string kept;
-    kept.reserve(length);
+    kept.reserve(text.size());
     while (!text.empty()) {
         const auto c = static_cast<unsigned char>(text.front());
         if (starts(text, 0xE2, 0x80, 0xAA, 0xAE) || starts(text, 0xE2, 0x81, 0xA6, 0xA9)) {
@@ -270,6 +267,17 @@ int l_printable(lua_State* L) {
             }
             text.remove_prefix(1);
         }
+    }
+    return kept;
+}
+
+int l_printable(lua_State* L) {
+    std::size_t length = 0;
+    const char* raw = luaL_checklstring(L, 1, &length);
+    std::string kept = without_controls({raw, length});
+    for (std::size_t before = length; kept.size() != before;) {
+        before = kept.size();
+        kept = without_controls(kept);
     }
     lua_pushlstring(L, kept.data(), kept.size());
     return 1;
