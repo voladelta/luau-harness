@@ -18,7 +18,7 @@ loop.system_prompt = function()
 	table.insert(systems, "built")
 	return "the session's prompt"
 end
-loop.request = function(system, messages)
+loop.request = function(system, messages, _, model)
 	local last = messages[#messages].content
 	local told
 	if type(last) == "string" then
@@ -38,10 +38,10 @@ loop.request = function(system, messages)
 		words = ("%d messages"):format(#messages)
 	elseif told == "functions" then
 		local names = {}
-		for _, fn in loop.functions do
-			table.insert(names, fn.name)
+		for name in loop.tools[1].description():gmatch("\n%- ([%w_]+)%(") do
+			table.insert(names, name)
 		end
-		words = table.concat(names, " ") .. " on " .. loop.model .. " under: " .. system
+		words = table.concat(names, " ") .. " on " .. tostring(model) .. " under: " .. system
 	elseif told == "global" then
 		words = "mark was " .. tostring(mark)
 		mark = "the agent's"

@@ -165,6 +165,16 @@ for _, assignment in { "host.sh = nil", "json.encode = nil", "_G.host.sh = nil",
 	check(assignment .. " fails", broke, true)
 	check(assignment .. " says why", result:find("is read-only", 1, true) ~= nil, true)
 end
+for _, digging in { "rawset(host, 'sh', nil)", "rawset(string, 'format', nil)", "host.extensions.bytes = ''",
+	"host.skills.hx = ''", "host.args[1] = 'x'", "host.endpoints.exa = true",
+	"getmetatable('').__index.upper = function() return 'x' end", "getmetatable('').__index = {}",
+	"setmetatable(host, {})", "getmetatable(host).__index = nil", "getfenv(bash).host.sh = nil",
+	"setfenv(bash, {})" } do
+	local _, broke = lua(digging)
+	check(digging .. " fails", broke, true)
+end
+check("strings still have their methods", ("still"):upper(), "STILL")
+check("and the loop's own host is whole", type(host.sh), "function")
 check("bash still works", lua("return bash('echo still')"), "still\n[exit 0]")
 check("json still works", lua("return json.encode({1})"), "[1]")
 check("and so does the loop's own json", json.encode({ 2 }), "[2]")

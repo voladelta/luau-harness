@@ -35,8 +35,8 @@ namespace fs = std::filesystem;
 bool reaches(const std::vector<Rule>& rules, const fs::path& path) {
     return std::any_of(rules.begin(), rules.end(), [&](const Rule& rule) {
         std::error_code ec;
-        const fs::path inside = path.lexically_relative(fs::weakly_canonical(rule.path, ec));
-        return !ec && !inside.empty() && *inside.begin() != "..";
+        const fs::path dir = fs::weakly_canonical(rule.path, ec);
+        return !ec && beneath(path, dir);
     });
 }
 

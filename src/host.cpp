@@ -247,6 +247,34 @@ int l_clip(lua_State* L) {
     return 2;
 }
 
+bool starts(std::string_view text, unsigned char lead, unsigned char next, unsigned char low, unsigned char high) {
+    const auto at = [&](std::size_t i) { return static_cast<unsigned char>(text[i]); };
+    return text.size() >= 3 && at(0) == lead && at(1) == next && at(2) >= low && at(2) <= high;
+}
+
+int l_printable(lua_State* L) {
+    std::size_t length = 0;
+    const char* raw = luaL_checklstring(L, 1, &length);
+    std::string_view text(raw, length);
+    std::string kept;
+    kept.reserve(length);
+    while (!text.empty()) {
+        const auto c = static_cast<unsigned char>(text.front());
+        if (starts(text, 0xE2, 0x80, 0xAA, 0xAE) || starts(text, 0xE2, 0x81, 0xA6, 0xA9)) {
+            text.remove_prefix(3);
+        } else if (c == 0xC2 && text.size() >= 2 && (static_cast<unsigned char>(text[1]) & 0xE0U) == 0x80U) {
+            text.remove_prefix(2);
+        } else {
+            if (c == '\t' || c == '\n' || (c >= 0x20 && c != 0x7F)) {
+                kept.push_back(text.front());
+            }
+            text.remove_prefix(1);
+        }
+    }
+    lua_pushlstring(L, kept.data(), kept.size());
+    return 1;
+}
+
 int l_log(lua_State* L) {
     std::size_t length = 0;
     const char* text = luaL_checklstring(L, 1, &length);
@@ -374,14 +402,16 @@ void Host::open(lua_State* L) {
     callbacks->interrupt = on_interrupt;
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"llm", llm},        {"tool", tool},        {"sh", sh},       {"try", try_},    {"timed", timed},
+        {"post", post},      {"route", route},      {"sh", sh},       {"try", try_},    {"timed", timed},
         {"read", read_file}, {"write", write_file}, {"list", l_list}, {"load", l_load}, {"input", l_input},
         {"log", l_log},      {"sleep", sleep},      {"env", l_env},   {"judge", judge}, {"clip", l_clip},
-        {"spawn", spawn},    {"wait", wait},        {"stat", l_stat}, {"walk", l_walk}, {nullptr, nullptr},
+        {"spawn", spawn},    {"wait", wait},        {"stat", l_stat}, {"walk", l_walk}, {"printable", l_printable},
+        {nullptr, nullptr},
     };
     luaL_register(L, "host", kFunctions);
 
     push_strings(L, config_.args);
+    lua_setreadonly(L, -1, 1);
     lua_setfield(L, -2, "args");
 
     std::error_code ec;
@@ -400,14 +430,13 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "tty");
     lua_pushlstring(L, config_.model.data(), config_.model.size());
     lua_setfield(L, -2, "model");
-    const auto has_key = [this](std::string_view name) {
-        const Endpoint* found = endpoint(name);
-        return found != nullptr && !found->key.empty();
-    };
-    lua_pushboolean(L, has_key("search") ? 1 : 0);
-    lua_setfield(L, -2, "tools");
-    lua_pushboolean(L, has_key("exa") ? 1 : 0);
-    lua_setfield(L, -2, "exa");
+    lua_createtable(L, 0, static_cast<int>(config_.endpoints.size()));
+    for (const Endpoint& each : config_.endpoints) {
+        lua_pushboolean(L, each.key_env.empty() || !each.key.empty() ? 1 : 0);
+        lua_setfield(L, -2, each.name.c_str());
+    }
+    lua_setreadonly(L, -1, 1);
+    lua_setfield(L, -2, "endpoints");
     lua_pushboolean(L, config_.judge.valid() ? 1 : 0);
     lua_setfield(L, -2, "judged");
     if (!config_.workflow.empty()) {
@@ -421,6 +450,7 @@ void Host::open(lua_State* L) {
             lua_pushlstring(L, text.data(), text.size());
             lua_setfield(L, -2, name.c_str());
         }
+        lua_setreadonly(L, -1, 1);
         lua_setfield(L, -2, field);
     }
     lua_pop(L, 1);

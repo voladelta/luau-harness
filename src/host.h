@@ -29,9 +29,13 @@ struct Endpoint {
     std::string key;
     std::string key_env;
     std::vector<std::string> headers;
-    bool form = false;
-    bool model = false;
 };
+
+inline constexpr std::string_view kSessionEndpoint = "session";
+
+[[nodiscard]] constexpr std::string_view vendor_of(std::string_view model) noexcept {
+    return model.starts_with("claude-") ? "anthropic" : "deepseek";
+}
 
 struct HostConfig {
     std::vector<Endpoint> endpoints;
@@ -60,8 +64,8 @@ class Host {
   private:
     static Host& of(lua_State* L);
     static void on_interrupt(lua_State* L, int gc);
-    static int llm(lua_State* L);
-    static int tool(lua_State* L);
+    static int post(lua_State* L);
+    static int route(lua_State* L);
     static int sh(lua_State* L);
     static int try_(lua_State* L);
     static int timed(lua_State* L);

@@ -22,7 +22,7 @@ type Usage = {
 	iterations: { Usage }?,
 }
 type Reply = { content: { Block }, stop_reason: string?, stop_details: any, usage: Usage? }
-type Function = { name: string, usage: string, run: (...any) -> ...any }
+type Function = { name: string, usage: string, run: (...any) -> ...any, lead: boolean? }
 type Schema = { type: string?, properties: { [string]: any }?, required: { string }? }
 type Tool = {
 	name: string,
@@ -94,10 +94,7 @@ local function clip(text: string): string
 		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail
 end
 
-function M.printable(text: string): string
-	return (text:gsub("[\0-\8\11-\31\127]", ""):gsub("\194[\128-\159]", ""):gsub("\226\128[\170-\174]", "")
-		:gsub("\226\129[\166-\169]", ""))
-end
+M.printable = host.printable :: (string) -> string
 
 local ext_dir = ".hx/ext/"
 
@@ -163,7 +160,7 @@ end
 
 local function read_only(name: string, real: { [any]: any }, own: { [string]: any }?): any
 	local view = {}
-	return setmetatable(view, {
+	setmetatable(view, table.freeze({
 		__index = function(_, key: any): any
 			local mine = if own and type(key) == "string" then own[key] else nil
 			if mine ~= nil then
@@ -187,8 +184,8 @@ local function read_only(name: string, real: { [any]: any }, own: { [string]: an
 		__len = function(): number
 			return #real
 		end,
-		__metatable = "read-only",
-	})
+	}))
+	return table.freeze(view)
 end
 
 local function host_view_parts(real: { [any]: any }, fresh_globals: () -> any): { [string]: any }
@@ -207,9 +204,13 @@ end
 
 local views: { [any]: any } = {}
 
+local function offered(fn: Function): boolean
+	return not (fn.lead and live.agent)
+end
+
 local function lookup(env: any, name: string): any
 	for _, fn in M.functions do
-		if fn.name == name then
+		if fn.name == name and offered(fn) then
 			local wrapper = live.wrappers[fn] or counted(fn)
 			live.wrappers[fn] = wrapper
 			return wrapper
@@ -219,6 +220,8 @@ local function lookup(env: any, name: string): any
 		return capture_print
 	elseif name == "_G" then
 		return env
+	elseif name == "getfenv" or name == "setfenv" then
+		return nil
 	end
 	local value = _G[name]
 	if type(value) ~= "table" then
@@ -275,7 +278,7 @@ local function extension_index(): { string }
 		end
 	end
 	local names = {}
-	local keyed = { exa = host.exa, web = host.tools, ocr = host.tools }
+	local keyed = { exa = host.endpoints.exa, web = host.endpoints.search, ocr = host.endpoints.ocr }
 	for name in host.extensions do
 		if keyed[name] ~= false then
 			table.insert(names, name)
@@ -850,6 +853,7 @@ M.functions = {
 if host.judged then
 	table.insert(M.functions, {
 		name = "submit",
+		lead = true,
 		usage = "submit(note?) -> text: hands the project as it stands to the judge, with a note on what you "
 			.. "changed and what you expect. The judge builds and measures it beside the champion, the best version "
 			.. "so far, with a kit you cannot see, and returns its verdict. Only verdicts count. One submission at a "
@@ -897,7 +901,9 @@ local function lua_description(): string
 		"",
 	}
 	for _, fn in M.functions do
-		table.insert(lines, "- " .. fn.usage)
+		if offered(fn) then
+			table.insert(lines, "- " .. fn.usage)
+		end
 	end
 	table.insert(lines, "- host.sh(command, {input?, timeout?, cwd?, env?}) -> {out, code}: runs a command for its "
 		.. "output as data, stdout and stderr together, whole up to 16 MiB; send more to a file and host.read it. "
@@ -1038,8 +1044,8 @@ M.claude = {
 	["claude-haiku-5-5"] = { effort = "medium", compaction = true },
 }
 
-local function claude_model(): (boolean, Features?)
-	return M.model:match("^claude%-") ~= nil, M.claude[M.model]
+local function claude_model(model: string): (boolean, Features?)
+	return model:match("^claude%-") ~= nil, M.claude[model]
 end
 
 local function prompt_tokens(counts: Usage): number
@@ -1057,11 +1063,11 @@ local function count_of(model: string): Count
 	return count
 end
 
-local function count_usage(reply: Reply)
+local function count_usage(reply: Reply, model: string)
 	local counts: Usage = type(reply.usage) == "table" and reply.usage or {}
 	local iterations = counts.iterations
 	local parts: { Usage } = if type(iterations) == "table" and #iterations > 0 then iterations else { counts }
-	local usage = count_of(M.model)
+	local usage = count_of(model)
 	usage.replies += 1
 	for _, part in parts do
 		usage.input += prompt_tokens(part)
@@ -1114,8 +1120,9 @@ local function after_fallback(reply: Reply)
 	reply.content = kept
 end
 
-function M.request(system: string, messages: { Message }, compaction: { [string]: any }?): Reply
-	local is_claude, features = claude_model()
+function M.request(system: string, messages: { Message }, compaction: { [string]: any }?, model: string?): Reply
+	local name = model or M.model
+	local is_claude, features = claude_model(name)
 	local thinking = { type = "adaptive" }
 	local betas = {}
 	local fallbacks = nil
@@ -1140,7 +1147,7 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 		system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
 	end
 	local body = json.encode({
-		model = M.model,
+		model = name,
 		max_tokens = M.max_output,
 		thinking = if is_claude then thinking else nil,
 		output_config = effort and { effort = effort } or nil,
@@ -1151,18 +1158,16 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 		tools = tool_specs(),
 		compaction = compaction,
 	})
-	local options = {
-		beta = #betas > 0 and table.concat(betas, ",") or nil,
-		endpoint = if not is_claude and host.model:match("^claude%-") then "deepseek" else nil,
-	}
+	local endpoint = host.route(name)
+	local options = { beta = #betas > 0 and table.concat(betas, ",") or nil }
 	local attempts = 5
 	for attempt = 1, attempts do
-		local status, text, retry_after = host.llm(body, options)
+		local status, text, retry_after = host.post(endpoint, body, options)
 		if status == 200 then
 			local reply, err = json.decode(text)
 			if type(reply) == "table" and type(reply.content) == "table" then
 				after_fallback(reply)
-				count_usage(reply)
+				count_usage(reply, name)
 				if compaction or has_content(reply) then
 					return reply
 				end
@@ -1250,12 +1255,12 @@ end
 local Conversation = {}
 Conversation.__index = Conversation
 M.Conversation = Conversation
-type ConversationFields = { messages: { Message }, on_answer: ((Conversation) -> ())? }
+type ConversationFields = { messages: { Message }, model: string?, on_answer: ((Conversation) -> ())? }
 type Conversation = typeof(setmetatable({} :: ConversationFields, Conversation))
 type State = "idle" | "ready" | "owing"
 
-function Conversation.new(): Conversation
-	return setmetatable({ messages = {}, on_answer = nil }, Conversation)
+function Conversation.new(model: string?): Conversation
+	return setmetatable({ messages = {}, model = model, on_answer = nil }, Conversation)
 end
 
 local function tool_calls(message: Message): { Block }
@@ -1349,7 +1354,7 @@ function Conversation.resume(self: Conversation, block: Block, text: string)
 end
 
 function Conversation.fork(self: Conversation): Conversation
-	local copy = Conversation.new()
+	local copy = Conversation.new(self.model)
 	copy.messages = table.clone(self.messages)
 	local last = copy.messages[#copy.messages]
 	if last and type(last.content) == "table" then
@@ -1409,7 +1414,7 @@ local function ask(system: string, talk: Conversation, compaction: { [string]: a
 	if problem then
 		error("this conversation cannot be sent: " .. problem, 0)
 	end
-	return M.request(system, talk.messages, compaction)
+	return M.request(system, talk.messages, compaction, talk.model)
 end
 
 M.compact_prompt = table.concat({
@@ -1471,7 +1476,7 @@ end
 
 function M.compact(system: string, talk: Conversation)
 	progress("  compacting the conversation")
-	local _, features = claude_model()
+	local _, features = claude_model(talk.model or M.model)
 	if features and features.compaction then
 		compact_on_server(system, talk)
 		return
@@ -1504,8 +1509,8 @@ function M.repeat_reminder(call: string, count: number, first: boolean): string
 		.. "action that will change the result, finish now and say what you found."):format(call, count)
 end
 
-local function show_text(reply: Reply)
-	local _, features = claude_model()
+local function show_text(reply: Reply, model: string)
+	local _, features = claude_model(model)
 	local updates = features and features.display == "updates"
 	for _, block in reply.content do
 		if block.type == "text" and block.text ~= "" then
@@ -1535,7 +1540,7 @@ local function turn(system: string, talk: Conversation): Reply
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
 		local cut_off = reply.stop_reason == "max_tokens"
-		show_text(reply)
+		show_text(reply, talk.model or M.model)
 		local calls = talk:reply(reply.content)
 		if #calls > 0 then
 			talk:answer(function(call)
@@ -1576,7 +1581,7 @@ local function turn(system: string, talk: Conversation): Reply
 	talk:say(("You have used all %d replies this task allows. Do not call any more tools. Write your final "
 		.. "report now: what you changed, what you checked, what is left."):format(M.max_replies))
 	local reply = ask(system, talk)
-	show_text(reply)
+	show_text(reply, talk.model or M.model)
 	if #talk:reply(reply.content) > 0 then
 		talk:abandon("the reply limit was reached")
 	end
@@ -1664,7 +1669,7 @@ function at_work(): { string }
 end
 
 local function agent_model(): string
-	return M.agent_model or (if host.tools then "deepseek-flash" else M.model)
+	return M.agent_model or (if host.endpoints.deepseek then "deepseek-flash" else M.model)
 end
 
 local function agent_named(name: string): Agent
@@ -1692,13 +1697,7 @@ local function work(agent: Agent, system: string): string
 	local began = os.clock()
 	live.agent = { name = agent.name, run = agent.runs }
 	live.usage = {}
-	for i = #M.functions, 1, -1 do
-		local name = M.functions[i].name
-		if name == "agents" or name == "submit" then
-			table.remove(M.functions, i)
-		end
-	end
-	M.model = agent_model()
+	agent.talk.model = agent_model()
 	agent.talk:say(agent.task)
 	local ok, err = host.timed(M.agent_seconds, M.turn, system, agent.talk)
 	if not ok then
@@ -1803,6 +1802,7 @@ end
 
 table.insert(M.functions, {
 	name = "agents",
+	lead = true,
 	usage = "agents(tasks) -> text: gives each task to an agent and returns the agents' reports. An agent is a "
 		.. "model with a conversation of its own, at work in this directory with these functions; all of them work "
 		.. 'at the same time. tasks is a list of { name = "...", task = "..." }. An agent knows nothing of your '

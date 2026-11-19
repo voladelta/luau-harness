@@ -94,13 +94,13 @@ std::string beta_option(lua_State* L, int idx) {
     const std::string value = string_option(L, idx, "beta", "");
     for (const char c : value) {
         if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '-' && c != '_' && c != ',') {
-            luaL_error(L, "host.llm: beta is beta names separated by commas, not %s", value.c_str());
+            luaL_error(L, "host.post: beta is beta names separated by commas, not %s", value.c_str());
         }
     }
     return value;
 }
 
-int post(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_list<std::string_view> extra,
+int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_list<std::string_view> extra,
          double timeout, const std::string& ca_bundle) {
     Headers headers;
     if (!endpoint.key.empty()) {
@@ -159,21 +159,15 @@ void set_body(CURL* curl, std::string_view body) {
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
 }
 
-[[noreturn]] void no_such_tool(lua_State* L, std::string_view name, const std::vector<Endpoint>& endpoints) {
-    std::vector<std::string_view> names;
-    for (const Endpoint& each : endpoints) {
-        if (!each.model) {
-            names.push_back(each.name);
-        }
-    }
+[[noreturn]] void no_such_endpoint(lua_State* L, std::string_view name, const std::vector<Endpoint>& endpoints) {
     std::string known;
-    for (std::size_t i = 0; i < names.size(); ++i) {
+    for (std::size_t i = 0; i < endpoints.size(); ++i) {
         if (i > 0) {
-            known += i + 1 == names.size() ? " and " : ", ";
+            known += i + 1 == endpoints.size() ? " and " : ", ";
         }
-        known += names[i];
+        known += endpoints[i].name;
     }
-    luaL_error(L, "host.tool: no tool %s; the tools are %s", std::string(name).c_str(), known.c_str());
+    luaL_error(L, "host.post: no endpoint %s; the endpoints are %s", std::string(name).c_str(), known.c_str());
 }
 
 std::vector<std::pair<std::string, std::string>> form_fields(lua_State* L, int idx) {
@@ -181,7 +175,7 @@ std::vector<std::pair<std::string, std::string>> form_fields(lua_State* L, int i
     lua_pushnil(L);
     while (lua_next(L, idx) != 0) {
         if (lua_type(L, -2) != LUA_TSTRING || lua_type(L, -1) != LUA_TSTRING) {
-            luaL_error(L, "host.tool: a form is a table of strings by name");
+            luaL_error(L, "host.post: a form is a table of strings by name");
         }
         std::size_t key_length = 0;
         std::size_t value_length = 0;
@@ -248,69 +242,52 @@ CURL* Host::curl() {
     return curl_.get();
 }
 
-int Host::llm(lua_State* L) {
-    std::size_t length = 0;
-    const char* body = luaL_checklstring(L, 1, &length);
-    Host& host = of(L);
-    const double timeout = host.within_limit(option(L, 2, "timeout", 600));
-    raise_if_signaled(L);
-    const std::string beta = beta_option(L, 2);
-    const std::string name = string_option(L, 2, "endpoint", "llm");
-    const Endpoint* endpoint = host.endpoint(name);
-    if (endpoint == nullptr || !endpoint->model) {
-        luaL_error(L, "host.llm: no endpoint %s; the endpoints are llm, the session's own, and deepseek", name.c_str());
-    }
-    if (endpoint->key.empty() && !endpoint->key_env.empty()) {
-        return fail(L, fmt::format("no {}: hx was started without one, so host.llm cannot reach the {} endpoint",
-                                   endpoint->key_env, endpoint->name));
-    }
-    CURL* curl = host.curl();
-    if (curl == nullptr) {
-        return fail(L, "cannot start an HTTP request");
-    }
-    set_body(curl, {body, length});
-    return post(L, curl, *endpoint,
-                {"Content-Type: application/json", beta.empty() ? "" : fmt::format("anthropic-beta: {}", beta)},
-                timeout, host.config_.ca_bundle);
+int Host::route(lua_State* L) {
+    const std::string_view vendor = vendor_of(check_cstring(L, 1));
+    const std::string_view name = vendor == vendor_of(of(L).config_.model) ? kSessionEndpoint : vendor;
+    lua_pushlstring(L, name.data(), name.size());
+    return 1;
 }
 
-int Host::tool(lua_State* L) {
+int Host::post(lua_State* L) {
     const std::string_view name = check_cstring(L, 1);
     Host& host = of(L);
     const Endpoint* endpoint = host.endpoint(name);
-    if (endpoint == nullptr || endpoint->model) {
-        no_such_tool(L, name, host.config_.endpoints);
+    if (endpoint == nullptr) {
+        no_such_endpoint(L, name, host.config_.endpoints);
     }
-    const bool form = endpoint->form && lua_istable(L, 2);
+    const bool form = lua_istable(L, 2);
     if (!form) {
         luaL_checktype(L, 2, LUA_TSTRING);
     }
-    const double timeout = host.within_limit(option(L, 3, "timeout", 300));
+    const double timeout = host.within_limit(option(L, 3, "timeout", 600));
+    const std::string beta = beta_option(L, 3);
     raise_if_signaled(L);
     if (endpoint->key.empty() && !endpoint->key_env.empty()) {
-        return fail(L, fmt::format("no {}: hx was started without one, so host.tool(\"{}\") cannot be used",
+        return fail(L, fmt::format("no {}: hx was started without one, so host.post cannot reach the {} endpoint",
                                    endpoint->key_env, endpoint->name));
     }
-
     CURL* curl = host.curl();
     if (curl == nullptr) {
         return fail(L, "cannot start an HTTP request");
     }
+    const std::string beta_header = beta.empty() ? "" : fmt::format("anthropic-beta: {}", beta);
     if (!form) {
         std::size_t length = 0;
         const char* body = lua_tolstring(L, 2, &length);
         set_body(curl, {body, length});
-        return post(L, curl, *endpoint, {"Content-Type: application/json"}, timeout, host.config_.ca_bundle);
+        return send(L, curl, *endpoint, {"Content-Type: application/json", beta_header}, timeout,
+                    host.config_.ca_bundle);
     }
     const CurlMime mime(curl_mime_init(curl));
     if (!mime) {
         return fail(L, "cannot start an HTTP request");
     }
     if (const std::optional<std::string> error = fill_form(L, mime.get(), 2)) {
-        luaL_error(L, "host.tool: %s", error->c_str());
+        luaL_error(L, "host.post: %s", error->c_str());
     }
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime.get());
-    return post(L, curl, *endpoint, {}, timeout, host.config_.ca_bundle);
+    return send(L, curl, *endpoint, {beta_header}, timeout, host.config_.ca_bundle);
 }
 
 }  // namespace hx

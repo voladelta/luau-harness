@@ -25,8 +25,10 @@ conversation, which the lead's process keeps. The lead's own conversation holds 
 the agents' steps, which is what keeps a long job inside its context.
 
 - **The model.** Agents run on `M.agent_model`: `deepseek-flash` when `DEEPSEEK_API_KEY` is set, whatever the
-  lead's model, and the lead's own model otherwise. Their tokens are counted with the session's, on the line of
-  their model.
+  lead's model, and the lead's own model otherwise. A model of the lead's vendor is asked through the session's
+  endpoint, and one of the other vendor through that vendor's, with its key: a Claude agent under a DeepSeek lead
+  needs `ANTHROPIC_API_KEY`, as a DeepSeek agent under a Claude lead needs `DEEPSEEK_API_KEY`. Their tokens are
+  counted with the session's, on the line of their model.
 - **The prompt.** An agent gets the session's system prompt and `M.agent_prompt` after it: that it is one of
   several, to change only what its task gives it, to leave git's index and branches alone, to check its own work
   narrowly, and to end with a report. It knows nothing of the lead's conversation, so the task has to carry what

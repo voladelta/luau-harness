@@ -57,7 +57,7 @@ type Request = {
 
 function M.call(request: Request): { [string]: any }
 	for attempt = 1, request.attempts do
-		local status: (number | string)?, text: string? = host.tool(request.endpoint, request.body, {
+		local status: (number | string)?, text: string? = host.post(request.endpoint, request.body, {
 			timeout = request.timeout,
 		})
 		local retry

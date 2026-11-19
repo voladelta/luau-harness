@@ -19,6 +19,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -84,6 +85,8 @@ options:
   --unix-sockets    before Landlock ABI 9, let commands create unix sockets; they can then connect to
                     any socket by path, the D-Bus session bus and ssh-agent included
   --no-sandbox      run without Landlock (the model can then touch anything you can)
+  --built-in-loop   run the loop built into hx and leave .hx/loop.luau unread; without this, a
+                    .hx/loop.luau that does not load stops hx
   -q, --quiet       leave out progress lines on stderr; the answer and errors still show
   --no-input        never prompt; with no task and stdin a terminal, fail instead
   -h, --help        show this text
@@ -107,8 +110,11 @@ environment:
   HX_EXA_URL        Exa's search endpoint, which the built-in exa extension uses for deep search with
                     EXA_API_KEY, whatever the model (default https://api.exa.ai/search)
   HX_DEEPSEEK_URL   DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude
-                    model is asked through, a sub-agent say, with DEEPSEEK_API_KEY (default
+                    model is asked through, an agent say, with DEEPSEEK_API_KEY (default
                     https://api.deepseek.com/anthropic/v1/messages)
+  HX_ANTHROPIC_URL  Anthropic's Messages endpoint, which a Claude model under a session on another
+                    model is asked through, with ANTHROPIC_API_KEY (default
+                    https://api.anthropic.com/v1/messages)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.
@@ -119,17 +125,50 @@ exit status:
 docs: https://github.com/voladelta/luau-harness
 )";
 
-constexpr const char* kDeepSeekUrl = "https://api.deepseek.com/anthropic/v1/messages";
-constexpr const char* kDeepSeekKeyEnv = "DEEPSEEK_API_KEY";
-constexpr const char* kDeepSeekModel = "deepseek-flash";
-constexpr const char* kDeepSeekToolsUrl = "https://api.deepseek.com/v1/tools";
-constexpr const char* kExaKeyEnv = "EXA_API_KEY";
-constexpr const char* kExaUrl = "https://api.exa.ai/search";
-constexpr const char* kAnthropicUrl = "https://api.anthropic.com/v1/messages";
-constexpr const char* kAnthropicKeyEnv = "ANTHROPIC_API_KEY";
-constexpr const char* kAnthropicModel = "claude-opus-5-5";
-constexpr const char* kAnthropicVersion = "anthropic-version: 2026-10-21";
-constexpr const char* kDeepSeekVersion = "anthropic-version: 2023-06-01";
+struct Vendor {
+    std::string_view name;
+    const char* url;
+    const char* url_env;
+    const char* key_env;
+    const char* version;
+    const char* model;
+};
+constexpr Vendor kVendors[] = {
+    {.name = "anthropic",
+     .url = "https://api.anthropic.com/v1/messages",
+     .url_env = "HX_ANTHROPIC_URL",
+     .key_env = "ANTHROPIC_API_KEY",
+     .version = "anthropic-version: 2026-10-21",
+     .model = "claude-opus-5-5"},
+    {.name = "deepseek",
+     .url = "https://api.deepseek.com/anthropic/v1/messages",
+     .url_env = "HX_DEEPSEEK_URL",
+     .key_env = "DEEPSEEK_API_KEY",
+     .version = "anthropic-version: 2023-06-01",
+     .model = "deepseek-flash"},
+};
+constexpr const Vendor& kAnthropic = kVendors[0];
+constexpr const Vendor& kDeepSeek = kVendors[1];
+
+struct Service {
+    const char* name;
+    const char* url;
+    const char* url_env;
+    const char* path;
+    const char* key_env;
+    hx::Auth auth;
+};
+constexpr Service kServices[] = {
+    {"search", "https://api.deepseek.com/v1/tools", "HX_TOOLS_URL", "/search", kDeepSeek.key_env, hx::Auth::Bearer},
+    {"fetch", "https://api.deepseek.com/v1/tools", "HX_TOOLS_URL", "/fetch", kDeepSeek.key_env, hx::Auth::Bearer},
+    {"ocr", "https://api.deepseek.com/v1/tools", "HX_TOOLS_URL", "/ocr", kDeepSeek.key_env, hx::Auth::Bearer},
+    {"exa", "https://api.exa.ai/search", "HX_EXA_URL", "", "EXA_API_KEY", hx::Auth::ApiKey},
+};
+
+const Vendor& vendor_of(std::string_view model) {
+    const auto found = std::ranges::find(kVendors, hx::vendor_of(model), &Vendor::name);
+    return found != std::end(kVendors) ? *found : kDeepSeek;
+}
 
 constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
     {"opus", "claude-opus-5-5"},
@@ -161,6 +200,7 @@ struct Options {
     std::optional<std::string> model;
     std::optional<std::string> judge;
     bool rpi = false;
+    bool built_in_loop = false;
     bool sandbox = true;
     bool unix_sockets = false;
     bool full = false;
@@ -170,7 +210,7 @@ struct Options {
 
 constexpr std::string_view kOptionNames[] = {
     "--model", "--ro",   "--rw",  "--keep-env", "--unix-sockets", "--no-sandbox", "--quiet", "--no-input",
-    "--init",  "--full", "--run", "--help",     "--version",      "--judge",      "--rpi",
+    "--init",  "--full", "--run", "--help",     "--version",      "--judge",      "--rpi",   "--built-in-loop",
 };
 
 std::size_t distance(std::string_view a, std::string_view b) {
@@ -251,6 +291,9 @@ void check_combinations(const Options& options) {
     if (options.rpi && options.mode != Mode::Agent) {
         throw UsageError("--rpi leads the agent on a task: it goes with neither --run nor --init");
     }
+    if (options.built_in_loop && options.mode != Mode::Agent) {
+        throw UsageError("--built-in-loop picks the agent's loop: it goes with neither --run nor --init");
+    }
     if (options.judge && !options.sandbox) {
         throw UsageError("--judge needs the wall: without it the agent could read the kit and rewrite the ledger");
     }
@@ -283,6 +326,9 @@ Options parse_args(const std::vector<std::string_view>& argv) {
         } else if (arg == "--rpi") {
             option.flag();
             options.rpi = true;
+        } else if (arg == "--built-in-loop") {
+            option.flag();
+            options.built_in_loop = true;
         } else if (arg == "--unix-sockets") {
             option.flag();
             options.unix_sockets = true;
@@ -372,13 +418,9 @@ bool looks_secret(std::string name) {
     return name.ends_with("_PAT") || name.ends_with("_PWD");
 }
 
-struct Secrets {
-    std::string key;
-    std::string tools_key;
-    std::string exa_key;
-};
+using Secrets = std::map<std::string, std::string, std::less<>>;
 
-Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& keep) {
+Secrets take_secrets(const std::vector<std::string>& key_envs, const std::vector<std::string>& keep) {
     Secrets secrets;
     std::vector<std::pair<std::string, char*>> doomed;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
@@ -389,20 +431,12 @@ Secrets take_secrets(std::string_view key_env, const std::vector<std::string>& k
             continue;
         }
         const std::string name(text.substr(0, equals));
-        const bool is_key = name == key_env;
+        const bool is_key = std::ranges::find(key_envs, name) != key_envs.end();
         if (is_key) {
-            secrets.key = text.substr(equals + 1);
+            secrets[name] = text.substr(equals + 1);
         }
-        const bool is_tools_key = name == kDeepSeekKeyEnv;
-        if (is_tools_key) {
-            secrets.tools_key = text.substr(equals + 1);
-        }
-        const bool is_exa_key = name == kExaKeyEnv;
-        if (is_exa_key) {
-            secrets.exa_key = text.substr(equals + 1);
-        }
-        const bool kept = std::find(keep.begin(), keep.end(), name) != keep.end();
-        if (is_key || is_tools_key || is_exa_key || (looks_secret(name) && !kept)) {
+        const bool kept = std::ranges::find(keep, name) != keep.end();
+        if (is_key || (looks_secret(name) && !kept)) {
             doomed.emplace_back(name, *entry);
         }
     }
@@ -417,6 +451,7 @@ struct ModelChoice {
     std::string model;
     std::string url;
     std::string key_env;
+    const Vendor* vendor;
 };
 
 ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
@@ -430,14 +465,15 @@ ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
         }
     }
     if (model.empty()) {
-        const bool only_anthropic = env_or(kDeepSeekKeyEnv, "").empty() && !env_or(kAnthropicKeyEnv, "").empty();
-        model = only_anthropic && env_or("HX_API_URL", "").empty() ? kAnthropicModel : kDeepSeekModel;
+        const bool only_anthropic = env_or(kDeepSeek.key_env, "").empty() && !env_or(kAnthropic.key_env, "").empty();
+        model = only_anthropic && env_or("HX_API_URL", "").empty() ? kAnthropic.model : kDeepSeek.model;
     }
-    const bool claude = model.starts_with("claude-");
+    const Vendor& vendor = vendor_of(model);
     return {
         .model = model,
-        .url = env_or("HX_API_URL", claude ? kAnthropicUrl : kDeepSeekUrl),
-        .key_env = env_or("HX_KEY_ENV", claude ? kAnthropicKeyEnv : kDeepSeekKeyEnv),
+        .url = env_or("HX_API_URL", vendor.url),
+        .key_env = env_or("HX_KEY_ENV", vendor.key_env),
+        .vendor = &vendor,
     };
 }
 
@@ -483,13 +519,7 @@ bool holds_home(const fs::path& project) {
     if (ec || home.empty()) {
         return false;
     }
-    const fs::path inside = home.lexically_relative(project);
-    return !inside.empty() && *inside.begin() != "..";
-}
-
-bool beneath(const fs::path& path, const fs::path& dir) {
-    const fs::path inside = path.lexically_relative(dir);
-    return !inside.empty() && *inside.begin() != "..";
+    return hx::beneath(home, project);
 }
 
 void add_path_rules(std::vector<hx::Rule>& rules) {
@@ -504,7 +534,7 @@ void add_path_rules(std::vector<hx::Rule>& rules) {
     const auto open = [&](const fs::path& dir) {
         std::error_code ec;
         const fs::path whole = fs::canonical(dir, ec);
-        const bool covered = std::ranges::any_of(readable, [&](const fs::path& r) { return beneath(whole, r); });
+        const bool covered = std::ranges::any_of(readable, [&](const fs::path& r) { return hx::beneath(whole, r); });
         if (!ec && fs::is_directory(whole, ec) && whole != "/" && !holds_home(whole) && !covered) {
             opened.insert(whole);
         }
@@ -549,9 +579,18 @@ std::vector<hx::Rule> system_rules() {
     for (const char* path : {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"}) {
         rules.push_back({path, Access::Device, false});
     }
-    if (const std::string home = env_or("HOME", ""); home.starts_with('/')) {
+    const std::string home = env_or("HOME", "");
+    if (home.starts_with('/')) {
         rules.push_back({home + "/.gitconfig", Access::Read, false});
-        rules.push_back({home + "/.config/git", Access::Read, false});
+    }
+    std::string config = env_or("XDG_CONFIG_HOME", "");
+    if (!config.starts_with('/') && home.starts_with('/')) {
+        config = home + "/.config";
+    }
+    if (config.starts_with('/')) {
+        for (const char* name : {"config", "ignore", "attributes"}) {
+            rules.push_back({fmt::format("{}/git/{}", config, name), Access::Read, false});
+        }
     }
     for (const char* name :
          {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
@@ -755,8 +794,11 @@ int run_module(lua_State* L, std::string_view source, const std::string& name) {
     return is_module(L) ? run_main(L) : 0;
 }
 
-int run_loop(lua_State* L) {
+int run_loop(lua_State* L, bool built_in) {
     std::error_code ec;
+    if (built_in) {
+        return run_module(L, hx::kDefaultLoop, "=loop");
+    }
     if (const std::string project = read_file(kProjectLoop, ec); ec != std::errc::no_such_file_or_directory) {
         std::string why;
         if (ec) {
@@ -774,9 +816,26 @@ int run_loop(lua_State* L) {
         } else {
             return run_main(L);
         }
-        fmt::print(stderr, "hx: {} {}; using the built-in loop\n", kProjectLoop, why);
+        fmt::print(stderr, "hx: {} {}. Fix it, or pass --built-in-loop to run without it.\n", kProjectLoop, why);
+        return kExitUsage;
     }
     return run_module(L, hx::kDefaultLoop, "=loop");
+}
+
+void freeze_libraries(lua_State* L) {
+    lua_pushnil(L);
+    while (lua_next(L, LUA_GLOBALSINDEX) != 0) {
+        if (lua_istable(L, -1) && lua_rawequal(L, -1, LUA_GLOBALSINDEX) == 0) {
+            lua_setreadonly(L, -1, 1);
+        }
+        lua_pop(L, 1);
+    }
+    lua_pushliteral(L, "");
+    if (lua_getmetatable(L, -1) != 0) {
+        lua_setreadonly(L, -1, 1);
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
 }
 
 template <typename Body>
@@ -791,6 +850,7 @@ int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) 
     lua_State* L = state.get();
     luaL_openlibs(L);
     hx::open_json(L);
+    freeze_libraries(L);
     host.open(L);
     return body(L);
 }
@@ -826,50 +886,53 @@ void check_effort() {
     }
 }
 
-std::string tools_base_url() {
-    std::string url = env_or("HX_TOOLS_URL", kDeepSeekToolsUrl);
-    while (url.ends_with('/')) {
+std::string service_url(const Service& service) {
+    std::string url = env_or(service.url_env, service.url);
+    while (*service.path != '\0' && url.ends_with('/')) {
         url.pop_back();
     }
-    return url;
+    return url + service.path;
 }
 
-std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::string& tools_url, const Secrets& secrets) {
+std::vector<std::string> key_envs(const ModelChoice& model) {
+    std::vector<std::string> names{model.key_env};
+    for (const Vendor& vendor : kVendors) {
+        names.emplace_back(vendor.key_env);
+    }
+    for (const Service& service : kServices) {
+        names.emplace_back(service.key_env);
+    }
+    return names;
+}
+
+std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const Secrets& secrets) {
+    const auto key = [&](std::string_view name) {
+        const auto found = secrets.find(name);
+        return found != secrets.end() ? found->second : std::string();
+    };
     std::vector<hx::Endpoint> endpoints;
-    endpoints.push_back({.name = "llm",
+    endpoints.push_back({.name = std::string(hx::kSessionEndpoint),
                          .url = model.url,
                          .auth = hx::Auth::ApiKey,
-                         .key = secrets.key,
+                         .key = key(model.key_env),
                          .key_env = "",
-                         .headers = {model.model.starts_with("claude-") ? kAnthropicVersion : kDeepSeekVersion},
-                         .form = false,
-                         .model = true});
-    endpoints.push_back({.name = "deepseek",
-                         .url = env_or("HX_DEEPSEEK_URL", kDeepSeekUrl),
-                         .auth = hx::Auth::ApiKey,
-                         .key = secrets.tools_key,
-                         .key_env = kDeepSeekKeyEnv,
-                         .headers = {kDeepSeekVersion},
-                         .form = false,
-                         .model = true});
-    for (const char* name : {"search", "fetch", "ocr"}) {
-        endpoints.push_back({.name = name,
-                             .url = fmt::format("{}/{}", tools_url, name),
-                             .auth = hx::Auth::Bearer,
-                             .key = secrets.tools_key,
-                             .key_env = kDeepSeekKeyEnv,
-                             .headers = {},
-                             .form = true,
-                             .model = false});
+                         .headers = {model.vendor->version}});
+    for (const Vendor& vendor : kVendors) {
+        endpoints.push_back({.name = std::string(vendor.name),
+                             .url = env_or(vendor.url_env, vendor.url),
+                             .auth = hx::Auth::ApiKey,
+                             .key = key(vendor.key_env),
+                             .key_env = vendor.key_env,
+                             .headers = {vendor.version}});
     }
-    endpoints.push_back({.name = "exa",
-                         .url = env_or("HX_EXA_URL", kExaUrl),
-                         .auth = hx::Auth::ApiKey,
-                         .key = secrets.exa_key,
-                         .key_env = kExaKeyEnv,
-                         .headers = {},
-                         .form = false,
-                         .model = false});
+    for (const Service& service : kServices) {
+        endpoints.push_back({.name = service.name,
+                             .url = service_url(service),
+                             .auth = service.auth,
+                             .key = key(service.key_env),
+                             .key_env = service.key_env,
+                             .headers = {}});
+    }
     return endpoints;
 }
 
@@ -884,9 +947,7 @@ std::string ca_bundle() {
 
 hx::HostConfig host_config(const Options& options, const ModelChoice& model, bool interactive) {
     hx::HostConfig config;
-    const std::string tools_url = tools_base_url();
-    const Secrets secrets = take_secrets(model.key_env, options.keep_env);
-    config.endpoints = endpoints(model, tools_url, secrets);
+    config.endpoints = endpoints(model, take_secrets(key_envs(model), options.keep_env));
     config.model = model.model;
     config.args = options.args;
     config.interactive = interactive;
@@ -973,7 +1034,8 @@ int run(const std::vector<std::string_view>& argv) {
         config.judge = hx::UniqueFd(judge->channel);
     }
     return run_vm(std::move(config), sandbox, [&](lua_State* L) {
-        const int status = script ? run_module(L, *script, fmt::format("={}", options.script)) : run_loop(L);
+        const int status =
+            script ? run_module(L, *script, fmt::format("={}", options.script)) : run_loop(L, options.built_in_loop);
         if (judge) {
             hx::finish_judge(*judge);
         }

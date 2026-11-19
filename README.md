@@ -16,8 +16,9 @@ hx --rpi "move the config loader to TOML"   # Opus researches and plans, deepsee
 
 ## The idea
 
-- **The host is a kernel, not a framework.** It gives Luau a model call, a shell, file access and JSON. That is
-  all. There is no plugin system, package format, permission prompt or configuration file.
+- **The host is a kernel, not a framework.** It gives Luau a POST to the endpoints it holds the keys for, a
+  shell, file access and JSON. That is all. There is no plugin system, package format, permission prompt or
+  configuration file.
 - **The loop belongs to the project.** `hx --init` writes `.hx/loop.luau`, a short file that loads the loop built
   into hx and changes what this project needs: the model, the prompt, the functions, the retry and compaction
   rules. What it leaves alone keeps up with hx. `hx --init --full` copies the whole built-in loop instead, and

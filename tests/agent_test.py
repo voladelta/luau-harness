@@ -459,10 +459,8 @@ class AgentTest(unittest.TestCase):
             f.write('local M = host.load(host.default_loop, "=loop")()\n'
                     'table.insert(M.functions, { name = "delegate", usage = "delegate(model, task) -> text", '
                     'run = function(model, task)\n'
-                    '\tlocal talk = M.Conversation.new()\n\ttalk:say(task)\n'
-                    '\tlocal outer = M.model\n\tM.model = model\n'
-                    '\tlocal ok, err = pcall(M.turn, "the sub-agent\'s system prompt", talk)\n'
-                    '\tM.model = outer\n\tif not ok then error(err, 0) end\n'
+                    '\tlocal talk = M.Conversation.new(model)\n\ttalk:say(task)\n'
+                    '\tM.turn("the sub-agent\'s system prompt", talk)\n'
                     '\treturn talk.messages[#talk.messages].content[1].text\nend })\nreturn M\n')
         ds_key = "ds-model-key-7"
         deepseek.script = [call("bash", {"command": "echo from flash"}, "s1"), say("flash is done")]
@@ -491,18 +489,42 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn(ds_key, json.dumps(self.model.requests))
         self.assertNotIn(KEY, json.dumps(deepseek.requests))
         self.assertNotIn(ds_key, self.tool_results()[1])
-        script = ("print(pcall(host.llm, '{}', { endpoint = 'search' }))\n"
-                  "print(pcall(host.llm, '{}', { endpoint = 'https://example.com' }))\n"
-                  "print(host.llm('{}', { endpoint = 'deepseek' }))\n"
-                  "print(pcall(host.tool, 'deepseek', '{}'))\n")
+        script = ("print(pcall(host.post, 'chat', '{}'))\n"
+                  "print(pcall(host.post, 'https://example.com', '{}'))\n"
+                  "print(host.post('deepseek', '{}'))\n"
+                  "print(host.route('claude-haiku-5-5'), host.route('deepseek-flash'), host.route('other'))\n")
         done = self.run_hx("--run", "-", stdin=script)
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
-        self.assertIn("no endpoint search", lines[0])
+        self.assertIn("no endpoint chat; the endpoints are session, anthropic, deepseek, search, fetch, ocr and exa",
+                      lines[0])
         self.assertIn("no endpoint https://example.com", lines[1])
-        self.assertEqual(lines[2], "nil\tno DEEPSEEK_API_KEY: hx was started without one, so host.llm cannot reach "
+        self.assertEqual(lines[2], "nil\tno DEEPSEEK_API_KEY: hx was started without one, so host.post cannot reach "
                          "the deepseek endpoint")
-        self.assertIn("no tool deepseek; the tools are search, fetch, ocr and exa", lines[3])
+        self.assertEqual(lines[3], "anthropic\tsession\tsession")
+
+    def test_a_claude_agent_under_a_deepseek_session_goes_to_anthropic_with_its_key(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write('local M = host.load(host.default_loop, "=loop")()\n'
+                    'M.agent_model = "claude-haiku-5-5"\nreturn M\n')
+        anthropic = self.agents_model({"make a.txt": [say("a.txt is made")]})
+        claude_key = "claude-agent-key-3"
+        done = self.run_hx("go", HX_ANTHROPIC_URL=anthropic.url, ANTHROPIC_API_KEY=claude_key, script=[
+            call("lua", {"code": 'return agents({ { name = "a", task = "make a.txt" } })'}, "c1"),
+            call("bash", {"command": "env"}, "c2"),
+            say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\na\.txt is made$")
+        self.assertEqual([r["model"] for r in anthropic.requests], ["claude-haiku-5-5"])
+        self.assertEqual(anthropic.headers[0]["x-api-key"], claude_key)
+        self.assertEqual(anthropic.headers[0]["anthropic-version"], "2026-10-21")
+        self.assertEqual(anthropic.requests[0]["thinking"]["type"], "adaptive")
+        self.assertEqual([r["model"] for r in self.model.requests], ["deepseek-flash"] * 3)
+        for headers in self.model.headers:
+            self.assertEqual(headers["x-api-key"], KEY)
+        self.assertNotIn(claude_key, json.dumps(self.model.requests))
+        self.assertNotIn(KEY, json.dumps(anthropic.requests))
 
     def agents_model(self, scripts):
         model = Model()
@@ -893,6 +915,25 @@ class AgentTest(unittest.TestCase):
             f.write("[user]\n\tname = Test Owner\n")
         self.run_hx("go", script=[call("bash", {"command": "git config user.name"}), say("ok")])
         self.assertEqual(self.tool_results(), ["Test Owner\n[exit 0]"])
+
+    def test_git_credentials_beside_its_config_stay_outside(self):
+        for config in (os.path.join(self.home, ".config"), os.path.join(self.home, "xdg")):
+            os.makedirs(os.path.join(config, "git"))
+            for name, content in (("config", "[user]\n\temail = owner@example.com\n"), ("ignore", "*.orig\n"),
+                                  ("credentials", "https://owner:GIT-TOKEN@example.com\n")):
+                with open(os.path.join(config, "git", name), "w") as f:
+                    f.write(content)
+        for env in ({}, {"XDG_CONFIG_HOME": os.path.join(self.home, "xdg")}):
+            config = env.get("XDG_CONFIG_HOME", os.path.join(self.home, ".config"))
+            done = self.run_hx("go", **env, script=[
+                call("bash", {"command": f"git config user.email; cat {config}/git/ignore; "
+                              f"cat {config}/git/credentials; ls {config}/git"}), say("ok")])
+            self.assertEqual(done.returncode, 0, done.stderr)
+            result = self.tool_results()[-1]
+            self.assertIn("owner@example.com\n*.orig\n", result)
+            self.assertIn("git/credentials: Permission denied", result)
+            self.assertIn("git': Permission denied", result)
+            self.assertNotIn("GIT-TOKEN", result)
 
     def test_trust_roots_named_in_the_environment_are_readable(self):
         bundle = os.path.join(self.home, "ca.pem")
@@ -1687,17 +1728,17 @@ class AgentTest(unittest.TestCase):
     def test_without_a_deepseek_key_the_tools_say_so(self):
         done = self.run_hx("go", script=[
             call("lua", {"code": "return ext('web').search('luau')"}, "c1"),
-            call("lua", {"code": "return host.tool('search', '{}')"}, "c2"),
-            call("lua", {"code": "return host.tool('chat', '{}')"}, "c3"),
+            call("lua", {"code": "return host.post('search', '{}')"}, "c2"),
+            call("lua", {"code": "return host.post('chat', '{}')"}, "c3"),
             call("lua", {"code": "return ext('ocr').read('nope.pdf')"}, "c4"),
             call("lua", {"code": "return ext('exa').deep('luau', 'why')"}, "c5"),
-            call("lua", {"code": "return host.tool('exa', '{}')"}, "c6"),
+            call("lua", {"code": "return host.post('exa', '{}')"}, "c6"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
         self.assertIn("without DEEPSEEK_API_KEY", results[0])
         self.assertIn("no DEEPSEEK_API_KEY", results[1])
-        self.assertIn("no tool chat", results[2])
+        self.assertIn("no endpoint chat", results[2])
         self.assertIn("without DEEPSEEK_API_KEY", results[3])
         self.assertIn("without EXA_API_KEY", results[4])
         self.assertIn("no EXA_API_KEY", results[5])
@@ -1781,7 +1822,7 @@ class AgentTest(unittest.TestCase):
             "count the files": [call("bash", {"command": "echo 3"}, "s1"), say("there are three")]})
         done = self.run_hx("go", script=[call("lua", {"code": 'return delegate("count the files")'}, "c1"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertNotIn("using the built-in loop", done.stderr)
+        self.assertNotIn("--built-in-loop", done.stderr)
         lead = [r for r in self.model.requests if r["messages"][0]["content"] == "go"]
         sub = [r for r in self.model.requests if r["messages"][0]["content"] == "count the files"]
         self.assertEqual((len(lead), len(sub)), (2, 2))
@@ -1872,35 +1913,38 @@ class AgentTest(unittest.TestCase):
         self.run_hx("go", script=[say("ok")])
         self.assertEqual(self.model.requests[0]["model"], "project-model")
 
-    def test_a_broken_project_loop_falls_back_to_the_built_in_one(self):
+    def broken_loop_stops(self, source, why):
+        os.makedirs(os.path.join(self.project, ".hx"), exist_ok=True)
+        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
+            f.write(source)
+        done = self.run_hx("go", script=[say("never")])
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn(why, done.stderr)
+        self.assertIn("Fix it, or pass --built-in-loop to run without it.", done.stderr)
+        self.assertEqual(self.model.requests, [])
+
+    def test_a_broken_project_loop_stops_hx(self):
+        self.broken_loop_stops("local M = {\n", "does not compile")
+
+    def test_a_project_loop_that_raises_while_loading_stops_hx(self):
+        self.broken_loop_stops("local M = host.load(host.default_loop)()\nM.tools.nope.run = nil\nreturn M\n",
+                               "raised an error while loading (.hx/loop.luau:2:")
+
+    def test_a_project_loop_that_is_not_a_module_stops_hx(self):
+        for source in ["return {}\n", "local M = host.load(host.default_loop)()\nM.main = nil\nreturn M\n", "print('x')\n"]:
+            self.broken_loop_stops(source, "does not return a table with a main function")
+
+    def test_built_in_loop_runs_without_the_project_loop(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
             f.write("local M = {\n")
-        done = self.run_hx("go", script=[say("still works")])
+        done = self.run_hx("--built-in-loop", "go", script=[say("still works")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "still works\n")
-        self.assertIn("does not compile", done.stderr)
-        self.assertIn("using the built-in loop", done.stderr)
-
-    def test_a_project_loop_that_raises_while_loading_falls_back(self):
-        os.makedirs(os.path.join(self.project, ".hx"))
-        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
-            f.write("local M = host.load(host.default_loop)()\nM.tools.nope.run = nil\nreturn M\n")
-        done = self.run_hx("go", script=[say("still works")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout, "still works\n")
-        self.assertIn("raised an error while loading (.hx/loop.luau:2:", done.stderr)
-        self.assertIn("using the built-in loop", done.stderr)
-
-    def test_a_project_loop_that_is_not_a_module_falls_back(self):
-        os.makedirs(os.path.join(self.project, ".hx"))
-        for source in ["return {}\n", "local M = host.load(host.default_loop)()\nM.main = nil\nreturn M\n", "print('x')\n"]:
-            with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
-                f.write(source)
-            done = self.run_hx("go", script=[say("still works")])
-            self.assertEqual(done.returncode, 0, done.stderr)
-            self.assertTrue(done.stdout.endswith("still works\n"), source)
-            self.assertIn("does not return a table with a main function; using the built-in loop", done.stderr)
+        self.assertEqual(done.stderr.count(".hx/loop.luau"), 0)
+        done = self.run_hx("--built-in-loop", "--run", "x.luau")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--built-in-loop picks the agent's loop", done.stderr)
 
     def test_an_error_inside_the_project_loop_is_not_a_fallback(self):
         os.makedirs(os.path.join(self.project, ".hx"))
