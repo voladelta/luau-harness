@@ -82,9 +82,9 @@ fs::path make_judge_state(const fs::path& project) {
         setenv("TMPDIR", tmp.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
 
         std::vector<Rule> rules = walls.system;
-        rules.push_back({project.string(), Access::Read, true});
-        rules.push_back({kit.string(), Access::Read, true});
-        rules.push_back({state.string(), Access::Write, true});
+        rules.push_back({.path = project.string(), .access = Access::Read, .required = true});
+        rules.push_back({.path = kit.string(), .access = Access::Read, .required = true});
+        rules.push_back({.path = state.string(), .access = Access::Write, .required = true});
         rules.insert(rules.end(), walls.user.begin(), walls.user.end());
         const Sandbox sandbox = Sandbox::confine(rules, walls.unix_sockets);
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);

@@ -64,9 +64,11 @@ class Capture {
         const std::string_view head = cut_head(head_);
         const std::string_view tail = cut_tail(std::string_view(tail_).substr(tail_.size() - kCaptureHalf));
         const std::size_t omitted = dropped_ + head_.size() + tail_.size() - head.size() - tail.size();
-        return {.text = fmt::format("{}{}[... {} bytes of output omitted ...]\n{}", head,
-                                    head.ends_with('\n') ? "" : "\n", omitted, tail),
-                .omitted = omitted};
+        return {
+            .text = fmt::format("{}{}[... {} bytes of output omitted ...]\n{}", head, head.ends_with('\n') ? "" : "\n",
+                                omitted, tail),
+            .omitted = omitted,
+        };
     }
 
   private:
@@ -283,10 +285,12 @@ Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, d
         if (g_signal != 0 || now() >= deadline) {
             return give_up(g_signal != 0 ? Ending::Signaled : Ending::TimedOut);
         }
-        std::array<pollfd, 4> waiters{{{.fd = exited.get(), .events = POLLIN, .revents = 0},
-                                       {.fd = hangup_fd, .events = POLLRDHUP, .revents = 0},
-                                       {.fd = output.at_end() ? -1 : output.fd(), .events = POLLIN, .revents = 0},
-                                       {.fd = input.fd(), .events = POLLOUT, .revents = 0}}};
+        std::array<pollfd, 4> waiters{
+            pollfd{.fd = exited.get(), .events = POLLIN, .revents = 0},
+            pollfd{.fd = hangup_fd, .events = POLLRDHUP, .revents = 0},
+            pollfd{.fd = output.at_end() ? -1 : output.fd(), .events = POLLIN, .revents = 0},
+            pollfd{.fd = input.fd(), .events = POLLOUT, .revents = 0},
+        };
         const double left = std::max(deadline - now(), 0.0);
         wait_for(waiters, exited.valid() ? left : std::min(left, kNoPidfdPoll));
         if ((waiters[1].revents & (POLLRDHUP | POLLHUP)) != 0) {
@@ -442,8 +446,10 @@ int Host::sh(lua_State* L) {
         }
     }
     environment.push_back(nullptr);
-    const Place place{.cwd = cwd ? cwd->c_str() : nullptr,
-                      .environment = entries.empty() ? nullptr : environment.data()};
+    const Place place{
+        .cwd = cwd ? cwd->c_str() : nullptr,
+        .environment = entries.empty() ? nullptr : environment.data(),
+    };
     Child child = start(L, command.c_str(), data.has_value(), wall, place);
     Output output(std::move(child.output));
     Input input(std::move(child.input), data.value_or(std::string_view{}));
@@ -481,7 +487,7 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
                 if (path == nullptr || std::strlen(path) != length) {
                     luaL_error(L, "host.sh: %s[%d] is not a path", field, i);
                 }
-                rules.push_back({path, access, true});
+                rules.push_back({.path = path, .access = access, .required = true});
                 lua_pop(L, 1);
             }
             lua_pop(L, 1);

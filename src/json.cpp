@@ -93,7 +93,7 @@ int l_decode(lua_State* L) {
     }
 
     std::vector<Frame> frames;
-    const auto attach = [&]() {
+    const auto attach = [&] {
         if (frames.empty()) {
             return;
         }
@@ -118,7 +118,7 @@ int l_decode(lua_State* L) {
             if (array) {
                 mark_array(L);
             }
-            frames.push_back({unsafe_yyjson_get_first(value), count, array, 1});
+            frames.push_back({.next = unsafe_yyjson_get_first(value), .left = count, .array = array, .index = 1});
         } else {
             push_scalar(L, value);
             attach();
@@ -317,7 +317,7 @@ class Encoder {
                 std::size_t key_length = 0;
                 const char* key = lua_tolstring(L_, -2, &key_length);
                 const auto slot = static_cast<int>(members_.size()) + 1;
-                members_.push_back({{key, key_length}, slot});
+                members_.push_back({.key = {key, key_length}, .slot = slot});
                 lua_rawseti(L_, kValues, slot);
                 continue;
             }
@@ -428,10 +428,10 @@ void open_json(lua_State* L) {
     lua_pop(L, 1);
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"encode", l_encode},
-        {"decode", l_decode},
-        {"array", l_array},
-        {nullptr, nullptr},
+        {.name = "encode", .func = l_encode},
+        {.name = "decode", .func = l_decode},
+        {.name = "array", .func = l_array},
+        {.name = nullptr, .func = nullptr},
     };
     luaL_register(L, "json", kFunctions);
     lua_pushlightuserdata(L, &null_tag);
