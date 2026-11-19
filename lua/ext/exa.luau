@@ -29,7 +29,7 @@ local function check(value: unknown, position: number, name: string, kind: strin
 end
 
 local function call(request: { [string]: unknown }): { [string]: any }
-	if not host.exa then
+	if not host.endpoints.exa then
 		error("exa: hx was started without EXA_API_KEY, so Exa's Deep Search cannot be used", 0)
 	end
 	return http.call({

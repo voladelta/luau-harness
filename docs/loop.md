@@ -34,9 +34,11 @@ Code from the model and from extensions sees `host`, `json` and the standard lib
 an assignment such as `host.sh = nil` raises "host is read-only" instead of breaking every later call, and the
 text such code passes to `host.log` and `host.input` is made printable, so it cannot send an escape sequence to
 the terminal. `_G` there is the code's own globals, and a chunk loaded with `host.load` and no environment gets
-globals of its own. `for key, value in view` iterates a view; `pairs` and `next` see nothing in one. The views
-stop mistakes, not code that digs with `rawset` or `debug` on purpose, and `host.extensions`, `host.skills` and
-`host.args` are still the tables themselves. The loop, a project's `.hx/loop.luau` and `--run` scripts use the real host.
+globals of its own. `for key, value in view` iterates a view; `pairs` and `next` see nothing in one. Digging does
+not get past them: a view is frozen, so `rawset` and `setmetatable` raise on it; the standard libraries, `json`,
+the metatable strings share, and `host.extensions`, `host.skills`, `host.args` and `host.endpoints` are read-only
+tables for everyone; and such code has no `getfenv` or `setfenv`, which would hand it the loop's globals. The
+loop, a project's `.hx/loop.luau` and `--run` scripts use the real host, whose own fields they can replace.
 
 `hx --init` writes `.hx/loop.luau` from `lua/overlay.luau`:
 
@@ -52,7 +54,10 @@ Every setting at the top of the loop is a field of `M`, and so are the parts a p
 call directly rather than from code), `M.skill_dirs`, `M.system_prompt`, `M.layout`, `M.request` (one request to
 the model), `M.turn` (replies and tool calls until the model is done), `M.compact`, `M.compact_prompt` and
 `M.resume_prompt`. The loop always calls them through `M`, so a replacement takes effect everywhere. `M.model`
-starts as `host.model`, the model `--model` or `HX_MODEL` chose with its alias resolved.
+starts as `host.model`, the model `--model` or `HX_MODEL` chose with its alias resolved. A conversation made with
+`M.Conversation.new(model)` is asked on that model instead, each request through the endpoint `host.route` gives
+for it; `M.request(system, messages, compaction, model)` takes the model as its last argument, and a replacement
+has to pass it on.
 
 The system prompt shows the project's layout, so the model's first call need not be a listing: the files git
 lists, tracked or new and not ignored, as a tree of at most `M.layout_lines` (60) lines, directories first. With
@@ -124,7 +129,7 @@ added; only a listed one gets the features below. The settings follow Anthropic'
 | `thinking.block_binding: drop_block`: a thinking block sent back after a changed history is dropped rather than failing the request | yes | yes | yes |
 | `compaction: {type: "summarize"}`: past `M.compact_at` prompt tokens, the API writes the summary (on-demand compaction) | yes | yes | yes |
 
-The betas these need go in the `anthropic-beta` header, which Luau sets with `host.llm(body, {beta = "a,b"})`. Thinking
+The betas these need go in the `anthropic-beta` header, which Luau sets with `host.post(endpoint, body, {beta = "a,b"})`. Thinking
 is adaptive and cannot be turned off on these models; effort is the control. A reply a fallback model finished
 carries a `fallback` block; the loop drops what the declining model wrote before it, as the API requires, and a
 refusal is logged with its category.

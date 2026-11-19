@@ -57,14 +57,9 @@ local function read_config(): (Config?, ...string)
 	return result :: Config
 end
 
-local function printable(text: string): string
-	return (text:gsub("[\0-\8\11-\31\127]", ""):gsub("\194[\128-\159]", ""):gsub("\226\128[\170-\174]", "")
-		:gsub("\226\129[\166-\169]", ""))
-end
-
 local function say(text: string)
 	if not host.quiet then
-		host.log(printable("judge: " .. text))
+		host.log(host.printable("judge: " .. text))
 	end
 end
 
@@ -407,7 +402,7 @@ local function summary_text(): string
 end
 
 local function summary()
-	host.log(printable(summary_text()))
+	host.log(host.printable(summary_text()))
 	host.sh(("cd %s && rm -rf run tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
 		:format(quote(state)))
 end

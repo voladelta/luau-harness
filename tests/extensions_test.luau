@@ -7,7 +7,7 @@ local check, raises = checks.check, checks.raises
 assert(not host.stat(".hx"), "extensions_test writes .hx and removes it: run it from a scratch directory, not from a project")
 
 local calls, answers, waits = {}, {}, {}
-host.tool = function(name, request, options)
+host.post = function(name, request, options)
 	table.insert(calls, { name = name, request = request, options = options })
 	local answer = table.remove(answers, 1) or { 500, "script ran out" }
 	return answer[1], answer[2]
@@ -22,11 +22,11 @@ local function script(...)
 	answers = { ... }
 end
 
-host.tools = false
+host.endpoints = { search = false, fetch = false, ocr = false, exa = true }
 raises("search without a key", "without DEEPSEEK_API_KEY", loop.ext("web").search, "luau")
 raises("ocr without a key", "without DEEPSEEK_API_KEY", loop.ext("ocr").read, "a.pdf")
 check("no request without a key", #calls, 0)
-host.tools = true
+host.endpoints = { search = true, fetch = true, ocr = true, exa = true }
 
 local web, ocr = loop.ext("web"), loop.ext("ocr")
 check("the web extension loads", type(web.search), "function")
@@ -158,9 +158,9 @@ script({ 413, '{"error": {"message": "file too large"}}' })
 raises("a file too large", "(413): file too large", ocr.read, "big.pdf")
 raises("ocr of a path that is not a string", "ocr.read: argument 1 (path) must be a string, not number", ocr.read, 1)
 
-host.exa = false
+host.endpoints = { search = true, fetch = true, ocr = true, exa = false }
 raises("exa without a key", "without EXA_API_KEY", loop.ext("exa").deep, "luau", "why")
-host.exa = true
+host.endpoints = { search = true, fetch = true, ocr = true, exa = true }
 local exa = loop.ext("exa")
 script({ 200, json.encode({
 	output = { content = "Luau is gradually typed.", grounding = { { field = "content" } } },

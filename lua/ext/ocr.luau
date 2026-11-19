@@ -18,7 +18,7 @@ type Page = { index: number?, text: string?, finish_reason: string? }
 local purposes = { text_recognition = true, rich_layout_recognition = true }
 
 local function recognize(path: string, purpose: string): { [string]: any }
-	if not host.tools then
+	if not host.endpoints.ocr then
 		error("ocr: hx was started without DEEPSEEK_API_KEY, so DeepSeek's OCR cannot be used", 0)
 	end
 	return http.call({

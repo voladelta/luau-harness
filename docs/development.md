@@ -10,7 +10,7 @@ Where each part of hx lives:
 | `src/host.cpp` | the `host` table and the VM: stops and time limits at safepoints, `host.try`, `host.timed`, `host.load` and the small primitives |
 | `src/host_proc.cpp` | signals, waiting until one arrives, and killing every process hx started |
 | `src/host_sh.cpp` | `host.sh`: forking the command behind its wall, its limits, and both ends of its output |
-| `src/host_http.cpp` | `host.llm` and `host.tool`: requests to the endpoints, each key to its own URLs only |
+| `src/host_http.cpp` | `host.post` and `host.route`: requests to the endpoints, each key to its own URL only |
 | `src/host_files.cpp` | `host.read`, `host.write`, `host.list`, `host.walk` and `host.stat` |
 | `src/host_judge.cpp` | `host.judge`: the agent's end of the channel to the judge |
 | `src/host_spawn.cpp` | `host.spawn` and `host.wait`: children of hx that run a Luau function in a copy of the VM, which the loop's agents are |

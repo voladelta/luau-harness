@@ -3,7 +3,7 @@
 | | Allowed |
 |---|---|
 | Write | the project directory (where you start `hx`), a private `$TMPDIR` that is removed on exit, `--rw` paths |
-| Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /nix/store`, the directories on your `PATH` (below), your git configuration, trust roots (below), `--ro` paths |
+| Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /nix/store`, the directories on your `PATH` (below), your git configuration (below), trust roots (below), `--ro` paths |
 | Devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom` |
 | Everything else | cannot be opened: the rest of your home directory, other terminals, other projects |
 
@@ -18,6 +18,11 @@ What a toolchain needs beyond its programs takes a flag, for example
 `hx --ro ~/.rustup --rw ~/.cargo/registry "..."` for rustup's toolchains and cargo's downloads. The flags and
 `PATH` come from your command line and environment on purpose: nothing inside the project, which the model can
 write, can widen the wall.
+
+Git reads your name, aliases and ignore rules inside: `~/.gitconfig`, and `config`, `ignore` and `attributes` in
+`$XDG_CONFIG_HOME/git` (`~/.config/git` by default). Nothing else in that directory opens, so the tokens
+`git credential-store` keeps in `credentials` beside them stay outside. A token written into the configuration
+itself, in a URL or an `http.extraHeader`, is readable with it: keep those in a credential helper.
 
 Behind a TLS-intercepting proxy the trust roots often live in your home directory. The file or directory named
 by each of `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
@@ -44,9 +49,9 @@ Also in force:
   `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS` (`MY_API_KEY`, `OPENAI_APIKEY`, `PGPASSWORD`),
   or in `_PAT` or `_PWD` (`GITHUB_PAT`, `MYSQL_PWD`; `PWD` and `OLDPWD` stay). `--keep-env NAME` keeps one. Luau
   code never sees the key: the host adds it to requests for the configured endpoint only, and commands cannot
-  read it out of the host's memory. `DEEPSEEK_API_KEY` is kept the same way, whatever the model, and is sent only
-  to DeepSeek's tool endpoints, `HX_TOOLS_URL/search`, `/fetch` and `/ocr`, and to its Messages endpoint,
-  `HX_DEEPSEEK_URL`; `EXA_API_KEY` too, sent only to `HX_EXA_URL`.
+  read it out of the host's memory. `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY` and `EXA_API_KEY` are kept the same way,
+  whatever the model, and each is sent only to its own endpoints: `HX_ANTHROPIC_URL`; `HX_DEEPSEEK_URL` and
+  DeepSeek's tools, `HX_TOOLS_URL/search`, `/fetch` and `/ocr`; and `HX_EXA_URL`.
 - The VM has a memory ceiling of 1 GiB, and below it takes only what the system can spare: each time it grows by
   64 MiB it reads `MemAvailable` in `/proc/meminfo` again, and it refuses to grow into the last 128 MiB, so that
   it runs out before the kernel's out-of-memory killer acts. Code that runs into either gets the error "not
@@ -76,5 +81,6 @@ Know these before you rely on it.
   the I/O returns; `hx` waits a second for it, then leaves without it. A command that times out is treated the
   same way: `host.sh` returns after that second, with `signal` 9.
 - **The model can edit `.hx/loop.luau` and its extensions.** That is the point, and it shows in `git diff`.
-  If the loop no longer loads and returns a `main` function, the built-in one runs instead.
+  A loop that no longer loads, or returns no `main` function, stops hx rather than running a session without
+  what the project put there; `hx --built-in-loop` runs without it, to repair it say.
 - **Nothing asks before a file in the project is changed or deleted.** Git is the undo.

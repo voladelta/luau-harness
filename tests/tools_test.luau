@@ -121,6 +121,10 @@ loop.output_limit = 30000
 
 check("printable keeps text, newlines and tabs", loop.printable("a\tb\nc é"), "a\tb\nc é")
 check("printable drops escape sequences' control bytes", loop.printable("\27]52;c;aGk=\7x\27[2Jy\r\0\127z"), "]52;c;aGk=x[2Jyz")
+check("printable drops C1 controls and bidi overrides", loop.printable("a\194\155b\226\128\174c\226\129\166d"), "abcd")
+check("printable drops a C1 control a dropped byte would splice", loop.printable("a\194\0\155b"), "ab")
+check("printable drops a bidi override a dropped byte would splice", loop.printable("a\226\0\128\170b"), "ab")
+check("printable drops a C1 control left by a dropped override", loop.printable("a\194\226\128\170\128b"), "ab")
 
 local function failed(code)
 	return select(2, lua(code))
@@ -165,6 +169,16 @@ for _, assignment in { "host.sh = nil", "json.encode = nil", "_G.host.sh = nil",
 	check(assignment .. " fails", broke, true)
 	check(assignment .. " says why", result:find("is read-only", 1, true) ~= nil, true)
 end
+for _, digging in { "rawset(host, 'sh', nil)", "rawset(string, 'format', nil)", "host.extensions.bytes = ''",
+	"host.skills.hx = ''", "host.args[1] = 'x'", "host.endpoints.exa = true",
+	"getmetatable('').__index.upper = function() return 'x' end", "getmetatable('').__index = {}",
+	"setmetatable(host, {})", "getmetatable(host).__index = nil", "getfenv(bash).host.sh = nil",
+	"setfenv(bash, {})" } do
+	local _, broke = lua(digging)
+	check(digging .. " fails", broke, true)
+end
+check("strings still have their methods", ("still"):upper(), "STILL")
+check("and the loop's own host is whole", type(host.sh), "function")
 check("bash still works", lua("return bash('echo still')"), "still\n[exit 0]")
 check("json still works", lua("return json.encode({1})"), "[1]")
 check("and so does the loop's own json", json.encode({ 2 }), "[2]")

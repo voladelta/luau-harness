@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -62,6 +63,11 @@ struct FreeDeleter {
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char* value = std::getenv(name);
     return std::string(value != nullptr && *value != '\0' ? value : fallback);
+}
+
+[[nodiscard]] inline bool beneath(const std::filesystem::path& path, const std::filesystem::path& dir) {
+    const std::filesystem::path inside = path.lexically_relative(dir);
+    return !inside.empty() && *inside.begin() != "..";
 }
 
 enum class ReadAll : std::uint8_t {

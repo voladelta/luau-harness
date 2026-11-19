@@ -28,6 +28,7 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 | `--keep-env NAME` | keep a secret-looking variable in the environment of commands |
 | `--unix-sockets` | before Landlock ABI 9, let commands create unix sockets (see [The wall](wall.md)) |
 | `--no-sandbox` | run without Landlock; the model is told it is not confined |
+| `--built-in-loop` | run the loop built into hx and leave `.hx/loop.luau` unread. Without it, a `.hx/loop.luau` that does not load stops hx with exit status 2 |
 | `-q`, `--quiet` | leave out progress lines; the answer, warnings and errors still show |
 | `--no-input` | never prompt: with no task and stdin a terminal, fail instead of waiting |
 | `-h`, `--help` / `--version` | print help or the version to stdout |
@@ -40,7 +41,8 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 | `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked. DeepSeek has three levels: it takes `medium` and `xhigh` for `high` | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
 | `HX_TOOLS_URL` | base of DeepSeek's Search, Fetch and OCR endpoints, which the built-in `web` and `ocr` extensions call with `DEEPSEEK_API_KEY`, whatever the model | `https://api.deepseek.com/v1/tools` |
 | `HX_EXA_URL` | Exa's search endpoint, which the built-in `exa` extension calls with `EXA_API_KEY`, whatever the model | `https://api.exa.ai/search` |
-| `HX_DEEPSEEK_URL` | DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude model is asked through, a sub-agent say, with `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1/messages` |
+| `HX_DEEPSEEK_URL` | DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude model is asked through, an agent say, with `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1/messages` |
+| `HX_ANTHROPIC_URL` | Anthropic's Messages endpoint, which a Claude model under a session on another model is asked through, with `ANTHROPIC_API_KEY` | `https://api.anthropic.com/v1/messages` |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
 Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143

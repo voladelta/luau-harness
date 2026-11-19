@@ -25,7 +25,7 @@ type Result = {
 type SearchOptions = { count: number?, content: boolean?, question: string? }
 
 local function call(name: string, request: { [string]: unknown }): { [string]: any }
-	if not host.tools then
+	if not host.endpoints[name] then
 		error(name .. ": hx was started without DEEPSEEK_API_KEY, so DeepSeek's " .. name .. " cannot be used", 0)
 	end
 	return http.call({

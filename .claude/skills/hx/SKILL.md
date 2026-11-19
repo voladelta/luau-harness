@@ -199,15 +199,13 @@ return M
   each in a process of its own, `agents` is already there (see "Agents").
 - A sub-agent shares the model's globals and the wall. Its words also go to stdout, its replies are counted in
   the line at the end of the run, and its conversation has a log of its own (see "Running hx").
-- A sub-agent runs on another model when `M.model` is set for its turn and put back however the turn ends:
-  `local outer = M.model; M.model = "deepseek-flash"; local ok, err = pcall(M.turn, system, talk); M.model = outer`,
-  then `error(err, 0)` when `ok` is false. Under a session on a Claude model that is another Claude model
-  (`claude-sonnet-5-5`), or a DeepSeek model, which needs `DEEPSEEK_API_KEY` set when hx starts. A session on
-  DeepSeek cannot hand a turn to Claude.
+- A sub-agent runs on another model when its conversation names one: `M.Conversation.new("deepseek-flash")`.
+  A model of the session's vendor goes through the session's endpoint; a Claude model under a DeepSeek session
+  needs `ANTHROPIC_API_KEY` set when hx starts, and a DeepSeek model under a Claude session `DEEPSEEK_API_KEY`.
 - Keep what goes to the model the same from request to request, or the prompt cache is lost: build prompt text
   once, and put nothing that changes (a clock, a counter) into the system prompt or a `usage` line.
-- A loop that does not load, or returns no table with a `main` function, is reported on stderr and the built-in
-  loop runs instead, so check after every change:
+- A loop that does not load, or returns no table with a `main` function, stops hx with the reason on stderr;
+  `hx --built-in-loop TASK` runs without it. So check after every change:
 
 ```
 echo 'local M = assert(host.load(assert(host.read(".hx/loop.luau")), "=.hx/loop.luau"))()
