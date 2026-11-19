@@ -247,28 +247,29 @@ int l_clip(lua_State* L) {
     return 2;
 }
 
-bool starts(std::string_view text, unsigned char lead, unsigned char next, unsigned char low, unsigned char high) {
-    const auto at = [&](std::size_t i) { return static_cast<unsigned char>(text[i]); };
-    return text.size() >= 3 && at(0) == lead && at(1) == next && at(2) >= low && at(2) <= high;
+std::size_t unprintable_tail(std::string_view kept) {
+    const std::size_t n = kept.size();
+    const auto at = [&](std::size_t back) { return static_cast<unsigned char>(kept[n - back]); };
+    if (n >= 2 && at(2) == 0xC2 && (at(1) & 0xE0U) == 0x80U) {
+        return 2;
+    }
+    if (n >= 3 && at(3) == 0xE2 &&
+        ((at(2) == 0x80 && at(1) >= 0xAA && at(1) <= 0xAE) || (at(2) == 0x81 && at(1) >= 0xA6 && at(1) <= 0xA9))) {
+        return 3;
+    }
+    return 0;
 }
 
 int l_printable(lua_State* L) {
     std::size_t length = 0;
     const char* raw = luaL_checklstring(L, 1, &length);
-    std::string_view text(raw, length);
     std::string kept;
     kept.reserve(length);
-    while (!text.empty()) {
-        const auto c = static_cast<unsigned char>(text.front());
-        if (starts(text, 0xE2, 0x80, 0xAA, 0xAE) || starts(text, 0xE2, 0x81, 0xA6, 0xA9)) {
-            text.remove_prefix(3);
-        } else if (c == 0xC2 && text.size() >= 2 && (static_cast<unsigned char>(text[1]) & 0xE0U) == 0x80U) {
-            text.remove_prefix(2);
-        } else {
-            if (c == '\t' || c == '\n' || (c >= 0x20 && c != 0x7F)) {
-                kept.push_back(text.front());
-            }
-            text.remove_prefix(1);
+    for (const char each : std::string_view(raw, length)) {
+        const auto c = static_cast<unsigned char>(each);
+        if (c == '\t' || c == '\n' || (c >= 0x20 && c != 0x7F)) {
+            kept.push_back(each);
+            kept.resize(kept.size() - unprintable_tail(kept));
         }
     }
     lua_pushlstring(L, kept.data(), kept.size());

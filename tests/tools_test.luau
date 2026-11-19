@@ -121,6 +121,10 @@ loop.output_limit = 30000
 
 check("printable keeps text, newlines and tabs", loop.printable("a\tb\nc é"), "a\tb\nc é")
 check("printable drops escape sequences' control bytes", loop.printable("\27]52;c;aGk=\7x\27[2Jy\r\0\127z"), "]52;c;aGk=x[2Jyz")
+check("printable drops C1 controls and bidi overrides", loop.printable("a\194\155b\226\128\174c\226\129\166d"), "abcd")
+check("printable drops a C1 control a dropped byte would splice", loop.printable("a\194\0\155b"), "ab")
+check("printable drops a bidi override a dropped byte would splice", loop.printable("a\226\0\128\170b"), "ab")
+check("printable drops a C1 control left by a dropped override", loop.printable("a\194\226\128\170\128b"), "ab")
 
 local function failed(code)
 	return select(2, lua(code))
