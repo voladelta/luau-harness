@@ -132,7 +132,7 @@ bool filter_unix_sockets() {
     constexpr auto kFirstArg = static_cast<uint32_t>(offsetof(seccomp_data, args));
     constexpr auto kSecondArg = kFirstArg + static_cast<uint32_t>(sizeof(uint64_t));
     constexpr uint32_t kTypeMask = 0xf;
-    std::array<sock_filter, 15> program{{
+    std::array<sock_filter, 15> program{
         stmt(BPF_LD | BPF_W | BPF_ABS, kArch),
         jump(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 11),
         stmt(BPF_LD | BPF_W | BPF_ABS, kNumber),
@@ -148,7 +148,7 @@ bool filter_unix_sockets() {
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
-    }};
+    };
     const sock_fprog fprog{.len = static_cast<unsigned short>(program.size()), .filter = program.data()};
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog, 0, 0) != 0) {
         fail("PR_SET_SECCOMP");

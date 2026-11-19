@@ -29,6 +29,7 @@ namespace {
 constexpr std::size_t kMaxResponse = std::size_t{256} << 20;
 constexpr std::size_t kMaxUpload = std::size_t{100} << 20;
 
+// NOLINTNEXTLINE(misc-const-correctness)
 std::size_t on_body(char* data, std::size_t size, std::size_t count, void* user) noexcept {
     auto* body = static_cast<std::string*>(user);
     const std::size_t bytes = size * count;

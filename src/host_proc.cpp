@@ -115,8 +115,10 @@ void wait_for(std::span<pollfd> fds, double seconds) noexcept {
     if (g_signal == 0) {
         seconds = std::min(seconds, kLongest);
         const auto whole = static_cast<time_t>(seconds);
-        const timespec limit{.tv_sec = whole,
-                             .tv_nsec = static_cast<long>((seconds - static_cast<double>(whole)) * 1e9)};
+        const timespec limit{
+            .tv_sec = whole,
+            .tv_nsec = static_cast<long>((seconds - static_cast<double>(whole)) * 1e9),
+        };
         ppoll(fds.data(), fds.size(), seconds < 0 ? nullptr : &limit, &before);
     }
     pthread_sigmask(SIG_SETMASK, &before, nullptr);

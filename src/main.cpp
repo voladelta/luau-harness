@@ -134,18 +134,22 @@ struct Vendor {
     const char* model;
 };
 constexpr Vendor kVendors[] = {
-    {.name = "anthropic",
-     .url = "https://api.anthropic.com/v1/messages",
-     .url_env = "HX_ANTHROPIC_URL",
-     .key_env = "ANTHROPIC_API_KEY",
-     .version = "anthropic-version: 2026-10-21",
-     .model = "claude-opus-5-5"},
-    {.name = "deepseek",
-     .url = "https://api.deepseek.com/anthropic/v1/messages",
-     .url_env = "HX_DEEPSEEK_URL",
-     .key_env = "DEEPSEEK_API_KEY",
-     .version = "anthropic-version: 2023-06-01",
-     .model = "deepseek-flash"},
+    {
+        .name = "anthropic",
+        .url = "https://api.anthropic.com/v1/messages",
+        .url_env = "HX_ANTHROPIC_URL",
+        .key_env = "ANTHROPIC_API_KEY",
+        .version = "anthropic-version: 2026-10-21",
+        .model = "claude-opus-5-5",
+    },
+    {
+        .name = "deepseek",
+        .url = "https://api.deepseek.com/anthropic/v1/messages",
+        .url_env = "HX_DEEPSEEK_URL",
+        .key_env = "DEEPSEEK_API_KEY",
+        .version = "anthropic-version: 2023-06-01",
+        .model = "deepseek-flash",
+    },
 };
 constexpr const Vendor& kAnthropic = kVendors[0];
 constexpr const Vendor& kDeepSeek = kVendors[1];
@@ -159,10 +163,38 @@ struct Service {
     hx::Auth auth;
 };
 constexpr Service kServices[] = {
-    {"search", "https://api.deepseek.com/v1/tools", "HX_TOOLS_URL", "/search", kDeepSeek.key_env, hx::Auth::Bearer},
-    {"fetch", "https://api.deepseek.com/v1/tools", "HX_TOOLS_URL", "/fetch", kDeepSeek.key_env, hx::Auth::Bearer},
-    {"ocr", "https://api.deepseek.com/v1/tools", "HX_TOOLS_URL", "/ocr", kDeepSeek.key_env, hx::Auth::Bearer},
-    {"exa", "https://api.exa.ai/search", "HX_EXA_URL", "", "EXA_API_KEY", hx::Auth::ApiKey},
+    {
+        .name = "search",
+        .url = "https://api.deepseek.com/v1/tools",
+        .url_env = "HX_TOOLS_URL",
+        .path = "/search",
+        .key_env = kDeepSeek.key_env,
+        .auth = hx::Auth::Bearer,
+    },
+    {
+        .name = "fetch",
+        .url = "https://api.deepseek.com/v1/tools",
+        .url_env = "HX_TOOLS_URL",
+        .path = "/fetch",
+        .key_env = kDeepSeek.key_env,
+        .auth = hx::Auth::Bearer,
+    },
+    {
+        .name = "ocr",
+        .url = "https://api.deepseek.com/v1/tools",
+        .url_env = "HX_TOOLS_URL",
+        .path = "/ocr",
+        .key_env = kDeepSeek.key_env,
+        .auth = hx::Auth::Bearer,
+    },
+    {
+        .name = "exa",
+        .url = "https://api.exa.ai/search",
+        .url_env = "HX_EXA_URL",
+        .path = "",
+        .key_env = "EXA_API_KEY",
+        .auth = hx::Auth::ApiKey,
+    },
 };
 
 const Vendor& vendor_of(std::string_view model) {
@@ -565,23 +597,36 @@ void add_path_rules(std::vector<hx::Rule>& rules) {
         }
     }
     for (const fs::path& dir : opened) {
-        rules.push_back({dir.string(), hx::Access::Read, false});
+        rules.push_back({.path = dir.string(), .access = hx::Access::Read, .required = false});
     }
 }
 
 std::vector<hx::Rule> system_rules() {
     using hx::Access;
     std::vector<hx::Rule> rules;
-    for (const char* path : {"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/proc",
-                             "/sys", "/nix/store", "/run/systemd/resolve"}) {
-        rules.push_back({path, Access::Read, false});
+    for (const char* path : {
+             "/usr",
+             "/bin",
+             "/sbin",
+             "/lib",
+             "/lib32",
+             "/lib64",
+             "/libx32",
+             "/etc",
+             "/opt",
+             "/proc",
+             "/sys",
+             "/nix/store",
+             "/run/systemd/resolve",
+         }) {
+        rules.push_back({.path = path, .access = Access::Read, .required = false});
     }
     for (const char* path : {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"}) {
-        rules.push_back({path, Access::Device, false});
+        rules.push_back({.path = path, .access = Access::Device, .required = false});
     }
     const std::string home = env_or("HOME", "");
     if (home.starts_with('/')) {
-        rules.push_back({home + "/.gitconfig", Access::Read, false});
+        rules.push_back({.path = home + "/.gitconfig", .access = Access::Read, .required = false});
     }
     std::string config = env_or("XDG_CONFIG_HOME", "");
     if (!config.starts_with('/') && home.starts_with('/')) {
@@ -589,14 +634,23 @@ std::vector<hx::Rule> system_rules() {
     }
     if (config.starts_with('/')) {
         for (const char* name : {"config", "ignore", "attributes"}) {
-            rules.push_back({fmt::format("{}/git/{}", config, name), Access::Read, false});
+            rules.push_back(
+                {.path = fmt::format("{}/git/{}", config, name), .access = Access::Read, .required = false});
         }
     }
-    for (const char* name :
-         {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-          "GIT_SSL_CAINFO", "CARGO_HTTP_CAINFO", "AWS_CA_BUNDLE", "NIX_SSL_CERT_FILE"}) {
+    for (const char* name : {
+             "SSL_CERT_FILE",
+             "SSL_CERT_DIR",
+             "CURL_CA_BUNDLE",
+             "REQUESTS_CA_BUNDLE",
+             "NODE_EXTRA_CA_CERTS",
+             "GIT_SSL_CAINFO",
+             "CARGO_HTTP_CAINFO",
+             "AWS_CA_BUNDLE",
+             "NIX_SSL_CERT_FILE",
+         }) {
         if (std::string path = env_or(name, ""); path.starts_with('/')) {
-            rules.push_back({std::move(path), Access::Read, false});
+            rules.push_back({.path = std::move(path), .access = Access::Read, .required = false});
         }
     }
     add_path_rules(rules);
@@ -607,10 +661,10 @@ std::vector<hx::Rule> user_rules(const Options& options) {
     std::vector<hx::Rule> rules;
     rules.reserve(options.read_paths.size() + options.write_paths.size());
     for (const std::string& path : options.read_paths) {
-        rules.push_back({path, hx::Access::Read, true});
+        rules.push_back({.path = path, .access = hx::Access::Read, .required = true});
     }
     for (const std::string& path : options.write_paths) {
-        rules.push_back({path, hx::Access::Write, true});
+        rules.push_back({.path = path, .access = hx::Access::Write, .required = true});
     }
     return rules;
 }
@@ -618,8 +672,8 @@ std::vector<hx::Rule> user_rules(const Options& options) {
 std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& project, const fs::path& tmp) {
     using hx::Access;
     std::vector<hx::Rule> rules = system_rules();
-    rules.push_back({project.string(), Access::Write, true});
-    rules.push_back({tmp.string(), Access::Write, true});
+    rules.push_back({.path = project.string(), .access = Access::Write, .required = true});
+    rules.push_back({.path = tmp.string(), .access = Access::Write, .required = true});
     const std::vector<hx::Rule> user = user_rules(options);
     rules.insert(rules.end(), user.begin(), user.end());
     return rules;
@@ -914,27 +968,33 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const Secrets& sec
         return found != secrets.end() ? found->second : std::string();
     };
     std::vector<hx::Endpoint> endpoints;
-    endpoints.push_back({.name = std::string(hx::kSessionEndpoint),
-                         .url = model.url,
-                         .auth = hx::Auth::ApiKey,
-                         .key = key(model.key_env),
-                         .key_env = "",
-                         .headers = {model.vendor->version}});
+    endpoints.push_back({
+        .name = std::string(hx::kSessionEndpoint),
+        .url = model.url,
+        .auth = hx::Auth::ApiKey,
+        .key = key(model.key_env),
+        .key_env = "",
+        .headers = {model.vendor->version},
+    });
     for (const Vendor& vendor : kVendors) {
-        endpoints.push_back({.name = std::string(vendor.name),
-                             .url = env_or(vendor.url_env, vendor.url),
-                             .auth = hx::Auth::ApiKey,
-                             .key = key(vendor.key_env),
-                             .key_env = vendor.key_env,
-                             .headers = {vendor.version}});
+        endpoints.push_back({
+            .name = std::string(vendor.name),
+            .url = env_or(vendor.url_env, vendor.url),
+            .auth = hx::Auth::ApiKey,
+            .key = key(vendor.key_env),
+            .key_env = vendor.key_env,
+            .headers = {vendor.version},
+        });
     }
     for (const Service& service : kServices) {
-        endpoints.push_back({.name = service.name,
-                             .url = service_url(service),
-                             .auth = service.auth,
-                             .key = key(service.key_env),
-                             .key_env = service.key_env,
-                             .headers = {}});
+        endpoints.push_back({
+            .name = service.name,
+            .url = service_url(service),
+            .auth = service.auth,
+            .key = key(service.key_env),
+            .key_env = service.key_env,
+            .headers = {},
+        });
     }
     return endpoints;
 }

@@ -164,7 +164,8 @@ void arm_limit(double deadline) noexcept {
     const auto whole = static_cast<time_t>(deadline);
     const itimerspec at{
         .it_interval = {.tv_sec = 0, .tv_nsec = 0},
-        .it_value = {.tv_sec = whole, .tv_nsec = static_cast<long>((deadline - static_cast<double>(whole)) * 1e9)}};
+        .it_value = {.tv_sec = whole, .tv_nsec = static_cast<long>((deadline - static_cast<double>(whole)) * 1e9)},
+    };
     timer_settime(*timer, TIMER_ABSTIME, &at, nullptr);
 }
 
@@ -403,11 +404,27 @@ void Host::open(lua_State* L) {
     callbacks->interrupt = on_interrupt;
 
     static constexpr luaL_Reg kFunctions[] = {
-        {"post", post},      {"route", route},      {"sh", sh},       {"try", try_},    {"timed", timed},
-        {"read", read_file}, {"write", write_file}, {"list", l_list}, {"load", l_load}, {"input", l_input},
-        {"log", l_log},      {"sleep", sleep},      {"env", l_env},   {"judge", judge}, {"clip", l_clip},
-        {"spawn", spawn},    {"wait", wait},        {"stat", l_stat}, {"walk", l_walk}, {"printable", l_printable},
-        {nullptr, nullptr},
+        {.name = "post", .func = post},
+        {.name = "route", .func = route},
+        {.name = "sh", .func = sh},
+        {.name = "try", .func = try_},
+        {.name = "timed", .func = timed},
+        {.name = "read", .func = read_file},
+        {.name = "write", .func = write_file},
+        {.name = "list", .func = l_list},
+        {.name = "load", .func = l_load},
+        {.name = "input", .func = l_input},
+        {.name = "log", .func = l_log},
+        {.name = "sleep", .func = sleep},
+        {.name = "env", .func = l_env},
+        {.name = "judge", .func = judge},
+        {.name = "clip", .func = l_clip},
+        {.name = "spawn", .func = spawn},
+        {.name = "wait", .func = wait},
+        {.name = "stat", .func = l_stat},
+        {.name = "walk", .func = l_walk},
+        {.name = "printable", .func = l_printable},
+        {.name = nullptr, .func = nullptr},
     };
     luaL_register(L, "host", kFunctions);
 

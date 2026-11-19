@@ -184,7 +184,7 @@ int Host::wait(lua_State* L) {
         std::vector<pollfd> waiters;
         waiters.reserve(host.spawned_.size());
         for (const Spawned& child : host.spawned_) {
-            waiters.push_back({child.result.get(), POLLIN, 0});
+            waiters.push_back({.fd = child.result.get(), .events = POLLIN, .revents = 0});
         }
         wait_for(waiters, until > 0 ? std::max(until - now(), 0.0) : -1.0);
     }
