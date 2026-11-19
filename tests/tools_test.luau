@@ -124,6 +124,9 @@ check("printable drops escape sequences' control bytes", loop.printable("\27]52;
 check("printable drops the marks that reorder text", loop.printable("a\226\128\174b\226\129\166c\194\155d"), "abcd")
 check("and one that what it drops would leave behind",
 	loop.printable("a\226\128\0\174b\226\194\155\128\174c\226\226\128\174\129\166d"), "abcd")
+local nested, began = ("\226\128"):rep(200000) .. ("\174"):rep(200000), os.clock()
+check("however deep they nest", loop.printable(nested), "")
+check("in one pass", os.clock() - began < 1, true)
 
 local function failed(code)
 	return select(2, lua(code))
