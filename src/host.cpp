@@ -247,15 +247,15 @@ int l_clip(lua_State* L) {
     return 2;
 }
 
-std::size_t unprintable_tail(std::string_view kept) {
-    const std::size_t n = kept.size();
-    const auto at = [&](std::size_t back) { return static_cast<unsigned char>(kept[n - back]); };
-    if (n >= 2 && at(2) == 0xC2 && (at(1) & 0xE0U) == 0x80U) {
-        return 2;
-    }
-    if (n >= 3 && at(3) == 0xE2 &&
-        ((at(2) == 0x80 && at(1) >= 0xAA && at(1) <= 0xAE) || (at(2) == 0x81 && at(1) >= 0xA6 && at(1) <= 0xA9))) {
+std::size_t mark_at_end(std::string_view text) {
+    const auto back = [&](std::size_t i) { return static_cast<unsigned char>(text[text.size() - i]); };
+    if (text.size() >= 3 && back(3) == 0xE2 &&
+        ((back(2) == 0x80 && back(1) >= 0xAA && back(1) <= 0xAE) ||
+         (back(2) == 0x81 && back(1) >= 0xA6 && back(1) <= 0xA9))) {
         return 3;
+    }
+    if (text.size() >= 2 && back(2) == 0xC2 && (back(1) & 0xE0U) == 0x80U) {
+        return 2;
     }
     return 0;
 }
@@ -265,11 +265,11 @@ int l_printable(lua_State* L) {
     const char* raw = luaL_checklstring(L, 1, &length);
     std::string kept;
     kept.reserve(length);
-    for (const char each : std::string_view(raw, length)) {
-        const auto c = static_cast<unsigned char>(each);
+    for (const char byte : std::string_view(raw, length)) {
+        const auto c = static_cast<unsigned char>(byte);
         if (c == '\t' || c == '\n' || (c >= 0x20 && c != 0x7F)) {
-            kept.push_back(each);
-            kept.resize(kept.size() - unprintable_tail(kept));
+            kept.push_back(byte);
+            kept.resize(kept.size() - mark_at_end(kept));
         }
     }
     lua_pushlstring(L, kept.data(), kept.size());

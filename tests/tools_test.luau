@@ -121,9 +121,13 @@ loop.output_limit = 30000
 
 check("printable keeps text, newlines and tabs", loop.printable("a\tb\nc é"), "a\tb\nc é")
 check("printable drops escape sequences' control bytes", loop.printable("\27]52;c;aGk=\7x\27[2Jy\r\0\127z"), "]52;c;aGk=x[2Jyz")
-check("printable drops C1 controls and bidi overrides", loop.printable("a\194\155b\226\128\174c\226\129\166d"), "abcd")
+check("printable drops the marks that reorder text", loop.printable("a\226\128\174b\226\129\166c\194\155d"), "abcd")
+check("and one that what it drops would leave behind",
+	loop.printable("a\226\128\0\174b\226\194\155\128\174c\226\226\128\174\129\166d"), "abcd")
+local nested, began = ("\226\128"):rep(200000) .. ("\174"):rep(200000), os.clock()
+check("however deep they nest", loop.printable(nested), "")
+check("in one pass", os.clock() - began < 1, true)
 check("printable drops a C1 control a dropped byte would splice", loop.printable("a\194\0\155b"), "ab")
-check("printable drops a bidi override a dropped byte would splice", loop.printable("a\226\0\128\170b"), "ab")
 check("printable drops a C1 control left by a dropped override", loop.printable("a\194\226\128\170\128b"), "ab")
 
 local function failed(code)
