@@ -12,7 +12,8 @@ You are in one of two places:
 
 - **Outside**: in a shell, as a person or another agent such as Claude Code. You start `hx` as a command.
 - **Inside**: you are the model hx runs. You have the `lua` tool, and your code calls `bash`, `read`, `write`,
-  `edit`, `skill` and `ext`.
+  `edit`, `see`, `skill` and `ext`. `see(path)` puts a PNG, JPEG, GIF or WebP file into the call's result for
+  you to look at.
 
 The files under `.hx/` mean the same whoever writes them, so extending hx is the same work from either place.
 
@@ -58,6 +59,9 @@ hx --rpi [options] TASK...            the agent as the lead of agents (see "Agen
   needs beyond its programs, such as `~/.rustup`, needs `--ro PATH` or `--rw PATH`. Variables that look like
   secrets are taken out of the environment of commands; `--keep-env NAME` keeps one. The network is open.
   `--no-sandbox` takes the wall away: do not pass it unless the user asked.
+- `--resume LOG` goes on from a conversation saved in `.hx/log/` (a project with `.hx/` saves each one), and
+  `--resume last` from the newest. `--endpoint NAME=URL` adds an endpoint an extension reaches with
+  `host.post(NAME, body)`; its key comes from `NAME_API_KEY` and never reaches Luau.
 - Nothing asks before a file changes, and git is the undo: commit first, then read `git diff`. For a task that
   reads text nobody vouches for, run hx in a clone and pull from it, since hooks and `.git/config` do not show
   in a diff.
@@ -92,6 +96,10 @@ return agents({
 
 - An agent knows only what its task says: name the files, what to change and leave alone, and the check to run.
 - Agents share the project's files and nothing else, so tasks at work together must not write the same files.
+  `write` refuses to overwrite a file that changed since the conversation last read or wrote it, and says to
+  read it first; commands are not checked.
+- A report names the files the agent wrote and the log its conversation is in.
+  `agents({ { name = "parser", stop = true } })` stops an agent at work.
 - A task for a name that already has an agent goes on in that agent's conversation: send work back to be fixed
   under the name that did it. A new name starts a new agent.
 - The call returns after `M.agent_wait` seconds at most (270), with the reports so far and a line for each
@@ -122,7 +130,7 @@ return {
 ```
 
 - Call it as `ext("NAME").count("src")`. A changed file is loaded again at its next use.
-- It sees what the model's code sees: `bash`, `read`, `write`, `edit`, `skill`, `ext`, `host.*`, `json.*`. Its
+- It sees what the model's code sees: `bash`, `read`, `write`, `edit`, `see`, `skill`, `ext`, `host.*`, `json.*`. Its
   globals are its own, and what it prints goes into the tool result.
 - Report failure with `error(message, 0)`. Return text, or a table: a table shows as JSON, unless its metatable
   has `__tostring`.
