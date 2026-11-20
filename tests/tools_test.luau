@@ -3,7 +3,7 @@ local dir = host.env("TMPDIR") .. "/"
 
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
-local check, raises = checks.check, checks.raises
+local check, has, lacks, raises = checks.check, checks.has, checks.lacks, checks.raises
 
 local tools = {}
 for _, fn in loop.functions do
@@ -13,6 +13,8 @@ end
 local function lua(code)
 	return loop.tools[1].run({ code = code })
 end
+
+check("with no globals set, the prompt after a compaction is the plain one", loop.resume_text(), loop.resume_prompt)
 
 assert(not host.stat(".hx"), "tools_test writes .hx and removes it: run it from a scratch directory, not from a project")
 
@@ -74,6 +76,72 @@ sh("ln -s gone.txt %sdangling.txt")
 check("write through a dangling link", host.write(w .. "dangling.txt", "made"), true)
 check("makes the file it names", host.read(w .. "gone.txt"), "made")
 check("no temporary file is left", table.concat(host.list(w), " "), "dangling.txt gone.txt link.txt new.txt one.txt real.txt run.sh two.txt")
+
+tools.write(dir .. "stale.txt", "mine\n")
+check("a file written here can be written again", tools.write(dir .. "stale.txt", "mine, twice\n"), ("wrote 12 bytes to %sstale.txt"):format(dir))
+host.sleep(0.01)
+host.write(dir .. "stale.txt", "somebody else's\n")
+raises("a file changed since it was written is not overwritten", "stale.txt has changed since you last read or wrote it", tools.write, dir .. "stale.txt", "mine again\n")
+check("and keeps the change", host.read(dir .. "stale.txt"), "somebody else's\n")
+tools.read(dir .. "stale.txt")
+check("once read, it can be", tools.write(dir .. "stale.txt", "mine again\n"), ("wrote 11 bytes to %sstale.txt"):format(dir))
+host.sleep(0.01)
+host.write(dir .. "stale.txt", "changed once more\n")
+check("edit reads the file as it is, and needs no second read", tools.edit(dir .. "stale.txt", "once more", "again"), ("replaced 1 occurrence in %sstale.txt"):format(dir))
+check("after which write knows it", tools.write(dir .. "stale.txt", "x"), ("wrote 1 bytes to %sstale.txt"):format(dir))
+tools.read(dir .. "stale.txt")
+host.sleep(0.01)
+host.write(dir .. "stale.txt", "changed behind another name\n")
+raises("the same file by another spelling of its path is the same file", "has changed since you last read or wrote it", tools.write, dir .. ".//stale.txt", "x")
+host.sh({ "ln", "-s", "stale.txt", dir .. "link.txt" })
+tools.read(dir .. "link.txt")
+host.sleep(0.01)
+host.write(dir .. "stale.txt", "changed behind the link\n")
+raises("and so is a link to it", "has changed since you last read or wrote it", tools.write, dir .. "link.txt", "x")
+check("which is left as it was", host.read(dir .. "stale.txt"), "changed behind the link\n")
+host.sh({ "mkdir", "-p", dir .. "far/inner" })
+host.sh({ "ln", "-s", "far/inner", dir .. "into" })
+host.write(dir .. "far/twin.txt", "the far one\n")
+host.write(dir .. "twin.txt", "the near one\n")
+tools.read(dir .. "twin.txt")
+host.sleep(0.01)
+tools.read(dir .. "into/../twin.txt")
+check("a path that goes up out of a linked directory is the file there, not its namesake here",
+	tools.write(dir .. "twin.txt", "near, rewritten\n"):match("^wrote") ~= nil, true)
+host.sleep(0.01)
+host.write(dir .. "far/twin.txt", "the far one, changed\n")
+raises("and a change to the file there is seen", "has changed since you last read or wrote it", tools.write, dir .. "into/../twin.txt", "x")
+host.write(dir .. "unread.txt", "never read here")
+check("a file never read is overwritten when nobody shares the directory", tools.write(dir .. "unread.txt", "x"), ("wrote 1 bytes to %sunread.txt"):format(dir))
+
+local png = "\137PNG\r\n\26\n" .. string.rep("\0", 20)
+host.write(dir .. "shot.png", png)
+host.write(dir .. "anim.webp", "RIFF\4\0\0\0WEBPVP8 ")
+local shown, failed, images = loop.tools[1].run({ code = ("print(see(%q)) return see(%q)"):format(dir .. "shot.png", dir .. "anim.webp") })
+check("see says what it shows", shown, ("[image 1 of this result: %sshot.png, image/png, 28 bytes]\n[image 2 of this result: %sanim.webp, image/webp, 16 bytes]"):format(dir, dir))
+check("which is no failure", failed, false)
+check("the images come with the result", #images, 2)
+check("as blocks the model can look at", json.encode(images[1]),
+	json.encode({ type = "image", source = { type = "base64", media_type = "image/png", data = loop.ext("bytes").base64(png) } }))
+check("each of its kind", images[2].source.media_type, "image/webp")
+check("a call that looks at nothing has none", select(3, loop.tools[1].run({ code = "return 1" })), nil)
+host.write(dir .. "not.png", "text")
+has("a file that is no image", lua(("return see(%q)"):format(dir .. "not.png")), "not.png is not a PNG, JPEG, GIF or WebP image")
+raises("see outside a call's result", "this is not one", tools.see, dir .. "shot.png")
+loop.image_bytes = 10
+has("an image too large to send", lua(("return see(%q)"):format(dir .. "shot.png")), "is 28 bytes, 40 as base64, and an image may be 10 at most")
+loop.image_bytes = 40
+check("the limit is on what is sent", lua(("return see(%q)"):format(dir .. "shot.png")):find("image 1 of this result", 1, true) ~= nil, true)
+loop.image_bytes = 5 * 1024 * 1024
+loop.call_image_bytes = 60
+has("more image bytes than one call sends", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "may be 60 bytes as base64 at most")
+loop.call_image_bytes = 20 * 1024 * 1024
+loop.images_per_call = 1
+has("more images than one call shows", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "one call shows 1 images at most")
+loop.images_per_call = 8
+loop.vision = false
+has("a model that takes no images", lua(("return see(%q)"):format(dir .. "shot.png")), "this session's model takes no images")
+loop.vision = true
 
 tools.write(dir .. "e.txt", "alpha beta\nalpha gamma\n")
 check("edit", tools.edit(dir .. "e.txt", "beta", "BETA"), ("replaced 1 occurrence in %se.txt"):format(dir))
@@ -206,7 +274,17 @@ check("a project function is there at once", lua("return twice(21)"), "42")
 check("and the model reads about it", loop.tools[1].description():find("- twice(n) -> number", 1, true) ~= nil, true)
 table.remove(loop.functions)
 local description = loop.tools[1].description()
-for _, name in { "bash(command, timeout?)", "read(path, offset?, limit?)", "write(path, content)", "edit(path, old, new, all?)", "ext(name)", "[==[" } do
+lua("survivor_b = { 1 } survivor_a = 'x' local gone = 2")
+has("after a compaction the model is told which globals are still set", loop.resume_text(), "are still set: ")
+has("by name, in order", loop.resume_text(), "survivor_a, survivor_b")
+lacks("a local is not one", loop.resume_text(), "gone")
+loop.globals_listed = 1
+lacks("a long list is cut", loop.resume_text(), "survivor_")
+has("and says how many it left out", loop.resume_text(), " more. The checkpoint")
+loop.globals_listed = 40
+lua("survivor_a, survivor_b = nil, nil")
+
+for _, name in { "bash(command, timeout?)", "read(path, offset?, limit?)", "write(path, content)", "edit(path, old, new, all?)", "see(path)", "ext(name)", "[==[" } do
 	check("the tool describes " .. name, description:find(name, 1, true) ~= nil, true)
 end
 check("the description is the same each time, for the cache", loop.tools[1].description(), description)

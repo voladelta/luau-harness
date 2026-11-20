@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -147,8 +148,17 @@ int Host::spawn(lua_State* L) {
     }
     fcntl(reader.get(), F_SETFL, O_NONBLOCK);
     const int id = ++host.spawn_count_;
-    host.spawned_.push_back({.id = id, .result = std::move(reader), .data = {}, .ended = false});
+    host.spawned_.push_back({.id = id, .pid = pid, .result = std::move(reader), .data = {}, .ended = false});
     lua_pushinteger(L, id);
+    return 1;
+}
+
+int Host::stop(lua_State* L) {
+    Host& host = of(L);
+    const int id = luaL_checkinteger(L, 1);
+    const auto child = std::ranges::find(host.spawned_, id, &Spawned::id);
+    const bool asked = child != host.spawned_.end() && !child->ended && kill(child->pid, SIGTERM) == 0;
+    lua_pushboolean(L, asked ? 1 : 0);
     return 1;
 }
 

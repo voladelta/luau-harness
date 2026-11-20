@@ -21,21 +21,24 @@ prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the p
 An extension whose name starts with `_` is a helper for other extensions: `ext()` loads it like any other, and
 the system prompt does not list it.
 
-## Built in: bytes, text, path, http, web, ocr and exa
+An extension that needs a service with a key gets it through an endpoint the user names at startup, so the key
+never reaches Luau: `hx --endpoint tickets=https://tickets.example/api/search` with `TICKETS_API_KEY` set lets
+`.hx/ext/tickets.luau` call `host.post("tickets", json.encode({ query = q }))`. The built-in `web`, `ocr` and
+`exa` extensions are written the same way, over endpoints hx has from the start.
 
-Seven extensions come with hx, in `lua/ext/`. `bytes`, `text`, `path` and `http` need no key and are always
-listed. `bytes` does in Luau what a model would otherwise reach for Python's standard library to do with binary
+## Built in: bytes, text, path, search, http, web, ocr and exa
+
+Eight extensions come with hx, in `lua/ext/`. `bytes`, `text`, `path`, `search` and `http` need no key and are
+always listed. `bytes` does in Luau what a model would otherwise reach for Python's standard library to do with binary
 data:
 
 | Call | Returns |
 |---|---|
 | `ext("bytes").hex(data)`, `.unhex(text)` | lower-case hex; and back, taking upper case, a `0x` and spaces |
 | `ext("bytes").base64(data)`, `.unbase64(text)` | standard base64 with padding; and back, taking the URL-safe alphabet, missing padding and line breaks |
-| `ext("bytes").base58(data)`, `.unbase58(text)` | base58 in the Bitcoin alphabet, which Solana addresses use, each leading zero byte a `1`; and back |
 | `ext("bytes").sha256(data)` | the 32-byte digest, raw: `hex(sha256(data))` reads as `sha256sum` prints it |
 | `ext("bytes").sha512(data)`, `.sha1(data)`, `.md5(data)` | the 64-, 20- and 16-byte digests, raw, as `sha512sum`, `sha1sum` and `md5sum` print them in hex |
 | `ext("bytes").hmac(algo, key, data)` | the HMAC of `data` under `key`, raw, with `algo` one of `"sha256"`, `"sha512"`, `"sha1"` and `"md5"` |
-| `ext("bytes").uint(data, at?, width?)`, `.int(...)` | the little-endian integer of `width` bytes from byte `at` (default all of `data` from byte 1), unsigned or two's complement, as exact decimal text of any width: `tonumber` makes it a number when 2^53 is enough, and `bc` computes with it exactly |
 
 `text` and `path` are string work that Luau's patterns make easy to get wrong:
 
@@ -47,6 +50,14 @@ data:
 | `ext("text").lines(s)` | the lines of `s`, each without its `\n` or `\r\n`; a final line break adds no empty line |
 | `ext("path").join(a, ...)`, `.dirname(p)`, `.basename(p)`, `.ext(p)`, `.normalize(p)` | as Python's `posixpath` has `join`, `dirname`, `basename`, the extension of `splitext` (`".gz"` of `a.tar.gz`, `""` of `.bashrc`) and `normpath` |
 | `ext("path").relative(p, from?)` | `p` relative to `from`, by default the working directory, as `posixpath.relpath`; the file system is not read |
+
+`search` finds files and text in the project and returns them as data, so that a search needs no shell quoting and
+no parsing of a command's output:
+
+| Call | Returns |
+|---|---|
+| `ext("search").files(glob?, dir?)` | the files under `dir`, by default the project, sorted: what git lists there, tracked or new and not ignored, without those deleted from the working tree. Outside a git repository, every file `host.walk` finds. `glob` is as `"**/*.luau"` |
+| `ext("search").grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit=1000})` | the matching lines, `{path, line, text}`, by path and line; printed or returned from `lua`, the list shows as `path:line: text` lines. `pattern` is a regex, or literal text with `fixed = true`. It runs ripgrep, which skips what `.gitignore` names and searches hidden directories other than `.git`; without ripgrep it runs `grep -E` over what `files` lists, so `.gitignore` holds there too; a `glob` with no `/` matches at any depth, as in ripgrep. A file it cannot read is passed over: the matches elsewhere still come back. A text longer than 500 bytes is cut; past `limit` matches the list has `more = true` and says so when shown |
 
 `http` makes a request with curl and returns it as data:
 

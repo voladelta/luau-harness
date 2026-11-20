@@ -50,6 +50,7 @@ struct HostConfig {
     std::vector<Rule> system_rules;
     UniqueFd judge;
     std::string workflow;
+    std::string resume;
 };
 
 class Host {
@@ -77,6 +78,7 @@ class Host {
     static int judge(lua_State* L);
     static int spawn(lua_State* L);
     static int wait(lua_State* L);
+    static int stop(lua_State* L);
     [[noreturn]] void run_child(lua_State* L, int result_fd) noexcept;
 
     [[nodiscard]] double within_limit(double seconds) const;
@@ -90,6 +92,7 @@ class Host {
 
     struct Spawned {
         int id = 0;
+        pid_t pid = 0;
         UniqueFd result;
         std::string data;
         bool ended = false;

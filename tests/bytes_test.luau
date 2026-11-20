@@ -32,35 +32,10 @@ check("unbase64 takes the URL alphabet", bytes.unbase64("-_8"), bytes.unbase64("
 raises("a character that is not base64", '"*" at 3 is not base64', bytes.unbase64, "YW*j")
 raises("one symbol left over", "cut short", bytes.unbase64, "YWJjZ")
 
-check("base58", bytes.base58("hello world"), "StV1DL6CwTryKyV")
-check("leading zero bytes are 1s", bytes.base58("\0\0\x28\x7f\xb4\xcd"), "11233QC4")
-check("a key of zeros", bytes.base58(string.rep("\0", 32)), string.rep("1", 32))
-local wsol = "So11111111111111111111111111111111111111112"
-check("a Solana address decodes to 32 bytes", #bytes.unbase58(wsol), 32)
-check("which are these", bytes.hex(bytes.unbase58(wsol)), "069b8857feab8184fb687f634618c035dac439dc1aeb3b5598a0f00000000001")
-check("and back", bytes.base58(bytes.unbase58(wsol)), wsol)
-check("every byte and back", bytes.unbase58(bytes.base58(every)), every)
-local wide = string.rep("\1", 8200)
-check("base58 handles inputs larger than the call stack", bytes.unbase58(bytes.base58(wide)), wide)
-check("nothing", bytes.base58(""), "")
-raises("a 0 is not base58", '"0" at 2 is not base58', bytes.unbase58, "10")
-
 check("sha256 of nothing", bytes.hex(bytes.sha256("")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 check("sha256 of abc", bytes.hex(bytes.sha256("abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
 check("sha256 of several blocks", bytes.hex(bytes.sha256(string.rep("a", 1000))), "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3")
 check("sha256 against the system's", bytes.hex(bytes.sha256(every)), host.sh({ "sha256sum" }, { input = every }).out:match("^%x+"))
-
-check("a u128 past 2^53, exactly", bytes.uint(string.rep("\255", 16)), "340282366920938463463374607431768211455")
-check("little-endian, from an offset", bytes.uint("xx" .. every:sub(2, 17) .. "yy", 3, 16), "21345817372864405881847059188222722561")
-check("a u64 at its offset", bytes.uint("\0\1\0\0\0\0\0\0\0", 2, 8), "1")
-check("zero", bytes.uint("\0\0\0\0"), "0")
-check("an i64 of -2", bytes.int("\254" .. string.rep("\255", 7)), "-2")
-check("the least i8", bytes.int("\128"), "-128")
-check("a positive int", bytes.int("\127"), "127")
-check("an i32 inside a record", bytes.int("ab\255\255\255\255cd", 3, 4), "-1")
-raises("a field past the end", "bytes 5 to 12 are not inside the 8 bytes given", bytes.uint, "12345678", 5, 8)
-raises("a width of no bytes", "not inside", bytes.uint, "12", 1, 0)
-raises("data that is not text", "bytes.uint: argument 1 (data) must be a string, not nil", bytes.uint)
 
 local function sums(algo: string, data: string): string
 	local file = host.env("TMPDIR") .. "/bytes-sum"

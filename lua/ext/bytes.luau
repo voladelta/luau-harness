@@ -1,4 +1,4 @@
--- binary data as text and numbers: hex, unhex, base64, unbase64, base58, unbase58, sha256(data) -> 32 bytes, sha512, sha1, md5, hmac(algo, key, data) with algo "sha256", "sha512", "sha1" or "md5", uint(data, at?, width?) and int(...) -> exact decimal text of a little-endian integer
+-- binary data as text: hex, unhex, base64, unbase64, sha256(data) -> 32 bytes, sha512, sha1, md5, hmac(algo, key, data) with algo "sha256", "sha512", "sha1" or "md5"
 --!strict
 
 local M = {}
@@ -8,28 +8,6 @@ local function check(fname: string, value: unknown, position: number, name: stri
 		return
 	end
 	error(("bytes.%s: argument %d (%s) must be a %s, not %s"):format(fname, position, name, kind, type(value)), 0)
-end
-
-local function convert(digits: { number }, from: number, to: number): { number }
-	local out = { 0 }
-	for _, digit in digits do
-		local carry = digit
-		for i = 1, #out do
-			carry += out[i] * from
-			out[i] = carry % to
-			carry //= to
-		end
-		while carry > 0 do
-			table.insert(out, carry % to)
-			carry //= to
-		end
-	end
-	return out
-end
-
-local function leading(text: string, char: string): number
-	local run = text:match("^" .. char .. "*")
-	return run and #run or 0
 end
 
 function M.hex(data: string): string
@@ -95,48 +73,6 @@ function M.unbase64(text: string): string
 		table.insert(out, whole:sub(1, #group - 1))
 	end
 	return table.concat(out)
-end
-
-local alphabet58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-local value58: { [string]: number } = {}
-for i = 1, 58 do
-	value58[alphabet58:sub(i, i)] = i - 1
-end
-
-function M.base58(data: string): string
-	check("base58", data, 1, "data", "string")
-	local zeros = leading(data, "\0")
-	local input: { number } = {}
-	for i = zeros + 1, #data do
-		input[i - zeros] = string.byte(data, i)
-	end
-	local digits = convert(input, 256, 58)
-	local out = {}
-	for i = #digits, 1, -1 do
-		table.insert(out, alphabet58:sub(digits[i] + 1, digits[i] + 1))
-	end
-	local body = if zeros == #data then "" else table.concat(out)
-	return string.rep("1", zeros) .. body
-end
-
-function M.unbase58(text: string): string
-	check("unbase58", text, 1, "text", "string")
-	local ones = leading(text, "1")
-	local digits = {}
-	for i = ones + 1, #text do
-		local value = value58[text:sub(i, i)]
-		if not value then
-			error(("bytes.unbase58: %q at %d is not base58"):format(text:sub(i, i), i), 0)
-		end
-		table.insert(digits, value)
-	end
-	local limbs = convert(digits, 58, 256)
-	local out = {}
-	for i = #limbs, 1, -1 do
-		table.insert(out, string.char(limbs[i]))
-	end
-	local body = if ones == #text then "" else table.concat(out)
-	return string.rep("\0", ones) .. body
 end
 
 local K = {
@@ -407,48 +343,6 @@ function M.hmac(algo: string, key: string, data: string): string
 		return string.char(bit32.bxor(c:byte(), 0x5c))
 	end)
 	return chosen.hash(outer .. chosen.hash(inner .. data))
-end
-
-local function field(fname: string, data: string, at: number?, width: number?): { number }
-	check(fname, data, 1, "data", "string")
-	check(fname, at, 2, "at", "number", true)
-	check(fname, width, 3, "width", "number", true)
-	local first = at or 1
-	local size = width or #data - first + 1
-	if first < 1 or size < 1 or first % 1 ~= 0 or size % 1 ~= 0 or first + size - 1 > #data then
-		error(("bytes.%s: bytes %d to %d are not inside the %d bytes given"):format(fname, first, first + size - 1, #data), 0)
-	end
-	local big = {}
-	for i = first + size - 1, first, -1 do
-		table.insert(big, (data:byte(i)))
-	end
-	return big
-end
-
-local function decimal(big: { number }): string
-	local limbs = convert(big, 256, 1e7)
-	local out = { tostring(limbs[#limbs]) }
-	for i = #limbs - 1, 1, -1 do
-		table.insert(out, ("%07d"):format(limbs[i]))
-	end
-	return table.concat(out)
-end
-
-function M.uint(data: string, at: number?, width: number?): string
-	return decimal(field("uint", data, at, width))
-end
-
-function M.int(data: string, at: number?, width: number?): string
-	local big = field("int", data, at, width)
-	if big[1] < 128 then
-		return decimal(big)
-	end
-	local carry = 1
-	for i = #big, 1, -1 do
-		local v = 255 - big[i] + carry
-		big[i], carry = v % 256, v // 256
-	end
-	return "-" .. decimal(big)
 end
 
 return M

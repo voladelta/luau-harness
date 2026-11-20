@@ -169,29 +169,35 @@ struct Place {
     char** environment = nullptr;
 };
 
-[[noreturn]] void exec_bash(const char* command, int stdin_fd, int output, const Wall* wall, Place place) {
+struct Streams {
+    int in = -1;
+    int out = -1;
+    int err = -1;
+};
+
+[[noreturn]] void exec_bash(const char* command, Streams streams, const Wall* wall, Place place) {
     setsid();
     if (wall != nullptr && !wall->enter()) {
         constexpr std::string_view message = "hx: cannot put up the command's wall\n";
-        if (write(output, message.data(), message.size()) < 0) {
+        if (write(streams.err, message.data(), message.size()) < 0) {
         }
         _exit(126);
     }
     if (place.cwd != nullptr && chdir(place.cwd) != 0) {
         constexpr std::string_view message = "hx: cannot enter the command's cwd\n";
-        if (write(output, message.data(), message.size()) < 0) {
+        if (write(streams.err, message.data(), message.size()) < 0) {
         }
         _exit(126);
     }
     if (place.environment != nullptr) {
         environ = place.environment;
     }
-    const int in = stdin_fd >= 0 ? stdin_fd : open("/dev/null", O_RDONLY);
+    const int in = streams.in >= 0 ? streams.in : open("/dev/null", O_RDONLY);
     if (in > STDIN_FILENO) {
         dup2(in, STDIN_FILENO);
     }
-    dup2(output, STDOUT_FILENO);
-    dup2(output, STDERR_FILENO);
+    dup2(streams.out, STDOUT_FILENO);
+    dup2(streams.err, STDERR_FILENO);
     static_cast<void>(cloexec_above_stderr());
     for (const int sig : {SIGINT, SIGTERM, SIGHUP, SIGPIPE}) {
         static_cast<void>(std::signal(sig, SIG_DFL));
@@ -203,9 +209,15 @@ struct Place {
     _exit(127);
 }
 
+struct Wiring {
+    bool input = false;
+    bool split = false;
+};
+
 struct Child {
     pid_t pid;
     UniqueFd output;
+    UniqueFd errors;
     UniqueFd input;
     double started;
 };
@@ -218,18 +230,30 @@ std::pair<UniqueFd, UniqueFd> make_pipe(lua_State* L) {
     return {UniqueFd(fds[0]), UniqueFd(fds[1])};
 }
 
-Child start(lua_State* L, const char* command, bool with_input, const std::optional<Wall>& wall, Place place) {
+Child start(lua_State* L, const char* command, Wiring wiring, const std::optional<Wall>& wall, Place place) {
     auto [output, output_end] = make_pipe(L);
-    auto [input_end, input] = with_input ? make_pipe(L) : std::pair<UniqueFd, UniqueFd>{};
+    auto [errors, errors_end] = wiring.split ? make_pipe(L) : std::pair<UniqueFd, UniqueFd>{};
+    auto [input_end, input] = wiring.input ? make_pipe(L) : std::pair<UniqueFd, UniqueFd>{};
     const double started = now();
     const pid_t pid = fork();
     if (pid < 0) {
         luaL_error(L, "fork: %s", error_text().c_str());
     }
     if (pid == 0) {
-        exec_bash(command, input_end.get(), output_end.get(), wall ? &*wall : nullptr, place);
+        const Streams streams{
+            .in = input_end.get(),
+            .out = output_end.get(),
+            .err = wiring.split ? errors_end.get() : output_end.get(),
+        };
+        exec_bash(command, streams, wall ? &*wall : nullptr, place);
     }
-    return {.pid = pid, .output = std::move(output), .input = std::move(input), .started = started};
+    return {
+        .pid = pid,
+        .output = std::move(output),
+        .errors = std::move(errors),
+        .input = std::move(input),
+        .started = started,
+    };
 }
 
 std::string quote(std::string_view word) {
@@ -264,7 +288,20 @@ std::string command_of(lua_State* L) {
     return command;
 }
 
-Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, double timeout) {
+struct Pipes {
+    Output& output;
+    Output* errors;
+    Input& input;
+
+    void drain() const {
+        output.drain();
+        if (errors != nullptr) {
+            errors->drain();
+        }
+    }
+};
+
+Outcome wait_for_command(pid_t pid, Pipes pipes, bool hangup, double timeout) {
     const UniqueFd exited(static_cast<int>(syscall(SYS_pidfd_open, pid, 0)));
     const int hangup_fd = hangup ? STDIN_FILENO : -1;
     const double deadline = now() + timeout;
@@ -277,7 +314,7 @@ Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, d
         return outcome;
     };
     for (;;) {
-        output.drain();
+        pipes.drain();
         if (waitpid(pid, &outcome.status, WNOHANG) == pid) {
             outcome.ended = now();
             return outcome;
@@ -285,11 +322,15 @@ Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, d
         if (g_signal != 0 || now() >= deadline) {
             return give_up(g_signal != 0 ? Ending::Signaled : Ending::TimedOut);
         }
-        std::array<pollfd, 4> waiters{
+        const auto readable = [](const Output* stream) {
+            return stream == nullptr || stream->at_end() ? -1 : stream->fd();
+        };
+        std::array<pollfd, 5> waiters{
             pollfd{.fd = exited.get(), .events = POLLIN, .revents = 0},
             pollfd{.fd = hangup_fd, .events = POLLRDHUP, .revents = 0},
-            pollfd{.fd = output.at_end() ? -1 : output.fd(), .events = POLLIN, .revents = 0},
-            pollfd{.fd = input.fd(), .events = POLLOUT, .revents = 0},
+            pollfd{.fd = readable(&pipes.output), .events = POLLIN, .revents = 0},
+            pollfd{.fd = pipes.input.fd(), .events = POLLOUT, .revents = 0},
+            pollfd{.fd = readable(pipes.errors), .events = POLLIN, .revents = 0},
         };
         const double left = std::max(deadline - now(), 0.0);
         wait_for(waiters, exited.valid() ? left : std::min(left, kNoPidfdPoll));
@@ -297,7 +338,7 @@ Outcome wait_for_command(pid_t pid, Output& output, Input& input, bool hangup, d
             return give_up(Ending::HungUp);
         }
         if (waiters[3].revents != 0) {
-            input.feed();
+            pipes.input.feed();
         }
     }
 }
@@ -381,13 +422,22 @@ bool hung_up() {
     return poll(&already, 1, 0) > 0 && (already.revents & (POLLRDHUP | POLLHUP)) != 0;
 }
 
-void push_result(lua_State* L, const Captured& output, const Outcome& outcome, double seconds) {
-    lua_createtable(L, 0, 6);
+void push_result(lua_State* L, const Captured& output, const std::optional<Captured>& errors, const Outcome& outcome,
+                 double seconds) {
+    lua_createtable(L, 0, 8);
     lua_pushlstring(L, output.text.data(), output.text.size());
     lua_setfield(L, -2, "out");
     if (output.omitted > 0) {
         lua_pushnumber(L, static_cast<double>(output.omitted));
         lua_setfield(L, -2, "omitted");
+    }
+    if (errors) {
+        lua_pushlstring(L, errors->text.data(), errors->text.size());
+        lua_setfield(L, -2, "err");
+        if (errors->omitted > 0) {
+            lua_pushnumber(L, static_cast<double>(errors->omitted));
+            lua_setfield(L, -2, "err_omitted");
+        }
     }
     if (!outcome.reaped) {
         lua_pushnumber(L, SIGKILL);
@@ -413,6 +463,7 @@ int Host::sh(lua_State* L) {
     const double timeout = host.within_limit(option(L, 2, "timeout", 120));
     const std::optional<Wall> wall = host.narrower_wall(L, 2);
     bool on_hangup = false;
+    bool split = false;
     std::optional<std::string_view> data;
     std::optional<std::string> cwd;
     std::vector<std::string> entries;
@@ -421,6 +472,9 @@ int Host::sh(lua_State* L) {
         entries = environment_of(L, 2);
         lua_getfield(L, 2, "hangup");
         on_hangup = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "split");
+        split = lua_toboolean(L, -1) != 0;
         lua_pop(L, 1);
         lua_getfield(L, 2, "input");
         if (!lua_isnil(L, -1)) {
@@ -450,21 +504,27 @@ int Host::sh(lua_State* L) {
         .cwd = cwd ? cwd->c_str() : nullptr,
         .environment = entries.empty() ? nullptr : environment.data(),
     };
-    Child child = start(L, command.c_str(), data.has_value(), wall, place);
+    Child child = start(L, command.c_str(), {.input = data.has_value(), .split = split}, wall, place);
     Output output(std::move(child.output));
+    std::optional<Output> errors;
+    if (split) {
+        errors.emplace(std::move(child.errors));
+    }
     Input input(std::move(child.input), data.value_or(std::string_view{}));
-    const Outcome outcome = wait_for_command(child.pid, output, input, on_hangup, timeout);
+    const Pipes pipes{.output = output, .errors = errors ? &*errors : nullptr, .input = input};
+    const Outcome outcome = wait_for_command(child.pid, pipes, on_hangup, timeout);
     if (wall) {
         kill_descendants(before);
     }
-    output.drain();
+    pipes.drain();
     if (outcome.ending == Ending::Signaled) {
         raise_if_signaled(L);
     }
     if (outcome.ending == Ending::HungUp) {
         raise_error(L, "hung up");
     }
-    push_result(L, output.result(), outcome, outcome.ended - child.started);
+    push_result(L, output.result(), errors ? std::optional<Captured>(errors->result()) : std::nullopt, outcome,
+                outcome.ended - child.started);
     return 1;
 }
 

@@ -10,11 +10,12 @@ call to the next. The code acts through these functions:
 
 | Function | Does |
 |---|---|
-| `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout. The status line is for reading: output used as data comes from `host.sh(command).out`, and the usage asks for it to be parsed in Luau rather than in a python or jq pipeline |
+| `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout. The status line is for reading: output used as data comes from `host.sh`, whose line in the tool's description offers `split = true` to keep stderr out of it and asks for it to be parsed in Luau rather than in a python or jq pipeline |
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
-| `write(path, content)` | creates or overwrites a file |
+| `write(path, content)` | creates or overwrites a file. It refuses one that changed since the conversation last read or wrote it, and says to read it again (see [Agents](agents.md)) |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
-| `skill(name)` | a skill's instructions, by name; for a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
+| `see(path)` | puts a PNG, JPEG, GIF or WebP file into the call's result as an image block, after the text, for a model that takes images: at most `M.image_bytes` (5 MiB, as base64) each, `M.images_per_call` (8) and `M.call_image_bytes` (20 MiB, as base64) a call. `M.vision = false` turns it away for a model that takes none |
+| `skill(name?)` | a skill's instructions, by name; with no name, or a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
 | `ext(name)` | an extension's table of functions |
 | `agents(tasks)` | gives each task to an agent, all at work at the same time, and returns their reports (see [Agents](agents.md)) |
 
@@ -137,7 +138,8 @@ refusal is logged with its category.
 Compaction on these models is the API's on-demand kind: the loop sends the conversation as it stands, with the same
 system prompt, tools, thinking and effort, plus `compaction` with `M.compact_prompt` as its `instructions`. The
 signed `compaction` block that comes back replaces every message it summarized; it goes first in the next request,
-exactly as it came, followed by `M.resume_prompt`. If no block comes back, the conversation is kept and compacted
+exactly as it came, followed by `M.resume_prompt` and, when the model's code has set globals, their names
+(`M.resume_text`): they outlast the compaction, and the checkpoint may not say so. If no block comes back, the conversation is kept and compacted
 after a later reply. Any other model, DeepSeek's included, is asked for the summary as an ordinary reply.
 
 Prompt caching follows each provider's docs. Every model gets a prefix that only grows: the system prompt is built
@@ -151,7 +153,7 @@ would not say what the run cost.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON, after every reply that
 called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. Whether
-the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. A
+the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. `hx --resume LOG TASK` starts a session from such a file's messages, and `--resume last` from the newest one that is not an agent's: a call the old session never answered is answered as abandoned, the system prompt is the new session's, and the new session saves to a log of its own. A
 sub-agent's conversation, one whose turn runs inside another turn, is saved the same way beside the session's,
 under the session's name with `-sub-1`, `-sub-2` and so on; so is each agent's, in the order the agents were
 first given a task. The logs hold file contents, so that directory

@@ -424,6 +424,7 @@ void Host::open(lua_State* L) {
         {.name = "clip", .func = l_clip},
         {.name = "spawn", .func = spawn},
         {.name = "wait", .func = wait},
+        {.name = "stop", .func = stop},
         {.name = "stat", .func = l_stat},
         {.name = "walk", .func = l_walk},
         {.name = "printable", .func = l_printable},
@@ -463,6 +464,10 @@ void Host::open(lua_State* L) {
     if (!config_.workflow.empty()) {
         lua_pushlstring(L, config_.workflow.data(), config_.workflow.size());
         lua_setfield(L, -2, "workflow");
+    }
+    if (!config_.resume.empty()) {
+        lua_pushlstring(L, config_.resume.data(), config_.resume.size());
+        lua_setfield(L, -2, "resume");
     }
     for (const auto& [field, texts] :
          {std::pair{"extensions", &config_.extensions}, std::pair{"skills", &config_.skills}}) {

@@ -7,6 +7,7 @@ Each test gets a fresh project directory and a fresh fake home, and scripts the 
 checks need a kernel with Landlock. Tests run side by side, HX_TEST_JOBS at a time (default twice the CPUs).
 """
 
+import base64
 import http.server
 import json
 import os
@@ -241,6 +242,39 @@ class AgentTest(unittest.TestCase):
                         seen.add(block["tool_use_id"])
                         out.append(block["content"])
         return out
+
+    def test_see_sends_an_image_with_the_result(self):
+        png = b"\x89PNG\r\n\x1a\n" + bytes(12)
+        with open(os.path.join(self.project, "shot.png"), "wb") as f:
+            f.write(png)
+        done = self.run_hx("look", script=[call("lua", {"code": "return see('shot.png')"}), say("A blank image.")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = self.model.requests[1]["messages"][2]["content"][0]
+        self.assertEqual(result["content"], [
+            {"type": "text", "text": "[image 1 of this result: shot.png, image/png, 20 bytes]"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": base64.b64encode(png).decode()}},
+        ])
+
+    def test_resume_goes_on_from_a_saved_conversation(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        first = self.run_hx("make a file", script=[call("bash", {"command": "echo made"}), say("All done.")])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        saved = self.model.requests[-1]["messages"]
+        self.model.requests.clear()
+        done = self.run_hx("--resume", "last", "and now?", script=[say("Still done.")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "Still done.\n")
+        self.assertIn("going on from .hx/log/", done.stderr)
+        asked = self.model.requests[0]["messages"]
+        self.assertEqual(asked[:len(saved)], saved)
+        self.assertEqual(asked[len(saved):], [
+            {"role": "assistant", "content": [{"type": "text", "text": "All done."}]},
+            {"role": "user", "content": "and now?"},
+        ])
+        missing = self.run_hx("--resume", "nowhere.json", "go on")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("nowhere.json", missing.stderr)
 
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
@@ -515,7 +549,7 @@ class AgentTest(unittest.TestCase):
             call("bash", {"command": "env"}, "c2"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\na\.txt is made$")
+        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-1\.json\]\na\.txt is made$")
         self.assertEqual([r["model"] for r in anthropic.requests], ["claude-haiku-5-5"])
         self.assertEqual(anthropic.headers[0]["x-api-key"], claude_key)
         self.assertEqual(anthropic.headers[0]["anthropic-version"], "2026-10-21")
@@ -543,8 +577,10 @@ class AgentTest(unittest.TestCase):
         done = self.run_hx("--model", "opus", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY="ds-key-1",
                            script=[call("lua", {"code": tasks}, "c1"), say("both are made")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\na\.txt is made\n\n"
-                         r"\[agent b: done in \d+ s\]\nb\.txt is made$")
+        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-1\.json\]\na\.txt is made\n\n"
+                         r"\[agent b: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-2\.json\]\nb\.txt is made$")
+        named = re.search(r"its conversation: (\S+)\]", self.tool_results()[0]).group(1)
+        self.assertIn("a.txt", read(self.project, named))
         self.assertEqual((read(self.project, "a.txt"), read(self.project, "b.txt")), ("a\n", "b\n"))
         self.assertEqual([len(r["messages"]) for r in deepseek.requests], [1, 1, 3, 3])
         for sent, headers in zip(deepseek.requests, deepseek.headers):
@@ -609,7 +645,7 @@ class AgentTest(unittest.TestCase):
                          "Your agents are still at work: slow. What they are doing ends half done when this session "
                          "does. Wait for their reports with agents(), check the work, then finish. If you mean to "
                          "stop without them, say so in your answer."})
-        self.assertRegex(report, r"^\[agent slow: done in \d+ s\]\nlate\.txt is made$")
+        self.assertRegex(report, r"^\[agent slow: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-1\.json\]\nlate\.txt is made$")
         self.assertEqual(read(self.project, "late.txt"), "late\n")
         self.assertEqual(done.stdout, "All done.\nNow it is.\n")
         self.model.requests.clear()
@@ -1724,6 +1760,42 @@ class AgentTest(unittest.TestCase):
         system = self.model.requests[0]["system"]
         self.assertIn("- exa (built in): researches a question", system)
         self.assertNotIn("- web (built in)", system)
+
+    def test_an_endpoint_named_at_startup_is_reached_with_its_own_key(self):
+        tools = Tools()
+        self.addCleanup(tools.server_close)
+        self.addCleanup(tools.shutdown)
+        key = "my-api-key-31"
+        done = self.run_hx("--endpoint", "my-api=" + tools.url + "/fetch", "--endpoint", "bare=" + tools.url + "/search",
+                           "go", MY_API_API_KEY=key, script=[
+                               call("lua", {"code": "return host.post('my-api', '{\"url\":\"u\"}')"}, "c1"),
+                               call("lua", {"code": "return host.post('bare', '{}')"}, "c2"),
+                               call("lua", {"code": "return host.endpoints['my-api'], host.endpoints.bare"}, "c3"),
+                               call("bash", {"command": "env"}, "c4"),
+                               say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        results = self.tool_results()
+        self.assertIn("200\n", results[0])
+        self.assertIn("A small fast language.", results[0])
+        self.assertEqual([r["path"] for r in tools.requests], ["/v1/tools/fetch"])
+        self.assertEqual(tools.requests[0]["headers"]["authorization"], "Bearer " + key)
+        self.assertEqual(tools.requests[0]["body"], b'{"url":"u"}')
+        self.assertIn("no BARE_API_KEY", results[1])
+        self.assertEqual(results[2], "true\nfalse")
+        self.assertNotIn(key, results[3])
+        self.assertNotIn(key, json.dumps(self.model.requests))
+        for pair, said in (("exa=https://x.test", "there is an endpoint named exa already"),
+                           ("session=https://x.test", "there is an endpoint named session already"),
+                           ("My=https://x.test", "a name is up to 40 lower-case letters"),
+                           ("mine", "it takes NAME=URL"),
+                           ("mine=ftp://x.test", "the URL starts with https:// or http://")):
+            refused = self.run_hx("--endpoint", pair, "go")
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assertIn(said, refused.stderr)
+        twice = self.run_hx("--endpoint", "mine=https://x.test", "--endpoint", "mine=https://y.test", "go")
+        self.assertIn("there is an endpoint named mine already", twice.stderr)
+        self.assertIn("--resume goes on with the agent's conversation",
+                      self.run_hx("--resume", "last", "--run", "x.luau").stderr)
 
     def test_without_a_deepseek_key_the_tools_say_so(self):
         done = self.run_hx("go", script=[

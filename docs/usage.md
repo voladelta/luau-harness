@@ -25,6 +25,8 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 | `--rpi` | lead the task by the rpi workflow (see [Agents](agents.md)): the model is `opus` unless `--model` names another, whatever `HX_MODEL` says |
 | `--ro PATH` | also allow reading `PATH` |
 | `--rw PATH` | also allow writing `PATH` |
+| `--resume LOG` | go on from a conversation saved in `.hx/log/`: `LOG` is the file, by its name there or its path, or `last` for the newest that is not an agent's (see [The loop](loop.md)) |
+| `--endpoint NAME=URL` | one more endpoint for `host.post(NAME, body)`, for an extension of your own. Its key is read from `NAME_API_KEY`, upper-cased with `-` as `_` (`my-api` has `MY_API_API_KEY`), taken out of the environment like the other keys and sent as a Bearer token to that URL only. May be given more than once |
 | `--keep-env NAME` | keep a secret-looking variable in the environment of commands |
 | `--unix-sockets` | before Landlock ABI 9, let commands create unix sockets (see [The wall](wall.md)) |
 | `--no-sandbox` | run without Landlock; the model is told it is not confined |

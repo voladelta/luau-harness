@@ -12,6 +12,7 @@ type Block = {
 	is_error: boolean?,
 	from: any,
 	to: any,
+	source: any,
 }
 type Message = { role: string, content: string | { Block } }
 type Usage = {
@@ -28,7 +29,7 @@ type Tool = {
 	name: string,
 	description: string | () -> string,
 	parameters: Schema?,
-	run: ({ [string]: any }) -> (string, boolean?),
+	run: ({ [string]: any }) -> (string, boolean?, { Block }?),
 }
 type Skill = { name: string, description: string, dir: string, path: string, hidden: boolean, source: string? }
 type Features = { effort: string?, fallbacks: string?, display: string?, compaction: boolean? }
@@ -56,6 +57,10 @@ local live: {
 	repeats: Repeats,
 	printed: { string }?,
 	agent: { name: string, run: number }?,
+	seen: { [string]: { mtime: number, size: number } },
+	wrote: { string },
+	shared_since: number?,
+	images: { Block }?,
 } = {
 	usage = {},
 	spills = 0,
@@ -66,6 +71,10 @@ local live: {
 	repeats = { counts = {}, worst = nil },
 	printed = nil,
 	agent = nil,
+	seen = {},
+	wrote = {},
+	shared_since = nil,
+	images = nil,
 }
 setmetatable(live.wrappers, { __mode = "k" })
 
@@ -468,7 +477,7 @@ local function listed_skills(): { Skill }
 	return listed
 end
 
-function M.skill(name: string): string
+function M.skill(name: string?): string
 	local skills = M.skills()
 	if #skills == 0 then
 		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
@@ -476,12 +485,12 @@ function M.skill(name: string): string
 	end
 	local found: { Skill } = {}
 	for _, skill in skills do
-		if skill.name == name then
+		if name and skill.name == name then
 			found = { skill }
 			break
 		end
 	end
-	if #found == 0 then
+	if name and #found == 0 then
 		for _, skill in skills do
 			if skill_key(skill.name) == skill_key(name) then
 				table.insert(found, skill)
@@ -518,11 +527,13 @@ function M.skill(name: string): string
 	end
 
 	local listed = listed_skills()
-	local lines = { ("No skill is named %q."):format(name) }
+	local lines = { if name then ("No skill is named %q."):format(name) else "The skills:" }
 	if #listed == 0 then
-		return lines[1]
+		return if name then lines[1] else "No skill is listed."
 	end
-	table.insert(lines, "Pick one of these and load it by its name:")
+	if name then
+		table.insert(lines, "Pick one of these and load it by its name:")
+	end
 	for i = 1, math.min(#listed, M.skill_listed) do
 		table.insert(lines, skill_line(listed[i]))
 	end
@@ -550,8 +561,8 @@ local function skill_index(): string?
 	for _, skill in listed do
 		table.insert(names, skill.name)
 	end
-	return ("%s There are %d: %s. To see what they are for, call skill() with a name none has, as skill(\"?\"), "
-		.. "which lists them with their descriptions."):format(head, #listed, table.concat(names, ", "))
+	return ("%s There are %d: %s. To see what they are for, call skill() with no name, which lists them with "
+		.. "their descriptions."):format(head, #listed, table.concat(names, ", "))
 end
 
 M.layout_lines = 60
@@ -673,6 +684,70 @@ local function or_raise<T>(value: T?, err: string?): T
 	return value
 end
 
+local function tracked(path: string): (string, { type: string, mtime: number, size: number, target: string? }?)
+	local pending = M.ext("path").join(host.cwd or "/", path):split("/")
+	local resolved, hops = "", 0
+	while #pending > 0 do
+		local part = table.remove(pending, 1) :: string
+		if part == ".." then
+			resolved = resolved:match("^(.*)/[^/]*$") or ""
+		elseif part ~= "" and part ~= "." then
+			local stat = host.stat(resolved .. "/" .. part)
+			if stat and stat.type == "link" and stat.target and hops < M.link_hops then
+				hops += 1
+				local target = stat.target:split("/")
+				if stat.target:sub(1, 1) == "/" then
+					resolved = ""
+				end
+				pending = table.move(pending, 1, #pending, #target + 1, target)
+			else
+				resolved ..= "/" .. part
+			end
+		end
+	end
+	local whole = if resolved == "" then "/" else resolved
+	return whole, host.stat(whole)
+end
+
+local function file_clock(): number
+	local marker = ("%s/hx-clock%s"):format(host.env("TMPDIR") or "/tmp", if live.agent then "-" .. live.agent.name else "")
+	local stat = host.write(marker, "") and host.stat(marker)
+	return if stat then stat.mtime else os.time() + 1
+end
+
+local function saw(path: string)
+	local key, stat = tracked(path)
+	if stat then
+		live.seen[key] = { mtime = stat.mtime, size = stat.size }
+	end
+end
+
+local function wrote(path: string)
+	saw(path)
+	if not table.find(live.wrote, path) then
+		table.insert(live.wrote, path)
+	end
+end
+
+local function unseen_change(path: string): string?
+	local key, stat = tracked(path)
+	if not stat or stat.type ~= "file" then
+		return nil
+	end
+	local seen = live.seen[key]
+	if seen then
+		if seen.mtime ~= stat.mtime or seen.size ~= stat.size then
+			return ("write: %s has changed since you last read or wrote it, and this would overwrite a change you "
+				.. "have not seen. Read it again, then write it, or edit it."):format(path)
+		end
+	elseif live.shared_since and stat.mtime > live.shared_since then
+		return ("write: %s was written while agents share this directory, and not by your write or edit: this "
+			.. "may overwrite another's work. Read it first. If it is not yours to change, leave it and say so "
+			.. "in your report."):format(path)
+	end
+	return nil
+end
+
 local function check(fname: string, value: any, position: number, name: string, kind: string, optional: boolean?)
 	if value == nil and optional then
 		return
@@ -695,14 +770,36 @@ local function check(fname: string, value: any, position: number, name: string, 
 	error(("%s: argument %d (%s) must be a %s, not %s; usage: %s"):format(fname, position, name, kind, got, usage), 0)
 end
 
+M.vision = true
+M.image_bytes = 5 * 1024 * 1024
+M.images_per_call = 8
+M.call_image_bytes = 20 * 1024 * 1024
+
+local image_kinds = {
+	{ type = "image/png", starts = "\137PNG\r\n\26\n" },
+	{ type = "image/jpeg", starts = "\255\216\255" },
+	{ type = "image/gif", starts = "GIF8" },
+	{ type = "image/webp", starts = "RIFF", at_9 = "WEBP" },
+}
+
+function M.image(data: string): Block?
+	for _, kind in image_kinds do
+		if data:sub(1, #kind.starts) == kind.starts and (not kind.at_9 or data:sub(9, 12) == kind.at_9) then
+			return {
+				type = "image",
+				source = { type = "base64", media_type = kind.type, data = M.ext("bytes").base64(data) },
+			}
+		end
+	end
+	return nil
+end
+
 M.functions = {
 	{
 		name = "bash",
 		usage = "bash(command, timeout?) -> text: runs a bash command in the project directory, a new shell each "
-			.. "time, and returns stdout and stderr together, then [exit N]. That last line is hx's, not the "
-			.. "command's: to use the output as data, as in a file or a string you build, take host.sh(command).out "
-			.. "instead, and parse it in your code, with json.decode or string patterns, not in a python or jq "
-			.. "pipeline. The command is killed after timeout "
+			.. "time, and returns stdout and stderr together, then [exit N], for you to read. Output you will use "
+			.. "as data comes from host.sh, below. The command is killed after timeout "
 			.. "seconds (default 120). A process left in the background must send its output to a file, and is "
 			.. "killed when this session ends, daemons included: nothing you start outlives it.",
 		run = function(command: any, timeout: any): string
@@ -740,6 +837,7 @@ M.functions = {
 			end
 			progress("  read " .. M.printable(path))
 			local text: string = or_raise(host.read(path))
+			saw(path)
 			if text == "" then
 				return "[empty file]"
 			end
@@ -792,12 +890,18 @@ M.functions = {
 	{
 		name = "write",
 		usage = "write(path, content) -> text: creates or overwrites a file. Missing directories are created. For a "
-			.. "change to part of an existing file, edit is cheaper and safer.",
+			.. "change to part of an existing file, edit is cheaper and safer. It refuses to overwrite a file that "
+			.. "has changed since you last read or wrote it: read it again first.",
 		run = function(path: any, content: any): string
 			check("write", path, 1, "path", "string")
 			check("write", content, 2, "content", "string")
 			progress("  write " .. M.printable(path))
+			local changed = unseen_change(path)
+			if changed then
+				error(changed, 0)
+			end
 			or_raise(host.write(path, content))
+			wrote(path)
 			return ("wrote %d bytes to %s"):format(#content, path)
 		end,
 	},
@@ -849,17 +953,61 @@ M.functions = {
 				error(("edit: old text occurs %d times in %s: add surrounding lines to make it unique, or pass all = true"):format(count, path), 0)
 			end
 			or_raise(host.write(path, table.concat(pieces)))
+			wrote(path)
 			return ("replaced %d occurrence%s in %s"):format(count, count == 1 and "" or "s", path)
 		end,
 	},
 	{
+		name = "see",
+		usage = "see(path) -> text: puts an image file, PNG, JPEG, GIF or WebP, into this call's result for you to "
+			.. "look at: a screenshot, a chart, a rendered page. It is for looking; text in a document comes from "
+			.. "read, or from a tool that extracts it.",
+		run = function(path: any): string
+			check("see", path, 1, "path", "string")
+			progress("  see " .. M.printable(path))
+			if not M.vision then
+				error("see: this session's model takes no images", 0)
+			end
+			local images = live.images
+			if not images then
+				error("see: an image is shown in the result of the lua call that asks for it, and this is not one", 0)
+			end
+			if #images >= M.images_per_call then
+				error(("see: one call shows %d images at most; look at these first"):format(M.images_per_call), 0)
+			end
+			local data: string = or_raise(host.read(path))
+			local sent = 4 * math.ceil(#data / 3)
+			if sent > M.image_bytes then
+				error(("see: %s is %d bytes, %d as base64, and an image may be %d at most: scale it down first")
+					:format(path, #data, sent, M.image_bytes), 0)
+			end
+			local total = sent
+			for _, shown in images do
+				total += #shown.source.data
+			end
+			if total > M.call_image_bytes then
+				error(("see: the images of one call may be %d bytes as base64 at most; look at these first")
+					:format(M.call_image_bytes), 0)
+			end
+			local image = M.image(data)
+			if not image then
+				error(("see: %s is not a PNG, JPEG, GIF or WebP image"):format(path), 0)
+			end
+			table.insert(images, image)
+			return ("[image %d of this result: %s, %s, %d bytes]"):format(#images, path, image.source.media_type, #data)
+		end,
+	},
+	{
 		name = "skill",
-		usage = "skill(name) -> text: the instructions of the skill of that name (case, -, _, . and spaces do not "
-			.. "matter), headed by its directory; for a name no skill has, the skills with what each is for.",
+		usage = "skill(name?) -> text: the instructions of the skill of that name (case, -, _, . and spaces do not "
+			.. "matter), headed by its directory; with no name, the skills with what each is for.",
 		run = function(name: any): string
-			check("skill", name, 1, "name", "string")
+			check("skill", name, 1, "name", "string", true)
+			if name == nil then
+				return M.skill()
+			end
 			if trim(name) == "" then
-				error("skill: give a skill's name", 0)
+				error("skill: give a skill's name, or nothing for the list", 0)
 			end
 			return M.skill(trim(name))
 		end,
@@ -928,8 +1076,11 @@ local function lua_description(): string
 			table.insert(lines, "- " .. fn.usage)
 		end
 	end
-	table.insert(lines, "- host.sh(command, {input?, timeout?, cwd?, env?}) -> {out, code}: runs a command for its "
-		.. "output as data, stdout and stderr together, whole up to 16 MiB; send more to a file and host.read it. "
+	table.insert(lines, "- host.sh(command, {split?, input?, timeout?, cwd?, env?}) -> {out, err, code}: runs a "
+		.. "command for its output as data, with nothing of hx's added, whole up to 16 MiB; send more to a file and "
+		.. "host.read it. With split = true, out is stdout alone and err is stderr, so a warning cannot spoil what "
+		.. "you parse; otherwise out is both together and there is no err. Parse out in your code, with "
+		.. "json.decode or string patterns, not in a python or jq pipeline. "
 		.. "command is a bash string, or a list {program, arg, ...} whose words reach the program as they are, with "
 		.. "no quoting; input is text for its stdin; cwd is the directory it runs in; env is {NAME = value} to set, "
 		.. "false to take one away.")
@@ -940,11 +1091,11 @@ local function lua_description(): string
 	table.insert(lines, "")
 	table.insert(lines, "Do the work in Luau: parsing, counting, deciding and building text and files belong in "
 		.. "your code, with string patterns, string.pack and string.unpack for binary data, ext(\"bytes\") for hex, "
-		.. "base64, base58, sha256, hmac and exact integers wider than 2^53, ext(\"text\") to replace literal "
+		.. "base64, sha256 and hmac, ext(\"text\") to replace literal "
 		.. "text without pattern traps, ext(\"path\") for paths, ext(\"http\") for HTTP as data, and os.date. "
 		.. "Commands run programs: the build, tests, git, rg, curl, and tools that turn data into data, such as bc "
 		.. "for exact arithmetic on "
-		.. "large integers. Join them in Luau: json.decode(host.sh({\"curl\", \"-sfL\", url}).out), or "
+		.. "large integers. Join them in Luau: json.decode(host.sh({\"curl\", \"-sfL\", url}, {split = true}).out), or "
 		.. "host.sh({\"bc\"}, {input = expression}).out. "
 		.. "Write a script in another language only for a library the job needs that neither Luau nor the "
 		.. "system's tools have, and pass it its data through input or a file.")
@@ -965,22 +1116,23 @@ local tools: { Tool } = {
 			properties = { code = { type = "string" } },
 			required = { "code" },
 		},
-		run = function(args: { [string]: any }): (string, boolean)
+		run = function(args: { [string]: any }): (string, boolean, { Block }?)
 			if type(args.code) ~= "string" then
 				error('argument "code" must be a string', 0)
 			end
 			local lines: { string } = {}
+			local images: { Block } = {}
 			scratch.print = capture_print
 			local chunk: (() -> ...any)?, err: string? = host.load(args.code, "=lua", scratch)
 			if not chunk then
 				return "error: " .. tostring(err), true
 			end
-			local outer = live.printed
-			live.printed = lines
+			local outer, outer_images = live.printed, live.images
+			live.printed, live.images = lines, images
 			local ok, results = host.timed(M.call_seconds, function()
 				return table.pack(chunk())
 			end)
-			live.printed = outer
+			live.printed, live.images = outer, outer_images
 			if not ok then
 				table.insert(lines, "error: " .. tostring(results))
 			else
@@ -989,7 +1141,7 @@ local tools: { Tool } = {
 				end
 			end
 			local failed = not ok
-			return #lines > 0 and clip(table.concat(lines, "\n")) or "[no output]", failed
+			return #lines > 0 and clip(table.concat(lines, "\n")) or "[no output]", failed, #images > 0 and images or nil
 		end,
 	},
 }
@@ -1031,7 +1183,7 @@ local function find_tool(name: string?): Tool?
 	return nil
 end
 
-local function run_tool(call: Block): (string, boolean)
+local function run_tool(call: Block): (string, boolean, { Block }?)
 	local tool = find_tool(call.name)
 	if not tool then
 		local problem = "error: there is no tool named " .. tostring(call.name)
@@ -1054,9 +1206,9 @@ local function run_tool(call: Block): (string, boolean)
 	if problem then
 		return "error: " .. problem, true
 	end
-	local ok, result, failed = pcall(tool.run, args)
+	local ok, result, failed, images = pcall(tool.run, args)
 	if ok then
-		return result, failed == true
+		return result, failed == true, images
 	end
 	return "error: " .. tostring(result), true
 end
@@ -1237,8 +1389,10 @@ function M.system_prompt(): string
 		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
 			.. "range of lines or go on through a large file. Read a file before you edit it, unless "
 			.. "you wrote or edited it yourself in this session."
-			.. (ripgrep and " To search, ripgrep is installed: use rg through bash rather than plain grep. It is "
-				.. "faster, and it skips what .gitignore names." or ""),
+			.. " To search, call ext(\"search\"): grep(pattern, {dir?, glob?}) returns the matches as data and "
+			.. "shows them as path:line: text, and files(glob?) lists the files git does not ignore."
+			.. (ripgrep and " For what they do not cover, ripgrep is installed: use rg through bash rather than plain "
+				.. "grep. It is faster, and it skips what .gitignore names." or ""),
 		"Do the task you were given, as its instructions say. When it is unclear, or doing it would take a step it "
 			.. "did not ask for, stop and ask: end your reply with the question. Never sleep or poll to wait for "
 			.. "something outside your control, such as a market, a deploy or a person: report what you found and "
@@ -1342,13 +1496,17 @@ function Conversation.reply(self: Conversation, content: { Block }): { Block }
 	return tool_calls(message)
 end
 
-function Conversation.answer(self: Conversation, run: (Block) -> (string, boolean?))
+function Conversation.answer(self: Conversation, run: (Block) -> (string, boolean?, { Block }?))
 	expect(self, "answer", "owing")
 	local results: { Block } = {}
 	for _, call in tool_calls(self.messages[#self.messages]) do
-		local text, failed = run(call)
+		local text, failed, images = run(call)
 		local is_error: boolean? = failed or nil
-		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = is_error })
+		local content: any = text
+		if images and #images > 0 then
+			content = table.move(images, 1, #images, 2, { { type = "text", text = text } })
+		end
+		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = content, is_error = is_error })
 	end
 	table.insert(self.messages, { role = "user", content = results })
 	if self.on_answer then
@@ -1467,6 +1625,26 @@ M.compact_prompt = table.concat({
 
 M.resume_prompt = "Earlier turns were replaced by the checkpoint above, written by you. Treat it as established "
 	.. "and continue the work from it directly, without restating or acknowledging it."
+M.globals_listed = 40
+M.link_hops = 40
+
+function M.resume_text(): string
+	local names = {}
+	for name in pairs(scratch :: { [any]: any }) do
+		if type(name) == "string" and name ~= "print" then
+			table.insert(names, name)
+		end
+	end
+	if #names == 0 then
+		return M.resume_prompt
+	end
+	table.sort(names)
+	local listed = table.move(names, 1, math.min(#names, M.globals_listed), 1, {})
+	local more = if #names > #listed then (" and %d more"):format(#names - #listed) else ""
+	return ("%s The globals your Luau code set before the checkpoint are still set: %s%s. The checkpoint may not "
+		.. "say what is in them, so look at one before you rely on it."):format(M.resume_prompt,
+		table.concat(listed, ", "), more)
+end
 
 local function ask_for_summary(system: string, talk: Conversation, compaction: { [string]: any }?): Reply?
 	local ok, reply = pcall(ask, system, talk, compaction)
@@ -1494,7 +1672,7 @@ local function compact_on_server(system: string, talk: Conversation)
 		progress(("  no summary came back (%s); keeping the conversation as it is"):format(tostring(reply.stop_reason)))
 		return
 	end
-	talk:resume(block, M.resume_prompt)
+	talk:resume(block, M.resume_text())
 end
 
 function M.compact(system: string, talk: Conversation)
@@ -1515,7 +1693,7 @@ function M.compact(system: string, talk: Conversation)
 		progress("  no summary came back; keeping the conversation as it is")
 		return
 	end
-	talk:restart(summary .. "\n\n" .. M.resume_prompt)
+	talk:restart(summary .. "\n\n" .. M.resume_text())
 end
 
 function M.repeat_reminder(call: string, count: number, first: boolean): string
@@ -1678,6 +1856,8 @@ type Agent = {
 	id: number?,
 	started: number,
 	report: string?,
+	stopping: boolean,
+	seen: { [string]: { mtime: number, size: number } },
 }
 local fleet: { agents: { Agent }, waiting: { Agent }, system: string? } = { agents = {}, waiting = {}, system = nil }
 
@@ -1710,6 +1890,8 @@ local function agent_named(name: string): Agent
 		id = nil,
 		started = 0,
 		report = nil,
+		stopping = false,
+		seen = {},
 	}
 	sub_log(agent.talk)
 	table.insert(fleet.agents, agent)
@@ -1720,6 +1902,7 @@ local function work(agent: Agent, system: string): string
 	local began = os.clock()
 	live.agent = { name = agent.name, run = agent.runs }
 	live.usage = {}
+	live.seen, live.wrote, live.shared_since = agent.seen, {}, file_clock()
 	agent.talk.model = agent_model()
 	agent.talk:say(agent.task)
 	local ok, err = host.timed(M.agent_seconds, M.turn, system, agent.talk)
@@ -1729,6 +1912,8 @@ local function work(agent: Agent, system: string): string
 	return json.encode({
 		messages = agent.talk.messages,
 		usage = live.usage,
+		wrote = live.wrote,
+		seen = live.seen,
 		seconds = os.clock() - began,
 		error = if ok then nil else tostring(err),
 	})
@@ -1744,22 +1929,47 @@ local function start(agent: Agent)
 	progress(("  agent %s: %s"):format(agent.name, headline(agent.task)))
 end
 
+M.agent_wrote_listed = 20
+
+local function trail(agent: Agent, files: { string }): string
+	local lines = {}
+	if #files > 0 then
+		local listed = table.move(files, 1, math.min(#files, M.agent_wrote_listed), 1, {})
+		local more = if #files > #listed then (" and %d more"):format(#files - #listed) else ""
+		table.insert(lines, ("[wrote, with write and edit: %s%s]"):format(table.concat(listed, ", "), more))
+	end
+	local log = sub_logs[agent.talk]
+	if log and host.stat(log) then
+		table.insert(lines, ("[its conversation: %s]"):format(log))
+	end
+	return if #lines > 0 then table.concat(lines, "\n") .. "\n" else ""
+end
+
 local function finish(agent: Agent, returned: boolean, text: string)
 	agent.state, agent.id = "idle", nil
-	local done: { messages: { Message }, usage: { Count }, seconds: number, error: string? }? = nil
+	local done: { messages: { Message }, usage: { Count }, wrote: { string }?, seen: any, seconds: number, error: string? }? = nil
 	if returned then
 		local decoded: any = json.decode(text)
 		if type(decoded) == "table" and type(decoded.messages) == "table" then
 			done = decoded
 		end
 	end
+	local stopping = agent.stopping
+	agent.stopping = false
+	if not done and stopping and text == "terminated" then
+		agent.report = ("[agent %s: stopped as you asked, after %.0f s. It has the conversation it had before this "
+			.. "task, and may have changed files.]\n%s"):format(agent.name, os.clock() - agent.started, trail(agent, {}))
+			:gsub("\n$", "")
+		return
+	end
 	if not done then
 		agent.report = ("[agent %s: stopped after %.0f s (%s). It has the conversation it had before this task, "
-			.. "and may have changed files.]"):format(agent.name, os.clock() - agent.started,
-			if returned then "its result could not be read" else text)
+			.. "and may have changed files.]\n%s"):format(agent.name, os.clock() - agent.started,
+			if returned then "its result could not be read" else text, trail(agent, {})):gsub("\n$", "")
 		return
 	end
 	agent.talk.messages = done.messages
+	agent.seen = if type(done.seen) == "table" then done.seen else {}
 	for _, count in done.usage do
 		local mine = count_of(count.model)
 		mine.replies += count.replies
@@ -1782,43 +1992,51 @@ local function finish(agent: Agent, returned: boolean, text: string)
 	elseif failure then
 		how = ("failed after %.0f s: %s"):format(done.seconds, failure)
 	end
-	agent.report = ("[agent %s: %s]\n%s"):format(agent.name, how,
+	agent.report = ("[agent %s: %s]\n%s%s"):format(agent.name, how, trail(agent, done.wrote or {}),
 		if #words > 0 then table.concat(words, "\n") else "(it said nothing)")
 end
 
-local function checked_tasks(tasks: any): { { name: string, task: string } }
+local function checked_tasks(tasks: any): { { name: string, task: string?, stop: boolean? } }
 	check("agents", tasks, 1, "tasks", "table", true)
 	if not tasks then
 		return {}
 	end
-	if type(tasks.name) == "string" and type(tasks.task) == "string" then
+	if type(tasks.name) == "string" and (type(tasks.task) == "string" or tasks.stop == true) then
 		tasks = { tasks }
 	elseif #tasks == 0 and next(tasks) ~= nil then
 		error('agents: tasks is a list, as in agents({ { name = "parser", task = "..." } })', 0)
 	end
 	local sends, seen = {}, {}
 	for i, item in ipairs(tasks) do
-		if type(item) ~= "table" or type(item.name) ~= "string" or type(item.task) ~= "string" then
+		local stop = type(item) == "table" and item.stop == true
+		if stop and item.task ~= nil then
+			error(("agents: task %d has a task and stop = true; send one or the other"):format(i), 0)
+		end
+		if type(item) ~= "table" or type(item.name) ~= "string" or not (stop or type(item.task) == "string") then
 			error(('agents: task %d must be a table { name = "...", task = "..." }'):format(i), 0)
 		end
-		local name: string, task: string = item.name, item.task
+		local name: string, task: string? = item.name, item.task
 		if not name:match("^[%w_%-]+$") or #name > 40 then
 			error(("agents: task %d: a name is up to 40 letters, digits, _ and -, not %q"):format(i, name), 0)
 		end
-		if task:match("^%s*$") then
+		if task and task:match("^%s*$") then
 			error(("agents: the task for %s is empty"):format(name), 0)
 		end
 		if seen[name] then
 			error(("agents: %s is given two tasks in one call; an agent takes one at a time"):format(name), 0)
 		end
 		seen[name] = true
+		local busy = false
 		for _, agent in fleet.agents do
-			if agent.name == name and agent.state ~= "idle" then
-				error(("agents: %s is still at work on its last task. Wait for its report, with agents() and no "
-					.. "tasks, before you send it more."):format(name), 0)
-			end
+			busy = busy or agent.name == name and agent.state ~= "idle"
 		end
-		table.insert(sends, { name = name, task = task })
+		if busy and not stop then
+			error(("agents: %s is still at work on its last task. Wait for its report, with agents() and no "
+				.. "tasks, before you send it more, or stop it with { name = %q, stop = true }."):format(name, name), 0)
+		elseif stop and not busy then
+			error(("agents: %s is not at work, so there is nothing to stop"):format(name), 0)
+		end
+		table.insert(sends, { name = name, task = task, stop = stop })
 	end
 	return sends
 end
@@ -1834,16 +2052,28 @@ table.insert(M.functions, {
 		.. "has an agent goes to that agent as your next message to it, with all it did still in its "
 		.. "conversation: that is how work goes back to be fixed. The call returns after a few minutes at most, "
 		.. "with the reports so far and the names of the agents still at work; agents() with no tasks waits for "
-		.. "those.",
+		.. "those. { name = \"...\", stop = true } stops an agent at work, which keeps the conversation it had before that task. A report "
+		.. "names the files the agent wrote and, when the project keeps logs, the file its whole conversation "
+		.. "is in, to read when the report leaves something out.",
 	run = function(tasks: any): string
 		if live.agent then
 			error("agents: an agent has no agents of its own", 0)
 		end
 		for _, send in checked_tasks(tasks) do
+			live.shared_since = live.shared_since or file_clock()
 			local agent = agent_named(send.name)
-			agent.task, agent.state, agent.report = send.task, "waiting", nil
-			agent.runs += 1
-			table.insert(fleet.waiting, agent)
+			local waiting = table.find(fleet.waiting, agent)
+			if send.task then
+				agent.task, agent.state, agent.report = send.task, "waiting", nil
+				agent.runs += 1
+				table.insert(fleet.waiting, agent)
+			elseif waiting then
+				table.remove(fleet.waiting, waiting)
+				agent.state = "idle"
+				agent.report = ("[agent %s: stopped as you asked, before it began]"):format(agent.name)
+			elseif agent.id then
+				agent.stopping = host.stop(agent.id)
+			end
 		end
 
 		local function take_in(id: number, returned: boolean, text: string)
@@ -1954,6 +2184,41 @@ function M.read_message(read: () -> string?): string?
 	return (table.concat(lines, "\n"):gsub("\27%[20[01]~", ""))
 end
 
+function M.resume_log(named: string): string
+	if named ~= "last" then
+		local logged = ".hx/log/" .. named
+		if not named:find("/", 1, true) and not host.read(named) and host.read(logged) then
+			return logged
+		end
+		return named
+	end
+	local newest: string? = nil
+	for _, name in host.list(".hx/log") or {} do
+		if name:match("%.json$") and not name:match("%-sub%-%d+%.json$") and (not newest or name > newest) then
+			newest = name
+		end
+	end
+	if not newest then
+		error("--resume last: .hx/log holds no conversation; one is saved there when the project has .hx/", 0)
+	end
+	return ".hx/log/" .. newest
+end
+
+function M.resumed(talk: Conversation, named: string)
+	local path = M.resume_log(named)
+	local ok, saved = pcall(json.decode, or_raise(host.read(path)))
+	if not ok or type(saved) ~= "table" or type(saved.messages) ~= "table" then
+		error(("--resume: %s is not a conversation hx saved"):format(path), 0)
+	end
+	talk.messages = saved.messages
+	local problem = talk:problem()
+	if problem then
+		error(("--resume: %s cannot be gone on from: %s"):format(path, problem), 0)
+	end
+	talk:abandon("the session ended before this call was answered")
+	progress(("hx: going on from %s, %d messages"):format(path, #talk.messages))
+end
+
 function M.main(): number
 	local system = M.system_prompt()
 	local lead = M.lead_prompt()
@@ -1965,6 +2230,9 @@ function M.main(): number
 		save(system, talk.messages, log_path)
 	end
 	local task = table.concat(host.args, " ")
+	if host.resume then
+		M.resumed(talk, host.resume)
+	end
 
 	if not host.interactive then
 		if task == "" then

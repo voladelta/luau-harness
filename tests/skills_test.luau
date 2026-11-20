@@ -120,6 +120,9 @@ end
 has("the function trims", fn.run("  xlsx \n"), "[skill xlsx,")
 check("a table is refused", pcall(fn.run, { name = "xlsx" }), false)
 check("an empty name is refused", pcall(fn.run, "  "), false)
+has("no name lists the skills", fn.run(), "The skills:\n")
+has("each with what it is for", fn.run(), "- pdf-tools: Read, split and merge PDF files.")
+lacks("and names no missing skill", fn.run(), "No skill is named")
 has("the lua tool reaches it", loop.tools[1].run({ code = "return skill('xlsx')" }), "[skill xlsx,")
 
 skill(first, "long", "name: long\ndescription: " .. string.rep("é", 400))

@@ -33,6 +33,10 @@ loop.request = function(system, messages, _, model)
 		local code = ("return bash(%q)"):format(command)
 		return { content = { { type = "tool_use", id = "c" .. #messages, name = "lua", input = { code = code } } }, stop_reason = "tool_use" }
 	end
+	local code = told:match("^lua: (.*)$")
+	if code then
+		return { content = { { type = "tool_use", id = "c" .. #messages, name = "lua", input = { code = code } } }, stop_reason = "tool_use" }
+	end
 	local words = told:match("^say: (.*)$")
 	if told == "count" then
 		words = ("%d messages"):format(#messages)
@@ -83,7 +87,7 @@ check("a report is given once", agents(),
 
 loop.agent_model = "some-model"
 local told = agents({ { name = "first", task = "functions" } })
-has("an agent has the functions", told, "bash read write edit skill ext on some-model")
+has("an agent has the functions", told, "bash read write edit see skill ext on some-model")
 lacks("but not agents", told, "ext agents")
 has("its prompt is the session's and the agents' paragraph", told,
 	"under: the session's prompt\n\nYou are one of several agents at work in this directory")
@@ -109,6 +113,44 @@ local killed = agents({ { name = "slow", task = "run: kill -9 $PPID" } })
 has("a killed agent is reported", killed, "[agent slow: stopped after 0 s (the child ended without a result")
 has("and has the conversation it had before", agents({ { name = "slow", task = "count" } }), "5 messages")
 
+host.write(dir .. "lead.txt", "the lead's")
+host.write(dir .. "kept.txt", "old")
+local wrote = agents({
+	{ name = "writer", task = ("lua: write(%q, 'a') edit(%q, 'a', 'b') write(%q, 'new') return 'ok'"):format(dir .. "w1.txt", dir .. "w1.txt", dir .. "kept.txt") },
+	{ name = "clasher", task = ("lua: host.sleep(0.05) host.write(%q, 'theirs') return write(%q, 'mine')"):format(dir .. "other.txt", dir .. "other.txt") },
+	{ name = "reader", task = ("lua: host.sleep(0.05) host.write(%q, 'theirs') read(%q) return write(%q, 'mine')"):format(dir .. "read.txt", dir .. "read.txt", dir .. "read.txt") },
+})
+has("a report names the files written, each once", wrote, ("[agent writer: done in 0 s]\n[wrote, with write and edit: %sw1.txt, %skept.txt]\nran: ok"):format(dir, dir))
+has("a file written since the task began, by another, is not overwritten", wrote, "other.txt was written while agents share this directory, and not by your write or edit")
+check("and stays as it was", host.read(dir .. "other.txt"), "theirs")
+has("once read, it can be", wrote, ("ran: wrote 4 bytes to %sread.txt"):format(dir))
+check("a file from before the task is the agent's to overwrite", host.read(dir .. "kept.txt"), "new")
+host.write(dir .. "w1.txt", "changed between its tasks")
+has("an agent sent back still knows what it wrote, and does not overwrite a change made since",
+	agents({ name = "writer", task = ("lua: return write(%q, 'stale')"):format(dir .. "w1.txt") }),
+	"w1.txt has changed since you last read or wrote it")
+check("so the change stays", host.read(dir .. "w1.txt"), "changed between its tasks")
+lacks("a report of an agent that wrote nothing names no files", agents({ name = "writer", task = "say: idle" }), "[wrote")
+
+host.sh({ "mkdir", "-p", ".hx" })
+local logged = agents({ name = "logged", task = "say: hello" })
+host.sh({ "rm", "-rf", ".hx" })
+lacks("outside a turn there is no conversation file to name", logged, "[its conversation:")
+
+local began = os.clock()
+local patience = loop.agent_wait
+loop.agent_wait = 0.3
+agents({ { name = "long", task = "run: sleep 30; echo never" } })
+loop.agent_wait = 10
+local stopped = agents({ { name = "long", stop = true } })
+has("an agent at work can be stopped", stopped, "[agent long: stopped as you asked, after")
+check("without waiting for its command", os.clock() - began < 10, true)
+has("and has the conversation it had before", agents({ { name = "long", task = "count" } }), "1 messages")
+raises("an idle agent has nothing to stop", "long is not at work, so there is nothing to stop", agents, { { name = "long", stop = true } })
+raises("nor has one that does not exist", "nobody is not at work", agents, { name = "nobody", stop = true })
+loop.agent_wait = patience
+raises("a stop takes no task", "task 1 has a task and stop = true", agents, { { name = "long", stop = true, task = "count" } })
+
 loop.agent_limit = 1
 loop.agent_wait = 0.3
 local busy = agents({ { name = "first", task = "run: sleep 1; echo a" }, { name = "second", task = "run: sleep 1; echo b" } })
@@ -117,6 +159,8 @@ has("the second waits for its place", busy, "[agent second: waiting for one of t
 has("and the lead is told how to wait", busy, "agents() with no tasks waits for the agents still at work.")
 raises("an agent at work takes no second task", "first is still at work on its last task", agents, { { name = "first", task = "count" } })
 raises("nor does one that waits", "second is still at work on its last task", agents, { { name = "second", task = "count" } })
+has("one that waits is stopped before it begins", agents({ { name = "second", stop = true } }), "[agent second: stopped as you asked, before it began]")
+agents({ { name = "second", task = "run: sleep 1; echo b" } })
 loop.agent_wait = 10
 local rest = agents()
 has("waiting gives the first report", rest, "ran: a\n[exit 0]")

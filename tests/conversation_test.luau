@@ -108,6 +108,17 @@ t:abandon("interrupted by the user")
 check("abandon answers every call", json.encode(t.messages[3]), '{"content":[{"content":"error: interrupted by the user","is_error":true,"tool_use_id":"a","type":"tool_result"},{"content":"error: interrupted by the user","is_error":true,"tool_use_id":"b","type":"tool_result"}],"role":"user"}')
 t:say("go on")
 check("text after results joins them, behind", t.messages[3].content[3].text, "go on")
+
+local looked = loop.Conversation.new()
+looked:say("look")
+looked:reply({ { type = "tool_use", id = "a", name = "lua", input = { code = "see('x.png')" } } })
+local picture = { type = "image", source = { type = "base64", media_type = "image/png", data = "AA==" } }
+looked:answer(function()
+	return "[image 1]", false, { picture }
+end)
+check("an answer with images is the text, then the images", json.encode(looked.messages[3].content[1].content),
+	json.encode({ { type = "text", text = "[image 1]" }, picture }))
+check("and the conversation is sound", looked:problem(), nil)
 check("sound", t:problem(), nil)
 
 local fork = t:fork()
