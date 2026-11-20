@@ -31,6 +31,7 @@ host.endpoints = { search = true, fetch = true, ocr = true, exa = true }
 local web, ocr = loop.ext("web"), loop.ext("ocr")
 check("the web extension loads", type(web.search), "function")
 check("it is loaded once", loop.ext("web"), web)
+web.search_with = "api"
 
 script({ 200, json.encode({ results = {
 	{ rerank_score = 2.4, title = "Luau", url = "https://luau.org", snippet = "short", summary = "A fast,\nsmall language.",
@@ -102,6 +103,47 @@ script({ 403, '{"error": "forbidden"}' })
 raises("an error that is text, not an object", "search failed (403): forbidden", web.search, "q")
 script({ 200, '{"results":[{"title":"T","url":"u","snippet":"","summary":"' .. string.rep("\255", 900) .. '"}]}' })
 check("a summary that is not UTF-8 is cut by bytes", tostring(web.search("q")), "1. T\n   u\n   " .. string.rep("\255", 800) .. " ...")
+
+web.search_with = nil
+host.model, host.endpoints.session = "deepseek-flash", true
+script({ 200, json.encode({ content = {
+	{ type = "server_tool_use", id = "s1", name = "web_search", input = { query = "luau" } },
+	{ type = "web_search_tool_result", tool_use_id = "s1", content = {
+		{ type = "web_search_result", url = "https://luau.org", title = "Luau", page_age = "2026-06-01", snippet = "its own" },
+		{ type = "web_search_result", url = "https://example.com", title = "Other" },
+		{ type = "web_search_result", url = "https://luau.org", title = "Luau again" },
+		{ type = "web_search_result", url = "https://third.example", title = "Third" },
+	} },
+	{ type = "text", text = "Luau is.", citations = { { url = "https://example.com", cited_text = "cited words" } } },
+} }) })
+local found = web.search("luau", { count = 2 })
+check("under a DeepSeek model a search is the model's own", calls[1].name, "session")
+local asked = json.decode(calls[1].request)
+check("asked of the search model", asked.model, "deepseek-flash")
+check("with the search tool", json.encode(asked.tools), json.encode({ { type = "web_search_20250305", name = "web_search", max_uses = 5 } }))
+check("and the query", asked.messages[1].content[1].text, "Perform a web search for the query: luau")
+check("without thinking", asked.thinking.type, "disabled")
+check("each page is given once, up to count", #found, 2)
+check("a result's own snippet is kept", found[1].snippet, "its own")
+check("one without takes the words cited from it", found[2].snippet, "cited words")
+check("and they print as the others do", tostring(found), "1. Luau (2026-06-01)\n   https://luau.org\n   its own\n\n2. Other\n   https://example.com\n   cited words")
+script({ 200, json.encode({ content = { { type = "text", text = "I know this." } } }) })
+raises("an answer with no search in it", "answered without searching", web.search, "q")
+script({ 200, json.encode({ content = { { type = "web_search_tool_result", content = { type = "web_search_tool_result_error", error_code = "too_many_requests" } } } }) })
+raises("a search that failed", "search failed: too_many_requests", web.search, "q")
+script({ 200, json.encode({ results = {} }) })
+web.search("q", { content = true })
+check("a search for content goes to the Search API", calls[#calls].name, "search")
+host.model = "claude-opus-5-5"
+script({ 200, json.encode({ results = {} }) })
+web.search("q")
+check("as does one under another vendor's model", calls[#calls].name, "search")
+web.search_with = "model"
+host.endpoints[host.route(web.search_model)] = false
+raises("the model's search needs DeepSeek's key", "without DEEPSEEK_API_KEY", web.search, "q")
+web.search_with = "neither"
+raises("a way that is not one", 'search_with is "model", "api" or nil', web.search, "q")
+web.search_with = "api"
 
 script({ 200, json.encode({ title = "Your First API Call", content = "# Your First API Call\n\nHello." }) })
 check("fetch returns the content", web.fetch("https://example.com/a"), "# Your First API Call\n\nHello.")

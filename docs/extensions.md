@@ -73,6 +73,7 @@ project's own `.hx/ext/web.luau` or `.hx/ext/ocr.luau` takes the place of the bu
 | Call | Returns |
 |---|---|
 | `ext("web").search(query, {count?, content?, question?})` | results, best first: `{title, url, snippet, summary, content?, site_name?, date?, rerank_score, authority}`. Printed or returned from `lua`, they read as a numbered list. `query` takes `site:`, `-site:`, `lang:`, `after:`, `before:` and `"phrases"`, up to 128 characters; `count` is 1 to 50 (default 10); `content = true` asks for each page's text |
+| `ext("web").search_with` | which search `search` uses. Unset, it is automatic: under a DeepSeek model, DeepSeek's server-side search, a Messages request to `search_model` (`deepseek-flash`) with the `web_search` tool (`search_uses`, 5, searches and `search_tokens`, 4096, tokens at most), which has no charge for each search and is billed as model tokens; under any other model, or when `content` is asked for, DeepSeek's Search API. `"model"` or `"api"` forces one. A result of the model's search has `title`, `url`, `snippet` and `date` only, and its tokens are not in the session's count |
 | `ext("web").fetch(url)` | the page as Markdown, its title first as a heading when the page does not show it |
 | `ext("ocr").read(path, purpose?)` | the text of a PDF, Word, PowerPoint or image file, up to 100 MiB and 1,000 pages. A PDF is read with `rich_layout_recognition`, which keeps tables and layout and leaves box tokens in the text; anything else with `text_recognition`. A document of several pages has a `[page N]` line before each |
 
