@@ -101,7 +101,7 @@ local _, err = pcall(http.request, "http://127.0.0.1:1/")
 has("a failed connection raises", err, "http.request http://127.0.0.1:1/: curl:")
 local _, slow_err = pcall(http.request, base .. "/slow", { timeout = 0.2 })
 has("a request past its timeout raises what curl says", slow_err, "http.request " .. base .. "/slow: curl: (28)")
-host.sh("(for _ in $(seq 50); do pkill -KILL -f '[c]url .*/slow' && break; sleep 0.1; done) >/dev/null 2>&1 &")
+host.sh(("(for _ in $(seq 50); do pkill -KILL -f '[c]url .*%s/slow' && break; sleep 0.1; done) >/dev/null 2>&1 &"):format(base))
 local _, killed_err = pcall(http.request, base .. "/slow", { timeout = 5 })
 check("a curl that dies without a word is still explained", killed_err,
 	"http.request " .. base .. "/slow: killed by signal 9")
