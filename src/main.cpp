@@ -702,6 +702,7 @@ void check_sandbox_paths(const Options& options, const fs::path& project) {
 }
 
 hx::Sandbox confine(const Options& options, const fs::path& project, const fs::path& tmp) {
+    check_sandbox_paths(options, project);
     try {
         return hx::Sandbox::confine(sandbox_rules(options, project, tmp), options.unix_sockets);
     } catch (const hx::SandboxError& error) {
@@ -1084,7 +1085,7 @@ int run(const std::vector<std::string_view>& argv) {
     const TempDir tmp;
 
     static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
-    if (options.sandbox) {
+    if (options.sandbox && options.judge) {
         check_sandbox_paths(options, project);
     }
     std::optional<hx::Judge> judge =
