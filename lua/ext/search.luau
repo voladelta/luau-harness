@@ -1,4 +1,4 @@
--- find files and text in the project as data, with no shell quoting: files(glob?, dir?) -> {path}, what git lists (tracked, or new and not ignored), or every file where git lists none; grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit?}) -> {{path, line, text}}, a regex search that skips what .gitignore names and prints as path:line: text
+-- find files and text in the project as data, with no shell quoting: files(glob?, dir?) -> {path}, what git lists (tracked, or new and not ignored), or every file outside a git repository; grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit?}) -> {{path, line, text}}, a regex search that skips what .gitignore names and prints as path:line: text
 --!strict
 
 local M = {}
@@ -58,7 +58,7 @@ function M.files(glob: string?, dir: string?): { string }
 	table.move(spec, 1, #spec, #gone + 1, gone)
 	local found = listed(list, where)
 	local out = {}
-	if found and #found > 0 then
+	if found then
 		local deleted = {}
 		for _, path in listed(gone, where) or {} do
 			deleted[path] = true
@@ -122,9 +122,6 @@ local function with_ripgrep(pattern: string, options: Options, limit: number): {
 	if result.timed_out then
 		error(("search.grep: no answer in %d s; narrow dir or glob"):format(M.seconds), 0)
 	end
-	if result.code ~= 0 and result.code ~= 1 then
-		error("search.grep: " .. result.err:gsub("%s+$", ""), 0)
-	end
 	local matches: any = {}
 	for _, line in result.out:split("\n") do
 		if line:sub(1, 15) == '{"type":"match"' then
@@ -140,34 +137,42 @@ local function with_ripgrep(pattern: string, options: Options, limit: number): {
 			end
 		end
 	end
+	if #matches == 0 and result.code ~= 0 and result.code ~= 1 then
+		error("search.grep: " .. result.err:gsub("%s+$", ""), 0)
+	end
 	return matches
 end
 
 local function with_grep(pattern: string, options: Options, limit: number): { Match }
-	local args = { "grep", "-rnIZ", "--exclude-dir=.git", if options.fixed then "-F" else "-E" }
+	local glob = options.glob
+	if glob and not glob:find("/", 1, true) then
+		glob = "**/" .. glob
+	end
+	local paths = M.files(glob, options.dir)
+	local matches: any = {}
+	if #paths == 0 then
+		return matches
+	end
+	local args = { "xargs", "-0", "grep", "-nHIZ", if options.fixed then "-F" else "-E" }
 	if options.ignore_case then
 		table.insert(args, "-i")
 	end
-	if options.glob then
-		table.insert(args, "--include=" .. (options.glob:match("[^/]*$") :: string))
-	end
 	table.insert(args, "-e")
 	table.insert(args, pattern)
-	table.insert(args, prefix_of(options.dir) == "" and "./" or options.dir :: string)
-	local result = host.sh(args, { split = true, timeout = M.seconds })
+	table.insert(args, "--")
+	local result = host.sh(args, { split = true, input = table.concat(paths, "\0"), timeout = M.seconds })
 	if result.timed_out then
 		error(("search.grep: no answer in %d s; narrow dir or glob"):format(M.seconds), 0)
 	end
-	if result.code ~= 0 and result.code ~= 1 then
-		error("search.grep: " .. result.err:gsub("%s+$", ""), 0)
-	end
-	local matches: any = {}
 	for path, line, text in result.out:gmatch("([^%z\n]+)%z(%d+):([^\n]*)") do
 		if #matches == limit then
 			matches.more = true
 			break
 		end
 		table.insert(matches, row(path, tonumber(line) :: number, text))
+	end
+	if #matches == 0 and result.code ~= 0 and result.err:find("%S") then
+		error("search.grep: " .. result.err:gsub("%s+$", ""), 0)
 	end
 	table.sort(matches, function(a: Match, b: Match): boolean
 		if a.path ~= b.path then

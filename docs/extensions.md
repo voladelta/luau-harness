@@ -56,8 +56,8 @@ no parsing of a command's output:
 
 | Call | Returns |
 |---|---|
-| `ext("search").files(glob?, dir?)` | the files under `dir`, by default the project, sorted: what git lists there, tracked or new and not ignored, without those deleted from the working tree. Where git lists nothing, every file `host.walk` finds. `glob` is as `"**/*.luau"` |
-| `ext("search").grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit=1000})` | the matching lines, `{path, line, text}`, by path and line; printed or returned from `lua`, the list shows as `path:line: text` lines. `pattern` is a regex, or literal text with `fixed = true`. It runs ripgrep, which skips what `.gitignore` names and searches hidden directories other than `.git`; without ripgrep it runs `grep -rE`, which skips nothing but `.git` and matches `glob` against the file's name alone. A text longer than 500 bytes is cut; past `limit` matches the list has `more = true` and says so when shown |
+| `ext("search").files(glob?, dir?)` | the files under `dir`, by default the project, sorted: what git lists there, tracked or new and not ignored, without those deleted from the working tree. Outside a git repository, every file `host.walk` finds. `glob` is as `"**/*.luau"` |
+| `ext("search").grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit=1000})` | the matching lines, `{path, line, text}`, by path and line; printed or returned from `lua`, the list shows as `path:line: text` lines. `pattern` is a regex, or literal text with `fixed = true`. It runs ripgrep, which skips what `.gitignore` names and searches hidden directories other than `.git`; without ripgrep it runs `grep -E` over what `files` lists, so `.gitignore` holds there too; a `glob` with no `/` matches at any depth, as in ripgrep. A file it cannot read is passed over: the matches elsewhere still come back. A text longer than 500 bytes is cut; past `limit` matches the list has `more = true` and says so when shown |
 
 `http` makes a request with curl and returns it as data:
 

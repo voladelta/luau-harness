@@ -30,6 +30,7 @@ check("a glob picks among them", joined(search.files("**/*.luau", "repo")), "rep
 check("a directory inside the repository", joined(search.files(nil, "repo/src")), "repo/src/a.luau")
 check("where git lists nothing, every file", joined(search.files(nil, "plain")), "plain/d.luau plain/sub/c.txt")
 check("with the glob", joined(search.files("**/*.txt", "plain")), "plain/sub/c.txt")
+check("in a repository a glob that matches nothing is nothing, not what git ignores", joined(search.files("**/built.luau", "repo")), "")
 
 for _, ripgrep in { true, false } do
 	if not ripgrep or host.sh("command -v rg").code == 0 then
@@ -52,10 +53,27 @@ for _, ripgrep in { true, false } do
 		raises(by .. "a pattern that does not parse", "search.grep: ", search.grep, "(", { dir = "repo" })
 	end
 end
-search.ripgrep = true
-if host.sh("command -v rg").code == 0 then
-	check("rg skips what .gitignore names", #search.grep("beta", { dir = "repo", glob = "*.luau" }), 2)
+for _, ripgrep in { true, false } do
+	if not ripgrep or host.sh("command -v rg").code == 0 then
+		search.ripgrep = ripgrep
+		local by = ripgrep and "rg: " or "grep: "
+		check(by .. "skips what .gitignore names", #search.grep("beta", { dir = "repo", glob = "*.luau" }), 2)
+	end
 end
+search.ripgrep = false
+check("grep: a glob with a directory keeps to it", tostring(search.grep("beta", { dir = "repo", glob = "src/*.luau" })),
+	"repo/src/a.luau:2: beta gamma")
+host.write("repo/src/locked.luau", "beta\n")
+host.sh({ "chmod", "000", "repo/src/locked.luau" })
+if not host.read("repo/src/locked.luau") then
+	for _, ripgrep in { true, false } do
+		if not ripgrep or host.sh("command -v rg").code == 0 then
+			search.ripgrep = ripgrep
+			check((ripgrep and "rg" or "grep") .. ": a file it cannot read does not lose the matches", #search.grep("gamma", { dir = "repo/src" }), 1)
+		end
+	end
+end
+host.sh({ "rm", "-f", "repo/src/locked.luau" })
 search.ripgrep = nil
 
 raises("an empty pattern", "search.grep: argument 1 (pattern) is empty", search.grep, "")
