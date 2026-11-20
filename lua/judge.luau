@@ -271,12 +271,12 @@ local function record(entry: Entry)
 end
 
 local function crown(trial: number, dir: string, kind: string, value: number)
-	if champion then
-		shell("rm -rf " .. quote(champion.dir))
-	end
-	shell(("rm -rf %s/built/.judge && cp %s/trials/%d.patch %s/champion.patch"):format(quote(dir), quote(state), trial,
-		quote(state)))
+	local previous = champion
+	shell(("mv %s/champion.patch.tmp %s/champion.patch"):format(quote(state), quote(state)))
 	champion = { trial = trial, dir = dir, built = dir .. "/built", kind = kind, value = value }
+	if previous then
+		host.try(host.sh, "rm -rf " .. quote(previous.dir))
+	end
 end
 
 local function champion_name(c: Champion): string
@@ -363,12 +363,15 @@ local function submit(note: string): string
 	snapshot(dir .. "/src")
 	write_patch(tree(dir .. "/src"), ("trials/%d.patch"):format(trial))
 	local answer, crowned = judge(entry, dir)
+	if crowned then
+		shell(("rm -rf %s/built/.judge && cp %s/trials/%d.patch %s/champion.patch.tmp"):format(quote(dir),
+			quote(state), trial, quote(state)))
+	end
 	record(entry)
+	current = nil
 	if crowned then
 		crown(trial, dir, crowned.kind, crowned.value)
-	end
-	current = nil
-	if not crowned then
+	else
 		shell("rm -rf " .. quote(dir))
 		if champion then
 			answer ..= ("\nThe champion is still %s."):format(champion_name(champion))
@@ -387,7 +390,7 @@ local function abandon(err: unknown): string
 	local verdict, why = (err == "hung up" or err == "terminated") and "stopped" or "error", tostring(err)
 	entry.verdict, entry.why = verdict, why
 	host.try(record, entry)
-	host.try(host.sh, "rm -rf " .. quote(dir))
+	host.try(host.sh, ("rm -rf %s %s/champion.patch.tmp"):format(quote(dir), quote(state)))
 	say(("trial %d: %s: %s"):format(entry.trial, verdict, why))
 	return ("Trial %d. %s: the judge could not finish it, through no fault of the submission: %s"):format(entry.trial,
 		verdict, why)
