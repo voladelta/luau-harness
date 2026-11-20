@@ -120,8 +120,30 @@ inline long cloexec_above_stderr() noexcept {
 #endif
 }
 
+inline timespec timespec_of(double seconds) noexcept {
+    if (seconds <= 0) {
+        return {.tv_sec = 0, .tv_nsec = 0};
+    }
+    constexpr long kNanosPerSecond = 1'000'000'000;
+    auto whole = static_cast<time_t>(seconds);
+    auto nanos = static_cast<long>((seconds - static_cast<double>(whole)) * 1e9);
+    if (nanos >= kNanosPerSecond) {
+        ++whole;
+        nanos -= kNanosPerSecond;
+    } else if (nanos < 0) {
+        nanos = 0;
+    }
+    return {.tv_sec = whole, .tv_nsec = nanos};
+}
+
 inline void nap(long milliseconds) noexcept {
-    const timespec duration{.tv_sec = 0, .tv_nsec = milliseconds * 1'000'000};
+    if (milliseconds <= 0) {
+        return;
+    }
+    const timespec duration{
+        .tv_sec = milliseconds / 1000,
+        .tv_nsec = (milliseconds % 1000) * 1'000'000,
+    };
     nanosleep(&duration, nullptr);
 }
 

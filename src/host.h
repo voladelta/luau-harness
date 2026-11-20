@@ -60,6 +60,7 @@ class Host {
     ~Host();
 
     void open(lua_State* L);
+    static void check_deadline(lua_State* L);
 
   private:
     static Host& of(lua_State* L);

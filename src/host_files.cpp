@@ -150,26 +150,34 @@ std::vector<std::string_view> segments(std::string_view path) {
 }
 
 bool matches(std::span<const std::string_view> glob, std::span<const std::string_view> path) {
-    if (glob.empty()) {
-        return path.empty();
-    }
-    if (glob.front() == "**") {
-        if (glob.size() == 1) {
-            return !path.empty();
-        }
-        for (std::size_t skip = 0; skip <= path.size(); ++skip) {
-            if (matches(glob.subspan(1), path.subspan(skip))) {
-                return true;
+    std::vector<bool> dp(path.size() + 1, false);
+    dp[path.size()] = true;
+    for (std::size_t i = glob.size(); i-- > 0;) {
+        std::vector<bool> cur(path.size() + 1, false);
+        if (glob[i] == "**") {
+            if (i + 1 == glob.size()) {
+                for (std::size_t j = 0; j < path.size(); ++j) {
+                    cur[j] = true;
+                }
+            } else {
+                bool seen = false;
+                for (std::size_t j = path.size() + 1; j-- > 0;) {
+                    seen = seen || dp[j];
+                    cur[j] = seen;
+                }
+            }
+        } else {
+            const std::string segment(glob[i]);
+            for (std::size_t j = 0; j < path.size(); ++j) {
+                if (dp[j + 1]) {
+                    const std::string name(path[j]);
+                    cur[j] = fnmatch(segment.c_str(), name.c_str(), 0) == 0;
+                }
             }
         }
-        return false;
+        dp = std::move(cur);
     }
-    if (path.empty()) {
-        return false;
-    }
-    const std::string segment(glob.front());
-    const std::string name(path.front());
-    return fnmatch(segment.c_str(), name.c_str(), 0) == 0 && matches(glob.subspan(1), path.subspan(1));
+    return dp[0];
 }
 
 const char* kind_of(mode_t mode) {
@@ -348,7 +356,7 @@ int l_walk(lua_State* L) {
     using Options = std::filesystem::directory_options;
     std::filesystem::recursive_directory_iterator it(base, Options::skip_permission_denied, ec);
     for (const std::filesystem::recursive_directory_iterator end; !ec && it != end; it.increment(ec)) {
-        raise_if_signaled(L);
+        Host::check_deadline(L);
         std::error_code type_ec;
         const bool dir = it->is_directory(type_ec) && !it->is_symlink(type_ec);
         const std::string name = it->path().filename().string();

@@ -474,7 +474,7 @@ Secrets take_secrets(const std::vector<std::string>& key_envs, const std::vector
     }
     for (const auto& [name, entry] : doomed) {
         unsetenv(name.c_str());  // NOLINT(concurrency-mt-unsafe)
-        std::memset(entry, 0, std::strlen(entry));
+        explicit_bzero(entry, std::strlen(entry));
     }
     return secrets;
 }
@@ -679,7 +679,7 @@ std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& proj
     return rules;
 }
 
-hx::Sandbox confine(const Options& options, const fs::path& project, const fs::path& tmp) {
+void check_sandbox_paths(const Options& options, const fs::path& project) {
     if (project == "/" || holds_home(project)) {
         throw UsageError(
             fmt::format("refusing to treat {} as a project: the sandbox would leave your home directory open. "
@@ -699,6 +699,10 @@ hx::Sandbox confine(const Options& options, const fs::path& project, const fs::p
             }
         }
     }
+}
+
+hx::Sandbox confine(const Options& options, const fs::path& project, const fs::path& tmp) {
+    check_sandbox_paths(options, project);
     try {
         return hx::Sandbox::confine(sandbox_rules(options, project, tmp), options.unix_sockets);
     } catch (const hx::SandboxError& error) {
@@ -1081,7 +1085,10 @@ int run(const std::vector<std::string_view>& argv) {
     const TempDir tmp;
 
     static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
-    const std::optional<hx::Judge> judge =
+    if (options.sandbox && options.judge) {
+        check_sandbox_paths(options, project);
+    }
+    std::optional<hx::Judge> judge =
         options.judge ? std::optional(spawn_judge(options, *options.judge, project, tmp.path())) : std::nullopt;
     const CurlGlobal curl;
     const hx::Sandbox sandbox = options.sandbox ? confine(options, project, tmp.path()) : hx::Sandbox::none();
@@ -1094,13 +1101,13 @@ int run(const std::vector<std::string_view>& argv) {
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     config.system_rules = system_rules();
     if (judge) {
-        config.judge = hx::UniqueFd(judge->channel);
+        config.judge = judge->share_channel();
     }
     return run_vm(std::move(config), sandbox, [&](lua_State* L) {
         const int status =
             script ? run_module(L, *script, fmt::format("={}", options.script)) : run_loop(L, options.built_in_loop);
         if (judge) {
-            hx::finish_judge(*judge);
+            judge->finish();
         }
         return status;
     });

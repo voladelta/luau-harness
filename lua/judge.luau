@@ -133,9 +133,20 @@ end
 
 local workdir = state .. "/run"
 
+local function has_script(path: string): boolean
+	local info = host.stat(path)
+	if not info then
+		return false
+	end
+	if info.type == "file" then
+		return true
+	end
+	return host.sh({ "test", "-f", path }).code == 0
+end
+
 local function build(dir: string): (boolean, ...string)
 	shell(("rm -rf %s %s/built && cp -a %s/src %s"):format(quote(workdir), quote(dir), quote(dir), quote(workdir)))
-	if host.read(kit .. "/build") then
+	if has_script(kit .. "/build") then
 		local seconds, why = candidate(workdir, "build")
 		if not seconds then
 			return false, why
@@ -152,7 +163,7 @@ local function measure(built: string): (Measure?, ...string)
 	if not seconds then
 		return nil, why
 	end
-	if not host.read(kit .. "/check") then
+	if not has_script(kit .. "/check") then
 		return { kind = "seconds", value = seconds }
 	end
 	shell(("find %s -type l -delete"):format(quote(dir)))
@@ -249,19 +260,23 @@ local current: { entry: Entry, dir: string }?
 
 local function record(entry: Entry)
 	local line: string = json.encode(entry)
+	local content = (#ledger == 0 and line or table.concat(ledger, "\n") .. "\n" .. line) .. "\n"
+	local wrote, why = host.write(state .. "/ledger.jsonl", content)
+	if not wrote then
+		error("cannot write the ledger: " .. tostring(why), 0)
+	end
 	table.insert(ledger, line)
-	host.write(state .. "/ledger.jsonl", table.concat(ledger, "\n") .. "\n")
 	local verdict = entry.verdict :: string
 	counts[verdict] = (counts[verdict] or 0) + 1
 end
 
 local function crown(trial: number, dir: string, kind: string, value: number)
-	if champion then
-		shell("rm -rf " .. quote(champion.dir))
-	end
-	shell(("rm -rf %s/built/.judge && cp %s/trials/%d.patch %s/champion.patch"):format(quote(dir), quote(state), trial,
-		quote(state)))
+	local previous = champion
+	shell(("mv %s/champion.patch.tmp %s/champion.patch"):format(quote(state), quote(state)))
 	champion = { trial = trial, dir = dir, built = dir .. "/built", kind = kind, value = value }
+	if previous then
+		host.try(host.sh, "rm -rf " .. quote(previous.dir))
+	end
 end
 
 local function champion_name(c: Champion): string
@@ -349,11 +364,14 @@ local function submit(note: string): string
 	write_patch(tree(dir .. "/src"), ("trials/%d.patch"):format(trial))
 	local answer, crowned = judge(entry, dir)
 	if crowned then
-		crown(trial, dir, crowned.kind, crowned.value)
+		shell(("rm -rf %s/built/.judge && cp %s/trials/%d.patch %s/champion.patch.tmp"):format(quote(dir),
+			quote(state), trial, quote(state)))
 	end
 	record(entry)
 	current = nil
-	if not crowned then
+	if crowned then
+		crown(trial, dir, crowned.kind, crowned.value)
+	else
 		shell("rm -rf " .. quote(dir))
 		if champion then
 			answer ..= ("\nThe champion is still %s."):format(champion_name(champion))
@@ -372,7 +390,7 @@ local function abandon(err: unknown): string
 	local verdict, why = (err == "hung up" or err == "terminated") and "stopped" or "error", tostring(err)
 	entry.verdict, entry.why = verdict, why
 	host.try(record, entry)
-	host.try(host.sh, "rm -rf " .. quote(dir))
+	host.try(host.sh, ("rm -rf %s %s/champion.patch.tmp"):format(quote(dir), quote(state)))
 	say(("trial %d: %s: %s"):format(entry.trial, verdict, why))
 	return ("Trial %d. %s: the judge could not finish it, through no fault of the submission: %s"):format(entry.trial,
 		verdict, why)

@@ -119,7 +119,11 @@ int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     std::string response;
     std::array<char, CURL_ERROR_SIZE> error_buffer{};
     curl_easy_setopt(curl, CURLOPT_URL, endpoint.url.c_str());
+#if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);

@@ -10,7 +10,7 @@ local http = loop.ext("http")
 check("the system prompt lists http", loop.system_prompt():find("- http (built in): HTTP requests", 1, true) ~= nil, true)
 
 host.write(dir .. "server.py", [==[
-import http.server, sys
+import http.server, sys, time
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def reply(self, status, body, headers=()):
@@ -26,6 +26,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(200, b"hello", [("X-Twice", "a"), ("X-Twice", "b")])
         elif self.path == "/moved":
             self.reply(302, b"", [("Location", "/ok")])
+        elif self.path == "/slow":
+            time.sleep(1)
+            self.reply(200, b"late")
         else:
             self.reply(404, b"no such page")
 
@@ -43,7 +46,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 open(sys.argv[1], "w").write(str(server.server_port))
 server.serve_forever()
 ]==])
@@ -80,6 +83,12 @@ local posted = http.request(base .. "/echo", { json = { a = 1 } })
 check("json is posted as JSON", posted.body, 'POST application/json {"a":1}')
 check("and its status", posted.status, 201)
 
+local custom_ct = http.request(base .. "/echo", {
+	json = { a = 1 },
+	headers = { ["content-Type"] = "application/merge-patch+json" },
+})
+check("mixed-case Content-Type is kept for json requests", custom_ct.body, 'POST application/merge-patch+json {"a":1}')
+
 local put = http.request(base .. "/echo", { method = "PUT", body = "it's \"raw\"\n", headers = { ["Content-Type"] = "text/plain" } })
 check("a body goes as it is, with the headers given", put.body, "PUT text/plain it's \"raw\"\n")
 
@@ -90,6 +99,12 @@ check("and no body", head.body, "")
 
 local _, err = pcall(http.request, "http://127.0.0.1:1/")
 has("a failed connection raises", err, "http.request http://127.0.0.1:1/: curl:")
+local _, slow_err = pcall(http.request, base .. "/slow", { timeout = 0.2 })
+has("a request past its timeout raises what curl says", slow_err, "http.request " .. base .. "/slow: curl: (28)")
+host.sh("(for _ in $(seq 50); do pkill -KILL -f '[c]url .*/slow' && break; sleep 0.1; done) >/dev/null 2>&1 &")
+local _, killed_err = pcall(http.request, base .. "/slow", { timeout = 5 })
+check("a curl that dies without a word is still explained", killed_err,
+	"http.request " .. base .. "/slow: killed by signal 9")
 raises("body and json both", "give body or json, not both", http.request, base, { body = "x", json = {} })
 raises("a url that is not text", "http.request: url must be a string, not nil", http.request)
 check("nothing is left in TMPDIR", #host.walk(dir, { glob = "tmp.*" }), 0)

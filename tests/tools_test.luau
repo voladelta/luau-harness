@@ -117,6 +117,12 @@ local spill = clipped:match("the whole output is in (%S+)")
 check("and names the file that holds all of it", spill ~= nil, true)
 check("which holds all of it", spill and host.read(spill), host.sh("seq 1 1000").out .. "[exit 0]")
 check("it is clipped once, so it says so once", select(2, clipped:gsub("bytes omitted", "")), 1)
+loop.output_limit = 250
+tools.write(dir .. "utf8_long.txt", string.rep("€", 40) .. "\n")
+local utf8_read = tools.read(dir .. "utf8_long.txt")
+local shown_line = utf8_read:match("^1: ([^\n]+)")
+check("over-budget single line stays valid UTF-8", shown_line ~= nil and utf8.len(shown_line) ~= nil, true)
+check("over-budget single line backs up to a character boundary", shown_line and #shown_line, 48)
 loop.output_limit = 30000
 
 check("printable keeps text, newlines and tabs", loop.printable("a\tb\nc é"), "a\tb\nc é")

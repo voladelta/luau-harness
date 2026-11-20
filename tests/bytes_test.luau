@@ -15,6 +15,7 @@ check("the system prompt lists bytes with no key", loop.system_prompt():find("- 
 
 check("hex", bytes.hex("\0\1\127\255"), "0001" .. "7fff")
 check("unhex takes upper case, a 0x and spaces", bytes.unhex("0x00 01 7F ff"), "\0\1\127\255")
+check("unhex takes leading whitespace before 0x", bytes.unhex(" \t0X00 01 7F ff"), "\0\1\127\255")
 check("hex and back", bytes.unhex(bytes.hex(every)), every)
 raises("an odd number of digits", "even number of hex digits", bytes.unhex, "abc")
 raises("a letter that is not hex", "even number of hex digits", bytes.unhex, "zz")
@@ -39,6 +40,8 @@ check("a Solana address decodes to 32 bytes", #bytes.unbase58(wsol), 32)
 check("which are these", bytes.hex(bytes.unbase58(wsol)), "069b8857feab8184fb687f634618c035dac439dc1aeb3b5598a0f00000000001")
 check("and back", bytes.base58(bytes.unbase58(wsol)), wsol)
 check("every byte and back", bytes.unbase58(bytes.base58(every)), every)
+local wide = string.rep("\1", 8200)
+check("base58 handles inputs larger than the call stack", bytes.unbase58(bytes.base58(wide)), wide)
 check("nothing", bytes.base58(""), "")
 raises("a 0 is not base58", '"0" at 2 is not base58', bytes.unbase58, "10")
 
