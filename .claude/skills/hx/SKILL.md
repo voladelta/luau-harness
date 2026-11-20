@@ -153,7 +153,7 @@ Group commits by area, newest first. Run scripts/authors.sh for the credits line
   characters, the most hx lists.
 - Scripts and references go beside `SKILL.md`; `skill(NAME)` names them by their paths from the project.
 - hx reads `name`, `description` and `disable-model-invocation: true` (not listed, still loads by name), and
-  ignores other fields. A name no skill has, as in `skill("?")`, lists the skills with their descriptions.
+  ignores other fields. `skill()` with no name lists the skills with their descriptions, as a name no skill has does.
 
 ## The loop
 

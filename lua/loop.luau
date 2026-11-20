@@ -468,7 +468,7 @@ local function listed_skills(): { Skill }
 	return listed
 end
 
-function M.skill(name: string): string
+function M.skill(name: string?): string
 	local skills = M.skills()
 	if #skills == 0 then
 		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
@@ -476,12 +476,12 @@ function M.skill(name: string): string
 	end
 	local found: { Skill } = {}
 	for _, skill in skills do
-		if skill.name == name then
+		if name and skill.name == name then
 			found = { skill }
 			break
 		end
 	end
-	if #found == 0 then
+	if name and #found == 0 then
 		for _, skill in skills do
 			if skill_key(skill.name) == skill_key(name) then
 				table.insert(found, skill)
@@ -518,11 +518,13 @@ function M.skill(name: string): string
 	end
 
 	local listed = listed_skills()
-	local lines = { ("No skill is named %q."):format(name) }
+	local lines = { if name then ("No skill is named %q."):format(name) else "The skills:" }
 	if #listed == 0 then
-		return lines[1]
+		return if name then lines[1] else "No skill is listed."
 	end
-	table.insert(lines, "Pick one of these and load it by its name:")
+	if name then
+		table.insert(lines, "Pick one of these and load it by its name:")
+	end
 	for i = 1, math.min(#listed, M.skill_listed) do
 		table.insert(lines, skill_line(listed[i]))
 	end
@@ -550,8 +552,8 @@ local function skill_index(): string?
 	for _, skill in listed do
 		table.insert(names, skill.name)
 	end
-	return ("%s There are %d: %s. To see what they are for, call skill() with a name none has, as skill(\"?\"), "
-		.. "which lists them with their descriptions."):format(head, #listed, table.concat(names, ", "))
+	return ("%s There are %d: %s. To see what they are for, call skill() with no name, which lists them with "
+		.. "their descriptions."):format(head, #listed, table.concat(names, ", "))
 end
 
 M.layout_lines = 60
@@ -854,12 +856,15 @@ M.functions = {
 	},
 	{
 		name = "skill",
-		usage = "skill(name) -> text: the instructions of the skill of that name (case, -, _, . and spaces do not "
-			.. "matter), headed by its directory; for a name no skill has, the skills with what each is for.",
+		usage = "skill(name?) -> text: the instructions of the skill of that name (case, -, _, . and spaces do not "
+			.. "matter), headed by its directory; with no name, the skills with what each is for.",
 		run = function(name: any): string
-			check("skill", name, 1, "name", "string")
+			check("skill", name, 1, "name", "string", true)
+			if name == nil then
+				return M.skill()
+			end
 			if trim(name) == "" then
-				error("skill: give a skill's name", 0)
+				error("skill: give a skill's name, or nothing for the list", 0)
 			end
 			return M.skill(trim(name))
 		end,
@@ -940,7 +945,7 @@ local function lua_description(): string
 	table.insert(lines, "")
 	table.insert(lines, "Do the work in Luau: parsing, counting, deciding and building text and files belong in "
 		.. "your code, with string patterns, string.pack and string.unpack for binary data, ext(\"bytes\") for hex, "
-		.. "base64, base58, sha256, hmac and exact integers wider than 2^53, ext(\"text\") to replace literal "
+		.. "base64, sha256 and hmac, ext(\"text\") to replace literal "
 		.. "text without pattern traps, ext(\"path\") for paths, ext(\"http\") for HTTP as data, and os.date. "
 		.. "Commands run programs: the build, tests, git, rg, curl, and tools that turn data into data, such as bc "
 		.. "for exact arithmetic on "

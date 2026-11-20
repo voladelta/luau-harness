@@ -14,7 +14,7 @@ call to the next. The code acts through these functions:
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
-| `skill(name)` | a skill's instructions, by name; for a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
+| `skill(name?)` | a skill's instructions, by name; with no name, or a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
 | `ext(name)` | an extension's table of functions |
 | `agents(tasks)` | gives each task to an agent, all at work at the same time, and returns their reports (see [Agents](agents.md)) |
 
