@@ -1243,8 +1243,10 @@ function M.system_prompt(): string
 		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
 			.. "range of lines or go on through a large file. Read a file before you edit it, unless "
 			.. "you wrote or edited it yourself in this session."
-			.. (ripgrep and " To search, ripgrep is installed: use rg through bash rather than plain grep. It is "
-				.. "faster, and it skips what .gitignore names." or ""),
+			.. " To search, call ext(\"search\"): grep(pattern, {dir?, glob?}) returns the matches as data and "
+			.. "shows them as path:line: text, and files(glob?) lists the files git does not ignore."
+			.. (ripgrep and " For what they do not cover, ripgrep is installed: use rg through bash rather than plain "
+				.. "grep. It is faster, and it skips what .gitignore names." or ""),
 		"Do the task you were given, as its instructions say. When it is unclear, or doing it would take a step it "
 			.. "did not ask for, stop and ask: end your reply with the question. Never sleep or poll to wait for "
 			.. "something outside your control, such as a market, a deploy or a person: report what you found and "

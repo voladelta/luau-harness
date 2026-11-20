@@ -77,7 +77,7 @@ stderr, so `hx "..." > answer.txt` captures the answer. Every option, variable a
 | [The loop](docs/loop.md) | the agent's one tool and its functions, `.hx/loop.luau`, Claude settings, compaction, caching, logs |
 | [Agents](docs/agents.md) | `agents()`, which runs tasks side by side, and the `--rpi` workflow |
 | [The judge](docs/judge.md) | `--judge KIT`: kits, trials, verdicts and the walls that keep them honest |
-| [Extensions](docs/extensions.md) | `.hx/ext/`, and the built-in `bytes`, `text`, `path`, `http`, `web`, `ocr` and `exa` |
+| [Extensions](docs/extensions.md) | `.hx/ext/`, and the built-in `bytes`, `text`, `path`, `search`, `http`, `web`, `ocr` and `exa` |
 | [Skills](docs/skills.md) | where hx finds skills, how the model loads them, and the built-in `hx` and `rpi` |
 | [Host primitives](docs/host.md) | every `host.*` and `json.*` call Luau has |
 | [Development](docs/development.md) | the source files, the dev build, linters and tests |
