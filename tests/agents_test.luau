@@ -117,14 +117,19 @@ host.write(dir .. "lead.txt", "the lead's")
 host.write(dir .. "kept.txt", "old")
 local wrote = agents({
 	{ name = "writer", task = ("lua: write(%q, 'a') edit(%q, 'a', 'b') write(%q, 'new') return 'ok'"):format(dir .. "w1.txt", dir .. "w1.txt", dir .. "kept.txt") },
-	{ name = "clasher", task = ("lua: host.sleep(1.2) host.write(%q, 'theirs') return write(%q, 'mine')"):format(dir .. "other.txt", dir .. "other.txt") },
-	{ name = "reader", task = ("lua: host.sleep(1.2) host.write(%q, 'theirs') read(%q) return write(%q, 'mine')"):format(dir .. "read.txt", dir .. "read.txt", dir .. "read.txt") },
+	{ name = "clasher", task = ("lua: host.sleep(0.05) host.write(%q, 'theirs') return write(%q, 'mine')"):format(dir .. "other.txt", dir .. "other.txt") },
+	{ name = "reader", task = ("lua: host.sleep(0.05) host.write(%q, 'theirs') read(%q) return write(%q, 'mine')"):format(dir .. "read.txt", dir .. "read.txt", dir .. "read.txt") },
 })
 has("a report names the files written, each once", wrote, ("[agent writer: done in 0 s]\n[wrote, with write and edit: %sw1.txt, %skept.txt]\nran: ok"):format(dir, dir))
 has("a file written since the task began, by another, is not overwritten", wrote, "other.txt was written while agents share this directory, and not by your write or edit")
 check("and stays as it was", host.read(dir .. "other.txt"), "theirs")
 has("once read, it can be", wrote, ("ran: wrote 4 bytes to %sread.txt"):format(dir))
 check("a file from before the task is the agent's to overwrite", host.read(dir .. "kept.txt"), "new")
+host.write(dir .. "w1.txt", "changed between its tasks")
+has("an agent sent back still knows what it wrote, and does not overwrite a change made since",
+	agents({ name = "writer", task = ("lua: return write(%q, 'stale')"):format(dir .. "w1.txt") }),
+	"w1.txt has changed since you last read or wrote it")
+check("so the change stays", host.read(dir .. "w1.txt"), "changed between its tasks")
 lacks("a report of an agent that wrote nothing names no files", agents({ name = "writer", task = "say: idle" }), "[wrote")
 
 host.sh({ "mkdir", "-p", ".hx" })

@@ -684,10 +684,29 @@ local function or_raise<T>(value: T?, err: string?): T
 	return value
 end
 
-local function saw(path: string)
+local function tracked(path: string): (string, { type: string, mtime: number, size: number, target: string? }?)
+	local paths = M.ext("path")
 	local stat = host.stat(path)
+	for _ = 1, 8 do
+		if not stat or stat.type ~= "link" or not stat.target then
+			break
+		end
+		path = paths.join(paths.dirname(path), stat.target)
+		stat = host.stat(path)
+	end
+	return paths.normalize(paths.join(host.cwd or ".", path)), stat
+end
+
+local function file_clock(): number
+	local marker = ("%s/hx-clock%s"):format(host.env("TMPDIR") or "/tmp", if live.agent then "-" .. live.agent.name else "")
+	local stat = host.write(marker, "") and host.stat(marker)
+	return if stat then stat.mtime else os.time() + 1
+end
+
+local function saw(path: string)
+	local key, stat = tracked(path)
 	if stat then
-		live.seen[path] = { mtime = stat.mtime, size = stat.size }
+		live.seen[key] = { mtime = stat.mtime, size = stat.size }
 	end
 end
 
@@ -699,11 +718,11 @@ local function wrote(path: string)
 end
 
 local function unseen_change(path: string): string?
-	local stat = host.stat(path)
+	local key, stat = tracked(path)
 	if not stat or stat.type ~= "file" then
 		return nil
 	end
-	local seen = live.seen[path]
+	local seen = live.seen[key]
 	if seen then
 		if seen.mtime ~= stat.mtime or seen.size ~= stat.size then
 			return ("write: %s has changed since you last read or wrote it, and this would overwrite a change you "
@@ -1815,6 +1834,7 @@ type Agent = {
 	started: number,
 	report: string?,
 	stopping: boolean,
+	seen: { [string]: { mtime: number, size: number } },
 }
 local fleet: { agents: { Agent }, waiting: { Agent }, system: string? } = { agents = {}, waiting = {}, system = nil }
 
@@ -1848,6 +1868,7 @@ local function agent_named(name: string): Agent
 		started = 0,
 		report = nil,
 		stopping = false,
+		seen = {},
 	}
 	sub_log(agent.talk)
 	table.insert(fleet.agents, agent)
@@ -1858,7 +1879,7 @@ local function work(agent: Agent, system: string): string
 	local began = os.clock()
 	live.agent = { name = agent.name, run = agent.runs }
 	live.usage = {}
-	live.seen, live.wrote, live.shared_since = {}, {}, os.time() + 1
+	live.seen, live.wrote, live.shared_since = agent.seen, {}, file_clock()
 	agent.talk.model = agent_model()
 	agent.talk:say(agent.task)
 	local ok, err = host.timed(M.agent_seconds, M.turn, system, agent.talk)
@@ -1869,6 +1890,7 @@ local function work(agent: Agent, system: string): string
 		messages = agent.talk.messages,
 		usage = live.usage,
 		wrote = live.wrote,
+		seen = live.seen,
 		seconds = os.clock() - began,
 		error = if ok then nil else tostring(err),
 	})
@@ -1902,7 +1924,7 @@ end
 
 local function finish(agent: Agent, returned: boolean, text: string)
 	agent.state, agent.id = "idle", nil
-	local done: { messages: { Message }, usage: { Count }, wrote: { string }?, seconds: number, error: string? }? = nil
+	local done: { messages: { Message }, usage: { Count }, wrote: { string }?, seen: any, seconds: number, error: string? }? = nil
 	if returned then
 		local decoded: any = json.decode(text)
 		if type(decoded) == "table" and type(decoded.messages) == "table" then
@@ -1923,6 +1945,7 @@ local function finish(agent: Agent, returned: boolean, text: string)
 		return
 	end
 	agent.talk.messages = done.messages
+	agent.seen = if type(done.seen) == "table" then done.seen else {}
 	for _, count in done.usage do
 		local mine = count_of(count.model)
 		mine.replies += count.replies
@@ -2014,7 +2037,7 @@ table.insert(M.functions, {
 			error("agents: an agent has no agents of its own", 0)
 		end
 		for _, send in checked_tasks(tasks) do
-			live.shared_since = live.shared_since or os.time() + 1
+			live.shared_since = live.shared_since or file_clock()
 			local agent = agent_named(send.name)
 			local waiting = table.find(fleet.waiting, agent)
 			if send.task then
