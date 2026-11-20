@@ -1691,7 +1691,7 @@ class AgentTest(unittest.TestCase):
         with open(os.path.join(self.project, "photo.png"), "wb") as f:
             f.write(b"\x89PNG fake")
         ds_key = "ds-tools-key-42"
-        code = ("local web, ocr = ext('web'), ext('ocr') web.search_with = 'api' "
+        code = ("local web, ocr = ext('web'), ext('ocr') "
                 "print(web.search('luau language', {count = 3})) print(web.fetch('https://luau.org')) "
                 "print(ocr.read('scan.pdf')) return ocr.read('photo.png')")
         done = self.run_hx("go", HX_TOOLS_URL=tools.url + "/", DEEPSEEK_API_KEY=ds_key, script=[
@@ -1733,7 +1733,7 @@ class AgentTest(unittest.TestCase):
                 "and r.cost == 0.012) return r")
         done = self.run_hx("go", HX_EXA_URL=tools.url.replace("/v1/tools", "/exa/search"), EXA_API_KEY=exa_key,
                            script=[call("lua", {"code": code}, "c1"),
-                                   call("lua", {"code": "ext('web').search_with = 'api' return ext('web').search('x')"}, "c2"),
+                                   call("lua", {"code": "return ext('web').search('x')"}, "c2"),
                                    call("bash", {"command": "env"}, "c3"),
                                    say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1797,26 +1797,9 @@ class AgentTest(unittest.TestCase):
         self.assertIn("--resume goes on with the agent's conversation",
                       self.run_hx("--resume", "last", "--run", "x.luau").stderr)
 
-    def test_under_a_deepseek_model_a_search_is_the_models_own(self):
-        found = {"content": [{"type": "web_search_tool_result", "content": [
-            {"type": "web_search_result", "url": "https://luau.org", "title": "Luau", "snippet": "A small fast language."}]}]}
-
-        def answer(request):
-            searching = (request.get("tools") or [{}])[0].get("type") == "web_search_20250305"
-            return (200, found) if searching else None
-        self.model.answer = answer
-        done = self.run_hx("go", script=[call("lua", {"code": "return ext('web').search('luau language')"}, "c1"),
-                                         say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.tool_results()[0], "1. Luau\n   https://luau.org\n   A small fast language.")
-        search = self.model.requests[1]
-        self.assertEqual(search["messages"][0]["content"][0]["text"], "Perform a web search for the query: luau language")
-        self.assertEqual(search["tools"], [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}])
-        self.assertEqual(self.model.headers[1]["x-api-key"], KEY)
-
     def test_without_a_deepseek_key_the_tools_say_so(self):
         done = self.run_hx("go", script=[
-            call("lua", {"code": "ext('web').search_with = 'api' return ext('web').search('luau')"}, "c1"),
+            call("lua", {"code": "return ext('web').search('luau')"}, "c1"),
             call("lua", {"code": "return host.post('search', '{}')"}, "c2"),
             call("lua", {"code": "return host.post('chat', '{}')"}, "c3"),
             call("lua", {"code": "return ext('ocr').read('nope.pdf')"}, "c4"),

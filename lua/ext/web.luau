@@ -1,4 +1,4 @@
--- searches the web and fetches pages, through DeepSeek: search(query, {count?, content?, question?}) -> results, fetch(url) -> markdown; under a DeepSeek model a search is the model's own, with no charge for each, unless content is asked for
+-- searches the web and fetches pages, through DeepSeek: search(query, {count?, content?, question?}) -> results, fetch(url) -> markdown
 --!strict
 
 local http = ext("_http")
@@ -9,10 +9,6 @@ local M = {}
 M.attempts = 3
 M.timeout = 60
 M.summary_limit = 800
-M.search_with = nil :: string?
-M.search_model = "deepseek-flash"
-M.search_tokens = 4096
-M.search_uses = 5
 
 type Result = {
 	title: string,
@@ -42,81 +38,6 @@ local function call(name: string, request: { [string]: unknown }): { [string]: a
 		sender = "DeepSeek",
 		body_error = {},
 	})
-end
-
-local function search_way(content: boolean?): string
-	local way = M.search_with
-	if way ~= nil and way ~= "model" and way ~= "api" then
-		error(('web.search: search_with is "model", "api" or nil, not %s'):format(tostring(way)), 0)
-	end
-	if way then
-		return way
-	end
-	local session: string = host.model or ""
-	return if session:match("^claude%-") or content then "api" else "model"
-end
-
-local function model_search(query: string, count: number): { Result }
-	local endpoint: string = host.route(M.search_model)
-	if not host.endpoints[endpoint] then
-		error("web.search: hx was started without DEEPSEEK_API_KEY, so DeepSeek's search cannot be used", 0)
-	end
-	local answer = http.call({
-		endpoint = endpoint,
-		body = json.encode({
-			model = M.search_model,
-			max_tokens = M.search_tokens,
-			messages = { {
-				role = "user",
-				content = { { type = "text", text = "Perform a web search for the query: " .. query } },
-			} },
-			tools = { { type = "web_search_20250305", name = "web_search", max_uses = M.search_uses } },
-			thinking = { type = "disabled" },
-		}),
-		attempts = M.attempts,
-		timeout = M.timeout,
-		label = "search",
-		what = "search",
-		sender = "DeepSeek",
-		body_error = {},
-	})
-	local blocks: { any } = type(answer.content) == "table" and answer.content or {}
-	local cited: { [string]: string } = {}
-	for _, block in blocks do
-		for _, citation in type(block) == "table" and type(block.citations) == "table" and block.citations or {} do
-			if type(citation.url) == "string" and type(citation.cited_text) == "string" and not cited[citation.url] then
-				cited[citation.url] = citation.cited_text
-			end
-		end
-	end
-	local results: { Result }, seen: { [string]: boolean }, searched = {}, {}, false
-	for _, block in blocks do
-		if type(block) == "table" and block.type == "web_search_tool_result" then
-			searched = true
-			local items = block.content
-			if type(items) == "table" and items.type == "web_search_tool_result_error" then
-				error("web.search: DeepSeek's search failed: " .. tostring(items.error_code), 0)
-			end
-			for _, item in type(items) == "table" and items or {} do
-				local url = type(item) == "table" and item.type == "web_search_result" and item.url
-				if type(url) == "string" and url ~= "" and not seen[url] and #results < count then
-					seen[url] = true
-					local own = type(item.snippet) == "string" and item.snippet ~= "" and item.snippet
-					table.insert(results, {
-						title = type(item.title) == "string" and item.title or "",
-						url = url,
-						snippet = own or cited[url] or "",
-						summary = "",
-						date = type(item.page_age) == "string" and item.page_age or nil,
-					})
-				end
-			end
-		end
-	end
-	if not searched then
-		error("web.search: DeepSeek's model answered without searching; try again, or set search_with = \"api\"", 0)
-	end
-	return results
 end
 
 local function results_text(results: { Result }): string
@@ -172,9 +93,6 @@ function M.search(query: string, options: SearchOptions?)
 		end
 	end
 	note("  search " .. query:gsub("%c", " "))
-	if search_way(given.content) == "model" then
-		return setmetatable(model_search(query, count), Results)
-	end
 	local answer = call("search", {
 		query = query,
 		count = count,
