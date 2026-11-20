@@ -3,7 +3,7 @@ local dir = host.env("TMPDIR") .. "/"
 
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
-local check, has, raises = checks.check, checks.has, checks.raises
+local check, has, lacks, raises = checks.check, checks.has, checks.lacks, checks.raises
 
 local tools = {}
 for _, fn in loop.functions do
@@ -13,6 +13,8 @@ end
 local function lua(code)
 	return loop.tools[1].run({ code = code })
 end
+
+check("with no globals set, the prompt after a compaction is the plain one", loop.resume_text(), loop.resume_prompt)
 
 assert(not host.stat(".hx"), "tools_test writes .hx and removes it: run it from a scratch directory, not from a project")
 
@@ -245,6 +247,16 @@ check("a project function is there at once", lua("return twice(21)"), "42")
 check("and the model reads about it", loop.tools[1].description():find("- twice(n) -> number", 1, true) ~= nil, true)
 table.remove(loop.functions)
 local description = loop.tools[1].description()
+lua("survivor_b = { 1 } survivor_a = 'x' local gone = 2")
+has("after a compaction the model is told which globals are still set", loop.resume_text(), "are still set: ")
+has("by name, in order", loop.resume_text(), "survivor_a, survivor_b")
+lacks("a local is not one", loop.resume_text(), "gone")
+loop.globals_listed = 1
+lacks("a long list is cut", loop.resume_text(), "survivor_")
+has("and says how many it left out", loop.resume_text(), " more. The checkpoint")
+loop.globals_listed = 40
+lua("survivor_a, survivor_b = nil, nil")
+
 for _, name in { "bash(command, timeout?)", "read(path, offset?, limit?)", "write(path, content)", "edit(path, old, new, all?)", "see(path)", "ext(name)", "[==[" } do
 	check("the tool describes " .. name, description:find(name, 1, true) ~= nil, true)
 end

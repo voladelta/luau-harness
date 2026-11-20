@@ -1584,6 +1584,25 @@ M.compact_prompt = table.concat({
 
 M.resume_prompt = "Earlier turns were replaced by the checkpoint above, written by you. Treat it as established "
 	.. "and continue the work from it directly, without restating or acknowledging it."
+M.globals_listed = 40
+
+function M.resume_text(): string
+	local names = {}
+	for name in pairs(scratch :: { [any]: any }) do
+		if type(name) == "string" and name ~= "print" then
+			table.insert(names, name)
+		end
+	end
+	if #names == 0 then
+		return M.resume_prompt
+	end
+	table.sort(names)
+	local listed = table.move(names, 1, math.min(#names, M.globals_listed), 1, {})
+	local more = if #names > #listed then (" and %d more"):format(#names - #listed) else ""
+	return ("%s The globals your Luau code set before the checkpoint are still set: %s%s. The checkpoint may not "
+		.. "say what is in them, so look at one before you rely on it."):format(M.resume_prompt,
+		table.concat(listed, ", "), more)
+end
 
 local function ask_for_summary(system: string, talk: Conversation, compaction: { [string]: any }?): Reply?
 	local ok, reply = pcall(ask, system, talk, compaction)
@@ -1611,7 +1630,7 @@ local function compact_on_server(system: string, talk: Conversation)
 		progress(("  no summary came back (%s); keeping the conversation as it is"):format(tostring(reply.stop_reason)))
 		return
 	end
-	talk:resume(block, M.resume_prompt)
+	talk:resume(block, M.resume_text())
 end
 
 function M.compact(system: string, talk: Conversation)
@@ -1632,7 +1651,7 @@ function M.compact(system: string, talk: Conversation)
 		progress("  no summary came back; keeping the conversation as it is")
 		return
 	end
-	talk:restart(summary .. "\n\n" .. M.resume_prompt)
+	talk:restart(summary .. "\n\n" .. M.resume_text())
 end
 
 function M.repeat_reminder(call: string, count: number, first: boolean): string

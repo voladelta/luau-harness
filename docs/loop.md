@@ -138,7 +138,8 @@ refusal is logged with its category.
 Compaction on these models is the API's on-demand kind: the loop sends the conversation as it stands, with the same
 system prompt, tools, thinking and effort, plus `compaction` with `M.compact_prompt` as its `instructions`. The
 signed `compaction` block that comes back replaces every message it summarized; it goes first in the next request,
-exactly as it came, followed by `M.resume_prompt`. If no block comes back, the conversation is kept and compacted
+exactly as it came, followed by `M.resume_prompt` and, when the model's code has set globals, their names
+(`M.resume_text`): they outlast the compaction, and the checkpoint may not say so. If no block comes back, the conversation is kept and compacted
 after a later reply. Any other model, DeepSeek's included, is asked for the summary as an ordinary reply.
 
 Prompt caching follows each provider's docs. Every model gets a prefix that only grows: the system prompt is built
