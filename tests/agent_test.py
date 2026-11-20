@@ -242,6 +242,26 @@ class AgentTest(unittest.TestCase):
                         out.append(block["content"])
         return out
 
+    def test_resume_goes_on_from_a_saved_conversation(self):
+        os.makedirs(os.path.join(self.project, ".hx"))
+        first = self.run_hx("make a file", script=[call("bash", {"command": "echo made"}), say("All done.")])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        saved = self.model.requests[-1]["messages"]
+        self.model.requests.clear()
+        done = self.run_hx("--resume", "last", "and now?", script=[say("Still done.")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "Still done.\n")
+        self.assertIn("going on from .hx/log/", done.stderr)
+        asked = self.model.requests[0]["messages"]
+        self.assertEqual(asked[:len(saved)], saved)
+        self.assertEqual(asked[len(saved):], [
+            {"role": "assistant", "content": [{"type": "text", "text": "All done."}]},
+            {"role": "user", "content": "and now?"},
+        ])
+        missing = self.run_hx("--resume", "nowhere.json", "go on")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("nowhere.json", missing.stderr)
+
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
         self.assertEqual(done.returncode, 0, done.stderr)

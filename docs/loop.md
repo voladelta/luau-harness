@@ -153,7 +153,7 @@ would not say what the run cost.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON, after every reply that
 called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. Whether
-the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. A
+the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. `hx --resume LOG TASK` starts a session from such a file's messages, and `--resume last` from the newest one that is not an agent's: a call the old session never answered is answered as abandoned, the system prompt is the new session's, and the new session saves to a log of its own. A
 sub-agent's conversation, one whose turn runs inside another turn, is saved the same way beside the session's,
 under the session's name with `-sub-1`, `-sub-2` and so on; so is each agent's, in the order the agents were
 first given a task. The logs hold file contents, so that directory

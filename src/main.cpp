@@ -78,6 +78,7 @@ options:
   --rpi             lead the task by the rpi workflow (research, plan, implement): the model is opus
                     unless --model names another, whatever HX_MODEL says, and its agents run on
                     deepseek-flash when DEEPSEEK_API_KEY is set, on the lead's model otherwise
+  --resume LOG      go on from a saved conversation: LOG is a file in .hx/log, or `last` for the newest
   --ro PATH        also allow reading PATH (a toolchain in your home directory, for example)
   --rw PATH         also allow writing PATH
   --keep-env NAME   keep a variable that looks like a secret (its name ends in KEY, TOKEN, SECRET,
@@ -231,6 +232,7 @@ struct Options {
     std::vector<std::string> keep_env;
     std::optional<std::string> model;
     std::optional<std::string> judge;
+    std::optional<std::string> resume;
     bool rpi = false;
     bool built_in_loop = false;
     bool sandbox = true;
@@ -241,8 +243,9 @@ struct Options {
 };
 
 constexpr std::string_view kOptionNames[] = {
-    "--model", "--ro",   "--rw",  "--keep-env", "--unix-sockets", "--no-sandbox", "--quiet", "--no-input",
-    "--init",  "--full", "--run", "--help",     "--version",      "--judge",      "--rpi",   "--built-in-loop",
+    "--model",   "--ro",       "--rw",   "--keep-env",      "--unix-sockets", "--no-sandbox",
+    "--quiet",   "--no-input", "--init", "--full",          "--run",          "--help",
+    "--version", "--judge",    "--rpi",  "--built-in-loop", "--resume",
 };
 
 std::size_t distance(std::string_view a, std::string_view b) {
@@ -355,6 +358,8 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             options.model = option.value("NAME");
         } else if (arg == "--judge") {
             options.judge = option.value("KIT");
+        } else if (arg == "--resume") {
+            options.resume = option.value("LOG");
         } else if (arg == "--rpi") {
             option.flag();
             options.rpi = true;
@@ -1030,6 +1035,7 @@ hx::HostConfig host_config(const Options& options, const ModelChoice& model, boo
     if (options.rpi) {
         config.workflow = kRpiWorkflow;
     }
+    config.resume = options.resume.value_or("");
     return config;
 }
 

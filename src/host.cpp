@@ -465,6 +465,10 @@ void Host::open(lua_State* L) {
         lua_pushlstring(L, config_.workflow.data(), config_.workflow.size());
         lua_setfield(L, -2, "workflow");
     }
+    if (!config_.resume.empty()) {
+        lua_pushlstring(L, config_.resume.data(), config_.resume.size());
+        lua_setfield(L, -2, "resume");
+    }
     for (const auto& [field, texts] :
          {std::pair{"extensions", &config_.extensions}, std::pair{"skills", &config_.skills}}) {
         lua_createtable(L, 0, static_cast<int>(texts->size()));

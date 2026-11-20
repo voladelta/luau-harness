@@ -12,6 +12,7 @@ export DEEPSEEK_API_KEY=...         # or ANTHROPIC_API_KEY=... for Claude
 hx "add a --json flag to the export command and test it"
 hx --model sonnet "same, on Claude Sonnet 5.5"
 hx --rpi "move the config loader to TOML"   # Opus researches and plans, deepseek-flash agents implement
+hx --resume last "now add the tests"        # go on from the last conversation saved in .hx/log
 ```
 
 ## The idea

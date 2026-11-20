@@ -50,6 +50,7 @@ struct HostConfig {
     std::vector<Rule> system_rules;
     UniqueFd judge;
     std::string workflow;
+    std::string resume;
 };
 
 class Host {

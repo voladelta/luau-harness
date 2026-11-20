@@ -2138,6 +2138,37 @@ function M.read_message(read: () -> string?): string?
 	return (table.concat(lines, "\n"):gsub("\27%[20[01]~", ""))
 end
 
+function M.resume_log(named: string): string
+	if named ~= "last" then
+		return named
+	end
+	local newest: string? = nil
+	for _, name in host.list(".hx/log") or {} do
+		if name:match("%.json$") and not name:match("%-sub%-%d+%.json$") and (not newest or name > newest) then
+			newest = name
+		end
+	end
+	if not newest then
+		error("--resume last: .hx/log holds no conversation; one is saved there when the project has .hx/", 0)
+	end
+	return ".hx/log/" .. newest
+end
+
+function M.resumed(talk: Conversation, named: string)
+	local path = M.resume_log(named)
+	local ok, saved = pcall(json.decode, or_raise(host.read(path)))
+	if not ok or type(saved) ~= "table" or type(saved.messages) ~= "table" then
+		error(("--resume: %s is not a conversation hx saved"):format(path), 0)
+	end
+	talk.messages = saved.messages
+	local problem = talk:problem()
+	if problem then
+		error(("--resume: %s cannot be gone on from: %s"):format(path, problem), 0)
+	end
+	talk:abandon("the session ended before this call was answered")
+	progress(("hx: going on from %s, %d messages"):format(path, #talk.messages))
+end
+
 function M.main(): number
 	local system = M.system_prompt()
 	local lead = M.lead_prompt()
@@ -2149,6 +2180,9 @@ function M.main(): number
 		save(system, talk.messages, log_path)
 	end
 	local task = table.concat(host.args, " ")
+	if host.resume then
+		M.resumed(talk, host.resume)
+	end
 
 	if not host.interactive then
 		if task == "" then
