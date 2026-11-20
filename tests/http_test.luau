@@ -26,6 +26,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(200, b"hello", [("X-Twice", "a"), ("X-Twice", "b")])
         elif self.path == "/moved":
             self.reply(302, b"", [("Location", "/ok")])
+        elif self.path == "/slow":
+            import time
+            time.sleep(2)
+            self.reply(200, b"late")
         else:
             self.reply(404, b"no such page")
 
@@ -80,6 +84,12 @@ local posted = http.request(base .. "/echo", { json = { a = 1 } })
 check("json is posted as JSON", posted.body, 'POST application/json {"a":1}')
 check("and its status", posted.status, 201)
 
+local custom_ct = http.request(base .. "/echo", {
+	json = { a = 1 },
+	headers = { ["content-Type"] = "application/merge-patch+json" },
+})
+check("mixed-case Content-Type is kept for json requests", custom_ct.body, 'POST application/merge-patch+json {"a":1}')
+
 local put = http.request(base .. "/echo", { method = "PUT", body = "it's \"raw\"\n", headers = { ["Content-Type"] = "text/plain" } })
 check("a body goes as it is, with the headers given", put.body, "PUT text/plain it's \"raw\"\n")
 
@@ -90,6 +100,9 @@ check("and no body", head.body, "")
 
 local _, err = pcall(http.request, "http://127.0.0.1:1/")
 has("a failed connection raises", err, "http.request http://127.0.0.1:1/: curl:")
+local _, slow_err = pcall(http.request, base .. "/slow", { timeout = 0.2 })
+has("a timed-out request reports a reason", slow_err, "http.request " .. base .. "/slow:")
+check("a timed-out request is not blank after the colon", slow_err:match(": .+") ~= nil, true)
 raises("body and json both", "give body or json, not both", http.request, base, { body = "x", json = {} })
 raises("a url that is not text", "http.request: url must be a string, not nil", http.request)
 check("nothing is left in TMPDIR", #host.walk(dir, { glob = "tmp.*" }), 0)

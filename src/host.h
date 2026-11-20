@@ -60,10 +60,10 @@ class Host {
     ~Host();
 
     void open(lua_State* L);
+    static void on_interrupt(lua_State* L, int gc);
 
   private:
     static Host& of(lua_State* L);
-    static void on_interrupt(lua_State* L, int gc);
     static int post(lua_State* L);
     static int route(lua_State* L);
     static int sh(lua_State* L);

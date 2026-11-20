@@ -153,42 +153,53 @@ Judge spawn_judge(const std::string& kit_dir, const fs::path& project, const Jud
                         "system directories and every --ro and --rw path",
                         kit.string()));
     }
-    Judge judge{.state = make_judge_state(project)};
-    if (reaches(walls.agent, judge.state)) {
-        fs::remove(judge.state, ec);
+    fs::path state = make_judge_state(project);
+    if (reaches(walls.agent, state)) {
+        fs::remove(state, ec);
         throw UsageError(
-            fmt::format("the judge's state directory {} would be within the agent's reach", judge.state.string()));
+            fmt::format("the judge's state directory {} would be within the agent's reach", state.string()));
     }
     std::array<int, 2> ends{};
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends.data()) != 0) {
         throw std::runtime_error(fmt::format("socketpair: {}", error_text()));
     }
+    UniqueFd parent_end(ends[0]);
+    UniqueFd child_end(ends[1]);
     static_cast<void>(std::fflush(nullptr));
-    judge.pid = fork();
-    if (judge.pid < 0) {
+    const pid_t pid = fork();
+    if (pid < 0) {
         throw std::runtime_error(fmt::format("fork: {}", error_text()));
     }
-    if (judge.pid == 0) {
-        close(ends[0]);
-        judge_main(walls, run, ends[1], project, kit, judge.state);
+    if (pid == 0) {
+        parent_end.reset();
+        judge_main(walls, run, child_end.get(), project, kit, state);
     }
-    close(ends[1]);
-    judge.channel = ends[0];
-    await_judge(judge.channel);
+    child_end.reset();
+    Judge judge(pid, std::move(parent_end), std::move(state));
+    await_judge(judge.channel());
     return judge;
 }
 
-void finish_judge(const Judge& judge) {
+void Judge::finish(int external_channel) noexcept {
+    if (pid_ < 0) {
+        return;
+    }
+    const pid_t pid = std::exchange(pid_, -1);
+    if (channel_.valid()) {
+        shutdown(channel_.get(), SHUT_WR);
+        channel_.reset();
+    } else if (external_channel >= 0) {
+        shutdown(external_channel, SHUT_WR);
+    }
     constexpr int kWaitTicks = 300;
-    shutdown(judge.channel, SHUT_WR);
     for (int tick = 0; tick < kWaitTicks; ++tick) {
-        const pid_t done = waitpid(judge.pid, nullptr, WNOHANG);
-        if (done == judge.pid || (done < 0 && errno == ECHILD)) {
+        const pid_t done = waitpid(pid, nullptr, WNOHANG);
+        if (done == pid || (done < 0 && errno == ECHILD)) {
             return;
         }
         nap(100);
     }
-    fmt::print(stderr, "hx: the judge did not finish; its state is in {}\n", judge.state.string());
+    fmt::print(stderr, "hx: the judge did not finish; its state is in {}\n", state_.string());
 }
 
 }  // namespace hx

@@ -58,7 +58,7 @@ class Capture {
     }
 
     [[nodiscard]] Captured result() const {
-        if (head_.size() + tail_.size() <= 2 * kCaptureHalf) {
+        if (dropped_ == 0 && head_.size() + tail_.size() <= 2 * kCaptureHalf) {
             return {.text = head_ + tail_, .omitted = 0};
         }
         const std::string_view head = cut_head(head_);

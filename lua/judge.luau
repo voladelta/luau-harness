@@ -135,7 +135,7 @@ local workdir = state .. "/run"
 
 local function build(dir: string): (boolean, ...string)
 	shell(("rm -rf %s %s/built && cp -a %s/src %s"):format(quote(workdir), quote(dir), quote(dir), quote(workdir)))
-	if host.read(kit .. "/build") then
+	if host.stat(kit .. "/build") then
 		local seconds, why = candidate(workdir, "build")
 		if not seconds then
 			return false, why
@@ -152,7 +152,7 @@ local function measure(built: string): (Measure?, ...string)
 	if not seconds then
 		return nil, why
 	end
-	if not host.read(kit .. "/check") then
+	if not host.stat(kit .. "/check") then
 		return { kind = "seconds", value = seconds }
 	end
 	shell(("find %s -type l -delete"):format(quote(dir)))
@@ -250,7 +250,10 @@ local current: { entry: Entry, dir: string }?
 local function record(entry: Entry)
 	local line: string = json.encode(entry)
 	table.insert(ledger, line)
-	host.write(state .. "/ledger.jsonl", table.concat(ledger, "\n") .. "\n")
+	local wrote, why = host.write(state .. "/ledger.jsonl", table.concat(ledger, "\n") .. "\n")
+	if not wrote then
+		error("cannot write the ledger: " .. tostring(why), 0)
+	end
 	local verdict = entry.verdict :: string
 	counts[verdict] = (counts[verdict] or 0) + 1
 end

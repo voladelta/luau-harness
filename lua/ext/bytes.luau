@@ -41,7 +41,7 @@ end
 
 function M.unhex(text: string): string
 	check("unhex", text, 1, "text", "string")
-	local digits = text:gsub("^0[xX]", ""):gsub("%s", "")
+	local digits = text:gsub("%s", ""):gsub("^0[xX]", "")
 	if #digits % 2 ~= 0 or digits:find("%X") then
 		error("bytes.unhex: the text is not an even number of hex digits", 0)
 	end
@@ -106,7 +106,11 @@ end
 function M.base58(data: string): string
 	check("base58", data, 1, "data", "string")
 	local zeros = leading(data, "\0")
-	local digits = convert({ data:byte(zeros + 1, -1) }, 256, 58)
+	local input = table.create(#data - zeros)
+	for i = zeros + 1, #data do
+		table.insert(input, data:byte(i))
+	end
+	local digits = convert(input, 256, 58)
 	local out = {}
 	for i = #digits, 1, -1 do
 		table.insert(out, alphabet58:sub(digits[i] + 1, digits[i] + 1))

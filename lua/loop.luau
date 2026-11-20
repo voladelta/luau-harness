@@ -80,6 +80,27 @@ local function progress(text: string)
 	end
 end
 
+local function utf8_prefix(text: string, limit: number): string
+	if limit <= 0 then
+		return ""
+	end
+	if #text <= limit then
+		return text
+	end
+	local cut = limit
+	local next_byte = text:byte(cut + 1)
+	if next_byte and next_byte >= 0x80 and next_byte < 0xC0 then
+		while cut > 0 do
+			local b = text:byte(cut)
+			cut -= 1
+			if b < 0x80 or b >= 0xC0 then
+				break
+			end
+		end
+	end
+	return text:sub(1, cut)
+end
+
 local function clip(text: string): string
 	local head: string, tail: string? = host.clip(text, M.output_limit)
 	if tail == nil then
@@ -87,9 +108,12 @@ local function clip(text: string): string
 	end
 	live.spills += 1
 	local agent = live.agent
-	local path = ("%s/hx-output-%s%d.txt"):format(host.env("TMPDIR"),
-		if agent then ("%s-%d-"):format(agent.name, agent.run) else "", live.spills)
-	local where: string = host.write(path, text) and "; the whole output is in " .. path or ""
+	local tmpdir = host.env("TMPDIR") or ""
+	local path = if tmpdir ~= ""
+		then ("%s/hx-output-%s%d.txt"):format(tmpdir,
+			if agent then ("%s-%d-"):format(agent.name, agent.run) else "", live.spills)
+		else nil
+	local where: string = if path and host.write(path, text) then "; the whole output is in " .. path else ""
 	return head .. (head:sub(-1) == "\n" and "" or "\n")
 		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail
 end
@@ -753,8 +777,9 @@ M.functions = {
 			local body
 			if #lines[first] > budget then
 				last = first
-				body = ("%d: %s"):format(first, lines[first]:sub(1, budget))
-					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], budget)
+				local prefix = utf8_prefix(lines[first], budget)
+				body = ("%d: %s"):format(first, prefix)
+					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], #prefix)
 			else
 				body = table.concat(shown, "\n")
 			end

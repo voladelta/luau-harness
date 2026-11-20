@@ -161,10 +161,9 @@ void arm_limit(double deadline) noexcept {
     if (timer == nullptr) {
         return;
     }
-    const auto whole = static_cast<time_t>(deadline);
     const itimerspec at{
         .it_interval = {.tv_sec = 0, .tv_nsec = 0},
-        .it_value = {.tv_sec = whole, .tv_nsec = static_cast<long>((deadline - static_cast<double>(whole)) * 1e9)},
+        .it_value = timespec_of(deadline),
     };
     timer_settime(*timer, TIMER_ABSTIME, &at, nullptr);
 }
