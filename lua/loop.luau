@@ -710,9 +710,9 @@ local function unseen_change(path: string): string?
 				.. "have not seen. Read it again, then write it, or edit it."):format(path)
 		end
 	elseif live.shared_since and stat.mtime > live.shared_since then
-		return ("write: %s was written while agents share this directory, and not by you: this would overwrite "
-			.. "another's work. Read it first. If it is not yours to change, leave it and say so in your "
-			.. "report."):format(path)
+		return ("write: %s was written while agents share this directory, and not by your write or edit: this "
+			.. "may overwrite another's work. Read it first. If it is not yours to change, leave it and say so "
+			.. "in your report."):format(path)
 	end
 	return nil
 end

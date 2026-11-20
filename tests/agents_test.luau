@@ -121,7 +121,7 @@ local wrote = agents({
 	{ name = "reader", task = ("lua: host.sleep(1.2) host.write(%q, 'theirs') read(%q) return write(%q, 'mine')"):format(dir .. "read.txt", dir .. "read.txt", dir .. "read.txt") },
 })
 has("a report names the files written, each once", wrote, ("[agent writer: done in 0 s]\n[wrote, with write and edit: %sw1.txt, %skept.txt]\nran: ok"):format(dir, dir))
-has("a file written since the task began, by another, is not overwritten", wrote, "other.txt was written while agents share this directory, and not by you")
+has("a file written since the task began, by another, is not overwritten", wrote, "other.txt was written while agents share this directory, and not by your write or edit")
 check("and stays as it was", host.read(dir .. "other.txt"), "theirs")
 has("once read, it can be", wrote, ("ran: wrote 4 bytes to %sread.txt"):format(dir))
 check("a file from before the task is the agent's to overwrite", host.read(dir .. "kept.txt"), "new")
