@@ -106,9 +106,9 @@ end
 function M.base58(data: string): string
 	check("base58", data, 1, "data", "string")
 	local zeros = leading(data, "\0")
-	local input = table.create(#data - zeros)
+	local input: { number } = {}
 	for i = zeros + 1, #data do
-		table.insert(input, data:byte(i))
+		input[i - zeros] = string.byte(data, i)
 	end
 	local digits = convert(input, 256, 58)
 	local out = {}

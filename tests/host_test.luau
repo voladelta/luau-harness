@@ -23,10 +23,10 @@ check("a glob with no slash matches names at any depth", walk({ glob = "*.cpp" }
 check("depth 1 is the directory's own entries", walk({ depth = 1 }), ".hidden link src/ top.luau")
 check("depth 2", walk({ depth = 2, glob = "src/**" }), "src/a.cpp src/a/")
 local deep = dir .. "deep/"
-host.write(deep .. "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/file.txt", "x")
+host.write(deep .. string.rep("d/", 26) .. "file.txt", "x")
 local glob_start = os.clock()
-check("multiple ** globs stay fast", #host.walk(deep, { glob = "**/**/**/**/**/**/**/nope.txt" }), 0)
-check("multiple ** globs finish quickly", os.clock() - glob_start < 1, true)
+check("a glob of many ** matches nothing", #host.walk(deep, { glob = string.rep("**/", 10) .. "nope.txt" }), 0)
+check("and takes time in step with the path, not every way to split it", os.clock() - glob_start < 5, true)
 check("a missing directory", select(2, host.walk(dir .. "nope")), dir .. "nope: No such file or directory")
 raises("depth 0", "host.walk: depth is a whole number, 1 or more", host.walk, dir, { depth = 0 })
 
@@ -51,8 +51,8 @@ raises("a cwd that is a file", "is not a directory", host.sh, "pwd", { cwd = dir
 raises("a name with =", "env has a name that is not a variable's", host.sh, "true", { env = { ["A=B"] = "x" } })
 raises("a value that is a table", "env.A is text, or false to remove it", host.sh, "true", { env = { A = {} } })
 
-local big = host.sh("head -c 25165824 /dev/zero | tr '\\0' 'a'")
-check("large sh output reports omitted bytes", big.omitted > 0, true)
-check("large sh output marks the omission", big.out:find("bytes of output omitted", 1, true) ~= nil, true)
+local big = host.sh("head -c 25165825 /dev/zero | tr '\\0' 'a'")
+check("output one byte past head and tail counts what it leaves out", big.omitted, 8388609)
+check("and marks it", big.out:find("[... 8388609 bytes of output omitted ...]", 1, true) ~= nil, true)
 
 checks.done("host")

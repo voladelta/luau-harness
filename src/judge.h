@@ -34,20 +34,21 @@ class Judge {
         : pid_(std::exchange(other.pid_, -1)), channel_(std::move(other.channel_)), state_(std::move(other.state_)) {}
     Judge& operator=(Judge&& other) noexcept {
         if (this != &other) {
-            finish();
+            static_cast<void>(stop());
             pid_ = std::exchange(other.pid_, -1);
             channel_ = std::move(other.channel_);
             state_ = std::move(other.state_);
         }
         return *this;
     }
-    ~Judge() { finish(); }
+    ~Judge() { static_cast<void>(stop()); }
 
-    [[nodiscard]] int channel() const noexcept { return channel_.get(); }
-    [[nodiscard]] UniqueFd take_channel() noexcept { return std::move(channel_); }
-    void finish(int external_channel = -1) noexcept;
+    [[nodiscard]] UniqueFd share_channel() const;
+    void finish();
 
   private:
+    [[nodiscard]] bool stop() noexcept;
+
     pid_t pid_ = -1;
     UniqueFd channel_;
     std::filesystem::path state_;

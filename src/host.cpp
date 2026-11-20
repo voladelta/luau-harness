@@ -341,6 +341,10 @@ void Host::on_interrupt(lua_State* L, int gc) {
     }
 }
 
+void Host::check_deadline(lua_State* L) {
+    on_interrupt(L, -1);
+}
+
 double Host::within_limit(double seconds) const {
     seconds = duration(seconds);
     if (deadline_ <= 0) {

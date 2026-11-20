@@ -356,7 +356,7 @@ int l_walk(lua_State* L) {
     using Options = std::filesystem::directory_options;
     std::filesystem::recursive_directory_iterator it(base, Options::skip_permission_denied, ec);
     for (const std::filesystem::recursive_directory_iterator end; !ec && it != end; it.increment(ec)) {
-        Host::on_interrupt(L, -1);
+        Host::check_deadline(L);
         std::error_code type_ec;
         const bool dir = it->is_directory(type_ec) && !it->is_symlink(type_ec);
         const std::string name = it->path().filename().string();

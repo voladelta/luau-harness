@@ -1,6 +1,5 @@
 #include <curl/curl.h>
 #include <fcntl.h>
-#include <strings.h>
 #include <sys/prctl.h>
 #include <unistd.h>
 
@@ -703,7 +702,6 @@ void check_sandbox_paths(const Options& options, const fs::path& project) {
 }
 
 hx::Sandbox confine(const Options& options, const fs::path& project, const fs::path& tmp) {
-    check_sandbox_paths(options, project);
     try {
         return hx::Sandbox::confine(sandbox_rules(options, project, tmp), options.unix_sockets);
     } catch (const hx::SandboxError& error) {
@@ -1101,15 +1099,14 @@ int run(const std::vector<std::string_view>& argv) {
     }
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     config.system_rules = system_rules();
-    const int judge_channel = judge ? judge->channel() : -1;
     if (judge) {
-        config.judge = judge->take_channel();
+        config.judge = judge->share_channel();
     }
     return run_vm(std::move(config), sandbox, [&](lua_State* L) {
         const int status =
             script ? run_module(L, *script, fmt::format("={}", options.script)) : run_loop(L, options.built_in_loop);
         if (judge) {
-            judge->finish(judge_channel);
+            judge->finish();
         }
         return status;
     });

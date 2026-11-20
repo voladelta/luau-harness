@@ -108,11 +108,9 @@ local function clip(text: string): string
 	end
 	live.spills += 1
 	local agent = live.agent
-	local tmpdir = host.env("TMPDIR") or ""
-	local path = if tmpdir ~= ""
-		then ("%s/hx-output-%s%d.txt"):format(tmpdir,
-			if agent then ("%s-%d-"):format(agent.name, agent.run) else "", live.spills)
-		else nil
+	local tmpdir: string = host.env("TMPDIR") or ""
+	local owner = if agent then ("%s-%d-"):format(agent.name, agent.run) else ""
+	local path = if tmpdir ~= "" then ("%s/hx-output-%s%d.txt"):format(tmpdir, owner, live.spills) else nil
 	local where: string = if path and host.write(path, text) then "; the whole output is in " .. path else ""
 	return head .. (head:sub(-1) == "\n" and "" or "\n")
 		.. ("[... %d bytes omitted%s ...]\n"):format(#text - #head - #tail, where) .. tail

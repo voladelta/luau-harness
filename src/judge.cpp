@@ -1,5 +1,6 @@
 #include "judge.h"
 
+#include <fcntl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -175,31 +176,44 @@ Judge spawn_judge(const std::string& kit_dir, const fs::path& project, const Jud
         judge_main(walls, run, child_end.get(), project, kit, state);
     }
     child_end.reset();
+    const int channel = parent_end.get();
     Judge judge(pid, std::move(parent_end), std::move(state));
-    await_judge(judge.channel());
+    await_judge(channel);
     return judge;
 }
 
-void Judge::finish(int external_channel) noexcept {
+UniqueFd Judge::share_channel() const {
+    UniqueFd shared(fcntl(channel_.get(), F_DUPFD_CLOEXEC, 0));
+    if (!shared.valid()) {
+        throw std::runtime_error(fmt::format("judge channel: {}", error_text()));
+    }
+    return shared;
+}
+
+bool Judge::stop() noexcept {
     if (pid_ < 0) {
-        return;
+        return true;
     }
     const pid_t pid = std::exchange(pid_, -1);
     if (channel_.valid()) {
         shutdown(channel_.get(), SHUT_WR);
         channel_.reset();
-    } else if (external_channel >= 0) {
-        shutdown(external_channel, SHUT_WR);
     }
     constexpr int kWaitTicks = 300;
     for (int tick = 0; tick < kWaitTicks; ++tick) {
         const pid_t done = waitpid(pid, nullptr, WNOHANG);
         if (done == pid || (done < 0 && errno == ECHILD)) {
-            return;
+            return true;
         }
         nap(100);
     }
-    fmt::print(stderr, "hx: the judge did not finish; its state is in {}\n", state_.string());
+    return false;
+}
+
+void Judge::finish() {
+    if (!stop()) {
+        fmt::print(stderr, "hx: the judge did not finish; its state is in {}\n", state_.string());
+    }
 }
 
 }  // namespace hx
