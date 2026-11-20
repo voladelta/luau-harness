@@ -129,8 +129,13 @@ host.write(dir .. "not.png", "text")
 has("a file that is no image", lua(("return see(%q)"):format(dir .. "not.png")), "not.png is not a PNG, JPEG, GIF or WebP image")
 raises("see outside a call's result", "this is not one", tools.see, dir .. "shot.png")
 loop.image_bytes = 10
-has("an image too large to send", lua(("return see(%q)"):format(dir .. "shot.png")), "is 28 bytes, and an image may be 10 at most")
+has("an image too large to send", lua(("return see(%q)"):format(dir .. "shot.png")), "is 28 bytes, 40 as base64, and an image may be 10 at most")
+loop.image_bytes = 40
+check("the limit is on what is sent", lua(("return see(%q)"):format(dir .. "shot.png")):find("image 1 of this result", 1, true) ~= nil, true)
 loop.image_bytes = 5 * 1024 * 1024
+loop.call_image_bytes = 60
+has("more image bytes than one call sends", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "may be 60 bytes as base64 at most")
+loop.call_image_bytes = 20 * 1024 * 1024
 loop.images_per_call = 1
 has("more images than one call shows", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "one call shows 1 images at most")
 loop.images_per_call = 8

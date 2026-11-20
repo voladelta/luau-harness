@@ -773,6 +773,7 @@ end
 M.vision = true
 M.image_bytes = 5 * 1024 * 1024
 M.images_per_call = 8
+M.call_image_bytes = 20 * 1024 * 1024
 
 local image_kinds = {
 	{ type = "image/png", starts = "\137PNG\r\n\26\n" },
@@ -975,9 +976,18 @@ M.functions = {
 				error(("see: one call shows %d images at most; look at these first"):format(M.images_per_call), 0)
 			end
 			local data: string = or_raise(host.read(path))
-			if #data > M.image_bytes then
-				error(("see: %s is %d bytes, and an image may be %d at most: scale it down first"):format(path, #data,
-					M.image_bytes), 0)
+			local sent = 4 * math.ceil(#data / 3)
+			if sent > M.image_bytes then
+				error(("see: %s is %d bytes, %d as base64, and an image may be %d at most: scale it down first")
+					:format(path, #data, sent, M.image_bytes), 0)
+			end
+			local total = sent
+			for _, shown in images do
+				total += #shown.source.data
+			end
+			if total > M.call_image_bytes then
+				error(("see: the images of one call may be %d bytes as base64 at most; look at these first")
+					:format(M.call_image_bytes), 0)
 			end
 			local image = M.image(data)
 			if not image then
@@ -1944,8 +1954,9 @@ local function finish(agent: Agent, returned: boolean, text: string)
 			done = decoded
 		end
 	end
-	if not done and agent.stopping and text == "terminated" then
-		agent.stopping = false
+	local stopping = agent.stopping
+	agent.stopping = false
+	if not done and stopping and text == "terminated" then
 		agent.report = ("[agent %s: stopped as you asked, after %.0f s. It has the conversation it had before this "
 			.. "task, and may have changed files.]\n%s"):format(agent.name, os.clock() - agent.started, trail(agent, {}))
 			:gsub("\n$", "")
@@ -1981,7 +1992,6 @@ local function finish(agent: Agent, returned: boolean, text: string)
 	elseif failure then
 		how = ("failed after %.0f s: %s"):format(done.seconds, failure)
 	end
-	agent.stopping = false
 	agent.report = ("[agent %s: %s]\n%s%s"):format(agent.name, how, trail(agent, done.wrote or {}),
 		if #words > 0 then table.concat(words, "\n") else "(it said nothing)")
 end
@@ -2176,6 +2186,10 @@ end
 
 function M.resume_log(named: string): string
 	if named ~= "last" then
+		local logged = ".hx/log/" .. named
+		if not named:find("/", 1, true) and not host.read(named) and host.read(logged) then
+			return logged
+		end
 		return named
 	end
 	local newest: string? = nil
