@@ -21,6 +21,11 @@ prompt caching keeps working. Commit `.hx/ext/` and the harness grows with the p
 An extension whose name starts with `_` is a helper for other extensions: `ext()` loads it like any other, and
 the system prompt does not list it.
 
+An extension that needs a service with a key gets it through an endpoint the user names at startup, so the key
+never reaches Luau: `hx --endpoint tickets=https://tickets.example/api/search` with `TICKETS_API_KEY` set lets
+`.hx/ext/tickets.luau` call `host.post("tickets", json.encode({ query = q }))`. The built-in `web`, `ocr` and
+`exa` extensions are written the same way, over endpoints hx has from the start.
+
 ## Built in: bytes, text, path, search, http, web, ocr and exa
 
 Eight extensions come with hx, in `lua/ext/`. `bytes`, `text`, `path`, `search` and `http` need no key and are

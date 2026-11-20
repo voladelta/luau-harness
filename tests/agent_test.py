@@ -1745,6 +1745,42 @@ class AgentTest(unittest.TestCase):
         self.assertIn("- exa (built in): researches a question", system)
         self.assertNotIn("- web (built in)", system)
 
+    def test_an_endpoint_named_at_startup_is_reached_with_its_own_key(self):
+        tools = Tools()
+        self.addCleanup(tools.server_close)
+        self.addCleanup(tools.shutdown)
+        key = "my-api-key-31"
+        done = self.run_hx("--endpoint", "my-api=" + tools.url + "/fetch", "--endpoint", "bare=" + tools.url + "/search",
+                           "go", MY_API_API_KEY=key, script=[
+                               call("lua", {"code": "return host.post('my-api', '{\"url\":\"u\"}')"}, "c1"),
+                               call("lua", {"code": "return host.post('bare', '{}')"}, "c2"),
+                               call("lua", {"code": "return host.endpoints['my-api'], host.endpoints.bare"}, "c3"),
+                               call("bash", {"command": "env"}, "c4"),
+                               say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        results = self.tool_results()
+        self.assertIn("200\n", results[0])
+        self.assertIn("A small fast language.", results[0])
+        self.assertEqual([r["path"] for r in tools.requests], ["/v1/tools/fetch"])
+        self.assertEqual(tools.requests[0]["headers"]["authorization"], "Bearer " + key)
+        self.assertEqual(tools.requests[0]["body"], b'{"url":"u"}')
+        self.assertIn("no BARE_API_KEY", results[1])
+        self.assertEqual(results[2], "true\nfalse")
+        self.assertNotIn(key, results[3])
+        self.assertNotIn(key, json.dumps(self.model.requests))
+        for pair, said in (("exa=https://x.test", "there is an endpoint named exa already"),
+                           ("session=https://x.test", "there is an endpoint named session already"),
+                           ("My=https://x.test", "a name is up to 40 lower-case letters"),
+                           ("mine", "it takes NAME=URL"),
+                           ("mine=ftp://x.test", "the URL starts with https:// or http://")):
+            refused = self.run_hx("--endpoint", pair, "go")
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assertIn(said, refused.stderr)
+        twice = self.run_hx("--endpoint", "mine=https://x.test", "--endpoint", "mine=https://y.test", "go")
+        self.assertIn("there is an endpoint named mine already", twice.stderr)
+        self.assertIn("--resume goes on with the agent's conversation",
+                      self.run_hx("--resume", "last", "--run", "x.luau").stderr)
+
     def test_without_a_deepseek_key_the_tools_say_so(self):
         done = self.run_hx("go", script=[
             call("lua", {"code": "return ext('web').search('luau')"}, "c1"),

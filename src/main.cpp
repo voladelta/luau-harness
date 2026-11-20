@@ -78,6 +78,10 @@ options:
   --rpi             lead the task by the rpi workflow (research, plan, implement): the model is opus
                     unless --model names another, whatever HX_MODEL says, and its agents run on
                     deepseek-flash when DEEPSEEK_API_KEY is set, on the lead's model otherwise
+  --endpoint NAME=URL
+                    one more endpoint for host.post(NAME, body), for an extension of yours: its key is
+                    read from NAME_API_KEY (my-api has MY_API_API_KEY) and sent as a Bearer token, to
+                    that URL only
   --resume LOG      go on from a saved conversation: LOG is a file in .hx/log, or `last` for the newest
   --ro PATH        also allow reading PATH (a toolchain in your home directory, for example)
   --rw PATH         also allow writing PATH
@@ -233,6 +237,7 @@ struct Options {
     std::optional<std::string> model;
     std::optional<std::string> judge;
     std::optional<std::string> resume;
+    std::vector<hx::Endpoint> endpoints;
     bool rpi = false;
     bool built_in_loop = false;
     bool sandbox = true;
@@ -245,7 +250,7 @@ struct Options {
 constexpr std::string_view kOptionNames[] = {
     "--model",   "--ro",       "--rw",   "--keep-env",      "--unix-sockets", "--no-sandbox",
     "--quiet",   "--no-input", "--init", "--full",          "--run",          "--help",
-    "--version", "--judge",    "--rpi",  "--built-in-loop", "--resume",
+    "--version", "--judge",    "--rpi",  "--built-in-loop", "--resume",       "--endpoint",
 };
 
 std::size_t distance(std::string_view a, std::string_view b) {
@@ -316,7 +321,49 @@ class OptionWord {
     std::optional<std::string_view> inline_value_;
 };
 
+bool is_built_in_endpoint(std::string_view name) {
+    return name == hx::kSessionEndpoint || std::ranges::find(kVendors, name, &Vendor::name) != std::end(kVendors) ||
+           std::ranges::find(kServices, name, &Service::name) != std::end(kServices);
+}
+
+hx::Endpoint named_endpoint(std::string_view pair, const std::vector<hx::Endpoint>& taken) {
+    const std::size_t equals = pair.find('=');
+    const std::string_view name = pair.substr(0, equals);
+    const std::string_view url = equals == std::string_view::npos ? std::string_view() : pair.substr(equals + 1);
+    const bool well_named = equals != std::string_view::npos && !name.empty() && name.size() <= 40 &&
+                            std::islower(static_cast<unsigned char>(name[0])) != 0 &&
+                            std::ranges::all_of(name, [](unsigned char c) {
+                                return std::islower(c) != 0 || std::isdigit(c) != 0 || c == '_' || c == '-';
+                            });
+    if (!well_named) {
+        throw UsageError(
+            fmt::format("--endpoint {}: it takes NAME=URL, and a name is up to 40 lower-case letters, digits, _ and -, "
+                        "starting with a letter",
+                        pair));
+    }
+    if (!url.starts_with("https://") && !url.starts_with("http://")) {
+        throw UsageError(fmt::format("--endpoint {}: the URL starts with https:// or http://", pair));
+    }
+    if (is_built_in_endpoint(name) || std::ranges::find(taken, name, &hx::Endpoint::name) != taken.end()) {
+        throw UsageError(fmt::format("--endpoint {}: there is an endpoint named {} already", pair, name));
+    }
+    std::string key_env(name);
+    std::ranges::transform(key_env, key_env.begin(),
+                           [](unsigned char c) { return c == '-' ? '_' : static_cast<char>(std::toupper(c)); });
+    return {
+        .name = std::string(name),
+        .url = std::string(url),
+        .auth = hx::Auth::Bearer,
+        .key = "",
+        .key_env = key_env + "_API_KEY",
+        .headers = {},
+    };
+}
+
 void check_combinations(const Options& options) {
+    if (options.resume && options.mode != Mode::Agent) {
+        throw UsageError("--resume goes on with the agent's conversation: it goes with neither --run nor --init");
+    }
     if (options.full && options.mode != Mode::Init) {
         throw UsageError("--full goes with --init");
     }
@@ -358,6 +405,8 @@ Options parse_args(const std::vector<std::string_view>& argv) {
             options.model = option.value("NAME");
         } else if (arg == "--judge") {
             options.judge = option.value("KIT");
+        } else if (arg == "--endpoint") {
+            options.endpoints.push_back(named_endpoint(option.value("NAME=URL"), options.endpoints));
         } else if (arg == "--resume") {
             options.resume = option.value("LOG");
         } else if (arg == "--rpi") {
@@ -960,8 +1009,11 @@ std::string service_url(const Service& service) {
     return url + service.path;
 }
 
-std::vector<std::string> key_envs(const ModelChoice& model) {
+std::vector<std::string> key_envs(const ModelChoice& model, const std::vector<hx::Endpoint>& added) {
     std::vector<std::string> names{model.key_env};
+    for (const hx::Endpoint& endpoint : added) {
+        names.emplace_back(endpoint.key_env);
+    }
     for (const Vendor& vendor : kVendors) {
         names.emplace_back(vendor.key_env);
     }
@@ -971,7 +1023,8 @@ std::vector<std::string> key_envs(const ModelChoice& model) {
     return names;
 }
 
-std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const Secrets& secrets) {
+std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const std::vector<hx::Endpoint>& added,
+                                    const Secrets& secrets) {
     const auto key = [&](std::string_view name) {
         const auto found = secrets.find(name);
         return found != secrets.end() ? found->second : std::string();
@@ -1005,6 +1058,10 @@ std::vector<hx::Endpoint> endpoints(const ModelChoice& model, const Secrets& sec
             .headers = {},
         });
     }
+    for (hx::Endpoint endpoint : added) {
+        endpoint.key = key(endpoint.key_env);
+        endpoints.push_back(std::move(endpoint));
+    }
     return endpoints;
 }
 
@@ -1019,7 +1076,8 @@ std::string ca_bundle() {
 
 hx::HostConfig host_config(const Options& options, const ModelChoice& model, bool interactive) {
     hx::HostConfig config;
-    config.endpoints = endpoints(model, take_secrets(key_envs(model), options.keep_env));
+    config.endpoints =
+        endpoints(model, options.endpoints, take_secrets(key_envs(model, options.endpoints), options.keep_env));
     config.model = model.model;
     config.args = options.args;
     config.interactive = interactive;
