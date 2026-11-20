@@ -133,9 +133,20 @@ end
 
 local workdir = state .. "/run"
 
+local function has_script(path: string): boolean
+	local info = host.stat(path)
+	if not info then
+		return false
+	end
+	if info.type == "file" then
+		return true
+	end
+	return host.sh({ "test", "-f", path }).code == 0
+end
+
 local function build(dir: string): (boolean, ...string)
 	shell(("rm -rf %s %s/built && cp -a %s/src %s"):format(quote(workdir), quote(dir), quote(dir), quote(workdir)))
-	if host.stat(kit .. "/build") then
+	if has_script(kit .. "/build") then
 		local seconds, why = candidate(workdir, "build")
 		if not seconds then
 			return false, why
@@ -152,7 +163,7 @@ local function measure(built: string): (Measure?, ...string)
 	if not seconds then
 		return nil, why
 	end
-	if not host.stat(kit .. "/check") then
+	if not has_script(kit .. "/check") then
 		return { kind = "seconds", value = seconds }
 	end
 	shell(("find %s -type l -delete"):format(quote(dir)))
