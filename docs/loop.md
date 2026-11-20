@@ -14,6 +14,7 @@ call to the next. The code acts through these functions:
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file. It refuses one that changed since the conversation last read or wrote it, and says to read it again (see [Agents](agents.md)) |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
+| `see(path)` | puts a PNG, JPEG, GIF or WebP file into the call's result as an image block, after the text, for a model that takes images: at most `M.image_bytes` (5 MiB) each and `M.images_per_call` (8) a call. `M.vision = false` turns it away for a model that takes none |
 | `skill(name?)` | a skill's instructions, by name; with no name, or a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
 | `ext(name)` | an extension's table of functions |
 | `agents(tasks)` | gives each task to an agent, all at work at the same time, and returns their reports (see [Agents](agents.md)) |

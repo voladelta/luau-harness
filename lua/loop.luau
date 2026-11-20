@@ -12,6 +12,7 @@ type Block = {
 	is_error: boolean?,
 	from: any,
 	to: any,
+	source: any,
 }
 type Message = { role: string, content: string | { Block } }
 type Usage = {
@@ -28,7 +29,7 @@ type Tool = {
 	name: string,
 	description: string | () -> string,
 	parameters: Schema?,
-	run: ({ [string]: any }) -> (string, boolean?),
+	run: ({ [string]: any }) -> (string, boolean?, { Block }?),
 }
 type Skill = { name: string, description: string, dir: string, path: string, hidden: boolean, source: string? }
 type Features = { effort: string?, fallbacks: string?, display: string?, compaction: boolean? }
@@ -59,6 +60,7 @@ local live: {
 	seen: { [string]: { mtime: number, size: number } },
 	wrote: { string },
 	shared_since: number?,
+	images: { Block }?,
 } = {
 	usage = {},
 	spills = 0,
@@ -72,6 +74,7 @@ local live: {
 	seen = {},
 	wrote = {},
 	shared_since = nil,
+	images = nil,
 }
 setmetatable(live.wrappers, { __mode = "k" })
 
@@ -736,6 +739,29 @@ local function check(fname: string, value: any, position: number, name: string, 
 	error(("%s: argument %d (%s) must be a %s, not %s; usage: %s"):format(fname, position, name, kind, got, usage), 0)
 end
 
+M.vision = true
+M.image_bytes = 5 * 1024 * 1024
+M.images_per_call = 8
+
+local image_kinds = {
+	{ type = "image/png", starts = "\137PNG\r\n\26\n" },
+	{ type = "image/jpeg", starts = "\255\216\255" },
+	{ type = "image/gif", starts = "GIF8" },
+	{ type = "image/webp", starts = "RIFF", at_9 = "WEBP" },
+}
+
+function M.image(data: string): Block?
+	for _, kind in image_kinds do
+		if data:sub(1, #kind.starts) == kind.starts and (not kind.at_9 or data:sub(9, 12) == kind.at_9) then
+			return {
+				type = "image",
+				source = { type = "base64", media_type = kind.type, data = M.ext("bytes").base64(data) },
+			}
+		end
+	end
+	return nil
+end
+
 M.functions = {
 	{
 		name = "bash",
@@ -900,6 +926,37 @@ M.functions = {
 		end,
 	},
 	{
+		name = "see",
+		usage = "see(path) -> text: puts an image file, PNG, JPEG, GIF or WebP, into this call's result for you to "
+			.. "look at: a screenshot, a chart, a rendered page. It is for looking; text in a document comes from "
+			.. "read, or from a tool that extracts it.",
+		run = function(path: any): string
+			check("see", path, 1, "path", "string")
+			progress("  see " .. M.printable(path))
+			if not M.vision then
+				error("see: this session's model takes no images", 0)
+			end
+			local images = live.images
+			if not images then
+				error("see: an image is shown in the result of the lua call that asks for it, and this is not one", 0)
+			end
+			if #images >= M.images_per_call then
+				error(("see: one call shows %d images at most; look at these first"):format(M.images_per_call), 0)
+			end
+			local data: string = or_raise(host.read(path))
+			if #data > M.image_bytes then
+				error(("see: %s is %d bytes, and an image may be %d at most: scale it down first"):format(path, #data,
+					M.image_bytes), 0)
+			end
+			local image = M.image(data)
+			if not image then
+				error(("see: %s is not a PNG, JPEG, GIF or WebP image"):format(path), 0)
+			end
+			table.insert(images, image)
+			return ("[image %d of this result: %s, %s, %d bytes]"):format(#images, path, image.source.media_type, #data)
+		end,
+	},
+	{
 		name = "skill",
 		usage = "skill(name?) -> text: the instructions of the skill of that name (case, -, _, . and spaces do not "
 			.. "matter), headed by its directory; with no name, the skills with what each is for.",
@@ -1018,22 +1075,23 @@ local tools: { Tool } = {
 			properties = { code = { type = "string" } },
 			required = { "code" },
 		},
-		run = function(args: { [string]: any }): (string, boolean)
+		run = function(args: { [string]: any }): (string, boolean, { Block }?)
 			if type(args.code) ~= "string" then
 				error('argument "code" must be a string', 0)
 			end
 			local lines: { string } = {}
+			local images: { Block } = {}
 			scratch.print = capture_print
 			local chunk: (() -> ...any)?, err: string? = host.load(args.code, "=lua", scratch)
 			if not chunk then
 				return "error: " .. tostring(err), true
 			end
-			local outer = live.printed
-			live.printed = lines
+			local outer, outer_images = live.printed, live.images
+			live.printed, live.images = lines, images
 			local ok, results = host.timed(M.call_seconds, function()
 				return table.pack(chunk())
 			end)
-			live.printed = outer
+			live.printed, live.images = outer, outer_images
 			if not ok then
 				table.insert(lines, "error: " .. tostring(results))
 			else
@@ -1042,7 +1100,7 @@ local tools: { Tool } = {
 				end
 			end
 			local failed = not ok
-			return #lines > 0 and clip(table.concat(lines, "\n")) or "[no output]", failed
+			return #lines > 0 and clip(table.concat(lines, "\n")) or "[no output]", failed, #images > 0 and images or nil
 		end,
 	},
 }
@@ -1084,7 +1142,7 @@ local function find_tool(name: string?): Tool?
 	return nil
 end
 
-local function run_tool(call: Block): (string, boolean)
+local function run_tool(call: Block): (string, boolean, { Block }?)
 	local tool = find_tool(call.name)
 	if not tool then
 		local problem = "error: there is no tool named " .. tostring(call.name)
@@ -1107,9 +1165,9 @@ local function run_tool(call: Block): (string, boolean)
 	if problem then
 		return "error: " .. problem, true
 	end
-	local ok, result, failed = pcall(tool.run, args)
+	local ok, result, failed, images = pcall(tool.run, args)
 	if ok then
-		return result, failed == true
+		return result, failed == true, images
 	end
 	return "error: " .. tostring(result), true
 end
@@ -1397,13 +1455,17 @@ function Conversation.reply(self: Conversation, content: { Block }): { Block }
 	return tool_calls(message)
 end
 
-function Conversation.answer(self: Conversation, run: (Block) -> (string, boolean?))
+function Conversation.answer(self: Conversation, run: (Block) -> (string, boolean?, { Block }?))
 	expect(self, "answer", "owing")
 	local results: { Block } = {}
 	for _, call in tool_calls(self.messages[#self.messages]) do
-		local text, failed = run(call)
+		local text, failed, images = run(call)
 		local is_error: boolean? = failed or nil
-		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = text, is_error = is_error })
+		local content: any = text
+		if images and #images > 0 then
+			content = table.move(images, 1, #images, 2, { { type = "text", text = text } })
+		end
+		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = content, is_error = is_error })
 	end
 	table.insert(self.messages, { role = "user", content = results })
 	if self.on_answer then

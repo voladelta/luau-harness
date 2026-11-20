@@ -3,7 +3,7 @@ local dir = host.env("TMPDIR") .. "/"
 
 local here = (debug.info(1, "s"):gsub("[^/]*$", ""))
 local checks = assert(host.load(assert(host.read(here .. "check.luau")), "=" .. here .. "check.luau"))()
-local check, raises = checks.check, checks.raises
+local check, has, raises = checks.check, checks.has, checks.raises
 
 local tools = {}
 for _, fn in loop.functions do
@@ -89,6 +89,30 @@ check("edit reads the file as it is, and needs no second read", tools.edit(dir .
 check("after which write knows it", tools.write(dir .. "stale.txt", "x"), ("wrote 1 bytes to %sstale.txt"):format(dir))
 host.write(dir .. "unread.txt", "never read here")
 check("a file never read is overwritten when nobody shares the directory", tools.write(dir .. "unread.txt", "x"), ("wrote 1 bytes to %sunread.txt"):format(dir))
+
+local png = "\137PNG\r\n\26\n" .. string.rep("\0", 20)
+host.write(dir .. "shot.png", png)
+host.write(dir .. "anim.webp", "RIFF\4\0\0\0WEBPVP8 ")
+local shown, failed, images = loop.tools[1].run({ code = ("print(see(%q)) return see(%q)"):format(dir .. "shot.png", dir .. "anim.webp") })
+check("see says what it shows", shown, ("[image 1 of this result: %sshot.png, image/png, 28 bytes]\n[image 2 of this result: %sanim.webp, image/webp, 16 bytes]"):format(dir, dir))
+check("which is no failure", failed, false)
+check("the images come with the result", #images, 2)
+check("as blocks the model can look at", json.encode(images[1]),
+	json.encode({ type = "image", source = { type = "base64", media_type = "image/png", data = loop.ext("bytes").base64(png) } }))
+check("each of its kind", images[2].source.media_type, "image/webp")
+check("a call that looks at nothing has none", select(3, loop.tools[1].run({ code = "return 1" })), nil)
+host.write(dir .. "not.png", "text")
+has("a file that is no image", lua(("return see(%q)"):format(dir .. "not.png")), "not.png is not a PNG, JPEG, GIF or WebP image")
+raises("see outside a call's result", "this is not one", tools.see, dir .. "shot.png")
+loop.image_bytes = 10
+has("an image too large to send", lua(("return see(%q)"):format(dir .. "shot.png")), "is 28 bytes, and an image may be 10 at most")
+loop.image_bytes = 5 * 1024 * 1024
+loop.images_per_call = 1
+has("more images than one call shows", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "one call shows 1 images at most")
+loop.images_per_call = 8
+loop.vision = false
+has("a model that takes no images", lua(("return see(%q)"):format(dir .. "shot.png")), "this session's model takes no images")
+loop.vision = true
 
 tools.write(dir .. "e.txt", "alpha beta\nalpha gamma\n")
 check("edit", tools.edit(dir .. "e.txt", "beta", "BETA"), ("replaced 1 occurrence in %se.txt"):format(dir))
@@ -221,7 +245,7 @@ check("a project function is there at once", lua("return twice(21)"), "42")
 check("and the model reads about it", loop.tools[1].description():find("- twice(n) -> number", 1, true) ~= nil, true)
 table.remove(loop.functions)
 local description = loop.tools[1].description()
-for _, name in { "bash(command, timeout?)", "read(path, offset?, limit?)", "write(path, content)", "edit(path, old, new, all?)", "ext(name)", "[==[" } do
+for _, name in { "bash(command, timeout?)", "read(path, offset?, limit?)", "write(path, content)", "edit(path, old, new, all?)", "see(path)", "ext(name)", "[==[" } do
 	check("the tool describes " .. name, description:find(name, 1, true) ~= nil, true)
 end
 check("the description is the same each time, for the cache", loop.tools[1].description(), description)
