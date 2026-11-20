@@ -1085,7 +1085,7 @@ int run(const std::vector<std::string_view>& argv) {
     const TempDir tmp;
 
     static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
-    if (options.sandbox && options.judge) {
+    if (options.judge) {
         check_sandbox_paths(options, project);
     }
     std::optional<hx::Judge> judge =

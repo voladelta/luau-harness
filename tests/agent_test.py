@@ -2136,7 +2136,7 @@ print(state("plain.pid") == "S", state(box .. "/walled.pid") == "S")
     def ledger(self):
         return [json.loads(line) for line in read(self.judge_state(), "ledger.jsonl").splitlines()]
 
-    def drive(self, kit, body, *flags, timeout=120):
+    def write_driver(self, body):
         with open(os.path.join(self.project, "drive.luau"), "w") as f:
             f.write("""
 function submit(note)
@@ -2145,8 +2145,38 @@ function submit(note)
 end
 function say(text) print((tostring(text):gsub("\\n", " | "))) end
 """ + body)
+
+    def drive(self, kit, body, *flags, timeout=120):
+        self.write_driver(body)
         return subprocess.run([HX, *flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
                               env=self.env(XDG_STATE_HOME=""), capture_output=True, text=True, timeout=timeout)
+
+    def drive_gated(self, kit, body):
+        flags = os.path.join(self.root, "flags")
+        os.makedirs(flags)
+        self.write_driver(f"""
+function gate(name)
+    host.write("{flags}/" .. name .. ".ready", "")
+    while not host.stat("{flags}/" .. name .. ".go") do host.sh("sleep 0.05") end
+end
+""" + body)
+        process = subprocess.Popen([HX, "--rw", flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
+                                   env=self.env(XDG_STATE_HOME=""), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        self.addCleanup(kill_quietly, process.pid)
+
+        def reached(name):
+            for _ in range(400):
+                if os.path.exists(os.path.join(flags, name + ".ready")):
+                    return
+                time.sleep(0.05)
+            self.fail(f"the driver never reached {name}")
+
+        def release(name):
+            with open(os.path.join(flags, name + ".go"), "w"):
+                pass
+
+        return process, reached, release
 
     def test_judge_keeps_only_confirmed_wins(self):
         kit = self.make_kit()
@@ -2410,6 +2440,74 @@ host.write("prog.sh", "echo SECRET-OUTPUT; exit 1\\n"); say(submit("crash"))
         self.assertTrue(self.tool_results()[1].startswith("Trial 1. win:"), self.tool_results())
         self.assertIn("hx judge: 1 trial: 1 win", done.stderr)
         self.assertEqual(self.ledger()[1]["note"], "dropped the long sleep")
+
+    def test_judge_dangling_optional_script_links_are_treated_as_absent(self):
+        kit = self.make_kit(check=None, config='{"runs": 1}')
+        os.symlink(os.path.join(kit, "missing-build"), os.path.join(kit, "build"))
+        os.symlink(os.path.join(kit, "missing-check"), os.path.join(kit, "check"))
+        done = self.drive(kit, 'host.write("prog.sh", "sleep 0.05\\necho 42\\n"); say(submit("fast"))\n')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stderr, r"the starting point passes \([0-9.]+ s\); it is the champion")
+        self.assertTrue(done.stdout.startswith("Trial 1. win:"), done.stdout)
+        self.assertIn(" s)", done.stdout)
+        self.assertEqual([e["verdict"] for e in self.ledger()], ["start", "win"])
+
+    def test_judge_a_ledger_write_failure_leaves_no_tmp_patch_or_phantom_win(self):
+        kit = self.make_kit(config='{"runs": 1}')
+        proc, reached, release = self.drive_gated(kit, """
+host.write("prog.sh", "sleep 0.05\\necho 42\\n")
+gate("blocked")
+say(submit("blocked ledger"))
+gate("restored")
+say(submit("restored ledger"))
+""")
+        reached("blocked")
+        state = self.judge_state()
+        ledger_path = os.path.join(state, "ledger.jsonl")
+        saved_ledger = read(state, "ledger.jsonl")
+        os.unlink(ledger_path)
+        os.mkdir(ledger_path)
+        release("blocked")
+
+        reached("restored")
+        self.assertFalse(os.path.exists(os.path.join(state, "champion.patch.tmp")))
+        self.assertEqual(read(state, "champion.patch"), "")
+        os.rmdir(ledger_path)
+        with open(ledger_path, "w") as f:
+            f.write(saved_ledger)
+        release("restored")
+
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 2, out)
+        self.assertTrue(lines[0].startswith("Trial 1. error: the judge could not finish it"), lines[0])
+        self.assertIn("cannot write the ledger", lines[0])
+        self.assertTrue(lines[1].startswith("Trial 2. win:"), lines[1])
+        self.assertEqual([(e["trial"], e["verdict"]) for e in self.ledger()], [(0, "start"), (2, "win")])
+        self.assertFalse(os.path.exists(os.path.join(state, "champion.patch.tmp")))
+        self.assertNotEqual(read(state, "champion.patch"), "")
+
+    def test_judge_a_champion_patch_cp_cannot_write_is_replaced_without_a_duplicate_ledger_entry(self):
+        kit = self.make_kit(config='{"runs": 1}')
+        proc, reached, release = self.drive_gated(kit, """
+host.write("prog.sh", "sleep 0.05\\necho 42\\n")
+gate("start")
+say(submit("fast"))
+""")
+        reached("start")
+        state = self.judge_state()
+        patch = os.path.join(state, "champion.patch")
+        os.unlink(patch)
+        os.symlink(os.path.join(self.root, "nowhere", "champion.patch"), patch)
+        release("start")
+
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertTrue(out.startswith("Trial 1. win:"), out)
+        self.assertEqual([(e["trial"], e["verdict"]) for e in self.ledger()], [(0, "start"), (1, "win")])
+        self.assertFalse(os.path.exists(os.path.join(state, "champion.patch.tmp")))
+        self.assertNotEqual(read(state, "champion.patch"), "")
 
 
 JOBS = int(os.environ.get("HX_TEST_JOBS") or 2 * (os.cpu_count() or 1))
