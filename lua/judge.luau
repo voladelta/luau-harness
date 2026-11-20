@@ -249,11 +249,12 @@ local current: { entry: Entry, dir: string }?
 
 local function record(entry: Entry)
 	local line: string = json.encode(entry)
-	table.insert(ledger, line)
-	local wrote, why = host.write(state .. "/ledger.jsonl", table.concat(ledger, "\n") .. "\n")
+	local content = (#ledger == 0 and line or table.concat(ledger, "\n") .. "\n" .. line) .. "\n"
+	local wrote, why = host.write(state .. "/ledger.jsonl", content)
 	if not wrote then
 		error("cannot write the ledger: " .. tostring(why), 0)
 	end
+	table.insert(ledger, line)
 	local verdict = entry.verdict :: string
 	counts[verdict] = (counts[verdict] or 0) + 1
 end
@@ -351,10 +352,10 @@ local function submit(note: string): string
 	snapshot(dir .. "/src")
 	write_patch(tree(dir .. "/src"), ("trials/%d.patch"):format(trial))
 	local answer, crowned = judge(entry, dir)
+	record(entry)
 	if crowned then
 		crown(trial, dir, crowned.kind, crowned.value)
 	end
-	record(entry)
 	current = nil
 	if not crowned then
 		shell("rm -rf " .. quote(dir))
