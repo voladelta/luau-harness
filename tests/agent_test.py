@@ -2136,7 +2136,7 @@ print(state("plain.pid") == "S", state(box .. "/walled.pid") == "S")
     def ledger(self):
         return [json.loads(line) for line in read(self.judge_state(), "ledger.jsonl").splitlines()]
 
-    def drive(self, kit, body, *flags, timeout=120):
+    def write_driver(self, body):
         with open(os.path.join(self.project, "drive.luau"), "w") as f:
             f.write("""
 function submit(note)
@@ -2145,8 +2145,38 @@ function submit(note)
 end
 function say(text) print((tostring(text):gsub("\\n", " | "))) end
 """ + body)
+
+    def drive(self, kit, body, *flags, timeout=120):
+        self.write_driver(body)
         return subprocess.run([HX, *flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
                               env=self.env(XDG_STATE_HOME=""), capture_output=True, text=True, timeout=timeout)
+
+    def drive_gated(self, kit, body):
+        flags = os.path.join(self.root, "flags")
+        os.makedirs(flags)
+        self.write_driver(f"""
+function gate(name)
+    host.write("{flags}/" .. name .. ".ready", "")
+    while not host.stat("{flags}/" .. name .. ".go") do host.sh("sleep 0.05") end
+end
+""" + body)
+        process = subprocess.Popen([HX, "--rw", flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
+                                   env=self.env(XDG_STATE_HOME=""), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        self.addCleanup(kill_quietly, process.pid)
+
+        def reached(name):
+            for _ in range(400):
+                if os.path.exists(os.path.join(flags, name + ".ready")):
+                    return
+                time.sleep(0.05)
+            self.fail(f"the driver never reached {name}")
+
+        def release(name):
+            with open(os.path.join(flags, name + ".go"), "w"):
+                pass
+
+        return process, reached, release
 
     def test_judge_keeps_only_confirmed_wins(self):
         kit = self.make_kit()
@@ -2424,55 +2454,28 @@ host.write("prog.sh", "echo SECRET-OUTPUT; exit 1\\n"); say(submit("crash"))
 
     def test_judge_a_ledger_write_failure_leaves_no_tmp_patch_or_phantom_win(self):
         kit = self.make_kit(config='{"runs": 1}')
-        flags = os.path.join(self.root, "flags")
-        os.makedirs(flags)
-        with open(os.path.join(self.project, "drive.luau"), "w") as f:
-            f.write(f"""
-local function submit(note)
-    local lines, pending = host.judge(json.encode({{ note = note }}))
-    return lines[1] and json.decode(lines[1]) or pending
-end
-local function say(text) print((tostring(text):gsub("\\n", " | "))) end
-local function wait_for(path)
-    while not host.stat(path) do host.sh("sleep 0.05") end
-end
+        proc, reached, release = self.drive_gated(kit, """
 host.write("prog.sh", "sleep 0.05\\necho 42\\n")
-host.write("{flags}/ready1", "")
-wait_for("{flags}/go1")
+gate("blocked")
 say(submit("blocked ledger"))
-host.write("{flags}/ready2", "")
-wait_for("{flags}/go2")
+gate("restored")
 say(submit("restored ledger"))
 """)
-        proc = subprocess.Popen([HX, "--rw", flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
-                                env=self.env(XDG_STATE_HOME=""), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.addCleanup(kill_quietly, proc.pid)
-
-        def await_flag(name):
-            path = os.path.join(flags, name)
-            for _ in range(400):
-                if os.path.exists(path):
-                    return
-                time.sleep(0.05)
-            self.fail(f"never saw {name}")
-
-        await_flag("ready1")
+        reached("blocked")
         state = self.judge_state()
         ledger_path = os.path.join(state, "ledger.jsonl")
         saved_ledger = read(state, "ledger.jsonl")
         os.unlink(ledger_path)
         os.mkdir(ledger_path)
-        with open(os.path.join(flags, "go1"), "w"):
-            pass
+        release("blocked")
 
-        await_flag("ready2")
+        reached("restored")
         self.assertFalse(os.path.exists(os.path.join(state, "champion.patch.tmp")))
         self.assertEqual(read(state, "champion.patch"), "")
         os.rmdir(ledger_path)
         with open(ledger_path, "w") as f:
             f.write(saved_ledger)
-        with open(os.path.join(flags, "go2"), "w"):
-            pass
+        release("restored")
 
         out, err = proc.communicate(timeout=30)
         self.assertEqual(proc.returncode, 0, err)
@@ -2485,43 +2488,19 @@ say(submit("restored ledger"))
         self.assertFalse(os.path.exists(os.path.join(state, "champion.patch.tmp")))
         self.assertNotEqual(read(state, "champion.patch"), "")
 
-    def test_judge_staging_champion_patch_replaces_readonly_patch_without_duplicate_ledger(self):
+    def test_judge_a_champion_patch_cp_cannot_write_is_replaced_without_a_duplicate_ledger_entry(self):
         kit = self.make_kit(config='{"runs": 1}')
-        flags = os.path.join(self.root, "flags")
-        os.makedirs(flags)
-        with open(os.path.join(self.project, "drive.luau"), "w") as f:
-            f.write(f"""
-local function submit(note)
-    local lines, pending = host.judge(json.encode({{ note = note }}))
-    return lines[1] and json.decode(lines[1]) or pending
-end
-local function say(text) print((tostring(text):gsub("\\n", " | "))) end
-local function wait_for(path)
-    while not host.stat(path) do host.sh("sleep 0.05") end
-end
+        proc, reached, release = self.drive_gated(kit, """
 host.write("prog.sh", "sleep 0.05\\necho 42\\n")
-host.write("{flags}/ready", "")
-wait_for("{flags}/go")
+gate("start")
 say(submit("fast"))
 """)
-        proc = subprocess.Popen([HX, "--rw", flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
-                                env=self.env(XDG_STATE_HOME=""), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.addCleanup(kill_quietly, proc.pid)
-
-        ready = os.path.join(flags, "ready")
-        for _ in range(400):
-            if os.path.exists(ready):
-                break
-            time.sleep(0.05)
-        else:
-            self.fail("never saw ready")
-
+        reached("start")
         state = self.judge_state()
         patch = os.path.join(state, "champion.patch")
-        os.chmod(patch, 0o444)
-        self.addCleanup(lambda: os.path.exists(patch) and os.chmod(patch, 0o644))
-        with open(os.path.join(flags, "go"), "w"):
-            pass
+        os.unlink(patch)
+        os.symlink(os.path.join(self.root, "nowhere", "champion.patch"), patch)
+        release("start")
 
         out, err = proc.communicate(timeout=30)
         self.assertEqual(proc.returncode, 0, err)
