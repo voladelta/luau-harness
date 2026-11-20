@@ -685,16 +685,28 @@ local function or_raise<T>(value: T?, err: string?): T
 end
 
 local function tracked(path: string): (string, { type: string, mtime: number, size: number, target: string? }?)
-	local paths = M.ext("path")
-	local stat = host.stat(path)
-	for _ = 1, 8 do
-		if not stat or stat.type ~= "link" or not stat.target then
-			break
+	local pending = M.ext("path").join(host.cwd or "/", path):split("/")
+	local resolved, hops = "", 0
+	while #pending > 0 do
+		local part = table.remove(pending, 1) :: string
+		if part == ".." then
+			resolved = resolved:match("^(.*)/[^/]*$") or ""
+		elseif part ~= "" and part ~= "." then
+			local stat = host.stat(resolved .. "/" .. part)
+			if stat and stat.type == "link" and stat.target and hops < M.link_hops then
+				hops += 1
+				local target = stat.target:split("/")
+				if stat.target:sub(1, 1) == "/" then
+					resolved = ""
+				end
+				pending = table.move(pending, 1, #pending, #target + 1, target)
+			else
+				resolved ..= "/" .. part
+			end
 		end
-		path = paths.join(paths.dirname(path), stat.target)
-		stat = host.stat(path)
 	end
-	return paths.normalize(paths.join(host.cwd or ".", path)), stat
+	local whole = if resolved == "" then "/" else resolved
+	return whole, host.stat(whole)
 end
 
 local function file_clock(): number
@@ -1604,6 +1616,7 @@ M.compact_prompt = table.concat({
 M.resume_prompt = "Earlier turns were replaced by the checkpoint above, written by you. Treat it as established "
 	.. "and continue the work from it directly, without restating or acknowledging it."
 M.globals_listed = 40
+M.link_hops = 40
 
 function M.resume_text(): string
 	local names = {}
