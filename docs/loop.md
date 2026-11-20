@@ -12,7 +12,7 @@ call to the next. The code acts through these functions:
 |---|---|
 | `bash(command, timeout?)` | runs a command and returns its output, then `[exit N]`; kills it after a timeout. The status line is for reading: output used as data comes from `host.sh`, whose line in the tool's description offers `split = true` to keep stderr out of it and asks for it to be parsed in Luau rather than in a python or jq pipeline |
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
-| `write(path, content)` | creates or overwrites a file |
+| `write(path, content)` | creates or overwrites a file. It refuses one that changed since the conversation last read or wrote it, and says to read it again (see [Agents](agents.md)) |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
 | `skill(name?)` | a skill's instructions, by name; with no name, or a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
 | `ext(name)` | an extension's table of functions |

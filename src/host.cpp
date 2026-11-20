@@ -424,6 +424,7 @@ void Host::open(lua_State* L) {
         {.name = "clip", .func = l_clip},
         {.name = "spawn", .func = spawn},
         {.name = "wait", .func = wait},
+        {.name = "stop", .func = stop},
         {.name = "stat", .func = l_stat},
         {.name = "walk", .func = l_walk},
         {.name = "printable", .func = l_printable},

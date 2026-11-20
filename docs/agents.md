@@ -43,12 +43,22 @@ the agents' steps, which is what keeps a long job inside its context.
   `M.agent_seconds` (1800), and is then stopped and reported as stopped, with its conversation intact.
 - **What is shared.** Files, and nothing else. What an agent sets in the VM, globals and loaded extensions, is its
   own and gone with its run; what its commands left running is killed when the run ends. Agents write the one
-  project directory, so two that edit the same file overwrite each other: the lead is told to give each task its
-  own files, and hx does not check that it did.
+  project directory, and the lead is told to give each task its own files. `write` holds the line where it can:
+  it refuses to overwrite a file that changed since the conversation last read or wrote it, and, once agents
+  share the directory, a file it never read that was written after its task began. The refusal says to read the
+  file first, so it costs a step and loses nothing. `edit` reads the file as it is and replaces one text in it,
+  so it carries another's change along rather than undoing it. Commands and `host.write` are not checked: two
+  agents that run a formatter over the same file still overwrite each other.
+- **The report.** Under its `[agent NAME: done in N s]` line a report names the files the agent wrote with
+  `write` and `edit`, up to `M.agent_wrote_listed` (20), and, when the project has `.hx/`, the file its whole
+  conversation is saved in. The lead reads that file when a report leaves out what it needs, rather than
+  sending the agent back to say it again.
 - **What an agent lacks.** It has no `agents` function, so agents do not multiply, and no `submit` under
   `--judge`: the lead submits. Its words go to stderr as progress lines headed by its name, `[parser] bash make
   test-parse`, and only the lead's words are the answer on stdout.
-- **Stopping.** Ctrl-C reaches the agents as it reaches hx, and each ends its run; an agent stopped that way keeps
+- **Stopping.** `agents({ { name = "parser", stop = true } })` stops one agent's run (`host.stop`): what it
+  started is killed, its report says it was stopped, and it has the conversation it had before that task. One
+  that was still waiting for a place is taken off the list. Ctrl-C reaches the agents as it reaches hx, and each ends its run; an agent stopped that way keeps
   the conversation it had before the task. When hx exits, every agent still at work is killed with what it
   started. A lead that answers while agents are at work would end them that way, so it is told once, and its next
   answer stands.

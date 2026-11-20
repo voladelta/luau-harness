@@ -56,6 +56,9 @@ local live: {
 	repeats: Repeats,
 	printed: { string }?,
 	agent: { name: string, run: number }?,
+	seen: { [string]: { mtime: number, size: number } },
+	wrote: { string },
+	shared_since: number?,
 } = {
 	usage = {},
 	spills = 0,
@@ -66,6 +69,9 @@ local live: {
 	repeats = { counts = {}, worst = nil },
 	printed = nil,
 	agent = nil,
+	seen = {},
+	wrote = {},
+	shared_since = nil,
 }
 setmetatable(live.wrappers, { __mode = "k" })
 
@@ -675,6 +681,39 @@ local function or_raise<T>(value: T?, err: string?): T
 	return value
 end
 
+local function saw(path: string)
+	local stat = host.stat(path)
+	if stat then
+		live.seen[path] = { mtime = stat.mtime, size = stat.size }
+	end
+end
+
+local function wrote(path: string)
+	saw(path)
+	if not table.find(live.wrote, path) then
+		table.insert(live.wrote, path)
+	end
+end
+
+local function unseen_change(path: string): string?
+	local stat = host.stat(path)
+	if not stat or stat.type ~= "file" then
+		return nil
+	end
+	local seen = live.seen[path]
+	if seen then
+		if seen.mtime ~= stat.mtime or seen.size ~= stat.size then
+			return ("write: %s has changed since you last read or wrote it, and this would overwrite a change you "
+				.. "have not seen. Read it again, then write it, or edit it."):format(path)
+		end
+	elseif live.shared_since and stat.mtime > live.shared_since then
+		return ("write: %s was written while agents share this directory, and not by you: this would overwrite "
+			.. "another's work. Read it first. If it is not yours to change, leave it and say so in your "
+			.. "report."):format(path)
+	end
+	return nil
+end
+
 local function check(fname: string, value: any, position: number, name: string, kind: string, optional: boolean?)
 	if value == nil and optional then
 		return
@@ -740,6 +779,7 @@ M.functions = {
 			end
 			progress("  read " .. M.printable(path))
 			local text: string = or_raise(host.read(path))
+			saw(path)
 			if text == "" then
 				return "[empty file]"
 			end
@@ -792,12 +832,18 @@ M.functions = {
 	{
 		name = "write",
 		usage = "write(path, content) -> text: creates or overwrites a file. Missing directories are created. For a "
-			.. "change to part of an existing file, edit is cheaper and safer.",
+			.. "change to part of an existing file, edit is cheaper and safer. It refuses to overwrite a file that "
+			.. "has changed since you last read or wrote it: read it again first.",
 		run = function(path: any, content: any): string
 			check("write", path, 1, "path", "string")
 			check("write", content, 2, "content", "string")
 			progress("  write " .. M.printable(path))
+			local changed = unseen_change(path)
+			if changed then
+				error(changed, 0)
+			end
 			or_raise(host.write(path, content))
+			wrote(path)
 			return ("wrote %d bytes to %s"):format(#content, path)
 		end,
 	},
@@ -849,6 +895,7 @@ M.functions = {
 				error(("edit: old text occurs %d times in %s: add surrounding lines to make it unique, or pass all = true"):format(count, path), 0)
 			end
 			or_raise(host.write(path, table.concat(pieces)))
+			wrote(path)
 			return ("replaced %d occurrence%s in %s"):format(count, count == 1 and "" or "s", path)
 		end,
 	},
@@ -1686,6 +1733,7 @@ type Agent = {
 	id: number?,
 	started: number,
 	report: string?,
+	stopping: boolean,
 }
 local fleet: { agents: { Agent }, waiting: { Agent }, system: string? } = { agents = {}, waiting = {}, system = nil }
 
@@ -1718,6 +1766,7 @@ local function agent_named(name: string): Agent
 		id = nil,
 		started = 0,
 		report = nil,
+		stopping = false,
 	}
 	sub_log(agent.talk)
 	table.insert(fleet.agents, agent)
@@ -1728,6 +1777,7 @@ local function work(agent: Agent, system: string): string
 	local began = os.clock()
 	live.agent = { name = agent.name, run = agent.runs }
 	live.usage = {}
+	live.seen, live.wrote, live.shared_since = {}, {}, os.time() + 1
 	agent.talk.model = agent_model()
 	agent.talk:say(agent.task)
 	local ok, err = host.timed(M.agent_seconds, M.turn, system, agent.talk)
@@ -1737,6 +1787,7 @@ local function work(agent: Agent, system: string): string
 	return json.encode({
 		messages = agent.talk.messages,
 		usage = live.usage,
+		wrote = live.wrote,
 		seconds = os.clock() - began,
 		error = if ok then nil else tostring(err),
 	})
@@ -1752,19 +1803,42 @@ local function start(agent: Agent)
 	progress(("  agent %s: %s"):format(agent.name, headline(agent.task)))
 end
 
+M.agent_wrote_listed = 20
+
+local function trail(agent: Agent, files: { string }): string
+	local lines = {}
+	if #files > 0 then
+		local listed = table.move(files, 1, math.min(#files, M.agent_wrote_listed), 1, {})
+		local more = if #files > #listed then (" and %d more"):format(#files - #listed) else ""
+		table.insert(lines, ("[wrote, with write and edit: %s%s]"):format(table.concat(listed, ", "), more))
+	end
+	local log = sub_logs[agent.talk]
+	if log and host.stat(log) then
+		table.insert(lines, ("[its conversation: %s]"):format(log))
+	end
+	return if #lines > 0 then table.concat(lines, "\n") .. "\n" else ""
+end
+
 local function finish(agent: Agent, returned: boolean, text: string)
 	agent.state, agent.id = "idle", nil
-	local done: { messages: { Message }, usage: { Count }, seconds: number, error: string? }? = nil
+	local done: { messages: { Message }, usage: { Count }, wrote: { string }?, seconds: number, error: string? }? = nil
 	if returned then
 		local decoded: any = json.decode(text)
 		if type(decoded) == "table" and type(decoded.messages) == "table" then
 			done = decoded
 		end
 	end
+	if not done and agent.stopping and text == "terminated" then
+		agent.stopping = false
+		agent.report = ("[agent %s: stopped as you asked, after %.0f s. It has the conversation it had before this "
+			.. "task, and may have changed files.]\n%s"):format(agent.name, os.clock() - agent.started, trail(agent, {}))
+			:gsub("\n$", "")
+		return
+	end
 	if not done then
 		agent.report = ("[agent %s: stopped after %.0f s (%s). It has the conversation it had before this task, "
-			.. "and may have changed files.]"):format(agent.name, os.clock() - agent.started,
-			if returned then "its result could not be read" else text)
+			.. "and may have changed files.]\n%s"):format(agent.name, os.clock() - agent.started,
+			if returned then "its result could not be read" else text, trail(agent, {})):gsub("\n$", "")
 		return
 	end
 	agent.talk.messages = done.messages
@@ -1790,43 +1864,52 @@ local function finish(agent: Agent, returned: boolean, text: string)
 	elseif failure then
 		how = ("failed after %.0f s: %s"):format(done.seconds, failure)
 	end
-	agent.report = ("[agent %s: %s]\n%s"):format(agent.name, how,
+	agent.stopping = false
+	agent.report = ("[agent %s: %s]\n%s%s"):format(agent.name, how, trail(agent, done.wrote or {}),
 		if #words > 0 then table.concat(words, "\n") else "(it said nothing)")
 end
 
-local function checked_tasks(tasks: any): { { name: string, task: string } }
+local function checked_tasks(tasks: any): { { name: string, task: string?, stop: boolean? } }
 	check("agents", tasks, 1, "tasks", "table", true)
 	if not tasks then
 		return {}
 	end
-	if type(tasks.name) == "string" and type(tasks.task) == "string" then
+	if type(tasks.name) == "string" and (type(tasks.task) == "string" or tasks.stop == true) then
 		tasks = { tasks }
 	elseif #tasks == 0 and next(tasks) ~= nil then
 		error('agents: tasks is a list, as in agents({ { name = "parser", task = "..." } })', 0)
 	end
 	local sends, seen = {}, {}
 	for i, item in ipairs(tasks) do
-		if type(item) ~= "table" or type(item.name) ~= "string" or type(item.task) ~= "string" then
+		local stop = type(item) == "table" and item.stop == true
+		if stop and item.task ~= nil then
+			error(("agents: task %d has a task and stop = true; send one or the other"):format(i), 0)
+		end
+		if type(item) ~= "table" or type(item.name) ~= "string" or not (stop or type(item.task) == "string") then
 			error(('agents: task %d must be a table { name = "...", task = "..." }'):format(i), 0)
 		end
-		local name: string, task: string = item.name, item.task
+		local name: string, task: string? = item.name, item.task
 		if not name:match("^[%w_%-]+$") or #name > 40 then
 			error(("agents: task %d: a name is up to 40 letters, digits, _ and -, not %q"):format(i, name), 0)
 		end
-		if task:match("^%s*$") then
+		if task and task:match("^%s*$") then
 			error(("agents: the task for %s is empty"):format(name), 0)
 		end
 		if seen[name] then
 			error(("agents: %s is given two tasks in one call; an agent takes one at a time"):format(name), 0)
 		end
 		seen[name] = true
+		local busy = false
 		for _, agent in fleet.agents do
-			if agent.name == name and agent.state ~= "idle" then
-				error(("agents: %s is still at work on its last task. Wait for its report, with agents() and no "
-					.. "tasks, before you send it more."):format(name), 0)
-			end
+			busy = busy or agent.name == name and agent.state ~= "idle"
 		end
-		table.insert(sends, { name = name, task = task })
+		if busy and not stop then
+			error(("agents: %s is still at work on its last task. Wait for its report, with agents() and no "
+				.. "tasks, before you send it more, or stop it with { name = %q, stop = true }."):format(name, name), 0)
+		elseif stop and not busy then
+			error(("agents: %s is not at work, so there is nothing to stop"):format(name), 0)
+		end
+		table.insert(sends, { name = name, task = task, stop = stop })
 	end
 	return sends
 end
@@ -1842,16 +1925,28 @@ table.insert(M.functions, {
 		.. "has an agent goes to that agent as your next message to it, with all it did still in its "
 		.. "conversation: that is how work goes back to be fixed. The call returns after a few minutes at most, "
 		.. "with the reports so far and the names of the agents still at work; agents() with no tasks waits for "
-		.. "those.",
+		.. "those. { name = \"...\", stop = true } stops an agent at work, which keeps the conversation it had before that task. A report "
+		.. "names the files the agent wrote and, when the project keeps logs, the file its whole conversation "
+		.. "is in, to read when the report leaves something out.",
 	run = function(tasks: any): string
 		if live.agent then
 			error("agents: an agent has no agents of its own", 0)
 		end
 		for _, send in checked_tasks(tasks) do
+			live.shared_since = live.shared_since or os.time() + 1
 			local agent = agent_named(send.name)
-			agent.task, agent.state, agent.report = send.task, "waiting", nil
-			agent.runs += 1
-			table.insert(fleet.waiting, agent)
+			local waiting = table.find(fleet.waiting, agent)
+			if send.task then
+				agent.task, agent.state, agent.report = send.task, "waiting", nil
+				agent.runs += 1
+				table.insert(fleet.waiting, agent)
+			elseif waiting then
+				table.remove(fleet.waiting, waiting)
+				agent.state = "idle"
+				agent.report = ("[agent %s: stopped as you asked, before it began]"):format(agent.name)
+			elseif agent.id then
+				agent.stopping = host.stop(agent.id)
+			end
 		end
 
 		local function take_in(id: number, returned: boolean, text: string)
