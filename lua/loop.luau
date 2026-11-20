@@ -701,10 +701,8 @@ M.functions = {
 	{
 		name = "bash",
 		usage = "bash(command, timeout?) -> text: runs a bash command in the project directory, a new shell each "
-			.. "time, and returns stdout and stderr together, then [exit N]. That last line is hx's, not the "
-			.. "command's: to use the output as data, as in a file or a string you build, take host.sh(command).out "
-			.. "instead, and parse it in your code, with json.decode or string patterns, not in a python or jq "
-			.. "pipeline. The command is killed after timeout "
+			.. "time, and returns stdout and stderr together, then [exit N], for you to read. Output you will use "
+			.. "as data comes from host.sh, below. The command is killed after timeout "
 			.. "seconds (default 120). A process left in the background must send its output to a file, and is "
 			.. "killed when this session ends, daemons included: nothing you start outlives it.",
 		run = function(command: any, timeout: any): string
@@ -933,8 +931,11 @@ local function lua_description(): string
 			table.insert(lines, "- " .. fn.usage)
 		end
 	end
-	table.insert(lines, "- host.sh(command, {input?, timeout?, cwd?, env?}) -> {out, code}: runs a command for its "
-		.. "output as data, stdout and stderr together, whole up to 16 MiB; send more to a file and host.read it. "
+	table.insert(lines, "- host.sh(command, {split?, input?, timeout?, cwd?, env?}) -> {out, err, code}: runs a "
+		.. "command for its output as data, with nothing of hx's added, whole up to 16 MiB; send more to a file and "
+		.. "host.read it. With split = true, out is stdout alone and err is stderr, so a warning cannot spoil what "
+		.. "you parse; otherwise out is both together and there is no err. Parse out in your code, with "
+		.. "json.decode or string patterns, not in a python or jq pipeline. "
 		.. "command is a bash string, or a list {program, arg, ...} whose words reach the program as they are, with "
 		.. "no quoting; input is text for its stdin; cwd is the directory it runs in; env is {NAME = value} to set, "
 		.. "false to take one away.")
@@ -949,7 +950,7 @@ local function lua_description(): string
 		.. "text without pattern traps, ext(\"path\") for paths, ext(\"http\") for HTTP as data, and os.date. "
 		.. "Commands run programs: the build, tests, git, rg, curl, and tools that turn data into data, such as bc "
 		.. "for exact arithmetic on "
-		.. "large integers. Join them in Luau: json.decode(host.sh({\"curl\", \"-sfL\", url}).out), or "
+		.. "large integers. Join them in Luau: json.decode(host.sh({\"curl\", \"-sfL\", url}, {split = true}).out), or "
 		.. "host.sh({\"bc\"}, {input = expression}).out. "
 		.. "Write a script in another language only for a library the job needs that neither Luau nor the "
 		.. "system's tools have, and pass it its data through input or a file.")

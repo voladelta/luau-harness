@@ -221,7 +221,7 @@ function is a module: `main()` runs, and the number it returns is the exit statu
 
 | Primitive | Returns |
 |---|---|
-| `host.sh(command, {timeout=120, input=, cwd=, env=})` | `{out, code, signal, timed_out, seconds}`: `out` whole up to 16 MiB. `command` is a bash string, or `{program, arg, ...}` with no quoting needed; `input` goes to stdin; `cwd` is where it runs; `env` sets variables, `false` takes one away |
+| `host.sh(command, {timeout=120, input=, cwd=, env=, split=})` | `{out, err, code, signal, timed_out, seconds}`: `out` whole up to 16 MiB; with `split = true` it is stdout alone and `err` is stderr. `command` is a bash string, or `{program, arg, ...}` with no quoting needed; `input` goes to stdin; `cwd` is where it runs; `env` sets variables, `false` takes one away |
 | `host.read(path)`, `host.write(path, data)`, `host.list(dir)` | the value, or `nil, error`: they do not raise. `write` makes missing directories |
 | `host.walk(dir, {glob=, depth=})`, `host.stat(path)` | every path under `dir`, sorted, `.git` left out, `"**/*.luau"`; `{type, size, mtime, mode, target}` of a path, a link not followed. Or `nil, error` |
 | `host.load(source, name, env?)` | a function, or `nil, error` |
