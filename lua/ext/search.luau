@@ -129,8 +129,9 @@ local function with_ripgrep(pattern: string, options: Options, limit: number): {
 	for _, line in result.out:split("\n") do
 		if line:sub(1, 15) == '{"type":"match"' then
 			local ok, event = pcall(json.decode, line)
-			local data = ok and event.data
-			if data and data.path.text and data.lines.text then
+			local data = ok and type(event) == "table" and event.data
+			if type(data) == "table" and type(data.path) == "table" and type(data.lines) == "table"
+				and data.path.text and data.lines.text then
 				if #matches == limit then
 					matches.more = true
 					break
