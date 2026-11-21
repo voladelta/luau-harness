@@ -51,12 +51,6 @@ for _, ripgrep in { true, false } do
 		check(by .. "the limit holds", #some, 1)
 		has(by .. "and says there is more", tostring(some), "[more than these 1 match;")
 		raises(by .. "a pattern that does not parse", "search.grep: ", search.grep, "(", { dir = "repo" })
-	end
-end
-for _, ripgrep in { true, false } do
-	if not ripgrep or host.sh("command -v rg").code == 0 then
-		search.ripgrep = ripgrep
-		local by = ripgrep and "rg: " or "grep: "
 		check(by .. "skips what .gitignore names", #search.grep("beta", { dir = "repo", glob = "*.luau" }), 2)
 	end
 end

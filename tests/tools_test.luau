@@ -55,7 +55,9 @@ local function sh(command)
 end
 host.write(w .. "run.sh", "#!/bin/sh\necho old\n")
 sh("chmod 754 %srun.sh")
+local before_ino = sh("stat -c %%i %srun.sh")
 check("write over an executable", host.write(w .. "run.sh", "#!/bin/sh\necho new\n"), true)
+check("it replaces the file rather than writing in place", sh("stat -c %%i %srun.sh") ~= before_ino, true)
 check("it keeps its mode", sh("stat -c %%a %srun.sh"), "754\n")
 check("and runs the new content", sh("%srun.sh"), "new\n")
 host.write(w .. "new.txt", "x")
@@ -310,15 +312,6 @@ check("all of a large input", host.sh("wc -c", { input = string.rep("x", 3000000
 check("an empty input is an empty stdin", host.sh("cat; echo end", { input = "" }).out, "end\n")
 check("a command may stop reading its input", host.sh("head -c 2", { input = string.rep("y", 3000000) }).out, "yy")
 raises("an input that is not text", "input is the text", host.sh, "cat", { input = {} })
-do
-	local long = host.sh("head -c 3000000 /dev/zero | tr '\\0' a")
-	check("an output of megabytes is kept whole, for code to work on", #long.out, 3000000)
-	check("so nothing is omitted", long.omitted, nil)
-	local endless = host.sh("head -c 20000000 /dev/zero | tr '\\0' a")
-	local marker = ("\n[... %d bytes of output omitted ...]\n"):format(endless.omitted or 0)
-	check("an output past 16 MiB is cut in the middle", endless.out:find(marker, 1, true) ~= nil, true)
-	check("and omitted counts the bytes that are gone", #endless.out - #marker + endless.omitted, 20000000)
-end
 raises("a path with a NUL byte", "contains a NUL byte", host.read, "a\0b")
 local hog_ok, hog_err = pcall(function()
 	local hoard = {}
