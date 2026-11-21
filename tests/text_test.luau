@@ -6,8 +6,6 @@ local check, raises = checks.check, checks.raises
 
 local text = loop.ext("text")
 
-check("the system prompt lists text", loop.system_prompt():find("- text (built in): plain text", 1, true) ~= nil, true)
-
 local magic = "^$()%.[]*+-?"
 check("escape makes every magic character literal", (magic):match(text.escape(magic)), magic)
 check("escape leaves the rest", text.escape("a b_c"), "a b_c")

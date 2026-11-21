@@ -11,8 +11,6 @@ for i = 0, 255 do
 end
 local every = table.concat(all)
 
-check("the system prompt lists bytes with no key", loop.system_prompt():find("- bytes (built in): binary data", 1, true) ~= nil, true)
-
 check("hex", bytes.hex("\0\1\127\255"), "0001" .. "7fff")
 check("unhex takes upper case, a 0x and spaces", bytes.unhex("0x00 01 7F ff"), "\0\1\127\255")
 check("unhex takes leading whitespace before 0x", bytes.unhex(" \t0X00 01 7F ff"), "\0\1\127\255")

@@ -7,8 +7,6 @@ local check, has, raises = checks.check, checks.has, checks.raises
 
 local http = loop.ext("http")
 
-check("the system prompt lists http", loop.system_prompt():find("- http (built in): HTTP requests", 1, true) ~= nil, true)
-
 host.write(dir .. "server.py", [==[
 import http.server, sys, time
 

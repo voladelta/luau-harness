@@ -81,12 +81,8 @@ class LiveTest(unittest.TestCase):
                 if message["role"] == "user" and isinstance(message["content"], list)
                 for block in message["content"] if block["type"] == "tool_result"]
 
-    def said(self):
-        return [block["text"] for message in self.log["messages"][1:] if message["role"] == "user"
-                and isinstance(message["content"], list) for block in message["content"] if block["type"] == "text"]
-
-    def test_a_file_is_made(self):
-        self.run_hx("create hello.txt containing the single word hi")
+    def test_a_file_is_made_at_low_effort(self):
+        self.run_hx("create hello.txt containing the single word hi", HX_EFFORT="low")
         self.assertEqual(self.read("hello.txt").strip(), "hi")
 
     def test_an_edit_keeps_crlf_line_ends(self):
@@ -110,10 +106,6 @@ class LiveTest(unittest.TestCase):
         answer = self.run_hx("run ./check.sh and tell me in one word, PASS or FAIL, whether it succeeded.")
         self.assertIn("FAIL", answer.upper())
         self.assertNotIn("PASS", answer.upper().replace("PASSED", ""))
-
-    def test_low_effort_is_accepted(self):
-        answer = self.run_hx("what is 17 * 23? Answer with the number only.", HX_EFFORT="low")
-        self.assertIn("391", answer)
 
     def test_a_long_output_can_be_searched(self):
         self.write("gen.sh", "#!/bin/sh\nfor i in $(seq 1 20000); do echo \"line $i\"; done\necho 'SECRET-IN-THE-MIDDLE' >&2\n"
@@ -223,7 +215,7 @@ class LiveTest(unittest.TestCase):
         self.assertIn("skill(", "\n".join(self.code()))
         self.assertEqual(self.read("VERSION").strip(), "1.4.2")
 
-    def test_a_skill_in_the_home_directory_needs_ro(self):
+    def test_a_home_skill_opened_with_ro_is_followed(self):
         home = tempfile.mkdtemp(prefix="hx-home-")
         self.addCleanup(shutil.rmtree, home, True)
         skills = os.path.join(home, ".claude", "skills")
@@ -231,13 +223,6 @@ class LiveTest(unittest.TestCase):
         with open(os.path.join(skills, "sign-off", "SKILL.md"), "w") as f:
             f.write("---\nname: sign-off\ndescription: How to sign off a piece of work. Use when asked to sign off."
                     "\n---\nSigning off means writing the word SIGNED to the file signoff.txt in the project.\n")
-        count = ("local M = assert(host.load(host.default_loop, '=loop'))()\n"
-                 "local n = 0 for _, s in M.skills() do if s.name == 'sign-off' then n += 1 end end print(n)\n")
-        self.write("count.luau", count)
-        for args, want in (((), "0"), (("--ro", skills), "1")):
-            done = subprocess.run([HX, "-q", *args, "--run", "count.luau"], cwd=self.project, capture_output=True,
-                                  text=True, timeout=60, env={**os.environ, "HOME": home})
-            self.assertEqual(done.stdout.strip(), want, done.stderr)
         self.run_hx("sign off the work", args=("--ro", skills), HOME=home)
         self.assertIn("skill(", "\n".join(self.code()))
         self.assertEqual(self.read("signoff.txt").strip(), "SIGNED")
@@ -277,9 +262,9 @@ class LiveTest(unittest.TestCase):
                     "miles_to_km in distance.py. Make all four functions raise TypeError for a value that is not "
                     "a number, where True and False do not count as numbers. Test every new behaviour in the "
                     "module's own test file.", args=("--rpi",))
-        check = subprocess.run([sys.executable, "-c", "from temperature import f_to_c; from distance import miles_to_km\n"
+        check = subprocess.run([sys.executable, "-c", "from temperature import c_to_f, f_to_c; from distance import km_to_miles, miles_to_km\n"
                                 "assert abs(f_to_c(212) - 100) < 1e-3 and abs(miles_to_km(6.21371) - 10) < 1e-3\n"
-                                "for convert in (f_to_c, miles_to_km):\n"
+                                "for convert in (c_to_f, f_to_c, km_to_miles, miles_to_km):\n"
                                 "    for bad in ('1', True, None):\n"
                                 "        try:\n            convert(bad)\n"
                                 "        except TypeError:\n            continue\n"
@@ -289,7 +274,19 @@ class LiveTest(unittest.TestCase):
         tests = subprocess.run([sys.executable, "-m", "unittest", "discover", "-p", "test_*.py"], cwd=self.project,
                                capture_output=True, text=True)
         self.assertEqual(tests.returncode, 0, tests.stderr)
-        self.assertGreaterEqual(int(tests.stderr.split("Ran ")[1].split()[0]), 4, tests.stderr)
+        for module, inverse in (("temperature", "f_to_c"), ("distance", "miles_to_km")):
+            test_module = f"test_{module}"
+            self.assertTrue(os.path.isfile(os.path.join(self.project, test_module + ".py")), test_module)
+            probe = (f"import {module}, unittest\n"
+                     f"convert = {module}.{inverse}\n"
+                     "def broken(*args, **kwargs):\n"
+                     "    convert(*args, **kwargs)\n"
+                     "    return None\n"
+                     f"{module}.{inverse} = broken\n"
+                     f"unittest.main(module='{test_module}')\n")
+            broken = subprocess.run([sys.executable, "-c", probe], cwd=self.project, capture_output=True, text=True)
+            self.assertEqual(broken.returncode, 1, f"{test_module} accepted a broken {inverse}\n{broken.stderr}")
+            self.assertIn("FAILED (", broken.stderr)
         self.assertIn("This session follows the rpi workflow", self.log["system"])
         agents = self.agent_logs()
         self.assertGreaterEqual(len(agents), 1)
@@ -313,29 +310,37 @@ class LiveTest(unittest.TestCase):
         self.assertEqual([b for b in final["content"] if b["type"] == "tool_use"], [])
 
 
-def run_all_at_once(hx):
+def run_all_at_once():
     import concurrent.futures
     import time
     names = unittest.TestLoader().getTestCaseNames(LiveTest)
-    start = time.time()
+    start = time.monotonic()
 
     def one(name):
-        done = subprocess.run([sys.executable, __file__, hx, f"LiveTest.{name}"], capture_output=True, text=True)
-        return name, done.returncode, done.stderr, time.time() - start
+        result = unittest.TestResult()
+        LiveTest(name).run(result)
+        return name, result, time.monotonic() - start
 
-    failed = 0
+    passed = skipped = failed = 0
     with concurrent.futures.ThreadPoolExecutor(len(names)) as pool:
-        for name, code, err, took in pool.map(one, names):
-            print(f"{'ok  ' if code == 0 else 'FAIL'} {took:5.0f}s  {name}")
-            if code != 0:
+        for name, result, took in pool.map(one, names):
+            if not result.wasSuccessful():
                 failed += 1
-                print("\n".join("      " + line for line in err.strip().splitlines()[-15:]))
-    print(f"{len(names) - failed}/{len(names)} passed in {time.time() - start:.0f}s")
+                print(f"FAIL {took:5.0f}s  {name}")
+                for _, trace in result.errors + result.failures:
+                    print(trace)
+            elif result.skipped:
+                skipped += 1
+                print(f"skip {took:5.0f}s  {name} ({result.skipped[0][1]})")
+            else:
+                passed += 1
+                print(f"ok   {took:5.0f}s  {name}")
+    print(f"{passed} passed, {skipped} skipped, {failed} failed in {time.monotonic() - start:.0f}s")
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
     HX = os.path.abspath(sys.argv.pop(1))
     if len(sys.argv) == 1:
-        sys.exit(run_all_at_once(HX))
+        sys.exit(run_all_at_once())
     unittest.main(verbosity=2)

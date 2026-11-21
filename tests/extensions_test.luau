@@ -29,7 +29,6 @@ check("no request without a key", #calls, 0)
 host.endpoints = { search = true, fetch = true, ocr = true, exa = true }
 
 local web, ocr = loop.ext("web"), loop.ext("ocr")
-check("the web extension loads", type(web.search), "function")
 check("it is loaded once", loop.ext("web"), web)
 
 script({ 200, json.encode({ results = {
