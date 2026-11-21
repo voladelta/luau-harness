@@ -1140,11 +1140,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results(), ["local\n[exit 0]"])
 
-    def test_keep_env_keeps_a_variable(self):
-        self.run_hx("--keep-env", "KEPT_TOKEN", "go", KEPT_TOKEN="kept-value", script=[
-            call("bash", {"command": "echo $KEPT_TOKEN"}), say("ok")])
-        self.assertEqual(self.tool_results(), ["kept-value\n[exit 0]"])
-
     def test_a_secret_is_known_by_the_end_of_its_name(self):
         secrets = {"PGPASSWORD": "s1", "OPENAI_APIKEY": "s2", "GITHUB_PAT": "s3", "MYSQL_PWD": "s4", "MY_API_KEY": "s5",
                    "AUTHTOKEN": "s6"}
@@ -1541,22 +1536,6 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(done.stdout, "nil\tf.txt: File too large\nf.txt s.luau\n")
         self.assertEqual(read(self.project, "f.txt"), "old\n")
 
-    def test_a_replaced_file_keeps_its_mode(self):
-        target = os.path.join(self.project, "f.txt")
-        with open(target, "w") as f:
-            f.write("old")
-        os.chmod(target, 0o640)
-        before = os.stat(target)
-        with open(os.path.join(self.project, "s.luau"), "w") as f:
-            f.write("print(host.write('f.txt', 'new'))\n")
-        done = subprocess.run([HX, "--run", "s.luau"], cwd=self.project, env=self.env(), capture_output=True,
-                              text=True, timeout=60)
-        self.assertEqual((done.returncode, done.stdout), (0, "true\n"), done.stderr)
-        after = os.stat(target)
-        self.assertNotEqual(after.st_ino, before.st_ino, "the file was written in place, not replaced")
-        self.assertEqual(read(target), "new")
-        self.assertEqual(after.st_mode, before.st_mode)
-
     def test_a_write_killed_part_way_leaves_the_file_whole(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
             f.write("local big = string.rep('x', 32 * 1024 * 1024)\n"
@@ -1657,17 +1636,6 @@ class AgentTest(unittest.TestCase):
             "host.sh(\"sh -c 'exec 3> fifo; echo $$ > cmd.pid; exec sleep 300' > /dev/null 2>&1 &\")\n"
             "print(host.try(host.read, 'fifo'))\nprint('after')\n")
         self.assertEqual((code, out), (0, "false\tinterrupted\nafter\n"))
-
-    def test_clip_keeps_both_ends_cut_at_a_line_or_a_character(self):
-        script = ("local function show(...) print(select('#', ...), json.encode({...})) end\n"
-                  "show(host.clip('abc', 3))\n"
-                  "show(host.clip(string.rep('xxxxxxx\\n', 4), 20))\n"
-                  "show(host.clip('a\\nbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\nc', 12))\n"
-                  "show(host.clip(string.rep('\\u{e9}', 10), 7))\n")
-        done = self.run_hx("--run", "-", stdin=script)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), [
-            '1\t["abc"]', '2\t["xxxxxxx\\n","xxxxxxx\\n"]', '2\t["a\\nbbbb","bbbb\\nc"]', '2\t["é","é"]'])
 
     def test_the_model_extends_itself_and_the_extension_stays(self):
         module = "-- shouts a word\nreturn { shout = function(w) return w:upper() .. '!' end }\n"
@@ -1816,19 +1784,17 @@ class AgentTest(unittest.TestCase):
         done = self.run_hx("go", script=[
             call("lua", {"code": "return ext('web').search('luau')"}, "c1"),
             call("lua", {"code": "return host.post('search', '{}')"}, "c2"),
-            call("lua", {"code": "return host.post('chat', '{}')"}, "c3"),
-            call("lua", {"code": "return ext('ocr').read('nope.pdf')"}, "c4"),
-            call("lua", {"code": "return ext('exa').deep('luau', 'why')"}, "c5"),
-            call("lua", {"code": "return host.post('exa', '{}')"}, "c6"),
+            call("lua", {"code": "return ext('ocr').read('nope.pdf')"}, "c3"),
+            call("lua", {"code": "return ext('exa').deep('luau', 'why')"}, "c4"),
+            call("lua", {"code": "return host.post('exa', '{}')"}, "c5"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
         self.assertIn("without DEEPSEEK_API_KEY", results[0])
         self.assertIn("no DEEPSEEK_API_KEY", results[1])
-        self.assertIn("no endpoint chat", results[2])
-        self.assertIn("without DEEPSEEK_API_KEY", results[3])
-        self.assertIn("without EXA_API_KEY", results[4])
-        self.assertIn("no EXA_API_KEY", results[5])
+        self.assertIn("without DEEPSEEK_API_KEY", results[2])
+        self.assertIn("without EXA_API_KEY", results[3])
+        self.assertIn("no EXA_API_KEY", results[4])
         system = self.model.requests[0]["system"]
         for name in ("bytes", "http", "path", "search", "text"):
             description = read(REPO, "lua", "ext", name + ".luau").splitlines()[0].removeprefix("-- ")

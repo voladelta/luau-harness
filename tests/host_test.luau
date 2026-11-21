@@ -51,9 +51,14 @@ raises("a cwd that is a file", "is not a directory", host.sh, "pwd", { cwd = dir
 raises("a name with =", "env has a name that is not a variable's", host.sh, "true", { env = { ["A=B"] = "x" } })
 raises("a value that is a table", "env.A is text, or false to remove it", host.sh, "true", { env = { A = {} } })
 
+local long = host.sh("head -c 3000000 /dev/zero | tr '\\0' 'a'")
+check("an output of megabytes is kept whole, for code to work on", #long.out, 3000000)
+check("so nothing is omitted", long.omitted, nil)
 local big = host.sh("head -c 25165825 /dev/zero | tr '\\0' 'a'")
+local marker = "\n[... 8388609 bytes of output omitted ...]\n"
 check("output one byte past head and tail counts what it leaves out", big.omitted, 8388609)
-check("and marks it", big.out:find("[... 8388609 bytes of output omitted ...]", 1, true) ~= nil, true)
+check("and marks it", big.out:find(marker, 1, true) ~= nil, true)
+check("and omitted counts the bytes that are gone", #big.out - #marker + big.omitted, 25165825)
 
 local both = host.sh("echo one; echo two >&2; echo three")
 check("stdout and stderr come together", both.out, "one\ntwo\nthree\n")
@@ -67,5 +72,19 @@ local loud = host.sh("head -c 25165825 /dev/zero | tr '\\0' 'a' >&2; echo done",
 check("a large stderr does not block stdout", loud.out, "done\n")
 check("and is cut as stdout is", loud.err_omitted, 8388609)
 check("stdin still reaches a split command", host.sh("cat; cat >&2 <<< e", { split = true, input = "in" }).out, "in")
+
+local function clipped(...)
+	return select("#", ...), json.encode({ ... })
+end
+local count, parts = clipped(host.clip("abc", 3))
+check("clip keeps text that fits", count, 1)
+check("unchanged", parts, '["abc"]')
+count, parts = clipped(host.clip(string.rep("xxxxxxx\n", 4), 20))
+check("clip cuts at a line boundary when it can", count, 2)
+check("keeping both ends", parts, '["xxxxxxx\\n","xxxxxxx\\n"]')
+count, parts = clipped(host.clip("a\nbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nc", 12))
+check("clip falls back to bytes when a line is too wide", parts, '["a\\nbbbb","bbbb\\nc"]')
+count, parts = clipped(host.clip(string.rep("\u{e9}", 10), 7))
+check("clip stays on a character boundary", parts, '["é","é"]')
 
 checks.done("host")
