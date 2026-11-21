@@ -11,7 +11,10 @@ end
 check("sorted keys", json.encode({ b = 1, a = 2, c = { z = 1, y = 2 } }), '{"a":2,"b":1,"c":{"y":2,"z":1}}')
 check("empty table is an object", json.encode({}), "{}")
 check("marked empty table is an array", json.encode(json.array()), "[]")
-check("json.array marks an existing table", json.encode(json.array({ 1 })), "[1]")
+local existing = { 1 }
+check("json.array returns the supplied table", json.array(existing), existing)
+existing[1] = nil
+check("the supplied table stays an array when emptied", json.encode(existing), "[]")
 check("null", json.encode({ json.null, 1 }), "[null,1]")
 check("nil at the top", json.encode(nil), "null")
 check("escapes", json.encode('a"b\\c\n\t\1'), '"a\\"b\\\\c\\n\\t\\u0001"')

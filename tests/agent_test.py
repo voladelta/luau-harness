@@ -570,9 +570,21 @@ class AgentTest(unittest.TestCase):
     def test_agents_work_side_by_side_on_deepseek_and_report_to_the_lead(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         deepseek = self.agents_model({
-            "make a.txt": [call("bash", {"command": "sleep 1; echo a > a.txt; echo made a"}, "a1"), say("a.txt is made")],
-            "make b.txt": [call("bash", {"command": "sleep 1; echo b > b.txt; echo made b"}, "b1"), say("b.txt is made")],
+            "make a.txt": [call("bash", {"command": "echo a > a.txt; echo made a"}, "a1"), say("a.txt is made")],
+            "make b.txt": [call("bash", {"command": "echo b > b.txt; echo made b"}, "b1"), say("b.txt is made")],
         })
+        both_started = threading.Barrier(2)
+        answer = deepseek.answer
+
+        def answer_together(request):
+            if len(request["messages"]) == 1:
+                try:
+                    both_started.wait(timeout=10)
+                except threading.BrokenBarrierError:
+                    return 400, {"error": {"message": "the other agent never reached the model"}}
+            return answer(request)
+
+        deepseek.answer = answer_together
         tasks = 'return agents({ { name = "a", task = "make a.txt" }, { name = "b", task = "make b.txt" } })'
         done = self.run_hx("--model", "opus", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY="ds-key-1",
                            script=[call("lua", {"code": tasks}, "c1"), say("both are made")])
@@ -595,7 +607,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("- agents(tasks) -> text", lead["tools"][0]["description"])
         self.assertNotIn("one of several agents", lead["system"][0]["text"])
         self.assertEqual(done.stdout, "both are made\n")
-        for line in ("  agent a: make a.txt", "[a] bash sleep 1; echo a > a.txt; echo made a", "[a] a.txt is made",
+        for line in ("  agent a: make a.txt", "[a] bash echo a > a.txt; echo made a", "[a] a.txt is made",
                      "[b] b.txt is made"):
             self.assertIn(line + "\n", done.stderr)
         self.assertIn("[claude-opus-5-5: 2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]\n"
@@ -1669,11 +1681,14 @@ class AgentTest(unittest.TestCase):
         self.assertIn("the loop built into hx", self.model.requests[0]["system"])
         self.assertIn("Never sleep or poll to wait for something outside your control", self.model.requests[0]["system"])
         self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system"])
+        history = self.model.requests[-1]["messages"] + [{"role": "assistant", "content": [text("ok")]}]
         self.run_hx("again", script=[say("ok")])
         self.assertIn("- shout: shouts a word", self.model.requests[-1]["system"])
         logs = [json.loads(read(self.project, ".hx", "log", name))
                 for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
         self.assertEqual(sorted(log["messages"][0]["content"] for log in logs), ["again", "go"])
+        first = next(log for log in logs if log["messages"][0]["content"] == "go")
+        self.assertEqual(first["messages"], history)
         saved = next(log for log in logs if log["messages"][0]["content"] == "again")
         self.assertEqual(saved["system"], self.model.requests[-1]["system"])
         self.assertEqual(read(self.project, ".hx", "log", ".gitignore"), "*\n")
@@ -1815,7 +1830,9 @@ class AgentTest(unittest.TestCase):
         self.assertIn("without EXA_API_KEY", results[4])
         self.assertIn("no EXA_API_KEY", results[5])
         system = self.model.requests[0]["system"]
-        self.assertIn("- bytes (built in):", system)
+        for name in ("bytes", "http", "path", "search", "text"):
+            description = read(REPO, "lua", "ext", name + ".luau").splitlines()[0].removeprefix("-- ")
+            self.assertIn(f"- {name} (built in): {description}", system.splitlines())
         for keyed in ("- web", "- ocr", "- exa"):
             self.assertNotIn(keyed, system)
 
@@ -2110,14 +2127,6 @@ class AgentTest(unittest.TestCase):
             process.kill()
             os.close(master)
         self.assertEqual(out, b"]52;c;aGk=red[31m!\r\n")
-
-    def test_a_session_that_makes_hx_keeps_its_log(self):
-        module = "-- says hi\nreturn { hi = function() return 'hi' end }\n"
-        done = self.run_hx("go", script=[call("write", {"path": ".hx/ext/hi.luau", "content": module}), say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        logs = [name for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
-        self.assertEqual(len(logs), 1)
-        self.assertEqual(len(json.loads(read(self.project, ".hx", "log", logs[0]))["messages"]), 4)
 
     def test_run_executes_a_script(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:

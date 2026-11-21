@@ -6,8 +6,6 @@ local check, raises = checks.check, checks.raises
 
 local path = loop.ext("path")
 
-check("the system prompt lists path", loop.system_prompt():find("- path (built in): POSIX paths", 1, true) ~= nil, true)
-
 local posixpath = json.decode([==[
 {"": ["", "", "", "."], "/": ["/", "", "", "/"], "//": ["//", "", "", "//"], "///": ["///", "", "", "/"], "a": ["", "a", "", "a"], "a/": ["a", "", "", "a"], "a/b": ["a", "b", "", "a/b"], "a/b/": ["a/b", "", "", "a/b"], "/a/b": ["/a", "b", "", "/a/b"], "//a/b": ["//a", "b", "", "//a/b"], "a//b": ["a", "b", "", "a/b"], "./a": [".", "a", "", "a"], "../a": ["..", "a", "", "../a"], "a/../..": ["a/..", "..", "", ".."], "/..": ["/", "..", "", "/"], "/a/./b/../c": ["/a/./b/..", "c", "", "/a/c"], "a/b.tar.gz": ["a", "b.tar.gz", ".gz", "a/b.tar.gz"], ".bashrc": ["", ".bashrc", "", ".bashrc"], "a/.bashrc": ["a", ".bashrc", "", "a/.bashrc"], "file.": ["", "file.", ".", "file."], "a..b": ["", "a..b", ".b", "a..b"], "...": ["", "...", "", "..."], "/x.y/z": ["/x.y", "z", "", "/x.y/z"], ".a.b": ["", ".a.b", ".b", ".a.b"]}
 ]==])

@@ -66,12 +66,10 @@ raises("an empty task", "the task for a is empty", agents, { { name = "a", task 
 raises("one name twice", "a is given two tasks in one call", agents, { { name = "a", task = "say: 1" }, { name = "a", task = "say: 2" } })
 check("a call that fails sends nothing", agents(), "You have no agents yet: give agents a list of tasks.")
 
-local began = os.clock()
 local reports = agents({
-	{ name = "first", task = ("run: sleep 1; echo one > %sone.txt; echo made one"):format(dir) },
-	{ name = "second", task = ("run: sleep 1; echo two > %stwo.txt; echo made two"):format(dir) },
+	{ name = "first", task = ("run: echo one > %sone.txt; echo made one"):format(dir) },
+	{ name = "second", task = ("run: echo two > %stwo.txt; echo made two"):format(dir) },
 })
-check("two agents that each sleep a second take about one", os.clock() - began < 1.9, true)
 check("their reports come back in the order they were named", (reports:gsub("in %d+ s", "in N s")),
 	"[agent first: done in N s]\nran: made one\n[exit 0]\n\n[agent second: done in N s]\nran: made two\n[exit 0]")
 check("the first did its work", host.read(dir .. "one.txt"), "one\n")

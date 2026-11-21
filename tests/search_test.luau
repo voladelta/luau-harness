@@ -6,14 +6,12 @@ local check, has, raises = checks.check, checks.has, checks.raises
 
 local search = loop.ext("search")
 
-check("the system prompt lists search", loop.system_prompt():find("- search (built in): find files and text", 1, true) ~= nil, true)
-
 host.sh({ "rm", "-rf", "repo", "plain" })
 host.sh({ "mkdir", "-p", "repo/src", "repo/.hx", "repo/out", "plain/sub" })
 host.write("repo/.gitignore", "out\n")
 host.write("repo/src/a.luau", "alpha\nbeta gamma\n")
 host.write("repo/src/gone.luau", "beta\n")
-host.write("repo/b.txt", "Beta\n1.5\n")
+host.write("repo/b.txt", "Beta\n1.5\n1x5\n")
 host.write("repo/.hx/n.luau", "beta\n")
 host.write("repo/out/built.luau", "beta\n")
 host.write("plain/sub/c.txt", "beta\n")
@@ -44,19 +42,13 @@ for _, ripgrep in { true, false } do
 		check(by .. "it prints as lines", tostring(found), "repo/src/a.luau:2: beta gamma")
 		check(by .. "hidden directories are searched", tostring(search.grep("beta", { dir = "repo/.hx" })), "repo/.hx/n.luau:1: beta")
 		check(by .. "case can be ignored", #search.grep("beta", { dir = "repo", glob = "*.txt", ignore_case = true }), 1)
-		check(by .. "a pattern is a regex", #search.grep("1.5|nothing", { dir = "repo", glob = "*.txt" }), 1)
-		check(by .. "unless fixed", tostring(search.grep("1.", { dir = "repo", fixed = true })), "repo/b.txt:2: 1.5")
+		check(by .. "a pattern is an extended regex", tostring(search.grep("1.5|nothing", { dir = "repo" })), "repo/b.txt:2: 1.5\nrepo/b.txt:3: 1x5")
+		check(by .. "unless fixed", tostring(search.grep("1.5", { dir = "repo", fixed = true })), "repo/b.txt:2: 1.5")
 		check(by .. "nothing found", tostring(search.grep("no such text", { dir = "repo" })), "[no match]")
 		local some = search.grep("e", { dir = "plain/..", limit = 1 })
 		check(by .. "the limit holds", #some, 1)
 		has(by .. "and says there is more", tostring(some), "[more than these 1 match;")
 		raises(by .. "a pattern that does not parse", "search.grep: ", search.grep, "(", { dir = "repo" })
-	end
-end
-for _, ripgrep in { true, false } do
-	if not ripgrep or host.sh("command -v rg").code == 0 then
-		search.ripgrep = ripgrep
-		local by = ripgrep and "rg: " or "grep: "
 		check(by .. "skips what .gitignore names", #search.grep("beta", { dir = "repo", glob = "*.luau" }), 2)
 	end
 end
