@@ -58,6 +58,10 @@ The walls are what make the verdicts worth having:
   project or a `--rw` path runs nothing for them either: give a toolchain `check` needs a `--ro` path of its own.
   `build` and `run` are the candidate's, and run whatever the candidate's wall holds. What `check` hands to an
   interpreter itself, `sh "$1/fix.sh"`, is the kit's to answer for.
+- **The judge's paths stay where they were.** It takes each `--ro` and `--rw` path as hx found it before the agent
+  began: one named through a link is held to where the link led then, and one that lies in the project or under
+  another `--rw` path is left out, since the model could put something else in its place and the agent's own wall
+  holds it already.
 - **The judge finds no program where the model can write.** Its `PATH`, and with it that of `build`, `run` and
   `check`, keeps only the absolute directories that lie outside the project and the `--rw` paths and are not
   reached through a link there; hx stops before the agent begins when none is left. Without a `PATH` it

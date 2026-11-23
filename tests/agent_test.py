@@ -2598,6 +2598,38 @@ say(submit("a wrong answer, and a program for the check to run"))
         self.assertIn("the starting point passes", done.stderr)
         self.assertEqual(done.stdout, "began\n")
 
+    def test_judge_a_rw_path_stays_where_it_was_when_its_name_is_moved(self):
+        outer = os.path.join(self.root, "outer")
+        real = os.path.join(outer, "real")
+        os.makedirs(real)
+        os.symlink(real, os.path.join(self.project, "out"))
+        kit = self.make_kit(config='{"runs": 1}',
+                            check=f'#!/bin/sh\n# ANSWER-42\n({real}/answer)\ngrep -qx 42 "$1/.judge/stdout"\n')
+        done = self.drive(kit, f"""
+host.write("{real}/answer", "#!/bin/sh\\ncat {kit}/check\\n")
+host.sh("chmod +x {real}/answer && rm out && mkdir out")
+host.write("prog.sh", "echo 41\\n")
+say(submit("a wrong answer, and the --rw path's name led elsewhere"))
+""", "--rw", "out", "--ro", outer)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed:"), done.stdout)
+        self.assertIn("answer: Permission denied", done.stdout)
+        self.assertNotIn("ANSWER-42", done.stdout + done.stderr)
+
+    def test_judge_a_kit_script_may_link_into_a_ro_path(self):
+        shared = os.path.join(self.root, "shared")
+        os.makedirs(shared)
+        kit = self.make_kit(config='{"runs": 1}', run=None)
+        with open(os.path.join(shared, "run"), "w") as f:
+            f.write("#!/bin/sh\nsh prog.sh\n")
+        os.chmod(os.path.join(shared, "run"), 0o755)
+        os.symlink(os.path.join(shared, "run"), os.path.join(kit, "run"))
+        done = self.drive(kit, 'print("began")', "--ro", shared)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertEqual(done.stdout, "began\n")
+
     def test_judge_a_path_the_model_can_write_all_of_stops_hx_before_the_agent(self):
         kit = self.make_kit()
         tools = os.path.join(self.project, "tools")

@@ -798,6 +798,22 @@ std::vector<hx::Rule> user_rules(const Options& options) {
     return rules;
 }
 
+std::vector<hx::Rule> settled_user_rules(const Options& options, const fs::path& project) {
+    std::vector<hx::Rule> rules = user_rules(options);
+    for (hx::Rule& rule : rules) {
+        std::error_code ec;
+        if (fs::path whole = fs::canonical(rule.path, ec); !ec) {
+            rule.path = whole.string();
+        }
+    }
+    const std::vector<fs::path> writable = writable_roots(options, project);
+    std::erase_if(rules, [&](const hx::Rule& rule) {
+        return std::ranges::any_of(
+            writable, [&](const fs::path& root) { return rule.path != root && hx::beneath(rule.path, root); });
+    });
+    return rules;
+}
+
 std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& project, const fs::path& tmp) {
     using hx::Access;
     std::vector<hx::Rule> rules = system_rules(options, project);
@@ -1050,7 +1066,7 @@ hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const 
     const std::string path = unwritable_path(writable_roots(options, project));
     const hx::JudgeWalls walls{
         .system = system_rules(options, project),
-        .user = user_rules(options),
+        .user = settled_user_rules(options, project),
         .agent = sandbox_rules(options, project, tmp),
         .unix_sockets = options.unix_sockets,
     };
