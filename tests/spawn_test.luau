@@ -113,6 +113,30 @@ local pid = (host.read(dir .. "left.pid") or ""):match("%d+")
 check("it had started a process", pid ~= nil, true)
 check("which is gone", host.sh(("kill -0 %s 2>&1"):format(pid or "0")).code ~= 0, true)
 
+local quick = host.spawn(function()
+	host.sh(("echo $PPID > %squick.pid"):format(dir))
+	return "done"
+end)
+local lasting = host.spawn(function()
+	host.sleep(30)
+end)
+local function ended(): boolean
+	local quick_pid = (host.read(dir .. "quick.pid") or ""):match("%d+")
+	local stat: string? = quick_pid and host.read(("/proc/%s/stat"):format(quick_pid))
+	return stat ~= nil and stat:match("^%d+ %(.*%) (%a)") == "Z"
+end
+began = os.clock()
+while not ended() and os.clock() - began < 10 do
+	host.sleep(0.01)
+end
+check("a child that has ended is not there to stop", host.stop(quick), false)
+check("one at work is", host.stop(lasting), true)
+done = wait_all(10)
+check("the one that had ended still returns", done[quick].text, "done")
+check("the stopped one does not", done[lasting].ok, false)
+check("and says why", done[lasting].text, "terminated")
+check("a child that was waited for is gone", host.stop(lasting), false)
+
 raises("spawn takes a function", "function expected", host.spawn, "not a function")
 
 checks.done("spawn")
