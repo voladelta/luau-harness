@@ -57,7 +57,7 @@ local live: {
 	repeats: Repeats,
 	printed: { string }?,
 	agent: { name: string, run: number }?,
-	seen: { [string]: { mtime: number, size: number } },
+	seen: { [string]: string },
 	wrote: { string },
 	shared_since: number?,
 	images: { Block }?,
@@ -684,7 +684,7 @@ local function or_raise<T>(value: T?, err: string?): T
 	return value
 end
 
-local function tracked(path: string): (string, { type: string, mtime: number, size: number, target: string? }?)
+local function tracked(path: string): (string, { type: string, mtime: number, revision: string, target: string? }?)
 	local pending = M.ext("path").join(host.cwd or "/", path):split("/")
 	local resolved, hops = "", 0
 	while #pending > 0 do
@@ -718,7 +718,7 @@ end
 local function saw(path: string)
 	local key, stat = tracked(path)
 	if stat then
-		live.seen[key] = { mtime = stat.mtime, size = stat.size }
+		live.seen[key] = stat.revision
 	end
 end
 
@@ -736,7 +736,7 @@ local function unseen_change(path: string): string?
 	end
 	local seen = live.seen[key]
 	if seen then
-		if seen.mtime ~= stat.mtime or seen.size ~= stat.size then
+		if seen ~= stat.revision then
 			return ("write: %s has changed since you last read or wrote it, and this would overwrite a change you "
 				.. "have not seen. Read it again, then write it, or edit it."):format(path)
 		end
@@ -1085,7 +1085,7 @@ local function lua_description(): string
 		.. "no quoting; input is text for its stdin; cwd is the directory it runs in; env is {NAME = value} to set, "
 		.. "false to take one away.")
 	table.insert(lines, "- host.walk(dir, {glob?, depth?}) -> {path}: every path under dir, sorted, .git left out, "
-		.. "directories ending in /; glob as \"**/*.luau\". host.stat(path) -> {type, size, mtime, mode}, or nil.")
+		.. "directories ending in /; glob as \"**/*.luau\". host.stat(path) -> {type, size, mtime, mode, revision}, or nil.")
 	table.insert(lines, "- host.read(path) -> text, host.write(path, text), host.list(dir), json.encode(value, "
 		.. "{indent?}), json.decode(text): the other plain primitives, for working on data.")
 	table.insert(lines, "")
@@ -1857,7 +1857,7 @@ type Agent = {
 	started: number,
 	report: string?,
 	stopping: boolean,
-	seen: { [string]: { mtime: number, size: number } },
+	seen: { [string]: string },
 }
 local fleet: { agents: { Agent }, waiting: { Agent }, system: string? } = { agents = {}, waiting = {}, system = nil }
 
