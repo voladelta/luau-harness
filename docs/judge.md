@@ -15,7 +15,7 @@ A **kit** is the judge's half of the project, a directory with up to four files:
 |---|---|
 | `run` | required, executable. Runs in a fresh copy of the built candidate and is timed by hx from outside; it exits 0 when it worked |
 | `build` | optional, executable. Runs once per candidate before any run, untimed, at the same path the runs use, so a build that records where it is still runs |
-| `check` | optional, executable. Runs as `check DIR` after each run, where `DIR/.judge/stdout` is what the run printed; links in `DIR` are removed first, so the run cannot point the check at the kit. It exits 0 when the output is right. A number on its last line is the score: positive, and higher is better; without one, the measure is the run's time. What it prints when it fails goes to the model, unless `blind` is on |
+| `check` | optional, executable. Runs as `check DIR` after each run, in the kit's directory, where `DIR/.judge/stdout` is what the run printed; links in `DIR` are removed first, so the run cannot point the check at the kit, and the check does not start in `DIR`, so a module or file the candidate left there is not taken for the check's own. It exits 0 when the output is right. A number on its last line is the score: positive, and higher is better; without one, the measure is the run's time. What it prints when it fails goes to the model, unless `blind` is on |
 | `kit.json` | optional: `{"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}`: pairs per round (1 suits a score that does not vary), the smallest relative gain that counts, the seconds one build, run or check may take, and whether the model hears verdicts without numbers and without the candidate's or the check's words, so that it cannot fit what the kit holds back by reading them. An unknown key or a wrong type stops hx before the model is asked anything |
 
 The model gets one more function, `submit(note?)`, and a paragraph in its prompt that says how judging works.
@@ -50,7 +50,8 @@ The walls are what make the verdicts worth having:
 - **The candidate cannot read the kit's other files.** `build` and `run` run behind a narrower wall still: their
   copy of the candidate, the system directories and the `--ro` and `--rw` paths. Only the script being run is
   copied in, so `check` and whatever else the kit holds stay out of reach. `check` reads the kit and the run's copy
-  and writes nothing that lasts.
+  and writes nothing that lasts. What a failed build or run printed goes to the model only from the file hx
+  sent it to: a link left in that file's place is not read.
 - **A candidate leaves nothing running.** What a build or run started dies when it ends, so no process of the
   candidate's can slow the champion's runs or write into an output after the run.
 - **The judge is built into hx** (`lua/judge.luau`). A project's loop can change everything about the agent, but

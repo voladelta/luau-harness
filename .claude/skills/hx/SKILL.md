@@ -254,8 +254,8 @@ version so far and keeps a change only when it wins twice. Use it for tasks with
 could otherwise make the number only look better.
 
 - A kit is a directory outside the wall: `run` (required, executable, exits 0 when it worked, timed by hx),
-  optional `build`, optional `check DIR` (exits 0 when the output in `DIR/.judge/stdout` is right; a number on its
-  last line is the score, higher is better), optional `kit.json`
+  optional `build`, optional `check DIR` (runs in the kit's directory, exits 0 when the output in
+  `DIR/.judge/stdout` is right; a number on its last line is the score, higher is better), optional `kit.json`
   (`{"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}`).
 - Keep the answers in `check`: the candidate's code can read `run`. Before trusting a kit, try it on the
   unchanged project and on a change known to be bad.

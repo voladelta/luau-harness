@@ -102,6 +102,14 @@ local function write_patch(to_tree: string, name: string)
 		:format(start_tree, to_tree, quote(state .. "/" .. name)))
 end
 
+local function printed(dir: string): string
+	local box, output = host.stat(dir .. "/.judge"), host.stat(dir .. "/.judge/stdout")
+	if box and box.type == "dir" and output and output.type == "file" then
+		return host.read(dir .. "/.judge/stdout") or ""
+	end
+	return ""
+end
+
 local function candidate(dir: string, script: string): (number?, ...string)
 	local wall = table.clone(writes)
 	table.insert(wall, dir)
@@ -123,7 +131,7 @@ local function candidate(dir: string, script: string): (number?, ...string)
 	if config.blind then
 		return nil, ("%s %s"):format(script, how)
 	end
-	return nil, ("%s %s:\n%s"):format(script, how, tail(host.read(dir .. "/.judge/stdout") or "", 1500))
+	return nil, ("%s %s:\n%s"):format(script, how, tail(printed(dir), 1500))
 end
 
 local function snapshot(dir: string)
@@ -171,7 +179,7 @@ local function measure(built: string): (Measure?, ...string)
 	table.insert(wall, kit)
 	table.insert(wall, dir)
 	table.move(writes, 1, #writes, #wall + 1, wall)
-	local result = host.sh(("cd %s && TMPDIR=%s %s %s"):format(quote(dir), quote(state .. "/tmp"),
+	local result = host.sh(("cd %s && TMPDIR=%s %s %s"):format(quote(kit), quote(state .. "/tmp"),
 		quote(kit .. "/check"), quote(dir)),
 		{ timeout = config.timeout, read = wall, write = { state .. "/tmp" }, hangup = true })
 	if result.timed_out then

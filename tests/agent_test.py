@@ -2431,6 +2431,37 @@ say(submit("a link into the kit, and no work"))
         self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed"), done.stdout)
         self.assertEqual(read(self.judge_state(), "champion.patch"), "")
 
+    def test_judge_a_failed_run_shows_no_file_it_linked_in_place_of_its_output(self):
+        kit = self.make_kit(config='{"runs": 1}', check='#!/bin/sh\n# ANSWER-42\ngrep -qx 42 "$1/.judge/stdout"\n')
+        with open(os.path.join(kit, "stdout"), "w") as f:
+            f.write("KIT-FILE\n")
+        done = self.drive(kit, f"""
+host.write("prog.sh", "rm .judge/stdout; ln -s {kit}/check .judge/stdout; exit 1\\n")
+say(submit("a link to the check where the output was"))
+host.write("prog.sh", "rm -rf .judge; ln -s {kit} .judge; exit 1\\n")
+say(submit("a link to the kit where the output's directory was"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        first, second = done.stdout.splitlines()
+        self.assertTrue(first.startswith("Trial 1. invalid: run exited 1:"), first)
+        self.assertTrue(second.startswith("Trial 2. invalid: run exited 1:"), second)
+        self.assertNotIn("ANSWER-42", done.stdout)
+        self.assertNotIn("KIT-FILE", done.stdout)
+
+    def test_judge_the_check_runs_in_the_kit_not_in_the_candidate(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n",
+                            check='#!/bin/sh\ncmp -s "$1/.judge/stdout" expected || { echo wrong; exit 1; }\n')
+        with open(os.path.join(kit, "expected"), "w") as f:
+            f.write("42\n")
+        done = self.drive(kit, """
+host.write("expected", "41\\n")
+host.write("prog.sh", "echo 41\\n")
+say(submit("a wrong answer, and a file for the check to compare it with"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed"), done.stdout)
+
     def test_judge_blind_withholds_the_checks_words_too(self):
         kit = self.make_kit(config='{"runs": 1, "blind": true}',
                             check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "SECRET expected 42"; exit 1; }\n')
