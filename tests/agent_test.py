@@ -2221,10 +2221,10 @@ end
 function say(text) print((tostring(text):gsub("\\n", " | "))) end
 """ + body)
 
-    def drive(self, kit, body, *flags, timeout=120):
+    def drive(self, kit, body, *flags, timeout=120, **env):
         self.write_driver(body)
         return subprocess.run([HX, *flags, "--judge", kit, "--run", "drive.luau"], cwd=self.project,
-                              env=self.env(XDG_STATE_HOME=""), capture_output=True, text=True, timeout=timeout)
+                              env=self.env(XDG_STATE_HOME="", **env), capture_output=True, text=True, timeout=timeout)
 
     def drive_gated(self, kit, body):
         flags = os.path.join(self.root, "flags")
@@ -2461,6 +2461,22 @@ say(submit("a wrong answer, and a file for the check to compare it with"))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("the starting point passes", done.stderr)
         self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed"), done.stdout)
+
+    def test_judge_a_name_the_model_can_change_opens_nothing_to_a_candidate(self):
+        kit = self.make_kit(config='{"runs": 1}', check='#!/bin/sh\n# ANSWER-42\ngrep -qx 42 "$1/.judge/stdout"\n')
+        roots = os.path.join(self.project, "roots.pem")
+        with open(roots, "w") as f:
+            f.write("roots\n")
+        done = self.drive(kit, f"""
+host.sh("rm roots.pem && ln -s {kit} roots.pem")
+host.write("prog.sh", "cat {kit}/check; exit 1\\n")
+say(submit("the trust roots' name now leads to the kit"))
+""", SSL_CERT_FILE=roots)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertTrue(done.stdout.startswith("Trial 1. invalid: run exited 1:"), done.stdout)
+        self.assertIn("Permission denied", done.stdout)
+        self.assertNotIn("ANSWER-42", done.stdout)
 
     def test_judge_blind_withholds_the_checks_words_too(self):
         kit = self.make_kit(config='{"runs": 1, "blind": true}',

@@ -21,7 +21,9 @@ write, can widen the wall. That holds for links too. A link the model could have
 project or under a `--rw` path, opens nothing, and neither does a `PATH` entry, a trust root or a git file that
 is reached through such a link: with `.venv/bin` on your `PATH`, a link planted there to `~/.ssh` leaves `~/.ssh`
 closed. A virtual environment in the project whose `python` is a link into your home directory therefore needs
-that directory named: `--ro ~/.pyenv`, say.
+that directory named: `--ro ~/.pyenv`, say. A `PATH` entry, trust root or git file that itself lies in the project
+or under a `--rw` path is inside already and gets no rule of its own, so the model cannot later put a link under
+a name the wall would open again.
 
 Git reads your name, aliases and ignore rules inside: `~/.gitconfig`, and `config`, `ignore` and `attributes` in
 `$XDG_CONFIG_HOME/git` (`~/.config/git` by default). Nothing else in that directory opens, so the tokens

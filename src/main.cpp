@@ -620,6 +620,10 @@ std::vector<fs::path> writable_roots(const Options& options, const fs::path& pro
     return roots;
 }
 
+bool within(const fs::path& path, const std::vector<fs::path>& roots) {
+    return std::ranges::any_of(roots, [&](const fs::path& root) { return hx::beneath(path, root); });
+}
+
 std::optional<fs::path> resolve_trusted(const fs::path& path, const std::vector<fs::path>& writable) {
     constexpr int kMaxLinks = 40;
     std::deque<fs::path> pending(path.begin(), path.end());
@@ -642,9 +646,7 @@ std::optional<fs::path> resolve_trusted(const fs::path& path, const std::vector<
             continue;
         }
         const fs::path target = fs::read_symlink(next, ec);
-        const bool planted =
-            std::ranges::any_of(writable, [&](const fs::path& root) { return hx::beneath(resolved, root); });
-        if (ec || planted || ++links > kMaxLinks) {
+        if (ec || within(resolved, writable) || ++links > kMaxLinks) {
             return std::nullopt;
         }
         if (target.is_absolute()) {
@@ -670,7 +672,7 @@ void add_path_rules(std::vector<hx::Rule>& rules, const std::vector<fs::path>& w
         if (!whole || !fs::is_directory(*whole, ec) || *whole == "/" || holds_home(*whole)) {
             return;
         }
-        if (std::ranges::none_of(readable, [&](const fs::path& r) { return hx::beneath(*whole, r); })) {
+        if (!within(*whole, readable)) {
             opened.insert(*whole);
         }
     };
@@ -758,7 +760,10 @@ std::vector<hx::Rule> system_rules(const Options& options, const fs::path& proje
         }
     }
     const std::vector<fs::path> writable = writable_roots(options, project);
-    std::erase_if(rules, [&](const hx::Rule& rule) { return !resolve_trusted(rule.path, writable); });
+    std::erase_if(rules, [&](const hx::Rule& rule) {
+        const std::optional<fs::path> whole = resolve_trusted(rule.path, writable);
+        return !whole || within(*whole, writable);
+    });
     add_path_rules(rules, writable);
     return rules;
 }
