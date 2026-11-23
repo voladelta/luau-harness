@@ -707,6 +707,26 @@ void add_path_rules(std::vector<hx::Rule>& rules, const std::vector<fs::path>& w
     }
 }
 
+void search_no_writable_path(const std::vector<fs::path>& writable) {
+    const char* path = std::getenv("PATH");  // NOLINT(concurrency-mt-unsafe)
+    if (path == nullptr) {
+        return;
+    }
+    std::string kept;
+    for (const auto part : std::views::split(std::string_view(path), ':')) {
+        const std::string_view entry(part.begin(), part.end());
+        const std::optional<fs::path> whole = entry.starts_with('/') ? resolve_trusted(entry, writable) : std::nullopt;
+        if (whole && !within(*whole, writable)) {
+            kept.append(kept.empty() ? "" : ":").append(entry);
+        }
+    }
+    if (kept.empty()) {
+        unsetenv("PATH");  // NOLINT(concurrency-mt-unsafe)
+    } else {
+        setenv("PATH", kept.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
+    }
+}
+
 std::vector<hx::Rule> system_rules(const Options& options, const fs::path& project) {
     using hx::Access;
     std::vector<hx::Rule> rules;
@@ -1036,6 +1056,7 @@ hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const 
         .unix_sockets = options.unix_sockets,
     };
     return hx::spawn_judge(kit_dir, project, walls, [&](std::vector<std::string> args, const hx::Sandbox& wall) {
+        search_no_writable_path(writable_roots(options, project));
         hx::HostConfig config;
         config.args = std::move(args);
         config.quiet = options.quiet;

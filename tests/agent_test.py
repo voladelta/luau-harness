@@ -2478,22 +2478,41 @@ say(submit("the trust roots' name now leads to the kit"))
         self.assertIn("Permission denied", done.stdout)
         self.assertNotIn("ANSWER-42", done.stdout)
 
-    def test_judge_a_candidate_runs_its_own_copy_of_a_program_on_path_in_the_project(self):
-        kit = self.make_kit(config='{"runs": 1}', run="#!/bin/sh\nanswer\n",
-                            check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { cat "$1/.judge/stdout"; exit 1; }\n')
+    def test_judge_finds_no_program_where_the_model_can_write(self):
+        kit = self.make_kit(config='{"runs": 1}', check='#!/bin/sh\n# ANSWER-42\ngrep -qx 42 "$1/.judge/stdout"\n')
+        tools = os.path.join(self.project, "tools")
+        os.makedirs(tools)
+        done = self.drive(kit, f"""
+host.write("tools/tar", [[#!/bin/sh
+/usr/bin/tar "$@" || exit
+[ "$3" = -xf ] && cp {kit}/check "$2/leaked"
+exit 0
+]])
+host.sh("chmod +x tools/tar")
+host.write("prog.sh", "cat leaked; exit 1\\n")
+say(submit("a tar of the model's own, for the judge to run"))
+""", PATH=f"{tools}::bin:{os.environ['PATH']}")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertTrue(done.stdout.startswith("Trial 1. invalid: run exited 1:"), done.stdout)
+        self.assertIn("leaked: No such file", done.stdout)
+        self.assertNotIn("ANSWER-42", done.stdout)
+
+    def test_judge_a_kit_names_a_program_in_the_candidates_copy(self):
+        kit = self.make_kit(config='{"runs": 1}',
+                            run="#!/bin/sh\ncommand -v answer && exit 1\nPATH=$PWD/tools:$PATH answer\n")
         tools = os.path.join(self.project, "tools")
         os.makedirs(tools)
         with open(os.path.join(tools, "answer"), "w") as f:
             f.write("#!/bin/sh\necho 42\n")
         os.chmod(os.path.join(tools, "answer"), 0o755)
-        done = self.drive(kit, f"""
-host.write("tools/answer", "#!/bin/sh\\ncat {tools}/answer\\necho 41\\n")
+        done = self.drive(kit, """
+host.write("tools/answer", "#!/bin/sh\\necho 41\\n")
 say(submit("a wrong answer, from the copy"))
 """, PATH=f"{tools}:{os.environ['PATH']}")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("the starting point passes", done.stderr)
-        self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed"), done.stdout)
-        self.assertIn(f"{tools}/answer: Permission denied | 41", done.stdout)
+        self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed: | wrong: 41"), done.stdout)
 
     def test_judge_blind_withholds_the_checks_words_too(self):
         kit = self.make_kit(config='{"runs": 1, "blind": true}',

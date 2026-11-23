@@ -48,12 +48,15 @@ The walls are what make the verdicts worth having:
   one socket, a line each way, through `host.judge`. The agent sends only a note; the judge copies the project
   itself.
 - **The candidate cannot read the kit's other files.** `build` and `run` run behind a narrower wall still: their
-  copy of the candidate, the system directories and the `--ro` and `--rw` paths. The project is not among them: a
-  `PATH` entry in the project names the same directory in the copy, so a candidate runs its own `node_modules/.bin`
-  and not the one the model is still writing. Only the script being run is
+  copy of the candidate, the system directories and the `--ro` and `--rw` paths. Only the script being run is
   copied in, so `check` and whatever else the kit holds stay out of reach. `check` reads the kit and the run's copy
   and writes nothing that lasts. What a failed build or run printed goes to the model only from the file hx
   sent it to: a link left in that file's place is not read.
+- **The judge finds no program where the model can write.** Its `PATH`, and with it that of `build`, `run` and
+  `check`, keeps only the absolute directories that lie outside the project and the `--rw` paths and are not
+  reached through a link there. Otherwise a `tar` the model left in `node_modules/.bin` would run as the judge,
+  with the kit in reach. A kit that wants a program from the project names it in the candidate's copy:
+  `./node_modules/.bin/tsc`, or `PATH=$PWD/node_modules/.bin:$PATH` in `run`.
 - **A candidate leaves nothing running.** What a build or run started dies when it ends, so no process of the
   candidate's can slow the champion's runs or write into an output after the run.
 - **The judge is built into hx** (`lua/judge.luau`). A project's loop can change everything about the agent, but
