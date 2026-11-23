@@ -54,10 +54,11 @@ The walls are what make the verdicts worth having:
   sent it to: a link left in that file's place is not read.
 - **The judge finds no program where the model can write.** Its `PATH`, and with it that of `build`, `run` and
   `check`, keeps only the absolute directories that lie outside the project and the `--rw` paths and are not
-  reached through a link there; hx stops before the agent begins when none is left. Otherwise a `tar` the model
-  left in `node_modules/.bin` would run as the judge, with the kit in reach. A kit that wants a program from the
-  project names it in the candidate's copy: `./node_modules/.bin/tsc`, or `PATH=$PWD/node_modules/.bin:$PATH` in
-  `run`.
+  reached through a link there; hx stops before the agent begins when none is left. Without a `PATH` it
+  starts from the one a shell searches then, `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`.
+  Otherwise a `tar` the model left in `node_modules/.bin` would run as the judge, with the kit in reach. A kit
+  that wants a program from the project names it in the candidate's copy: `./node_modules/.bin/tsc`, or
+  `PATH=$PWD/node_modules/.bin:$PATH` in `run`.
 - **A candidate leaves nothing running.** What a build or run started dies when it ends, so no process of the
   candidate's can slow the champion's runs or write into an output after the run.
 - **The judge is built into hx** (`lua/judge.luau`). A project's loop can change everything about the agent, but

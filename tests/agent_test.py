@@ -2502,10 +2502,23 @@ say(submit("a tar of the model's own, for the judge to run"))
         kit = self.make_kit()
         tools = os.path.join(self.project, "tools")
         os.makedirs(tools)
-        done = self.drive(kit, 'print("began")', PATH=f"{tools}:bin")
-        self.assertEqual(done.returncode, 2, done.stderr)
-        self.assertIn("every directory on PATH is one the model can write", done.stderr)
-        self.assertEqual(done.stdout, "")
+        for path in (f"{tools}:bin", ""):
+            with self.subTest(path=path):
+                done = self.drive(kit, 'print("began")', PATH=path)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertIn("PATH has no directory the model cannot write", done.stderr)
+                self.assertEqual(done.stdout, "")
+
+    def test_judge_without_a_path_searches_where_a_shell_would(self):
+        kit = self.make_kit(config='{"runs": 1}', run='#!/bin/sh\necho ":$PATH:"\n',
+                            check='#!/bin/sh\ngrep -q :/usr/local/bin: "$1/.judge/stdout"\n')
+        self.write_driver("")
+        env = self.env(XDG_STATE_HOME="")
+        del env["PATH"]
+        done = subprocess.run([HX, "--judge", kit, "--run", "drive.luau"], cwd=self.project, env=env,
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
 
     def test_judge_a_kit_names_a_program_in_the_candidates_copy(self):
         kit = self.make_kit(config='{"runs": 1}',

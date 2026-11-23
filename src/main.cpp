@@ -708,8 +708,10 @@ void add_path_rules(std::vector<hx::Rule>& rules, const std::vector<fs::path>& w
 }
 
 std::string unwritable_path(const std::vector<fs::path>& writable) {
+    constexpr std::string_view kShellDefault = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const char* set = std::getenv("PATH");  // NOLINT(concurrency-mt-unsafe)
     std::string kept;
-    for (const auto part : std::views::split(env_or("PATH", "/usr/bin:/bin"), ':')) {
+    for (const auto part : std::views::split(set != nullptr ? std::string_view(set) : kShellDefault, ':')) {
         const std::string_view entry(part.begin(), part.end());
         const std::optional<fs::path> whole = entry.starts_with('/') ? resolve_trusted(entry, writable) : std::nullopt;
         if (whole && !within(*whole, writable)) {
@@ -718,8 +720,7 @@ std::string unwritable_path(const std::vector<fs::path>& writable) {
     }
     if (kept.empty()) {
         throw UsageError(
-            "--judge: every directory on PATH is one the model can write, so the judge has nowhere to "
-            "find its programs");
+            "--judge: PATH has no directory the model cannot write, so the judge has nowhere to find its programs");
     }
     return kept;
 }
