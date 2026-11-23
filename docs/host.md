@@ -22,6 +22,7 @@ Everything Luau can do to the machine:
 | `host.timed(seconds, fn, ...)` | as `host.try`; the error is `"timeout"` when the limit passed |
 | `host.input(prompt)` | a line from stdin, or `nil` at the end |
 | `host.log(text)`, `host.sleep(seconds)`, `host.env(name)` | |
+| `host.wall_time()` | whole seconds since the Unix epoch, then the nanoseconds within that second |
 | `host.printable(text)` | `text` without what could steer a terminal: control characters other than tab and newline, and the Unicode marks that reorder text |
 | `host.args`, `host.cwd`, `host.interactive`, `host.sandboxed`, `host.default_loop` | |
 | `host.quiet` | `true` with `--quiet`: leave out progress lines |

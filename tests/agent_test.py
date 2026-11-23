@@ -276,6 +276,30 @@ class AgentTest(unittest.TestCase):
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("nowhere.json", missing.stderr)
 
+    def test_resume_last_orders_same_second_logs_by_start_time(self):
+        log = os.path.join(self.project, ".hx", "log")
+        os.makedirs(log)
+        for older, newer, older_stamp in [
+            ("20260101-120000-zzzzzz.json", "20260101-120000-aaaaaa.json", 1767268800_100000000),
+            ("20260101-120000-t1767268800n090000000xzzzzzz.json",
+             "20260101-120000-t1767268800n100000000xaaaaaa.json", 1767268800_990000000),
+        ]:
+            with self.subTest(older=older, newer=newer):
+                for name, task, stamp in [
+                    (older, "older", older_stamp),
+                    (newer, "newer", 1767268800_200000000),
+                    (newer[:-5] + "-sub-1.json", "agent", 1767268800_300000000),
+                ]:
+                    path = os.path.join(log, name)
+                    with open(path, "w") as f:
+                        json.dump({"messages": [{"role": "user", "content": task}]}, f)
+                    os.utime(path, ns=(stamp, stamp))
+                done = self.run_hx("--resume", "last", "continue", script=[say("ok")])
+                for name in os.listdir(log):
+                    os.unlink(os.path.join(log, name))
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(self.model.requests[-1]["messages"][0]["content"][0]["text"], "newer")
+
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
         self.assertEqual(done.returncode, 0, done.stderr)

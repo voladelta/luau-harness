@@ -1789,7 +1789,8 @@ local function turn(system: string, talk: Conversation): Reply
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
 end
 
-local log_path = (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
+local started_at, started_ns = host.wall_time()
+local log_path = (".hx/log/%s-t%dn%09dx%s.json"):format(os.date("%Y%m%d-%H%M%S", started_at), started_at, started_ns,
 	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0")
 local function save(system: string, messages: { Message }, path: string)
 	if host.list(".hx") then
@@ -2193,9 +2194,23 @@ function M.resume_log(named: string): string
 		return named
 	end
 	local newest: string? = nil
+	local newest_seconds, newest_nanos = -math.huge, 0
 	for _, name in host.list(".hx/log") or {} do
-		if name:match("%.json$") and not name:match("%-sub%-%d+%.json$") and (not newest or name > newest) then
-			newest = name
+		if name:match("%.json$") and not name:match("%-sub%-%d+%.json$") then
+			local epoch, fraction = name:match("^%d+%-%d+%-t(%d+)n(%d+)x%w+%.json$")
+			local seconds, nanos = tonumber(epoch), tonumber(fraction)
+			if not seconds or not nanos then
+				local stat = host.stat(".hx/log/" .. name)
+				if not stat then
+					continue
+				end
+				seconds = math.floor(stat.mtime)
+				nanos = (stat.mtime - seconds) * 1e9
+			end
+			if not newest or seconds > newest_seconds or (seconds == newest_seconds
+				and (nanos > newest_nanos or (nanos == newest_nanos and name > newest))) then
+				newest, newest_seconds, newest_nanos = name, seconds, nanos
+			end
 		end
 	end
 	if not newest then
