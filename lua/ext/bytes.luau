@@ -29,26 +29,47 @@ function M.unhex(text: string): string
 end
 
 local alphabet64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local encode64: { [number]: number } = {}
 local value64: { [string]: number } = { ["-"] = 62, ["_"] = 63 }
 for i = 1, 64 do
+	encode64[i - 1] = string.byte(alphabet64, i)
 	value64[alphabet64:sub(i, i)] = i - 1
 end
 
 function M.base64(data: string): string
 	check("base64", data, 1, "data", "string")
-	local out = {}
-	for i = 1, #data, 3 do
-		local a, b, c = data:byte(i, i + 2)
-		local n = a * 65536 + (b or 0) * 256 + (c or 0)
-		local quad = {}
-		for shift = 3, 0, -1 do
-			local index = n // 64 ^ shift % 64 + 1
-			table.insert(quad, alphabet64:sub(index, index))
-		end
-		local kept = if c then 4 elseif b then 3 else 2
-		table.insert(out, table.concat(quad, "", 1, kept) .. string.rep("=", 4 - kept))
+	local len = #data
+	if len == 0 then
+		return ""
 	end
-	return table.concat(out)
+	local out = buffer.create(((len + 2) // 3) * 4)
+	local o = 0
+	local full = len - (len % 3)
+	for i = 1, full, 3 do
+		local a, b, c = string.byte(data, i, i + 2)
+		local n = a * 65536 + b * 256 + c
+		buffer.writeu8(out, o, encode64[bit32.rshift(n, 18)])
+		buffer.writeu8(out, o + 1, encode64[bit32.band(bit32.rshift(n, 12), 63)])
+		buffer.writeu8(out, o + 2, encode64[bit32.band(bit32.rshift(n, 6), 63)])
+		buffer.writeu8(out, o + 3, encode64[bit32.band(n, 63)])
+		o += 4
+	end
+	local rem = len - full
+	if rem == 1 then
+		local a = string.byte(data, full + 1)
+		buffer.writeu8(out, o, encode64[bit32.rshift(a, 2)])
+		buffer.writeu8(out, o + 1, encode64[bit32.lshift(bit32.band(a, 3), 4)])
+		buffer.writeu8(out, o + 2, 61)
+		buffer.writeu8(out, o + 3, 61)
+	elseif rem == 2 then
+		local a, b = string.byte(data, full + 1, full + 2)
+		local n = a * 256 + b
+		buffer.writeu8(out, o, encode64[bit32.rshift(n, 10)])
+		buffer.writeu8(out, o + 1, encode64[bit32.band(bit32.rshift(n, 4), 63)])
+		buffer.writeu8(out, o + 2, encode64[bit32.lshift(bit32.band(n, 15), 2)])
+		buffer.writeu8(out, o + 3, 61)
+	end
+	return buffer.tostring(out)
 end
 
 function M.unbase64(text: string): string
