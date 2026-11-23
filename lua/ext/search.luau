@@ -165,7 +165,7 @@ local function collect(args: { string }, limit: number, input: string?): { Match
 end
 
 local function with_ripgrep(pattern: string, options: Options, limit: number): { Match }
-	local args = { "rg", "--line-number", "--with-filename", "--null", "--no-heading", "--color", "never",
+	local args = { "rg", "--no-config", "--line-number", "--with-filename", "--null", "--no-heading", "--color", "never",
 		"--hidden", "--glob", "!.git", "--sort", "path" }
 	if options.fixed then
 		table.insert(args, "--fixed-strings")

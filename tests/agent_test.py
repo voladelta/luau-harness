@@ -2107,6 +2107,24 @@ end
             done = self.run_hx(*flags, "--run", "-", stdin=script)
             self.assertEqual((done.returncode, done.stdout), (0, "true\ttrue\n"), (flags, done.stderr))
 
+    def test_search_ignores_ripgrep_configuration(self):
+        if not shutil.which("rg"):
+            self.skipTest("ripgrep is not installed")
+        config = os.path.join(self.project, "rg.conf")
+        with open(os.path.join(self.project, "note.txt"), "w") as f:
+            f.write("needle\ncontext\n")
+        for option in ["--count", "--column", "--after-context=1"]:
+            with self.subTest(option=option):
+                with open(config, "w") as f:
+                    f.write(option + "\n")
+                done = self.run_hx(
+                    "--run", "-", RIPGREP_CONFIG_PATH=config,
+                    stdin='local search = assert(host.load(host.default_loop, "=loop"))().ext("search")\n'
+                          'search.ripgrep = true\nprint(tostring(search.grep("needle", { glob = "note.txt" })))\n',
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout, "note.txt:1: needle\n")
+
     def test_a_loop_without_tools_sends_an_empty_list(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
