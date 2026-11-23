@@ -113,7 +113,7 @@ local function remove(path: string)
 end
 
 local function candidate(dir: string, script: string): (number?, ...string)
-	local stdout = state .. "/tmp/stdout"
+	local stdout = state .. "/stdout"
 	local wall = table.clone(writes)
 	table.insert(wall, dir)
 	table.insert(wall, stdout)
@@ -449,7 +449,7 @@ end
 
 local function summary()
 	host.log(host.printable(summary_text()))
-	host.sh(("cd %s && rm -rf run tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
+	host.sh(("cd %s && rm -rf run stdout tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
 		:format(quote(state)))
 end
 
