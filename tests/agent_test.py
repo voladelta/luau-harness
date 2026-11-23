@@ -2478,6 +2478,23 @@ say(submit("the trust roots' name now leads to the kit"))
         self.assertIn("Permission denied", done.stdout)
         self.assertNotIn("ANSWER-42", done.stdout)
 
+    def test_judge_a_candidate_runs_its_own_copy_of_a_program_on_path_in_the_project(self):
+        kit = self.make_kit(config='{"runs": 1}', run="#!/bin/sh\nanswer\n",
+                            check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { cat "$1/.judge/stdout"; exit 1; }\n')
+        tools = os.path.join(self.project, "tools")
+        os.makedirs(tools)
+        with open(os.path.join(tools, "answer"), "w") as f:
+            f.write("#!/bin/sh\necho 42\n")
+        os.chmod(os.path.join(tools, "answer"), 0o755)
+        done = self.drive(kit, f"""
+host.write("tools/answer", "#!/bin/sh\\ncat {tools}/answer\\necho 41\\n")
+say(submit("a wrong answer, from the copy"))
+""", PATH=f"{tools}:{os.environ['PATH']}")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed"), done.stdout)
+        self.assertIn(f"{tools}/answer: Permission denied | 41", done.stdout)
+
     def test_judge_blind_withholds_the_checks_words_too(self):
         kit = self.make_kit(config='{"runs": 1, "blind": true}',
                             check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "SECRET expected 42"; exit 1; }\n')

@@ -110,6 +110,15 @@ local function printed(dir: string): string
 	return ""
 end
 
+local function path_in(dir: string): string
+	local entries = {}
+	for entry in ((host.env("PATH") or "") .. ":"):gmatch("([^:]*):") do
+		local inside = entry == project or entry:sub(1, #project + 1) == project .. "/"
+		table.insert(entries, inside and dir .. entry:sub(#project + 1) or entry)
+	end
+	return table.concat(entries, ":")
+end
+
 local function candidate(dir: string, script: string): (number?, ...string)
 	local wall = table.clone(writes)
 	table.insert(wall, dir)
@@ -120,6 +129,7 @@ local function candidate(dir: string, script: string): (number?, ...string)
 		timeout = config.timeout,
 		read = reads,
 		write = wall,
+		env = { PATH = path_in(dir) },
 		hangup = true,
 	})
 	if result.code == 0 then
