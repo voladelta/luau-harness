@@ -77,6 +77,7 @@ fs::path make_judge_state(const fs::path& project) {
             throw std::runtime_error(fmt::format("judge: dup2: {}", error_text()));
         }
         close(channel);
+        std::clearerr(stdin);
         static_cast<void>(std::setvbuf(stdout, nullptr, _IOLBF, 0));
         const fs::path tmp = state / "tmp";
         fs::create_directories(tmp);
