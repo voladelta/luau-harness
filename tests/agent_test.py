@@ -2498,6 +2498,15 @@ say(submit("a tar of the model's own, for the judge to run"))
         self.assertIn("leaked: No such file", done.stdout)
         self.assertNotIn("ANSWER-42", done.stdout)
 
+    def test_judge_a_path_the_model_can_write_all_of_stops_hx_before_the_agent(self):
+        kit = self.make_kit()
+        tools = os.path.join(self.project, "tools")
+        os.makedirs(tools)
+        done = self.drive(kit, 'print("began")', PATH=f"{tools}:bin")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("every directory on PATH is one the model can write", done.stderr)
+        self.assertEqual(done.stdout, "")
+
     def test_judge_a_kit_names_a_program_in_the_candidates_copy(self):
         kit = self.make_kit(config='{"runs": 1}',
                             run="#!/bin/sh\ncommand -v answer && exit 1\nPATH=$PWD/tools:$PATH answer\n")

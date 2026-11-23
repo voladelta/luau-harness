@@ -707,13 +707,9 @@ void add_path_rules(std::vector<hx::Rule>& rules, const std::vector<fs::path>& w
     }
 }
 
-void search_no_writable_path(const std::vector<fs::path>& writable) {
-    const char* path = std::getenv("PATH");  // NOLINT(concurrency-mt-unsafe)
-    if (path == nullptr) {
-        return;
-    }
+std::string unwritable_path(const std::vector<fs::path>& writable) {
     std::string kept;
-    for (const auto part : std::views::split(std::string_view(path), ':')) {
+    for (const auto part : std::views::split(env_or("PATH", "/usr/bin:/bin"), ':')) {
         const std::string_view entry(part.begin(), part.end());
         const std::optional<fs::path> whole = entry.starts_with('/') ? resolve_trusted(entry, writable) : std::nullopt;
         if (whole && !within(*whole, writable)) {
@@ -721,10 +717,11 @@ void search_no_writable_path(const std::vector<fs::path>& writable) {
         }
     }
     if (kept.empty()) {
-        unsetenv("PATH");  // NOLINT(concurrency-mt-unsafe)
-    } else {
-        setenv("PATH", kept.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
+        throw UsageError(
+            "--judge: every directory on PATH is one the model can write, so the judge has nowhere to "
+            "find its programs");
     }
+    return kept;
 }
 
 std::vector<hx::Rule> system_rules(const Options& options, const fs::path& project) {
@@ -1049,6 +1046,7 @@ int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) 
 
 hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::path& project,
                       const fs::path& tmp) {
+    const std::string path = unwritable_path(writable_roots(options, project));
     const hx::JudgeWalls walls{
         .system = system_rules(options, project),
         .user = user_rules(options),
@@ -1056,7 +1054,7 @@ hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const 
         .unix_sockets = options.unix_sockets,
     };
     return hx::spawn_judge(kit_dir, project, walls, [&](std::vector<std::string> args, const hx::Sandbox& wall) {
-        search_no_writable_path(writable_roots(options, project));
+        setenv("PATH", path.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
         hx::HostConfig config;
         config.args = std::move(args);
         config.quiet = options.quiet;
