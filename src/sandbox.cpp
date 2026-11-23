@@ -132,19 +132,22 @@ bool filter_unix_sockets() {
     constexpr auto kFirstArg = static_cast<uint32_t>(offsetof(seccomp_data, args));
     constexpr auto kSecondArg = kFirstArg + static_cast<uint32_t>(sizeof(uint64_t));
     constexpr uint32_t kTypeMask = 0xf;
-    std::array<sock_filter, 15> program{
+    std::array<sock_filter, 18> program{
         stmt(BPF_LD | BPF_W | BPF_ABS, kArch),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 11),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 14),
         stmt(BPF_LD | BPF_W | BPF_ABS, kNumber),
-        jump(BPF_JMP | BPF_JGE | BPF_K, kX32Bit, 9, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, kIoUringSetup, 8, 0),
+        jump(BPF_JMP | BPF_JGE | BPF_K, kX32Bit, 12, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, kIoUringSetup, 11, 0),
         jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_socket, 0, 2),
         stmt(BPF_LD | BPF_W | BPF_ABS, kFirstArg),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 6, 4),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_socketpair, 0, 3),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 9, 7),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, SYS_socketpair, 0, 6),
+        stmt(BPF_LD | BPF_W | BPF_ABS, kFirstArg),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 4),
         stmt(BPF_LD | BPF_W | BPF_ABS, kSecondArg),
         stmt(BPF_ALU | BPF_AND | BPF_K, kTypeMask),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, SOCK_DGRAM, 2, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 1, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, SOCK_SEQPACKET, 0, 2),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
