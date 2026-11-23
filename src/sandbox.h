@@ -21,6 +21,7 @@ struct Rule {
     std::string path;
     Access access;
     bool required;
+    bool inert = false;
 };
 
 class SandboxError : public std::runtime_error {

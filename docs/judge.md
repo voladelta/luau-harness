@@ -49,9 +49,15 @@ The walls are what make the verdicts worth having:
   itself.
 - **The candidate cannot read the kit's other files.** `build` and `run` run behind a narrower wall still: their
   copy of the candidate, the system directories and the `--ro` and `--rw` paths. Only the script being run is
-  copied in, so `check` and whatever else the kit holds stay out of reach. `check` reads the kit and the run's copy
-  and writes nothing that lasts. What a failed build or run printed goes to the model only from the file hx
-  sent it to: a link left in that file's place is not read.
+  copied in, so `check` and whatever else the kit holds stay out of reach. `check` reads the kit, the run's copy
+  and the `--ro` paths, not the `--rw` ones, and writes nothing that lasts. What a failed build or run printed
+  goes to the model only from the file hx sent it to: a link left in that file's place is not read.
+- **The judge runs nothing the model can write.** Its own commands and `check` cannot run a file in the project,
+  in a run's copy or under a `--rw` path, whether it is named outright, found on `PATH` or reached through a link.
+  The wall cannot open a directory and close part of it, so a `--ro` path or a system directory that holds the
+  project or a `--rw` path runs nothing for them either: give a toolchain `check` needs a `--ro` path of its own.
+  `build` and `run` are the candidate's, and run whatever the candidate's wall holds. What `check` hands to an
+  interpreter itself, `sh "$1/fix.sh"`, is the kit's to answer for.
 - **The judge finds no program where the model can write.** Its `PATH`, and with it that of `build`, `run` and
   `check`, keeps only the absolute directories that lie outside the project and the `--rw` paths and are not
   reached through a link there; hx stops before the agent begins when none is left. Without a `PATH` it

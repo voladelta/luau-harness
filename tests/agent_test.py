@@ -2187,6 +2187,39 @@ print(state("plain.pid") == "S", state(box .. "/walled.pid") == "S")
         self.assertEqual((inside, alive), ("inside", "true\tfalse"))
         self.assertNotIn("s3cret", done.stdout)
 
+    def test_an_inert_path_is_read_and_written_but_runs_nothing(self):
+        with open(os.path.join(self.project, "inert.luau"), "w") as f:
+            f.write("""
+local tmp = host.env("TMPDIR")
+local box, held = tmp .. "/box", tmp .. "/held"
+host.sh({ "mkdir", "-p", box, held .. "/in" })
+for _, dir in { box, held .. "/in" } do
+	host.write(dir .. "/tool", "#!/bin/sh\\necho ran\\n")
+	host.sh({ "chmod", "+x", dir .. "/tool" })
+end
+local function try(command, walled)
+	local done = host.sh(command, walled)
+	print(done.code, (done.out:gsub("%s+$", ""):gsub("^.*: ", "")))
+end
+try(box .. "/tool", { write = { box } })
+try(box .. "/tool", { write = { box }, inert = { box } })
+try("echo new > " .. box .. "/f && cat " .. box .. "/f && sh " .. box .. "/tool", { write = { box }, inert = { box } })
+try(held .. "/in/tool", { read = { held }, inert = { held .. "/in" } })
+try("true", { write = { box }, inert = { "/" } })
+print(pcall(host.sh, "true", { inert = "box" }))
+""")
+        done = self.run_hx("--run", "inert.luau")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), [
+            "0\tran",
+            "126\tPermission denied",
+            "0\tnew",
+            "ran",
+            "126\tPermission denied",
+            "127\tcannot run bash",
+            "false\thost.sh: inert is a list of paths",
+        ])
+
     def make_kit(self, where=None, run="#!/bin/sh\nsh prog.sh\n",
                  check='#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout" || { echo "wrong: $(head -c 80 "$1/.judge/stdout")"; exit 1; }\n',
                  config='{"runs": 3}', prog="sleep 0.3\necho 42\n"):
@@ -2497,6 +2530,73 @@ say(submit("a tar of the model's own, for the judge to run"))
         self.assertTrue(done.stdout.startswith("Trial 1. invalid: run exited 1:"), done.stdout)
         self.assertIn("leaked: No such file", done.stdout)
         self.assertNotIn("ANSWER-42", done.stdout)
+
+    def test_judge_a_link_on_path_to_a_program_the_model_wrote_does_not_run_as_the_judge(self):
+        kit = self.make_kit(config='{"runs": 1}', check='#!/bin/sh\n# ANSWER-42\ngrep -qx 42 "$1/.judge/stdout"\n')
+        links = os.path.join(self.root, "links")
+        os.makedirs(links)
+        os.makedirs(os.path.join(self.project, "tools"))
+        os.symlink(os.path.join(self.project, "tools", "tar"), os.path.join(links, "tar"))
+        done = self.drive(kit, f"""
+host.write("tools/tar", [[#!/bin/sh
+/usr/bin/tar "$@" || exit
+[ "$3" = -xf ] && cp {kit}/check "$2/leaked"
+exit 0
+]])
+host.sh("chmod +x tools/tar")
+host.write("prog.sh", "cat leaked; exit 1\\n")
+say(submit("a tar of the model's own, behind a link the model did not write"))
+""", PATH=f"{links}:{os.environ['PATH']}")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertIn("Trial 1. error: the judge could not finish it", done.stdout)
+        self.assertIn("links/tar: /bin/sh: bad interpreter: Permission denied", done.stdout)
+        self.assertNotIn("ANSWER-42", done.stdout + done.stderr)
+
+    def test_judge_a_check_runs_and_reads_nothing_the_model_can_write(self):
+        outer = os.path.join(self.root, "outer")
+        rw, links = os.path.join(outer, "rw"), os.path.join(outer, "links")
+        os.makedirs(rw)
+        os.makedirs(links)
+        os.symlink(os.path.join(rw, "answer"), os.path.join(links, "answer"))
+        leak = f"#!/bin/sh\\ncat {os.path.join(self.root, 'kit', 'check')}\\n"
+        cases = [
+            ("run through a link on PATH", "answer", []),
+            ("run where a --ro path holds it", "answer", ["--ro", outer]),
+            ("run by its name", f"{rw}/answer", []),
+            ("read", f". {rw}/answer", []),
+            ("run in the candidate", '"$1/answer"', []),
+        ]
+        for name, call, flags in cases:
+            with self.subTest(name):
+                kit = self.make_kit(config='{"runs": 1}',
+                                    check=f'#!/bin/sh\n# ANSWER-42\n({call})\ngrep -qx 42 "$1/.judge/stdout"\n')
+                done = self.drive(kit, f"""
+host.write("{rw}/answer", "{leak}")
+host.write("answer", "{leak}")
+host.sh("chmod +x {rw}/answer answer")
+host.write("prog.sh", "echo 41\\n")
+say(submit("a wrong answer, and a program for the check to run"))
+""", "--rw", rw, *flags, PATH=f"{links}:{os.environ['PATH']}")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("the starting point passes", done.stderr)
+                self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed:"), done.stdout)
+                self.assertIn("answer: Permission denied", done.stdout)
+                self.assertNotIn("ANSWER-42", done.stdout + done.stderr)
+
+    def test_judge_a_check_runs_what_a_ro_path_holds_and_a_run_what_a_rw_path_holds(self):
+        ro, rw = os.path.join(self.root, "ro"), os.path.join(self.root, "rw")
+        for path, body in [(os.path.join(ro, "verify"), '#!/bin/sh\ngrep -qx 42 "$1/.judge/stdout"\n'),
+                           (os.path.join(rw, "emit"), "#!/bin/sh\necho 42\n")]:
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0o755)
+        kit = self.make_kit(config='{"runs": 1}', run=f"#!/bin/sh\n{rw}/emit\n", check=f'#!/bin/sh\n{ro}/verify "$1"\n')
+        done = self.drive(kit, 'print("began")', "--ro", ro, "--rw", rw)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the starting point passes", done.stderr)
+        self.assertEqual(done.stdout, "began\n")
 
     def test_judge_a_path_the_model_can_write_all_of_stops_hx_before_the_agent(self):
         kit = self.make_kit()

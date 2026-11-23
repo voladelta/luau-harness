@@ -205,6 +205,9 @@ std::pair<UniqueFd, int> make_ruleset(const std::vector<Rule>& rules) {
         if (!S_ISDIR(st.st_mode)) {
             rights &= kFileRights;
         }
+        if (rule.inert) {
+            rights &= ~kExecute;
+        }
         if (rights == 0) {
             continue;
         }

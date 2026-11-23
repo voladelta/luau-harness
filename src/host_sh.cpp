@@ -12,9 +12,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -29,6 +31,8 @@
 
 namespace hx {
 namespace {
+
+namespace fs = std::filesystem;
 
 constexpr std::size_t kCaptureHalf = std::size_t{8} << 20;
 constexpr double kNoPidfdPoll = 0.05;
@@ -533,8 +537,11 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
         return std::nullopt;
     }
     std::vector<Rule> rules = config_.system_rules;
+    std::vector<fs::path> inert;
     bool asked = false;
-    for (const auto& [field, access] : {std::pair{"read", Access::Read}, std::pair{"write", Access::Write}}) {
+    for (const auto& [field, access] :
+         {std::pair{"read", std::optional(Access::Read)}, std::pair{"write", std::optional(Access::Write)},
+          std::pair{"inert", std::optional<Access>()}}) {
         lua_getfield(L, idx, field);
         if (!lua_isnil(L, -1)) {
             if (!lua_istable(L, -1)) {
@@ -547,7 +554,15 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
                 if (path == nullptr || std::strlen(path) != length) {
                     luaL_error(L, "host.sh: %s[%d] is not a path", field, i);
                 }
-                rules.push_back({.path = path, .access = access, .required = true});
+                if (access) {
+                    rules.push_back({.path = path, .access = *access, .required = true});
+                } else {
+                    std::error_code ec;
+                    inert.push_back(fs::weakly_canonical(path, ec));
+                    if (ec) {
+                        luaL_error(L, "host.sh: inert[%d]: %s", i, ec.message().c_str());
+                    }
+                }
                 lua_pop(L, 1);
             }
             lua_pop(L, 1);
@@ -556,6 +571,13 @@ std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
     }
     if (!asked) {
         return std::nullopt;
+    }
+    for (Rule& rule : rules) {
+        std::error_code ec;
+        const fs::path whole = inert.empty() ? fs::path() : fs::weakly_canonical(rule.path, ec);
+        rule.inert = ec || std::ranges::any_of(inert, [&whole](const fs::path& dir) {
+                         return beneath(whole, dir) || beneath(dir, whole);
+                     });
     }
     try {
         return Wall::prepare(rules);

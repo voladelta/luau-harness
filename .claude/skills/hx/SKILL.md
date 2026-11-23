@@ -259,6 +259,8 @@ could otherwise make the number only look better.
   (`{"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}`).
 - Keep the answers in `check`: the candidate's code can read `run`. Before trusting a kit, try it on the
   unchanged project and on a change known to be bad.
+- `check` runs no file the model can write, in the project, the run's copy or a `--rw` path, and reads no `--rw`
+  path: a toolchain it needs goes in a `--ro` path of its own, one that holds neither.
 - Verdicts, patches and `ledger.jsonl` go to `~/.local/state/hx/judge/PROJECT-TIME-XXXXXX`; `champion.patch`
   there applies with `git apply`.
 
