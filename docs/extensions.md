@@ -52,7 +52,7 @@ data:
 | `ext("path").relative(p, from?)` | `p` relative to `from`, by default the working directory, as `posixpath.relpath`; the file system is not read |
 
 `search` finds files and text in the project and returns them as data, so that a search needs no shell quoting and
-no parsing of a command's output:
+no parsing of a command's output. Text search needs an `awk` that supports NUL record separators:
 
 | Call | Returns |
 |---|---|

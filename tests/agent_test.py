@@ -315,6 +315,23 @@ end
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "1: x\n[lines 1-1 of 4194304; offset=2 goes on]\n")
 
+    def test_search_rejects_awk_without_nul_record_support(self):
+        bin_dir = os.path.join(self.project, "bin")
+        os.mkdir(bin_dir)
+        awk = os.path.join(bin_dir, "awk")
+        with open(awk, "w") as f:
+            f.write('#!/bin/bash\nIFS= read -r -d "" record\nprintf "%s" "$record" | command -p awk "$@"\n')
+        os.chmod(awk, 0o755)
+        with open(os.path.join(self.project, "note.txt"), "w") as f:
+            f.write("needle\n")
+        done = self.run_hx(
+            "--run", "-", PATH=bin_dir + ":" + os.environ["PATH"],
+            stdin='local search = assert(host.load(host.default_loop, "=loop"))().ext("search")\n'
+                  'search.ripgrep = false\nprint(tostring(search.grep("needle", { glob = "note.txt" })))\n',
+        )
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("awk must support NUL record separators", done.stderr)
+
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
         self.assertEqual(done.returncode, 0, done.stderr)

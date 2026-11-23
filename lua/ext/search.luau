@@ -101,9 +101,11 @@ local shown = {
 local preview_matches = [[
 count=$1 width=$2
 shift 2
-"$@" | LC_ALL=C awk -v count="$count" -v width="$width" '
+{ printf "hx\0awk\0"; "$@"; } | LC_ALL=C awk -v count="$count" -v width="$width" '
 	BEGIN { RS = "\0" }
-	NR == 1 { path = $0; next }
+	NR == 1 { if ($0 != "hx") exit; next }
+	NR == 2 { if ($0 != "awk") exit; split_on_nul = 1; next }
+	NR == 3 { path = $0; next }
 	{
 		nl = index($0, "\n")
 		colon = index($0, ":")
@@ -116,6 +118,12 @@ shift 2
 			if (++shown == count) exit
 		}
 		path = substr($0, nl + 1)
+	}
+	END {
+		if (!split_on_nul) {
+			print "awk must support NUL record separators" > "/dev/stderr"
+			exit 1
+		}
 	}
 '
 status=("${PIPESTATUS[@]}")
