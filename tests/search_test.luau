@@ -90,4 +90,19 @@ raises("a pattern that is not text", "search.grep: argument 1 (pattern) must be 
 has("the lua tool shows matches as lines", loop.tools[1].run({ code = 'return ext("search").grep("gamma", { dir = "repo" })' }),
 	"repo/src/a.luau:2: beta gamma")
 
+assert(host.write("repo/src/conflicted.txt", "merge-token one\nmerge-token two\n"))
+local hash = host.sh({ "git", "hash-object", "-w", "src/conflicted.txt" }, { cwd = "repo" }).out:match("%x+")
+assert(hash)
+local stages = {}
+for stage = 1, 3 do
+	table.insert(stages, ("100644 %s %d\tsrc/conflicted.txt\n"):format(hash, stage))
+end
+assert(host.sh({ "git", "update-index", "--index-info" }, { cwd = "repo", input = table.concat(stages) }).code == 0)
+check("an unmerged path is listed once", joined(search.files("src/conflicted.txt", "repo")), "repo/src/conflicted.txt")
+search.ripgrep = false
+local conflict = search.grep("merge-token", { dir = "repo", glob = "src/conflicted.txt", limit = 2 })
+check("grep reads an unmerged path once, in line order", tostring(conflict),
+	"repo/src/conflicted.txt:1: merge-token one\nrepo/src/conflicted.txt:2: merge-token two")
+check("duplicate index stages do not count as extra matches", conflict.more, nil)
+
 checks.done("search")

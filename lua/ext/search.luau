@@ -62,12 +62,13 @@ function M.files(glob: string?, dir: string?): { string }
 	local found = listed(list, where)
 	local out = {}
 	if found then
-		local deleted = {}
+		local seen = {}
 		for _, path in listed(gone, where) or {} do
-			deleted[path] = true
+			seen[path] = true
 		end
 		for _, path in found do
-			if not deleted[path] then
+			if not seen[path] then
+				seen[path] = true
 				table.insert(out, prefix .. path)
 			end
 		end
