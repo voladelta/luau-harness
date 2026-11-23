@@ -300,6 +300,21 @@ class AgentTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(self.model.requests[-1]["messages"][0]["content"][0]["text"], "newer")
 
+    def test_numbered_read_of_dense_file_uses_bounded_working_memory(self):
+        with open(os.path.join(self.project, "dense.txt"), "wb") as f:
+            f.write(b"x\n" * (4 << 20))
+        done = subprocess.run(
+            ["bash", "-c", 'ulimit -v 131072 && exec "$@"', "bash", HX, "-q", "--run", "-"],
+            input="""local loop = assert(host.load(host.default_loop, "=loop"))()
+for _, tool in loop.functions do
+    if tool.name == "read" then print(tool.run("dense.txt", 1, 1)) end
+end
+""",
+            cwd=self.project, env=self.env(), capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "1: x\n[lines 1-1 of 4194304; offset=2 goes on]\n")
+
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
         self.assertEqual(done.returncode, 0, done.stderr)

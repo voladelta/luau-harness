@@ -841,50 +841,45 @@ M.functions = {
 			if text == "" then
 				return "[empty file]"
 			end
-			local lines = text:split("\n")
-			if text:sub(-1) == "\n" then
-				table.remove(lines)
-			end
-			for i, line in lines do
-				if line:sub(-1) == "\r" then
-					lines[i] = line:sub(1, -2)
-				end
-			end
 			local first = math.max(1, offset or 1)
-			local last = math.min(#lines, first + (limit or 2000) - 1)
-			if first > #lines then
-				error(("offset %d is past the end: the file has %d lines"):format(first, #lines), 0)
-			end
-			local budget = M.output_limit - 200
-			local function numbered(i)
-				return ("%d: %s"):format(i, lines[i])
-			end
-			local shown = { numbered(first) }
-			local size = #shown[1]
-			for i = first + 1, last do
-				local line = numbered(i)
-				size += 1 + #line
-				if size > budget then
-					last = i - 1
-					break
+			local until_line = first + (limit or 2000) - 1
+			local budget = math.max(0, M.output_limit - 200)
+			local shown = {}
+			local at, total, last, size = 1, 0, first - 1, 0
+			while at <= #text do
+				local newline = text:find("\n", at, true) or #text + 1
+				total += 1
+				if total >= first and total <= until_line then
+					local stop = newline - 1
+					if stop >= at and text:byte(stop) == 13 then
+						stop -= 1
+					end
+					local length = stop - at + 1
+					local number = ("%d: "):format(total)
+					if total == first and length > budget then
+						local prefix = utf8_prefix(text:sub(at, at + budget), budget)
+						table.insert(shown, number .. prefix)
+						table.insert(shown, ("[line %d is %d bytes; only the first %d are shown]"):format(total, length, #prefix))
+						last, until_line = total, total
+					elseif total == first or size + 1 + #number + length <= budget then
+						table.insert(shown, number .. text:sub(at, stop))
+						size += (if total == first then 0 else 1) + #number + length
+						last = total
+					else
+						until_line = last
+					end
 				end
-				table.insert(shown, line)
+				at = newline + 1
 			end
-			local body
-			if #lines[first] > budget then
-				last = first
-				local prefix = utf8_prefix(lines[first], budget)
-				body = ("%d: %s"):format(first, prefix)
-					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], #prefix)
-			else
-				body = table.concat(shown, "\n")
+			if first > total then
+				error(("offset %d is past the end: the file has %d lines"):format(first, total), 0)
 			end
-			if last < #lines then
-				body ..= ("\n[lines %d-%d of %d; offset=%d goes on]"):format(first, last, #lines, last + 1)
+			if last < total then
+				table.insert(shown, ("[lines %d-%d of %d; offset=%d goes on]"):format(first, last, total, last + 1))
 			elseif first > 1 then
-				body ..= ("\n[lines %d-%d of %d]"):format(first, last, #lines)
+				table.insert(shown, ("[lines %d-%d of %d]"):format(first, last, total))
 			end
-			return body
+			return table.concat(shown, "\n")
 		end,
 	},
 	{
