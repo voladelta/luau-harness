@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -608,8 +609,54 @@ bool holds_home(const fs::path& project) {
     return hx::beneath(home, project);
 }
 
-void add_path_rules(std::vector<hx::Rule>& rules) {
-    std::vector<fs::path> readable;
+std::vector<fs::path> writable_roots(const Options& options, const fs::path& project) {
+    std::vector<fs::path> roots{project};
+    for (const std::string& path : options.write_paths) {
+        std::error_code ec;
+        if (fs::path whole = fs::canonical(path, ec); !ec) {
+            roots.push_back(std::move(whole));
+        }
+    }
+    return roots;
+}
+
+std::optional<fs::path> resolve_trusted(const fs::path& path, const std::vector<fs::path>& writable) {
+    constexpr int kMaxLinks = 40;
+    std::deque<fs::path> pending(path.begin(), path.end());
+    fs::path resolved = "/";
+    int links = 0;
+    while (!pending.empty()) {
+        const fs::path part = std::move(pending.front());
+        pending.pop_front();
+        if (part.empty() || part == "/" || part == ".") {
+            continue;
+        }
+        if (part == "..") {
+            resolved = resolved.parent_path();
+            continue;
+        }
+        fs::path next = resolved / part;
+        std::error_code ec;
+        if (!fs::is_symlink(next, ec)) {
+            resolved = std::move(next);
+            continue;
+        }
+        const fs::path target = fs::read_symlink(next, ec);
+        const bool planted =
+            std::ranges::any_of(writable, [&](const fs::path& root) { return hx::beneath(resolved, root); });
+        if (ec || planted || ++links > kMaxLinks) {
+            return std::nullopt;
+        }
+        if (target.is_absolute()) {
+            resolved = "/";
+        }
+        pending.insert(pending.begin(), target.begin(), target.end());
+    }
+    return resolved;
+}
+
+void add_path_rules(std::vector<hx::Rule>& rules, const std::vector<fs::path>& writable) {
+    std::vector<fs::path> readable = writable;
     for (const hx::Rule& rule : rules) {
         std::error_code ec;
         if (fs::path whole = fs::canonical(rule.path, ec); !ec) {
@@ -618,11 +665,13 @@ void add_path_rules(std::vector<hx::Rule>& rules) {
     }
     std::set<fs::path> opened;
     const auto open = [&](const fs::path& dir) {
+        const std::optional<fs::path> whole = resolve_trusted(dir, writable);
         std::error_code ec;
-        const fs::path whole = fs::canonical(dir, ec);
-        const bool covered = std::ranges::any_of(readable, [&](const fs::path& r) { return hx::beneath(whole, r); });
-        if (!ec && fs::is_directory(whole, ec) && whole != "/" && !holds_home(whole) && !covered) {
-            opened.insert(whole);
+        if (!whole || !fs::is_directory(*whole, ec) || *whole == "/" || holds_home(*whole)) {
+            return;
+        }
+        if (std::ranges::none_of(readable, [&](const fs::path& r) { return hx::beneath(*whole, r); })) {
+            opened.insert(*whole);
         }
     };
     for (const auto part : std::views::split(env_or("PATH", ""), ':')) {
@@ -638,10 +687,11 @@ void add_path_rules(std::vector<hx::Rule>& rules) {
             if (!it->is_symlink(link_ec)) {
                 continue;
             }
-            const fs::path home = fs::canonical(it->path(), link_ec).parent_path();
-            if (link_ec || listed.contains(home)) {
+            const std::optional<fs::path> target = resolve_trusted(it->path(), writable);
+            if (!target || !fs::exists(*target, link_ec) || listed.contains(target->parent_path())) {
                 continue;
             }
+            const fs::path home = target->parent_path();
             open(home);
             if (home.filename() == "bin") {
                 for (const char* sibling : {"lib", "lib64", "libexec"}) {
@@ -655,7 +705,7 @@ void add_path_rules(std::vector<hx::Rule>& rules) {
     }
 }
 
-std::vector<hx::Rule> system_rules() {
+std::vector<hx::Rule> system_rules(const Options& options, const fs::path& project) {
     using hx::Access;
     std::vector<hx::Rule> rules;
     for (const char* path : {
@@ -707,7 +757,9 @@ std::vector<hx::Rule> system_rules() {
             rules.push_back({.path = std::move(path), .access = Access::Read, .required = false});
         }
     }
-    add_path_rules(rules);
+    const std::vector<fs::path> writable = writable_roots(options, project);
+    std::erase_if(rules, [&](const hx::Rule& rule) { return !resolve_trusted(rule.path, writable); });
+    add_path_rules(rules, writable);
     return rules;
 }
 
@@ -725,7 +777,7 @@ std::vector<hx::Rule> user_rules(const Options& options) {
 
 std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& project, const fs::path& tmp) {
     using hx::Access;
-    std::vector<hx::Rule> rules = system_rules();
+    std::vector<hx::Rule> rules = system_rules(options, project);
     rules.push_back({.path = project.string(), .access = Access::Write, .required = true});
     rules.push_back({.path = tmp.string(), .access = Access::Write, .required = true});
     const std::vector<hx::Rule> user = user_rules(options);
@@ -973,7 +1025,7 @@ int run_vm(hx::HostConfig config, const hx::Sandbox& sandbox, const Body& body) 
 hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const fs::path& project,
                       const fs::path& tmp) {
     const hx::JudgeWalls walls{
-        .system = system_rules(),
+        .system = system_rules(options, project),
         .user = user_rules(options),
         .agent = sandbox_rules(options, project, tmp),
         .unix_sockets = options.unix_sockets,
@@ -982,7 +1034,7 @@ hx::Judge spawn_judge(const Options& options, const std::string& kit_dir, const 
         hx::HostConfig config;
         config.args = std::move(args);
         config.quiet = options.quiet;
-        config.system_rules = system_rules();
+        config.system_rules = system_rules(options, project);
         return run_vm(std::move(config), wall, [](lua_State* L) { return run_module(L, hx::kJudge, "=judge"); });
     });
 }
@@ -1163,7 +1215,7 @@ int run(const std::vector<std::string_view>& argv) {
                    sandbox.abi(), hx::Sandbox::kUnixSocketAbi);
     }
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-    config.system_rules = system_rules();
+    config.system_rules = system_rules(options, project);
     if (judge) {
         config.judge = judge->share_channel();
     }

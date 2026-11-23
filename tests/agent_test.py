@@ -1030,6 +1030,34 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("SECRET", result)
         self.assertNotIn("HOME-FILE", result)
 
+    def test_a_link_the_model_could_have_written_opens_nothing(self):
+        def secret(path, text):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+
+        key = os.path.join(self.home, ".ssh/id")
+        vault = os.path.join(self.home, "vault")
+        stored = os.path.join(self.home, "store/token")
+        secret(key, "KEY-SECRET")
+        secret(os.path.join(vault, "note"), "VAULT-SECRET")
+        secret(stored, "STORE-SECRET")
+        os.makedirs(os.path.join(self.project, ".venv/bin"))
+        os.symlink(key, os.path.join(self.project, ".venv/bin/tool"))
+        os.symlink(vault, os.path.join(self.project, "tools"))
+        os.makedirs(os.path.join(self.home, ".local/bin"))
+        os.symlink(os.path.join(self.project, "dev"), os.path.join(self.home, ".local/bin/dev"))
+        os.symlink(stored, os.path.join(self.project, "dev"))
+        path = ":".join([f"{self.project}/.venv/bin", f"{self.project}/tools", f"{self.home}/.local/bin",
+                         os.environ["PATH"]])
+        done = self.run_hx("go", PATH=path, script=[call("bash", {"command": (
+            f"cat {key} {vault}/note {stored}")}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = self.tool_results()[0]
+        for denied in (key, f"{vault}/note", stored):
+            self.assertIn(f"{denied}: Permission denied", result)
+        self.assertNotIn("SECRET", result)
+
     def test_the_home_directory_is_not_a_project(self):
         done = subprocess.run([HX, "go"], cwd=self.home, env=self.env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 2)
