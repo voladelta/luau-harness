@@ -66,6 +66,23 @@ if not host.read("repo/src/locked.luau") then
 	end
 end
 host.sh({ "rm", "-f", "repo/src/locked.luau" })
+assert(host.write("plain/long.txt", "needle" .. string.rep("x", 20 * 1024 * 1024) .. "\nneedle\n"))
+assert(host.write("plain/a\nb.txt", "needle\n"))
+for _, ripgrep in { true, false } do
+	if not ripgrep or host.sh("command -v rg").code == 0 then
+		search.ripgrep = ripgrep
+		local by = ripgrep and "rg: " or "grep: "
+		local unusual = search.grep("needle", { dir = "plain", glob = "a*.txt" })
+		assert(unusual[1] and unusual[1].path == "plain/a\nb.txt", by .. "a newline is part of the filename")
+		local long = search.grep("needle", { dir = "plain", glob = "long.txt", limit = 1 })
+		assert(long[1] and long[1].text == "needle" .. string.rep("x", 494) .. " ...", by .. "a long line must return its bounded preview")
+		check(by .. "the next match still marks the limited result", long.more, true)
+		search.text_limit = 20 * 1024 * 1024
+		raises(by .. "clipped output is never silently parsed", "shell output was clipped", search.grep, "needle",
+			{ dir = "plain", glob = "long.txt" })
+		search.text_limit = 500
+	end
+end
 search.ripgrep = nil
 
 raises("an empty pattern", "search.grep: argument 1 (pattern) is empty", search.grep, "")
