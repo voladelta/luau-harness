@@ -26,7 +26,11 @@ for i = 3, #host.args, 2 do
 	table.insert(host.args[i] == "--ro" and reads or writes, host.args[i + 1])
 end
 
-local own = { read = { project, kit }, write = { state }, inert = { project, state, table.unpack(writes) } }
+local own = {
+	read = { project, kit, table.unpack(reads) },
+	write = { state },
+	inert = { project, state, table.unpack(writes) },
+}
 
 local defaults: { [string]: number | boolean } = { runs = 5, margin = 0.02, timeout = 600, blind = false }
 local config: Config
