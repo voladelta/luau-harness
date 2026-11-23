@@ -103,7 +103,8 @@ local function write_patch(to_tree: string, name: string)
 end
 
 local function unlock(path: string)
-	host.sh(("chmod -R u+rwX %s 2>/dev/null || true"):format(quote(path)))
+	host.sh(("if [ -d %s ] && [ ! -L %s ]; then find %s -type d -exec chmod u+rwx {} ';' 2>/dev/null || true; fi")
+		:format(quote(path), quote(path), quote(path)))
 end
 
 local function remove(path: string)
@@ -112,11 +113,15 @@ local function remove(path: string)
 end
 
 local function candidate(dir: string, script: string): (number?, ...string)
+	local stdout = state .. "/tmp/stdout"
 	local wall = table.clone(writes)
 	table.insert(wall, dir)
+	table.insert(wall, stdout)
 	remove(dir .. "/.judge")
-	shell(("mkdir -p %s/.judge/tmp && cp %s %s/.judge/"):format(quote(dir), quote(kit .. "/" .. script), quote(dir)))
-	local result = host.sh(("cd %s && TMPDIR=$PWD/.judge/tmp ./.judge/%s"):format(quote(dir), script), {
+	shell(("mkdir -p %s/.judge/tmp && cp %s %s/.judge/ && rm -f %s && : > %s"):format(quote(dir),
+		quote(kit .. "/" .. script), quote(dir), quote(stdout), quote(stdout)))
+	local result = host.sh(("cd %s && TMPDIR=$PWD/.judge/tmp ./.judge/%s > %s 2>&1"):format(quote(dir), script,
+		quote(stdout)), {
 		timeout = config.timeout,
 		read = reads,
 		write = wall,
@@ -126,25 +131,27 @@ local function candidate(dir: string, script: string): (number?, ...string)
 	if result.code == 0 then
 		if script == "run" then
 			remove(dir .. "/.judge")
-			shell("mkdir -p " .. quote(dir .. "/.judge"))
-			assert(host.write(dir .. "/.judge/stdout", result.out))
+			shell(("mkdir -p %s/.judge && mv -f %s %s/.judge/stdout"):format(quote(dir), quote(stdout), quote(dir)))
+		else
+			shell("rm -f " .. quote(stdout))
 		end
 		return result.seconds
 	end
+	local shown = if config.blind then "" else tail(host.sh({ "tail", "-c", "1500", stdout }).out, 1500)
+	shell("rm -f " .. quote(stdout))
 	local how = result.timed_out and ("timed out after %g s"):format(config.timeout)
 		or result.signal and "was killed by signal " .. result.signal
 		or "exited " .. result.code
 	if config.blind then
 		return nil, ("%s %s"):format(script, how)
 	end
-	return nil, ("%s %s:\n%s"):format(script, how, tail(result.out, 1500))
+	return nil, ("%s %s:\n%s"):format(script, how, shown)
 end
 
 local function snapshot(dir: string)
 	remove(dir)
 	shell(("mkdir -p %s && tar -C %s --exclude=./.git --exclude=./.hx -cf - . | tar -C %s -xf -"):format(
 		quote(dir), quote(project), quote(dir)))
-	unlock(dir)
 end
 
 local workdir = state .. "/run"
