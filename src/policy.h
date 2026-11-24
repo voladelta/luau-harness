@@ -22,6 +22,7 @@ class WallPolicy {
     [[nodiscard]] std::string unwritable_path() const;
 
   private:
+    [[nodiscard]] std::vector<std::filesystem::path> writable_roots() const;
     [[nodiscard]] std::vector<Rule> user_rules() const;
     [[nodiscard]] std::vector<Rule> settled_user_rules() const;
     [[nodiscard]] std::vector<Rule> agent_rules(const std::filesystem::path& tmp) const;
@@ -29,7 +30,6 @@ class WallPolicy {
     std::filesystem::path project_;
     std::vector<std::string> read_paths_;
     std::vector<std::string> write_paths_;
-    std::vector<std::filesystem::path> writable_roots_;
     bool unix_sockets_;
 };
 

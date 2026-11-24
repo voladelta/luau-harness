@@ -126,14 +126,17 @@ WallPolicy::WallPolicy(fs::path project, std::vector<std::string> read_paths, st
     : project_(std::move(project)),
       read_paths_(std::move(read_paths)),
       write_paths_(std::move(write_paths)),
-      unix_sockets_(unix_sockets) {
-    writable_roots_.push_back(project_);
+      unix_sockets_(unix_sockets) {}
+
+std::vector<fs::path> WallPolicy::writable_roots() const {
+    std::vector<fs::path> roots{project_};
     for (const std::string& path : write_paths_) {
         std::error_code ec;
         if (fs::path whole = fs::canonical(path, ec); !ec) {
-            writable_roots_.push_back(std::move(whole));
+            roots.push_back(std::move(whole));
         }
     }
+    return roots;
 }
 
 void WallPolicy::check() const {
@@ -208,11 +211,12 @@ std::vector<Rule> WallPolicy::system_rules() const {
             rules.push_back({.path = std::move(path), .access = Access::Read, .required = false});
         }
     }
+    const std::vector<fs::path> writable = writable_roots();
     std::erase_if(rules, [&](const Rule& rule) {
-        const std::optional<fs::path> whole = resolve_trusted(rule.path, writable_roots_);
-        return !whole || within(*whole, writable_roots_);
+        const std::optional<fs::path> whole = resolve_trusted(rule.path, writable);
+        return !whole || within(*whole, writable);
     });
-    add_path_rules(rules, writable_roots_);
+    add_path_rules(rules, writable);
     return rules;
 }
 
@@ -229,13 +233,14 @@ std::vector<Rule> WallPolicy::user_rules() const {
 }
 
 std::vector<Rule> WallPolicy::settled_user_rules() const {
+    const std::vector<fs::path> writable = writable_roots();
     std::vector<Rule> settled;
     for (Rule& rule : user_rules()) {
         std::error_code ec;
         const fs::path whole = fs::canonical(rule.path, ec);
         if (ec) {
             settled.push_back(std::move(rule));
-        } else if (std::ranges::none_of(writable_roots_, [&](const fs::path& root) {
+        } else if (std::ranges::none_of(writable, [&](const fs::path& root) {
                        return (whole != root || root == project_) && beneath(whole, root);
                    })) {
             rule.path = whole.string();
@@ -274,14 +279,14 @@ JudgeWalls WallPolicy::judge_walls(const fs::path& tmp) const {
 
 std::string WallPolicy::unwritable_path() const {
     constexpr std::string_view kShellDefault = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const std::vector<fs::path> writable = writable_roots();
     const char* set = std::getenv("PATH");  // NOLINT(concurrency-mt-unsafe)
     std::string kept;
     for (const auto part : std::views::split(set != nullptr ? std::string_view(set) : kShellDefault, ':')) {
         const std::string_view entry(part.begin(), part.end());
-        const std::optional<fs::path> whole =
-            entry.starts_with('/') ? resolve_trusted(entry, writable_roots_) : std::nullopt;
+        const std::optional<fs::path> whole = entry.starts_with('/') ? resolve_trusted(entry, writable) : std::nullopt;
         std::error_code ec;
-        if (whole && !within(*whole, writable_roots_) && fs::is_directory(entry, ec)) {
+        if (whole && !within(*whole, writable) && fs::is_directory(entry, ec)) {
             kept.append(kept.empty() ? "" : ":").append(entry);
         }
     }
