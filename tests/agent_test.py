@@ -2113,7 +2113,7 @@ end
         config = os.path.join(self.project, "rg.conf")
         with open(os.path.join(self.project, "note.txt"), "w") as f:
             f.write("needle\ncontext\n")
-        for option in ["--count", "--column", "--after-context=1"]:
+        for option in ["--count", "--column", "--after-context=1", "--invert-match"]:
             with self.subTest(option=option):
                 with open(config, "w") as f:
                     f.write(option + "\n")
