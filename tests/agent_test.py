@@ -2963,6 +2963,52 @@ say(submit("fast"))
         self.assertFalse(os.path.exists(os.path.join(state, "champion.patch.tmp")))
         self.assertNotEqual(read(state, "champion.patch"), "")
 
+    def test_judge_ro_or_rw_on_the_project_itself_opens_nothing_to_a_candidate(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n")
+        marker = os.path.join(self.project, "live_only.txt")
+        with open(marker, "w") as f:
+            f.write("LIVE-SECRET\n")
+        written = os.path.join(self.project, "written_by_candidate.txt")
+        for flag, probe in (
+            ("--rw", f"echo leaked > {written}; exit 1"),
+            ("--ro", f"cat {marker}; exit 1"),
+        ):
+            with self.subTest(flag=flag):
+                with open(os.path.join(self.project, "prog.sh"), "w") as f:
+                    f.write("echo 42\n")
+                done = self.drive(kit, f"""
+host.write("prog.sh", {json.dumps(probe + chr(10))})
+say(submit("probe live project with {flag}"))
+""", flag, ".")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertTrue(done.stdout.startswith("Trial 1. invalid: run exited 1:"), done.stdout)
+                self.assertIn("Permission denied", done.stdout)
+                self.assertNotIn("LIVE-SECRET", done.stdout)
+                self.assertFalse(os.path.exists(written))
+
+    def test_judge_cleans_up_snapshots_containing_readonly_directories(self):
+        ro_dir = os.path.join(self.project, "locked")
+        os.makedirs(ro_dir)
+        with open(os.path.join(ro_dir, "data.txt"), "w") as f:
+            f.write("keep\n")
+        os.chmod(ro_dir, 0o500)
+        self.addCleanup(os.chmod, ro_dir, 0o700)
+
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 1\n",
+                            check='#!/bin/sh\ncat "$1/.judge/stdout"\n')
+        done = self.drive(kit, """
+host.write("prog.sh", "echo 2\\n")
+say(submit("win"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.startswith("Trial 1. win:"), done.stdout)
+        state = self.judge_state()
+        self.assertFalse(os.path.exists(os.path.join(state, "start")))
+        self.assertFalse(os.path.exists(os.path.join(state, "trials", "1")))
+        self.assertTrue(os.path.exists(os.path.join(state, "trials", "1.patch")))
+        self.assertTrue(os.path.exists(os.path.join(state, "champion.patch")))
+        self.assertTrue(os.path.exists(os.path.join(state, "ledger.jsonl")))
+
 
 JOBS = int(os.environ.get("HX_TEST_JOBS") or 2 * (os.cpu_count() or 1))
 

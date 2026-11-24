@@ -807,8 +807,10 @@ std::vector<hx::Rule> settled_user_rules(const Options& options, const fs::path&
         const fs::path whole = fs::canonical(rule.path, ec);
         if (ec) {
             settled.push_back(std::move(rule));
-        } else if (std::ranges::none_of(
-                       writable, [&](const fs::path& root) { return whole != root && hx::beneath(whole, root); })) {
+        } else if (std::ranges::none_of(writable, [&](const fs::path& root) {
+                       const bool keep_self = rule.access == hx::Access::Write && root != project;
+                       return (!keep_self || whole != root) && hx::beneath(whole, root);
+                   })) {
             rule.path = whole.string();
             settled.push_back(std::move(rule));
         }

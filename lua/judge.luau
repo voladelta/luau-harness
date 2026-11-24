@@ -312,7 +312,7 @@ local function crown(trial: number, dir: string, kind: string, value: number)
 	shell(("mv %s/champion.patch.tmp %s/champion.patch"):format(quote(state), quote(state)))
 	champion = { trial = trial, dir = dir, built = dir .. "/built", kind = kind, value = value }
 	if previous then
-		host.try(host.sh, "rm -rf " .. quote(previous.dir), own)
+		host.try(remove, previous.dir)
 	end
 end
 
@@ -460,7 +460,8 @@ end
 
 local function summary()
 	host.log(host.printable(summary_text()))
-	host.sh(("cd %s && rm -rf run stdout tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
+	unlock(state)
+	host.sh(("cd %s && { rm -rf run stdout tmp git index index.lock start; find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +; }")
 		:format(quote(state)), own)
 end
 
