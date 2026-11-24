@@ -101,6 +101,13 @@ host.sleep(0.01)
 host.write(dir .. "stale.txt", "changed behind the link\n")
 raises("and so is a link to it", "has changed since you last read or wrote it", tools.write, dir .. "link.txt", "x")
 check("which is left as it was", host.read(dir .. "stale.txt"), "changed behind the link\n")
+check("read before a same-size replacement", tools.read(dir .. "stale.txt"), "1: changed behind the link")
+host.write(dir .. "replacement.txt", "updated behind the link\n")
+check("install a different file with the same size and modification time",
+	host.sh("touch -r stale.txt replacement.txt && mv replacement.txt stale.txt", { cwd = dir }).code, 0)
+raises("write notices a different inode even with the same size and mtime", "has changed since you last read or wrote it",
+	tools.write, dir .. "stale.txt", "x")
+check("the replacement is not lost", host.read(dir .. "stale.txt"), "updated behind the link\n")
 host.sh({ "mkdir", "-p", dir .. "far/inner" })
 host.sh({ "ln", "-s", "far/inner", dir .. "into" })
 host.write(dir .. "far/twin.txt", "the far one\n")
