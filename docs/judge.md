@@ -22,7 +22,8 @@ The model gets one more function, `submit(note?)`, and a paragraph in its prompt
 Before the model begins, the judge copies the project and measures it as it is. That is the first champion; if it
 does not pass, the first submission that does is. Each submission then goes through the same steps:
 
-1. **Copied.** The judge copies the project as it stands, without `.git` and `.hx`, and writes its patch.
+1. **Copied.** The judge copies the project as it stands, without `.hx` and without any `.git`, so the files of a
+   repository nested in it are in the patch like the rest, and writes its patch.
 2. **Built**, by the kit's `build`, if there is one. A build that fails is `broken`.
 3. **Screened.** The candidate and the champion run in pairs, each pair in a random order, and each run in a fresh
    copy of its build. A run or check that fails is `invalid`. The change is better when the median pair favours it

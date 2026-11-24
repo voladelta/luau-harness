@@ -2435,6 +2435,30 @@ say(submit("all kinds"))
         self.assertEqual(os.readlink(os.path.join(original, "link")), "prog.sh")
         self.assertFalse(os.path.exists(os.path.join(original, "gone.txt")))
 
+    def test_judge_a_patch_carries_a_change_inside_a_nested_repository(self):
+        kit = self.make_kit(check=None, config='{"runs": 1}')
+        lib = os.path.join(self.project, "vendor", "lib")
+        os.makedirs(lib)
+        with open(os.path.join(lib, "lib.sh"), "w") as f:
+            f.write("echo slow\n")
+        git = dict(cwd=lib, env=self.env(GIT_CONFIG_GLOBAL="/dev/null"), capture_output=True, text=True)
+        subprocess.run(["git", "init", "-q"], **git)
+        subprocess.run(["git", "add", "lib.sh"], **git)
+        committed = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "lib"],
+                                   **git)
+        self.assertEqual(committed.returncode, 0, committed.stderr)
+        original = os.path.join(self.root, "original")
+        shutil.copytree(self.project, original, symlinks=True)
+        done = self.drive(kit, """
+host.write("vendor/lib/lib.sh", "echo fast\\n")
+say(submit("inside the nested repository"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        applied = subprocess.run(["git", "apply", os.path.join(self.judge_state(), "trials", "1.patch")], cwd=original,
+                                 capture_output=True, text=True)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(read(original, "vendor/lib/lib.sh"), "echo fast\n")
+
     def test_judge_a_score_must_be_positive_and_finite(self):
         kit = self.make_kit(check='#!/bin/sh\ncat "$1/.judge/stdout"\n', config='{"runs": 1}', prog="echo 2\n")
         done = self.drive(kit, """
