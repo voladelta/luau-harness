@@ -4,7 +4,10 @@ Where each part of hx lives:
 
 | File | Holds |
 |---|---|
-| `src/main.cpp` | arguments, secrets, the sandbox rules, starting the VM |
+| `src/main.cpp` | process startup, private `$TMPDIR`, wiring the judge, sandbox and VM together |
+| `src/cli.cpp` | CLI options, `--init`, model/endpoint resolution and scrubbing secrets from the environment |
+| `src/policy.cpp` | path trust and Landlock rule construction for the agent and the judge (`WallPolicy`) |
+| `src/vm.cpp` | Luau VM lifecycle, `/proc/meminfo` memory budgeting, library freezing and chunk execution |
 | `src/judge.cpp` | the judge's process for `--judge`: checking the kit, forking, its wall, hanging up at the end |
 | `src/sandbox.cpp` | Landlock; `Sandbox` is the proof that confinement was decided, and a `Host` cannot be built without it |
 | `src/host.cpp` | the `host` table and the VM: stops and time limits at safepoints, `host.try`, `host.timed`, `host.load` and the small primitives |

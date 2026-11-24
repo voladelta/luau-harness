@@ -16,43 +16,42 @@
 
 namespace hx {
 
-int Host::judge(lua_State* L) {
+int JudgeChannel::exchange(lua_State* L, double deadline) {
     constexpr double kJudgeSlack = 2.0;
     constexpr std::size_t kMaxLine = std::size_t{64} << 10;
     std::size_t length = 0;
     const char* line = luaL_optlstring(L, 1, nullptr, &length);
-    Host& host = of(L);
-    if (!host.config_.judge.valid()) {
+    if (!fd_.valid()) {
         luaL_error(L, "host.judge: no judge in this session (start hx with --judge KIT)");
     }
     if (line != nullptr && (std::memchr(line, '\n', length) != nullptr || length > kMaxLine)) {
         luaL_error(L, "host.judge: send one line, without a newline, of at most 64 KiB");
     }
     raise_if_signaled(L);
-    const int fd = host.config_.judge.get();
-    if (line != nullptr && host.judge_owed_ > 0) {
+    const int fd = fd_.get();
+    if (line != nullptr && owed_ > 0) {
         luaL_error(L, "host.judge: the judge is still judging the last submission; wait for its verdict first");
     }
     if (line != nullptr) {
         if (!write_all(fd, std::string(line, length) + "\n")) {
             luaL_error(L, "host.judge: the judge is gone");
         }
-        ++host.judge_owed_;
+        ++owed_;
     }
-    const double until = host.deadline_ > 0 ? host.deadline_ - kJudgeSlack : 0;
+    const double until = deadline > 0 ? deadline - kJudgeSlack : 0;
     std::array<char, kBufferSize> buffer{};
     lua_newtable(L);
     int answers = 0;
     for (;;) {
-        for (std::size_t end = host.judge_in_.find('\n'); end != std::string::npos; end = host.judge_in_.find('\n')) {
-            lua_pushlstring(L, host.judge_in_.data(), end);
+        for (std::size_t end = in_.find('\n'); end != std::string::npos; end = in_.find('\n')) {
+            lua_pushlstring(L, in_.data(), end);
             lua_rawseti(L, -2, ++answers);
-            host.judge_in_.erase(0, end + 1);
-            --host.judge_owed_;
+            in_.erase(0, end + 1);
+            --owed_;
         }
         raise_if_signaled(L);
-        if (host.judge_owed_ == 0 || (until > 0 && now() >= until)) {
-            lua_pushinteger(L, host.judge_owed_);
+        if (owed_ == 0 || (until > 0 && now() >= until)) {
+            lua_pushinteger(L, owed_);
             return 2;
         }
         pollfd waiter{.fd = fd, .events = POLLIN, .revents = 0};
@@ -62,7 +61,7 @@ int Host::judge(lua_State* L) {
             luaL_error(L, "host.judge: the judge is gone");
         }
         if (n > 0) {
-            host.judge_in_.append(buffer.data(), static_cast<std::size_t>(n));
+            in_.append(buffer.data(), static_cast<std::size_t>(n));
         }
     }
 }
