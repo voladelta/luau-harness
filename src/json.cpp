@@ -13,7 +13,6 @@
 #include <fmt/format.h>
 #include <yyjson.h>
 
-#include "host_internal.h"
 #include "lua.h"
 #include "lualib.h"
 
@@ -395,9 +394,20 @@ class Encoder {
     std::vector<Member> members_;
 };
 
+double indent_option(lua_State* L, int idx) {
+    if (lua_isnoneornil(L, idx)) {
+        return 0;
+    }
+    luaL_checktype(L, idx, LUA_TTABLE);
+    lua_getfield(L, idx, "indent");
+    const double value = lua_isnil(L, -1) ? 0 : luaL_checknumber(L, -1);
+    lua_pop(L, 1);
+    return value;
+}
+
 int l_encode(lua_State* L) {
     luaL_checkany(L, 1);
-    const double indent = option(L, 2, "indent", 0);
+    const double indent = indent_option(L, 2);
     if (indent < 0 || indent > kMaxIndent || std::floor(indent) != indent) {
         luaL_error(L, "json.encode: indent is a whole number of spaces from 0 to %d", kMaxIndent);
     }
