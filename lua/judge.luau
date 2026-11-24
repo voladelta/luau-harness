@@ -102,33 +102,56 @@ local function write_patch(to_tree: string, name: string)
 		:format(start_tree, to_tree, quote(state .. "/" .. name)))
 end
 
+local function unlock(path: string)
+	host.sh(("if [ -d %s ] && [ ! -L %s ]; then find %s -type d -exec chmod u+rwx {} ';' 2>/dev/null || true; fi")
+		:format(quote(path), quote(path), quote(path)))
+end
+
+local function remove(path: string)
+	unlock(path)
+	shell("rm -rf " .. quote(path))
+end
+
 local function candidate(dir: string, script: string): (number?, ...string)
+	local stdout = state .. "/stdout"
 	local wall = table.clone(writes)
 	table.insert(wall, dir)
-	shell(("rm -rf %s/.judge && mkdir -p %s/.judge/tmp && cp %s %s/.judge/"):format(quote(dir), quote(dir),
-		quote(kit .. "/" .. script), quote(dir)))
-	local result = host.sh(("cd %s && TMPDIR=$PWD/.judge/tmp ./.judge/%s > .judge/stdout 2>&1"):format(quote(dir),
-		script), {
+	table.insert(wall, stdout)
+	remove(dir .. "/.judge")
+	shell(("mkdir -p %s/.judge/tmp && cp %s %s/.judge/ && rm -f %s && : > %s"):format(quote(dir),
+		quote(kit .. "/" .. script), quote(dir), quote(stdout), quote(stdout)))
+	local result = host.sh(("cd %s && TMPDIR=$PWD/.judge/tmp ./.judge/%s > %s 2>&1"):format(quote(dir), script,
+		quote(stdout)), {
 		timeout = config.timeout,
 		read = reads,
 		write = wall,
 		hangup = true,
 	})
+	unlock(dir)
 	if result.code == 0 then
+		if script == "run" then
+			remove(dir .. "/.judge")
+			shell(("mkdir -p %s/.judge && mv -f %s %s/.judge/stdout"):format(quote(dir), quote(stdout), quote(dir)))
+		else
+			shell("rm -f " .. quote(stdout))
+		end
 		return result.seconds
 	end
+	local shown = if config.blind then "" else tail(host.sh({ "tail", "-c", "1500", stdout }).out, 1500)
+	shell("rm -f " .. quote(stdout))
 	local how = result.timed_out and ("timed out after %g s"):format(config.timeout)
 		or result.signal and "was killed by signal " .. result.signal
 		or "exited " .. result.code
 	if config.blind then
 		return nil, ("%s %s"):format(script, how)
 	end
-	return nil, ("%s %s:\n%s"):format(script, how, tail(host.read(dir .. "/.judge/stdout") or "", 1500))
+	return nil, ("%s %s:\n%s"):format(script, how, shown)
 end
 
 local function snapshot(dir: string)
-	shell(("rm -rf %s && mkdir -p %s && tar -C %s --exclude=./.git --exclude=./.hx -cf - . | tar -C %s -xf -"):format(
-		quote(dir), quote(dir), quote(project), quote(dir)))
+	remove(dir)
+	shell(("mkdir -p %s && tar -C %s --exclude=./.git --exclude=./.hx -cf - . | tar -C %s -xf -"):format(
+		quote(dir), quote(project), quote(dir)))
 end
 
 local workdir = state .. "/run"
@@ -145,7 +168,9 @@ local function has_script(path: string): boolean
 end
 
 local function build(dir: string): (boolean, ...string)
-	shell(("rm -rf %s %s/built && cp -a %s/src %s"):format(quote(workdir), quote(dir), quote(dir), quote(workdir)))
+	remove(workdir)
+	remove(dir .. "/built")
+	shell(("cp -a %s/src %s"):format(quote(dir), quote(workdir)))
 	if has_script(kit .. "/build") then
 		local seconds, why = candidate(workdir, "build")
 		if not seconds then
@@ -158,7 +183,8 @@ end
 
 local function measure(built: string): (Measure?, ...string)
 	local dir = workdir
-	shell(("rm -rf %s && cp -a %s %s"):format(quote(dir), quote(built), quote(dir)))
+	remove(dir)
+	shell(("cp -a %s %s"):format(quote(built), quote(dir)))
 	local seconds, why = candidate(dir, "run")
 	if not seconds then
 		return nil, why
@@ -372,7 +398,7 @@ local function submit(note: string): string
 	if crowned then
 		crown(trial, dir, crowned.kind, crowned.value)
 	else
-		shell("rm -rf " .. quote(dir))
+		remove(dir)
 		if champion then
 			answer ..= ("\nThe champion is still %s."):format(champion_name(champion))
 		end
@@ -390,7 +416,9 @@ local function abandon(err: unknown): string
 	local verdict, why = (err == "hung up" or err == "terminated") and "stopped" or "error", tostring(err)
 	entry.verdict, entry.why = verdict, why
 	host.try(record, entry)
-	host.try(host.sh, ("rm -rf %s %s/champion.patch.tmp"):format(quote(dir), quote(state)))
+	host.try(unlock, dir)
+	host.try(unlock, workdir)
+	host.try(host.sh, ("rm -rf %s %s %s/champion.patch.tmp"):format(quote(dir), quote(workdir), quote(state)))
 	say(("trial %d: %s: %s"):format(entry.trial, verdict, why))
 	return ("Trial %d. %s: the judge could not finish it, through no fault of the submission: %s"):format(entry.trial,
 		verdict, why)
@@ -421,7 +449,7 @@ end
 
 local function summary()
 	host.log(host.printable(summary_text()))
-	host.sh(("cd %s && rm -rf run tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
+	host.sh(("cd %s && rm -rf run stdout tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
 		:format(quote(state)))
 end
 

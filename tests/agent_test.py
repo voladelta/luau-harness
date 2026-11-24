@@ -1188,6 +1188,19 @@ end
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("PermissionError", self.tool_results()[0])
 
+    def test_a_raw_socketpair_cannot_reach_a_socket_outside(self):
+        path = os.path.join(self.root, "outside-raw.sock")
+        send = (f"import socket; a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_RAW); "
+                f"a.connect('{path}'); a.send(b'leak'); print('sent')")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
+            listener.bind(path)
+            done = self.run_hx("go", script=[call("bash", {"command": f'python3 -c "{send}"'}), say("ok")])
+            listener.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                listener.recv(16)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("PermissionError", self.tool_results()[0])
+
     def test_unix_sockets_opens_sockets_inside_the_project(self):
         script = ("import socket; s = socket.socket(socket.AF_UNIX); s.bind('in.sock'); s.listen(); "
                   "c = socket.socket(socket.AF_UNIX); c.connect('in.sock'); a, _ = s.accept(); c.send(b'local'); "
@@ -2476,6 +2489,40 @@ say(submit("a link into the kit, and no work"))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed"), done.stdout)
         self.assertEqual(read(self.judge_state(), "champion.patch"), "")
+
+    def test_judge_a_failing_run_cannot_leak_the_kit_through_stdout_link(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n")
+        with open(os.path.join(kit, "secret"), "w") as f:
+            f.write("KIT_SECRET_ORACLE\n")
+        done = self.drive(kit, f"""
+host.write("prog.sh", "rm -f .judge/stdout; ln -s {kit}/secret .judge/stdout; exit 1\\n")
+say(submit("symlink stdout on failure"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Trial 1. invalid: run exited 1", done.stdout)
+        self.assertNotIn("KIT_SECRET_ORACLE", done.stdout)
+
+    def test_judge_a_locked_directory_left_by_a_candidate_does_not_brick_later_trials(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n")
+        done = self.drive(kit, """
+host.write("prog.sh", "mkdir -p locked && touch locked/f && chmod 000 locked && echo 42\\n")
+say(submit("locks a directory"))
+host.write("prog.sh", "echo 42\\n")
+say(submit("clean follow-up"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 2, done.stdout)
+        self.assertNotIn("error:", lines[0])
+        self.assertNotIn("error:", lines[1])
+
+    def test_judge_works_with_a_script_read_from_stdin(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n")
+        done = self.run_hx("--judge", kit, "--run", "-",
+                           stdin='local r = host.judge(json.encode({ note = "from stdin" })); print(json.encode(r))\n',
+                           XDG_STATE_HOME="")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Trial 1.", done.stdout)
 
     def test_judge_blind_withholds_the_checks_words_too(self):
         kit = self.make_kit(config='{"runs": 1, "blind": true}',
