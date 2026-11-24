@@ -577,7 +577,7 @@ class TempDir {
         }
         path_ = std::move(pattern);
         setenv("TMPDIR", path_.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
-        remover_ = start_remover(path_.c_str());
+        remover_ = start_remover(path_.parent_path().c_str(), path_.filename().c_str());
     }
     TempDir(const TempDir&) = delete;
     TempDir& operator=(const TempDir&) = delete;
@@ -595,7 +595,7 @@ class TempDir {
   private:
     static constexpr int kRemoverWaitMs = 1000;
 
-    static hx::UniqueFd start_remover(const char* path) noexcept {
+    static hx::UniqueFd start_remover(const char* parent, const char* name) noexcept {
         std::array<int, 2> ends{};
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends.data()) != 0) {
             return {};
@@ -604,23 +604,22 @@ class TempDir {
         hx::UniqueFd theirs(ends[1]);
         const pid_t pid = fork();
         if (pid == 0) {
-            const pid_t remover = fork();
+            const pid_t remover = chdir(parent) == 0 ? fork() : -1;
             if (remover != 0) {
                 _exit(remover > 0 ? 0 : 1);
             }
             setsid();
             prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
             prctl(PR_SET_NAME, "hx-tmpdir", 0, 0, 0);
-            const int end = theirs.get();
-            static_cast<void>(close_range(0, static_cast<unsigned>(end) - 1, 0));
-            static_cast<void>(close_range(static_cast<unsigned>(end) + 1, ~0U, 0));
+            dup2(theirs.get(), STDIN_FILENO);
+            static_cast<void>(close_range(STDIN_FILENO + 1, ~0U, 0));
             char byte = 0;
             ssize_t got = 0;
             do {
-                got = read(end, &byte, 1);
+                got = read(STDIN_FILENO, &byte, 1);
             } while (got > 0 || (got < 0 && errno == EINTR));
             std::error_code ec;
-            fs::remove_all(path, ec);
+            fs::remove_all(name, ec);
             _exit(0);
         }
         int status = -1;

@@ -1366,6 +1366,33 @@ end
             self.assertFalse(os.path.exists(tmp), sent)
             os.remove(os.path.join(self.project, "hx.pid"))
 
+    def test_the_private_tmpdir_is_removed_where_it_was_made_not_where_its_path_leads_later(self):
+        outside = os.path.join(self.root, "outside")
+        os.makedirs(os.path.join(self.project, "tmp"))
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("host.write('tmp.name', host.env('TMPDIR'):match('[^/]+$')) "
+                    "while not host.stat('go') do host.sleep(0.05) end "
+                    f"print(host.sh('mv tmp moved && ln -s {outside} tmp').code)")
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project,
+                                   env=self.env(TMPDIR=os.path.join(self.project, "tmp")),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(kill_quietly, process.pid)
+        for _ in range(200):
+            if os.path.exists(os.path.join(self.project, "tmp.name")):
+                break
+            time.sleep(0.05)
+        name = read(self.project, "tmp.name")
+        self.assertRegex(name, r"^hx-\w{6}$")
+        os.makedirs(os.path.join(outside, name))
+        with open(os.path.join(outside, name, "kept"), "w") as f:
+            f.write("x")
+        with open(os.path.join(self.project, "go"), "w") as f:
+            f.write("")
+        out, err = process.communicate(timeout=20)
+        self.assertEqual((process.returncode, out), (0, "0\n"), err)
+        self.assertTrue(os.path.exists(os.path.join(outside, name, "kept")))
+        self.assertFalse(os.path.exists(os.path.join(self.project, "moved", name)))
+
     def test_sigterm_and_sighup_end_the_run_with_143_and_leave_its_log(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         for sent in (signal.SIGTERM, signal.SIGHUP):
