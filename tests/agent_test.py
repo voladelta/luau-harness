@@ -1338,6 +1338,34 @@ end
         self.assert_gone(pid)
         self.assertEqual(len(self.model.requests), 1)
 
+    def test_the_private_tmpdir_is_removed_on_exit_with_or_without_the_sandbox(self):
+        script = "host.write(host.env('TMPDIR') .. '/kept/file', 'x') print(host.env('TMPDIR'))"
+        for flags in ([], ["--no-sandbox"]):
+            done = self.run_hx(*flags, "--run", "-", stdin=script)
+            self.assertEqual(done.returncode, 0, (flags, done.stderr))
+            self.assertRegex(done.stdout, r"/hx-\w{6}\n$")
+            self.assertFalse(os.path.exists(done.stdout.strip()), flags)
+
+    def test_the_private_tmpdir_is_removed_when_hx_is_killed(self):
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("host.write(host.env('TMPDIR') .. '/kept/file', 'x') host.write('tmp.path', host.env('TMPDIR')) "
+                    "host.write('hx.pid', host.sh('echo $PPID').out) host.sleep(300)")
+        for sent in (signal.SIGKILL, (signal.SIGINT, signal.SIGINT)):
+            process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.wait_for_pid_file("hx.pid")
+            tmp = read(self.project, "tmp.path")
+            self.assertTrue(os.path.isdir(tmp), tmp)
+            for one in sent if isinstance(sent, tuple) else (sent,):
+                process.send_signal(one)
+            process.communicate(timeout=20)
+            for _ in range(100):
+                if not os.path.exists(tmp):
+                    break
+                time.sleep(0.05)
+            self.assertFalse(os.path.exists(tmp), sent)
+            os.remove(os.path.join(self.project, "hx.pid"))
+
     def test_sigterm_and_sighup_end_the_run_with_143_and_leave_its_log(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         for sent in (signal.SIGTERM, signal.SIGHUP):

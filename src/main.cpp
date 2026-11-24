@@ -1,6 +1,9 @@
 #include <curl/curl.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -574,18 +577,60 @@ class TempDir {
         }
         path_ = std::move(pattern);
         setenv("TMPDIR", path_.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
+        remover_ = start_remover(path_.c_str());
     }
     TempDir(const TempDir&) = delete;
     TempDir& operator=(const TempDir&) = delete;
     ~TempDir() {
         std::error_code ec;
         fs::remove_all(path_, ec);
+        if (shutdown(remover_.get(), SHUT_WR) == 0) {
+            pollfd gone{.fd = remover_.get(), .events = POLLIN, .revents = 0};
+            static_cast<void>(poll(&gone, 1, kRemoverWaitMs));
+        }
     }
 
     [[nodiscard]] const fs::path& path() const noexcept { return path_; }
 
   private:
+    static constexpr int kRemoverWaitMs = 1000;
+
+    static hx::UniqueFd start_remover(const char* path) noexcept {
+        std::array<int, 2> ends{};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends.data()) != 0) {
+            return {};
+        }
+        hx::UniqueFd ours(ends[0]);
+        hx::UniqueFd theirs(ends[1]);
+        const pid_t pid = fork();
+        if (pid == 0) {
+            const pid_t remover = fork();
+            if (remover != 0) {
+                _exit(remover > 0 ? 0 : 1);
+            }
+            setsid();
+            prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+            prctl(PR_SET_NAME, "hx-tmpdir", 0, 0, 0);
+            const int end = theirs.get();
+            static_cast<void>(close_range(0, static_cast<unsigned>(end) - 1, 0));
+            static_cast<void>(close_range(static_cast<unsigned>(end) + 1, ~0U, 0));
+            char byte = 0;
+            ssize_t got = 0;
+            do {
+                got = read(end, &byte, 1);
+            } while (got > 0 || (got < 0 && errno == EINTR));
+            std::error_code ec;
+            fs::remove_all(path, ec);
+            _exit(0);
+        }
+        int status = -1;
+        while (pid > 0 && waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+        return status == 0 ? std::move(ours) : hx::UniqueFd();
+    }
+
     fs::path path_;
+    hx::UniqueFd remover_;
 };
 
 class CurlGlobal {

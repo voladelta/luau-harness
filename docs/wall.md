@@ -2,7 +2,7 @@
 
 | | Allowed |
 |---|---|
-| Write | the project directory (where you start `hx`), a private `$TMPDIR` that is removed on exit, `--rw` paths |
+| Write | the project directory (where you start `hx`), a private `$TMPDIR` that is removed when `hx` ends, killed or not, `--rw` paths |
 | Read | the above, plus `/usr /bin /sbin /lib* /etc /opt /proc /sys /nix/store`, the directories on your `PATH` (below), your git configuration (below), trust roots (below), `--ro` paths |
 | Devices | `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom` |
 | Everything else | cannot be opened: the rest of your home directory, other terminals, other projects |
