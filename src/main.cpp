@@ -714,7 +714,8 @@ std::string unwritable_path(const std::vector<fs::path>& writable) {
     for (const auto part : std::views::split(set != nullptr ? std::string_view(set) : kShellDefault, ':')) {
         const std::string_view entry(part.begin(), part.end());
         const std::optional<fs::path> whole = entry.starts_with('/') ? resolve_trusted(entry, writable) : std::nullopt;
-        if (whole && !within(*whole, writable)) {
+        std::error_code ec;
+        if (whole && !within(*whole, writable) && fs::is_directory(entry, ec)) {
             kept.append(kept.empty() ? "" : ":").append(entry);
         }
     }

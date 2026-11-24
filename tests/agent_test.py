@@ -276,6 +276,62 @@ class AgentTest(unittest.TestCase):
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("nowhere.json", missing.stderr)
 
+    def test_resume_last_orders_same_second_logs_by_start_time(self):
+        log = os.path.join(self.project, ".hx", "log")
+        os.makedirs(log)
+        for older, newer, older_stamp in [
+            ("20260101-120000-zzzzzz.json", "20260101-120000-aaaaaa.json", 1767268800_100000000),
+            ("20260101-120000-t1767268800n090000000xzzzzzz.json",
+             "20260101-120000-t1767268800n100000000xaaaaaa.json", 1767268800_990000000),
+        ]:
+            with self.subTest(older=older, newer=newer):
+                for name, task, stamp in [
+                    (older, "older", older_stamp),
+                    (newer, "newer", 1767268800_200000000),
+                    (newer[:-5] + "-sub-1.json", "agent", 1767268800_300000000),
+                ]:
+                    path = os.path.join(log, name)
+                    with open(path, "w") as f:
+                        json.dump({"messages": [{"role": "user", "content": task}]}, f)
+                    os.utime(path, ns=(stamp, stamp))
+                done = self.run_hx("--resume", "last", "continue", script=[say("ok")])
+                for name in os.listdir(log):
+                    os.unlink(os.path.join(log, name))
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(self.model.requests[-1]["messages"][0]["content"][0]["text"], "newer")
+
+    def test_numbered_read_of_dense_file_uses_bounded_working_memory(self):
+        with open(os.path.join(self.project, "dense.txt"), "wb") as f:
+            f.write(b"x\n" * (4 << 20))
+        done = subprocess.run(
+            ["bash", "-c", 'ulimit -v 131072 && exec "$@"', "bash", HX, "-q", "--run", "-"],
+            input="""local loop = assert(host.load(host.default_loop, "=loop"))()
+for _, tool in loop.functions do
+    if tool.name == "read" then print(tool.run("dense.txt", 1, 1)) end
+end
+""",
+            cwd=self.project, env=self.env(), capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "1: x\n[lines 1-1 of 4194304; offset=2 goes on]\n")
+
+    def test_search_rejects_awk_without_nul_record_support(self):
+        bin_dir = os.path.join(self.project, "bin")
+        os.mkdir(bin_dir)
+        awk = os.path.join(bin_dir, "awk")
+        with open(awk, "w") as f:
+            f.write('#!/bin/bash\nIFS= read -r -d "" record\nprintf "%s" "$record" | command -p awk "$@"\n')
+        os.chmod(awk, 0o755)
+        with open(os.path.join(self.project, "note.txt"), "w") as f:
+            f.write("needle\n")
+        done = self.run_hx(
+            "--run", "-", PATH=bin_dir + ":" + os.environ["PATH"],
+            stdin='local search = assert(host.load(host.default_loop, "=loop"))().ext("search")\n'
+                  'search.ripgrep = false\nprint(tostring(search.grep("needle", { glob = "note.txt" })))\n',
+        )
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("awk must support NUL record separators", done.stderr)
+
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1151,6 +1207,19 @@ class AgentTest(unittest.TestCase):
         path = os.path.join(self.root, "outside-datagram.sock")
         send = (f"import socket; a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM); "
                 f"a.sendto(b'leak', '{path}'); print('sent')")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
+            listener.bind(path)
+            done = self.run_hx("go", script=[call("bash", {"command": f'python3 -c "{send}"'}), say("ok")])
+            listener.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                listener.recv(16)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("PermissionError", self.tool_results()[0])
+
+    def test_a_raw_socketpair_cannot_reach_a_socket_outside(self):
+        path = os.path.join(self.root, "outside-raw.sock")
+        send = (f"import socket; a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_RAW); "
+                f"a.connect('{path}'); a.send(b'leak'); print('sent')")
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
             listener.bind(path)
             done = self.run_hx("go", script=[call("bash", {"command": f'python3 -c "{send}"'}), say("ok")])
@@ -2079,6 +2148,24 @@ class AgentTest(unittest.TestCase):
             done = self.run_hx(*flags, "--run", "-", stdin=script)
             self.assertEqual((done.returncode, done.stdout), (0, "true\ttrue\n"), (flags, done.stderr))
 
+    def test_search_ignores_ripgrep_configuration(self):
+        if not shutil.which("rg"):
+            self.skipTest("ripgrep is not installed")
+        config = os.path.join(self.project, "rg.conf")
+        with open(os.path.join(self.project, "note.txt"), "w") as f:
+            f.write("needle\ncontext\n")
+        for option in ["--count", "--column", "--after-context=1", "--invert-match"]:
+            with self.subTest(option=option):
+                with open(config, "w") as f:
+                    f.write(option + "\n")
+                done = self.run_hx(
+                    "--run", "-", RIPGREP_CONFIG_PATH=config,
+                    stdin='local search = assert(host.load(host.default_loop, "=loop"))().ext("search")\n'
+                          'search.ripgrep = true\nprint(tostring(search.grep("needle", { glob = "note.txt" })))\n',
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout, "note.txt:1: needle\n")
+
     def test_a_loop_without_tools_sends_an_empty_list(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
@@ -2651,6 +2738,17 @@ say(submit("a wrong answer, and the --rw path's name led elsewhere"))
                 self.assertIn("PATH has no directory the model cannot write", done.stderr)
                 self.assertEqual(done.stdout, "")
 
+    def test_judge_does_not_count_missing_or_non_directory_path_entries(self):
+        kit = self.make_kit()
+        not_a_directory = os.path.join(self.root, "not-a-directory")
+        with open(not_a_directory, "w"):
+            pass
+        missing = os.path.join(self.root, "missing")
+        done = self.drive(kit, 'print("began")', PATH=f"{missing}:{not_a_directory}:{missing}/..")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("PATH has no directory the model cannot write", done.stderr)
+        self.assertEqual(done.stdout, "")
+
     def test_judge_without_a_path_searches_where_a_shell_would(self):
         kit = self.make_kit(config='{"runs": 1}', run='#!/bin/sh\necho ":$PATH:"\n',
                             check='#!/bin/sh\ngrep -q :/usr/local/bin: "$1/.judge/stdout"\n')
@@ -2677,6 +2775,40 @@ say(submit("a wrong answer, from the copy"))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("the starting point passes", done.stderr)
         self.assertTrue(done.stdout.startswith("Trial 1. invalid: the check failed: | wrong: 41"), done.stdout)
+
+    def test_judge_a_failing_run_cannot_leak_the_kit_through_stdout_link(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n")
+        with open(os.path.join(kit, "secret"), "w") as f:
+            f.write("KIT_SECRET_ORACLE\n")
+        done = self.drive(kit, f"""
+host.write("prog.sh", "rm -f .judge/stdout; ln -s {kit}/secret .judge/stdout; exit 1\\n")
+say(submit("symlink stdout on failure"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Trial 1. invalid: run exited 1", done.stdout)
+        self.assertNotIn("KIT_SECRET_ORACLE", done.stdout)
+
+    def test_judge_a_locked_directory_left_by_a_candidate_does_not_brick_later_trials(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n")
+        done = self.drive(kit, """
+host.write("prog.sh", "mkdir -p locked && touch locked/f && chmod 000 locked && echo 42\\n")
+say(submit("locks a directory"))
+host.write("prog.sh", "echo 42\\n")
+say(submit("clean follow-up"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 2, done.stdout)
+        self.assertNotIn("error:", lines[0])
+        self.assertNotIn("error:", lines[1])
+
+    def test_judge_works_with_a_script_read_from_stdin(self):
+        kit = self.make_kit(config='{"runs": 1}', prog="echo 42\n")
+        done = self.run_hx("--judge", kit, "--run", "-",
+                           stdin='local r = host.judge(json.encode({ note = "from stdin" })); print(json.encode(r))\n',
+                           XDG_STATE_HOME="")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Trial 1.", done.stdout)
 
     def test_judge_blind_withholds_the_checks_words_too(self):
         kit = self.make_kit(config='{"runs": 1, "blind": true}',

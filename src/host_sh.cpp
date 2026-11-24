@@ -282,7 +282,10 @@ std::string command_of(lua_State* L) {
         if (std::strlen(word) != length) {
             luaL_error(L, "host.sh: command[%d] contains a NUL byte", i);
         }
-        command += (i == 1 ? "" : " ") + quote({word, length});
+        if (i > 1) {
+            command += ' ';
+        }
+        command += quote({word, length});
         lua_pop(L, 1);
     }
     lua_pop(L, 1);

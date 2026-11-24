@@ -90,8 +90,8 @@ stderr, so `hx "..." > answer.txt` captures the answer. Every option, variable a
   say, when `M.model` is set for the turn and put back after it. Under an Opus session a turn then runs on
   Sonnet, with its own model's settings from `M.claude`, or on a DeepSeek model, which is asked through
   DeepSeek's endpoint with `DEEPSEEK_API_KEY` and gets the plain request: Opus leads and `deepseek-flash` does
-  the sub-agents' work. The other way round is not there: a session on DeepSeek holds no key of Claude's, and a
-  project loop that changes `M.model` to a Claude model there still talks to DeepSeek. The Claude settings have
+  the sub-agents' work. The other way round works the same way when `ANTHROPIC_API_KEY` is set: a Claude turn
+  under a DeepSeek session is asked through `HX_ANTHROPIC_URL`. The Claude settings have
   been checked against a stand-in server, and `tests/live_test.py` passes against the live API on Opus 5.5 and
   Sonnet 5.5. Haiku 5.5 passes 13 to 15 of its fifteen checks from run to run: told to use the edit function, it
   often tries a tool named `edit` first, which does not exist, is told so, and then goes through `lua`; the file
