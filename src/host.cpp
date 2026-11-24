@@ -63,6 +63,14 @@ double duration(double seconds) {
     return seconds > 0 ? std::min(seconds, kLongest) : 0.0;
 }
 
+double within_limit(double deadline, double seconds) {
+    seconds = duration(seconds);
+    if (deadline <= 0) {
+        return seconds;
+    }
+    return std::clamp(deadline - now(), 0.0, seconds);
+}
+
 const char* stop_error(int sig) {
     return sig == SIGINT ? "interrupted" : "terminated";
 }
@@ -309,7 +317,13 @@ void renew_limit_timer() noexcept {
     g_expired = 1;
 }
 
-Host::Host(HostConfig config, const Sandbox& sandbox) : config_(std::move(config)), sandboxed_(sandbox.confined()) {
+Host::Host(HostConfig config, const Sandbox& sandbox, bool* memory_refused)
+    : config_(std::move(config)),
+      sandboxed_(sandbox.confined()),
+      memory_refused_(memory_refused),
+      http_(std::make_unique<HttpClient>(std::move(config_.endpoints), config_.model, std::move(config_.ca_bundle))),
+      judge_(std::make_unique<JudgeChannel>(std::move(config_.judge))),
+      spawn_(std::make_unique<SpawnPool>()) {
     prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 }
 
@@ -321,22 +335,13 @@ Host& Host::of(lua_State* L) {
     return *static_cast<Host*>(lua_callbacks(L)->userdata);
 }
 
-namespace {
-
-bool g_memory_refused = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-
-}  // namespace
-
-void vm_memory_refused() noexcept {
-    g_memory_refused = true;
-}
-
 void Host::on_interrupt(lua_State* L, int gc) {
     if (gc >= 0) {
         return;
     }
-    if (g_memory_refused) {
-        g_memory_refused = false;
+    const Host& host = of(L);
+    if (host.memory_refused_ != nullptr && *host.memory_refused_) {
+        *host.memory_refused_ = false;
         lua_gc(L, LUA_GCCOLLECT, 0);
     }
     raise_if_signaled(L);
@@ -344,7 +349,6 @@ void Host::on_interrupt(lua_State* L, int gc) {
         return;
     }
     g_expired = limit_timer() != nullptr ? 0 : 1;
-    const Host& host = of(L);
     if (host.deadline_ > 0 && now() >= host.deadline_) {
         g_expired = 1;
         raise_error(L, "timeout");
@@ -355,17 +359,56 @@ void Host::check_deadline(lua_State* L) {
     on_interrupt(L, -1);
 }
 
-double Host::within_limit(double seconds) const {
-    seconds = duration(seconds);
-    if (deadline_ <= 0) {
-        return seconds;
-    }
-    return std::clamp(deadline_ - now(), 0.0, seconds);
+int Host::post(lua_State* L) {
+    Host& host = of(L);
+    return host.http_->post(L, host.deadline_);
+}
+
+int Host::route(lua_State* L) {
+    return of(L).http_->route(L);
+}
+
+int Host::sh(lua_State* L) {
+    const Host& host = of(L);
+    return run_sh(L, host.deadline_, host.config_.system_rules);
+}
+
+int Host::read_file(lua_State* L) {
+    return read_file_lua(L, of(L).deadline_);
+}
+
+int Host::write_file(lua_State* L) {
+    return write_file_lua(L, of(L).deadline_);
+}
+
+int Host::judge(lua_State* L) {
+    Host& host = of(L);
+    return host.judge_->exchange(L, host.deadline_);
+}
+
+int Host::spawn(lua_State* L) {
+    Host& host = of(L);
+    return host.spawn_->spawn(
+        L, [&] { host.http_->reset_handle(); },
+        [&] {
+            host.judge_->reset();
+            host.deadline_ = 0;
+            ++host.tries_;
+        });
+}
+
+int Host::wait(lua_State* L) {
+    Host& host = of(L);
+    return host.spawn_->wait(L, host.deadline_);
+}
+
+int Host::stop(lua_State* L) {
+    return of(L).spawn_->stop(L);
 }
 
 int Host::sleep(lua_State* L) {
     raise_if_signaled(L);
-    const double until = now() + of(L).within_limit(luaL_checknumber(L, 1));
+    const double until = now() + within_limit(of(L).deadline_, luaL_checknumber(L, 1));
     while (g_signal == 0) {
         const double left = until - now();
         if (left <= 0) {
@@ -463,14 +506,14 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "tty");
     lua_pushlstring(L, config_.model.data(), config_.model.size());
     lua_setfield(L, -2, "model");
-    lua_createtable(L, 0, static_cast<int>(config_.endpoints.size()));
-    for (const Endpoint& each : config_.endpoints) {
+    lua_createtable(L, 0, static_cast<int>(http_->endpoints().size()));
+    for (const Endpoint& each : http_->endpoints()) {
         lua_pushboolean(L, each.key_env.empty() || !each.key.empty() ? 1 : 0);
         lua_setfield(L, -2, each.name.c_str());
     }
     lua_setreadonly(L, -1, 1);
     lua_setfield(L, -2, "endpoints");
-    lua_pushboolean(L, config_.judge.valid() ? 1 : 0);
+    lua_pushboolean(L, judge_->valid() ? 1 : 0);
     lua_setfield(L, -2, "judged");
     if (!config_.workflow.empty()) {
         lua_pushlstring(L, config_.workflow.data(), config_.workflow.size());

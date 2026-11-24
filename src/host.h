@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,9 +12,12 @@
 #include "sys.h"
 
 struct lua_State;
-using CURL = void;
 
 namespace hx {
+
+class HttpClient;
+class JudgeChannel;
+class SpawnPool;
 
 enum class Auth : std::uint8_t {
     ApiKey,
@@ -55,7 +57,7 @@ struct HostConfig {
 
 class Host {
   public:
-    Host(HostConfig config, const Sandbox& sandbox);
+    Host(HostConfig config, const Sandbox& sandbox, bool* memory_refused = nullptr);
     Host(const Host&) = delete;
     Host& operator=(const Host&) = delete;
     ~Host();
@@ -79,41 +81,18 @@ class Host {
     static int spawn(lua_State* L);
     static int wait(lua_State* L);
     static int stop(lua_State* L);
-    [[noreturn]] void run_child(lua_State* L, int result_fd) noexcept;
-
-    [[nodiscard]] double within_limit(double seconds) const;
-    [[nodiscard]] std::optional<Wall> narrower_wall(lua_State* L, int idx) const;
-    [[nodiscard]] const Endpoint* endpoint(std::string_view name) const;
-    CURL* curl();
-
-    struct CurlDeleter {
-        void operator()(CURL* handle) const noexcept;
-    };
-
-    struct Spawned {
-        int id = 0;
-        pid_t pid = 0;
-        UniqueFd result;
-        std::string data;
-        bool ended = false;
-    };
-    static void drain(Spawned& child);
 
     HostConfig config_;
     bool sandboxed_;
-    std::unique_ptr<CURL, CurlDeleter> curl_;
+    bool* memory_refused_;
     double deadline_ = 0;
     int tries_ = 0;
-    std::string judge_in_;
-    int judge_owed_ = 0;
-    std::vector<Spawned> spawned_;
-    int spawn_count_ = 0;
-    bool child_ = false;
+    std::unique_ptr<HttpClient> http_;
+    std::unique_ptr<JudgeChannel> judge_;
+    std::unique_ptr<SpawnPool> spawn_;
 };
 
 void install_signal_handlers();
-
-void vm_memory_refused() noexcept;
 
 }  // namespace hx
 

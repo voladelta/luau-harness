@@ -201,9 +201,9 @@ const char* kind_of(mode_t mode) {
 
 }  // namespace
 
-int Host::read_file(lua_State* L) {
+int read_file_lua(lua_State* L, double deadline) {
     const char* path = check_cstring(L, 1);
-    const double until = now() + of(L).within_limit(kLongest);
+    const double until = now() + within_limit(deadline, kLongest);
     const UniqueFd file(::open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC));
     if (!file.valid()) {
         return fail_errno(L, path);
@@ -235,9 +235,9 @@ int Host::read_file(lua_State* L) {
     return 1;
 }
 
-int Host::write_file(lua_State* L) {
+int write_file_lua(lua_State* L, double deadline) {
     const char* path = check_cstring(L, 1);
-    const double until = now() + of(L).within_limit(kLongest);
+    const double until = now() + within_limit(deadline, kLongest);
     std::size_t length = 0;
     const char* raw = luaL_checklstring(L, 2, &length);
     const std::string_view data(raw, length);

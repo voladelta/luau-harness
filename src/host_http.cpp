@@ -229,16 +229,21 @@ std::optional<std::string> fill_form(lua_State* L, curl_mime* mime, int idx) {
 
 }  // namespace
 
-const Endpoint* Host::endpoint(std::string_view name) const {
-    const auto found = std::ranges::find(config_.endpoints, name, &Endpoint::name);
-    return found == config_.endpoints.end() ? nullptr : &*found;
+HttpClient::HttpClient(std::vector<Endpoint> endpoints, std::string model, std::string ca_bundle)
+    : endpoints_(std::move(endpoints)), model_(std::move(model)), ca_bundle_(std::move(ca_bundle)) {}
+
+HttpClient::~HttpClient() = default;
+
+const Endpoint* HttpClient::endpoint(std::string_view name) const {
+    const auto found = std::ranges::find(endpoints_, name, &Endpoint::name);
+    return found == endpoints_.end() ? nullptr : &*found;
 }
 
-void Host::CurlDeleter::operator()(CURL* handle) const noexcept {
+void HttpClient::CurlDeleter::operator()(CURL* handle) const noexcept {
     curl_easy_cleanup(handle);
 }
 
-CURL* Host::curl() {
+CURL* HttpClient::curl() {
     if (!curl_) {
         curl_.reset(curl_easy_init());
     } else {
@@ -247,52 +252,50 @@ CURL* Host::curl() {
     return curl_.get();
 }
 
-int Host::route(lua_State* L) {
+int HttpClient::route(lua_State* L) const {
     const std::string_view vendor = vendor_of(check_cstring(L, 1));
-    const std::string_view name = vendor == vendor_of(of(L).config_.model) ? kSessionEndpoint : vendor;
+    const std::string_view name = vendor == vendor_of(model_) ? kSessionEndpoint : vendor;
     lua_pushlstring(L, name.data(), name.size());
     return 1;
 }
 
-int Host::post(lua_State* L) {
+int HttpClient::post(lua_State* L, double deadline) {
     const std::string_view name = check_cstring(L, 1);
-    Host& host = of(L);
-    const Endpoint* endpoint = host.endpoint(name);
-    if (endpoint == nullptr) {
-        no_such_endpoint(L, name, host.config_.endpoints);
+    const Endpoint* target = endpoint(name);
+    if (target == nullptr) {
+        no_such_endpoint(L, name, endpoints_);
     }
     const bool form = lua_istable(L, 2);
     if (!form) {
         luaL_checktype(L, 2, LUA_TSTRING);
     }
-    const double timeout = host.within_limit(option(L, 3, "timeout", 600));
+    const double timeout = within_limit(deadline, option(L, 3, "timeout", 600));
     const std::string beta = beta_option(L, 3);
     raise_if_signaled(L);
-    if (endpoint->key.empty() && !endpoint->key_env.empty()) {
+    if (target->key.empty() && !target->key_env.empty()) {
         return fail(L, fmt::format("no {}: hx was started without one, so host.post cannot reach the {} endpoint",
-                                   endpoint->key_env, endpoint->name));
+                                   target->key_env, target->name));
     }
-    CURL* curl = host.curl();
-    if (curl == nullptr) {
+    CURL* handle = curl();
+    if (handle == nullptr) {
         return fail(L, "cannot start an HTTP request");
     }
     const std::string beta_header = beta.empty() ? "" : fmt::format("anthropic-beta: {}", beta);
     if (!form) {
         std::size_t length = 0;
         const char* body = lua_tolstring(L, 2, &length);
-        set_body(curl, {body, length});
-        return send(L, curl, *endpoint, {"Content-Type: application/json", beta_header}, timeout,
-                    host.config_.ca_bundle);
+        set_body(handle, {body, length});
+        return send(L, handle, *target, {"Content-Type: application/json", beta_header}, timeout, ca_bundle_);
     }
-    const CurlMime mime(curl_mime_init(curl));
+    const CurlMime mime(curl_mime_init(handle));
     if (!mime) {
         return fail(L, "cannot start an HTTP request");
     }
     if (const std::optional<std::string> error = fill_form(L, mime.get(), 2)) {
         luaL_error(L, "host.post: %s", error->c_str());
     }
-    curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime.get());
-    return send(L, curl, *endpoint, {beta_header}, timeout, host.config_.ca_bundle);
+    curl_easy_setopt(handle, CURLOPT_MIMEPOST, mime.get());
+    return send(L, handle, *target, {beta_header}, timeout, ca_bundle_);
 }
 
 }  // namespace hx

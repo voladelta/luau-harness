@@ -73,7 +73,7 @@ std::string result_text(lua_State* L, bool& returned) {
 
 }  // namespace
 
-void Host::drain(Spawned& child) {
+void SpawnPool::drain(Spawned& child) {
     std::array<char, kBufferSize> buffer{};
     while (!child.ended) {
         const ssize_t n = read(child.result.get(), buffer.data(), buffer.size());
@@ -88,14 +88,12 @@ void Host::drain(Spawned& child) {
     }
 }
 
-void Host::run_child(lua_State* L, int result_fd) noexcept {
+void SpawnPool::run_child(lua_State* L, int result_fd, const std::function<void()>& in_child) noexcept {
     int status = 1;
     try {
         child_ = true;
         spawned_.clear();
-        config_.judge.reset();
-        deadline_ = 0;
-        ++tries_;
+        in_child();
         renew_limit_timer();
         prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
         if (const int null = ::open("/dev/null", O_RDONLY | O_CLOEXEC); null >= 0) {
@@ -117,13 +115,12 @@ void Host::run_child(lua_State* L, int result_fd) noexcept {
     _exit(status);
 }
 
-int Host::spawn(lua_State* L) {
+int SpawnPool::spawn(lua_State* L, const std::function<void()>& before_fork, const std::function<void()>& in_child) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
-    Host& host = of(L);
-    if (host.child_) {
+    if (child_) {
         luaL_error(L, "host.spawn: a spawned child cannot spawn");
     }
-    if (host.spawned_.size() >= kMaxSpawned) {
+    if (spawned_.size() >= kMaxSpawned) {
         luaL_error(L,
                    "host.spawn: %d children are running or not yet waited for, which is the most; host.wait "
                    "takes one off the list",
@@ -136,7 +133,7 @@ int Host::spawn(lua_State* L) {
     }
     UniqueFd reader(ends[0]);
     const UniqueFd writer(ends[1]);
-    host.curl_.reset();
+    before_fork();
     static_cast<void>(std::fflush(nullptr));
     const pid_t pid = fork();
     if (pid < 0) {
@@ -144,42 +141,40 @@ int Host::spawn(lua_State* L) {
     }
     if (pid == 0) {
         reader.reset();
-        host.run_child(L, writer.get());
+        run_child(L, writer.get(), in_child);
     }
     fcntl(reader.get(), F_SETFL, O_NONBLOCK);
-    const int id = ++host.spawn_count_;
-    host.spawned_.push_back({.id = id, .pid = pid, .result = std::move(reader), .data = {}, .ended = false});
+    const int id = ++count_;
+    spawned_.push_back({.id = id, .pid = pid, .result = std::move(reader), .data = {}, .ended = false});
     lua_pushinteger(L, id);
     return 1;
 }
 
-int Host::stop(lua_State* L) {
-    Host& host = of(L);
+int SpawnPool::stop(lua_State* L) {
     const int id = luaL_checkinteger(L, 1);
-    const auto child = std::ranges::find(host.spawned_, id, &Spawned::id);
-    if (child != host.spawned_.end()) {
+    const auto child = std::ranges::find(spawned_, id, &Spawned::id);
+    if (child != spawned_.end()) {
         drain(*child);
     }
-    const bool asked = child != host.spawned_.end() && !child->ended && kill(child->pid, SIGTERM) == 0;
+    const bool asked = child != spawned_.end() && !child->ended && kill(child->pid, SIGTERM) == 0;
     lua_pushboolean(L, asked ? 1 : 0);
     return 1;
 }
 
-int Host::wait(lua_State* L) {
-    Host& host = of(L);
+int SpawnPool::wait(lua_State* L, double deadline) {
     const bool limited = !lua_isnoneornil(L, 1);
-    double until = limited ? now() + host.within_limit(luaL_checknumber(L, 1)) : 0;
-    if (host.deadline_ > 0) {
-        until = until > 0 ? std::min(until, host.deadline_ - kWaitSlack) : host.deadline_ - kWaitSlack;
+    double until = limited ? now() + within_limit(deadline, luaL_checknumber(L, 1)) : 0;
+    if (deadline > 0) {
+        until = until > 0 ? std::min(until, deadline - kWaitSlack) : deadline - kWaitSlack;
     }
     for (;;) {
         raise_if_signaled(L);
-        for (Spawned& child : host.spawned_) {
+        for (Spawned& child : spawned_) {
             drain(child);
         }
-        if (const auto done = std::ranges::find(host.spawned_, true, &Spawned::ended); done != host.spawned_.end()) {
+        if (const auto done = std::ranges::find(spawned_, true, &Spawned::ended); done != spawned_.end()) {
             const Spawned child = std::move(*done);
-            host.spawned_.erase(done);
+            spawned_.erase(done);
             reap_exited();
             bool returned = false;
             std::string_view text = "the child ended without a result: it was killed, or ran out of memory";
@@ -189,14 +184,14 @@ int Host::wait(lua_State* L) {
             lua_pushlstring(L, text.data(), text.size());
             return 3;
         }
-        if (host.spawned_.empty() || (until > 0 && now() >= until)) {
+        if (spawned_.empty() || (until > 0 && now() >= until)) {
             lua_pushnil(L);
-            lua_pushinteger(L, static_cast<int>(host.spawned_.size()));
+            lua_pushinteger(L, static_cast<int>(spawned_.size()));
             return 2;
         }
         std::vector<pollfd> waiters;
-        waiters.reserve(host.spawned_.size());
-        for (const Spawned& child : host.spawned_) {
+        waiters.reserve(spawned_.size());
+        for (const Spawned& child : spawned_) {
             waiters.push_back({.fd = child.result.get(), .events = POLLIN, .revents = 0});
         }
         wait_for(waiters, until > 0 ? std::max(until - now(), 0.0) : -1.0);

@@ -1,6 +1,7 @@
 #ifndef HX_SYS_H_
 #define HX_SYS_H_
 
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -94,6 +95,17 @@ enum class ReadAll : std::uint8_t {
         }
         data.append(buffer.data(), static_cast<std::size_t>(n));
     }
+}
+
+[[nodiscard]] inline std::string read_file(const std::filesystem::path& path, std::error_code& ec) {
+    ec.clear();
+    const UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    std::string text;
+    if (!fd.valid() || read_all(fd.get(), text) != ReadAll::Done) {
+        ec.assign(errno, std::generic_category());
+        return {};
+    }
+    return text;
 }
 
 [[nodiscard]] inline bool write_all(int fd, std::string_view data) {

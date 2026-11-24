@@ -462,13 +462,66 @@ void push_result(lua_State* L, const Captured& output, const std::optional<Captu
     lua_setfield(L, -2, "seconds");
 }
 
+std::optional<Wall> narrower_wall(lua_State* L, int idx, const std::vector<Rule>& system_rules) {
+    if (!lua_istable(L, idx)) {
+        return std::nullopt;
+    }
+    std::vector<Rule> rules = system_rules;
+    std::vector<fs::path> inert;
+    bool asked = false;
+    for (const auto& [field, access] :
+         {std::pair{"read", std::optional(Access::Read)}, std::pair{"write", std::optional(Access::Write)},
+          std::pair{"inert", std::optional<Access>()}}) {
+        lua_getfield(L, idx, field);
+        if (!lua_isnil(L, -1)) {
+            if (!lua_istable(L, -1)) {
+                luaL_error(L, "host.sh: %s is a list of paths", field);
+            }
+            asked = true;
+            for (int i = 1; lua_rawgeti(L, -1, i) != LUA_TNIL; ++i) {
+                std::size_t length = 0;
+                const char* path = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &length) : nullptr;
+                if (path == nullptr || std::strlen(path) != length) {
+                    luaL_error(L, "host.sh: %s[%d] is not a path", field, i);
+                }
+                if (access) {
+                    rules.push_back({.path = path, .access = *access, .required = true});
+                } else {
+                    std::error_code ec;
+                    inert.push_back(fs::weakly_canonical(path, ec));
+                    if (ec) {
+                        luaL_error(L, "host.sh: inert[%d]: %s", i, ec.message().c_str());
+                    }
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+    if (!asked) {
+        return std::nullopt;
+    }
+    for (Rule& rule : rules) {
+        std::error_code ec;
+        const fs::path whole = inert.empty() ? fs::path() : fs::weakly_canonical(rule.path, ec);
+        rule.inert = ec || std::ranges::any_of(inert, [&whole](const fs::path& dir) {
+                         return beneath(whole, dir) || beneath(dir, whole);
+                     });
+    }
+    try {
+        return Wall::prepare(rules);
+    } catch (const SandboxError& error) {
+        luaL_error(L, "host.sh: %s", error.what());
+    }
+}
+
 }  // namespace
 
-int Host::sh(lua_State* L) {
+int run_sh(lua_State* L, double deadline, const std::vector<Rule>& system_rules) {
     const std::string command = command_of(L);
-    const Host& host = of(L);
-    const double timeout = host.within_limit(option(L, 2, "timeout", 120));
-    const std::optional<Wall> wall = host.narrower_wall(L, 2);
+    const double timeout = within_limit(deadline, option(L, 2, "timeout", 120));
+    const std::optional<Wall> wall = narrower_wall(L, 2, system_rules);
     bool on_hangup = false;
     bool split = false;
     std::optional<std::string_view> data;
@@ -533,60 +586,6 @@ int Host::sh(lua_State* L) {
     push_result(L, output.result(), errors ? std::optional<Captured>(errors->result()) : std::nullopt, outcome,
                 outcome.ended - child.started);
     return 1;
-}
-
-std::optional<Wall> Host::narrower_wall(lua_State* L, int idx) const {
-    if (!lua_istable(L, idx)) {
-        return std::nullopt;
-    }
-    std::vector<Rule> rules = config_.system_rules;
-    std::vector<fs::path> inert;
-    bool asked = false;
-    for (const auto& [field, access] :
-         {std::pair{"read", std::optional(Access::Read)}, std::pair{"write", std::optional(Access::Write)},
-          std::pair{"inert", std::optional<Access>()}}) {
-        lua_getfield(L, idx, field);
-        if (!lua_isnil(L, -1)) {
-            if (!lua_istable(L, -1)) {
-                luaL_error(L, "host.sh: %s is a list of paths", field);
-            }
-            asked = true;
-            for (int i = 1; lua_rawgeti(L, -1, i) != LUA_TNIL; ++i) {
-                std::size_t length = 0;
-                const char* path = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &length) : nullptr;
-                if (path == nullptr || std::strlen(path) != length) {
-                    luaL_error(L, "host.sh: %s[%d] is not a path", field, i);
-                }
-                if (access) {
-                    rules.push_back({.path = path, .access = *access, .required = true});
-                } else {
-                    std::error_code ec;
-                    inert.push_back(fs::weakly_canonical(path, ec));
-                    if (ec) {
-                        luaL_error(L, "host.sh: inert[%d]: %s", i, ec.message().c_str());
-                    }
-                }
-                lua_pop(L, 1);
-            }
-            lua_pop(L, 1);
-        }
-        lua_pop(L, 1);
-    }
-    if (!asked) {
-        return std::nullopt;
-    }
-    for (Rule& rule : rules) {
-        std::error_code ec;
-        const fs::path whole = inert.empty() ? fs::path() : fs::weakly_canonical(rule.path, ec);
-        rule.inert = ec || std::ranges::any_of(inert, [&whole](const fs::path& dir) {
-                         return beneath(whole, dir) || beneath(dir, whole);
-                     });
-    }
-    try {
-        return Wall::prepare(rules);
-    } catch (const SandboxError& error) {
-        luaL_error(L, "host.sh: %s", error.what());
-    }
 }
 
 }  // namespace hx

@@ -99,7 +99,7 @@ foreach(path IN LISTS HX_SKILL_FILES)
 endforeach()
 configure_file(src/embedded.h.in embedded.h @ONLY)
 
-add_executable(hx src/main.cpp src/host.cpp src/host_files.cpp src/host_http.cpp src/host_judge.cpp src/host_proc.cpp src/host_sh.cpp src/host_spawn.cpp src/judge.cpp src/json.cpp src/sandbox.cpp)
+add_executable(hx src/main.cpp src/cli.cpp src/policy.cpp src/vm.cpp src/host.cpp src/host_files.cpp src/host_http.cpp src/host_judge.cpp src/host_proc.cpp src/host_sh.cpp src/host_spawn.cpp src/judge.cpp src/json.cpp src/sandbox.cpp)
 target_include_directories(hx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(hx PRIVATE Luau.Compiler Luau.VM yyjson fmt::fmt-header-only CURL::libcurl)
 target_compile_options(
