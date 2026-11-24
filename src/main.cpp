@@ -799,19 +799,20 @@ std::vector<hx::Rule> user_rules(const Options& options) {
 }
 
 std::vector<hx::Rule> settled_user_rules(const Options& options, const fs::path& project) {
-    std::vector<hx::Rule> rules = user_rules(options);
-    for (hx::Rule& rule : rules) {
+    const std::vector<fs::path> writable = writable_roots(options, project);
+    std::vector<hx::Rule> settled;
+    for (hx::Rule& rule : user_rules(options)) {
         std::error_code ec;
-        if (fs::path whole = fs::canonical(rule.path, ec); !ec) {
+        const fs::path whole = fs::canonical(rule.path, ec);
+        if (ec) {
+            settled.push_back(std::move(rule));
+        } else if (std::ranges::none_of(
+                       writable, [&](const fs::path& root) { return whole != root && hx::beneath(whole, root); })) {
             rule.path = whole.string();
+            settled.push_back(std::move(rule));
         }
     }
-    const std::vector<fs::path> writable = writable_roots(options, project);
-    std::erase_if(rules, [&](const hx::Rule& rule) {
-        return std::ranges::any_of(
-            writable, [&](const fs::path& root) { return rule.path != root && hx::beneath(rule.path, root); });
-    });
-    return rules;
+    return settled;
 }
 
 std::vector<hx::Rule> sandbox_rules(const Options& options, const fs::path& project, const fs::path& tmp) {

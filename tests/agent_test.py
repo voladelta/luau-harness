@@ -2617,6 +2617,16 @@ say(submit("a wrong answer, and the --rw path's name led elsewhere"))
         self.assertIn("answer: Permission denied", done.stdout)
         self.assertNotIn("ANSWER-42", done.stdout + done.stderr)
 
+    def test_judge_a_missing_path_in_the_project_stops_the_judge_too(self):
+        kit = self.make_kit(config='{"runs": 1}')
+        for flag in ("--ro", "--rw"):
+            with self.subTest(flag):
+                done = self.drive(kit, 'print("began")', flag, os.path.join(self.project, "missing"))
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("missing: no such file or directory", done.stderr)
+                self.assertNotIn("the starting point", done.stderr)
+                self.assertEqual(done.stdout, "")
+
     def test_judge_a_kit_script_may_link_into_a_ro_path(self):
         shared = os.path.join(self.root, "shared")
         os.makedirs(shared)
