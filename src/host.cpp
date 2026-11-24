@@ -292,6 +292,16 @@ int l_env(lua_State* L) {
     return 1;
 }
 
+int l_wall_time(lua_State* L) {
+    timespec stamp{};
+    if (clock_gettime(CLOCK_REALTIME, &stamp) != 0) {
+        luaL_error(L, "clock_gettime: %s", error_text().c_str());
+    }
+    lua_pushnumber(L, static_cast<double>(stamp.tv_sec));
+    lua_pushnumber(L, static_cast<double>(stamp.tv_nsec));
+    return 2;
+}
+
 }  // namespace
 
 void renew_limit_timer() noexcept {
@@ -420,6 +430,7 @@ void Host::open(lua_State* L) {
         {.name = "log", .func = l_log},
         {.name = "sleep", .func = sleep},
         {.name = "env", .func = l_env},
+        {.name = "wall_time", .func = l_wall_time},
         {.name = "judge", .func = judge},
         {.name = "clip", .func = l_clip},
         {.name = "spawn", .func = spawn},

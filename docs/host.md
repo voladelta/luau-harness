@@ -15,13 +15,14 @@ Everything Luau can do to the machine:
 | `host.write(path, data)` | `true`, or `nil, error`; creates parent directories. A regular file is replaced by renaming a new one over it, so a failed write leaves the old content (a killed one can leave the new file beside it); the mode stays and a link stays a link, but owner, extended attributes and ACLs are not carried over. A device, a FIFO, a file with other hard links, a dangling link, or a file in a directory that refuses a new file is written in place; waiting for a FIFO's reader, or for room, ends as `host.read`'s waits do |
 | `host.list(dir)` | sorted names, directories ending in `/`, or `nil, error` |
 | `host.walk(dir, {glob=, depth=})` | every entry under `dir`, as sorted paths relative to it, directories ending in `/`, or `nil, error`. A `.git` directory is left out, links are not followed, and `.gitignore` is not read (`rg --files` honours it). `depth` 1 is `dir`'s own entries. A `glob` with a `/` is matched against the whole path, where `*` and `?` stay inside a directory and `**` is any number of them, more than none at the end; one without a `/` is matched against the name, at any depth. More than 100,000 entries is an error |
-| `host.stat(path)` | `{type, size, mtime, mode, target}`, or `nil, error`: `type` is `"file"`, `"dir"`, `"link"`, `"fifo"`, `"socket"` or `"device"`, of the path itself, as a link is not followed; `mtime` is in seconds since the epoch; `mode` is the permission bits as octal text, `"644"`; `target` is where a link points |
+| `host.stat(path)` | `{type, size, mtime, mode, target, revision}`, or `nil, error`: `type` is `"file"`, `"dir"`, `"link"`, `"fifo"`, `"socket"` or `"device"`, of the path itself, as a link is not followed; `mtime` is in seconds since the epoch; `mode` is the permission bits as octal text, `"644"`; `target` is where a link points; `revision` is an opaque string identifying the file and its current size, modification and change timestamps |
 | `host.clip(text, limit)` | `text` when it is at most `limit` bytes; otherwise `head, tail`, at most `limit // 2` bytes from each end. Each is cut at a line when that keeps more than half of it, and otherwise never inside a UTF-8 character; `host.sh` cuts a long output the same way |
 | `host.load(source, name, env)` | a function, or `nil, error` |
 | `host.try(fn, ...)` | `true, ...`, or `false, error`: a `pcall` that is also where a stop ends |
 | `host.timed(seconds, fn, ...)` | as `host.try`; the error is `"timeout"` when the limit passed |
 | `host.input(prompt)` | a line from stdin, or `nil` at the end |
 | `host.log(text)`, `host.sleep(seconds)`, `host.env(name)` | |
+| `host.wall_time()` | whole seconds since the Unix epoch, then the nanoseconds within that second |
 | `host.printable(text)` | `text` without what could steer a terminal: control characters other than tab and newline, and the Unicode marks that reorder text |
 | `host.args`, `host.cwd`, `host.interactive`, `host.sandboxed`, `host.default_loop` | |
 | `host.quiet` | `true` with `--quiet`: leave out progress lines |

@@ -276,6 +276,62 @@ class AgentTest(unittest.TestCase):
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("nowhere.json", missing.stderr)
 
+    def test_resume_last_orders_same_second_logs_by_start_time(self):
+        log = os.path.join(self.project, ".hx", "log")
+        os.makedirs(log)
+        for older, newer, older_stamp in [
+            ("20260101-120000-zzzzzz.json", "20260101-120000-aaaaaa.json", 1767268800_100000000),
+            ("20260101-120000-t1767268800n090000000xzzzzzz.json",
+             "20260101-120000-t1767268800n100000000xaaaaaa.json", 1767268800_990000000),
+        ]:
+            with self.subTest(older=older, newer=newer):
+                for name, task, stamp in [
+                    (older, "older", older_stamp),
+                    (newer, "newer", 1767268800_200000000),
+                    (newer[:-5] + "-sub-1.json", "agent", 1767268800_300000000),
+                ]:
+                    path = os.path.join(log, name)
+                    with open(path, "w") as f:
+                        json.dump({"messages": [{"role": "user", "content": task}]}, f)
+                    os.utime(path, ns=(stamp, stamp))
+                done = self.run_hx("--resume", "last", "continue", script=[say("ok")])
+                for name in os.listdir(log):
+                    os.unlink(os.path.join(log, name))
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(self.model.requests[-1]["messages"][0]["content"][0]["text"], "newer")
+
+    def test_numbered_read_of_dense_file_uses_bounded_working_memory(self):
+        with open(os.path.join(self.project, "dense.txt"), "wb") as f:
+            f.write(b"x\n" * (4 << 20))
+        done = subprocess.run(
+            ["bash", "-c", 'ulimit -v 131072 && exec "$@"', "bash", HX, "-q", "--run", "-"],
+            input="""local loop = assert(host.load(host.default_loop, "=loop"))()
+for _, tool in loop.functions do
+    if tool.name == "read" then print(tool.run("dense.txt", 1, 1)) end
+end
+""",
+            cwd=self.project, env=self.env(), capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "1: x\n[lines 1-1 of 4194304; offset=2 goes on]\n")
+
+    def test_search_rejects_awk_without_nul_record_support(self):
+        bin_dir = os.path.join(self.project, "bin")
+        os.mkdir(bin_dir)
+        awk = os.path.join(bin_dir, "awk")
+        with open(awk, "w") as f:
+            f.write('#!/bin/bash\nIFS= read -r -d "" record\nprintf "%s" "$record" | command -p awk "$@"\n')
+        os.chmod(awk, 0o755)
+        with open(os.path.join(self.project, "note.txt"), "w") as f:
+            f.write("needle\n")
+        done = self.run_hx(
+            "--run", "-", PATH=bin_dir + ":" + os.environ["PATH"],
+            stdin='local search = assert(host.load(host.default_loop, "=loop"))().ext("search")\n'
+                  'search.ripgrep = false\nprint(tostring(search.grep("needle", { glob = "note.txt" })))\n',
+        )
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("awk must support NUL record separators", done.stderr)
+
     def test_a_tool_call_runs_and_its_result_goes_back(self):
         done = self.run_hx("make a file", script=[call("bash", {"command": "echo hi > out.txt; echo made"}), say("All done.")])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -2050,6 +2106,24 @@ class AgentTest(unittest.TestCase):
         for flags in ([], ["--no-sandbox"]):
             done = self.run_hx(*flags, "--run", "-", stdin=script)
             self.assertEqual((done.returncode, done.stdout), (0, "true\ttrue\n"), (flags, done.stderr))
+
+    def test_search_ignores_ripgrep_configuration(self):
+        if not shutil.which("rg"):
+            self.skipTest("ripgrep is not installed")
+        config = os.path.join(self.project, "rg.conf")
+        with open(os.path.join(self.project, "note.txt"), "w") as f:
+            f.write("needle\ncontext\n")
+        for option in ["--count", "--column", "--after-context=1", "--invert-match"]:
+            with self.subTest(option=option):
+                with open(config, "w") as f:
+                    f.write(option + "\n")
+                done = self.run_hx(
+                    "--run", "-", RIPGREP_CONFIG_PATH=config,
+                    stdin='local search = assert(host.load(host.default_loop, "=loop"))().ext("search")\n'
+                          'search.ripgrep = true\nprint(tostring(search.grep("needle", { glob = "note.txt" })))\n',
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout, "note.txt:1: needle\n")
 
     def test_a_loop_without_tools_sends_an_empty_list(self):
         os.makedirs(os.path.join(self.project, ".hx"))

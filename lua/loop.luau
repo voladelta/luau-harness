@@ -57,7 +57,7 @@ local live: {
 	repeats: Repeats,
 	printed: { string }?,
 	agent: { name: string, run: number }?,
-	seen: { [string]: { mtime: number, size: number } },
+	seen: { [string]: string },
 	wrote: { string },
 	shared_since: number?,
 	images: { Block }?,
@@ -684,7 +684,7 @@ local function or_raise<T>(value: T?, err: string?): T
 	return value
 end
 
-local function tracked(path: string): (string, { type: string, mtime: number, size: number, target: string? }?)
+local function tracked(path: string): (string, { type: string, mtime: number, revision: string, target: string? }?)
 	local pending = M.ext("path").join(host.cwd or "/", path):split("/")
 	local resolved, hops = "", 0
 	while #pending > 0 do
@@ -718,7 +718,7 @@ end
 local function saw(path: string)
 	local key, stat = tracked(path)
 	if stat then
-		live.seen[key] = { mtime = stat.mtime, size = stat.size }
+		live.seen[key] = stat.revision
 	end
 end
 
@@ -736,7 +736,7 @@ local function unseen_change(path: string): string?
 	end
 	local seen = live.seen[key]
 	if seen then
-		if seen.mtime ~= stat.mtime or seen.size ~= stat.size then
+		if seen ~= stat.revision then
 			return ("write: %s has changed since you last read or wrote it, and this would overwrite a change you "
 				.. "have not seen. Read it again, then write it, or edit it."):format(path)
 		end
@@ -841,50 +841,45 @@ M.functions = {
 			if text == "" then
 				return "[empty file]"
 			end
-			local lines = text:split("\n")
-			if text:sub(-1) == "\n" then
-				table.remove(lines)
-			end
-			for i, line in lines do
-				if line:sub(-1) == "\r" then
-					lines[i] = line:sub(1, -2)
-				end
-			end
 			local first = math.max(1, offset or 1)
-			local last = math.min(#lines, first + (limit or 2000) - 1)
-			if first > #lines then
-				error(("offset %d is past the end: the file has %d lines"):format(first, #lines), 0)
-			end
-			local budget = M.output_limit - 200
-			local function numbered(i)
-				return ("%d: %s"):format(i, lines[i])
-			end
-			local shown = { numbered(first) }
-			local size = #shown[1]
-			for i = first + 1, last do
-				local line = numbered(i)
-				size += 1 + #line
-				if size > budget then
-					last = i - 1
-					break
+			local until_line = first + (limit or 2000) - 1
+			local budget = math.max(0, M.output_limit - 200)
+			local shown = {}
+			local at, total, last, size = 1, 0, first - 1, 0
+			while at <= #text do
+				local newline = text:find("\n", at, true) or #text + 1
+				total += 1
+				if total >= first and total <= until_line then
+					local stop = newline - 1
+					if stop >= at and text:byte(stop) == 13 then
+						stop -= 1
+					end
+					local length = stop - at + 1
+					local number = ("%d: "):format(total)
+					if total == first and length > budget then
+						local prefix = utf8_prefix(text:sub(at, at + budget), budget)
+						table.insert(shown, number .. prefix)
+						table.insert(shown, ("[line %d is %d bytes; only the first %d are shown]"):format(total, length, #prefix))
+						last, until_line = total, total
+					elseif total == first or size + 1 + #number + length <= budget then
+						table.insert(shown, number .. text:sub(at, stop))
+						size += (if total == first then 0 else 1) + #number + length
+						last = total
+					else
+						until_line = last
+					end
 				end
-				table.insert(shown, line)
+				at = newline + 1
 			end
-			local body
-			if #lines[first] > budget then
-				last = first
-				local prefix = utf8_prefix(lines[first], budget)
-				body = ("%d: %s"):format(first, prefix)
-					.. ("\n[line %d is %d bytes; only the first %d are shown]"):format(first, #lines[first], #prefix)
-			else
-				body = table.concat(shown, "\n")
+			if first > total then
+				error(("offset %d is past the end: the file has %d lines"):format(first, total), 0)
 			end
-			if last < #lines then
-				body ..= ("\n[lines %d-%d of %d; offset=%d goes on]"):format(first, last, #lines, last + 1)
+			if last < total then
+				table.insert(shown, ("[lines %d-%d of %d; offset=%d goes on]"):format(first, last, total, last + 1))
 			elseif first > 1 then
-				body ..= ("\n[lines %d-%d of %d]"):format(first, last, #lines)
+				table.insert(shown, ("[lines %d-%d of %d]"):format(first, last, total))
 			end
-			return body
+			return table.concat(shown, "\n")
 		end,
 	},
 	{
@@ -1085,7 +1080,7 @@ local function lua_description(): string
 		.. "no quoting; input is text for its stdin; cwd is the directory it runs in; env is {NAME = value} to set, "
 		.. "false to take one away.")
 	table.insert(lines, "- host.walk(dir, {glob?, depth?}) -> {path}: every path under dir, sorted, .git left out, "
-		.. "directories ending in /; glob as \"**/*.luau\". host.stat(path) -> {type, size, mtime, mode}, or nil.")
+		.. "directories ending in /; glob as \"**/*.luau\". host.stat(path) -> {type, size, mtime, mode, revision}, or nil.")
 	table.insert(lines, "- host.read(path) -> text, host.write(path, text), host.list(dir), json.encode(value, "
 		.. "{indent?}), json.decode(text): the other plain primitives, for working on data.")
 	table.insert(lines, "")
@@ -1789,7 +1784,8 @@ local function turn(system: string, talk: Conversation): Reply
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
 end
 
-local log_path = (".hx/log/%s-%s.json"):format(os.date("%Y%m%d-%H%M%S"),
+local started_at, started_ns = host.wall_time()
+local log_path = (".hx/log/%s-t%dn%09dx%s.json"):format(os.date("%Y%m%d-%H%M%S", started_at), started_at, started_ns,
 	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0")
 local function save(system: string, messages: { Message }, path: string)
 	if host.list(".hx") then
@@ -1857,7 +1853,7 @@ type Agent = {
 	started: number,
 	report: string?,
 	stopping: boolean,
-	seen: { [string]: { mtime: number, size: number } },
+	seen: { [string]: string },
 }
 local fleet: { agents: { Agent }, waiting: { Agent }, system: string? } = { agents = {}, waiting = {}, system = nil }
 
@@ -2193,9 +2189,23 @@ function M.resume_log(named: string): string
 		return named
 	end
 	local newest: string? = nil
+	local newest_seconds, newest_nanos = -math.huge, 0
 	for _, name in host.list(".hx/log") or {} do
-		if name:match("%.json$") and not name:match("%-sub%-%d+%.json$") and (not newest or name > newest) then
-			newest = name
+		if name:match("%.json$") and not name:match("%-sub%-%d+%.json$") then
+			local epoch, fraction = name:match("^%d+%-%d+%-t(%d+)n(%d+)x%w+%.json$")
+			local seconds, nanos = tonumber(epoch), tonumber(fraction)
+			if not seconds or not nanos then
+				local stat = host.stat(".hx/log/" .. name)
+				if not stat then
+					continue
+				end
+				seconds = math.floor(stat.mtime)
+				nanos = (stat.mtime - seconds) * 1e9
+			end
+			if not newest or seconds > newest_seconds or (seconds == newest_seconds
+				and (nanos > newest_nanos or (nanos == newest_nanos and name > newest))) then
+				newest, newest_seconds, newest_nanos = name, seconds, nanos
+			end
 		end
 	end
 	if not newest then
