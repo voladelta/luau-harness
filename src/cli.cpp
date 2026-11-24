@@ -25,6 +25,7 @@
 #include "embedded.h"
 #include "sys.h"
 #include "usage.h"
+#include "vm.h"
 
 namespace hx {
 namespace {
@@ -143,6 +144,8 @@ constexpr Vendor kVendors[] = {
 constexpr const Vendor& kAnthropic = kVendors[0];
 constexpr const Vendor& kDeepSeek = kVendors[1];
 
+constexpr const char* kToolsUrl = "https://api.deepseek.com/v1/tools";
+
 struct Service {
     const char* name;
     const char* url;
@@ -155,7 +158,7 @@ struct Service {
 constexpr Service kServices[] = {
     {
         .name = "search",
-        .url = "https://api.deepseek.com/v1/tools",
+        .url = kToolsUrl,
         .url_env = "HX_TOOLS_URL",
         .path = "/search",
         .key_env = kDeepSeek.key_env,
@@ -163,7 +166,7 @@ constexpr Service kServices[] = {
     },
     {
         .name = "fetch",
-        .url = "https://api.deepseek.com/v1/tools",
+        .url = kToolsUrl,
         .url_env = "HX_TOOLS_URL",
         .path = "/fetch",
         .key_env = kDeepSeek.key_env,
@@ -171,7 +174,7 @@ constexpr Service kServices[] = {
     },
     {
         .name = "ocr",
-        .url = "https://api.deepseek.com/v1/tools",
+        .url = kToolsUrl,
         .url_env = "HX_TOOLS_URL",
         .path = "/ocr",
         .key_env = kDeepSeek.key_env,
@@ -195,7 +198,6 @@ constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
 constexpr std::string_view kRpiLead = "opus";
 constexpr const char* kRpiWorkflow = "rpi";
 constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh", "max"};
-constexpr const char* kProjectLoop = ".hx/loop.luau";
 
 constexpr std::string_view kOptionNames[] = {
     "--model",   "--ro",       "--rw",   "--keep-env",      "--unix-sockets", "--no-sandbox",

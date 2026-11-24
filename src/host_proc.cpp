@@ -21,16 +21,34 @@
 #include "sys.h"
 
 namespace hx {
+namespace {
+
+constexpr int kKillRounds = 100;
+constexpr std::size_t kMaxKilled = 4096;
 
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 volatile std::sig_atomic_t g_signal = 0;
 volatile std::sig_atomic_t g_expired = 1;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
-namespace {
+struct LimitTimer {
+    timer_t timer{};
+    bool made = false;
+};
 
-constexpr int kKillRounds = 100;
-constexpr std::size_t kMaxKilled = 4096;
+LimitTimer make_limit_timer() noexcept {
+    LimitTimer timer;
+    sigevent event{};
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGALRM;
+    timer.made = timer_create(CLOCK_MONOTONIC, &event, &timer.timer) == 0;
+    return timer;
+}
+
+LimitTimer& limit_timer() noexcept {
+    static LimitTimer timer = make_limit_timer();
+    return timer;
+}
 
 pid_t parent_of(int proc, std::string_view pid) {
     constexpr std::string_view kStat = "/stat";
@@ -102,6 +120,43 @@ double now() noexcept {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<double>(ts.tv_sec) + (static_cast<double>(ts.tv_nsec) * 1e-9);
+}
+
+int pending_signal() noexcept {
+    return g_signal;
+}
+
+void forget_signal() noexcept {
+    g_signal = 0;
+}
+
+void arm_limit(double deadline) noexcept {
+    const LimitTimer& limit = limit_timer();
+    if (!limit.made) {
+        return;
+    }
+    const itimerspec at{
+        .it_interval = {.tv_sec = 0, .tv_nsec = 0},
+        .it_value = timespec_of(deadline),
+    };
+    timer_settime(limit.timer, TIMER_ABSTIME, &at, nullptr);
+}
+
+bool take_limit_check() noexcept {
+    if (g_expired == 0) {
+        return false;
+    }
+    g_expired = limit_timer().made ? 0 : 1;
+    return true;
+}
+
+void keep_limit_check() noexcept {
+    g_expired = 1;
+}
+
+void renew_limit_timer() noexcept {
+    limit_timer() = make_limit_timer();
+    keep_limit_check();
 }
 
 void wait_for(std::span<pollfd> fds, double seconds) noexcept {

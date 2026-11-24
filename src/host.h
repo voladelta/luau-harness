@@ -93,6 +93,7 @@ class Host {
 };
 
 void install_signal_handlers();
+int stop_signal(std::string_view error) noexcept;
 
 }  // namespace hx
 

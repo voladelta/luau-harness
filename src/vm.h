@@ -10,6 +10,8 @@
 
 namespace hx {
 
+inline constexpr const char* kProjectLoop = ".hx/loop.luau";
+
 int run_module(HostConfig config, const Sandbox& sandbox, std::string_view source, const std::string& name,
                const std::function<void()>& on_done = {});
 

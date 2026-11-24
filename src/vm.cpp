@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <csignal>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +31,6 @@
 namespace hx {
 namespace {
 
-constexpr const char* kProjectLoop = ".hx/loop.luau";
 constexpr int kExitInterrupted = 130;
 constexpr int kExitTerminated = 143;
 
@@ -138,17 +138,13 @@ std::string pop_message(lua_State* L) {
 
 bool is_stop(lua_State* L) {
     const char* text = lua_tostring(L, -1);
-    const std::string_view message = text != nullptr ? text : "";
-    return message == "interrupted" || message == "terminated";
+    return text != nullptr && stop_signal(text) != 0;
 }
 
 int failure(lua_State* L) {
     const std::string message = pop_message(L);
-    if (message == "interrupted") {
-        return kExitInterrupted;
-    }
-    if (message == "terminated") {
-        return kExitTerminated;
+    if (const int sig = stop_signal(message); sig != 0) {
+        return sig == SIGINT ? kExitInterrupted : kExitTerminated;
     }
     fmt::print(stderr, "hx: {}\n", message);
     return kExitFailure;
