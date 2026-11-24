@@ -1338,6 +1338,61 @@ end
         self.assert_gone(pid)
         self.assertEqual(len(self.model.requests), 1)
 
+    def test_the_private_tmpdir_is_removed_on_exit_with_or_without_the_sandbox(self):
+        script = "host.write(host.env('TMPDIR') .. '/kept/file', 'x') print(host.env('TMPDIR'))"
+        for flags in ([], ["--no-sandbox"]):
+            done = self.run_hx(*flags, "--run", "-", stdin=script)
+            self.assertEqual(done.returncode, 0, (flags, done.stderr))
+            self.assertRegex(done.stdout, r"/hx-\w{6}\n$")
+            self.assertFalse(os.path.exists(done.stdout.strip()), flags)
+
+    def test_the_private_tmpdir_is_removed_when_hx_is_killed(self):
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("host.write(host.env('TMPDIR') .. '/kept/file', 'x') host.write('tmp.path', host.env('TMPDIR')) "
+                    "host.write('hx.pid', host.sh('echo $PPID').out) host.sleep(300)")
+        for sent in (signal.SIGKILL, (signal.SIGINT, signal.SIGINT)):
+            process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.wait_for_pid_file("hx.pid")
+            tmp = read(self.project, "tmp.path")
+            self.assertTrue(os.path.isdir(tmp), tmp)
+            for one in sent if isinstance(sent, tuple) else (sent,):
+                process.send_signal(one)
+            process.communicate(timeout=20)
+            for _ in range(100):
+                if not os.path.exists(tmp):
+                    break
+                time.sleep(0.05)
+            self.assertFalse(os.path.exists(tmp), sent)
+            os.remove(os.path.join(self.project, "hx.pid"))
+
+    def test_the_private_tmpdir_is_removed_where_it_was_made_not_where_its_path_leads_later(self):
+        outside = os.path.join(self.root, "outside")
+        os.makedirs(os.path.join(self.project, "tmp"))
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("host.write('tmp.name', host.env('TMPDIR'):match('[^/]+$')) "
+                    "while not host.stat('go') do host.sleep(0.05) end "
+                    f"print(host.sh('mv tmp moved && ln -s {outside} tmp').code)")
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project,
+                                   env=self.env(TMPDIR=os.path.join(self.project, "tmp")),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(kill_quietly, process.pid)
+        for _ in range(200):
+            if os.path.exists(os.path.join(self.project, "tmp.name")):
+                break
+            time.sleep(0.05)
+        name = read(self.project, "tmp.name")
+        self.assertRegex(name, r"^hx-\w{6}$")
+        os.makedirs(os.path.join(outside, name))
+        with open(os.path.join(outside, name, "kept"), "w") as f:
+            f.write("x")
+        with open(os.path.join(self.project, "go"), "w") as f:
+            f.write("")
+        out, err = process.communicate(timeout=20)
+        self.assertEqual((process.returncode, out), (0, "0\n"), err)
+        self.assertTrue(os.path.exists(os.path.join(outside, name, "kept")))
+        self.assertFalse(os.path.exists(os.path.join(self.project, "moved", name)))
+
     def test_sigterm_and_sighup_end_the_run_with_143_and_leave_its_log(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         for sent in (signal.SIGTERM, signal.SIGHUP):
@@ -2434,6 +2489,30 @@ say(submit("all kinds"))
         self.assertTrue(os.access(os.path.join(original, "fast one.sh"), os.X_OK))
         self.assertEqual(os.readlink(os.path.join(original, "link")), "prog.sh")
         self.assertFalse(os.path.exists(os.path.join(original, "gone.txt")))
+
+    def test_judge_a_patch_carries_a_change_inside_a_nested_repository(self):
+        kit = self.make_kit(check=None, config='{"runs": 1}')
+        lib = os.path.join(self.project, "vendor", "lib")
+        os.makedirs(lib)
+        with open(os.path.join(lib, "lib.sh"), "w") as f:
+            f.write("echo slow\n")
+        git = dict(cwd=lib, env=self.env(GIT_CONFIG_GLOBAL="/dev/null"), capture_output=True, text=True)
+        subprocess.run(["git", "init", "-q"], **git)
+        subprocess.run(["git", "add", "lib.sh"], **git)
+        committed = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "lib"],
+                                   **git)
+        self.assertEqual(committed.returncode, 0, committed.stderr)
+        original = os.path.join(self.root, "original")
+        shutil.copytree(self.project, original, symlinks=True)
+        done = self.drive(kit, """
+host.write("vendor/lib/lib.sh", "echo fast\\n")
+say(submit("inside the nested repository"))
+""")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        applied = subprocess.run(["git", "apply", os.path.join(self.judge_state(), "trials", "1.patch")], cwd=original,
+                                 capture_output=True, text=True)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(read(original, "vendor/lib/lib.sh"), "echo fast\n")
 
     def test_judge_a_score_must_be_positive_and_finite(self):
         kit = self.make_kit(check='#!/bin/sh\ncat "$1/.judge/stdout"\n', config='{"runs": 1}', prog="echo 2\n")

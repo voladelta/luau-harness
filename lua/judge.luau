@@ -157,7 +157,7 @@ end
 
 local function snapshot(dir: string)
 	remove(dir)
-	shell(("mkdir -p %s && tar -C %s --exclude=./.git --exclude=./.hx -cf - . | tar -C %s -xf -"):format(
+	shell(("mkdir -p %s && tar -C %s --exclude=.git --exclude=./.hx -cf - . | tar -C %s -xf -"):format(
 		quote(dir), quote(project), quote(dir)))
 end
 
