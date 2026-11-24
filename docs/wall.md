@@ -17,7 +17,13 @@ relative entries. To run with a narrower wall, narrow `PATH`: `PATH=/usr/bin:/bi
 What a toolchain needs beyond its programs takes a flag, for example
 `hx --ro ~/.rustup --rw ~/.cargo/registry "..."` for rustup's toolchains and cargo's downloads. The flags and
 `PATH` come from your command line and environment on purpose: nothing inside the project, which the model can
-write, can widen the wall.
+write, can widen the wall. That holds for links too. A link the model could have made, one that lies in the
+project or under a `--rw` path, opens nothing, and neither does a `PATH` entry, a trust root or a git file that
+is reached through such a link: with `.venv/bin` on your `PATH`, a link planted there to `~/.ssh` leaves `~/.ssh`
+closed. A virtual environment in the project whose `python` is a link into your home directory therefore needs
+that directory named: `--ro ~/.pyenv`, say. A `PATH` entry, trust root or git file that itself lies in the project
+or under a `--rw` path is inside already and gets no rule of its own, so the model cannot later put a link under
+a name the wall would open again.
 
 Git reads your name, aliases and ignore rules inside: `~/.gitconfig`, and `config`, `ignore` and `attributes` in
 `$XDG_CONFIG_HOME/git` (`~/.config/git` by default). Nothing else in that directory opens, so the tokens

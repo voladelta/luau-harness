@@ -157,6 +157,9 @@ int Host::stop(lua_State* L) {
     Host& host = of(L);
     const int id = luaL_checkinteger(L, 1);
     const auto child = std::ranges::find(host.spawned_, id, &Spawned::id);
+    if (child != host.spawned_.end()) {
+        drain(*child);
+    }
     const bool asked = child != host.spawned_.end() && !child->ended && kill(child->pid, SIGTERM) == 0;
     lua_pushboolean(L, asked ? 1 : 0);
     return 1;

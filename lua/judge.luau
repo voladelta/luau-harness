@@ -26,6 +26,12 @@ for i = 3, #host.args, 2 do
 	table.insert(host.args[i] == "--ro" and reads or writes, host.args[i + 1])
 end
 
+local own = {
+	read = { project, kit, table.unpack(reads) },
+	write = { state },
+	inert = { project, state, table.unpack(writes) },
+}
+
 local defaults: { [string]: number | boolean } = { runs = 5, margin = 0.02, timeout = 600, blind = false }
 local config: Config
 
@@ -73,7 +79,8 @@ local function tail(text: string, limit: number): string
 end
 
 local function shell(command: string): string
-	local result = host.sh("set -o pipefail; " .. command, { timeout = 3600, hangup = true })
+	local result = host.sh("set -o pipefail; " .. command,
+		{ timeout = 3600, hangup = true, read = own.read, write = own.write, inert = own.inert })
 	if result.code ~= 0 then
 		error(("%s: %s"):format(command, tail(result.out, 500)), 0)
 	end
@@ -104,7 +111,7 @@ end
 
 local function unlock(path: string)
 	host.sh(("if [ -d %s ] && [ ! -L %s ]; then find %s -type d -exec chmod u+rwx {} ';' 2>/dev/null || true; fi")
-		:format(quote(path), quote(path), quote(path)))
+		:format(quote(path), quote(path), quote(path)), own)
 end
 
 local function remove(path: string)
@@ -137,7 +144,7 @@ local function candidate(dir: string, script: string): (number?, ...string)
 		end
 		return result.seconds
 	end
-	local shown = if config.blind then "" else tail(host.sh({ "tail", "-c", "1500", stdout }).out, 1500)
+	local shown = if config.blind then "" else tail(host.sh({ "tail", "-c", "1500", stdout }, own).out, 1500)
 	shell("rm -f " .. quote(stdout))
 	local how = result.timed_out and ("timed out after %g s"):format(config.timeout)
 		or result.signal and "was killed by signal " .. result.signal
@@ -164,7 +171,7 @@ local function has_script(path: string): boolean
 	if info.type == "file" then
 		return true
 	end
-	return host.sh({ "test", "-f", path }).code == 0
+	return host.sh({ "test", "-f", path }, own).code == 0
 end
 
 local function build(dir: string): (boolean, ...string)
@@ -196,10 +203,14 @@ local function measure(built: string): (Measure?, ...string)
 	local wall = table.clone(reads)
 	table.insert(wall, kit)
 	table.insert(wall, dir)
-	table.move(writes, 1, #writes, #wall + 1, wall)
-	local result = host.sh(("cd %s && TMPDIR=%s %s %s"):format(quote(dir), quote(state .. "/tmp"),
-		quote(kit .. "/check"), quote(dir)),
-		{ timeout = config.timeout, read = wall, write = { state .. "/tmp" }, hangup = true })
+	local result = host.sh(("cd %s && TMPDIR=%s %s %s"):format(quote(kit), quote(state .. "/tmp"),
+		quote(kit .. "/check"), quote(dir)), {
+		timeout = config.timeout,
+		read = wall,
+		write = { state .. "/tmp" },
+		inert = { project, dir, table.unpack(writes) },
+		hangup = true,
+	})
 	if result.timed_out then
 		return nil, ("the check timed out after %g s"):format(config.timeout)
 	elseif result.code ~= 0 then
@@ -301,7 +312,7 @@ local function crown(trial: number, dir: string, kind: string, value: number)
 	shell(("mv %s/champion.patch.tmp %s/champion.patch"):format(quote(state), quote(state)))
 	champion = { trial = trial, dir = dir, built = dir .. "/built", kind = kind, value = value }
 	if previous then
-		host.try(host.sh, "rm -rf " .. quote(previous.dir))
+		host.try(host.sh, "rm -rf " .. quote(previous.dir), own)
 	end
 end
 
@@ -418,7 +429,7 @@ local function abandon(err: unknown): string
 	host.try(record, entry)
 	host.try(unlock, dir)
 	host.try(unlock, workdir)
-	host.try(host.sh, ("rm -rf %s %s %s/champion.patch.tmp"):format(quote(dir), quote(workdir), quote(state)))
+	host.try(host.sh, ("rm -rf %s %s %s/champion.patch.tmp"):format(quote(dir), quote(workdir), quote(state)), own)
 	say(("trial %d: %s: %s"):format(entry.trial, verdict, why))
 	return ("Trial %d. %s: the judge could not finish it, through no fault of the submission: %s"):format(entry.trial,
 		verdict, why)
@@ -450,7 +461,7 @@ end
 local function summary()
 	host.log(host.printable(summary_text()))
 	host.sh(("cd %s && rm -rf run stdout tmp git index index.lock start && find trials -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +")
-		:format(quote(state)))
+		:format(quote(state)), own)
 end
 
 local function main(): number

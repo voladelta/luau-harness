@@ -15,7 +15,7 @@ A **kit** is the judge's half of the project, a directory with up to four files:
 |---|---|
 | `run` | required, executable. Runs in a fresh copy of the built candidate and is timed by hx from outside; it exits 0 when it worked |
 | `build` | optional, executable. Runs once per candidate before any run, untimed, at the same path the runs use, so a build that records where it is still runs |
-| `check` | optional, executable. Runs as `check DIR` after each run, where `DIR/.judge/stdout` is what the run printed; links in `DIR` are removed first, so the run cannot point the check at the kit. It exits 0 when the output is right. A number on its last line is the score: positive, and higher is better; without one, the measure is the run's time. What it prints when it fails goes to the model, unless `blind` is on |
+| `check` | optional, executable. Runs as `check DIR` after each run, in the kit's directory, where `DIR/.judge/stdout` is what the run printed; links in `DIR` are removed first, so the run cannot point the check at the kit, and the check does not start in `DIR`, so a module or file the candidate left there is not taken for the check's own. It exits 0 when the output is right. A number on its last line is the score: positive, and higher is better; without one, the measure is the run's time. What it prints when it fails goes to the model, unless `blind` is on |
 | `kit.json` | optional: `{"runs": 5, "margin": 0.02, "timeout": 600, "blind": false}`: pairs per round (1 suits a score that does not vary), the smallest relative gain that counts, the seconds one build, run or check may take, and whether the model hears verdicts without numbers and without the candidate's or the check's words, so that it cannot fit what the kit holds back by reading them. An unknown key or a wrong type stops hx before the model is asked anything |
 
 The model gets one more function, `submit(note?)`, and a paragraph in its prompt that says how judging works.
@@ -49,8 +49,26 @@ The walls are what make the verdicts worth having:
   itself.
 - **The candidate cannot read the kit's other files.** `build` and `run` run behind a narrower wall still: their
   copy of the candidate, the system directories and the `--ro` and `--rw` paths. Only the script being run is
-  copied in, so `check` and whatever else the kit holds stay out of reach. `check` reads the kit and the run's copy
-  and writes nothing that lasts.
+  copied in, so `check` and whatever else the kit holds stay out of reach. `check` reads the kit, the run's copy
+  and the `--ro` paths, not the `--rw` ones, and writes nothing that lasts. What a failed build or run printed
+  goes to the model only from the file hx sent it to: a link left in that file's place is not read.
+- **The judge runs nothing the model can write.** Its own commands and `check` cannot run a file in the project,
+  in a run's copy or under a `--rw` path, whether it is named outright, found on `PATH` or reached through a link.
+  The wall cannot open a directory and close part of it, so a `--ro` path or a system directory that holds the
+  project or a `--rw` path runs nothing for them either: give a toolchain `check` needs a `--ro` path of its own.
+  `build` and `run` are the candidate's, and run whatever the candidate's wall holds. What `check` hands to an
+  interpreter itself, `sh "$1/fix.sh"`, is the kit's to answer for.
+- **The judge's paths stay where they were.** It takes each `--ro` and `--rw` path as hx found it before the agent
+  began: one named through a link is held to where the link led then, and one that lies in the project or under
+  another `--rw` path is left out, since the model could put something else in its place and the agent's own wall
+  holds it already.
+- **The judge finds no program where the model can write.** Its `PATH`, and with it that of `build`, `run` and
+  `check`, keeps only the absolute directories that lie outside the project and the `--rw` paths and are not
+  reached through a link there; hx stops before the agent begins when none is left. Without a `PATH` it
+  starts from the one a shell searches then, `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`.
+  Otherwise a `tar` the model left in `node_modules/.bin` would run as the judge, with the kit in reach. A kit
+  that wants a program from the project names it in the candidate's copy: `./node_modules/.bin/tsc`, or
+  `PATH=$PWD/node_modules/.bin:$PATH` in `run`.
 - **A candidate leaves nothing running.** What a build or run started dies when it ends, so no process of the
   candidate's can slow the champion's runs or write into an output after the run.
 - **The judge is built into hx** (`lua/judge.luau`). A project's loop can change everything about the agent, but
