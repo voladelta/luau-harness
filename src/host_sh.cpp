@@ -335,8 +335,8 @@ Outcome wait_for_command(pid_t pid, Pipes& pipes, bool hangup, double timeout) {
             outcome.ended = now();
             return outcome;
         }
-        if (const bool signaled = pending_signal() != 0; signaled || now() >= deadline) {
-            return give_up(signaled ? Ending::Signaled : Ending::TimedOut);
+        if (pending_signal() != 0 || now() >= deadline) {
+            return give_up(pending_signal() != 0 ? Ending::Signaled : Ending::TimedOut);
         }
         std::array<pollfd, 5> waiters{
             pollfd{.fd = exited.get(), .events = POLLIN, .revents = 0},
