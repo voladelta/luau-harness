@@ -74,7 +74,7 @@ class TempDir {
             return {};
         }
         hx::UniqueFd ours(ends[0]);
-        hx::UniqueFd theirs(ends[1]);
+        const hx::UniqueFd theirs(ends[1]);
         const pid_t pid = fork();
         if (pid == 0) {
             const pid_t remover = chdir(parent) == 0 ? fork() : -1;

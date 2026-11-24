@@ -46,7 +46,7 @@ std::size_t on_body(char* data, std::size_t size, std::size_t count, void* user)
 
 int on_progress(void* /*user*/, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/, curl_off_t /*ultotal*/,
                 curl_off_t /*ulnow*/) noexcept {
-    return g_signal != 0 ? 1 : 0;
+    return pending_signal() != 0 ? 1 : 0;
 }
 
 class Headers {

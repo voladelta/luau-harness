@@ -179,19 +179,19 @@ struct Streams {
     int err = -1;
 };
 
+[[noreturn]] void quit(int fd, std::string_view message, int status) {
+    if (write(fd, message.data(), message.size()) < 0) {
+    }
+    _exit(status);
+}
+
 [[noreturn]] void exec_bash(const char* command, Streams streams, const Wall* wall, Place place) {
     setsid();
     if (wall != nullptr && !wall->enter()) {
-        constexpr std::string_view message = "hx: cannot put up the command's wall\n";
-        if (write(streams.err, message.data(), message.size()) < 0) {
-        }
-        _exit(126);
+        quit(streams.err, "hx: cannot put up the command's wall\n", 126);
     }
     if (place.cwd != nullptr && chdir(place.cwd) != 0) {
-        constexpr std::string_view message = "hx: cannot enter the command's cwd\n";
-        if (write(streams.err, message.data(), message.size()) < 0) {
-        }
-        _exit(126);
+        quit(streams.err, "hx: cannot enter the command's cwd\n", 126);
     }
     if (place.environment != nullptr) {
         environ = place.environment;
@@ -207,10 +207,7 @@ struct Streams {
         static_cast<void>(std::signal(sig, SIG_DFL));
     }
     execlp("bash", "bash", "-c", command, static_cast<char*>(nullptr));
-    constexpr std::string_view message = "hx: cannot run bash\n";
-    if (write(STDERR_FILENO, message.data(), message.size()) < 0) {
-    }
-    _exit(127);
+    quit(STDERR_FILENO, "hx: cannot run bash\n", 127);
 }
 
 struct Wiring {
@@ -225,14 +222,6 @@ struct Child {
     UniqueFd input;
     double started;
 };
-
-std::pair<UniqueFd, UniqueFd> make_pipe(lua_State* L) {
-    std::array<int, 2> fds{};
-    if (pipe2(fds.data(), O_CLOEXEC) != 0) {
-        luaL_error(L, "pipe: %s", error_text().c_str());
-    }
-    return {UniqueFd(fds[0]), UniqueFd(fds[1])};
-}
 
 Child start(lua_State* L, const char* command, Wiring wiring, const std::optional<Wall>& wall, Place place) {
     auto [output, output_end] = make_pipe(L);
@@ -295,20 +284,40 @@ std::string command_of(lua_State* L) {
     return command;
 }
 
-struct Pipes {
-    Output& output;
-    Output* errors;
-    Input& input;
+class Pipes {
+  public:
+    Pipes(UniqueFd output, UniqueFd errors, UniqueFd input, std::string_view data)
+        : output_(std::move(output)),
+          errors_(errors.valid() ? std::optional<Output>(std::in_place, std::move(errors)) : std::nullopt),
+          input_(std::move(input), data) {}
 
-    void drain() const {
-        output.drain();
-        if (errors != nullptr) {
-            errors->drain();
+    void drain() {
+        output_.drain();
+        if (errors_) {
+            errors_->drain();
         }
     }
+
+    void feed() noexcept { input_.feed(); }
+
+    [[nodiscard]] int output_fd() const noexcept { return readable(output_); }
+    [[nodiscard]] int errors_fd() const noexcept { return errors_ ? readable(*errors_) : -1; }
+    [[nodiscard]] int input_fd() const noexcept { return input_.fd(); }
+
+    [[nodiscard]] Captured output() const { return output_.result(); }
+    [[nodiscard]] std::optional<Captured> errors() const {
+        return errors_ ? std::optional<Captured>(errors_->result()) : std::nullopt;
+    }
+
+  private:
+    static int readable(const Output& stream) noexcept { return stream.at_end() ? -1 : stream.fd(); }
+
+    Output output_;
+    std::optional<Output> errors_;
+    Input input_;
 };
 
-Outcome wait_for_command(pid_t pid, Pipes pipes, bool hangup, double timeout) {
+Outcome wait_for_command(pid_t pid, Pipes& pipes, bool hangup, double timeout) {
     const UniqueFd exited(static_cast<int>(syscall(SYS_pidfd_open, pid, 0)));
     const int hangup_fd = hangup ? STDIN_FILENO : -1;
     const double deadline = now() + timeout;
@@ -326,18 +335,15 @@ Outcome wait_for_command(pid_t pid, Pipes pipes, bool hangup, double timeout) {
             outcome.ended = now();
             return outcome;
         }
-        if (g_signal != 0 || now() >= deadline) {
-            return give_up(g_signal != 0 ? Ending::Signaled : Ending::TimedOut);
+        if (pending_signal() != 0 || now() >= deadline) {
+            return give_up(pending_signal() != 0 ? Ending::Signaled : Ending::TimedOut);
         }
-        const auto readable = [](const Output* stream) {
-            return stream == nullptr || stream->at_end() ? -1 : stream->fd();
-        };
         std::array<pollfd, 5> waiters{
             pollfd{.fd = exited.get(), .events = POLLIN, .revents = 0},
             pollfd{.fd = hangup_fd, .events = POLLRDHUP, .revents = 0},
-            pollfd{.fd = readable(&pipes.output), .events = POLLIN, .revents = 0},
-            pollfd{.fd = pipes.input.fd(), .events = POLLOUT, .revents = 0},
-            pollfd{.fd = readable(pipes.errors), .events = POLLIN, .revents = 0},
+            pollfd{.fd = pipes.output_fd(), .events = POLLIN, .revents = 0},
+            pollfd{.fd = pipes.input_fd(), .events = POLLOUT, .revents = 0},
+            pollfd{.fd = pipes.errors_fd(), .events = POLLIN, .revents = 0},
         };
         const double left = std::max(deadline - now(), 0.0);
         wait_for(waiters, exited.valid() ? left : std::min(left, kNoPidfdPoll));
@@ -345,9 +351,15 @@ Outcome wait_for_command(pid_t pid, Pipes pipes, bool hangup, double timeout) {
             return give_up(Ending::HungUp);
         }
         if (waiters[3].revents != 0) {
-            pipes.input.feed();
+            pipes.feed();
         }
     }
+}
+
+const char* cstring_at(lua_State* L, int idx) {
+    std::size_t length = 0;
+    const char* text = lua_type(L, idx) == LUA_TSTRING ? lua_tolstring(L, idx, &length) : nullptr;
+    return text != nullptr && std::strlen(text) == length ? text : nullptr;
 }
 
 std::optional<std::string> cwd_of(lua_State* L, int idx) {
@@ -356,12 +368,11 @@ std::optional<std::string> cwd_of(lua_State* L, int idx) {
         lua_pop(L, 1);
         return std::nullopt;
     }
-    std::size_t length = 0;
-    const char* path = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &length) : nullptr;
-    if (path == nullptr || std::strlen(path) != length) {
+    const char* path = cstring_at(L, -1);
+    if (path == nullptr) {
         luaL_error(L, "host.sh: cwd is the path of a directory");
     }
-    std::string cwd(path, length);
+    std::string cwd(path);
     lua_pop(L, 1);
     struct stat st{};
     if (stat(cwd.c_str(), &st) != 0) {
@@ -385,10 +396,8 @@ std::vector<std::string> environment_of(lua_State* L, int idx) {
     std::vector<std::pair<std::string, std::optional<std::string>>> changes;
     lua_pushnil(L);
     while (lua_next(L, -2) != 0) {
-        std::size_t name_length = 0;
-        const char* name = lua_type(L, -2) == LUA_TSTRING ? lua_tolstring(L, -2, &name_length) : nullptr;
-        if (name == nullptr || name_length == 0 || std::strlen(name) != name_length ||
-            std::strchr(name, '=') != nullptr) {
+        const char* name = cstring_at(L, -2);
+        if (name == nullptr || *name == '\0' || std::strchr(name, '=') != nullptr) {
             luaL_error(L, "host.sh: env has a name that is not a variable's");
         }
         std::size_t length = 0;
@@ -432,34 +441,51 @@ bool hung_up() {
 void push_result(lua_State* L, const Captured& output, const std::optional<Captured>& errors, const Outcome& outcome,
                  double seconds) {
     lua_createtable(L, 0, 8);
-    lua_pushlstring(L, output.text.data(), output.text.size());
-    lua_setfield(L, -2, "out");
+    set_text(L, "out", output.text);
     if (output.omitted > 0) {
-        lua_pushnumber(L, static_cast<double>(output.omitted));
-        lua_setfield(L, -2, "omitted");
+        set_number(L, "omitted", static_cast<double>(output.omitted));
     }
     if (errors) {
-        lua_pushlstring(L, errors->text.data(), errors->text.size());
-        lua_setfield(L, -2, "err");
+        set_text(L, "err", errors->text);
         if (errors->omitted > 0) {
-            lua_pushnumber(L, static_cast<double>(errors->omitted));
-            lua_setfield(L, -2, "err_omitted");
+            set_number(L, "err_omitted", static_cast<double>(errors->omitted));
         }
     }
     if (!outcome.reaped) {
-        lua_pushnumber(L, SIGKILL);
-        lua_setfield(L, -2, "signal");
+        set_number(L, "signal", SIGKILL);
     } else if (WIFEXITED(outcome.status)) {
-        lua_pushnumber(L, WEXITSTATUS(outcome.status));
-        lua_setfield(L, -2, "code");
+        set_number(L, "code", WEXITSTATUS(outcome.status));
     } else if (WIFSIGNALED(outcome.status)) {
-        lua_pushnumber(L, WTERMSIG(outcome.status));
-        lua_setfield(L, -2, "signal");
+        set_number(L, "signal", WTERMSIG(outcome.status));
     }
-    lua_pushboolean(L, outcome.ending == Ending::TimedOut ? 1 : 0);
-    lua_setfield(L, -2, "timed_out");
-    lua_pushnumber(L, seconds);
-    lua_setfield(L, -2, "seconds");
+    set_flag(L, "timed_out", outcome.ending == Ending::TimedOut);
+    set_number(L, "seconds", seconds);
+}
+
+template <typename Fn>
+bool for_each_path(lua_State* L, int idx, const char* field, const Fn& fn) {
+    lua_getfield(L, idx, field);
+    const bool given = !lua_isnil(L, -1);
+    if (given) {
+        if (!lua_istable(L, -1)) {
+            luaL_error(L, "host.sh: %s is a list of paths", field);
+        }
+        for (int i = 1; lua_rawgeti(L, -1, i) != LUA_TNIL; ++i) {
+            const char* path = cstring_at(L, -1);
+            if (path == nullptr) {
+                luaL_error(L, "host.sh: %s[%d] is not a path", field, i);
+            }
+            fn(i, path);
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    return given;
+}
+
+bool overlap(const fs::path& one, const fs::path& other) {
+    return beneath(one, other) || beneath(other, one);
 }
 
 std::optional<Wall> narrower_wall(lua_State* L, int idx, const std::vector<Rule>& system_rules) {
@@ -468,46 +494,27 @@ std::optional<Wall> narrower_wall(lua_State* L, int idx, const std::vector<Rule>
     }
     std::vector<Rule> rules = system_rules;
     std::vector<fs::path> inert;
-    bool asked = false;
-    for (const auto& [field, access] :
-         {std::pair{"read", std::optional(Access::Read)}, std::pair{"write", std::optional(Access::Write)},
-          std::pair{"inert", std::optional<Access>()}}) {
-        lua_getfield(L, idx, field);
-        if (!lua_isnil(L, -1)) {
-            if (!lua_istable(L, -1)) {
-                luaL_error(L, "host.sh: %s is a list of paths", field);
-            }
-            asked = true;
-            for (int i = 1; lua_rawgeti(L, -1, i) != LUA_TNIL; ++i) {
-                std::size_t length = 0;
-                const char* path = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &length) : nullptr;
-                if (path == nullptr || std::strlen(path) != length) {
-                    luaL_error(L, "host.sh: %s[%d] is not a path", field, i);
-                }
-                if (access) {
-                    rules.push_back({.path = path, .access = *access, .required = true});
-                } else {
-                    std::error_code ec;
-                    inert.push_back(fs::weakly_canonical(path, ec));
-                    if (ec) {
-                        luaL_error(L, "host.sh: inert[%d]: %s", i, ec.message().c_str());
-                    }
-                }
-                lua_pop(L, 1);
-            }
-            lua_pop(L, 1);
+    const auto allow = [&rules](Access access) {
+        return [&rules, access](int /*i*/, const char* path) {
+            rules.push_back({.path = path, .access = access, .required = true});
+        };
+    };
+    const bool reads = for_each_path(L, idx, "read", allow(Access::Read));
+    const bool writes = for_each_path(L, idx, "write", allow(Access::Write));
+    const bool inerts = for_each_path(L, idx, "inert", [&](int i, const char* path) {
+        std::error_code ec;
+        inert.push_back(fs::weakly_canonical(path, ec));
+        if (ec) {
+            luaL_error(L, "host.sh: inert[%d]: %s", i, ec.message().c_str());
         }
-        lua_pop(L, 1);
-    }
-    if (!asked) {
+    });
+    if (!reads && !writes && !inerts) {
         return std::nullopt;
     }
     for (Rule& rule : rules) {
         std::error_code ec;
         const fs::path whole = inert.empty() ? fs::path() : fs::weakly_canonical(rule.path, ec);
-        rule.inert = ec || std::ranges::any_of(inert, [&whole](const fs::path& dir) {
-                         return beneath(whole, dir) || beneath(dir, whole);
-                     });
+        rule.inert = ec || std::ranges::any_of(inert, [&whole](const fs::path& dir) { return overlap(whole, dir); });
     }
     try {
         return Wall::prepare(rules);
@@ -516,63 +523,81 @@ std::optional<Wall> narrower_wall(lua_State* L, int idx, const std::vector<Rule>
     }
 }
 
+struct Options {
+    std::optional<std::string> cwd;
+    std::vector<std::string> environment;
+    std::optional<std::string_view> input;
+    bool hangup = false;
+    bool split = false;
+};
+
+bool flag(lua_State* L, int idx, const char* name) {
+    lua_getfield(L, idx, name);
+    const bool set = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    return set;
+}
+
+std::optional<std::string_view> anchored_input(lua_State* L, int idx) {
+    lua_getfield(L, idx, "input");
+    if (lua_isnil(L, -1)) {
+        return std::nullopt;
+    }
+    std::size_t length = 0;
+    const char* text = lua_isstring(L, -1) != 0 ? lua_tolstring(L, -1, &length) : nullptr;
+    if (text == nullptr) {
+        luaL_error(L, "host.sh: input is the text to send to the command's stdin");
+    }
+    return std::string_view(text, length);
+}
+
+Options options_of(lua_State* L, int idx) {
+    Options options;
+    if (lua_istable(L, idx)) {
+        options.cwd = cwd_of(L, idx);
+        options.environment = environment_of(L, idx);
+        options.hangup = flag(L, idx, "hangup");
+        options.split = flag(L, idx, "split");
+        options.input = anchored_input(L, idx);
+    }
+    return options;
+}
+
+std::vector<char*> pointers_to(std::vector<std::string>& entries) {
+    std::vector<char*> pointers;
+    for (std::string& entry : entries) {
+        if (!entry.empty()) {
+            pointers.push_back(entry.data());
+        }
+    }
+    pointers.push_back(nullptr);
+    return pointers;
+}
+
 }  // namespace
 
 int run_sh(lua_State* L, double deadline, const std::vector<Rule>& system_rules) {
     const std::string command = command_of(L);
     const double timeout = within_limit(deadline, option(L, 2, "timeout", 120));
     const std::optional<Wall> wall = narrower_wall(L, 2, system_rules);
-    bool on_hangup = false;
-    bool split = false;
-    std::optional<std::string_view> data;
-    std::optional<std::string> cwd;
-    std::vector<std::string> entries;
-    if (lua_istable(L, 2)) {
-        cwd = cwd_of(L, 2);
-        entries = environment_of(L, 2);
-        lua_getfield(L, 2, "hangup");
-        on_hangup = lua_toboolean(L, -1) != 0;
-        lua_pop(L, 1);
-        lua_getfield(L, 2, "split");
-        split = lua_toboolean(L, -1) != 0;
-        lua_pop(L, 1);
-        lua_getfield(L, 2, "input");
-        if (!lua_isnil(L, -1)) {
-            std::size_t length = 0;
-            const char* text = lua_isstring(L, -1) != 0 ? lua_tolstring(L, -1, &length) : nullptr;
-            if (text == nullptr) {
-                luaL_error(L, "host.sh: input is the text to send to the command's stdin");
-            }
-            data = std::string_view(text, length);
-        }
-    }
+    Options options = options_of(L, 2);
     const std::vector<pid_t> before = wall ? descendants_now() : std::vector<pid_t>{};
     raise_if_signaled(L);
-    if (on_hangup && hung_up()) {
+    if (options.hangup && hung_up()) {
         raise_error(L, "hung up");
     }
     reap_exited();
 
-    std::vector<char*> environment;
-    for (std::string& entry : entries) {
-        if (!entry.empty()) {
-            environment.push_back(entry.data());
-        }
-    }
-    environment.push_back(nullptr);
+    std::vector<char*> environment = pointers_to(options.environment);
     const Place place{
-        .cwd = cwd ? cwd->c_str() : nullptr,
-        .environment = entries.empty() ? nullptr : environment.data(),
+        .cwd = options.cwd ? options.cwd->c_str() : nullptr,
+        .environment = options.environment.empty() ? nullptr : environment.data(),
     };
-    Child child = start(L, command.c_str(), {.input = data.has_value(), .split = split}, wall, place);
-    Output output(std::move(child.output));
-    std::optional<Output> errors;
-    if (split) {
-        errors.emplace(std::move(child.errors));
-    }
-    Input input(std::move(child.input), data.value_or(std::string_view{}));
-    const Pipes pipes{.output = output, .errors = errors ? &*errors : nullptr, .input = input};
-    const Outcome outcome = wait_for_command(child.pid, pipes, on_hangup, timeout);
+    const Wiring wiring{.input = options.input.has_value(), .split = options.split};
+    Child child = start(L, command.c_str(), wiring, wall, place);
+    Pipes pipes(std::move(child.output), std::move(child.errors), std::move(child.input),
+                options.input.value_or(std::string_view{}));
+    const Outcome outcome = wait_for_command(child.pid, pipes, options.hangup, timeout);
     if (wall) {
         kill_descendants(before);
     }
@@ -583,8 +608,7 @@ int run_sh(lua_State* L, double deadline, const std::vector<Rule>& system_rules)
     if (outcome.ending == Ending::HungUp) {
         raise_error(L, "hung up");
     }
-    push_result(L, output.result(), errors ? std::optional<Captured>(errors->result()) : std::nullopt, outcome,
-                outcome.ended - child.started);
+    push_result(L, pipes.output(), pipes.errors(), outcome, outcome.ended - child.started);
     return 1;
 }
 

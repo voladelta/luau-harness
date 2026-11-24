@@ -1,9 +1,11 @@
 #include "host.h"
 
+#include <fcntl.h>
 #include <sys/prctl.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <csignal>
 #include <cstddef>
 #include <cstdio>
@@ -75,15 +77,32 @@ const char* stop_error(int sig) {
     return sig == SIGINT ? "interrupted" : "terminated";
 }
 
+int stop_signal(std::string_view error) noexcept {
+    for (const int sig : {SIGINT, SIGTERM}) {
+        if (error == stop_error(sig)) {
+            return sig;
+        }
+    }
+    return 0;
+}
+
 void raise_error(lua_State* L, const char* error) {
     lua_pushstring(L, error);
     lua_error(L);
 }
 
 void raise_if_signaled(lua_State* L) {
-    if (g_signal != 0) {
-        raise_error(L, stop_error(g_signal));
+    if (const int sig = pending_signal(); sig != 0) {
+        raise_error(L, stop_error(sig));
     }
+}
+
+std::pair<UniqueFd, UniqueFd> make_pipe(lua_State* L) {
+    std::array<int, 2> ends{};
+    if (pipe2(ends.data(), O_CLOEXEC) != 0) {
+        luaL_error(L, "pipe: %s", error_text().c_str());
+    }
+    return {UniqueFd(ends[0]), UniqueFd(ends[1])};
 }
 
 void push_strings(lua_State* L, const std::vector<std::string>& strings) {
@@ -93,6 +112,21 @@ void push_strings(lua_State* L, const std::vector<std::string>& strings) {
         lua_pushlstring(L, each.data(), each.size());
         lua_rawseti(L, -2, ++index);
     }
+}
+
+void set_text(lua_State* L, const char* field, std::string_view text) {
+    lua_pushlstring(L, text.data(), text.size());
+    lua_setfield(L, -2, field);
+}
+
+void set_number(lua_State* L, const char* field, double number) {
+    lua_pushnumber(L, number);
+    lua_setfield(L, -2, field);
+}
+
+void set_flag(lua_State* L, const char* field, bool flag) {
+    lua_pushboolean(L, flag ? 1 : 0);
+    lua_setfield(L, -2, field);
 }
 
 namespace {
@@ -139,42 +173,6 @@ class TryScope {
   private:
     int& depth_;
 };
-
-struct LimitTimer {
-    timer_t timer{};
-    bool made = false;
-};
-
-LimitTimer make_limit_timer() noexcept {
-    LimitTimer timer;
-    sigevent event{};
-    event.sigev_notify = SIGEV_SIGNAL;
-    event.sigev_signo = SIGALRM;
-    timer.made = timer_create(CLOCK_MONOTONIC, &event, &timer.timer) == 0;
-    return timer;
-}
-
-LimitTimer& the_limit_timer() noexcept {
-    static LimitTimer timer = make_limit_timer();
-    return timer;
-}
-
-timer_t* limit_timer() noexcept {
-    LimitTimer& timer = the_limit_timer();
-    return timer.made ? &timer.timer : nullptr;
-}
-
-void arm_limit(double deadline) noexcept {
-    const timer_t* const timer = limit_timer();
-    if (timer == nullptr) {
-        return;
-    }
-    const itimerspec at{
-        .it_interval = {.tv_sec = 0, .tv_nsec = 0},
-        .it_value = timespec_of(deadline),
-    };
-    timer_settime(*timer, TIMER_ABSTIME, &at, nullptr);
-}
 
 class DeadlineScope {
   public:
@@ -227,7 +225,7 @@ int l_input(lua_State* L) {
     static_cast<void>(std::fflush(stderr));
     std::string line;
     if (!std::getline(std::cin, line)) {
-        if (g_signal != 0) {
+        if (pending_signal() != 0) {
             std::cin.clear();
             std::clearerr(stdin);
             raise_if_signaled(L);
@@ -312,11 +310,6 @@ int l_wall_time(lua_State* L) {
 
 }  // namespace
 
-void renew_limit_timer() noexcept {
-    the_limit_timer() = make_limit_timer();
-    g_expired = 1;
-}
-
 Host::Host(HostConfig config, const Sandbox& sandbox, bool* memory_refused)
     : config_(std::move(config)),
       sandboxed_(sandbox.confined()),
@@ -345,12 +338,11 @@ void Host::on_interrupt(lua_State* L, int gc) {
         lua_gc(L, LUA_GCCOLLECT, 0);
     }
     raise_if_signaled(L);
-    if (g_expired == 0) {
+    if (!take_limit_check()) {
         return;
     }
-    g_expired = limit_timer() != nullptr ? 0 : 1;
     if (host.deadline_ > 0 && now() >= host.deadline_) {
-        g_expired = 1;
+        keep_limit_check();
         raise_error(L, "timeout");
     }
 }
@@ -409,7 +401,7 @@ int Host::stop(lua_State* L) {
 int Host::sleep(lua_State* L) {
     raise_if_signaled(L);
     const double until = now() + within_limit(of(L).deadline_, luaL_checknumber(L, 1));
-    while (g_signal == 0) {
+    while (pending_signal() == 0) {
         const double left = until - now();
         if (left <= 0) {
             break;
@@ -427,13 +419,13 @@ int Host::protect(lua_State* L, int fn, double deadline) {
     {
         const DeadlineScope limit(host.deadline_, deadline);
         const TryScope scope(host.tries_);
-        if (g_signal == 0) {
+        if (pending_signal() == 0) {
             status = lua_pcall(L, lua_gettop(L) - fn, LUA_MULTRET, 0);
         }
     }
-    if (const int sig = g_signal; sig != 0) {
+    if (const int sig = pending_signal(); sig != 0) {
         if (host.tries_ == 0) {
-            g_signal = 0;
+            forget_signal();
         }
         lua_settop(L, 0);
         lua_pushboolean(L, 0);
@@ -491,44 +483,31 @@ void Host::open(lua_State* L) {
     lua_setfield(L, -2, "args");
 
     std::error_code ec;
-    const std::string cwd = std::filesystem::current_path(ec).string();
-    lua_pushlstring(L, cwd.data(), cwd.size());
-    lua_setfield(L, -2, "cwd");
-    lua_pushboolean(L, config_.interactive ? 1 : 0);
-    lua_setfield(L, -2, "interactive");
-    lua_pushboolean(L, config_.quiet ? 1 : 0);
-    lua_setfield(L, -2, "quiet");
-    lua_pushboolean(L, sandboxed_ ? 1 : 0);
-    lua_setfield(L, -2, "sandboxed");
-    lua_pushlstring(L, config_.default_loop.data(), config_.default_loop.size());
-    lua_setfield(L, -2, "default_loop");
-    lua_pushboolean(L, isatty(STDOUT_FILENO) != 0 ? 1 : 0);
-    lua_setfield(L, -2, "tty");
-    lua_pushlstring(L, config_.model.data(), config_.model.size());
-    lua_setfield(L, -2, "model");
+    set_text(L, "cwd", std::filesystem::current_path(ec).string());
+    set_flag(L, "interactive", config_.interactive);
+    set_flag(L, "quiet", config_.quiet);
+    set_flag(L, "sandboxed", sandboxed_);
+    set_text(L, "default_loop", config_.default_loop);
+    set_flag(L, "tty", isatty(STDOUT_FILENO) != 0);
+    set_text(L, "model", config_.model);
     lua_createtable(L, 0, static_cast<int>(http_->endpoints().size()));
     for (const Endpoint& each : http_->endpoints()) {
-        lua_pushboolean(L, each.key_env.empty() || !each.key.empty() ? 1 : 0);
-        lua_setfield(L, -2, each.name.c_str());
+        set_flag(L, each.name.c_str(), each.key_env.empty() || !each.key.empty());
     }
     lua_setreadonly(L, -1, 1);
     lua_setfield(L, -2, "endpoints");
-    lua_pushboolean(L, judge_->valid() ? 1 : 0);
-    lua_setfield(L, -2, "judged");
+    set_flag(L, "judged", judge_->valid());
     if (!config_.workflow.empty()) {
-        lua_pushlstring(L, config_.workflow.data(), config_.workflow.size());
-        lua_setfield(L, -2, "workflow");
+        set_text(L, "workflow", config_.workflow);
     }
     if (!config_.resume.empty()) {
-        lua_pushlstring(L, config_.resume.data(), config_.resume.size());
-        lua_setfield(L, -2, "resume");
+        set_text(L, "resume", config_.resume);
     }
     for (const auto& [field, texts] :
          {std::pair{"extensions", &config_.extensions}, std::pair{"skills", &config_.skills}}) {
         lua_createtable(L, 0, static_cast<int>(texts->size()));
         for (const auto& [name, text] : *texts) {
-            lua_pushlstring(L, text.data(), text.size());
-            lua_setfield(L, -2, name.c_str());
+            set_text(L, name.c_str(), text);
         }
         lua_setreadonly(L, -1, 1);
         lua_setfield(L, -2, field);

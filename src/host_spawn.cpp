@@ -28,7 +28,6 @@ namespace {
 
 constexpr std::size_t kMaxSpawned = 64;
 constexpr std::size_t kMaxResult = std::size_t{256} << 20;
-constexpr double kWaitSlack = 2.0;
 
 constexpr char kReturned = '+';
 constexpr char kRaised = '-';
@@ -127,12 +126,7 @@ int SpawnPool::spawn(lua_State* L, const std::function<void()>& before_fork, con
                    static_cast<int>(kMaxSpawned));
     }
     raise_if_signaled(L);
-    std::array<int, 2> ends{};
-    if (pipe2(ends.data(), O_CLOEXEC) != 0) {
-        luaL_error(L, "pipe: %s", error_text().c_str());
-    }
-    UniqueFd reader(ends[0]);
-    const UniqueFd writer(ends[1]);
+    auto [reader, writer] = make_pipe(L);
     before_fork();
     static_cast<void>(std::fflush(nullptr));
     const pid_t pid = fork();
@@ -165,7 +159,7 @@ int SpawnPool::wait(lua_State* L, double deadline) {
     const bool limited = !lua_isnoneornil(L, 1);
     double until = limited ? now() + within_limit(deadline, luaL_checknumber(L, 1)) : 0;
     if (deadline > 0) {
-        until = until > 0 ? std::min(until, deadline - kWaitSlack) : deadline - kWaitSlack;
+        until = until > 0 ? std::min(until, deadline - kDeadlineSlack) : deadline - kDeadlineSlack;
     }
     for (;;) {
         raise_if_signaled(L);

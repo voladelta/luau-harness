@@ -4,12 +4,12 @@
 #include <poll.h>
 #include <sys/types.h>
 
-#include <csignal>
 #include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "host.h"
@@ -27,11 +27,7 @@ namespace hx {
 
 inline constexpr double kReapSeconds = 1.0;
 inline constexpr double kLongest = 1e9;
-
-// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
-extern volatile std::sig_atomic_t g_signal;
-extern volatile std::sig_atomic_t g_expired;
-// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+inline constexpr double kDeadlineSlack = 2.0;
 
 int fail(lua_State* L, std::string_view message);
 int fail_errno(lua_State* L, std::string_view path);
@@ -42,8 +38,11 @@ double within_limit(double deadline, double seconds);
 const char* stop_error(int sig);
 [[noreturn]] void raise_error(lua_State* L, const char* error);
 void raise_if_signaled(lua_State* L);
+std::pair<UniqueFd, UniqueFd> make_pipe(lua_State* L);
 void push_strings(lua_State* L, const std::vector<std::string>& strings);
-void renew_limit_timer() noexcept;
+void set_text(lua_State* L, const char* field, std::string_view text);
+void set_number(lua_State* L, const char* field, double number);
+void set_flag(lua_State* L, const char* field, bool flag);
 
 std::string_view cut_head(std::string_view head);
 std::string_view cut_tail(std::string_view tail);
@@ -130,6 +129,12 @@ class SpawnPool {
 };
 
 double now() noexcept;
+int pending_signal() noexcept;
+void forget_signal() noexcept;
+void arm_limit(double deadline) noexcept;
+bool take_limit_check() noexcept;
+void keep_limit_check() noexcept;
+void renew_limit_timer() noexcept;
 void wait_for(std::span<pollfd> fds, double seconds) noexcept;
 void kill_descendants(std::span<const pid_t> spared = {}) noexcept;
 std::vector<pid_t> descendants_now();

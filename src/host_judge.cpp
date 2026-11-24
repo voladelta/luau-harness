@@ -17,7 +17,6 @@
 namespace hx {
 
 int JudgeChannel::exchange(lua_State* L, double deadline) {
-    constexpr double kJudgeSlack = 2.0;
     constexpr std::size_t kMaxLine = std::size_t{64} << 10;
     std::size_t length = 0;
     const char* line = luaL_optlstring(L, 1, nullptr, &length);
@@ -38,7 +37,7 @@ int JudgeChannel::exchange(lua_State* L, double deadline) {
         }
         ++owed_;
     }
-    const double until = deadline > 0 ? deadline - kJudgeSlack : 0;
+    const double until = deadline > 0 ? deadline - kDeadlineSlack : 0;
     std::array<char, kBufferSize> buffer{};
     lua_newtable(L);
     int answers = 0;

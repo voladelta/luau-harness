@@ -313,26 +313,18 @@ int l_stat(lua_State* L) {
         return fail_errno(L, path);
     }
     lua_createtable(L, 0, 6);
-    lua_pushstring(L, kind_of(st.st_mode));
-    lua_setfield(L, -2, "type");
-    lua_pushnumber(L, static_cast<double>(st.st_size));
-    lua_setfield(L, -2, "size");
-    lua_pushnumber(L, static_cast<double>(st.st_mtim.tv_sec) + (static_cast<double>(st.st_mtim.tv_nsec) * 1e-9));
-    lua_setfield(L, -2, "mtime");
-    const std::string revision =
-        fmt::format("{}:{}:{}:{}:{}:{}:{}", st.st_dev, st.st_ino, st.st_size, st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
-                    st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
-    lua_pushlstring(L, revision.data(), revision.size());
-    lua_setfield(L, -2, "revision");
-    const std::string mode = fmt::format("{:o}", st.st_mode & 07777);
-    lua_pushlstring(L, mode.data(), mode.size());
-    lua_setfield(L, -2, "mode");
+    set_text(L, "type", kind_of(st.st_mode));
+    set_number(L, "size", static_cast<double>(st.st_size));
+    set_number(L, "mtime", static_cast<double>(st.st_mtim.tv_sec) + (static_cast<double>(st.st_mtim.tv_nsec) * 1e-9));
+    set_text(L, "revision",
+             fmt::format("{}:{}:{}:{}:{}:{}:{}", st.st_dev, st.st_ino, st.st_size, st.st_mtim.tv_sec,
+                         st.st_mtim.tv_nsec, st.st_ctim.tv_sec, st.st_ctim.tv_nsec));
+    set_text(L, "mode", fmt::format("{:o}", st.st_mode & 07777));
     if (S_ISLNK(st.st_mode)) {
         std::error_code ec;
         const std::string target = std::filesystem::read_symlink(path, ec).string();
         if (!ec) {
-            lua_pushlstring(L, target.data(), target.size());
-            lua_setfield(L, -2, "target");
+            set_text(L, "target", target);
         }
     }
     return 1;
