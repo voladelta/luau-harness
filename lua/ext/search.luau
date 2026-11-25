@@ -54,7 +54,8 @@ function M.files(glob: string?, dir: string?): { string }
 	check("files", dir, 2, "dir", "string", true)
 	local prefix = prefix_of(dir)
 	local where = if prefix == "" then nil else prefix
-	local spec = if glob then { "--", ":(glob)" .. glob } else {}
+	local git_glob = if glob and not glob:find("/", 1, true) then "**/" .. glob else glob
+	local spec = if git_glob then { "--", ":(glob)" .. git_glob } else {}
 	local list = { "git", "ls-files", "-z", "--cached", "--others", "--exclude-standard" }
 	local gone = { "git", "ls-files", "-z", "--deleted" }
 	table.move(spec, 1, #spec, #list + 1, list)
@@ -166,8 +167,8 @@ local function collect(args: { string }, limit: number, input: string?): { Match
 end
 
 local function with_ripgrep(pattern: string, options: Options, limit: number): { Match }
-	local args = { "rg", "--no-config", "--line-number", "--with-filename", "--null", "--no-heading", "--color", "never",
-		"--hidden", "--glob", "!.git", "--sort", "path" }
+	local args = { "rg", "--no-config", "--no-messages", "--line-number", "--with-filename", "--null", "--no-heading", "--color",
+		"never", "--hidden", "--glob", "!.git", "--sort", "path" }
 	if options.fixed then
 		table.insert(args, "--fixed-strings")
 	end
@@ -186,15 +187,11 @@ local function with_ripgrep(pattern: string, options: Options, limit: number): {
 end
 
 local function with_grep(pattern: string, options: Options, limit: number): { Match }
-	local glob = options.glob
-	if glob and not glob:find("/", 1, true) then
-		glob = "**/" .. glob
-	end
-	local paths = M.files(glob, options.dir)
+	local paths = M.files(options.glob, options.dir)
 	if #paths == 0 then
 		return {}
 	end
-	local args = { "xargs", "-0", "grep", "-nHIZ", if options.fixed then "-F" else "-E" }
+	local args = { "xargs", "-0", "grep", "-snHIZ", "-d", "skip", if options.fixed then "-F" else "-E" }
 	if options.ignore_case then
 		table.insert(args, "-i")
 	end

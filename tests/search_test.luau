@@ -25,6 +25,11 @@ end
 check("files are what git lists, less what is ignored or deleted", joined(search.files(nil, "repo")),
 	"repo/.gitignore repo/.hx/n.luau repo/b.txt repo/src/a.luau")
 check("a glob picks among them", joined(search.files("**/*.luau", "repo")), "repo/.hx/n.luau repo/src/a.luau")
+check("a glob without a slash matches nested files in git", joined(search.files("*.luau", "repo")), "repo/.hx/n.luau repo/src/a.luau")
+host.write("repo/root.luau", "root\n")
+check("a glob without a slash matches root and nested files in git", joined(search.files("*.luau", "repo")),
+	"repo/.hx/n.luau repo/root.luau repo/src/a.luau")
+host.sh({ "rm", "-f", "repo/root.luau" })
 check("a directory inside the repository", joined(search.files(nil, "repo/src")), "repo/src/a.luau")
 check("where git lists nothing, every file", joined(search.files(nil, "plain")), "plain/d.luau plain/sub/c.txt")
 check("with the glob", joined(search.files("**/*.txt", "plain")), "plain/sub/c.txt")
@@ -61,7 +66,10 @@ if not host.read("repo/src/locked.luau") then
 	for _, ripgrep in { true, false } do
 		if not ripgrep or host.sh("command -v rg").code == 0 then
 			search.ripgrep = ripgrep
-			check((ripgrep and "rg" or "grep") .. ": a file it cannot read does not lose the matches", #search.grep("gamma", { dir = "repo/src" }), 1)
+			local by = ripgrep and "rg" or "grep"
+			check(by .. ": a file it cannot read does not lose the matches", #search.grep("gamma", { dir = "repo/src" }), 1)
+			check(by .. ": a file it cannot read does not break a zero-match search",
+				tostring(search.grep("no-such-pattern", { dir = "repo/src" })), "[no match]")
 		end
 	end
 end
@@ -104,5 +112,18 @@ local conflict = search.grep("merge-token", { dir = "repo", glob = "src/conflict
 check("grep reads an unmerged path once, in line order", tostring(conflict),
 	"repo/src/conflicted.txt:1: merge-token one\nrepo/src/conflicted.txt:2: merge-token two")
 check("duplicate index stages do not count as extra matches", conflict.more, nil)
+
+host.sh({ "ln", "-s", "src", "repo/dirlink" })
+check("add tracked directory symlink", host.sh({ "git", "-C", "repo", "add", "dirlink" }).code, 0)
+for _, ripgrep in { true, false } do
+	if not ripgrep or host.sh("command -v rg").code == 0 then
+		search.ripgrep = ripgrep
+		local by = ripgrep and "rg" or "grep"
+		check(by .. ": a tracked directory symlink does not break a zero-match search",
+			tostring(search.grep("no-such-pattern", { dir = "repo" })), "[no match]")
+	end
+end
+search.ripgrep = nil
+host.sh({ "git", "-C", "repo", "rm", "-fq", "dirlink" })
 
 checks.done("search")
