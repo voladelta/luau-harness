@@ -86,11 +86,21 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 	table.insert(command, "--")
 	table.insert(command, url)
 
-	local ok, result, head, data = pcall(function()
+	local ok, result, head, head_err, data, data_err = pcall(function()
 		local ran = host.sh(command, { input = body, timeout = timeout + 10 })
-		local h: string? = host.read(head_file)
-		local d: string? = if method == "HEAD" then "" else host.read(body_file)
-		return ran, h, d
+		local h: string?, herr: string? = nil, nil
+		if host.stat(head_file) then
+			h, herr = host.read(head_file)
+		else
+			h = ""
+		end
+		local d: string?, derr: string? = nil, nil
+		if method == "HEAD" or not host.stat(body_file) then
+			d = ""
+		else
+			d, derr = host.read(body_file)
+		end
+		return ran, h, herr, d, derr
 	end)
 	pcall(host.sh, { "rm", "-rf", where })
 	if not ok then
@@ -106,8 +116,14 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 		end
 		error(("http.request %s: %s"):format(url, detail), 0)
 	end
-	local status, response = last_block(head or "")
-	return { status = status, headers = response, body = data or "" }
+	if not head then
+		error(("http.request %s: %s"):format(url, tostring(head_err)), 0)
+	end
+	if not data then
+		error(("http.request %s: %s"):format(url, tostring(data_err)), 0)
+	end
+	local status, response = last_block(head)
+	return { status = status, headers = response, body = data }
 end
 
 return M
