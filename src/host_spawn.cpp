@@ -95,14 +95,7 @@ void SpawnPool::run_child(lua_State* L, int result_fd, const std::function<void(
         in_child();
         renew_limit_timer();
         prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-        if (const int null = ::open("/dev/null", O_RDONLY); null >= 0) {
-            if (null != STDIN_FILENO) {
-                dup2(null, STDIN_FILENO);
-                close(null);
-            }
-        }
-        if (std::freopen("/dev/null", "r", stdin) == nullptr) {
-        }
+        [[maybe_unused]] FILE* const in = std::freopen("/dev/null", "r", stdin);
         std::cin.clear();
 
         bool returned = lua_pcall(L, lua_gettop(L) - 1, 1, 0) == 0;
