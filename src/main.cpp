@@ -1,4 +1,5 @@
 #include <curl/curl.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -48,15 +49,19 @@ class TempDir {
         if (ec || mkdtemp(pattern.data()) == nullptr) {
             throw UsageError(fmt::format("cannot create a temporary directory: {}", hx::error_text()));
         }
-        path_ = std::move(pattern);
+        path_ = fs::canonical(pattern, ec);
+        if (ec) {
+            const std::string why = ec.message();
+            fs::remove_all(pattern, ec);
+            throw UsageError(fmt::format("cannot resolve a temporary directory: {}", why));
+        }
         setenv("TMPDIR", path_.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
         remover_ = start_remover(path_.parent_path().c_str(), path_.filename().c_str());
     }
     TempDir(const TempDir&) = delete;
     TempDir& operator=(const TempDir&) = delete;
     ~TempDir() {
-        std::error_code ec;
-        fs::remove_all(path_, ec);
+        remove_tree(path_);
         if (shutdown(remover_.get(), SHUT_WR) == 0) {
             pollfd gone{.fd = remover_.get(), .events = POLLIN, .revents = 0};
             static_cast<void>(poll(&gone, 1, kRemoverWaitMs));
@@ -67,6 +72,20 @@ class TempDir {
 
   private:
     static constexpr int kRemoverWaitMs = 1000;
+
+    static void remove_tree(const fs::path& root) noexcept {
+        std::error_code ec;
+        fs::permissions(root, fs::perms::owner_all, fs::perm_options::add | fs::perm_options::nofollow, ec);
+        for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code perm_ec;
+            if (!it->is_symlink(perm_ec) && it->is_directory(perm_ec)) {
+                fs::permissions(it->path(), fs::perms::owner_all, fs::perm_options::add | fs::perm_options::nofollow,
+                                perm_ec);
+            }
+        }
+        fs::remove_all(root, ec);
+    }
 
     static hx::UniqueFd start_remover(const char* parent, const char* name) noexcept {
         std::array<int, 2> ends{};
@@ -91,8 +110,7 @@ class TempDir {
             do {
                 got = read(STDIN_FILENO, &byte, 1);
             } while (got > 0 || (got < 0 && errno == EINTR));
-            std::error_code ec;
-            fs::remove_all(name, ec);
+            remove_tree(name);
             _exit(0);
         }
         int status = -1;
@@ -118,6 +136,16 @@ class CurlGlobal {
 };
 
 void close_inherited_fds() {
+    while (true) {
+        const int fd = ::open("/dev/null", O_RDWR);
+        if (fd < 0) {
+            throw std::runtime_error(fmt::format("/dev/null: {}", hx::error_text()));
+        }
+        if (fd > STDERR_FILENO) {
+            ::close(fd);
+            break;
+        }
+    }
     if (hx::cloexec_above_stderr() != 0) {
         throw std::runtime_error(fmt::format("cannot mark inherited descriptors close-on-exec: {}", hx::error_text()));
     }

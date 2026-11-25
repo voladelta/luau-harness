@@ -1014,6 +1014,15 @@ end
         self.assertIn(f"{extra_ro}/g: Permission denied", result)
         self.assertIn("\ny\n", result)
 
+    def test_missing_ro_and_rw_fail_as_usage_errors(self):
+        for flag in ("--ro", "--rw"):
+            missing = os.path.join(self.root, "missing")
+            done = self.run_hx(flag, missing, "go", script=[say("never")])
+            self.assertEqual(done.returncode, 2, (flag, done.stderr))
+            self.assertIn(f"{flag} {missing}: no such file or directory", done.stderr)
+            self.assertNotIn("Pass --no-sandbox", done.stderr)
+        self.assertEqual(self.model.requests, [])
+
     def test_git_still_reads_its_config(self):
         with open(os.path.join(self.home, ".gitconfig"), "w") as f:
             f.write("[user]\n\tname = Test Owner\n")
@@ -1085,6 +1094,29 @@ end
             self.assertIn(f"{secret}: Permission denied", result)
         self.assertNotIn("SECRET", result)
         self.assertNotIn("HOME-FILE", result)
+
+    def test_symlinks_in_ro_path_dirs_open_targets_and_siblings(self):
+        prefix = os.path.join(self.home, "opt/linked")
+        os.makedirs(os.path.join(prefix, "bin"))
+        os.makedirs(os.path.join(prefix, "lib"))
+        with open(os.path.join(prefix, "bin/linked"), "w") as f:
+            f.write('#!/bin/sh\ncat "$(dirname "$(readlink -f "$0")")/../lib/data"\n')
+        os.chmod(os.path.join(prefix, "bin/linked"), 0o755)
+        with open(os.path.join(prefix, "lib/data"), "w") as f:
+            f.write("from its lib\n")
+        with open(os.path.join(prefix, "secret"), "w") as f:
+            f.write("PREFIX-SECRET\n")
+        extra_ro = os.path.join(self.root, "ro")
+        os.makedirs(os.path.join(extra_ro, "bin"))
+        os.symlink(os.path.join(prefix, "bin/linked"), os.path.join(extra_ro, "bin/linked"))
+        path = ":".join([os.path.join(extra_ro, "bin"), os.environ["PATH"]])
+        done = self.run_hx("--ro", extra_ro, "go", PATH=path, script=[
+            call("bash", {"command": f"linked; cat {prefix}/secret"}), say("ok")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = self.tool_results()[0]
+        self.assertIn("from its lib\n", result)
+        self.assertIn("opt/linked/secret: Permission denied", result)
+        self.assertNotIn("PREFIX-SECRET", result)
 
     def test_a_link_the_model_could_have_written_opens_nothing(self):
         def secret(path, text):
@@ -1365,6 +1397,59 @@ end
                 time.sleep(0.05)
             self.assertFalse(os.path.exists(tmp), sent)
             os.remove(os.path.join(self.project, "hx.pid"))
+
+    def test_the_private_tmpdir_with_readonly_dirs_is_removed_on_exit_and_sigkill(self):
+        setup = ('assert(host.sh(\'mkdir -p "$TMPDIR/d000" "$TMPDIR/d500" && '
+                 'echo a > "$TMPDIR/d000/f" && echo b > "$TMPDIR/d500/f" && '
+                 'chmod 000 "$TMPDIR/d000" && chmod 500 "$TMPDIR/d500"\').code == 0) ')
+        done = self.run_hx("--run", "-", stdin=setup + "print(host.env('TMPDIR'))")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stdout, r"/hx-\w{6}\n$")
+        self.assertFalse(os.path.exists(done.stdout.strip()))
+
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write(setup + "host.write('tmp.path', host.env('TMPDIR')) "
+                    "host.write('hx.pid', host.sh('echo $PPID').out) host.sleep(300)")
+        process = subprocess.Popen([HX, "--run", "s.luau"], cwd=self.project, env=self.env(),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.wait_for_pid_file("hx.pid")
+        tmp = read(self.project, "tmp.path")
+        self.assertTrue(os.path.isdir(tmp), tmp)
+        process.send_signal(signal.SIGKILL)
+        process.communicate(timeout=20)
+        for _ in range(100):
+            if not os.path.exists(tmp):
+                break
+            time.sleep(0.05)
+        self.assertFalse(os.path.exists(tmp))
+
+    def test_relative_tmpdir_is_canonicalized(self):
+        reltmp = os.path.join(self.project, "reltmp")
+        os.makedirs(reltmp)
+        script = ('local tmp = host.env("TMPDIR") assert(tmp:sub(1, 1) == "/") '
+                  'local sh = host.sh(\'cd /usr && echo ok > "$TMPDIR/probe" && cat "$TMPDIR/probe"\') '
+                  'assert(sh.code == 0 and sh.out == "ok\\n") print(tmp)')
+        done = self.run_hx("--run", "-", stdin=script, TMPDIR="reltmp")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        tmp = done.stdout.strip()
+        self.assertTrue(tmp.startswith(os.path.realpath(reltmp) + "/"), tmp)
+        self.assertFalse(os.path.exists(tmp))
+
+    def test_hx_with_closed_stdin_exits_cleanly(self):
+        for kw in ({"stdin": subprocess.DEVNULL}, {"preexec_fn": lambda: os.close(0)}):
+            done = subprocess.run([HX], cwd=self.project, env=self.env(),
+                                  capture_output=True, text=True, timeout=20, **kw)
+            self.assertEqual(done.returncode, 1, (kw, done.stderr))
+            self.assertIn("no task", done.stderr)
+
+    def test_spawned_child_does_not_read_buffered_parent_stdin(self):
+        with open(os.path.join(self.project, "s.luau"), "w") as f:
+            f.write("local first = host.input()\n"
+                    "local id = host.spawn(function() return tostring((host.input())) end)\n"
+                    "local _, ok, child = host.wait(5)\n"
+                    "print(first, ok, child)\n")
+        done = self.run_hx("--run", "s.luau", stdin="first\nsecond\n")
+        self.assertEqual((done.returncode, done.stdout), (0, "first\ttrue\tnil\n"), done.stderr)
 
     def test_the_private_tmpdir_is_removed_where_it_was_made_not_where_its_path_leads_later(self):
         outside = os.path.join(self.root, "outside")

@@ -144,11 +144,6 @@ Judge spawn_judge(const std::string& kit_dir, const fs::path& project, const Jud
         throw UsageError(fmt::format("--judge {}: not a directory", kit_dir));
     }
     check_kit(kit);
-    for (const Rule& rule : walls.user) {
-        if (!fs::exists(rule.path, ec)) {
-            throw UsageError(fmt::format("{} {}: no such file or directory", flag_of(rule), rule.path));
-        }
-    }
     if (reaches(walls.agent, kit)) {
         throw UsageError(
             fmt::format("--judge {}: the agent could read the kit there; keep it outside the project, the "

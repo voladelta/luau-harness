@@ -78,22 +78,30 @@ void add_path_rules(std::vector<Rule>& rules, const std::vector<fs::path>& writa
         }
     }
     std::set<fs::path> opened;
-    const auto open = [&](const fs::path& dir) {
-        const std::optional<fs::path> whole = resolve_trusted(dir, writable);
+    const auto trusted_dir = [&](const fs::path& dir) -> std::optional<fs::path> {
+        std::optional<fs::path> whole = resolve_trusted(dir, writable);
         std::error_code ec;
         if (!whole || !fs::is_directory(*whole, ec) || *whole == "/" || holds_home(*whole)) {
-            return;
+            return std::nullopt;
         }
-        if (!within(*whole, readable)) {
+        return whole;
+    };
+    const auto open = [&](const fs::path& dir) {
+        if (const std::optional<fs::path> whole = trusted_dir(dir); whole && !within(*whole, readable)) {
             opened.insert(*whole);
         }
     };
+    std::set<fs::path> listed;
     for (const auto part : std::views::split(env_or("PATH", ""), ':')) {
         if (const std::string_view entry(part.begin(), part.end()); entry.starts_with('/')) {
-            open(entry);
+            if (const std::optional<fs::path> whole = trusted_dir(entry); whole && !within(*whole, writable)) {
+                listed.insert(*whole);
+                if (!within(*whole, readable)) {
+                    opened.insert(*whole);
+                }
+            }
         }
     }
-    const std::set<fs::path> listed = opened;
     for (const fs::path& dir : listed) {
         std::error_code ec;
         for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
@@ -102,7 +110,7 @@ void add_path_rules(std::vector<Rule>& rules, const std::vector<fs::path>& writa
                 continue;
             }
             const std::optional<fs::path> target = resolve_trusted(it->path(), writable);
-            if (!target || !fs::exists(*target, link_ec) || listed.contains(target->parent_path())) {
+            if (!target || !fs::exists(*target, link_ec)) {
                 continue;
             }
             const fs::path home = target->parent_path();
@@ -149,6 +157,9 @@ void WallPolicy::check() const {
     for (const auto& [flag, paths] : {std::pair{"--ro", &read_paths_}, std::pair{"--rw", &write_paths_}}) {
         for (const std::string& path : *paths) {
             std::error_code ec;
+            if (!fs::exists(path, ec)) {
+                throw UsageError(fmt::format("{} {}: {}", flag, path, ec ? ec.message() : "no such file or directory"));
+            }
             const fs::path whole = fs::canonical(path, ec);
             if (!ec && (whole == "/" || holds_home(whole))) {
                 throw UsageError(

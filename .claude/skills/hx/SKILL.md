@@ -277,7 +277,7 @@ that alters one changes its paragraph too.
 | This skill, which is built into hx | `.claude/skills/hx/SKILL.md` |
 | A built-in skill for hx's model alone, such as `rpi` (each directory is one, by its name) | `lua/skills/NAME/SKILL.md` |
 | A primitive | `src/host*.cpp`, and the lists in `src/host.h`, `lua/loop.luau` and `docs/host.md` |
-| Options, secrets, what the wall lets in | `src/main.cpp`, `src/sandbox.cpp` |
+| Options, secrets, what the wall lets in | `src/cli.cpp`, `src/policy.cpp`, `src/sandbox.cpp` |
 | The judge | `lua/judge.luau`, `src/judge.cpp` |
 
 ```
