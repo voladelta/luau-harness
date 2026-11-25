@@ -26,13 +26,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
         elif self.path == "/huge":
-            size = 65 * 1024 * 1024
             self.send_response(200)
-            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Length", str(65 * 1024 * 1024))
+            self.end_headers()
+            time.sleep(5)
+        elif self.path == "/huge-stream":
+            self.send_response(200)
             self.end_headers()
             chunk = b"x" * (1024 * 1024)
-            for _ in range(65):
-                self.wfile.write(chunk)
+            try:
+                for _ in range(65):
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif self.path == "/moved":
             self.reply(302, b"", [("Location", "/ok")])
         elif self.path == "/slow":
@@ -110,7 +116,12 @@ local empty = http.request(base .. "/empty")
 check("a 204 GET ends without a body", empty.status, 204)
 check("and empty body is string", empty.body, "")
 
-raises("a response over 64 MiB", "larger than 64 MiB", http.request, base .. "/huge")
+local _, huge_err = pcall(http.request, base .. "/huge", { timeout = 3 })
+check("a body declared over 64 MiB raises before it arrives", huge_err,
+	"http.request " .. base .. "/huge: the response body: larger than 64 MiB")
+local _, stream_err = pcall(http.request, base .. "/huge-stream")
+check("a body that grows past 64 MiB raises", stream_err,
+	"http.request " .. base .. "/huge-stream: the response body: larger than 64 MiB")
 
 local _, err = pcall(http.request, "http://127.0.0.1:1/")
 has("a failed connection raises", err, "http.request http://127.0.0.1:1/: curl:")

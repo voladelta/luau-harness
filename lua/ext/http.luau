@@ -3,6 +3,9 @@
 
 local M = {}
 
+local largest_body = 64 * 1024 * 1024
+local too_large = "larger than 64 MiB"
+
 type Options = {
 	method: string?,
 	headers: { [string]: string }?,
@@ -15,6 +18,11 @@ local function check(value: unknown, name: string, kind: string, required: boole
 	if (value ~= nil or required) and type(value) ~= kind then
 		error(("http.request: %s must be a %s, not %s"):format(name, kind, type(value)), 0)
 	end
+end
+
+local function without_path(err: string?, path: string): string
+	local text = tostring(err)
+	return if text:sub(1, #path + 2) == path .. ": " then text:sub(#path + 3) else text
 end
 
 local function last_block(text: string): (number, { [string]: string })
@@ -68,7 +76,8 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 	end
 	local where = (made.out:gsub("%s+$", ""))
 	local head_file, body_file = where .. "/head", where .. "/body"
-	local command: { string | number } = { "curl", "-sS", "-L", "--max-time", timeout, "-D", head_file, "-o", body_file }
+	local command: { string | number } = { "curl", "-sS", "-L", "--max-time", timeout, "--max-filesize", largest_body, "-D",
+		head_file, "-o", body_file }
 	if method == "HEAD" then
 		table.insert(command, "-I")
 	elseif method then
@@ -106,6 +115,9 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 	if not ok then
 		error(result, 0)
 	end
+	if result.code == 63 then
+		error(("http.request %s: the response body: %s"):format(url, too_large), 0)
+	end
 	if result.code ~= 0 then
 		local detail = (tostring(result.out or ""):gsub("%s+$", ""))
 		if detail == "" then
@@ -117,10 +129,10 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 		error(("http.request %s: %s"):format(url, detail), 0)
 	end
 	if not head then
-		error(("http.request %s: %s"):format(url, tostring(head_err)), 0)
+		error(("http.request %s: the response headers: %s"):format(url, without_path(head_err, head_file)), 0)
 	end
 	if not data then
-		error(("http.request %s: %s"):format(url, tostring(data_err)), 0)
+		error(("http.request %s: the response body: %s"):format(url, without_path(data_err, body_file)), 0)
 	end
 	local status, response = last_block(head)
 	return { status = status, headers = response, body = data }
