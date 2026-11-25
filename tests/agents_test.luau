@@ -169,4 +169,28 @@ has("waiting gives the first report", rest, "ran: a\n[exit 0]")
 has("and the second, which ran after it", rest, "ran: b\n[exit 0]")
 lacks("with nobody left at work", rest, "still at work")
 
+local previous_request = loop.request
+local previous_seconds = loop.agent_seconds
+host.sh({ "mkdir", "-p", ".hx" })
+loop.agent_seconds = 0.2
+loop.request = function(system, messages, tools, model)
+	local last = messages[#messages].content
+	if type(last) == "string" and last == "sleepy-task" then
+		host.sleep(5)
+	end
+	return previous_request(system, messages, tools, model)
+end
+local lead_talk = loop.Conversation.new()
+lead_talk:say('lua: return agents({ name = "sleepy", task = "sleepy-task" })')
+loop.turn("the session's prompt", lead_talk)
+loop.agent_seconds = previous_seconds
+loop.request = previous_request
+local final_content = lead_talk.messages[#lead_talk.messages].content
+local final_text = type(final_content) == "table" and final_content[1] and final_content[1].text or ""
+local saved_log = final_text:match("%[its conversation: (%.hx/log/[^%]]+%.json)%]")
+check("a timed-out agent inside a turn names its conversation file", saved_log ~= nil, true)
+local saved = saved_log and json.decode(host.read(saved_log) or "{}")
+check("and its log holds the message it timed out on", saved and saved.messages and saved.messages[1] and saved.messages[1].content, "sleepy-task")
+host.sh({ "rm", "-rf", ".hx" })
+
 checks.done("agents")

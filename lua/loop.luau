@@ -1903,7 +1903,12 @@ local function work(agent: Agent, system: string): string
 	agent.talk:say(agent.task)
 	local ok, err = host.timed(M.agent_seconds, M.turn, system, agent.talk)
 	if not ok then
+		local was_owing = agent.talk:state() == "owing"
 		agent.talk:abandon("the turn ended: " .. tostring(err))
+		local path = if not was_owing and live.turns > 0 then sub_logs[agent.talk] else nil
+		if path then
+			save(system, agent.talk.messages, path)
+		end
 	end
 	return json.encode({
 		messages = agent.talk.messages,
