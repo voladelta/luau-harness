@@ -131,6 +131,15 @@ def fenced(text, marker):
     raise AssertionError(f"no code block holds {marker!r}")
 
 
+def remove_tree(root):
+    for top, dirs, _ in os.walk(root):
+        for name in dirs:
+            path = os.path.join(top, name)
+            if not os.path.islink(path):
+                os.chmod(path, 0o700)
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def kill_quietly(pid):
     try:
         os.kill(pid, signal.SIGKILL)
@@ -211,7 +220,7 @@ class AgentTest(unittest.TestCase):
     def tearDown(self):
         self.model.shutdown()
         self.model.server_close()
-        shutil.rmtree(self.root, ignore_errors=True)
+        remove_tree(self.root)
 
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
@@ -3156,7 +3165,6 @@ say(submit("probe live project with {flag}"))
         with open(os.path.join(ro_dir, "data.txt"), "w") as f:
             f.write("keep\n")
         os.chmod(ro_dir, 0o500)
-        self.addCleanup(os.chmod, ro_dir, 0o700)
 
         kit = self.make_kit(config='{"runs": 1}', prog="echo 1\n",
                             check='#!/bin/sh\ncat "$1/.judge/stdout"\n')
