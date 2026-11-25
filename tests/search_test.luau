@@ -67,9 +67,15 @@ if not host.read("repo/src/locked.luau") then
 		if not ripgrep or host.sh("command -v rg").code == 0 then
 			search.ripgrep = ripgrep
 			local by = ripgrep and "rg" or "grep"
-			check(by .. ": a file it cannot read does not lose the matches", #search.grep("gamma", { dir = "repo/src" }), 1)
-			check(by .. ": a file it cannot read does not break a zero-match search",
-				tostring(search.grep("no-such-pattern", { dir = "repo/src" })), "[no match]")
+			local found = search.grep("gamma", { dir = "repo/src" })
+			check(by .. ": a file it cannot read does not lose the matches", #found, 1)
+			check(by .. ": and is named among them", tostring(found),
+				"repo/src/a.luau:2: beta gamma\n[could not read 1 file: repo/src/locked.luau]")
+			check(by .. ": a file it cannot read does not break a zero-match search, and is named",
+				tostring(search.grep("no-such-pattern", { dir = "repo/src" })),
+				"[no match]\n[could not read 1 file: repo/src/locked.luau]")
+			raises(by .. ": a pattern that does not parse still raises beside it", "search.grep: ", search.grep, "(",
+				{ dir = "repo/src" })
 		end
 	end
 end

@@ -1,4 +1,4 @@
--- find files and text in the project as data, with no shell quoting: files(glob?, dir?) -> {path}, what git lists (tracked, or new and not ignored), or every file outside a git repository; grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit?}) -> {{path, line, text}}, a regex search that skips what .gitignore names and prints as path:line: text
+-- find files and text in the project as data, with no shell quoting: files(glob?, dir?) -> {path}, what git lists (tracked, or new and not ignored), or every file outside a git repository; grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit?}) -> {{path, line, text}}, a regex search that skips what .gitignore names and prints as path:line: text; .unreadable lists files it could not read
 --!strict
 
 local M = {}
@@ -91,10 +91,16 @@ local shown = {
 			table.insert(lines, ("%s:%d: %s"):format(match.path, match.line, match.text))
 		end
 		if #lines == 0 then
-			return "[no match]"
-		end
-		if matches.more then
+			table.insert(lines, "[no match]")
+		elseif matches.more then
 			table.insert(lines, ("[more than these %d match; narrow the pattern, dir or glob, or raise limit]"):format(#lines))
+		end
+		local unreadable: { string }? = matches.unreadable
+		if unreadable then
+			local named = table.concat(unreadable, ", ", 1, math.min(#unreadable, 5))
+			local rest = if #unreadable > 5 then (" and %d more"):format(#unreadable - 5) else ""
+			table.insert(lines, ("[could not read %d file%s: %s%s]"):format(#unreadable, if #unreadable == 1 then "" else "s",
+				named, rest))
 		end
 		return table.concat(lines, "\n")
 	end,
@@ -133,7 +139,7 @@ if ((status[1] != 0)); then exit 250; fi
 exit "${status[0]}"
 ]]
 
-local function collect(args: { string }, limit: number, input: string?): { Match }
+local function collect(args: { string }, limit: number, unreadable_in: (line: string) -> string?, input: string?): { Match }
 	local command = { "bash", "-c", preview_matches, "search.grep", tostring(limit + 1), tostring(M.text_limit) }
 	table.move(args, 1, #args, #command + 1, command)
 	local result = host.sh(command, { split = true, input = input, timeout = M.seconds })
@@ -160,15 +166,31 @@ local function collect(args: { string }, limit: number, input: string?): { Match
 		})
 		at = stop + 1
 	end
-	if result.code == 250 or (#matches == 0 and not matches.more and result.code ~= 0 and result.err:find("%S")) then
+	if result.code == 250 then
 		error("search.grep: " .. result.err:gsub("%s+$", ""), 0)
+	end
+	local unreadable, problems = {}, {}
+	for _, line in result.err:split("\n") do
+		local path = unreadable_in(line)
+		if path then
+			table.insert(unreadable, (path:gsub("^%./", "")))
+		elseif line:find("%S") then
+			table.insert(problems, line)
+		end
+	end
+	if #matches == 0 and not matches.more and result.code ~= 0 and #problems > 0 then
+		error("search.grep: " .. table.concat(problems, "\n"), 0)
+	end
+	if #unreadable > 0 then
+		table.sort(unreadable)
+		matches.unreadable = unreadable
 	end
 	return matches
 end
 
 local function with_ripgrep(pattern: string, options: Options, limit: number): { Match }
-	local args = { "rg", "--no-config", "--no-messages", "--line-number", "--with-filename", "--null", "--no-heading", "--color",
-		"never", "--hidden", "--glob", "!.git", "--sort", "path" }
+	local args = { "rg", "--no-config", "--line-number", "--with-filename", "--null", "--no-heading", "--color", "never",
+		"--hidden", "--glob", "!.git", "--sort", "path" }
 	if options.fixed then
 		table.insert(args, "--fixed-strings")
 	end
@@ -183,7 +205,9 @@ local function with_ripgrep(pattern: string, options: Options, limit: number): {
 	table.insert(args, pattern)
 	table.insert(args, "--")
 	table.insert(args, prefix_of(options.dir) == "" and "./" or options.dir :: string)
-	return collect(args, limit)
+	return collect(args, limit, function(line: string): string?
+		return line:match("^rg: (.+): .+ %(os error %d+%)$")
+	end)
 end
 
 local function with_grep(pattern: string, options: Options, limit: number): { Match }
@@ -191,14 +215,21 @@ local function with_grep(pattern: string, options: Options, limit: number): { Ma
 	if #paths == 0 then
 		return {}
 	end
-	local args = { "xargs", "-0", "grep", "-snHIZ", "-d", "skip", if options.fixed then "-F" else "-E" }
+	local listed_paths = {}
+	for _, path in paths do
+		listed_paths[path] = true
+	end
+	local args = { "xargs", "-0", "grep", "-nHIZ", "-d", "skip", if options.fixed then "-F" else "-E" }
 	if options.ignore_case then
 		table.insert(args, "-i")
 	end
 	table.insert(args, "-e")
 	table.insert(args, pattern)
 	table.insert(args, "--")
-	return collect(args, limit, table.concat(paths, "\0"))
+	return collect(args, limit, function(line: string): string?
+		local path = line:match("^grep: (.+): [^:]+$")
+		return if path and listed_paths[path] then path else nil
+	end, table.concat(paths, "\0"))
 end
 
 function M.grep(pattern: string, options: Options?): { Match }
