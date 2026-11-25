@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <initializer_list>
 #include <memory>
@@ -102,7 +103,7 @@ std::string beta_option(lua_State* L, int idx) {
 }
 
 int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_list<std::string_view> extra,
-         double timeout, const std::string& ca_bundle) {
+         double timeout, double deadline, const std::string& ca_bundle) {
     Headers headers;
     if (!endpoint.key.empty()) {
         headers.add(endpoint.auth == Auth::Bearer ? fmt::format("Authorization: Bearer {}", endpoint.key)
@@ -134,7 +135,7 @@ int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, std::max(1L, static_cast<long>(timeout * 1000)));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, std::max(1L, static_cast<long>(std::ceil(timeout * 1000.0))));
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
     if (!ca_bundle.empty()) {
         curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str());
@@ -148,6 +149,10 @@ int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     curl_easy_reset(curl);
     if (code != CURLE_OK) {
         raise_if_signaled(L);
+        if (deadline > 0 && now() >= deadline) {
+            keep_limit_check();
+            raise_error(L, "timeout");
+        }
         return fail(L, error_buffer.front() != '\0' ? error_buffer.data() : curl_easy_strerror(code));
     }
     lua_pushnumber(L, static_cast<double>(status));
@@ -285,7 +290,7 @@ int HttpClient::post(lua_State* L, double deadline) {
         std::size_t length = 0;
         const char* body = lua_tolstring(L, 2, &length);
         set_body(handle, {body, length});
-        return send(L, handle, *target, {"Content-Type: application/json", beta_header}, timeout, ca_bundle_);
+        return send(L, handle, *target, {"Content-Type: application/json", beta_header}, timeout, deadline, ca_bundle_);
     }
     const CurlMime mime(curl_mime_init(handle));
     if (!mime) {
@@ -295,7 +300,7 @@ int HttpClient::post(lua_State* L, double deadline) {
         luaL_error(L, "host.post: %s", error->c_str());
     }
     curl_easy_setopt(handle, CURLOPT_MIMEPOST, mime.get());
-    return send(L, handle, *target, {beta_header}, timeout, ca_bundle_);
+    return send(L, handle, *target, {beta_header}, timeout, deadline, ca_bundle_);
 }
 
 }  // namespace hx

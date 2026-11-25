@@ -608,6 +608,10 @@ int run_sh(lua_State* L, double deadline, const std::vector<Rule>& system_rules)
     if (outcome.ending == Ending::HungUp) {
         raise_error(L, "hung up");
     }
+    if (outcome.ending == Ending::TimedOut && deadline > 0 && now() >= deadline) {
+        keep_limit_check();
+        raise_error(L, "timeout");
+    }
     push_result(L, pipes.output(), pipes.errors(), outcome, outcome.ended - child.started);
     return 1;
 }

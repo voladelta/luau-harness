@@ -90,7 +90,7 @@ class JudgeChannel {
     ~JudgeChannel() = default;
 
     [[nodiscard]] bool valid() const noexcept { return fd_.valid(); }
-    void reset() noexcept { fd_.reset(); }
+    void close() noexcept { fd_.reset(); }
 
     int exchange(lua_State* L, double deadline);
 

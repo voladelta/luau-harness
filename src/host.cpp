@@ -383,7 +383,7 @@ int Host::spawn(lua_State* L) {
     return host.spawn_->spawn(
         L, [&] { host.http_->reset_handle(); },
         [&] {
-            host.judge_->reset();
+            host.judge_->close();
             host.deadline_ = 0;
             ++host.tries_;
         });
@@ -400,7 +400,9 @@ int Host::stop(lua_State* L) {
 
 int Host::sleep(lua_State* L) {
     raise_if_signaled(L);
-    const double until = now() + within_limit(of(L).deadline_, luaL_checknumber(L, 1));
+    const double deadline = of(L).deadline_;
+    const double requested = now() + duration(luaL_checknumber(L, 1));
+    const double until = deadline > 0 ? std::min(deadline, requested) : requested;
     while (pending_signal() == 0) {
         const double left = until - now();
         if (left <= 0) {
@@ -409,6 +411,10 @@ int Host::sleep(lua_State* L) {
         wait_for({}, left);
     }
     raise_if_signaled(L);
+    if (deadline > 0 && now() >= deadline) {
+        keep_limit_check();
+        raise_error(L, "timeout");
+    }
     return 0;
 }
 
@@ -420,7 +426,14 @@ int Host::protect(lua_State* L, int fn, double deadline) {
         const DeadlineScope limit(host.deadline_, deadline);
         const TryScope scope(host.tries_);
         if (pending_signal() == 0) {
-            status = lua_pcall(L, lua_gettop(L) - fn, LUA_MULTRET, 0);
+            if (host.deadline_ > 0 && now() >= host.deadline_) {
+                keep_limit_check();
+                lua_settop(L, fn - 1);
+                lua_pushliteral(L, "timeout");
+                status = LUA_ERRRUN;
+            } else {
+                status = lua_pcall(L, lua_gettop(L) - fn, LUA_MULTRET, 0);
+            }
         }
     }
     if (const int sig = pending_signal(); sig != 0) {
