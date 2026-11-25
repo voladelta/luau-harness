@@ -1905,9 +1905,8 @@ local function work(agent: Agent, system: string): string
 	if not ok then
 		local was_owing = agent.talk:state() == "owing"
 		agent.talk:abandon("the turn ended: " .. tostring(err))
-		local path = if not was_owing and live.turns > 0 then sub_logs[agent.talk] else nil
-		if path then
-			save(system, agent.talk.messages, path)
+		if not was_owing then
+			save(system, agent.talk.messages, sub_log(agent.talk))
 		end
 	end
 	return json.encode({
