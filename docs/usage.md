@@ -21,8 +21,8 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 | Option | Meaning |
 |---|---|
 | `--judge KIT` | judge the model's work with the kit in directory `KIT`, which must lie outside the wall (see [The judge](judge.md)) |
-| `--model NAME` | the model to ask; overrides `HX_MODEL`. `opus`, `sonnet` and `haiku` are the current Claude models |
-| `--rpi` | lead the task by the rpi workflow (see [Agents](agents.md)): the model is `opus` unless `--model` names another, whatever `HX_MODEL` says |
+| `--model NAME` | the model to ask; overrides `HX_MODEL`. `carbon`, `argon`, `neon` and `hydrogen` are the Gemini 4 models |
+| `--rpi` | lead the task by the rpi workflow (see [Agents](agents.md)): the model is `carbon` unless `--model` names another, whatever `HX_MODEL` says |
 | `--ro PATH` | also allow reading `PATH` |
 | `--rw PATH` | also allow writing `PATH` |
 | `--resume LOG` | go on from a conversation saved in `.hx/log/`: `LOG` is the file, by its name there or its path, or `last` for the newest that is not an agent's (see [The loop](loop.md)) |
@@ -37,15 +37,12 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `HX_MODEL` | model name; `opus`, `sonnet` and `haiku` stand for `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5`; `carbon`, `argon`, `neon` and `hydrogen` for `gemini-4-carbon`, `gemini-4-argon`, `gemini-4-neon` and `gemini-4-hydrogen` | `deepseek-flash`; without `DEEPSEEK_API_KEY`, `claude-opus-5-5` when `ANTHROPIC_API_KEY` is set, or `gemini-4-neon` when `GEMINI_API_KEY` is |
-| `HX_API_URL` | the session's endpoint: Gemini's Interactions API for a `gemini-*` model, an Anthropic Messages endpoint otherwise | `https://api.anthropic.com/v1/messages` for a `claude-*` model, `https://generativelanguage.googleapis.com/v1beta/interactions` for a `gemini-*` one, `https://api.deepseek.com/anthropic/v1/messages` otherwise |
-| `HX_KEY_ENV` | name of the variable holding the API key | `ANTHROPIC_API_KEY` for a `claude-*` model, `GEMINI_API_KEY` for a `gemini-*` one, `DEEPSEEK_API_KEY` otherwise |
-| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked. DeepSeek has three levels: it takes `medium` and `xhigh` for `high`. A Gemini model gets it as `generation_config.thinking_level`, held to the deepest level the model has: `xhigh` on Neon and Hydrogen, `high` on the others | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
-| `HX_TOOLS_URL` | base of DeepSeek's Search, Fetch and OCR endpoints, which the built-in `web` and `ocr` extensions call with `DEEPSEEK_API_KEY`, whatever the model | `https://api.deepseek.com/v1/tools` |
-| `HX_EXA_URL` | Exa's search endpoint, which the built-in `exa` extension calls with `EXA_API_KEY`, whatever the model | `https://api.exa.ai/search` |
-| `HX_DEEPSEEK_URL` | DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude model is asked through, an agent say, with `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1/messages` |
-| `HX_ANTHROPIC_URL` | Anthropic's Messages endpoint, which a Claude model under a session on another model is asked through, with `ANTHROPIC_API_KEY` | `https://api.anthropic.com/v1/messages` |
-| `HX_GEMINI_URL` | Gemini's Interactions endpoint, which a Gemini model under a session on another model is asked through, with `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/v1beta/interactions` |
+| `HX_MODEL` | model name; `carbon`, `argon`, `neon` and `hydrogen` stand for `gemini-4-carbon`, `gemini-4-argon`, `gemini-4-neon` and `gemini-4-hydrogen` | `gemini-4-neon` |
+| `HX_API_URL` | the model endpoint, which speaks Gemini's Interactions API | `https://generativelanguage.googleapis.com/v1beta/interactions` |
+| `HX_KEY_ENV` | name of the variable holding the API key | `GEMINI_API_KEY` |
+| `HX_EFFORT` | the model's thinking level: `minimal`, `low`, `medium`, `high` or `xhigh`, sent as `generation_config.thinking_level`; any other value is refused before the model is asked. Only Neon and Hydrogen have `xhigh`; another model gets `high` for it | the model's own: `high` on Neon and Hydrogen, `medium` on Carbon and Argon |
+| `HX_EXA_URL` | Exa's search endpoint, which the built-in `web` and `exa` extensions search through with `EXA_API_KEY` | `https://api.exa.ai/search` |
+| `HX_EXA_CONTENTS_URL` | Exa's contents endpoint, which the built-in `web` extension reads pages through with `EXA_API_KEY` | `https://api.exa.ai/contents` |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
 Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143

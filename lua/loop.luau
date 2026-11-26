@@ -1,52 +1,46 @@
 --!strict
 
-type Block = {
+type Part = { type: string, text: string?, data: string?, mime_type: string? }
+type Step = {
 	type: string,
-	text: string?,
-	thinking: any,
+	content: { Part }?,
 	id: string?,
 	name: string?,
-	input: any,
-	tool_use_id: string?,
-	content: any,
+	arguments: any,
+	call_id: string?,
+	result: { Part }?,
 	is_error: boolean?,
-	from: any,
-	to: any,
-	source: any,
 }
-type Message = { role: string, content: string | { Block } }
 type Usage = {
-	input_tokens: number?,
-	cache_read_input_tokens: number?,
-	cache_creation_input_tokens: number?,
-	output_tokens: number?,
-	iterations: { Usage }?,
+	total_input_tokens: number?,
+	total_cached_tokens: number?,
+	total_output_tokens: number?,
+	total_thought_tokens: number?,
 }
-type Reply = { content: { Block }, stop_reason: string?, stop_details: any, usage: Usage? }
+type Reply = { steps: { Step }, status: string, usage: Usage? }
 type Function = { name: string, usage: string, run: (...any) -> ...any, lead: boolean? }
 type Schema = { type: string?, properties: { [string]: any }?, required: { string }? }
 type Tool = {
 	name: string,
 	description: string | () -> string,
 	parameters: Schema?,
-	run: ({ [string]: any }) -> (string, boolean?, { Block }?),
+	run: ({ [string]: any }) -> (string, boolean?, { Part }?),
 }
 type Skill = { name: string, description: string, dir: string, path: string, hidden: boolean, source: string? }
-type Features = { effort: string?, fallbacks: string?, display: string?, compaction: boolean? }
 
 local M = {}
 
 M.model = host.model
-M.max_output = 16000
 M.max_replies = 200
 M.compact_at = 150000
 M.output_limit = 30000
 M.call_seconds = 600
+M.request_seconds = 900
 M.effort = host.env("HX_EFFORT")
 M.repeat_reminders = { 3, 5, 8 }
 
 type Repeats = { counts: { [string]: number }, worst: { call: string, count: number }? }
-type Count = { model: string, replies: number, input: number, cached: number, written: number, output: number }
+type Count = { model: string, replies: number, input: number, cached: number, output: number }
 local live: {
 	usage: { Count },
 	spills: number,
@@ -60,7 +54,7 @@ local live: {
 	seen: { [string]: string },
 	wrote: { string },
 	shared_since: number?,
-	images: { Block }?,
+	images: { Part }?,
 } = {
 	usage = {},
 	spills = 0,
@@ -309,7 +303,7 @@ local function extension_index(): { string }
 		end
 	end
 	local names = {}
-	local keyed = { exa = host.endpoints.exa, web = host.endpoints.search, ocr = host.endpoints.ocr }
+	local keyed = { exa = host.endpoints.exa, web = host.endpoints.exa }
 	for name in host.extensions do
 		if keyed[name] ~= false then
 			table.insert(names, name)
@@ -782,14 +776,36 @@ local image_kinds = {
 	{ type = "image/webp", starts = "RIFF", at_9 = "WEBP" },
 }
 
-function M.image(data: string): Block?
+function M.image(data: string): Part?
 	for _, kind in image_kinds do
 		if data:sub(1, #kind.starts) == kind.starts and (not kind.at_9 or data:sub(9, 12) == kind.at_9) then
-			return {
-				type = "image",
-				source = { type = "base64", media_type = kind.type, data = M.ext("bytes").base64(data) },
-			}
+			return { type = "image", data = M.ext("bytes").base64(data), mime_type = kind.type }
 		end
+	end
+	return nil
+end
+
+M.document_bytes = 20 * 1024 * 1024
+
+local zip, ole = "PK\3\4", "\208\207\17\224\161\177\26\225"
+local document_kinds: { [string]: { type: string, starts: string } } = {
+	pdf = { type = "application/pdf", starts = "%PDF-" },
+	docx = { type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", starts = zip },
+	dotx = { type = "application/vnd.openxmlformats-officedocument.wordprocessingml.template", starts = zip },
+	pptx = { type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", starts = zip },
+	xlsx = { type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", starts = zip },
+	odt = { type = "application/vnd.oasis.opendocument.text", starts = zip },
+	odp = { type = "application/vnd.oasis.opendocument.presentation", starts = zip },
+	ods = { type = "application/vnd.oasis.opendocument.spreadsheet", starts = zip },
+	doc = { type = "application/msword", starts = ole },
+	ppt = { type = "application/vnd.ms-powerpoint", starts = ole },
+	xls = { type = "application/vnd.ms-excel", starts = ole },
+}
+
+function M.document(path: string, data: string): Part?
+	local kind = document_kinds[(path:match("%.(%w+)$") or ""):lower()]
+	if kind and data:sub(1, #kind.starts) == kind.starts then
+		return { type = "document", data = M.ext("bytes").base64(data), mime_type = kind.type }
 	end
 	return nil
 end
@@ -954,42 +970,45 @@ M.functions = {
 	},
 	{
 		name = "see",
-		usage = "see(path) -> text: puts an image file, PNG, JPEG, GIF or WebP, into this call's result for you to "
-			.. "look at: a screenshot, a chart, a rendered page. It is for looking; text in a document comes from "
-			.. "read, or from a tool that extracts it.",
+		usage = "see(path) -> text: puts a file into this call's result for you to look at: an image, PNG, JPEG, GIF "
+			.. "or WebP, such as a screenshot, a chart or a rendered page; or a document, PDF, Word, PowerPoint, Excel "
+			.. "or OpenDocument, which you take in whole, text, tables and figures. A file of plain text comes from read.",
 		run = function(path: any): string
 			check("see", path, 1, "path", "string")
 			progress("  see " .. M.printable(path))
 			if not M.vision then
-				error("see: this session's model takes no images", 0)
+				error("see: this session's model takes no files", 0)
 			end
-			local images = live.images
-			if not images then
-				error("see: an image is shown in the result of the lua call that asks for it, and this is not one", 0)
+			local shown = live.images
+			if not shown then
+				error("see: a file is shown in the result of the lua call that asks for it, and this is not one", 0)
 			end
-			if #images >= M.images_per_call then
-				error(("see: one call shows %d images at most; look at these first"):format(M.images_per_call), 0)
+			if #shown >= M.images_per_call then
+				error(("see: one call shows %d files at most; look at these first"):format(M.images_per_call), 0)
 			end
 			local data: string = or_raise(host.read(path))
-			local sent = 4 * math.ceil(#data / 3)
-			if sent > M.image_bytes then
-				error(("see: %s is %d bytes, %d as base64, and an image may be %d at most: scale it down first")
-					:format(path, #data, sent, M.image_bytes), 0)
+			local part = M.image(data) or M.document(path, data)
+			if not part then
+				error(("see: %s is not a PNG, JPEG, GIF or WebP image, nor a PDF, Word, PowerPoint, Excel or "
+					.. "OpenDocument file"):format(path), 0)
+			end
+			local sent = #(part.data :: string)
+			local limit = if part.type == "image" then M.image_bytes else M.document_bytes
+			if sent > limit then
+				error(("see: %s is %d bytes, %d as base64, and %s may be %d at most%s"):format(path, #data, sent,
+					if part.type == "image" then "an image" else "a document", limit,
+					if part.type == "image" then ": scale it down first" else ": split it first"), 0)
 			end
 			local total = sent
-			for _, shown in images do
-				total += #shown.source.data
+			for _, other in shown do
+				total += #(other.data :: string)
 			end
 			if total > M.call_image_bytes then
-				error(("see: the images of one call may be %d bytes as base64 at most; look at these first")
+				error(("see: the files of one call may be %d bytes as base64 at most; look at these first")
 					:format(M.call_image_bytes), 0)
 			end
-			local image = M.image(data)
-			if not image then
-				error(("see: %s is not a PNG, JPEG, GIF or WebP image"):format(path), 0)
-			end
-			table.insert(images, image)
-			return ("[image %d of this result: %s, %s, %d bytes]"):format(#images, path, image.source.media_type, #data)
+			table.insert(shown, part)
+			return ("[%s %d of this result: %s, %s, %d bytes]"):format(part.type, #shown, path, part.mime_type :: string, #data)
 		end,
 	},
 	{
@@ -1111,12 +1130,12 @@ local tools: { Tool } = {
 			properties = { code = { type = "string" } },
 			required = { "code" },
 		},
-		run = function(args: { [string]: any }): (string, boolean, { Block }?)
+		run = function(args: { [string]: any }): (string, boolean, { Part }?)
 			if type(args.code) ~= "string" then
 				error('argument "code" must be a string', 0)
 			end
 			local lines: { string } = {}
-			local images: { Block } = {}
+			local images: { Part } = {}
 			scratch.print = capture_print
 			local chunk: (() -> ...any)?, err: string? = host.load(args.code, "=lua", scratch)
 			if not chunk then
@@ -1178,7 +1197,7 @@ local function find_tool(name: string?): Tool?
 	return nil
 end
 
-local function run_tool(call: Block): (string, boolean, { Block }?)
+local function run_tool(call: Step): (string, boolean, { Part }?)
 	local tool = find_tool(call.name)
 	if not tool then
 		local problem = "error: there is no tool named " .. tostring(call.name)
@@ -1190,7 +1209,7 @@ local function run_tool(call: Block): (string, boolean, { Block }?)
 		end
 		return problem, true
 	end
-	local args = call.input
+	local args = call.arguments
 	if type(args) ~= "table" then
 		return "error: the tool input is not an object", true
 	end
@@ -1208,19 +1227,7 @@ local function run_tool(call: Block): (string, boolean, { Block }?)
 	return "error: " .. tostring(result), true
 end
 
-M.claude = {
-	["claude-opus-5-5"] = { effort = "medium", fallbacks = "default", display = "updates", compaction = true },
-	["claude-sonnet-5-5"] = { effort = "medium", fallbacks = "default", display = "updates", compaction = true },
-	["claude-haiku-5-5"] = { effort = "medium", compaction = true },
-}
-
-local function claude_model(model: string): (boolean, Features?)
-	return model:match("^claude%-") ~= nil, M.claude[model]
-end
-
-local function prompt_tokens(counts: Usage): number
-	return (counts.input_tokens or 0) + (counts.cache_read_input_tokens or 0) + (counts.cache_creation_input_tokens or 0)
-end
+M.xhigh = { ["gemini-4-neon"] = true, ["gemini-4-hydrogen"] = true }
 
 local function count_of(model: string): Count
 	for _, count in live.usage do
@@ -1228,314 +1235,88 @@ local function count_of(model: string): Count
 			return count
 		end
 	end
-	local count: Count = { model = model, replies = 0, input = 0, cached = 0, written = 0, output = 0 }
+	local count: Count = { model = model, replies = 0, input = 0, cached = 0, output = 0 }
 	table.insert(live.usage, count)
 	return count
 end
 
 local function count_usage(reply: Reply, model: string)
-	local counts: Usage = type(reply.usage) == "table" and reply.usage or {}
-	local iterations = counts.iterations
-	local parts: { Usage } = if type(iterations) == "table" and #iterations > 0 then iterations else { counts }
+	local counts: Usage = reply.usage or {}
 	local usage = count_of(model)
 	usage.replies += 1
-	for _, part in parts do
-		usage.input += prompt_tokens(part)
-		usage.cached += part.cache_read_input_tokens or 0
-		usage.written += part.cache_creation_input_tokens or 0
-		usage.output += part.output_tokens or 0
+	usage.input += counts.total_input_tokens or 0
+	usage.cached += counts.total_cached_tokens or 0
+	usage.output += (counts.total_output_tokens or 0) + (counts.total_thought_tokens or 0)
+end
+
+local function text_of(steps: { Step }): string
+	local parts = {}
+	for _, step in steps do
+		for _, part in if step.type == "model_output" then step.content or {} else {} do
+			if part.type == "text" and part.text ~= "" then
+				table.insert(parts, part.text :: string)
+			end
+		end
 	end
+	return table.concat(parts, "\n")
 end
 
 local function has_content(reply: Reply): boolean
-	if reply.stop_reason == "max_tokens" or reply.stop_reason == "refusal" then
+	if reply.status == "incomplete" or text_of(reply.steps) ~= "" then
 		return true
 	end
-	for _, block in reply.content do
-		if block.type ~= "text" or block.text ~= "" then
+	for _, step in reply.steps do
+		if step.type == "function_call" then
 			return true
 		end
 	end
 	return false
 end
 
-local internal_before_fallback = { thinking = true, redacted_thinking = true, tool_use = true, server_tool_use = true }
-local function after_fallback(reply: Reply)
-	local last = nil
-	for i, block in reply.content do
-		if block.type == "fallback" then
-			last = i
-		end
+local function tool_specs(): { any }
+	local specs = json.array({})
+	for _, tool in M.tools do
+		table.insert(specs, {
+			type = "function",
+			name = tool.name,
+			description = if type(tool.description) == "function" then tool.description() else tool.description,
+			parameters = tool.parameters,
+		})
 	end
-	if not last then
-		return
+	return specs
+end
+
+local function read_reply(text: string): Reply
+	local answer, err = json.decode(text)
+	if type(answer) ~= "table" or type(answer.steps) ~= "table" then
+		error("the model endpoint sent a reply this loop cannot read: " .. (err or text:sub(1, 300)), 0)
 	end
-	local from, to = reply.content[last]["from"], reply.content[last].to
-	progress(("  %s declined; %s continued"):format(tostring(from and from.model), tostring(to and to.model)))
-	local kept = {}
-	for i, block in reply.content do
-		if i >= last or not internal_before_fallback[block.type] then
-			table.insert(kept, block)
-		end
+	local status = answer.status
+	if status ~= "completed" and status ~= "requires_action" and status ~= "incomplete" then
+		local fault = type(answer.errors) == "table" and answer.errors[1] or {}
+		error(("the model request failed (%s): %s"):format(tostring(status), tostring(fault.message or fault.code)), 0)
 	end
-	reply.content = kept
+	return { steps = answer.steps, status = status, usage = type(answer.usage) == "table" and answer.usage or nil }
 end
 
-local function tool_description(tool: Tool): string
-	return if type(tool.description) == "function" then tool.description() else tool.description
-end
-
-type Wire = {
-	body: (system: string, messages: { Message }, model: string, compaction: { [string]: any }?) -> { [string]: any },
-	beta: ((model: string) -> string?)?,
-	timeout: number?,
-	reply: (answer: any) -> Reply?,
-}
-
-local function claude_betas(features: Features?): { string }
-	local betas = {}
-	if features then
-		table.insert(betas, "thinking-binding-controls-2026-08-01")
-		if features.display then
-			table.insert(betas, "thinking-display-updates-2026-08-18")
-		end
-		if features.fallbacks then
-			table.insert(betas, "server-side-fallback-2026-07-01")
-		end
-		if features.compaction then
-			table.insert(betas, "compact-2026-09-04")
-		end
-	end
-	return betas
-end
-
-local function gemini_thought(block: Block): { [string]: any }?
-	local signature = (block :: any).signature
-	local step = type(signature) == "string" and json.decode(signature)
-	return type(step) == "table" and step.type == "thought" and step or nil
-end
-
-local function without_gemini_thoughts(messages: { Message }): { Message }
-	local kept = table.create(#messages)
-	for i, message in messages do
-		kept[i] = message
-		if type(message.content) ~= "table" then
-			continue
-		end
-		local blocks = {}
-		for _, block in message.content :: { Block } do
-			if not (block.type == "thinking" and gemini_thought(block)) then
-				table.insert(blocks, block)
-			end
-		end
-		if #blocks < #(message.content :: { Block }) then
-			kept[i] = { role = message.role, content = blocks }
-		end
-	end
-	return kept
-end
-
-local messages_wire: Wire = {
-	body = function(system, messages, model, compaction)
-		local is_claude, features = claude_model(model)
-		local thinking = { type = "adaptive" }
-		if features then
-			thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
-			thinking.display = features.display
-		end
-		local effort = M.effort or (features and features.effort)
-		local system_field: string | { { [string]: any } } = system
-		if is_claude then
-			system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
-		end
-		local specs = json.array({})
-		for _, tool in M.tools do
-			table.insert(specs, { name = tool.name, description = tool_description(tool), input_schema = tool.parameters })
-		end
-		return {
-			model = model,
-			max_tokens = M.max_output,
-			thinking = if is_claude then thinking else nil,
-			output_config = effort and { effort = effort } or nil,
-			fallbacks = features and features.fallbacks,
-			cache_control = { type = "ephemeral" },
-			system = system_field,
-			messages = without_gemini_thoughts(messages),
-			tools = specs,
-			compaction = compaction,
-		}
-	end,
-	beta = function(model)
-		local betas = claude_betas(select(2, claude_model(model)))
-		return #betas > 0 and table.concat(betas, ",") or nil
-	end,
-	reply = function(answer)
-		if type(answer.content) ~= "table" then
-			return nil
-		end
-		after_fallback(answer)
-		return answer
-	end,
-}
-
-M.gemini = {
-	["gemini-4-neon"] = { deepest = "xhigh" },
-	["gemini-4-hydrogen"] = { deepest = "xhigh" },
-}
-local efforts = { "low", "medium", "high", "xhigh", "max" }
-
-local function thinking_level(model: string, effort: string?): string?
-	local deepest = (M.gemini[model] or {}).deepest or "high"
-	local asked = effort and table.find(efforts, effort)
-	return if asked and asked > (table.find(efforts, deepest) :: number) then deepest else effort
-end
-
-local function gemini_content(block: Block): { [string]: any }?
-	if block.type == "text" then
-		return block.text ~= "" and { type = "text", text = block.text } or nil
-	elseif block.type == "image" then
-		return { type = "image", data = block.source.data, mime_type = block.source.media_type }
-	elseif block.type == "compaction" and type(block.content) == "string" then
-		return { type = "text", text = block.content }
-	end
-	return nil
-end
-
-local function gemini_result(block: Block, name: string?): { [string]: any }
-	local content = block.content
-	local parts: { Block } = if type(content) == "table" then content else { { type = "text", text = tostring(content or "") } }
-	local result = json.array({})
-	for _, part in parts do
-		table.insert(result, gemini_content(part))
-	end
-	return { type = "function_result", call_id = block.tool_use_id, name = name, is_error = block.is_error, result = result }
-end
-
-local function gemini_steps(messages: { Message }): { any }
-	local steps = json.array({})
-	local names: { [string]: string } = {}
-	for _, message in messages do
-		local content = message.content
-		local blocks: { Block } = if type(content) == "string" then { { type = "text", text = content } } else content
-		local said: { any }? = nil
-		for _, block in blocks do
-			local part = gemini_content(block)
-			if part then
-				if not said then
-					said = json.array({})
-					table.insert(steps, { type = message.role == "assistant" and "model_output" or "user_input", content = said })
-				end
-				table.insert(said :: { any }, part)
-				continue
-			end
-			local step = nil
-			if block.type == "thinking" then
-				step = gemini_thought(block)
-			elseif block.type == "tool_use" then
-				names[block.id :: string] = block.name :: string
-				step = { type = "function_call", id = block.id, name = block.name, arguments = block.input }
-			elseif block.type == "tool_result" then
-				step = gemini_result(block, names[block.tool_use_id :: string])
-			end
-			if step then
-				said = nil
-				table.insert(steps, step)
-			end
-		end
-	end
-	return steps
-end
-
-local function gemini_blocks(steps: { any }): { Block }
-	local blocks: { Block } = {}
-	for _, step in steps do
-		if step.type == "thought" then
-			local summary = {}
-			for _, part in step.summary or {} do
-				table.insert(summary, part.text)
-			end
-			table.insert(blocks, { type = "thinking", thinking = table.concat(summary, "\n"), signature = json.encode(step) } :: any)
-		elseif step.type == "model_output" then
-			for _, part in step.content or {} do
-				if part.type == "text" then
-					table.insert(blocks, { type = "text", text = part.text })
-				end
-			end
-		elseif step.type == "function_call" then
-			table.insert(blocks, { type = "tool_use", id = step.id, name = step.name, input = step.arguments })
-		end
-	end
-	return blocks
-end
-
-local interactions_wire: Wire = {
-	timeout = 900,
-	body = function(system, messages, model)
-		local specs = json.array({})
-		for _, tool in M.tools do
-			table.insert(specs,
-				{ type = "function", name = tool.name, description = tool_description(tool), parameters = tool.parameters })
-		end
-		local level = thinking_level(model, M.effort)
-		return {
-			model = model,
-			store = false,
-			system_instruction = system,
-			generation_config = level and { thinking_level = level },
-			input = gemini_steps(messages),
-			tools = specs,
-		}
-	end,
-	reply = function(answer)
-		if type(answer.steps) ~= "table" then
-			return nil
-		end
-		local status = answer.status
-		if status ~= "completed" and status ~= "requires_action" and status ~= "incomplete" then
-			local fault = type(answer.errors) == "table" and answer.errors[1] or {}
-			error(("the model request failed (%s): %s"):format(tostring(status), tostring(fault.message or fault.code)), 0)
-		end
-		local counts = type(answer.usage) == "table" and answer.usage or {}
-		local cached = counts.total_cached_tokens or 0
-		local content = gemini_blocks(answer.steps)
-		local calls, said = false, false
-		for _, block in content do
-			calls = calls or block.type == "tool_use"
-			said = said or block.type ~= "thinking"
-		end
-		return {
-			content = if said then content else {},
-			stop_reason = if status == "incomplete" then "max_tokens" elseif calls then "tool_use" else "end_turn",
-			usage = {
-				input_tokens = (counts.total_input_tokens or 0) - cached,
-				cache_read_input_tokens = cached,
-				output_tokens = (counts.total_output_tokens or 0) + (counts.total_thought_tokens or 0),
-			},
-		}
-	end,
-}
-
-local function wire_of(model: string): Wire
-	return if model:match("^gemini%-") then interactions_wire else messages_wire
-end
-
-function M.request(system: string, messages: { Message }, compaction: { [string]: any }?, model: string?): Reply
+function M.request(system: string, steps: { Step }, model: string?): Reply
 	local name = model or M.model
-	local wire = wire_of(name)
-	local body = json.encode(wire.body(system, messages, name, compaction))
-	local endpoint = host.route(name)
-	local options = { beta = wire.beta and wire.beta(name), timeout = wire.timeout }
+	local level = if M.effort == "xhigh" and not M.xhigh[name] then "high" else M.effort
+	local body = json.encode({
+		model = name,
+		store = false,
+		system_instruction = system,
+		generation_config = level and { thinking_level = level },
+		input = steps,
+		tools = tool_specs(),
+	})
 	local attempts = 5
 	for attempt = 1, attempts do
-		local status, text, retry_after = host.post(endpoint, body, options)
+		local status, text, retry_after = host.post("session", body, { timeout = M.request_seconds })
 		if status == 200 then
-			local answer, err = json.decode(text)
-			local reply = type(answer) == "table" and wire.reply(answer)
-			if not reply then
-				error("the model endpoint sent a reply this loop cannot read: " .. (err or text:sub(1, 300)), 0)
-			end
+			local reply = read_reply(text)
 			count_usage(reply, name)
-			if compaction or has_content(reply) then
+			if has_content(reply) then
 				return reply
 			end
 			status, text = "empty reply", "the model sent a reply with nothing in it"
@@ -1621,35 +1402,38 @@ end
 local Conversation = {}
 Conversation.__index = Conversation
 M.Conversation = Conversation
-type ConversationFields = { messages: { Message }, model: string?, on_answer: ((Conversation) -> ())? }
+type ConversationFields = { steps: { Step }, model: string?, on_answer: ((Conversation) -> ())? }
 type Conversation = typeof(setmetatable({} :: ConversationFields, Conversation))
 type State = "idle" | "ready" | "owing"
 
 function Conversation.new(model: string?): Conversation
-	return setmetatable({ messages = {}, model = model, on_answer = nil }, Conversation)
+	return setmetatable({ steps = {}, model = model, on_answer = nil }, Conversation)
 end
 
-local function tool_calls(message: Message): { Block }
+local function owed(steps: { Step }): { Step }
+	local answered: { [string]: boolean } = {}
 	local calls = {}
-	for _, block in message.content :: { Block } do
-		if block.type == "tool_use" then
-			table.insert(calls, block)
+	for i = #steps, 1, -1 do
+		local step = steps[i]
+		if step.type == "user_input" then
+			break
+		elseif step.type == "function_result" then
+			answered[step.call_id :: string] = true
+		elseif step.type == "function_call" and not answered[step.id :: string] then
+			table.insert(calls, 1, step)
 		end
 	end
 	return calls
 end
 
 function Conversation.state(self: Conversation): State
-	local last = self.messages[#self.messages]
+	local last = self.steps[#self.steps]
 	if not last then
 		return "idle"
-	elseif last.role == "user" then
-		return "ready"
-	end
-	if #tool_calls(last) > 0 then
+	elseif #owed(self.steps) > 0 then
 		return "owing"
 	end
-	return "idle"
+	return if last.type == "user_input" or last.type == "function_result" then "ready" else "idle"
 end
 
 local function expect(self: Conversation, operation: string, ...: State)
@@ -1664,40 +1448,31 @@ end
 
 function Conversation.say(self: Conversation, text: string)
 	expect(self, "say", "idle", "ready")
-	local last = self.messages[#self.messages]
-	if not last or last.role ~= "user" then
-		table.insert(self.messages, { role = "user", content = text })
-		return
+	local last = self.steps[#self.steps]
+	if last and last.type == "user_input" then
+		table.insert(last.content :: { Part }, { type = "text", text = text })
+	else
+		table.insert(self.steps, { type = "user_input", content = { { type = "text", text = text } } })
 	end
-	local content = last.content
-	local blocks: { Block } = if type(content) == "string" then { { type = "text", text = content } } else content
-	last.content = blocks
-	table.insert(blocks, { type = "text", text = text })
 end
 
-function Conversation.reply(self: Conversation, content: { Block }): { Block }
+function Conversation.reply(self: Conversation, steps: { Step }): { Step }
 	expect(self, "reply", "ready")
-	if #content == 0 then
-		return {}
-	end
-	local message: Message = { role = "assistant", content = content }
-	table.insert(self.messages, message)
-	return tool_calls(message)
+	table.move(steps, 1, #steps, #self.steps + 1, self.steps)
+	return owed(self.steps)
 end
 
-function Conversation.answer(self: Conversation, run: (Block) -> (string, boolean?, { Block }?))
+function Conversation.answer(self: Conversation, run: (Step) -> (string, boolean?, { Part }?))
 	expect(self, "answer", "owing")
-	local results: { Block } = {}
-	for _, call in tool_calls(self.messages[#self.messages]) do
+	local results: { Step } = {}
+	for _, call in owed(self.steps) do
 		local text, failed, images = run(call)
-		local is_error: boolean? = failed or nil
-		local content: any = text
-		if images and #images > 0 then
-			content = table.move(images, 1, #images, 2, { { type = "text", text = text } })
-		end
-		table.insert(results, { type = "tool_result", tool_use_id = call.id, content = content, is_error = is_error })
+		local result: { Part } = { { type = "text", text = text } }
+		table.move(images or {}, 1, #(images or {}), 2, result)
+		table.insert(results,
+			{ type = "function_result", call_id = call.id, name = call.name, is_error = failed or nil, result = result })
 	end
-	table.insert(self.messages, { role = "user", content = results })
+	table.move(results, 1, #results, #self.steps + 1, self.steps)
 	if self.on_answer then
 		self.on_answer(self)
 	end
@@ -1713,78 +1488,50 @@ end
 
 function Conversation.restart(self: Conversation, text: string)
 	expect(self, "restart", "idle", "ready")
-	table.clear(self.messages)
+	table.clear(self.steps)
 	self:say(text)
-end
-
-function Conversation.resume(self: Conversation, block: Block, text: string)
-	expect(self, "resume", "idle", "ready")
-	table.clear(self.messages)
-	table.insert(self.messages, { role = "user", content = { block, { type = "text", text = text } } })
 end
 
 function Conversation.fork(self: Conversation): Conversation
 	local copy = Conversation.new(self.model)
-	copy.messages = table.clone(self.messages)
-	local last = copy.messages[#copy.messages]
-	if last and type(last.content) == "table" then
-		copy.messages[#copy.messages] = { role = last.role, content = table.clone(last.content) }
+	copy.steps = table.clone(self.steps)
+	local last = copy.steps[#copy.steps]
+	if last and last.type == "user_input" then
+		copy.steps[#copy.steps] = { type = "user_input", content = table.clone(last.content :: { Part }) }
 	end
 	return copy
 end
 
 function Conversation.problem(self: Conversation): string?
-	local owed: { Block }? = nil
-	for i, message in self.messages do
-		local expected = i % 2 == 1 and "user" or "assistant"
-		if message.role ~= expected then
-			return ("message %d is from the %s, where the %s should speak"):format(i, tostring(message.role), expected)
-		end
-		if message.role == "assistant" then
-			if type(message.content) ~= "table" or #message.content == 0 then
-				return ("message %d is an empty reply"):format(i)
+	local open: { [string]: boolean } = {}
+	local unanswered = 0
+	for i, step in self.steps do
+		if type(step) ~= "table" then
+			return ("step %d is not a step"):format(i)
+		elseif i == 1 and step.type ~= "user_input" then
+			return "step 1 is the model's, where the user should speak"
+		elseif step.type == "function_call" then
+			open[step.id :: string] = true
+			unanswered += 1
+		elseif step.type == "function_result" then
+			if not open[step.call_id :: string] then
+				return ("step %d answers a tool call that was not made"):format(i)
 			end
-			owed = tool_calls(message)
-		else
-			local answered = 0
-			local content = message.content
-			local blocks: { Block } = if type(content) == "table" then content else {}
-			for j, block in blocks do
-				if block.type == "tool_result" then
-					answered += 1
-					if answered ~= j then
-						return ("message %d has a tool result behind other content"):format(i)
-					end
-					if not owed or not owed[answered] or owed[answered].id ~= block.tool_use_id then
-						return ("message %d answers a tool call that was not made"):format(i)
-					end
-				end
-			end
-			if owed and answered ~= #owed then
-				return ("message %d leaves a tool call unanswered"):format(i)
-			end
-			owed = nil
+			open[step.call_id :: string] = nil
+			unanswered -= 1
+		elseif unanswered > 0 then
+			return ("step %d leaves a tool call unanswered"):format(i)
 		end
 	end
 	return nil
 end
 
-local function text_of(reply: Reply): string
-	local parts = {}
-	for _, block in reply.content do
-		if block.type == "text" then
-			table.insert(parts, block.text)
-		end
-	end
-	return table.concat(parts, "\n")
-end
-
-local function ask(system: string, talk: Conversation, compaction: { [string]: any }?): Reply
+local function ask(system: string, talk: Conversation): Reply
 	local problem = talk:state() ~= "ready" and "it is " .. talk:state() .. ", not ready" or talk:problem()
 	if problem then
 		error("this conversation cannot be sent: " .. problem, 0)
 	end
-	return M.request(system, talk.messages, compaction, talk.model)
+	return M.request(system, talk.steps, talk.model)
 end
 
 M.compact_prompt = table.concat({
@@ -1835,49 +1582,16 @@ function M.resume_text(): string
 		table.concat(listed, ", "), more)
 end
 
-local function ask_for_summary(system: string, talk: Conversation, compaction: { [string]: any }?): Reply?
-	local ok, reply = pcall(ask, system, talk, compaction)
-	if not ok then
-		progress("  compaction failed, the conversation stays as it is: " .. tostring(reply))
-		return nil
-	end
-	return reply
-end
-
-local function compact_on_server(system: string, talk: Conversation)
-	local reply = ask_for_summary(system, talk, { type = "summarize", instructions = M.compact_prompt })
-	if not reply then
-		return
-	end
-	local block: Block? = nil
-	if reply.stop_reason == "compaction" then
-		for _, b in reply.content do
-			if b.type == "compaction" then
-				block = b
-			end
-		end
-	end
-	if not block then
-		progress(("  no summary came back (%s); keeping the conversation as it is"):format(tostring(reply.stop_reason)))
-		return
-	end
-	talk:resume(block, M.resume_text())
-end
-
 function M.compact(system: string, talk: Conversation)
 	progress("  compacting the conversation")
-	local _, features = claude_model(talk.model or M.model)
-	if features and features.compaction then
-		compact_on_server(system, talk)
-		return
-	end
 	local asking = talk:fork()
 	asking:say(M.compact_prompt)
-	local reply = ask_for_summary(system, asking, nil)
-	if not reply then
+	local ok, reply = pcall(ask, system, asking)
+	if not ok then
+		progress("  compaction failed, the conversation stays as it is: " .. tostring(reply))
 		return
 	end
-	local summary = text_of(reply)
+	local summary = text_of(reply.steps)
 	if summary == "" then
 		progress("  no summary came back; keeping the conversation as it is")
 		return
@@ -1899,20 +1613,14 @@ function M.repeat_reminder(call: string, count: number, first: boolean): string
 		.. "action that will change the result, finish now and say what you found."):format(call, count)
 end
 
-local function show_text(reply: Reply, model: string)
-	local _, features = claude_model(model)
-	local updates = features and features.display == "updates"
-	for _, block in reply.content do
-		if block.type == "text" and block.text ~= "" then
-			local text = block.text :: string
-			if live.agent then
-				progress(text)
-			else
-				print(host.tty and M.printable(text) or text)
-			end
-		elseif updates and block.type == "thinking" and type(block.thinking) == "string" and block.thinking ~= "" then
-			progress("  " .. M.printable(block.thinking))
-		end
+local function show_text(reply: Reply)
+	local text = text_of(reply.steps)
+	if text == "" then
+		return
+	elseif live.agent then
+		progress(text)
+	else
+		print(host.tty and M.printable(text) or text)
 	end
 end
 
@@ -1929,9 +1637,9 @@ local function turn(system: string, talk: Conversation): Reply
 	local waited = false
 	for _ = 1, M.max_replies do
 		local reply = ask(system, talk)
-		local cut_off = reply.stop_reason == "max_tokens"
-		show_text(reply, talk.model or M.model)
-		local calls = talk:reply(reply.content)
+		local cut_off = reply.status == "incomplete"
+		show_text(reply)
+		local calls = talk:reply(reply.steps)
 		if #calls > 0 then
 			talk:answer(function(call)
 				if cut_off then
@@ -1949,17 +1657,12 @@ local function turn(system: string, talk: Conversation): Reply
 				reminded = M.repeat_reminders[due]
 				talk:say(M.repeat_reminder(worst.call, worst.count, due == 1))
 			end
-			if prompt_tokens(reply.usage or {}) > M.compact_at then
+			if ((reply.usage or {}).total_input_tokens or 0) > M.compact_at then
 				M.compact(system, talk)
 			end
 		elseif cut_off then
 			talk:say("Your reply was cut off by the output limit. Continue.")
 		else
-			if reply.stop_reason == "refusal" then
-				local details = type(reply.stop_details) == "table" and reply.stop_details or {}
-				local category = type(details.category) == "string" and " (" .. details.category .. ")" or ""
-				host.log("[the model declined to answer" .. category .. "]")
-			end
 			local busy = if live.turns == 1 and not live.agent and not waited then at_work() else {}
 			if #busy == 0 then
 				return reply
@@ -1971,8 +1674,8 @@ local function turn(system: string, talk: Conversation): Reply
 	talk:say(("You have used all %d replies this task allows. Do not call any more tools. Write your final "
 		.. "report now: what you changed, what you checked, what is left."):format(M.max_replies))
 	local reply = ask(system, talk)
-	show_text(reply, talk.model or M.model)
-	if #talk:reply(reply.content) > 0 then
+	show_text(reply)
+	if #talk:reply(reply.steps) > 0 then
 		talk:abandon("the reply limit was reached")
 	end
 	error(("stopped after %d model replies without a final answer"):format(M.max_replies), 0)
@@ -1981,12 +1684,12 @@ end
 local started_at, started_ns = host.wall_time()
 local log_path = (".hx/log/%s-t%dn%09dx%s.json"):format(os.date("%Y%m%d-%H%M%S", started_at), started_at, started_ns,
 	(host.env("TMPDIR") :: string? or ""):match("([%w]+)/*$") or "0")
-local function save(system: string, messages: { Message }, path: string)
+local function save(system: string, steps: { Step }, path: string)
 	if host.list(".hx") then
 		if not host.read(".hx/log/.gitignore") then
 			host.write(".hx/log/.gitignore", "*\n")
 		end
-		host.write(path, json.encode({ system = system, messages = messages }))
+		host.write(path, json.encode({ system = system, steps = steps }))
 	end
 end
 
@@ -2007,7 +1710,7 @@ function M.turn(system: string, talk: Conversation)
 	local path: string? = if live.turns > 0 then sub_log(talk) else nil
 	if path and not talk.on_answer then
 		talk.on_answer = function()
-			save(system, talk.messages, path)
+			save(system, talk.steps, path)
 		end
 	end
 	live.repeats = { counts = {}, worst = nil }
@@ -2016,7 +1719,7 @@ function M.turn(system: string, talk: Conversation)
 	live.turns -= 1
 	live.repeats = outer
 	if path then
-		save(system, talk.messages, path)
+		save(system, talk.steps, path)
 	end
 	if not ok then
 		error(err, 0)
@@ -2024,6 +1727,7 @@ function M.turn(system: string, talk: Conversation)
 end
 
 M.agent_model = nil :: string?
+M.workflow_agents = { rpi = "gemini-4-hydrogen" }
 M.agent_limit = 8
 M.agent_wait = 270
 M.agent_seconds = 1800
@@ -2062,7 +1766,7 @@ function at_work(): { string }
 end
 
 local function agent_model(): string
-	return M.agent_model or (if host.endpoints.deepseek then "deepseek-flash" else M.model)
+	return M.agent_model or M.workflow_agents[host.workflow or ""] or M.model
 end
 
 local function agent_named(name: string): Agent
@@ -2100,11 +1804,11 @@ local function work(agent: Agent, system: string): string
 		local was_owing = agent.talk:state() == "owing"
 		agent.talk:abandon("the turn ended: " .. tostring(err))
 		if not was_owing then
-			save(system, agent.talk.messages, sub_log(agent.talk))
+			save(system, agent.talk.steps, sub_log(agent.talk))
 		end
 	end
 	return json.encode({
-		messages = agent.talk.messages,
+		steps = agent.talk.steps,
 		usage = live.usage,
 		wrote = live.wrote,
 		seen = live.seen,
@@ -2141,10 +1845,10 @@ end
 
 local function finish(agent: Agent, returned: boolean, text: string)
 	agent.state, agent.id = "idle", nil
-	local done: { messages: { Message }, usage: { Count }, wrote: { string }?, seen: any, seconds: number, error: string? }? = nil
+	local done: { steps: { Step }, usage: { Count }, wrote: { string }?, seen: any, seconds: number, error: string? }? = nil
 	if returned then
 		local decoded: any = json.decode(text)
-		if type(decoded) == "table" and type(decoded.messages) == "table" then
+		if type(decoded) == "table" and type(decoded.steps) == "table" then
 			done = decoded
 		end
 	end
@@ -2162,24 +1866,20 @@ local function finish(agent: Agent, returned: boolean, text: string)
 			if returned then "its result could not be read" else text, trail(agent, {})):gsub("\n$", "")
 		return
 	end
-	agent.talk.messages = done.messages
+	agent.talk.steps = done.steps
 	agent.seen = if type(done.seen) == "table" then done.seen else {}
 	for _, count in done.usage do
 		local mine = count_of(count.model)
 		mine.replies += count.replies
 		mine.input += count.input
 		mine.cached += count.cached
-		mine.written += count.written
 		mine.output += count.output
 	end
-	local last, words = done.messages[#done.messages], {}
-	if last and last.role == "assistant" and type(last.content) == "table" then
-		for _, block in last.content do
-			if block.type == "text" and block.text ~= "" then
-				table.insert(words, block.text :: string)
-			end
-		end
+	local said = #done.steps
+	while said > 0 and done.steps[said].type ~= "user_input" and done.steps[said].type ~= "function_result" do
+		said -= 1
 	end
+	local words = text_of(table.move(done.steps, said + 1, #done.steps, 1, {}))
 	local how, failure = ("done in %.0f s"):format(done.seconds), done.error
 	if failure == "timeout" then
 		how = ("stopped at the %.0f s one run may take"):format(M.agent_seconds)
@@ -2187,7 +1887,7 @@ local function finish(agent: Agent, returned: boolean, text: string)
 		how = ("failed after %.0f s: %s"):format(done.seconds, failure)
 	end
 	agent.report = ("[agent %s: %s]\n%s%s"):format(agent.name, how, trail(agent, done.wrote or {}),
-		if #words > 0 then table.concat(words, "\n") else "(it said nothing)")
+		if words ~= "" then words else "(it said nothing)")
 end
 
 local function checked_tasks(tasks: any): { { name: string, task: string?, stop: boolean? } }
@@ -2351,11 +2051,11 @@ end
 local function report()
 	local used: { Count } = live.usage
 	if #used == 0 then
-		used = { { model = M.model, replies = 0, input = 0, cached = 0, written = 0, output = 0 } }
+		used = { { model = M.model, replies = 0, input = 0, cached = 0, output = 0 } }
 	end
 	for _, usage in used do
-		progress(("[%s%d replies, %d tokens in (%d read from cache, %d written to it), %d out]"):format(
-			#used > 1 and usage.model .. ": " or "", usage.replies, usage.input, usage.cached, usage.written, usage.output))
+		progress(("[%s%d replies, %d tokens in (%d read from cache), %d out]"):format(
+			#used > 1 and usage.model .. ": " or "", usage.replies, usage.input, usage.cached, usage.output))
 	end
 end
 
@@ -2415,16 +2115,16 @@ end
 function M.resumed(talk: Conversation, named: string)
 	local path = M.resume_log(named)
 	local ok, saved = pcall(json.decode, or_raise(host.read(path)))
-	if not ok or type(saved) ~= "table" or type(saved.messages) ~= "table" then
+	if not ok or type(saved) ~= "table" or type(saved.steps) ~= "table" then
 		error(("--resume: %s is not a conversation hx saved"):format(path), 0)
 	end
-	talk.messages = saved.messages
+	talk.steps = saved.steps
 	local problem = talk:problem()
 	if problem then
 		error(("--resume: %s cannot be gone on from: %s"):format(path, problem), 0)
 	end
 	talk:abandon("the session ended before this call was answered")
-	progress(("hx: going on from %s, %d messages"):format(path, #talk.messages))
+	progress(("hx: going on from %s, %d steps"):format(path, #talk.steps))
 end
 
 function M.main(): number
@@ -2435,7 +2135,7 @@ function M.main(): number
 	end
 	local talk = Conversation.new()
 	talk.on_answer = function()
-		save(system, talk.messages, log_path)
+		save(system, talk.steps, log_path)
 	end
 	local task = table.concat(host.args, " ")
 	if host.resume then
@@ -2455,7 +2155,7 @@ function M.main(): number
 		end
 		talk:say(task)
 		local ok, err = host.try(M.turn, system, talk)
-		save(system, talk.messages, log_path)
+		save(system, talk.steps, log_path)
 		report()
 		if not ok then
 			error(err, 0)
@@ -2483,7 +2183,7 @@ function M.main(): number
 			local ok, err = host.try(M.turn, system, talk)
 			if not ok then
 				if err == "terminated" then
-					save(system, talk.messages, log_path)
+					save(system, talk.steps, log_path)
 					host.log(PASTE_OFF)
 					error(err, 0)
 				end
@@ -2495,7 +2195,7 @@ function M.main(): number
 					host.log(M.printable("[the turn failed: " .. tostring(err) .. "]"))
 				end
 			end
-			save(system, talk.messages, log_path)
+			save(system, talk.steps, log_path)
 		end
 	end
 	host.log(PASTE_OFF)

@@ -76,32 +76,6 @@ struct CurlMimeDeleter {
 };
 using CurlMime = std::unique_ptr<curl_mime, CurlMimeDeleter>;
 
-std::string string_option(lua_State* L, int idx, const char* field, std::string_view fallback) {
-    if (lua_isnoneornil(L, idx)) {
-        return std::string(fallback);
-    }
-    luaL_checktype(L, idx, LUA_TTABLE);
-    lua_getfield(L, idx, field);
-    std::string value(fallback);
-    if (!lua_isnil(L, -1)) {
-        std::size_t length = 0;
-        const char* text = luaL_checklstring(L, -1, &length);
-        value.assign(text, length);
-    }
-    lua_pop(L, 1);
-    return value;
-}
-
-std::string beta_option(lua_State* L, int idx) {
-    const std::string value = string_option(L, idx, "beta", "");
-    for (const char c : value) {
-        if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '-' && c != '_' && c != ',') {
-            luaL_error(L, "host.post: beta is beta names separated by commas, not %s", value.c_str());
-        }
-    }
-    return value;
-}
-
 constexpr std::string_view key_header(Auth auth) noexcept {
     switch (auth) {
         case Auth::Bearer:
@@ -119,9 +93,6 @@ int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     Headers headers;
     if (!endpoint.key.empty()) {
         headers.add(fmt::format("{}{}", key_header(endpoint.auth), endpoint.key));
-    }
-    for (const std::string& header : endpoint.headers) {
-        headers.add(header);
     }
     for (const std::string_view header : extra) {
         if (!header.empty()) {
@@ -245,8 +216,8 @@ std::optional<std::string> fill_form(lua_State* L, curl_mime* mime, int idx) {
 
 }  // namespace
 
-HttpClient::HttpClient(std::vector<Endpoint> endpoints, std::string model, std::string ca_bundle)
-    : endpoints_(std::move(endpoints)), model_(std::move(model)), ca_bundle_(std::move(ca_bundle)) {}
+HttpClient::HttpClient(std::vector<Endpoint> endpoints, std::string ca_bundle)
+    : endpoints_(std::move(endpoints)), ca_bundle_(std::move(ca_bundle)) {}
 
 HttpClient::~HttpClient() = default;
 
@@ -268,13 +239,6 @@ CURL* HttpClient::curl() {
     return curl_.get();
 }
 
-int HttpClient::route(lua_State* L) const {
-    const std::string_view vendor = vendor_of(check_cstring(L, 1));
-    const std::string_view name = vendor == vendor_of(model_) ? kSessionEndpoint : vendor;
-    lua_pushlstring(L, name.data(), name.size());
-    return 1;
-}
-
 int HttpClient::post(lua_State* L, double deadline) {
     const std::string_view name = check_cstring(L, 1);
     const Endpoint* target = endpoint(name);
@@ -286,7 +250,6 @@ int HttpClient::post(lua_State* L, double deadline) {
         luaL_checktype(L, 2, LUA_TSTRING);
     }
     const double timeout = within_limit(deadline, option(L, 3, "timeout", 600));
-    const std::string beta = beta_option(L, 3);
     raise_if_signaled(L);
     if (target->key.empty() && !target->key_env.empty()) {
         return fail(L, fmt::format("no {}: hx was started without one, so host.post cannot reach the {} endpoint",
@@ -296,12 +259,11 @@ int HttpClient::post(lua_State* L, double deadline) {
     if (handle == nullptr) {
         return fail(L, "cannot start an HTTP request");
     }
-    const std::string beta_header = beta.empty() ? "" : fmt::format("anthropic-beta: {}", beta);
     if (!form) {
         std::size_t length = 0;
         const char* body = lua_tolstring(L, 2, &length);
         set_body(handle, {body, length});
-        return send(L, handle, *target, {"Content-Type: application/json", beta_header}, timeout, deadline, ca_bundle_);
+        return send(L, handle, *target, {"Content-Type: application/json"}, timeout, deadline, ca_bundle_);
     }
     const CurlMime mime(curl_mime_init(handle));
     if (!mime) {
@@ -311,7 +273,7 @@ int HttpClient::post(lua_State* L, double deadline) {
         luaL_error(L, "host.post: %s", error->c_str());
     }
     curl_easy_setopt(handle, CURLOPT_MIMEPOST, mime.get());
-    return send(L, handle, *target, {beta_header}, timeout, deadline, ca_bundle_);
+    return send(L, handle, *target, {}, timeout, deadline, ca_bundle_);
 }
 
 }  // namespace hx

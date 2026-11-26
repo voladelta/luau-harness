@@ -57,7 +57,7 @@ int run_sh(lua_State* L, double deadline, const std::vector<Rule>& system_rules)
 
 class HttpClient {
   public:
-    HttpClient(std::vector<Endpoint> endpoints, std::string model, std::string ca_bundle);
+    HttpClient(std::vector<Endpoint> endpoints, std::string ca_bundle);
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
     ~HttpClient();
@@ -65,7 +65,6 @@ class HttpClient {
     [[nodiscard]] const std::vector<Endpoint>& endpoints() const noexcept { return endpoints_; }
     void reset_handle() noexcept { curl_.reset(); }
 
-    int route(lua_State* L) const;
     int post(lua_State* L, double deadline);
 
   private:
@@ -77,7 +76,6 @@ class HttpClient {
     CURL* curl();
 
     std::vector<Endpoint> endpoints_;
-    std::string model_;
     std::string ca_bundle_;
     std::unique_ptr<CURL, CurlDeleter> curl_;
 };

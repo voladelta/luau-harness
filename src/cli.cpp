@@ -44,8 +44,8 @@ usage:
                                       with --full, a copy of the whole built-in loop
   hx --judge KIT [options] [TASK...]  run the agent with a judge: only changes it submits and the kit's
                                       measurements confirm count; KIT must lie outside the wall
-  hx --rpi [options] [TASK...]        run the agent as a lead, on Opus: it researches and plans, agents
-                                      on deepseek-flash implement side by side, and it verifies their work
+  hx --rpi [options] [TASK...]        run the agent as a lead, on Carbon: it researches and plans, agents
+                                      on Hydrogen implement side by side, and it verifies their work
 
 examples:
   hx "add a --json flag to the export command and test it"
@@ -55,14 +55,13 @@ examples:
   hx -q "summarise the README" > summary.txt
 
 options:
-  --model NAME      model to ask (overrides HX_MODEL): opus, sonnet, haiku, carbon, argon, neon,
-                    hydrogen or a full name
+  --model NAME      model to ask (overrides HX_MODEL): carbon, argon, neon, hydrogen or a full name
   --judge KIT       judge the agent's changes with the kit in directory KIT (run, and optionally build
                     and check); the agent cannot read the kit, and the champion, its patch and the
                     ledger go to a directory outside the wall
-  --rpi             lead the task by the rpi workflow (research, plan, implement): the model is opus
+  --rpi             lead the task by the rpi workflow (research, plan, implement): the model is carbon
                     unless --model names another, whatever HX_MODEL says, and its agents run on
-                    deepseek-flash when DEEPSEEK_API_KEY is set, on the lead's model otherwise
+                    gemini-4-hydrogen
   --endpoint NAME=URL
                     one more endpoint for host.post(NAME, body), for an extension of yours: its key is
                     read from NAME_API_KEY (my-api has MY_API_API_KEY) and sent as a Bearer token, to
@@ -86,33 +85,18 @@ options:
   A value can follow its option as the next word or after =, as in --ro=PATH.
 
 environment:
-  HX_MODEL          model name; opus, sonnet and haiku are the current Claude models, and carbon,
-                    argon, neon and hydrogen the Gemini 4 ones (default deepseek-flash; without
-                    DEEPSEEK_API_KEY, claude-opus-5-5 when ANTHROPIC_API_KEY is set, or
-                    gemini-4-neon when GEMINI_API_KEY is)
-  HX_API_URL        the session's endpoint: Gemini's Interactions API for a gemini-* model, the
-                    Anthropic Messages format otherwise (default
-                    https://api.anthropic.com/v1/messages for a claude-* model,
-                    https://generativelanguage.googleapis.com/v1beta/interactions for a gemini-*
-                    one, https://api.deepseek.com/anthropic/v1/messages otherwise)
-  HX_KEY_ENV        name of the variable that holds the API key (default ANTHROPIC_API_KEY for a
-                    claude-* model, GEMINI_API_KEY for a gemini-* one, DEEPSEEK_API_KEY otherwise)
-  HX_EFFORT         how hard the model thinks: low, medium, high, xhigh or max (default: medium on
-                    the Claude models hx knows, the endpoint's own otherwise)
-  HX_TOOLS_URL      base of DeepSeek's search, fetch and OCR endpoints, which the built-in web and ocr
-                    extensions use with DEEPSEEK_API_KEY, whatever the model (default
-                    https://api.deepseek.com/v1/tools)
-  HX_EXA_URL        Exa's search endpoint, which the built-in exa extension uses for deep search with
-                    EXA_API_KEY, whatever the model (default https://api.exa.ai/search)
-  HX_DEEPSEEK_URL   DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude
-                    model is asked through, an agent say, with DEEPSEEK_API_KEY (default
-                    https://api.deepseek.com/anthropic/v1/messages)
-  HX_ANTHROPIC_URL  Anthropic's Messages endpoint, which a Claude model under a session on another
-                    model is asked through, with ANTHROPIC_API_KEY (default
-                    https://api.anthropic.com/v1/messages)
-  HX_GEMINI_URL     Gemini's Interactions endpoint, which a Gemini model under a session on another
-                    model is asked through, with GEMINI_API_KEY (default
+  HX_MODEL          model name; carbon, argon, neon and hydrogen are the Gemini 4 models (default
+                    gemini-4-neon)
+  HX_API_URL        the model endpoint, which speaks Gemini's Interactions API (default
                     https://generativelanguage.googleapis.com/v1beta/interactions)
+  HX_KEY_ENV        name of the variable that holds the API key (default GEMINI_API_KEY)
+  HX_EFFORT         the model's thinking level: minimal, low, medium, high or xhigh, where xhigh is
+                    high on a model without it (default: the model's own)
+  HX_EXA_URL        Exa's search endpoint, which the built-in web and exa extensions search through
+                    with EXA_API_KEY (default https://api.exa.ai/search)
+  HX_EXA_CONTENTS_URL
+                    Exa's contents endpoint, which the built-in web extension reads pages through
+                    with EXA_API_KEY (default https://api.exa.ai/contents)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.
@@ -123,116 +107,50 @@ exit status:
 docs: https://github.com/voladelta/luau-harness
 )";
 
-struct Vendor {
-    std::string_view name;
-    const char* url;
-    const char* url_env;
-    const char* key_env;
-    Auth auth;
-    const char* version;
-    const char* model;
-};
-
-constexpr Vendor kVendors[] = {
-    {
-        .name = "anthropic",
-        .url = "https://api.anthropic.com/v1/messages",
-        .url_env = "HX_ANTHROPIC_URL",
-        .key_env = "ANTHROPIC_API_KEY",
-        .auth = Auth::ApiKey,
-        .version = "anthropic-version: 2026-10-21",
-        .model = "claude-opus-5-5",
-    },
-    {
-        .name = "deepseek",
-        .url = "https://api.deepseek.com/anthropic/v1/messages",
-        .url_env = "HX_DEEPSEEK_URL",
-        .key_env = "DEEPSEEK_API_KEY",
-        .auth = Auth::ApiKey,
-        .version = "anthropic-version: 2023-06-01",
-        .model = "deepseek-flash",
-    },
-    {
-        .name = "gemini",
-        .url = "https://generativelanguage.googleapis.com/v1beta/interactions",
-        .url_env = "HX_GEMINI_URL",
-        .key_env = "GEMINI_API_KEY",
-        .auth = Auth::GoogleKey,
-        .version = nullptr,
-        .model = "gemini-4-neon",
-    },
-};
-constexpr const Vendor& kDeepSeek = kVendors[1];
-
-constexpr const char* kToolsUrl = "https://api.deepseek.com/v1/tools";
+constexpr const char* kModelUrl = "https://generativelanguage.googleapis.com/v1beta/interactions";
+constexpr const char* kModelKeyEnv = "GEMINI_API_KEY";
+constexpr const char* kModel = "gemini-4-neon";
 
 struct Service {
     const char* name;
     const char* url;
     const char* url_env;
-    const char* path;
     const char* key_env;
     Auth auth;
 };
 
 constexpr Service kServices[] = {
     {
-        .name = "search",
-        .url = kToolsUrl,
-        .url_env = "HX_TOOLS_URL",
-        .path = "/search",
-        .key_env = kDeepSeek.key_env,
-        .auth = Auth::Bearer,
-    },
-    {
-        .name = "fetch",
-        .url = kToolsUrl,
-        .url_env = "HX_TOOLS_URL",
-        .path = "/fetch",
-        .key_env = kDeepSeek.key_env,
-        .auth = Auth::Bearer,
-    },
-    {
-        .name = "ocr",
-        .url = kToolsUrl,
-        .url_env = "HX_TOOLS_URL",
-        .path = "/ocr",
-        .key_env = kDeepSeek.key_env,
-        .auth = Auth::Bearer,
-    },
-    {
         .name = "exa",
         .url = "https://api.exa.ai/search",
         .url_env = "HX_EXA_URL",
-        .path = "",
+        .key_env = "EXA_API_KEY",
+        .auth = Auth::ApiKey,
+    },
+    {
+        .name = "contents",
+        .url = "https://api.exa.ai/contents",
+        .url_env = "HX_EXA_CONTENTS_URL",
         .key_env = "EXA_API_KEY",
         .auth = Auth::ApiKey,
     },
 };
 
 constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
-    {"opus", "claude-opus-5-5"},
-    {"sonnet", "claude-sonnet-5-5"},
-    {"haiku", "claude-haiku-5-5"},
     {"carbon", "gemini-4-carbon"},
     {"argon", "gemini-4-argon"},
     {"neon", "gemini-4-neon"},
     {"hydrogen", "gemini-4-hydrogen"},
 };
-constexpr std::string_view kRpiLead = "opus";
+constexpr std::string_view kRpiLead = "carbon";
 constexpr const char* kRpiWorkflow = "rpi";
-constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh", "max"};
+constexpr std::string_view kEfforts[] = {"minimal", "low", "medium", "high", "xhigh"};
 
 constexpr std::string_view kOptionNames[] = {
     "--model",   "--ro",       "--rw",   "--keep-env",      "--unix-sockets", "--no-sandbox",
     "--quiet",   "--no-input", "--init", "--full",          "--run",          "--help",
     "--version", "--judge",    "--rpi",  "--built-in-loop", "--resume",       "--endpoint",
 };
-
-const Vendor& find_vendor(std::string_view model) {
-    const auto* const found = std::ranges::find(kVendors, vendor_of(model), &Vendor::name);
-    return found != std::end(kVendors) ? *found : kDeepSeek;
-}
 
 std::size_t distance(std::string_view a, std::string_view b) {
     std::vector<std::size_t> row(b.size() + 1);
@@ -303,8 +221,7 @@ class OptionWord {
 };
 
 bool is_built_in_endpoint(std::string_view name) {
-    return name == kSessionEndpoint || std::ranges::find(kVendors, name, &Vendor::name) != std::end(kVendors) ||
-           std::ranges::find(kServices, name, &Service::name) != std::end(kServices);
+    return name == kSessionEndpoint || std::ranges::find(kServices, name, &Service::name) != std::end(kServices);
 }
 
 Endpoint named_endpoint(std::string_view pair, const std::vector<Endpoint>& taken) {
@@ -337,7 +254,6 @@ Endpoint named_endpoint(std::string_view pair, const std::vector<Endpoint>& take
         .auth = Auth::Bearer,
         .key = "",
         .key_env = key_env + "_API_KEY",
-        .headers = {},
     };
 }
 
@@ -406,24 +322,10 @@ struct ModelChoice {
     std::string model;
     std::string url;
     std::string key_env;
-    const Vendor* vendor;
 };
 
-const Vendor& default_vendor() {
-    const auto has_key = [](const Vendor& vendor) { return !env_or(vendor.key_env, "").empty(); };
-    if (has_key(kDeepSeek) || !env_or("HX_API_URL", "").empty()) {
-        return kDeepSeek;
-    }
-    const auto* const keyed = std::ranges::find_if(kVendors, has_key);
-    return keyed != std::end(kVendors) ? *keyed : kDeepSeek;
-}
-
-std::vector<std::string> version_headers(const Vendor& vendor) {
-    return vendor.version != nullptr ? std::vector<std::string>{vendor.version} : std::vector<std::string>{};
-}
-
-ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
-    std::string model = rpi ? std::string(kRpiLead) : env_or("HX_MODEL", "");
+ModelChoice choose_model(const std::optional<std::string>& flag, bool rpi) {
+    std::string model = rpi ? std::string(kRpiLead) : env_or("HX_MODEL", kModel);
     if (flag) {
         model = *flag;
     }
@@ -432,15 +334,10 @@ ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
             model = name;
         }
     }
-    if (model.empty()) {
-        model = default_vendor().model;
-    }
-    const Vendor& vendor = find_vendor(model);
     return {
         .model = model,
-        .url = env_or("HX_API_URL", vendor.url),
-        .key_env = env_or("HX_KEY_ENV", vendor.key_env),
-        .vendor = &vendor,
+        .url = env_or("HX_API_URL", kModelUrl),
+        .key_env = env_or("HX_KEY_ENV", kModelKeyEnv),
     };
 }
 
@@ -448,25 +345,14 @@ void check_effort() {
     if (const std::string effort = env_or("HX_EFFORT", ""); effort.empty()) {
         unsetenv("HX_EFFORT");  // NOLINT(concurrency-mt-unsafe)
     } else if (std::ranges::find(kEfforts, effort) == std::end(kEfforts)) {
-        throw UsageError(fmt::format("HX_EFFORT={}: the efforts are low, medium, high, xhigh and max", effort));
+        throw UsageError(fmt::format("HX_EFFORT={}: the efforts are minimal, low, medium, high and xhigh", effort));
     }
-}
-
-std::string service_url(const Service& service) {
-    std::string url = env_or(service.url_env, service.url);
-    while (*service.path != '\0' && url.ends_with('/')) {
-        url.pop_back();
-    }
-    return url + service.path;
 }
 
 std::vector<std::string> key_envs(const ModelChoice& model, const std::vector<Endpoint>& added) {
-    std::vector<std::string> names{model.key_env};
+    std::vector<std::string> names{model.key_env, kModelKeyEnv};
     for (const Endpoint& endpoint : added) {
         names.emplace_back(endpoint.key_env);
-    }
-    for (const Vendor& vendor : kVendors) {
-        names.emplace_back(vendor.key_env);
     }
     for (const Service& service : kServices) {
         names.emplace_back(service.key_env);
@@ -484,29 +370,17 @@ std::vector<Endpoint> resolve_endpoints(const ModelChoice& model, const std::vec
     list.push_back({
         .name = std::string(kSessionEndpoint),
         .url = model.url,
-        .auth = model.vendor->auth,
+        .auth = Auth::GoogleKey,
         .key = key(model.key_env),
         .key_env = "",
-        .headers = version_headers(*model.vendor),
     });
-    for (const Vendor& vendor : kVendors) {
-        list.push_back({
-            .name = std::string(vendor.name),
-            .url = env_or(vendor.url_env, vendor.url),
-            .auth = vendor.auth,
-            .key = key(vendor.key_env),
-            .key_env = vendor.key_env,
-            .headers = version_headers(vendor),
-        });
-    }
     for (const Service& service : kServices) {
         list.push_back({
             .name = service.name,
-            .url = service_url(service),
+            .url = env_or(service.url_env, service.url),
             .auth = service.auth,
             .key = key(service.key_env),
             .key_env = service.key_env,
-            .headers = {},
         });
     }
     for (Endpoint endpoint : added) {
@@ -633,7 +507,7 @@ int init_project(bool full) {
 }
 
 HostConfig build_host_config(const Options& options) {
-    const ModelChoice model = choose_endpoint(options.model, options.rpi);
+    const ModelChoice model = choose_model(options.model, options.rpi);
     setenv("HX_MODEL", model.model.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
     check_effort();
     const bool stdin_tty = isatty(STDIN_FILENO) != 0;

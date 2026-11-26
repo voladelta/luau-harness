@@ -18,28 +18,30 @@ loop.system_prompt = function()
 	table.insert(systems, "built")
 	return "the session's prompt"
 end
-loop.request = function(system, messages, _, model)
-	local last = messages[#messages].content
-	local told
-	if type(last) == "string" then
-		told = last
-	elseif last[#last].type == "text" then
-		told = last[#last].text
-	else
-		return { content = { { type = "text", text = "ran: " .. last[#last].content } }, stop_reason = "end_turn" }
+local function call(steps, code)
+	return { status = "requires_action", steps = { { type = "function_call", id = "c" .. #steps, name = "lua", arguments = { code = code } } } }
+end
+local function says(words)
+	return { status = "completed", steps = { { type = "model_output", content = { { type = "text", text = words } } } } }
+end
+loop.request = function(system, steps, model)
+	local last = steps[#steps]
+	if last.type == "function_result" then
+		return says("ran: " .. last.result[1].text)
 	end
+	local told = last.content[#last.content].text
 	local command = told:match("^run: (.*)$")
 	if command then
 		local code = ("return bash(%q)"):format(command)
-		return { content = { { type = "tool_use", id = "c" .. #messages, name = "lua", input = { code = code } } }, stop_reason = "tool_use" }
+		return call(steps, code)
 	end
 	local code = told:match("^lua: (.*)$")
 	if code then
-		return { content = { { type = "tool_use", id = "c" .. #messages, name = "lua", input = { code = code } } }, stop_reason = "tool_use" }
+		return call(steps, code)
 	end
 	local words = told:match("^say: (.*)$")
 	if told == "count" then
-		words = ("%d messages"):format(#messages)
+		words = ("%d steps"):format(#steps)
 	elseif told == "functions" then
 		local names = {}
 		for name in loop.tools[1].description():gmatch("\n%- ([%w_]+)%(") do
@@ -52,7 +54,7 @@ loop.request = function(system, messages, _, model)
 	elseif told == "fail" then
 		error("the model request failed (500): no", 0)
 	end
-	return { content = { { type = "text", text = words or "what?" } }, stop_reason = "end_turn" }
+	return says(words or "what?")
 end
 
 check("with no agents, it says so", agents(), "You have no agents yet: give agents a list of tasks.")
@@ -81,8 +83,8 @@ check("and the second", host.read(dir .. "two.txt"), "two\n")
 check("the agents' prompt was built once", #systems, 1)
 
 reports = agents({ { name = "first", task = "count" }, { name = "third", task = "count" } })
-has("the agent sent more has what it did", reports, "[agent first: done in 0 s]\n5 messages")
-has("a new one starts empty", reports, "[agent third: done in 0 s]\n1 messages")
+has("the agent sent more has what it did", reports, "[agent first: done in 0 s]\n5 steps")
+has("a new one starts empty", reports, "[agent third: done in 0 s]\n1 steps")
 has("one task alone", agents({ name = "third", task = "say: again" }), "again")
 check("a report is given once", agents(),
 	"No agent is at work, and you have every report. Your agents so far: first, second, third.")
@@ -103,17 +105,17 @@ has("nor does its next run see what its last one set", agents({ { name = "first"
 
 local failed = agents({ { name = "second", task = "fail" } })
 has("a failed turn says why", failed, "[agent second: failed after 0 s: the model request failed (500): no]\n(it said nothing)")
-has("and the agent goes on from there", agents({ { name = "second", task = "count" } }), "5 messages")
+has("and the agent goes on from there", agents({ { name = "second", task = "count" } }), "5 steps")
 
 loop.agent_seconds = 1
 local late = agents({ { name = "slow", task = "run: sleep 20; echo never" } })
 has("a run past its time is stopped", late, "[agent slow: stopped at the 1 s one run may take]")
 loop.agent_seconds = 1800
-has("and the agent can still be sent more", agents({ { name = "slow", task = "count" } }), "3 messages")
+has("and the agent can still be sent more", agents({ { name = "slow", task = "count" } }), "4 steps")
 
 local killed = agents({ { name = "slow", task = "run: kill -9 $PPID" } })
 has("a killed agent is reported", killed, "[agent slow: stopped after 0 s (the child ended without a result")
-has("and has the conversation it had before", agents({ { name = "slow", task = "count" } }), "5 messages")
+has("and has the conversation it had before", agents({ { name = "slow", task = "count" } }), "6 steps")
 
 host.write(dir .. "lead.txt", "the lead's")
 host.write(dir .. "kept.txt", "old")
@@ -147,7 +149,7 @@ loop.agent_wait = 10
 local stopped = agents({ { name = "long", stop = true } })
 has("an agent at work can be stopped", stopped, "[agent long: stopped as you asked, after")
 check("without waiting for its command", os.clock() - began < 10, true)
-has("and has the conversation it had before", agents({ { name = "long", task = "count" } }), "1 messages")
+has("and has the conversation it had before", agents({ { name = "long", task = "count" } }), "1 steps")
 raises("an idle agent has nothing to stop", "long is not at work, so there is nothing to stop", agents, { { name = "long", stop = true } })
 raises("nor has one that does not exist", "nobody is not at work", agents, { name = "nobody", stop = true })
 loop.agent_wait = patience
@@ -173,24 +175,22 @@ local previous_request = loop.request
 local previous_seconds = loop.agent_seconds
 host.sh({ "mkdir", "-p", ".hx" })
 loop.agent_seconds = 0.2
-loop.request = function(system, messages, tools, model)
-	local last = messages[#messages].content
-	if type(last) == "string" and last == "sleepy-task" then
+loop.request = function(system, steps, model)
+	if steps[#steps].type == "user_input" and steps[#steps].content[1].text == "sleepy-task" then
 		host.sleep(5)
 	end
-	return previous_request(system, messages, tools, model)
+	return previous_request(system, steps, model)
 end
 local lead_talk = loop.Conversation.new()
 lead_talk:say('lua: return agents({ name = "sleepy", task = "sleepy-task" })')
 loop.turn("the session's prompt", lead_talk)
 loop.agent_seconds = previous_seconds
 loop.request = previous_request
-local final_content = lead_talk.messages[#lead_talk.messages].content
-local final_text = type(final_content) == "table" and final_content[1] and final_content[1].text or ""
+local final_text = lead_talk.steps[#lead_talk.steps].content[1].text
 local saved_log = final_text:match("%[its conversation: (%.hx/log/[^%]]+%.json)%]")
 check("a timed-out agent inside a turn names its conversation file", saved_log ~= nil, true)
 local saved = saved_log and json.decode(host.read(saved_log) or "{}")
-check("and its log holds the message it timed out on", saved and saved.messages and saved.messages[1] and saved.messages[1].content, "sleepy-task")
+check("and its log holds the message it timed out on", saved and saved.steps and saved.steps[1] and saved.steps[1].content[1].text, "sleepy-task")
 host.sh({ "rm", "-rf", ".hx" })
 
 checks.done("agents")
