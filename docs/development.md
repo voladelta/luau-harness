@@ -13,7 +13,7 @@ Where each part of hx lives:
 | `src/host.cpp` | the `host` table and the VM: stops and time limits at safepoints, `host.try`, `host.timed`, `host.load` and the small primitives |
 | `src/host_proc.cpp` | signals, waiting until one arrives, and killing every process hx started |
 | `src/host_sh.cpp` | `host.sh`: forking the command behind its wall, its limits, and both ends of its output |
-| `src/host_http.cpp` | `host.post` and `host.route`: requests to the endpoints, each key to its own URL only |
+| `src/host_http.cpp` | `host.post`: requests to the endpoints, each key to its own URL only |
 | `src/host_files.cpp` | `host.read`, `host.write`, `host.list`, `host.walk` and `host.stat` |
 | `src/host_judge.cpp` | `host.judge`: the agent's end of the channel to the judge |
 | `src/host_spawn.cpp` | `host.spawn` and `host.wait`: children of hx that run a Luau function in a copy of the VM, which the loop's agents are |
@@ -54,7 +54,7 @@ noticing a failed command, following a long output to its file, compacting a Vie
 checkpoints that keep a fact, giving up a status polled between sleeps, reporting when out of replies,
 following a skill (one listed in the prompt, one listed by name only, one found by searching, and one in the home
 directory that only `--ro` makes reachable), and leading agents: two at work side by side, with a task sent back
-to the one that did the work, and, on a Claude model only, `--rpi` planning a change that its agents write. It
+to the one that did the work, and `--rpi` planning a change that its agents write. It
 costs tokens, so ctest
-leaves it out: `python3 tests/live_test.py build/hx` with `DEEPSEEK_API_KEY` set, or with `ANTHROPIC_API_KEY` and `HX_MODEL=sonnet`
-(or `opus`, `haiku`).
+leaves it out: `python3 tests/live_test.py build/hx` with `GEMINI_API_KEY` set, and `HX_MODEL=carbon` for a model
+other than Neon.

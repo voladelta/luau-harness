@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end checks of hx against a scripted Anthropic Messages server.
+"""End-to-end checks of hx against a scripted Gemini Interactions server.
 
 usage: agent_test.py PATH_TO_HX [unittest arguments]
 
@@ -42,7 +42,7 @@ class Model(http.server.ThreadingHTTPServer):
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server_address[1]}/v1/messages"
+        return f"http://127.0.0.1:{self.server_address[1]}/v1beta/interactions"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -80,35 +80,38 @@ class Tools(http.server.ThreadingHTTPServer):
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server_address[1]}/v1/tools"
+        return f"http://127.0.0.1:{self.server_address[1]}/exa"
 
 
 class ToolsHandler(http.server.BaseHTTPRequestHandler):
-    ANSWERS = {
-        "/v1/tools/search": {"results": [{"rerank_score": 2.1, "title": "Luau", "url": "https://luau.org",
-                                          "snippet": "s", "summary": "A small fast language.", "content": "",
-                                          "site_name": None, "site_icon": None, "date": None, "authority": 3}]},
-        "/v1/tools/fetch": {"title": "Luau", "content": "# Luau\n\nA small fast language."},
-        "/exa/search": {"requestId": "r1", "costDollars": {"total": 0.012},
-                        "results": [{"title": "Luau", "url": "https://luau.org", "id": "x",
-                                     "publishedDate": "2026-08-26T00:00:00.000Z", "author": None,
-                                     "highlights": ["Luau is a small fast language.", "It has gradual types."]}],
-                        "output": {"content": "Luau is a fast, small, gradually typed language.",
-                                   "grounding": [{"field": "content", "confidence": "high",
-                                                  "citations": [{"url": "https://luau.org", "title": "Luau"}]}]},
-                        "notices": [{"code": "RESTRICTIONS_RELAXED", "path": "/query", "message": "site: removed."}],
-                        "warnings": [{"code": "IGNORED_FIELD", "path": "/x", "message": "x is ignored."}]},
-        "/v1/tools/ocr": {"id": "ocr-1", "object": "ocr.result", "created": 0, "purpose": "x", "page_count": 1,
-                          "pages": [{"index": 0, "text": "Recognized words", "finish_reason": "stop"}],
-                          "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}},
-    }
+    SEARCH = {"requestId": "r1", "costDollars": {"total": 0.012},
+              "results": [{"title": "Luau", "url": "https://luau.org", "id": "x",
+                           "publishedDate": "2026-08-26T00:00:00.000Z", "author": None,
+                           "highlights": ["Luau is a small fast language.", "It has gradual types."]}],
+              "output": {"content": "Luau is a fast, small, gradually typed language.",
+                         "grounding": [{"field": "content", "confidence": "high",
+                                        "citations": [{"url": "https://luau.org", "title": "Luau"}]}]},
+              "notices": [{"code": "RESTRICTIONS_RELAXED", "path": "/query", "message": "site: removed."}],
+              "warnings": [{"code": "IGNORED_FIELD", "path": "/x", "message": "x is ignored."}]}
+    PAGE = {"requestId": "r2", "results": [{"id": "https://luau.org", "url": "https://luau.org", "title": "Luau",
+                                            "text": "# Luau\n\nA small fast language."}],
+            "statuses": [{"id": "https://luau.org", "status": "success", "source": "cached"}]}
+    GONE = {"requestId": "r3", "results": [], "statuses": [
+        {"id": "https://gone.example", "status": "error", "error": {"tag": "CRAWL_NOT_FOUND", "httpStatusCode": 404}}]}
+
+    def answer(self, body):
+        if self.path == "/exa/search":
+            return self.SEARCH
+        if self.path == "/exa/contents":
+            return self.GONE if b"gone.example" in body else self.PAGE
+        return None
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         self.server.requests.append({"path": self.path, "body": body,
                                      "headers": {k.lower(): v for k, v in self.headers.items()}})
-        answer = self.ANSWERS.get(self.path)
-        data = (b"\n\n" if self.path.endswith("/ocr") else b"") + json.dumps(answer or {"error": "no such tool"}).encode()
+        answer = self.answer(body)
+        data = json.dumps(answer or {"error": "no such tool"}).encode()
         self.send_response(200 if answer else 404)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -147,14 +150,28 @@ def kill_quietly(pid):
         pass
 
 
-def reply(content,stop="end_turn", input_tokens=10):
-    usage = {"input_tokens": input_tokens, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 5}
-    return 200, {"id": "msg_1", "type": "message", "role": "assistant", "content": content, "stop_reason": stop,
-                 "stop_sequence": None, "usage": usage}
+def reply(steps, status=None, input_tokens=10):
+    calls = any(step["type"] == "function_call" for step in steps)
+    usage = {"total_input_tokens": input_tokens, "total_cached_tokens": 0, "total_output_tokens": 5,
+             "total_thought_tokens": 0, "total_tokens": input_tokens + 5}
+    return 200, {"id": "interaction_1", "object": "interaction", "steps": steps,
+                 "status": status or ("requires_action" if calls else "completed"), "usage": usage}
+
+
+def part(words):
+    return {"type": "text", "text": words}
 
 
 def text(words):
-    return {"type": "text", "text": words}
+    return {"type": "model_output", "content": [part(words)]}
+
+
+def said(*words):
+    return {"type": "user_input", "content": [part(w) for w in words]}
+
+
+def task_of(request):
+    return request["input"][0]["content"][0]["text"]
 
 
 FUNCTIONS = {"bash": ["command", "timeout"], "read": ["path", "offset", "limit"], "write": ["path", "content"],
@@ -189,23 +206,30 @@ def code(name, args):
 def use(name, args, call_id="call_1"):
     if name in FUNCTIONS:
         name, args = "lua", {"code": code(name, args)}
-    return {"type": "tool_use", "id": call_id, "name": name, "input": args}
+    return {"type": "function_call", "id": call_id, "name": name, "arguments": args}
 
 
 def say(words, **kw):
     return reply([text(words)], **kw)
 
 
+MODEL_STEPS = ("thought", "model_output", "function_call")
+
+
+def replies_in(steps):
+    return sum(1 for before, step in zip([{"type": "user_input"}] + steps, steps)
+               if step["type"] in MODEL_STEPS and before["type"] not in MODEL_STEPS)
+
+
 def agent_answers(scripts):
     def answer(request):
-        first = request["messages"][0]["content"]
-        replies = scripts.get(first if isinstance(first, str) else first[0].get("text"))
-        return replies[sum(1 for m in request["messages"] if m["role"] == "assistant")] if replies else None
+        replies = scripts.get(task_of(request))
+        return replies[replies_in(request["input"])] if replies else None
     return answer
 
 
-def call(name, args, call_id="call_1", stop="tool_use", **kw):
-    return reply([use(name, args, call_id)], stop=stop, **kw)
+def call(name, args, call_id="call_1", **kw):
+    return reply([use(name, args, call_id)], **kw)
 
 
 class AgentTest(unittest.TestCase):
@@ -224,9 +248,9 @@ class AgentTest(unittest.TestCase):
 
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
-               if not k.lower().endswith("_proxy") and not k.startswith("HX_") and k != "ANTHROPIC_API_KEY"}
+               if not k.lower().endswith("_proxy") and not k.startswith("HX_") and k != "GEMINI_API_KEY"}
         env.update(HOME=self.home, HX_API_URL=self.model.url, HX_KEY_ENV="HX_TEST_KEY", HX_TEST_KEY=KEY,
-                   NO_PROXY="127.0.0.1", DEEPSEEK_API_KEY="", EXA_API_KEY="")
+                   NO_PROXY="127.0.0.1", EXA_API_KEY="")
         env.update(extra)
         return env
 
@@ -243,13 +267,10 @@ class AgentTest(unittest.TestCase):
     def tool_results(self, requests=None):
         seen, out = set(), []
         for request in self.model.requests if requests is None else requests:
-            for message in request["messages"]:
-                if message["role"] != "user" or isinstance(message["content"], str):
-                    continue
-                for block in message["content"]:
-                    if block["type"] == "tool_result" and block["tool_use_id"] not in seen:
-                        seen.add(block["tool_use_id"])
-                        out.append(block["content"])
+            for step in request["input"]:
+                if step["type"] == "function_result" and step["call_id"] not in seen:
+                    seen.add(step["call_id"])
+                    out.append(step["result"][0]["text"] if len(step["result"]) == 1 else step["result"])
         return out
 
     def test_see_sends_an_image_with_the_result(self):
@@ -258,29 +279,35 @@ class AgentTest(unittest.TestCase):
             f.write(png)
         done = self.run_hx("look", script=[call("lua", {"code": "return see('shot.png')"}), say("A blank image.")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        result = self.model.requests[1]["messages"][2]["content"][0]
-        self.assertEqual(result["content"], [
-            {"type": "text", "text": "[image 1 of this result: shot.png, image/png, 20 bytes]"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                         "data": base64.b64encode(png).decode()}},
+        self.assertEqual(self.model.requests[1]["input"][2]["result"], [
+            part("[image 1 of this result: shot.png, image/png, 20 bytes]"),
+            {"type": "image", "data": base64.b64encode(png).decode(), "mime_type": "image/png"},
+        ])
+
+    def test_see_sends_a_document_for_the_model_to_read(self):
+        pdf = b"%PDF-1.7\n%%EOF\n"
+        with open(os.path.join(self.project, "paper.pdf"), "wb") as f:
+            f.write(pdf)
+        done = self.run_hx("read it", script=[call("lua", {"code": "return see('paper.pdf')"}), say("An empty paper.")])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[1]["input"][2]["result"], [
+            part("[document 1 of this result: paper.pdf, application/pdf, 15 bytes]"),
+            {"type": "document", "data": base64.b64encode(pdf).decode(), "mime_type": "application/pdf"},
         ])
 
     def test_resume_goes_on_from_a_saved_conversation(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         first = self.run_hx("make a file", script=[call("bash", {"command": "echo made"}), say("All done.")])
         self.assertEqual(first.returncode, 0, first.stderr)
-        saved = self.model.requests[-1]["messages"]
+        saved = self.model.requests[-1]["input"]
         self.model.requests.clear()
         done = self.run_hx("--resume", "last", "and now?", script=[say("Still done.")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "Still done.\n")
         self.assertIn("going on from .hx/log/", done.stderr)
-        asked = self.model.requests[0]["messages"]
+        asked = self.model.requests[0]["input"]
         self.assertEqual(asked[:len(saved)], saved)
-        self.assertEqual(asked[len(saved):], [
-            {"role": "assistant", "content": [{"type": "text", "text": "All done."}]},
-            {"role": "user", "content": "and now?"},
-        ])
+        self.assertEqual(asked[len(saved):], [text("All done."), said("and now?")])
         missing = self.run_hx("--resume", "nowhere.json", "go on")
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("nowhere.json", missing.stderr)
@@ -301,13 +328,13 @@ class AgentTest(unittest.TestCase):
                 ]:
                     path = os.path.join(log, name)
                     with open(path, "w") as f:
-                        json.dump({"messages": [{"role": "user", "content": task}]}, f)
+                        json.dump({"steps": [said(task)]}, f)
                     os.utime(path, ns=(stamp, stamp))
                 done = self.run_hx("--resume", "last", "continue", script=[say("ok")])
                 for name in os.listdir(log):
                     os.unlink(os.path.join(log, name))
                 self.assertEqual(done.returncode, 0, done.stderr)
-                self.assertEqual(self.model.requests[-1]["messages"][0]["content"][0]["text"], "newer")
+                self.assertEqual(task_of(self.model.requests[-1]), "newer")
 
     def test_numbered_read_of_dense_file_uses_bounded_working_memory(self):
         with open(os.path.join(self.project, "dense.txt"), "wb") as f:
@@ -347,39 +374,39 @@ end
         self.assertEqual(done.stdout, "All done.\n")
         self.assertEqual(read(self.project, "out.txt"), "hi\n")
         first, second = self.model.requests
-        self.assertIn("coding agent", first["system"])
-        self.assertIn("The kernel confines you", first["system"])
-        self.assertEqual(first["messages"], [{"role": "user", "content": "make a file"}])
+        self.assertIn("coding agent", first["system_instruction"])
+        self.assertIn("The kernel confines you", first["system_instruction"])
+        self.assertEqual(first["input"], [said("make a file")])
         self.assertEqual([t["name"] for t in first["tools"]], ["lua"])
-        self.assertEqual(set(first["tools"][0]), {"name", "description", "input_schema"})
-        self.assertNotIn("thinking", first)
-        self.assertIn("[2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]", done.stderr)
-        self.assertEqual(second["messages"][1:], [
-            {"role": "assistant", "content": [use("bash", {"command": "echo hi > out.txt; echo made"})]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "made\n[exit 0]"}]},
+        self.assertEqual(set(first["tools"][0]), {"type", "name", "description", "parameters"})
+        self.assertIn("[2 replies, 20 tokens in (0 read from cache), 10 out]", done.stderr)
+        self.assertEqual(second["input"][1:], [
+            use("bash", {"command": "echo hi > out.txt; echo made"}),
+            {"type": "function_result", "call_id": "call_1", "name": "lua", "result": [part("made\n[exit 0]")]},
         ])
-        self.assertEqual(second["messages"][0], first["messages"][0])
-        self.assertEqual((second["system"], second["tools"]), (first["system"], first["tools"]))
+        self.assertEqual(second["input"][0], first["input"][0])
+        self.assertEqual((second["system_instruction"], second["tools"]), (first["system_instruction"], first["tools"]))
 
-    def test_thinking_blocks_go_back_exactly_as_they_came(self):
-        blocks = [{"type": "thinking", "thinking": "", "signature": "sig-1"}, text("Looking."),
-                  {"type": "thinking", "thinking": "run ls\né", "signature": "sig-2"}, use("bash", {"command": "true"})]
-        done = self.run_hx("go", script=[reply(blocks, stop="tool_use"), say("ok")])
+    def test_thoughts_go_back_exactly_as_they_came(self):
+        steps = [{"type": "thought", "signature": "sig-1"}, text("Looking."),
+                 {"type": "thought", "signature": "sig-2", "summary": [part("run ls\né")]}, use("bash", {"command": "true"})]
+        done = self.run_hx("go", script=[reply(steps), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.model.requests[1]["messages"][1], {"role": "assistant", "content": blocks})
+        self.assertEqual(self.model.requests[1]["input"][1:5], steps)
         self.assertEqual(done.stdout, "Looking.\nok\n")
 
     def test_several_calls_in_one_reply_are_answered_in_one_message(self):
-        done = self.run_hx("go", script=[reply([use("bash", {"command": f"echo {i}"}, f"c{i}") for i in range(3)], stop="tool_use"),
+        done = self.run_hx("go", script=[reply([use("bash", {"command": f"echo {i}"}, f"c{i}") for i in range(3)]),
                                          say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual([m["role"] for m in self.model.requests[1]["messages"]], ["user", "assistant", "user"])
+        self.assertEqual([s["type"] for s in self.model.requests[1]["input"]],
+                         ["user_input"] + ["function_call"] * 3 + ["function_result"] * 3)
         self.assertEqual(self.tool_results(), ["0\n[exit 0]", "1\n[exit 0]", "2\n[exit 0]"])
 
     def test_a_bad_tool_call_is_reported_to_the_model_not_fatal(self):
         done = self.run_hx("go", script=[call("lua", "not an object", "c1"),
-                                         reply([{"type": "tool_use", "id": "c2", "name": "bash", "input": {"command": "true"}}],
-                                               stop="tool_use"),
+                                         reply([{"type": "function_call", "id": "c2", "name": "bash",
+                                                 "arguments": {"command": "true"}}]),
                                          call("nope", {}, "c3"), call("lua", {}, "c4"),
                                          call("lua", {"code": "return read({file_path = 'f.txt'})"}, "c5"),
                                          call("lua", {"code": "return +"}, "c6"), say("ok")])
@@ -392,8 +419,7 @@ end
         self.assertEqual(results[3], 'error: missing argument "code": lua takes code')
         self.assertEqual(results[4], "error: read: argument 1 (path) must be a string, not table; usage: read(path, offset?, limit?)")
         self.assertIn("error: lua:1:", results[5])
-        failed = self.model.requests[1]["messages"][-1]["content"][0]
-        self.assertIs(failed["is_error"], True)
+        self.assertIs(self.model.requests[1]["input"][-1]["is_error"], True)
 
     def test_an_empty_reply_is_asked_for_again(self):
         done = self.run_hx("go", script=[reply([]), reply([text("")]), say("ok")])
@@ -402,19 +428,15 @@ end
         self.assertEqual(len(self.model.requests), 3)
         self.assertEqual(self.model.requests[0], self.model.requests[2])
 
-    def test_an_empty_refusal_is_an_answer(self):
-        done = self.run_hx("go", script=[reply([], stop="refusal")])
+    def test_a_reply_of_thought_alone_is_asked_for_again(self):
+        done = self.run_hx("go", script=[reply([{"type": "thought", "signature": "s"}]), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(len(self.model.requests), 1)
-        self.assertIn("declined", done.stderr)
-
-    def test_a_reply_of_thinking_alone_is_not_empty(self):
-        done = self.run_hx("go", script=[reply([{"type": "thinking", "thinking": "hm", "signature": "s"}])])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(len(self.model.requests), 1)
+        self.assertEqual(done.stdout, "ok\n")
+        self.assertEqual(self.model.requests[0], self.model.requests[1])
 
     def reminders(self):
-        return [[b["text"] for b in r["messages"][-1]["content"] if b["type"] == "text"] for r in self.model.requests[1:]]
+        return [[p["text"] for p in r["input"][-1]["content"]] if r["input"][-1]["type"] == "user_input" else []
+                for r in self.model.requests[1:]]
 
     def test_a_repeated_call_gets_a_reminder(self):
         same = [call("bash", {"command": "echo same", "timeout": 5}, f"c{i}") for i in range(5)]
@@ -475,11 +497,11 @@ end
                                          call("bash", {"command": "cat .hx/log/*.json"}, "c2"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         during = json.loads(self.tool_results()[1].rsplit("\n", 1)[0])
-        self.assertEqual([m["role"] for m in during["messages"]], ["user", "assistant", "user"])
-        self.assertEqual(during["messages"][2]["content"][0]["content"], "first\n[exit 0]")
+        self.assertEqual([s["type"] for s in during["steps"]], ["user_input", "function_call", "function_result"])
+        self.assertEqual(during["steps"][2]["result"], [part("first\n[exit 0]")])
         logs = [name for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
         self.assertEqual(len(logs), 1)
-        self.assertEqual(len(json.loads(read(self.project, ".hx", "log", logs[0]))["messages"]), 6)
+        self.assertEqual(len(json.loads(read(self.project, ".hx", "log", logs[0]))["steps"]), 6)
 
     def test_sessions_in_the_same_second_keep_their_own_logs(self):
         os.makedirs(os.path.join(self.project, ".hx"))
@@ -497,62 +519,24 @@ end
         self.assertEqual(done.returncode, 1)
         self.assertEqual(done.stdout, "REPORT\n")
         self.assertIn("stopped after 2 model replies", done.stderr)
-        self.assertIn("Write your final report now", self.model.requests[2]["messages"][-1]["content"][-1]["text"])
+        self.assertIn("Write your final report now", self.model.requests[2]["input"][-1]["content"][-1]["text"])
 
     def test_effort_is_sent_when_set_and_refused_when_it_is_no_effort(self):
         done = self.run_hx("go", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertNotIn("output_config", self.model.requests[0])
-        done = self.run_hx("go", script=[say("ok")], HX_EFFORT="max")
+        self.assertNotIn("generation_config", self.model.requests[0])
+        done = self.run_hx("go", script=[say("ok")], HX_EFFORT="xhigh")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.model.requests[1]["output_config"], {"effort": "max"})
+        self.assertEqual(self.model.requests[1]["generation_config"], {"thinking_level": "xhigh"})
+        done = self.run_hx("--model", "carbon", "go", script=[say("ok")], HX_EFFORT="xhigh")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.model.requests[2]["generation_config"], {"thinking_level": "high"})
         done = self.run_hx("go", script=[say("never")], HX_EFFORT="extreme")
         self.assertEqual(done.returncode, 2)
-        self.assertIn("hx: HX_EFFORT=extreme: the efforts are low, medium, high, xhigh and max", done.stderr)
-        self.assertEqual(len(self.model.requests), 2)
+        self.assertIn("hx: HX_EFFORT=extreme: the efforts are minimal, low, medium, high and xhigh", done.stderr)
+        self.assertEqual(len(self.model.requests), 3)
 
-    def test_a_claude_model_gets_its_effort_fallbacks_and_betas(self):
-        done = self.run_hx("--model", "opus", "go", script=[say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        sent = self.model.requests[0]
-        self.assertEqual(sent["model"], "claude-opus-5-5")
-        self.assertEqual(self.model.headers[0]["anthropic-version"], "2026-10-21")
-        self.assertEqual(sent["output_config"], {"effort": "medium"})
-        self.assertEqual(sent["fallbacks"], "default")
-        self.assertEqual(sent["thinking"], {"type": "adaptive", "display": "updates",
-                                            "block_binding": {"prefix_mismatch_behavior": "drop_block"}})
-        self.assertEqual(self.model.headers[0]["anthropic-beta"], "thinking-binding-controls-2026-08-01,"
-                         "thinking-display-updates-2026-08-18,server-side-fallback-2026-07-01,compact-2026-09-04")
-        self.assertEqual(sent["cache_control"], {"type": "ephemeral"})
-        self.assertEqual(len(sent["system"]), 1)
-        self.assertEqual(sent["system"][0]["cache_control"], {"type": "ephemeral"})
-        self.assertIn("coding agent", sent["system"][0]["text"])
-        done = self.run_hx("go", script=[say("ok")], HX_MODEL="haiku", HX_EFFORT="low")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        sent = self.model.requests[1]
-        self.assertEqual(sent["model"], "claude-haiku-5-5")
-        self.assertEqual(sent["output_config"], {"effort": "low"})
-        self.assertNotIn("fallbacks", sent)
-        self.assertEqual(self.model.headers[1]["anthropic-beta"], "thinking-binding-controls-2026-08-01,compact-2026-09-04")
-        done = self.run_hx("--model", "deepseek-flash", "go", script=[say("ok")])
-        self.assertNotIn("thinking", self.model.requests[2])
-        self.assertNotIn("fallbacks", self.model.requests[2])
-        self.assertNotIn("anthropic-beta", self.model.headers[2])
-        self.assertIsInstance(self.model.requests[2]["system"], str)
-        done = self.run_hx("--model", "claude-opus-9", "go", script=[say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        sent = self.model.requests[3]
-        self.assertEqual(sent["model"], "claude-opus-9")
-        self.assertEqual(sent["thinking"], {"type": "adaptive"})
-        for field in ("output_config", "fallbacks"):
-            self.assertNotIn(field, sent)
-        self.assertNotIn("anthropic-beta", self.model.headers[3])
-        self.assertEqual(sent["system"][0]["cache_control"], {"type": "ephemeral"})
-
-    def test_a_deepseek_sub_agent_under_a_claude_session_goes_to_deepseek_with_its_key(self):
-        deepseek = Model()
-        self.addCleanup(deepseek.server_close)
-        self.addCleanup(deepseek.shutdown)
+    def test_a_conversation_on_another_model_goes_to_the_same_endpoint_with_the_same_key(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
             f.write('local M = host.load(host.default_loop, "=loop")()\n'
@@ -560,97 +544,59 @@ end
                     'run = function(model, task)\n'
                     '\tlocal talk = M.Conversation.new(model)\n\ttalk:say(task)\n'
                     '\tM.turn("the sub-agent\'s system prompt", talk)\n'
-                    '\treturn talk.messages[#talk.messages].content[1].text\nend })\nreturn M\n')
-        ds_key = "ds-model-key-7"
-        deepseek.script = [call("bash", {"command": "echo from flash"}, "s1"), say("flash is done")]
-        done = self.run_hx("--model", "opus", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY=ds_key, script=[
-            call("lua", {"code": "return delegate('deepseek-flash', 'a sub-task')"}, "c1"),
+                    '\treturn talk.steps[#talk.steps].content[1].text\nend })\nreturn M\n')
+        self.model.answer = agent_answers({
+            "a sub-task": [call("bash", {"command": "echo from hydrogen"}, "s1"), say("hydrogen is done")]})
+        done = self.run_hx("--model", "carbon", "go", script=[
+            call("lua", {"code": "return delegate('gemini-4-hydrogen', 'a sub-task')"}, "c1"),
             call("bash", {"command": "env"}, "c2"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.tool_results()[0], "flash is done")
-        self.assertEqual([r["model"] for r in deepseek.requests], ["deepseek-flash", "deepseek-flash"])
-        for sent, headers in zip(deepseek.requests, deepseek.headers):
-            self.assertEqual(headers["x-api-key"], ds_key)
-            self.assertEqual(headers["anthropic-version"], "2023-06-01")
-            self.assertNotIn("anthropic-beta", headers)
-            self.assertEqual(sent["system"], "the sub-agent's system prompt")
-            self.assertNotIn("thinking", sent)
-            self.assertNotIn("fallbacks", sent)
-        self.assertIn("[claude-opus-5-5: 3 replies, 30 tokens in (0 read from cache, 0 written to it), 15 out]\n"
-                      "[deepseek-flash: 2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]",
-                      done.stderr)
-        self.assertEqual(deepseek.requests[0]["messages"], [{"role": "user", "content": "a sub-task"}])
-        self.assertEqual([r["model"] for r in self.model.requests], ["claude-opus-5-5"] * 3)
+        sub = [r for r in self.model.requests if task_of(r) == "a sub-task"]
+        results = self.tool_results([r for r in self.model.requests if task_of(r) == "go"])
+        self.assertEqual(results[0], "hydrogen is done")
+        self.assertEqual([r["model"] for r in sub], ["gemini-4-hydrogen"] * 2)
+        self.assertEqual([r["system_instruction"] for r in sub], ["the sub-agent's system prompt"] * 2)
+        self.assertEqual(sub[0]["input"], [said("a sub-task")])
+        self.assertEqual([r["model"] for r in self.model.requests if task_of(r) == "go"], ["gemini-4-carbon"] * 3)
         for headers in self.model.headers:
-            self.assertEqual(headers["x-api-key"], KEY)
-            self.assertIn("server-side-fallback", headers["anthropic-beta"])
-        self.assertNotIn(ds_key, json.dumps(self.model.requests))
-        self.assertNotIn(KEY, json.dumps(deepseek.requests))
-        self.assertNotIn(ds_key, self.tool_results()[1])
+            self.assertEqual(headers["x-goog-api-key"], KEY)
+        self.assertIn("[gemini-4-carbon: 3 replies, 30 tokens in (0 read from cache), 15 out]\n"
+                      "[gemini-4-hydrogen: 2 replies, 20 tokens in (0 read from cache), 10 out]", done.stderr)
+        self.assertNotIn(KEY, results[1])
         script = ("print(pcall(host.post, 'chat', '{}'))\n"
                   "print(pcall(host.post, 'https://example.com', '{}'))\n"
-                  "print(host.post('deepseek', '{}'))\n"
-                  "print(host.route('claude-haiku-5-5'), host.route('deepseek-flash'), host.route('other'))\n")
+                  "print(host.post('exa', '{}'))\n"
+                  "print(host.route)\n")
         done = self.run_hx("--run", "-", stdin=script)
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
-        self.assertIn("no endpoint chat; the endpoints are session, anthropic, deepseek, gemini, search, fetch, ocr and exa",
-                      lines[0])
+        self.assertIn("no endpoint chat; the endpoints are session, exa and contents", lines[0])
         self.assertIn("no endpoint https://example.com", lines[1])
-        self.assertEqual(lines[2], "nil\tno DEEPSEEK_API_KEY: hx was started without one, so host.post cannot reach "
-                         "the deepseek endpoint")
-        self.assertEqual(lines[3], "anthropic\tsession\tsession")
+        self.assertEqual(lines[2], "nil\tno EXA_API_KEY: hx was started without one, so host.post cannot reach "
+                         "the exa endpoint")
+        self.assertEqual(lines[3], "nil")
 
-    def test_a_gemini_session_speaks_the_interactions_api_with_a_google_key(self):
+    def test_a_session_speaks_the_interactions_api_with_a_google_key(self):
         usage = {"total_input_tokens": 10, "total_cached_tokens": 4, "total_output_tokens": 3, "total_thought_tokens": 2}
-        thought = {"type": "thought", "signature": "c2lnbmVk"}
+        thought = {"type": "thought", "signature": "c2lnbmVk", "summary": [part("weigh it")]}
         asked = {"type": "function_call", "id": "f1", "name": "lua", "arguments": {"code": "return 6 * 7"}}
-        answered = {"type": "model_output", "content": [text("forty-two")]}
-        done = self.run_hx("--model", "neon", "go", script=[
+        done = self.run_hx("go", script=[
             (200, {"status": "requires_action", "steps": [thought, asked], "usage": usage}),
-            (200, {"status": "completed", "steps": [answered], "usage": usage})])
+            (200, {"status": "completed", "steps": [text("forty-two")], "usage": usage})])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "forty-two\n")
-        self.assertIn("[2 replies, 20 tokens in (8 read from cache, 0 written to it), 10 out]", done.stderr)
+        self.assertIn("[2 replies, 20 tokens in (8 read from cache), 10 out]", done.stderr)
         for sent, headers in zip(self.model.requests, self.model.headers):
             self.assertEqual(headers["x-goog-api-key"], KEY)
             self.assertNotIn("x-api-key", headers)
-            self.assertNotIn("anthropic-version", headers)
+            self.assertNotIn("authorization", headers)
             self.assertEqual(sent["model"], "gemini-4-neon")
-            self.assertNotIn("messages", sent)
-        self.assertEqual(self.model.requests[1]["input"][1:], [
-            thought, asked,
-            {"type": "function_result", "call_id": "f1", "name": "lua", "result": [text("42")]}])
-        done = self.run_hx("--run", "-", stdin="print(host.route('gemini-4-carbon'), host.route('gemini-4-neon'))\n",
-                           HX_MODEL="opus")
-        self.assertEqual(done.stdout, "gemini\tgemini\n", done.stderr)
-        done = self.run_hx("--run", "-", stdin="print(host.route('gemini-4-carbon'), host.route('claude-opus-5-5'))\n",
-                           HX_MODEL="neon")
-        self.assertEqual(done.stdout, "session\tanthropic\n", done.stderr)
-
-    def test_a_claude_agent_under_a_deepseek_session_goes_to_anthropic_with_its_key(self):
-        os.makedirs(os.path.join(self.project, ".hx"))
-        with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
-            f.write('local M = host.load(host.default_loop, "=loop")()\n'
-                    'M.agent_model = "claude-haiku-5-5"\nreturn M\n')
-        anthropic = self.agents_model({"make a.txt": [say("a.txt is made")]})
-        claude_key = "claude-agent-key-3"
-        done = self.run_hx("go", HX_ANTHROPIC_URL=anthropic.url, ANTHROPIC_API_KEY=claude_key, script=[
-            call("lua", {"code": 'return agents({ { name = "a", task = "make a.txt" } })'}, "c1"),
-            call("bash", {"command": "env"}, "c2"),
-            say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-1\.json\]\na\.txt is made$")
-        self.assertEqual([r["model"] for r in anthropic.requests], ["claude-haiku-5-5"])
-        self.assertEqual(anthropic.headers[0]["x-api-key"], claude_key)
-        self.assertEqual(anthropic.headers[0]["anthropic-version"], "2026-10-21")
-        self.assertEqual(anthropic.requests[0]["thinking"]["type"], "adaptive")
-        self.assertEqual([r["model"] for r in self.model.requests], ["deepseek-flash"] * 3)
-        for headers in self.model.headers:
-            self.assertEqual(headers["x-api-key"], KEY)
-        self.assertNotIn(claude_key, json.dumps(self.model.requests))
-        self.assertNotIn(KEY, json.dumps(anthropic.requests))
+            self.assertIs(sent["store"], False)
+            self.assertEqual(set(sent), {"model", "store", "system_instruction", "input", "tools"})
+        self.assertEqual(self.model.requests[1]["input"], [
+            said("go"), thought, asked,
+            {"type": "function_result", "call_id": "f1", "name": "lua", "result": [part("42")]}])
 
     def agents_model(self, scripts):
         model = Model()
@@ -659,57 +605,55 @@ end
         model.answer = agent_answers(scripts)
         return model
 
-    def test_agents_work_side_by_side_on_deepseek_and_report_to_the_lead(self):
+    def test_agents_work_side_by_side_and_report_to_the_lead(self):
         os.makedirs(os.path.join(self.project, ".hx"))
-        deepseek = self.agents_model({
+        self.model.answer = agent_answers({
             "make a.txt": [call("bash", {"command": "echo a > a.txt; echo made a"}, "a1"), say("a.txt is made")],
             "make b.txt": [call("bash", {"command": "echo b > b.txt; echo made b"}, "b1"), say("b.txt is made")],
         })
         both_started = threading.Barrier(2)
-        answer = deepseek.answer
+        answer = self.model.answer
 
         def answer_together(request):
-            if len(request["messages"]) == 1:
+            if len(request["input"]) == 1 and task_of(request) != "go":
                 try:
                     both_started.wait(timeout=10)
                 except threading.BrokenBarrierError:
                     return 400, {"error": {"message": "the other agent never reached the model"}}
             return answer(request)
 
-        deepseek.answer = answer_together
+        self.model.answer = answer_together
         tasks = 'return agents({ { name = "a", task = "make a.txt" }, { name = "b", task = "make b.txt" } })'
-        done = self.run_hx("--model", "opus", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY="ds-key-1",
-                           script=[call("lua", {"code": tasks}, "c1"), say("both are made")])
+        done = self.run_hx("--model", "carbon", "go", script=[call("lua", {"code": tasks}, "c1"), say("both are made")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertRegex(self.tool_results()[0], r"^\[agent a: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-1\.json\]\na\.txt is made\n\n"
+        report = self.tool_results([r for r in self.model.requests if task_of(r) == "go"])[0]
+        self.assertRegex(report, r"^\[agent a: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-1\.json\]\na\.txt is made\n\n"
                          r"\[agent b: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-2\.json\]\nb\.txt is made$")
-        named = re.search(r"its conversation: (\S+)\]", self.tool_results()[0]).group(1)
+        named = re.search(r"its conversation: (\S+)\]", report).group(1)
         self.assertIn("a.txt", read(self.project, named))
         self.assertEqual((read(self.project, "a.txt"), read(self.project, "b.txt")), ("a\n", "b\n"))
-        self.assertEqual([len(r["messages"]) for r in deepseek.requests], [1, 1, 3, 3])
-        for sent, headers in zip(deepseek.requests, deepseek.headers):
-            self.assertEqual(sent["model"], "deepseek-flash")
-            self.assertEqual(headers["x-api-key"], "ds-key-1")
-            self.assertIn("You are a coding agent working in", sent["system"])
-            self.assertIn("You are one of several agents at work in this directory", sent["system"])
+        agents = [r for r in self.model.requests if task_of(r) != "go"]
+        self.assertEqual([len(r["input"]) for r in agents], [1, 1, 3, 3])
+        for sent in agents:
+            self.assertEqual(sent["model"], "gemini-4-carbon")
+            self.assertIn("You are a coding agent working in", sent["system_instruction"])
+            self.assertIn("You are one of several agents at work in this directory", sent["system_instruction"])
             self.assertIn("- bash(command", sent["tools"][0]["description"])
             self.assertNotIn("agents(tasks)", sent["tools"][0]["description"])
-        self.assertEqual(deepseek.requests[0]["system"], deepseek.requests[1]["system"])
-        lead = self.model.requests[0]
+        self.assertEqual(agents[0]["system_instruction"], agents[1]["system_instruction"])
+        lead = next(r for r in self.model.requests if task_of(r) == "go")
         self.assertIn("- agents(tasks) -> text", lead["tools"][0]["description"])
-        self.assertNotIn("one of several agents", lead["system"][0]["text"])
+        self.assertNotIn("one of several agents", lead["system_instruction"])
         self.assertEqual(done.stdout, "both are made\n")
         for line in ("  agent a: make a.txt", "[a] bash echo a > a.txt; echo made a", "[a] a.txt is made",
                      "[b] b.txt is made"):
             self.assertIn(line + "\n", done.stderr)
-        self.assertIn("[claude-opus-5-5: 2 replies, 20 tokens in (0 read from cache, 0 written to it), 10 out]\n"
-                      "[deepseek-flash: 4 replies, 40 tokens in (0 read from cache, 0 written to it), 20 out]",
-                      done.stderr)
+        self.assertIn("[6 replies, 60 tokens in (0 read from cache), 30 out]", done.stderr)
         logs = sorted(os.listdir(os.path.join(self.project, ".hx", "log")))
         self.assertEqual([name.split("-", 3)[3] for name in logs if "-sub-" in name], ["sub-1.json", "sub-2.json"])
         first = json.loads(read(self.project, ".hx", "log", next(name for name in logs if "-sub-1" in name)))
-        self.assertEqual(first["messages"][0], {"role": "user", "content": "make a.txt"})
-        self.assertEqual(first["messages"][-1]["content"], [text("a.txt is made")])
+        self.assertEqual(first["steps"][0], said("make a.txt"))
+        self.assertEqual(first["steps"][-1], text("a.txt is made"))
 
     def test_work_sent_back_goes_to_the_agent_that_did_it(self):
         self.model.answer = agent_answers({"make a.txt": [say("made it"), say("now it is right")]})
@@ -721,12 +665,9 @@ end
         first, second = self.tool_results()
         self.assertRegex(first, r"^\[agent a: done in \d+ s\]\nmade it$")
         self.assertRegex(second, r"^\[agent a: done in \d+ s\]\nnow it is right$")
-        asked = [r for r in self.model.requests if "one of several agents" in r["system"]]
-        self.assertEqual([r["model"] for r in asked], ["deepseek-flash"] * 2)
-        self.assertEqual(asked[1]["messages"], [
-            {"role": "user", "content": "make a.txt"},
-            {"role": "assistant", "content": [text("made it")]},
-            {"role": "user", "content": "it is empty: fill it"}])
+        asked = [r for r in self.model.requests if "one of several agents" in r["system_instruction"]]
+        self.assertEqual([r["model"] for r in asked], ["gemini-4-neon"] * 2)
+        self.assertEqual(asked[1]["input"], [said("make a.txt"), text("made it"), said("it is empty: fill it")])
         self.assertIn("[5 replies, 50 tokens in", done.stderr)
 
     def test_a_lead_that_answers_while_its_agents_work_is_told_to_wait(self):
@@ -741,14 +682,14 @@ end
             call("lua", {"code": "host.sleep(3) return agents()"}, "c2"),
             say("Now it is.")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        lead = [r for r in self.model.requests if "one of several agents" not in r["system"]]
+        lead = [r for r in self.model.requests if "one of several agents" not in r["system_instruction"]]
         still, report = self.tool_results(lead)
         self.assertRegex(still, r"^\[agent slow: still at work, \d+ s so far\]\n\n"
                          r"agents\(\) with no tasks waits for the agents still at work\.$")
-        self.assertEqual(lead[2]["messages"][-1], {"role": "user", "content":
+        self.assertEqual(lead[2]["input"][-1], said(
                          "Your agents are still at work: slow. What they are doing ends half done when this session "
                          "does. Wait for their reports with agents(), check the work, then finish. If you mean to "
-                         "stop without them, say so in your answer."})
+                         "stop without them, say so in your answer."))
         self.assertRegex(report, r"^\[agent slow: done in \d+ s\]\n\[its conversation: \.hx/log/[\w-]+-sub-1\.json\]\nlate\.txt is made$")
         self.assertEqual(read(self.project, "late.txt"), "late\n")
         self.assertEqual(done.stdout, "All done.\nNow it is.\n")
@@ -774,43 +715,47 @@ end
         self.assertEqual(process.returncode, 130)
         self.assert_gone(pid)
 
-    def test_rpi_leads_on_opus_by_the_rpi_skill(self):
-        done = self.run_hx("--rpi", "go", HX_MODEL="deepseek-flash", script=[say("ok")])
+    def test_rpi_leads_on_carbon_by_the_rpi_skill(self):
+        done = self.run_hx("--rpi", "go", HX_MODEL="hydrogen", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         sent = self.model.requests[0]
-        self.assertEqual(sent["model"], "claude-opus-5-5")
-        system = sent["system"][0]["text"]
+        self.assertEqual(sent["model"], "gemini-4-carbon")
+        system = sent["system_instruction"]
         self.assertIn("This session follows the rpi workflow, whatever the task", system)
         body = read(REPO, "lua", "skills", "rpi", "SKILL.md").split("---\n", 2)[2].strip()
         self.assertTrue(system.endswith("[skill rpi, built into hx. Every path in it is the project's.]\n\n" + body))
         self.assertIn("  skill rpi\n", done.stderr)
-        done = self.run_hx("--model", "sonnet", "--rpi", "go", script=[say("ok")])
-        self.assertEqual(self.model.requests[1]["model"], "claude-sonnet-5-5")
-        self.assertIn("follows the rpi workflow", self.model.requests[1]["system"][0]["text"])
+        done = self.run_hx("--model", "neon", "--rpi", "go", script=[say("ok")])
+        self.assertEqual(self.model.requests[1]["model"], "gemini-4-neon")
+        self.assertIn("follows the rpi workflow", self.model.requests[1]["system_instruction"])
         done = self.run_hx("go", script=[call("lua", {"code": "return skill('rpi')"}, "c1"), say("ok")])
-        self.assertNotIn("follows the rpi workflow", self.model.requests[2]["system"])
-        self.assertIn("\n- rpi (built in): The rpi workflow (research, plan, implement).", self.model.requests[2]["system"])
+        self.assertNotIn("follows the rpi workflow", self.model.requests[2]["system_instruction"])
+        self.assertIn("\n- rpi (built in): The rpi workflow (research, plan, implement).", self.model.requests[2]["system_instruction"])
         self.assertEqual(self.tool_results()[0], "[skill rpi, built into hx. Every path in it is the project's.]\n\n" + body)
         for args in (["--rpi", "--run", "s.luau"], ["--rpi", "--init"], ["--init", "--rpi"]):
             done = self.run_hx(*args)
             self.assertEqual(done.returncode, 2, done.stderr)
             self.assertIn("--rpi leads the agent on a task", done.stderr)
-        done = self.run_hx("--rpi=opus", "go")
+        done = self.run_hx("--rpi=carbon", "go")
         self.assertEqual((done.returncode, done.stderr), (2, "hx: --rpi takes no value\n"))
 
     def test_the_rpi_lead_s_agents_do_not_get_the_workflow_and_a_project_s_own_takes_its_place(self):
         os.makedirs(os.path.join(self.project, ".hx", "skills", "rpi"))
         with open(os.path.join(self.project, ".hx", "skills", "rpi", "SKILL.md"), "w") as f:
             f.write("---\nname: rpi\ndescription: This project's way.\n---\nPlan twice.\n")
-        deepseek = self.agents_model({"do it": [say("did it")]})
-        done = self.run_hx("--rpi", "go", HX_DEEPSEEK_URL=deepseek.url, DEEPSEEK_API_KEY="ds-key-1", script=[
+        self.model.answer = agent_answers({"do it": [say("did it")]})
+        done = self.run_hx("--rpi", "go", script=[
             call("lua", {"code": 'return agents({ { name = "a", task = "do it" } })'}, "c1"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        system = self.model.requests[0]["system"][0]["text"]
+        lead = [r for r in self.model.requests if task_of(r) == "go"]
+        self.assertEqual([r["model"] for r in lead], ["gemini-4-carbon"] * 2)
+        system = lead[0]["system_instruction"]
         self.assertTrue(system.endswith("Plan twice."), system[-200:])
         self.assertNotIn("# rpi: research, plan, implement", system)
-        self.assertEqual(self.model.requests[1]["system"], self.model.requests[0]["system"])
-        agent = deepseek.requests[0]["system"]
+        self.assertEqual(lead[1]["system_instruction"], system)
+        sent = next(r for r in self.model.requests if task_of(r) == "do it")
+        self.assertEqual(sent["model"], "gemini-4-hydrogen")
+        agent = sent["system_instruction"]
         self.assertNotIn("follows the rpi workflow", agent)
         self.assertNotIn("Plan twice.", agent)
         self.assertIn("- rpi: This project's way.", agent)
@@ -820,48 +765,21 @@ end
         self.assertEqual(done.returncode, 1)
         self.assertIn("hx: the workflow review needs a skill of that name, and there is none", done.stderr)
 
-    def test_the_model_follows_the_key_that_is_set(self):
+    def test_the_model_is_neon_unless_another_is_named(self):
         show = ["--run", "-"]
         script = "print(host.env('HX_MODEL'))"
-        done = self.run_hx(*show, stdin=script, HX_API_URL="", HX_MODEL="", DEEPSEEK_API_KEY="", ANTHROPIC_API_KEY="k")
-        self.assertEqual(done.stdout, "claude-opus-5-5\n", done.stderr)
-        done = self.run_hx(*show, stdin=script, HX_API_URL="", HX_MODEL="", DEEPSEEK_API_KEY="d", ANTHROPIC_API_KEY="k")
-        self.assertEqual(done.stdout, "deepseek-flash\n", done.stderr)
-        done = self.run_hx(*show, stdin=script, HX_MODEL="sonnet")
-        self.assertEqual(done.stdout, "claude-sonnet-5-5\n", done.stderr)
-
-    def test_what_a_declining_model_wrote_before_a_fallback_is_not_sent_back(self):
-        fallback = {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}}
-        thinking = {"type": "thinking", "thinking": "", "signature": "sig"}
-        done = self.run_hx("--model", "opus", "go", script=[
-            reply([thinking, use("bash", {"command": "echo no"}, "c0"), fallback, thinking,
-                   use("bash", {"command": "echo yes"}, "c1")], stop="tool_use"),
-            say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("claude-opus-5-5 declined; claude-opus-5 continued", done.stderr)
-        self.assertEqual(self.model.requests[1]["messages"][1]["content"],
-                         [fallback, thinking, use("bash", {"command": "echo yes"}, "c1")])
-        self.assertEqual(self.tool_results(), ["yes\n[exit 0]"])
-
-    def test_progress_updates_are_shown_for_a_claude_model(self):
-        update = {"type": "thinking", "thinking": "Looking at the tests next.", "signature": "sig"}
-        done = self.run_hx("--model", "sonnet", "go", script=[reply([update, text("ok")])])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("Looking at the tests next.", done.stderr)
-        self.assertEqual(done.stdout, "ok\n")
-        done = self.run_hx("--model", "deepseek-flash", "go", script=[reply([update, text("ok")])])
-        self.assertNotIn("Looking at the tests next.", done.stderr)
-
-    def test_a_refusal_names_its_category(self):
-        refused = reply([], stop="refusal")
-        refused[1]["stop_details"] = {"type": "refusal", "category": "cyber", "explanation": None}
-        done = self.run_hx("--model", "opus", "go", script=[refused])
-        self.assertIn("[the model declined to answer (cyber)]", done.stderr)
+        done = self.run_hx(*show, stdin=script, HX_MODEL="")
+        self.assertEqual(done.stdout, "gemini-4-neon\n", done.stderr)
+        for alias in ("carbon", "argon", "neon", "hydrogen"):
+            done = self.run_hx(*show, stdin=script, HX_MODEL=alias)
+            self.assertEqual(done.stdout, f"gemini-4-{alias}\n", done.stderr)
+        done = self.run_hx("--model", "gemini-3.6-flash", *show, stdin=script, HX_MODEL="carbon")
+        self.assertEqual(done.stdout, "gemini-3.6-flash\n", done.stderr)
 
     def test_the_task_can_come_from_stdin(self):
         done = self.run_hx(stdin="line one\nline two\n", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.model.requests[0]["messages"][0]["content"], "line one\nline two")
+        self.assertEqual(task_of(self.model.requests[0]), "line one\nline two")
 
     def test_no_task_is_an_error(self):
         done = self.run_hx(stdin="")
@@ -881,7 +799,7 @@ end
         self.assertEqual(self.model.requests, [])
         done = self.run_hx("--no-input", stdin="the task, piped\n", script=[say("ok")])
         self.assertEqual((done.returncode, done.stdout), (0, "ok\n"), done.stderr)
-        self.assertEqual(self.model.requests[0]["messages"][0]["content"], "the task, piped")
+        self.assertEqual(task_of(self.model.requests[0]), "the task, piped")
 
     def test_help_and_version_go_to_stdout(self):
         done = self.run_hx("--help")
@@ -925,13 +843,13 @@ end
         self.assertEqual((done.returncode, done.stdout), (0, "a -b\n"), done.stderr)
 
     def test_a_cut_off_reply_is_continued(self):
-        done = self.run_hx("go", script=[say("part one", stop="max_tokens"), say("part two")])
+        done = self.run_hx("go", script=[say("part one", status="incomplete"), say("part two")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "part one\npart two\n")
-        self.assertIn("cut off", self.model.requests[1]["messages"][-1]["content"])
+        self.assertIn("cut off", self.model.requests[1]["input"][-1]["content"][0]["text"])
 
     def test_a_cut_off_tool_call_does_not_run(self):
-        done = self.run_hx("go", script=[call("bash", {"command": "touch ran.txt"}, stop="max_tokens"), say("ok")])
+        done = self.run_hx("go", script=[call("bash", {"command": "touch ran.txt"}, status="incomplete"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("cut off by the output limit", self.tool_results()[0])
         self.assertFalse(os.path.exists(os.path.join(self.project, "ran.txt")))
@@ -961,51 +879,12 @@ end
                                                say("SUMMARY TEXT"), say("finished")])
         self.assertEqual(done.returncode, 0, done.stderr)
         _, ask, after = self.model.requests
-        self.assertEqual([m["role"] for m in ask["messages"]], ["user", "assistant", "user"])
-        self.assertEqual([b["type"] for b in ask["messages"][2]["content"]], ["tool_result", "text"])
-        self.assertIn("replaced by a summary", ask["messages"][2]["content"][1]["text"])
-        self.assertEqual([m["role"] for m in after["messages"]], ["user"])
-        self.assertIn("SUMMARY TEXT", after["messages"][0]["content"])
-        self.assertEqual(after["system"], ask["system"])
+        self.assertEqual([s["type"] for s in ask["input"]], ["user_input", "function_call", "function_result", "user_input"])
+        self.assertIn("replaced by a summary", ask["input"][3]["content"][0]["text"])
+        self.assertEqual([s["type"] for s in after["input"]], ["user_input"])
+        self.assertIn("SUMMARY TEXT", after["input"][0]["content"][0]["text"])
+        self.assertEqual(after["system_instruction"], ask["system_instruction"])
         self.assertEqual(done.stdout, "finished\n")
-
-    def test_a_claude_model_compacts_on_the_server(self):
-        block = {"type": "compaction", "content": "SUMMARY TEXT", "signature": "sig-c"}
-        compacted = (200, {"id": "msg_c", "type": "message", "role": "assistant", "content": [block],
-                           "stop_reason": "compaction", "stop_sequence": None,
-                           "usage": {"input_tokens": 0, "output_tokens": 0,
-                                     "iterations": [{"type": "compaction", "input_tokens": 300, "output_tokens": 70}]}})
-        done = self.run_hx("--model", "opus", "the task", script=[
-            call("bash", {"command": "echo big"}, input_tokens=200000), compacted, say("finished")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        first, ask, after = self.model.requests
-        self.assertEqual(ask["compaction"]["type"], "summarize")
-        self.assertIn("## Next step", ask["compaction"]["instructions"])
-        self.assertEqual(ask["messages"][0], first["messages"][0])
-        self.assertEqual([b["type"] for b in ask["messages"][2]["content"]], ["tool_result"])
-        for key in ("system", "tools", "thinking", "output_config", "model"):
-            self.assertEqual(ask[key], first[key])
-        self.assertIn("compact-2026-09-04", self.model.headers[1]["anthropic-beta"].split(","))
-        self.assertEqual(len(after["messages"]), 1)
-        self.assertEqual(after["messages"][0]["role"], "user")
-        self.assertEqual(after["messages"][0]["content"][0], block)
-        self.assertIn("continue the work", after["messages"][0]["content"][1]["text"])
-        self.assertNotIn("compaction", after)
-        self.assertIn("compact-2026-09-04", self.model.headers[2]["anthropic-beta"].split(","))
-        self.assertEqual(done.stdout, "finished\n")
-        self.assertIn("3 replies", done.stderr)
-        self.assertIn("80 out]", done.stderr)
-
-    def test_a_claude_compaction_without_a_summary_keeps_the_conversation(self):
-        empty = (200, {"id": "msg_c", "type": "message", "role": "assistant", "content": [], "stop_reason": "max_tokens",
-                       "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}})
-        done = self.run_hx("--model", "opus", "the task", script=[
-            call("bash", {"command": "echo big"}, input_tokens=200000), empty, say("finished")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("no summary came back (max_tokens)", done.stderr)
-        _, ask, after = self.model.requests
-        self.assertEqual(after["messages"], ask["messages"])
-        self.assertNotIn("compaction", after)
 
     def test_the_model_cannot_leave_the_project(self):
         with open(os.path.join(self.home, "secret"), "w") as f:
@@ -1215,12 +1094,12 @@ end
         load = call("lua", {"code": "return skill('sign-off')"})
         done = self.run_hx("go", script=[load, say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertNotIn("sign-off", self.model.requests[0]["system"])
+        self.assertNotIn("sign-off", self.model.requests[0]["system_instruction"])
         self.assertIn('No skill is named "sign-off".', self.tool_results()[0])
         self.model.requests.clear()
         done = self.run_hx("--ro", skills, "go", script=[load, say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("\n- sign-off: How to sign off a piece of work.", self.model.requests[0]["system"])
+        self.assertIn("\n- sign-off: How to sign off a piece of work.", self.model.requests[0]["system_instruction"])
         self.assertTrue(self.tool_results()[0].endswith("\n\nWrite SIGNED to signoff.txt."), self.tool_results())
 
     def test_the_api_key_reaches_the_endpoint_and_nothing_else(self):
@@ -1230,8 +1109,7 @@ end
                                  "return table.concat(t, ' '), host.env('HX_TEST_KEY'), host.env('OTHER_SECRET_TOKEN')"}, "c2"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.model.headers[0]["x-api-key"], KEY)
-        self.assertEqual(self.model.headers[0]["anthropic-version"], "2023-06-01")
+        self.assertEqual(self.model.headers[0]["x-goog-api-key"], KEY)
         sent = json.dumps(self.model.requests)
         self.assertNotIn(KEY, sent)
         self.assertNotIn("hunter2-token", sent)
@@ -1531,8 +1409,8 @@ end
                 for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
         self.assertEqual(len(logs), 2)
         for log in logs:
-            self.assertEqual([m["role"] for m in log["messages"]], ["user", "assistant"])
-            self.assertEqual(log["messages"][0]["content"], "the task")
+            self.assertEqual([s["type"] for s in log["steps"]], ["user_input", "function_call"])
+            self.assertEqual(log["steps"][0], said("the task"))
 
     def test_an_interrupted_turn_leaves_a_conversation_that_continues(self):
         self.model.script = [say("first answer"), call("bash", {"command": "echo $$ > cmd.pid; sleep 300"}),
@@ -1556,12 +1434,11 @@ end
         finally:
             process.kill()
             os.close(master)
-        messages = self.model.requests[2]["messages"]
-        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user", "assistant", "user"])
-        self.assertEqual(messages[4]["content"], [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "error: interrupted by the user", "is_error": True},
-            {"type": "text", "text": "go on"},
-        ])
+        steps = self.model.requests[2]["input"]
+        self.assertEqual([s["type"] for s in steps],
+                         ["user_input", "model_output", "user_input", "function_call", "function_result", "user_input"])
+        self.assertEqual(steps[4:], [
+            {"type": "function_result", "call_id": "call_1", "name": "lua", "result": [part("error: interrupted by the user")], "is_error": True}, said("go on")])
 
     def test_an_interrupted_request_leaves_a_conversation_that_continues(self):
         self.model.script = [("hang", 30), say("after the interrupt")]
@@ -1583,8 +1460,7 @@ end
         finally:
             process.kill()
             os.close(master)
-        self.assertEqual(self.model.requests[1]["messages"], [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "again"}]}])
+        self.assertEqual(self.model.requests[1]["input"], [said("hello", "again")])
 
     def test_a_failed_turn_returns_to_the_prompt(self):
         self.model.script = [call("bash", {"command": "echo ran"}), (400, {"error": {"message": "no such model"}}),
@@ -1607,12 +1483,9 @@ end
             errors.seek(0)
             self.assertIn("no such model", errors.read())
         self.assertEqual(len(self.model.requests), 3)
-        messages = self.model.requests[2]["messages"]
-        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
-        self.assertEqual(messages[2]["content"], [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "ran\n[exit 0]"},
-            {"type": "text", "text": "again"},
-        ])
+        steps = self.model.requests[2]["input"]
+        self.assertEqual([s["type"] for s in steps], ["user_input", "function_call", "function_result", "user_input"])
+        self.assertEqual(steps[2:], [{"type": "function_result", "call_id": "call_1", "name": "lua", "result": [part("ran\n[exit 0]")]}, said("again")])
 
     def test_a_pasted_message_is_one_message(self):
         self.model.script = [say("one"), say("two"), say("three")]
@@ -1638,9 +1511,9 @@ end
             errors.seek(0)
             written = errors.read()
         self.assertEqual(len(self.model.requests), 3)
-        self.assertEqual(self.model.requests[0]["messages"], [{"role": "user", "content": "first line\nsecond line\nthird"}])
-        self.assertEqual(self.model.requests[1]["messages"][2], {"role": "user", "content": "plain"})
-        self.assertEqual(self.model.requests[2]["messages"][4], {"role": "user", "content": "before a\nb after"})
+        self.assertEqual(self.model.requests[0]["input"], [said("first line\nsecond line\nthird")])
+        self.assertEqual(self.model.requests[1]["input"][2], said("plain"))
+        self.assertEqual(self.model.requests[2]["input"][4], said("before a\nb after"))
         self.assertIn(b"\x1b[?2004h> ", written)
         self.assertGreater(written.rfind(b"\x1b[?2004l"), written.rfind(b"\x1b[?2004h"))
 
@@ -1658,7 +1531,7 @@ end
         finally:
             process.kill()
             os.close(master)
-        self.assertEqual(self.model.requests[0]["messages"], [{"role": "user", "content": "cut\nshort"}])
+        self.assertEqual(self.model.requests[0]["input"], [said("cut\nshort")])
 
     def test_a_stop_at_the_prompt_turns_paste_off(self):
         master, slave = pty.openpty()
@@ -1702,10 +1575,8 @@ end
         finally:
             process.kill()
             os.close(master)
-        self.assertEqual(self.model.requests[1]["messages"][2]["content"], [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "error: interrupted by the user", "is_error": True},
-            {"type": "text", "text": "go on"},
-        ])
+        self.assertEqual(self.model.requests[1]["input"][2:], [
+            {"type": "function_result", "call_id": "call_1", "name": "lua", "result": [part("error: interrupted by the user")], "is_error": True}, said("go on")])
 
     def run_interrupted(self, source):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
@@ -1781,8 +1652,8 @@ end
         done = self.run_hx("--no-sandbox", "go", script=[call("bash", {"command": f"echo x > {outside} && echo wrote"}), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results(), ["wrote\n[exit 0]"])
-        self.assertIn("Nothing confines you", self.model.requests[0]["system"])
-        self.assertNotIn("The kernel confines you", self.model.requests[0]["system"])
+        self.assertIn("Nothing confines you", self.model.requests[0]["system_instruction"])
+        self.assertNotIn("The kernel confines you", self.model.requests[0]["system_instruction"])
 
     def assert_gone(self, pid):
         for _ in range(100):
@@ -1918,65 +1789,56 @@ end
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.tool_results()[1], "HEY!")
-        self.assertNotIn("- shout", self.model.requests[0]["system"])
-        self.assertIn("the loop built into hx", self.model.requests[0]["system"])
-        self.assertIn("Never sleep or poll to wait for something outside your control", self.model.requests[0]["system"])
-        self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system"])
-        history = self.model.requests[-1]["messages"] + [{"role": "assistant", "content": [text("ok")]}]
+        self.assertNotIn("- shout", self.model.requests[0]["system_instruction"])
+        self.assertIn("the loop built into hx", self.model.requests[0]["system_instruction"])
+        self.assertIn("Never sleep or poll to wait for something outside your control", self.model.requests[0]["system_instruction"])
+        self.assertNotIn("running you is .hx/loop.luau", self.model.requests[0]["system_instruction"])
+        history = self.model.requests[-1]["input"] + [text("ok")]
         self.run_hx("again", script=[say("ok")])
-        self.assertIn("- shout: shouts a word", self.model.requests[-1]["system"])
+        self.assertIn("- shout: shouts a word", self.model.requests[-1]["system_instruction"])
         logs = [json.loads(read(self.project, ".hx", "log", name))
                 for name in os.listdir(os.path.join(self.project, ".hx", "log")) if name.endswith(".json")]
-        self.assertEqual(sorted(log["messages"][0]["content"] for log in logs), ["again", "go"])
-        first = next(log for log in logs if log["messages"][0]["content"] == "go")
-        self.assertEqual(first["messages"], history)
-        saved = next(log for log in logs if log["messages"][0]["content"] == "again")
-        self.assertEqual(saved["system"], self.model.requests[-1]["system"])
+        self.assertEqual(sorted(log["steps"][0]["content"][0]["text"] for log in logs), ["again", "go"])
+        first = next(log for log in logs if log["steps"][0]["content"][0]["text"] == "go")
+        self.assertEqual(first["steps"], history)
+        saved = next(log for log in logs if log["steps"][0]["content"][0]["text"] == "again")
+        self.assertEqual(saved["system"], self.model.requests[-1]["system_instruction"])
         self.assertEqual(read(self.project, ".hx", "log", ".gitignore"), "*\n")
         git = dict(cwd=self.project, env=self.env(), capture_output=True, text=True, check=True)
         subprocess.run(["git", "init", "-q"], **git)
         subprocess.run(["git", "add", "-A"], **git)
         self.assertEqual(subprocess.run(["git", "ls-files"], **git).stdout, ".hx/ext/shout.luau\n")
 
-    def test_web_and_ocr_go_to_deepseek_with_its_key_alone(self):
+    def test_web_goes_to_exa_with_its_key_alone(self):
         tools = Tools()
         self.addCleanup(tools.server_close)
         self.addCleanup(tools.shutdown)
-        with open(os.path.join(self.project, "scan.pdf"), "wb") as f:
-            f.write(b"%PDF-1.7 not really\x00\xff")
-        with open(os.path.join(self.project, "photo.png"), "wb") as f:
-            f.write(b"\x89PNG fake")
-        ds_key = "ds-tools-key-42"
-        code = ("local web, ocr = ext('web'), ext('ocr') "
-                "print(web.search('luau language', {count = 3})) print(web.fetch('https://luau.org')) "
-                "print(ocr.read('scan.pdf')) return ocr.read('photo.png')")
-        done = self.run_hx("go", HX_TOOLS_URL=tools.url + "/", DEEPSEEK_API_KEY=ds_key, script=[
+        exa_key = "exa-web-key-42"
+        code = ("local web = ext('web') print(web.search('luau language', {count = 3})) "
+                "print(pcall(web.fetch, 'https://gone.example')) return web.fetch('https://luau.org')")
+        done = self.run_hx("go", HX_EXA_URL=tools.url + "/search", HX_EXA_CONTENTS_URL=tools.url + "/contents",
+                           EXA_API_KEY=exa_key, script=[
             call("lua", {"code": code}, "c1"),
             call("bash", {"command": "env"}, "c2"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         result = self.tool_results()[0]
-        self.assertIn("1. Luau\n   https://luau.org\n   A small fast language.", result)
+        self.assertIn("1. Luau (2026-08-26)\n   https://luau.org\n"
+                      "   Luau is a small fast language. ... It has gradual types.", result)
+        self.assertIn("false\tweb.fetch: Exa could not read https://gone.example: CRAWL_NOT_FOUND", result)
         self.assertIn("# Luau\n\nA small fast language.", result)
-        self.assertEqual(result.count("Recognized words"), 2)
-        self.assertEqual([r["path"] for r in tools.requests],
-                         ["/v1/tools/search", "/v1/tools/fetch", "/v1/tools/ocr", "/v1/tools/ocr"])
+        self.assertEqual([r["path"] for r in tools.requests], ["/exa/search", "/exa/contents", "/exa/contents"])
         for r in tools.requests:
-            self.assertEqual(r["headers"]["authorization"], f"Bearer {ds_key}")
-            self.assertNotIn("x-api-key", r["headers"])
-        self.assertEqual(json.loads(tools.requests[0]["body"]), {"query": "luau language", "count": 3})
-        self.assertEqual(json.loads(tools.requests[1]["body"]), {"url": "https://luau.org"})
-        pdf, png = tools.requests[2], tools.requests[3]
-        self.assertTrue(pdf["headers"]["content-type"].startswith("multipart/form-data; boundary="))
-        self.assertIn(b'name="file"; filename="scan.pdf"', pdf["body"])
-        self.assertIn(b"%PDF-1.7 not really\x00\xff", pdf["body"])
-        self.assertIn(b'name="purpose"\r\n\r\nrich_layout_recognition', pdf["body"])
-        self.assertIn(b'name="purpose"\r\n\r\ntext_recognition', png["body"])
-        self.assertEqual(self.model.headers[0]["x-api-key"], KEY)
-        self.assertNotIn(ds_key, json.dumps(self.model.requests))
-        self.assertNotIn(ds_key, self.tool_results()[1])
-        self.assertIn("- web (built in): searches the web", self.model.requests[0]["system"])
-        self.assertIn("- ocr (built in): reads the text", self.model.requests[0]["system"])
+            self.assertEqual(r["headers"]["x-api-key"], exa_key)
+            self.assertNotIn("authorization", r["headers"])
+            self.assertNotIn("x-goog-api-key", r["headers"])
+        self.assertEqual(json.loads(tools.requests[0]["body"]),
+                         {"query": "luau language", "type": "auto", "numResults": 3, "contents": {"highlights": True}})
+        self.assertEqual(json.loads(tools.requests[2]["body"]), {"ids": ["https://luau.org"], "text": True})
+        self.assertEqual(self.model.headers[0]["x-goog-api-key"], KEY)
+        self.assertNotIn(exa_key, json.dumps(self.model.requests))
+        self.assertNotIn(exa_key, self.tool_results()[1])
+        self.assertIn("- web (built in): searches the web", self.model.requests[0]["system_instruction"])
 
     def test_exa_deep_search_goes_to_exa_with_its_key_alone(self):
         tools = Tools()
@@ -1987,10 +1849,9 @@ end
                 "{queries = {'luau gradual typing'}}) "
                 "assert(r.answer and r.results[1].highlights[2] and r.grounding[1].field == 'content' "
                 "and r.cost == 0.012) return r")
-        done = self.run_hx("go", HX_EXA_URL=tools.url.replace("/v1/tools", "/exa/search"), EXA_API_KEY=exa_key,
+        done = self.run_hx("go", HX_EXA_URL=tools.url + "/search", EXA_API_KEY=exa_key,
                            script=[call("lua", {"code": code}, "c1"),
-                                   call("lua", {"code": "return ext('web').search('x')"}, "c2"),
-                                   call("bash", {"command": "env"}, "c3"),
+                                   call("bash", {"command": "env"}, "c2"),
                                    say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
@@ -2010,30 +1871,42 @@ end
         self.assertEqual(body["outputSchema"]["type"], "text")
         self.assertIn("exa warning: x is ignored.", done.stderr)
         self.assertNotIn("x is ignored", json.dumps(self.model.requests))
-        self.assertIn("without DEEPSEEK_API_KEY", results[1])
         self.assertNotIn(exa_key, json.dumps(self.model.requests))
-        self.assertNotIn(exa_key, results[2])
-        system = self.model.requests[0]["system"]
+        self.assertNotIn(exa_key, results[1])
+        system = self.model.requests[0]["system_instruction"]
         self.assertIn("- exa (built in): researches a question", system)
-        self.assertNotIn("- web (built in)", system)
 
     def test_an_endpoint_named_at_startup_is_reached_with_its_own_key(self):
         tools = Tools()
         self.addCleanup(tools.server_close)
         self.addCleanup(tools.shutdown)
         key = "my-api-key-31"
-        done = self.run_hx("--endpoint", "my-api=" + tools.url + "/fetch", "--endpoint", "bare=" + tools.url + "/search",
+        secret = os.path.join(self.home, "secret.pdf")
+        for path, content in ((secret, b"private"), (os.path.join(self.project, "scan.pdf"), b"%PDF-1.7 not really\x00\xff")):
+            with open(path, "wb") as f:
+                f.write(content)
+        done = self.run_hx("--endpoint", "my-api=" + tools.url + "/contents", "--endpoint", "bare=" + tools.url + "/search",
                            "go", MY_API_API_KEY=key, script=[
                                call("lua", {"code": "return host.post('my-api', '{\"url\":\"u\"}')"}, "c1"),
                                call("lua", {"code": "return host.post('bare', '{}')"}, "c2"),
                                call("lua", {"code": "return host.endpoints['my-api'], host.endpoints.bare"}, "c3"),
                                call("bash", {"command": "env"}, "c4"),
+                               call("lua", {"code": "return host.post('my-api', { file = 'scan.pdf', purpose = 'read' })"}, "c5"),
+                               call("lua", {"code": f"return host.post('my-api', {{ file = {lua_literal(secret)} }})"}, "c6"),
+                               call("lua", {"code": "return host.post('my-api', { file = '.' })"}, "c7"),
                                say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
         self.assertIn("200\n", results[0])
         self.assertIn("A small fast language.", results[0])
-        self.assertEqual([r["path"] for r in tools.requests], ["/v1/tools/fetch"])
+        self.assertEqual([r["path"] for r in tools.requests], ["/exa/contents"] * 2)
+        sent = tools.requests[1]
+        self.assertTrue(sent["headers"]["content-type"].startswith("multipart/form-data; boundary="))
+        self.assertIn(b'name="file"; filename="scan.pdf"', sent["body"])
+        self.assertIn(b"%PDF-1.7 not really\x00\xff", sent["body"])
+        self.assertIn(b'name="purpose"\r\n\r\nread', sent["body"])
+        self.assertIn("Permission denied", results[5])
+        self.assertIn("not a regular file", results[6])
         self.assertEqual(tools.requests[0]["headers"]["authorization"], "Bearer " + key)
         self.assertEqual(tools.requests[0]["body"], b'{"url":"u"}')
         self.assertIn("no BARE_API_KEY", results[1])
@@ -2053,65 +1926,48 @@ end
         self.assertIn("--resume goes on with the agent's conversation",
                       self.run_hx("--resume", "last", "--run", "x.luau").stderr)
 
-    def test_without_a_deepseek_key_the_tools_say_so(self):
+    def test_without_an_exa_key_the_tools_say_so(self):
         done = self.run_hx("go", script=[
             call("lua", {"code": "return ext('web').search('luau')"}, "c1"),
-            call("lua", {"code": "return host.post('search', '{}')"}, "c2"),
-            call("lua", {"code": "return ext('ocr').read('nope.pdf')"}, "c3"),
+            call("lua", {"code": "return ext('web').fetch('https://luau.org')"}, "c2"),
+            call("lua", {"code": "return host.post('contents', '{}')"}, "c3"),
             call("lua", {"code": "return ext('exa').deep('luau', 'why')"}, "c4"),
             call("lua", {"code": "return host.post('exa', '{}')"}, "c5"),
             say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         results = self.tool_results()
-        self.assertIn("without DEEPSEEK_API_KEY", results[0])
-        self.assertIn("no DEEPSEEK_API_KEY", results[1])
-        self.assertIn("without DEEPSEEK_API_KEY", results[2])
+        self.assertIn("without EXA_API_KEY", results[0])
+        self.assertIn("without EXA_API_KEY", results[1])
+        self.assertIn("no EXA_API_KEY", results[2])
         self.assertIn("without EXA_API_KEY", results[3])
         self.assertIn("no EXA_API_KEY", results[4])
-        system = self.model.requests[0]["system"]
+        system = self.model.requests[0]["system_instruction"]
         for name in ("bytes", "http", "path", "search", "text"):
             description = read(REPO, "lua", "ext", name + ".luau").splitlines()[0].removeprefix("-- ")
             self.assertIn(f"- {name} (built in): {description}", system.splitlines())
-        for keyed in ("- web", "- ocr", "- exa"):
+        for keyed in ("- web", "- exa"):
             self.assertNotIn(keyed, system)
-
-    def test_ocr_of_a_file_outside_the_wall_is_refused_before_sending(self):
-        tools = Tools()
-        self.addCleanup(tools.server_close)
-        self.addCleanup(tools.shutdown)
-        secret = os.path.join(self.home, "secret.pdf")
-        with open(secret, "w") as f:
-            f.write("private")
-        done = self.run_hx("go", HX_TOOLS_URL=tools.url, DEEPSEEK_API_KEY="k", script=[
-            call("lua", {"code": f"return ext('ocr').read({lua_literal(secret)})"}, "c1"),
-            call("lua", {"code": "return ext('ocr').read('.')"}, "c2"),
-            say("ok")])
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("Permission denied", self.tool_results()[0])
-        self.assertIn("not a regular file", self.tool_results()[1])
-        self.assertEqual(tools.requests, [])
-        self.assertNotIn("retrying", done.stderr)
 
     def test_project_notes_reach_the_system_prompt(self):
         os.makedirs(os.path.join(self.project, ".hx"))
         with open(os.path.join(self.project, ".hx", "prompt.md"), "w") as f:
             f.write("Run the tests with make check.")
         self.run_hx("go", script=[say("ok")])
-        self.assertIn("Run the tests with make check.", self.model.requests[0]["system"])
+        self.assertIn("Run the tests with make check.", self.model.requests[0]["system_instruction"])
 
     def test_the_hx_skill_is_built_in_and_a_project_s_own_takes_its_place(self):
         done = self.run_hx("go", script=[call("lua", {"code": "return skill('hx')"}, "c1"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("\n- hx (built in): Use, extend or change hx", self.model.requests[0]["system"])
-        self.assertIn('skill("hx") says which of these a need calls for', self.model.requests[0]["system"])
+        self.assertIn("\n- hx (built in): Use, extend or change hx", self.model.requests[0]["system_instruction"])
+        self.assertIn('skill("hx") says which of these a need calls for', self.model.requests[0]["system_instruction"])
         body = read(REPO, ".claude", "skills", "hx", "SKILL.md").split("---\n", 2)[2].strip()
         self.assertEqual(self.tool_results()[0], "[skill hx, built into hx. Every path in it is the project's.]\n\n" + body)
         os.makedirs(os.path.join(self.project, ".hx", "skills", "hx"))
         with open(os.path.join(self.project, ".hx", "skills", "hx", "SKILL.md"), "w") as f:
             f.write("---\nname: hx\ndescription: This project's own.\n---\nOurs.\n")
         self.run_hx("again", script=[call("lua", {"code": "return skill('hx')"}, "c2"), say("ok")])
-        self.assertIn("\n- hx: This project's own.", self.model.requests[-2]["system"])
-        self.assertNotIn("hx (built in)", self.model.requests[-2]["system"])
+        self.assertIn("\n- hx: This project's own.", self.model.requests[-2]["system_instruction"])
+        self.assertNotIn("hx (built in)", self.model.requests[-2]["system_instruction"])
         self.assertEqual(self.tool_results()[1], "[skill hx, in .hx/skills/hx/. A path in it that names one of the skill's "
                          "own files is relative to that directory; everything else is the project's.]\n\nOurs.")
 
@@ -2128,7 +1984,7 @@ end
         self.assertEqual((tried.returncode, tried.stdout), (0, "src/a.c:2\n\n"), tried.stderr)
         done = self.run_hx("go", script=[call("lua", {"code": 'return ext("todo").count("src")'}), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("\n- todo: counts TODO comments per file: count(dir) -> text\n", self.model.requests[0]["system"])
+        self.assertIn("\n- todo: counts TODO comments per file: count(dir) -> text\n", self.model.requests[0]["system_instruction"])
         self.assertEqual(self.tool_results(), ["src/a.c:2\n"])
 
     def test_the_hx_skill_s_loop_check_tells_a_loop_that_loads_from_one_that_does_not(self):
@@ -2151,13 +2007,13 @@ end
         done = self.run_hx("go", script=[call("lua", {"code": 'return delegate("count the files")'}, "c1"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertNotIn("--built-in-loop", done.stderr)
-        lead = [r for r in self.model.requests if r["messages"][0]["content"] == "go"]
-        sub = [r for r in self.model.requests if r["messages"][0]["content"] == "count the files"]
+        lead = [r for r in self.model.requests if task_of(r) == "go"]
+        sub = [r for r in self.model.requests if task_of(r) == "count the files"]
         self.assertEqual((len(lead), len(sub)), (2, 2))
         self.assertIn("- delegate(task) -> text", lead[0]["tools"][0]["description"])
         self.assertEqual(self.tool_results(sub), ["3\n[exit 0]"])
         self.assertEqual(self.tool_results(lead), ["there are three"])
-        self.assertEqual((sub[0]["system"], sub[0]["tools"]), (lead[0]["system"], lead[0]["tools"]))
+        self.assertEqual((sub[0]["system_instruction"], sub[0]["tools"]), (lead[0]["system_instruction"], lead[0]["tools"]))
         self.assertEqual(done.stdout, "there are three\nok\n")
         self.assertIn("[4 replies, 40 tokens in", done.stderr)
         logs = sorted(os.listdir(os.path.join(self.project, ".hx", "log")))
@@ -2185,7 +2041,7 @@ end
             f.write("build/\n")
         subprocess.run(["git", "add", "src", "README.md", ".gitignore"], **git)
         self.run_hx("go", script=[say("ok")])
-        system = self.model.requests[0]["system"]
+        system = self.model.requests[0]["system_instruction"]
         self.assertIn("5 in all, as git lists them", system)
         self.assertIn("\nsrc/\n  util/\n    text.c\n  main.c\n.gitignore\nREADME.md\nnew.txt", system)
         self.assertNotIn("build/", system)
@@ -2197,12 +2053,12 @@ end
             f.write(source.replace("-- M.max_replies = 100", "M.layout_lines = 0"))
         done = self.run_hx("go", script=[say("ok")])
         self.assertNotIn("loop.luau", done.stderr)
-        self.assertNotIn("main.c", self.model.requests[-1]["system"])
+        self.assertNotIn("main.c", self.model.requests[-1]["system_instruction"])
 
     def test_without_git_the_system_prompt_shows_the_project_directory(self):
         self.write_files("src/main.c", "notes.txt")
         self.run_hx("go", script=[say("ok")])
-        system = self.model.requests[0]["system"]
+        system = self.model.requests[0]["system_instruction"]
         self.assertIn("its own entries only, since git lists no files here.\nsrc/\nnotes.txt", system)
         self.assertNotIn("main.c", system)
 
@@ -2226,8 +2082,8 @@ end
         self.run_hx("go", script=[say("ok")])
         sent = self.model.requests[-1]
         self.assertEqual(sent["model"], "project-model")
-        self.assertTrue(sent["system"].startswith("You are a coding agent"))
-        self.assertTrue(sent["system"].endswith("Run `make check` before you report."))
+        self.assertTrue(sent["system_instruction"].startswith("You are a coding agent"))
+        self.assertTrue(sent["system_instruction"].endswith("Run `make check` before you report."))
 
     def test_init_full_copies_the_whole_loop(self):
         done = self.run_hx("--init", "--full")
@@ -2309,7 +2165,7 @@ end
         self.assertEqual(self.tool_results(), [
             "replaced 1 occurrence in f.txt\n"
             "error: edit: old text not found in f.txt: read the file again and copy the text exactly"])
-        self.assertIs(self.model.requests[1]["messages"][-1]["content"][0]["is_error"], True)
+        self.assertIs(self.model.requests[1]["input"][-1]["is_error"], True)
         self.assertEqual((read(self.project, "x.txt"), read(self.project, "y.txt")), ("x", "y"))
         self.assertEqual(read(self.project, "f.txt"), "A\nb\n")
         self.assertIn("  write x.txt\n  write y.txt\n  edit f.txt\n  edit f.txt\n", done.stderr)
@@ -2399,14 +2255,14 @@ end
     def test_a_task_may_start_with_any_word(self):
         done = self.run_hx("run", "the", "tests", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.model.requests[0]["messages"][0]["content"], "run the tests")
+        self.assertEqual(task_of(self.model.requests[0]), "run the tests")
         done = self.run_hx("init", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.model.requests[-1]["messages"][0]["content"], "init")
+        self.assertEqual(task_of(self.model.requests[-1]), "init")
         self.assertFalse(os.path.exists(os.path.join(self.project, ".hx", "loop.luau")))
         done = self.run_hx("-q", "--", "--verbose", "is", "ignored:", "why?", script=[say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.model.requests[-1]["messages"][0]["content"], "--verbose is ignored: why?")
+        self.assertEqual(task_of(self.model.requests[-1]), "--verbose is ignored: why?")
 
     def test_a_script_error_is_reported(self):
         with open(os.path.join(self.project, "s.luau"), "w") as f:
@@ -3089,7 +2945,7 @@ host.write("prog.sh", "echo SECRET-OUTPUT; exit 1\\n"); say(submit("crash"))
             call("bash", {"command": "printf 'sleep 0.05\\necho 42\\n' > prog.sh"}),
             call("submit", {"note": "dropped the long sleep"}, call_id="call_2"), say("It won.")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("This session is judged.", self.model.requests[0]["system"])
+        self.assertIn("This session is judged.", self.model.requests[0]["system_instruction"])
         self.assertIn("submit(note?)", self.model.requests[0]["tools"][0]["description"])
         self.assertTrue(self.tool_results()[1].startswith("Trial 1. win:"), self.tool_results())
         self.assertIn("hx judge: 1 trial: 1 win", done.stderr)

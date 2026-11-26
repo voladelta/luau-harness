@@ -24,11 +24,9 @@ functions, extensions and skills, and needs no key passed to it. It runs one tur
 conversation, which the lead's process keeps. The lead's own conversation holds tasks and reports and none of
 the agents' steps, which is what keeps a long job inside its context.
 
-- **The model.** Agents run on `M.agent_model`: `deepseek-flash` when `DEEPSEEK_API_KEY` is set, whatever the
-  lead's model, and the lead's own model otherwise. A model of the lead's vendor is asked through the session's
-  endpoint, and one of the other vendor through that vendor's, with its key: a Claude agent under a DeepSeek lead
-  needs `ANTHROPIC_API_KEY`, as a DeepSeek agent under a Claude lead needs `DEEPSEEK_API_KEY`. Their tokens are
-  counted with the session's, on the line of their model.
+- **The model.** Agents run on `M.agent_model`, which is the lead's own model unless a project names another, or
+  a workflow does: under `--rpi` they run on `gemini-4-hydrogen`. Every model is asked through the session's
+  endpoint with its key. Their tokens are counted with the session's, on the line of their model.
 - **The prompt.** An agent gets the session's system prompt and `M.agent_prompt` after it: that it is one of
   several, to change only what its task gives it, to leave git's index and branches alone, to check its own work
   narrowly, and to end with a report. It knows nothing of the lead's conversation, so the task has to carry what
@@ -37,7 +35,7 @@ the agents' steps, which is what keeps a long job inside its context.
   conversation, with everything the agent did still there. A new name is a new agent.
 - **Waiting.** The call returns when every agent has reported, or after `M.agent_wait` (270) seconds with the
   reports so far and a line for each agent still at work; `agents()` with no tasks waits again. The wait is short
-  on purpose: the lead's next request then falls inside the five minutes Claude keeps its prompt cache, and well
+  on purpose: the lead's next request then falls inside the time the prompt cache is kept, and well
   inside `M.call_seconds`. A report is given once. An agent at work takes no second task until it has reported.
 - **How many.** `M.agent_limit` (8) agents work at once; more wait their turn. One run of an agent may take
   `M.agent_seconds` (1800), and is then stopped and reported as stopped, with its conversation intact.
@@ -65,9 +63,9 @@ the agents' steps, which is what keeps a long job inside its context.
 
 ## The rpi workflow
 
-`hx --rpi TASK` runs the task by **rpi**: research, plan, implement. The lead is Opus 5.5, unless `--model`
-names another, and its agents are `deepseek-flash`'s, when both keys are set: the expensive model reads, decides
-and judges, and the cheap ones type.
+`hx --rpi TASK` runs the task by **rpi**: research, plan, implement. The lead is Gemini 4 Carbon, unless `--model`
+names another, and its agents are Hydrogen's (`M.workflow_agents.rpi`), as Google's guidance for Carbon has it: the
+expensive model reads, decides and judges, and the cheap ones type.
 
 1. **Research.** The lead reads the code the task touches, and runs the project's build and tests once to know
    where it starts. It changes nothing.

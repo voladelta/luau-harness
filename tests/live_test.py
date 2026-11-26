@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Checks of hx against the real model endpoint. They cost tokens and need the network, so ctest does not run them.
 
-usage: DEEPSEEK_API_KEY=... live_test.py PATH_TO_HX [unittest arguments]
-       ANTHROPIC_API_KEY=... HX_MODEL=sonnet live_test.py PATH_TO_HX [unittest arguments]
+usage: GEMINI_API_KEY=... live_test.py PATH_TO_HX [unittest arguments]
+       GEMINI_API_KEY=... HX_MODEL=carbon live_test.py PATH_TO_HX [unittest arguments]
 
 HX_MODEL, HX_API_URL and HX_KEY_ENV are passed through. Each test gets a fresh project with a .hx directory, so the
 conversation is kept in .hx/log/ and the checks can look at the code the model sent, not only at what it said.
@@ -32,14 +32,15 @@ M.max_replies = 10
 M.call_seconds = 20'''
 
 
+def calls(log):
+    return [step["arguments"].get("code", "") for step in log["steps"] if step["type"] == "function_call"]
+
+
 class LiveTest(unittest.TestCase):
     def setUp(self):
-        model = os.environ.get("HX_MODEL", "")
-        claude = model.startswith("claude-") or model in ("opus", "sonnet", "haiku")
-        key_env = os.environ.get("HX_KEY_ENV", "ANTHROPIC_API_KEY" if claude else "DEEPSEEK_API_KEY")
+        key_env = os.environ.get("HX_KEY_ENV", "GEMINI_API_KEY")
         if not os.environ.get(key_env):
             self.skipTest(f"no {key_env}")
-        self.claude = claude
         self.project = tempfile.mkdtemp(prefix="hx-live-")
         os.makedirs(os.path.join(self.project, ".hx"))
 
@@ -62,7 +63,7 @@ class LiveTest(unittest.TestCase):
                               capture_output=True, text=True, timeout=300)
         self.assertEqual(done.returncode, status, done.stderr)
         logs = sorted(glob.glob(os.path.join(self.project, ".hx", "log", "*.json")))
-        self.log = json.loads(self.read(logs[-1])) if logs else {"messages": []}
+        self.log = json.loads(self.read(logs[-1])) if logs else {"steps": []}
         for result in self.results():
             self.assertFalse(result.startswith(("error: unknown argument", "error: missing argument",
                                                 "error: there is no tool")), result)
@@ -70,16 +71,13 @@ class LiveTest(unittest.TestCase):
         return done.stdout
 
     def code(self):
-        return [block["input"].get("code", "") for message in self.log["messages"] if message["role"] == "assistant"
-                for block in message["content"] if block["type"] == "tool_use"]
+        return calls(self.log)
 
     def all_code(self):
         return "\n".join(self.code())
 
     def results(self):
-        return [block["content"] for message in self.log["messages"]
-                if message["role"] == "user" and isinstance(message["content"], list)
-                for block in message["content"] if block["type"] == "tool_result"]
+        return [step["result"][0]["text"] for step in self.log["steps"] if step["type"] == "function_result"]
 
     def test_a_file_is_made_at_low_effort(self):
         self.run_hx("create hello.txt containing the single word hi", HX_EFFORT="low")
@@ -124,11 +122,7 @@ class LiveTest(unittest.TestCase):
         self.assertLessEqual(len(self.code()), 5, self.code())
 
     def checkpoint(self):
-        first = self.log["messages"][0]["content"]
-        if isinstance(first, list):
-            if first[0].get("type") == "compaction":
-                return first[0]["content"]
-            first = first[0]["text"]
+        first = self.log["steps"][0]["content"][0]["text"]
         resume = "\n\nEarlier turns were replaced by the checkpoint above"
         self.assertIn(resume, first, "the conversation was never compacted")
         return first.rsplit(resume, 1)[0]
@@ -241,14 +235,12 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(self.read("south.txt").split(), ["south"])
         self.assertIn("pole", answer)
         north, south = self.agent_logs()
-        tasks = [m["content"] for m in north["messages"] if m["role"] == "user" and isinstance(m["content"], str)]
+        tasks = [step for step in north["steps"] if step["type"] == "user_input"]
         self.assertEqual(len(tasks), 2, tasks)
         self.assertIn("one of several agents", north["system"])
         self.assertIn("agents(", self.all_code())
 
     def test_rpi_plans_and_its_agents_implement(self):
-        if not self.claude:
-            self.skipTest("--rpi leads with a Claude model")
         self.write("temperature.py", "def c_to_f(c):\n    return c * 9 / 5 + 32\n")
         self.write("distance.py", "def km_to_miles(km):\n    return km * 0.621371\n")
         self.write("test_temperature.py", "import unittest\n\nfrom temperature import c_to_f\n\n\n"
@@ -293,9 +285,7 @@ class LiveTest(unittest.TestCase):
         for agent in agents:
             self.assertNotIn("follows the rpi workflow", agent["system"])
         self.assertIn("agents(", self.all_code())
-        written = "\n".join(block["input"].get("code", "") for agent in agents for message in agent["messages"]
-                            if message["role"] == "assistant" for block in message["content"]
-                            if block["type"] == "tool_use")
+        written = "\n".join(code for agent in agents for code in calls(agent))
         self.assertRegex(written, r"\b(write|edit)\(", "no agent wrote anything")
 
     def test_running_out_of_replies_ends_with_a_report(self):
@@ -305,9 +295,7 @@ class LiveTest(unittest.TestCase):
         answer = self.run_hx("read a.txt, b.txt, c.txt and d.txt one at a time, one tool call each, then tell me "
                              "what they hold", status=1)
         self.assertNotEqual(answer.strip(), "")
-        final = self.log["messages"][-1]
-        self.assertEqual(final["role"], "assistant")
-        self.assertEqual([b for b in final["content"] if b["type"] == "tool_use"], [])
+        self.assertEqual(self.log["steps"][-1]["type"], "model_output")
 
 
 def run_all_at_once():

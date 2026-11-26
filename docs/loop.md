@@ -1,10 +1,8 @@
 # The loop
 
-`lua/loop.luau` is the whole agent, in one file. It speaks the Anthropic Messages format and sends thinking blocks
-back exactly as they came. Thinking is always on and is not a setting of hx's: `HX_EFFORT` is the one control.
-Every `claude-*` request carries `thinking: {type: "adaptive"}`; DeepSeek's models think by default and get no
-thinking field. Claude requests use the latest API version, `anthropic-version: 2026-10-21`; DeepSeek's endpoint
-gets `2023-06-01`. It gives the model one tool, `lua`, which runs the
+`lua/loop.luau` is the whole agent, in one file. It is written for Gemini: it speaks the Interactions API, keeps
+the conversation as that API's steps, and sends thought steps back exactly as they came. Thinking is not a setting
+of hx's: `HX_EFFORT` is the one control. It gives the model one tool, `lua`, which runs the
 code it is sent in the project directory and returns what the code prints and returns. Globals persist from one
 call to the next. The code acts through these functions:
 
@@ -14,7 +12,7 @@ call to the next. The code acts through these functions:
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file. It refuses one that changed since the conversation last read or wrote it, and says to read it again (see [Agents](agents.md)) |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends |
-| `see(path)` | puts a PNG, JPEG, GIF or WebP file into the call's result as an image block, after the text, for a model that takes images: at most `M.image_bytes` (5 MiB, as base64) each, `M.images_per_call` (8) and `M.call_image_bytes` (20 MiB, as base64) a call. `M.vision = false` turns it away for a model that takes none |
+| `see(path)` | puts a file into the call's result, after the text, for the model to look at: a PNG, JPEG, GIF or WebP image, at most `M.image_bytes` (5 MiB, as base64), or a PDF, Word, PowerPoint, Excel or OpenDocument file, at most `M.document_bytes` (20 MiB, as base64), which Gemini reads itself, text, tables and pictures. One call shows `M.images_per_call` (8) files and `M.call_image_bytes` (20 MiB, as base64) at most. `M.vision = false` turns it away for a model that takes none |
 | `skill(name?)` | a skill's instructions, by name; with no name, or a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
 | `ext(name)` | an extension's table of functions |
 | `agents(tasks)` | gives each task to an agent, all at work at the same time, and returns their reports (see [Agents](agents.md)) |
@@ -56,9 +54,8 @@ call directly rather than from code), `M.skill_dirs`, `M.system_prompt`, `M.layo
 the model), `M.turn` (replies and tool calls until the model is done), `M.compact`, `M.compact_prompt` and
 `M.resume_prompt`. The loop always calls them through `M`, so a replacement takes effect everywhere. `M.model`
 starts as `host.model`, the model `--model` or `HX_MODEL` chose with its alias resolved. A conversation made with
-`M.Conversation.new(model)` is asked on that model instead, each request through the endpoint `host.route` gives
-for it; `M.request(system, messages, compaction, model)` takes the model as its last argument, and a replacement
-has to pass it on.
+`M.Conversation.new(model)` is asked on that model instead, through the same endpoint;
+`M.request(system, steps, model)` takes the model as its last argument, and a replacement has to pass it on.
 
 The system prompt shows the project's layout, so the model's first call need not be a listing: the files git
 lists, tracked or new and not ignored, as a tree of at most `M.layout_lines` (60) lines, directories first. With
@@ -115,77 +112,56 @@ task that runs out of replies gets one more, to report where it stands; and a mo
 are still at work is told once that its answer would end them half way.
 For notes to the model that need no code, write `.hx/prompt.md`.
 
-## Claude models
+## The request
 
-`M.claude` lists what the loop adds for the Claude models it knows, which are the 5.5 family: hx is not for the
-models before it. Any other model, DeepSeek's included, gets the plain request. A `claude-*` model newer than the
-list gets adaptive thinking and the system prompt as a block with `cache_control`, and nothing else, until it is
-added; only a listed one gets the features below. The settings follow Anthropic's guidance for these models:
+`M.request` sends one stateless request (`store: false`): the whole conversation as `input` steps, the system prompt
+as `system_instruction`, the tools as `function` tools, and `HX_EFFORT`, when set, as
+`generation_config.thinking_level`. The settings follow Google's guidance for the Gemini 4 models:
 
-| | Opus 5.5 | Sonnet 5.5 | Haiku 5.5 |
-|---|---|---|---|
-| `output_config.effort`, unless `HX_EFFORT` is set | `medium` | `medium` | `medium` |
-| `fallbacks: "default"`: a declined request runs again on a model picked for why it was declined, in the same round trip | yes | yes | no (Haiku has none) |
-| `thinking.display: "updates"`: notes between tool calls come back and show as progress lines | yes | yes | no |
-| `thinking.block_binding: drop_block`: a thinking block sent back after a changed history is dropped rather than failing the request | yes | yes | yes |
-| `compaction: {type: "summarize"}`: past `M.compact_at` prompt tokens, the API writes the summary (on-demand compaction) | yes | yes | yes |
+- **Thinking level.** Unset, each model thinks at its own default, `high` on Neon and Hydrogen and `medium` on
+  Carbon and Argon. `M.xhigh` lists the models that have `xhigh`, Neon and Hydrogen; any other gets `high` for it.
+- **No output cap.** `max_output_tokens` caps thinking and answer together and a low cap cuts answers short, so
+  none is sent and the API's own 65,536 holds.
+- **No sampling parameters**, and a request may take `M.request_seconds` (900): a hard prompt thinks for minutes.
 
-The betas these need go in the `anthropic-beta` header, which Luau sets with `host.post(endpoint, body, {beta = "a,b"})`. Thinking
-is adaptive and cannot be turned off on these models; effort is the control. A reply a fallback model finished
-carries a `fallback` block; the loop drops what the declining model wrote before it, as the API requires, and a
-refusal is logged with its category.
+A reply is the steps the API sent, appended to the conversation as they are: a `thought` with its signature, which
+a stateless caller must send back unchanged; `model_output`, the answer; and each `function_call`, which the loop
+answers with a `function_result` whose `result` is the text and any images or documents `see` added. A reply with
+status `incomplete` was cut off and is answered with a request to go on; `failed` or any status other than
+`completed` and `requires_action` raises with the API's message. A reply with nothing but thoughts is asked for
+again. Requests that fail with 408, 409, 429 or 5xx, or get no answer, are tried five times.
 
-Compaction on these models is the API's on-demand kind: the loop sends the conversation as it stands, with the same
-system prompt, tools, thinking and effort, plus `compaction` with `M.compact_prompt` as its `instructions`. The
-signed `compaction` block that comes back replaces every message it summarized; it goes first in the next request,
-exactly as it came, followed by `M.resume_prompt` and, when the model's code has set globals, their names
-(`M.resume_text`): they outlast the compaction, and the checkpoint may not say so. If no block comes back, the conversation is kept and compacted
-after a later reply. Any other model, DeepSeek's included, is asked for the summary as an ordinary reply.
+Past `M.compact_at` prompt tokens the loop compacts: it asks the model, on a fork of the conversation, for a
+checkpoint (`M.compact_prompt`), and the conversation starts again from that text followed by `M.resume_prompt`
+and, when the model's code has set globals, their names (`M.resume_text`): they outlast the compaction, and the
+checkpoint may not say so. If no summary comes back, the conversation is kept and compacted after a later reply.
 
-Prompt caching follows each provider's docs. Every model gets a prefix that only grows: the system prompt is built
-once per run, the tool description never changes, JSON keys are sorted, and the history is only appended to. A
-Claude model gets two cache breakpoints: one on the system prompt, so tools and system are still read from the
-cache after a compaction, and the top-level automatic one, which moves forward with the conversation. DeepSeek
-caches every prefix by itself and ignores `cache_control`. The line at the end of a run gives the replies, the
-tokens in, those read from the cache and written to it, and the tokens out. A run that used several models, a
+Caching is Gemini's own implicit kind, and the loop keeps a prefix that only grows: the system prompt is built
+once per run, the tool description never changes, JSON keys are sorted, and the history is only appended to. The
+line at the end of a run gives the replies, the tokens in, those read from the cache (`total_cached_tokens`), and
+the tokens out, thoughts included. A run that used several models, a
 sub-agent on another say, gets such a line for each, headed by the model's name: their prices differ, so one sum
 would not say what the run cost.
 
 When a `.hx` directory exists, each session's conversation is saved to `.hx/log/` as JSON, after every reply that
 called tools and its results as well as at the end of a turn, so a run killed half-way leaves its log too. Whether
-the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. `hx --resume LOG TASK` starts a session from such a file's messages, and `--resume last` from the newest one that is not an agent's. It orders sessions by the start time in their filenames, using the file's modification time for older filenames without a precise start time. A call the old session never answered is answered as abandoned, the system prompt is the new session's, and the new session saves to a log of its own. A
+the directory exists is looked at with each save, so a session that makes `.hx` itself keeps its log. `hx --resume LOG TASK` starts a session from such a file's steps, and `--resume last` from the newest one that is not an agent's. It orders sessions by the start time in their filenames, using the file's modification time for older filenames without a precise start time. A call the old session never answered is answered as abandoned, the system prompt is the new session's, and the new session saves to a log of its own. A
 sub-agent's conversation, one whose turn runs inside another turn, is saved the same way beside the session's,
 under the session's name with `-sub-1`, `-sub-2` and so on; so is each agent's, in the order the agents were
 first given a task. The logs hold file contents, so that directory
 carries a `.gitignore` that keeps all of it out of git.
 
-## Gemini models
-
-A `gemini-*` model is asked through Gemini's Interactions API, not the Messages format, and `M.request` translates
-both ways, so the loop, its tools and a conversation's log are the same on every model. The request is stateless
-(`store: false`): the whole conversation goes as `input` steps, the system prompt as `system_instruction`, the tools
-as `function` tools, and `HX_EFFORT` as `generation_config.thinking_level`. Two settings follow Google's guidance
-for the Gemini 4 models: `M.max_output` is not sent, because `max_output_tokens` there caps thinking and answer
-together and a low cap cuts answers short, so the API's own 65,536 holds; and a request may take 15 minutes, not
-10, since a hard prompt thinks for several. A reply's steps come back as blocks: a
-`thought` as a `thinking` block that keeps the whole step in `signature` and is sent back unchanged, as the API asks
-of a stateless caller; `model_output` as text; a `function_call` as a `tool_use`, answered with a `function_result`.
-`M.gemini` lists the models that think at `xhigh`, Neon and Hydrogen; on any other a higher `HX_EFFORT` is held to
-`high`.
-Compaction asks for the summary as an ordinary reply, and caching is Gemini's own implicit one, counted from
-`total_cached_tokens`.
-
 ## The conversation is a state machine
 
-The Messages API accepts one shape of history only: it starts with the user, roles alternate, and a reply
-that calls tools is answered by the next message with exactly one result per call. The loop keeps the history
-in a `Conversation` whose state is read off its last message, and each operation is legal in some states only:
+The Interactions API accepts one shape of history only: every `function_call` is answered by exactly one
+`function_result`, and the model is asked only after the user's input or a result. The loop keeps the history
+in a `Conversation` whose state is read off its steps, and each operation is legal in some states only:
 
-| State | The last message is | Legal operations |
+| State | The steps end with | Legal operations |
 |---|---|---|
 | `idle` | nothing, or a finished reply | `say` |
-| `ready` | the user's | `say`, `reply` |
-| `owing` | a reply that called tools | `answer`, `abandon` |
+| `ready` | the user's input, or the results of every call | `say`, `reply` |
+| `owing` | a call with no result | `answer`, `abandon` |
 
 An illegal operation raises and changes nothing, so an interrupt, a cut-off reply or a compaction cannot leave
 a history the API would reject. `tests/conversation_test.luau` checks this with a random walk over every

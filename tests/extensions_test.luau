@@ -22,144 +22,94 @@ local function script(...)
 	answers = { ... }
 end
 
-host.endpoints = { search = false, fetch = false, ocr = false, exa = true }
-raises("search without a key", "without DEEPSEEK_API_KEY", loop.ext("web").search, "luau")
-raises("ocr without a key", "without DEEPSEEK_API_KEY", loop.ext("ocr").read, "a.pdf")
+host.endpoints = { exa = false, contents = false }
+raises("search without a key", "without EXA_API_KEY", loop.ext("web").search, "luau")
+raises("fetch without a key", "without EXA_API_KEY", loop.ext("web").fetch, "https://luau.org")
+raises("exa without a key", "without EXA_API_KEY", loop.ext("exa").deep, "luau", "why")
 check("no request without a key", #calls, 0)
-host.endpoints = { search = true, fetch = true, ocr = true, exa = true }
+host.endpoints = { exa = true, contents = true }
 
-local web, ocr = loop.ext("web"), loop.ext("ocr")
+local web = loop.ext("web")
 check("it is loaded once", loop.ext("web"), web)
 
 script({ 200, json.encode({ results = {
-	{ rerank_score = 2.4, title = "Luau", url = "https://luau.org", snippet = "short", summary = "A fast,\nsmall language.",
-		content = "", site_name = "luau.org", date = "2026-06-01T00:00:00Z", authority = 3 },
-	{ rerank_score = 0.9, title = "Other", url = "https://example.com", snippet = "just a snippet", summary = "",
-		content = "", authority = -1 },
+	{ title = "Luau", url = "https://luau.org", publishedDate = "2026-06-01T00:00:00Z", author = "Roblox",
+		highlights = { "A fast,\nsmall language.", 7, "Gradually typed." } },
+	{ title = "Other", url = "https://example.com", author = "", text = "" },
 } }) })
-local results = web.search("luau language", { count = 2, question = "what is luau?" })
-check("search asks the search endpoint", calls[1].name, "search")
+local results = web.search("luau language", { count = 2 })
+check("search asks Exa's search endpoint", calls[1].name, "exa")
 local sent = json.decode(calls[1].request)
 check("search sends the query", sent.query, "luau language")
-check("search sends the count", sent.count, 2)
-check("search sends the question", sent.ori_question, "what is luau?")
-check("search does not ask for content unasked", sent.need_content, nil)
+check("search sends the count", sent.numResults, 2)
+check("search lets Exa pick how to search", sent.type, "auto")
+check("search asks for the passages that matter", sent.contents.highlights, true)
+check("search does not ask for content unasked", sent.contents.text, nil)
 check("search returns the results", #results, 2)
 check("a result keeps its url", results[1].url, "https://luau.org")
-check("a result keeps its score", results[1].rerank_score, 2.4)
-check("empty content is left out", results[1].content, nil)
-check("missing fields stay missing", results[2].site_name, nil)
+check("a highlight that is not text is left out", #results[1].highlights, 2)
+check("empty content is left out", results[2].content, nil)
+check("missing fields stay missing", results[2].date, nil)
 check("results read as text", tostring(results), table.concat({
-	"1. Luau (luau.org, 2026-06-01)",
+	"1. Luau (Roblox, 2026-06-01)",
 	"   https://luau.org",
-	"   A fast, small language.",
+	"   A fast, small language. ... Gradually typed.",
 	"",
 	"2. Other",
 	"   https://example.com",
-	"   just a snippet",
 }, "\n"))
 script({ 200, '{"results": []}' })
 check("the tool shows results as text", loop.tools[1].run({ code = "return ext('web').search('x')" }), "[no results]")
 
-script({ 200, json.encode({ results = { { title = "T", url = "u", snippet = "", summary = string.rep("é", 900) } } }) })
+script({ 200, json.encode({ results = { { title = "T", url = "u", highlights = { string.rep("é", 900) } } } }) })
 local long = web.search("q")
-check("a long summary is cut when shown", tostring(long):find(string.rep("é", 800) .. " ...", 1, true) ~= nil, true)
-check("but kept whole in the result", utf8.len(long[1].summary), 900)
+check("long highlights are cut when shown", tostring(long):find(string.rep("é", 800) .. " ...", 1, true) ~= nil, true)
+check("but kept whole in the result", utf8.len(long[1].highlights[1]), 900)
 
-script({ 200, json.encode({ results = { { title = "T", url = "u", snippet = "", summary = "s", content = "body" } } }) })
+script({ 200, json.encode({ results = { { title = "T", url = "u", highlights = { "s" }, text = "body" } } }) })
 check("content is shown when asked for", tostring(web.search("q", { content = true })):find("content:\nbody", 1, true) ~= nil, true)
-check("content is asked for", json.decode(calls[1].request).need_content, true)
+check("content is asked for, up to a limit", json.decode(calls[1].request).contents.text.maxCharacters, 20000)
 
-script({ 200, '{"results": []}' })
-web.search("q", { question = string.rep("é", 200) })
-check("the question is cut to 128 characters", utf8.len(json.decode(calls[1].request).ori_question), 128)
-
-raises("an empty query", "1 to 128 characters", web.search, "   ")
-raises("a long query", "1 to 128 characters", web.search, string.rep("a", 129))
+raises("an empty query", "1 to 2000 bytes", web.search, "   ")
+raises("a long query", "1 to 2000 bytes", web.search, string.rep("a", 2001))
 raises("a bad count", "count must be", web.search, "q", { count = 51 })
 raises("a query that is not a string", "must be a string, not table", web.search, { query = "q" })
 
-script({ 503, '{"error": {"message": "busy"}}' }, { 429, "slow down" }, { 200, '{"results": []}' })
+script({ 503, '{"error": "busy"}' }, { 429, "slow down" }, { 200, '{"results": []}' })
 web.search("q")
 check("503 and 429 are retried", #calls, 3)
 check("after 2 s, then 4", table.concat(waits, ","), "2,4")
 check("with the time limit each", calls[1].options.timeout, 60)
-script({ 200, '{"error": {"message": "quota spent"}}' })
-raises("an answer that carries an error", "search failed: quota spent", web.search, "q")
-check("such an answer is not retried", #calls, 1)
-script({ 400, '{"error": {"message": "bad query", "type": "invalid_request_error"}}' })
-raises("a 400", "search failed (400): bad query", web.search, "q")
+script({ 400, '{"requestId": "r", "error": "bad query", "tag": "INVALID_REQUEST_BODY"}' })
+raises("a 400", "web.search failed (400): bad query", web.search, "q")
 check("a 400 is not retried", #calls, 1)
 script({ nil, "Could not resolve host" }, { nil, "Could not resolve host" }, { nil, "Could not resolve host" })
-raises("no answer at all", "search failed (no answer): Could not resolve host", web.search, "q")
+raises("no answer at all", "web.search failed (no answer): Could not resolve host", web.search, "q")
 check("no answer is retried", #calls, 3)
 script({ 200, "<html>" })
 raises("an answer that is not JSON", "not JSON", web.search, "q")
 script({ 404, string.rep("x", 400) })
-check("an error page is shown cut to 300 bytes", select(2, pcall(web.search, "q")), "search failed (404): " .. string.rep("x", 300))
-script({ 403, '{"error": "forbidden"}' })
-raises("an error that is text, not an object", "search failed (403): forbidden", web.search, "q")
-script({ 200, '{"results":[{"title":"T","url":"u","snippet":"","summary":"' .. string.rep("\255", 900) .. '"}]}' })
-check("a summary that is not UTF-8 is cut by bytes", tostring(web.search("q")), "1. T\n   u\n   " .. string.rep("\255", 800) .. " ...")
+check("an error page is shown cut to 300 bytes", select(2, pcall(web.search, "q")), "web.search failed (404): " .. string.rep("x", 300))
+script({ 200, '{"results":[{"title":"T","url":"u","highlights":["' .. string.rep("\255", 900) .. '"]}]}' })
+check("a highlight that is not UTF-8 is cut by bytes", tostring(web.search("q")), "1. T\n   u\n   " .. string.rep("\255", 800) .. " ...")
 
-script({ 200, json.encode({ title = "Your First API Call", content = "# Your First API Call\n\nHello." }) })
+script({ 200, json.encode({ results = { { title = "Your First API Call", url = "https://example.com/a",
+	text = "# Your First API Call\n\nHello." } }, statuses = { { id = "https://example.com/a", status = "success" } } }) })
 check("fetch returns the content", web.fetch("https://example.com/a"), "# Your First API Call\n\nHello.")
-check("fetch asks the fetch endpoint", calls[1].name, "fetch")
-check("fetch sends the url", json.decode(calls[1].request).url, "https://example.com/a")
-script({ 200, json.encode({ title = "Title", content = "Body." }) })
+check("fetch asks Exa's contents endpoint", calls[1].name, "contents")
+check("fetch sends the url", json.decode(calls[1].request).ids[1], "https://example.com/a")
+check("and asks for the whole text", json.decode(calls[1].request).text, true)
+script({ 200, json.encode({ results = { { title = "Title", text = "Body." } } }) })
 check("a title the page does not show comes first", web.fetch("http://example.com"), "# Title\n\nBody.")
-script({ 200, json.encode({ title = "", content = "" }) })
+script({ 200, json.encode({ results = { { title = "", text = "" } } }) })
 check("an empty page says so", web.fetch("http://example.com"), "[the page has no content]")
+script({ 200, '{"results": [], "statuses": [{"id": "http://example.com", "status": "error", '
+	.. '"error": {"tag": "CRAWL_NOT_FOUND", "httpStatusCode": 404}}]}' })
+raises("a page Exa cannot read", "Exa could not read http://example.com: CRAWL_NOT_FOUND", web.fetch, "http://example.com")
+check("which is not asked for again", #calls, 1)
 raises("fetch of a file url", "http:// or https://", web.fetch, "file:///etc/passwd")
 raises("fetch of no host", "http:// or https://", web.fetch, "https://")
 
-check("a pdf keeps its layout", ocr.purpose("docs/Scan.PDF"), "rich_layout_recognition")
-check("an image is plain text", ocr.purpose("photo.png"), "text_recognition")
-check("a word file is plain text", ocr.purpose("notes.docx"), "text_recognition")
-
-script({ 200, "\n\n\n" .. json.encode({ id = "ocr-1", object = "ocr.result", page_count = 2, pages = {
-	{ index = 1, text = "second", finish_reason = "length" },
-	{ index = 0, text = "first", finish_reason = "stop" },
-} }) })
-check("ocr returns the pages in order", ocr.read("scan.pdf"),
-	"[page 1]\nfirst\n\n[page 2]\nsecond\n[this page was cut off: the recognition reached its output limit]")
-check("ocr asks the ocr endpoint", calls[1].name, "ocr")
-check("ocr sends the file as a path", calls[1].request.file, "scan.pdf")
-check("ocr reads a pdf with its layout", calls[1].request.purpose, "rich_layout_recognition")
-
-script({ 200, json.encode({ page_count = 1, pages = { { index = 0, text = "hello", finish_reason = "stop" } } }) })
-check("one page has no page line", ocr.read("photo.jpg"), "hello")
-check("ocr reads an image as text", calls[1].request.purpose, "text_recognition")
-
-script({ 200, json.encode({ page_count = 2, pages = { { index = 0, text = " \n", finish_reason = "stop" },
-	{ index = 1, text = "b", finish_reason = "stop" } } }) })
-check("an empty page is marked", ocr.read("two.pdf"), "[page 1]\n[no text was recognized on this page]\n\n[page 2]\nb")
-
-script({ 200, json.encode({ page_count = 1, pages = { { index = 0, text = "x", finish_reason = "stop" } } }) })
-ocr.read("scan.pdf", "text_recognition")
-check("the caller's purpose wins", calls[1].request.purpose, "text_recognition")
-raises("a purpose that does not exist", "purpose must be", ocr.read, "scan.pdf", "layout")
-
-script({ 200, json.encode({ error = { message = "the file is password protected", type = "invalid_request_error" } }) })
-raises("a failed recognition", "password protected", ocr.read, "locked.pdf")
-check("a failed recognition is not retried", #calls, 1)
-script({ 200, json.encode({ error = { message = "try later", type = "service_unavailable" } }) },
-	{ 200, json.encode({ page_count = 1, pages = { { index = 0, text = "ok", finish_reason = "stop" } } }) })
-check("an unavailable service is tried again", ocr.read("a.png"), "ok")
-check("it took two calls", #calls, 2)
-check("ocr waits 4 s before its second try", table.concat(waits, ","), "4")
-script({ 200, json.encode({ error = { message = "down", code = "internal_error" } }) },
-	{ 200, json.encode({ error = { message = "down", code = "internal_error" } }) },
-	{ 200, json.encode({ error = { message = "still down", code = "internal_error" } }) })
-raises("a recognition that keeps failing", "ocr of a.png failed (recognition failed): still down", ocr.read, "a.png")
-check("and 8 s before its third", table.concat(waits, ","), "4,8")
-script({ 413, '{"error": {"message": "file too large"}}' })
-raises("a file too large", "(413): file too large", ocr.read, "big.pdf")
-raises("ocr of a path that is not a string", "ocr.read: argument 1 (path) must be a string, not number", ocr.read, 1)
-
-host.endpoints = { search = true, fetch = true, ocr = true, exa = false }
-raises("exa without a key", "without EXA_API_KEY", loop.ext("exa").deep, "luau", "why")
-host.endpoints = { search = true, fetch = true, ocr = true, exa = true }
 local exa = loop.ext("exa")
 script({ 200, json.encode({
 	output = { content = "Luau is gradually typed.", grounding = { { field = "content" } } },

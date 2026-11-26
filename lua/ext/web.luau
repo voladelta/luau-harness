@@ -1,4 +1,4 @@
--- searches the web and fetches pages, through DeepSeek: search(query, {count?, content?, question?}) -> results, fetch(url) -> markdown
+-- searches the web and reads pages, through Exa: search(query, {count?, content?}) -> results, fetch(url) -> markdown
 --!strict
 
 local http = ext("_http")
@@ -8,35 +8,33 @@ local M = {}
 
 M.attempts = 3
 M.timeout = 60
-M.summary_limit = 800
+M.highlight_limit = 800
+M.content_limit = 20000
 
 type Result = {
 	title: string,
 	url: string,
-	snippet: string,
-	summary: string,
+	highlights: { string },
 	content: string?,
-	site_name: string?,
 	date: string?,
-	rerank_score: number?,
-	authority: number?,
+	author: string?,
 }
 
-type SearchOptions = { count: number?, content: boolean?, question: string? }
+type SearchOptions = { count: number?, content: boolean? }
 
-local function call(name: string, request: { [string]: unknown }): { [string]: any }
+local function call(name: string, what: string, request: { [string]: unknown }): { [string]: any }
 	if not host.endpoints[name] then
-		error(name .. ": hx was started without DEEPSEEK_API_KEY, so DeepSeek's " .. name .. " cannot be used", 0)
+		error(what .. ": hx was started without EXA_API_KEY, so Exa cannot be used", 0)
 	end
 	return http.call({
 		endpoint = name,
 		body = json.encode(request),
 		attempts = M.attempts,
 		timeout = M.timeout,
-		label = name,
-		what = name,
-		sender = "DeepSeek",
-		body_error = {},
+		label = what:match("%.(.*)$") :: string,
+		what = what,
+		sender = "Exa",
+		top_message = true,
 	})
 end
 
@@ -47,7 +45,7 @@ local function results_text(results: { Result }): string
 	local blocks = {}
 	for i, r in results do
 		local about = {}
-		for _, part in { r.site_name, r.date and r.date:sub(1, 10) } do
+		for _, part in { r.author, r.date and r.date:sub(1, 10) } do
 			if part and part ~= "" then
 				table.insert(about, part)
 			end
@@ -57,11 +55,11 @@ local function results_text(results: { Result }): string
 			lines[1] ..= " (" .. table.concat(about, ", ") .. ")"
 		end
 		table.insert(lines, "   " .. r.url)
-		local text: string = http.clip(r.summary ~= "" and r.summary or r.snippet, M.summary_limit)
+		local text: string = http.clip(table.concat(r.highlights, " ... "), M.highlight_limit)
 		if text ~= "" then
 			table.insert(lines, "   " .. text)
 		end
-		if r.content and r.content ~= "" then
+		if r.content then
 			table.insert(lines, "   content:\n" .. r.content)
 		end
 		table.insert(blocks, table.concat(lines, "\n"))
@@ -70,47 +68,46 @@ local function results_text(results: { Result }): string
 end
 local Results = { __tostring = results_text }
 
+local function text_of(value: unknown): string?
+	return if type(value) == "string" and value ~= "" then value else nil
+end
+
 function M.search(query: string, options: SearchOptions?)
 	check("web.search", query, 1, "query", "string")
 	check("web.search", options, 2, "options", "table", true)
 	local given: SearchOptions = options or {}
-	local length = utf8.len(query)
-	if not length or query:match("^%s*$") or length > 128 then
-		error("web.search: the query must be 1 to 128 characters and not all spaces", 0)
+	if query:match("^%s*$") or #query > 2000 then
+		error("web.search: the query must be 1 to 2000 bytes and not all spaces", 0)
 	end
 	local count = given.count or 10
 	if type(count) ~= "number" or count < 1 or count > 50 or count % 1 ~= 0 then
 		error("web.search: count must be a whole number from 1 to 50", 0)
 	end
-	local question = given.question
-	if question ~= nil then
-		check("web.search", question, 2, "options.question", "string")
-		local characters = utf8.len(question)
-		if not characters then
-			question = nil
-		elseif characters > 128 then
-			question = question:sub(1, (utf8.offset(question, 129) :: number) - 1)
-		end
-	end
 	note("  search " .. query:gsub("%c", " "))
-	local answer = call("search", {
+	local answer = call("exa", "web.search", {
 		query = query,
-		count = count,
-		need_content = given.content and true or nil,
-		ori_question = question ~= "" and question or nil,
+		type = "auto",
+		numResults = count,
+		contents = {
+			highlights = true,
+			text = if given.content then { maxCharacters = M.content_limit } else nil,
+		},
 	})
 	local results: { Result } = {}
 	for _, r in type(answer.results) == "table" and answer.results or {} do
+		local highlights = {}
+		for _, h in type(r.highlights) == "table" and r.highlights or {} do
+			if type(h) == "string" then
+				table.insert(highlights, (h:gsub("%s+", " ")))
+			end
+		end
 		table.insert(results, {
-			title = r.title or "",
-			url = r.url or "",
-			snippet = r.snippet or "",
-			summary = r.summary or "",
-			content = r.content ~= "" and r.content or nil,
-			site_name = r.site_name,
-			date = r.date,
-			rerank_score = r.rerank_score,
-			authority = r.authority,
+			title = text_of(r.title) or "",
+			url = text_of(r.url) or "",
+			highlights = highlights,
+			content = text_of(r.text),
+			date = text_of(r.publishedDate),
+			author = text_of(r.author),
 		})
 	end
 	return setmetatable(results, Results)
@@ -122,9 +119,15 @@ function M.fetch(url: string): string
 		error("web.fetch: the url must start with http:// or https://, name a host, and be at most 8192 bytes", 0)
 	end
 	note("  fetch " .. url:gsub("%c", ""))
-	local page = call("fetch", { url = url })
-	local title: string = type(page.title) == "string" and page.title or ""
-	local content: string = type(page.content) == "string" and page.content or ""
+	local answer = call("contents", "web.fetch", { ids = { url }, text = true })
+	local page = type(answer.results) == "table" and answer.results[1]
+	if type(page) ~= "table" then
+		local status = type(answer.statuses) == "table" and answer.statuses[1]
+		local failure = type(status) == "table" and type(status.error) == "table" and status.error or {}
+		error(("web.fetch: Exa could not read %s: %s"):format(url, text_of(failure.tag) or "it gave no reason"), 0)
+	end
+	local title = text_of(page.title) or ""
+	local content = text_of(page.text) or ""
 	if title ~= "" and not content:sub(1, 500):find(title, 1, true) then
 		content = "# " .. title .. "\n\n" .. content
 	end

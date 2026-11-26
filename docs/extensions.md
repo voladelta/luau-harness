@@ -23,10 +23,10 @@ the system prompt does not list it.
 
 An extension that needs a service with a key gets it through an endpoint the user names at startup, so the key
 never reaches Luau: `hx --endpoint tickets=https://tickets.example/api/search` with `TICKETS_API_KEY` set lets
-`.hx/ext/tickets.luau` call `host.post("tickets", json.encode({ query = q }))`. The built-in `web`, `ocr` and
+`.hx/ext/tickets.luau` call `host.post("tickets", json.encode({ query = q }))`. The built-in `web` and
 `exa` extensions are written the same way, over endpoints hx has from the start.
 
-## Built in: bytes, text, path, search, http, web, ocr and exa
+## Built in: bytes, text, path, search, http, web and exa
 
 Eight extensions come with hx, in `lua/ext/`. `bytes`, `text`, `path`, `search` and `http` need no key and are
 always listed. `bytes` does in Luau what a model would otherwise reach for Python's standard library to do with binary
@@ -66,26 +66,24 @@ the user's ripgrep configuration so that its output format stays fixed:
 |---|---|
 | `ext("http").request(url, {method?, headers?, body?, json?, timeout=60})` | `{status, headers, body}`: the status of the last response after redirects, its headers by lower-case name (one named twice is joined with `, `), and its body. Any status is returned, a 404 with the body it came with; only a request that gets no response raises, with curl's message. `json` is a value sent encoded, with `Content-Type: application/json` unless `headers` names one; `body` is sent as it is, and the two do not go together. The method is `GET`, or `POST` with a body |
 
-Of the other three, two, `web` and `ocr`, call DeepSeek's [Search, Fetch](https://api-docs.deepseek.com/guides/search)
-and [OCR](https://api-docs.deepseek.com/guides/ocr) APIs with `DEEPSEEK_API_KEY`, whichever model the loop talks
-to, so a session on Claude can use them too when that key is set. The system prompt lists them only then. A
-project's own `.hx/ext/web.luau` or `.hx/ext/ocr.luau` takes the place of the built-in one.
+The other two, `web` and `exa`, call [Exa](https://exa.ai/docs) with `EXA_API_KEY`, and the system prompt lists
+them only when that key is set. A project's own `.hx/ext/web.luau` takes the place of the built-in one. `web`
+searches with Exa's [Search](https://exa.ai/docs/reference/search) and reads a page with its
+[Contents](https://exa.ai/docs/contents/quickstart):
 
 | Call | Returns |
 |---|---|
-| `ext("web").search(query, {count?, content?, question?})` | results, best first: `{title, url, snippet, summary, content?, site_name?, date?, rerank_score, authority}`. Printed or returned from `lua`, they read as a numbered list. `query` takes `site:`, `-site:`, `lang:`, `after:`, `before:` and `"phrases"`, up to 128 characters; `count` is 1 to 50 (default 10); `content = true` asks for each page's text |
-| `ext("web").fetch(url)` | the page as Markdown, its title first as a heading when the page does not show it |
-| `ext("ocr").read(path, purpose?)` | the text of a PDF, Word, PowerPoint or image file, up to 100 MiB and 1,000 pages. A PDF is read with `rich_layout_recognition`, which keeps tables and layout and leaves box tokens in the text; anything else with `text_recognition`. A document of several pages has a `[page N]` line before each |
+| `ext("web").search(query, {count?, content?})` | results, best first: `{title, url, date?, author?, highlights, text?}`. Printed or returned from `lua`, they read as a numbered list. `count` is 1 to 100 (default 10); `content = true` asks for each page's text, up to `content_limit` (20,000) characters, beside its highlights |
+| `ext("web").fetch(url)` | the page as Markdown, its title first as a heading when the page does not show it. A page Exa cannot read raises with Exa's reason, `CRAWL_NOT_FOUND` say |
 
-Requests that fail with 408, 429 or 5xx, or get no answer, are tried three times, Exa's too. The retry loop, the
-reading of error bodies and the argument checks are written once, in the helper `_http`, which all three load; a
-project's own `.hx/ext/_http.luau` takes its place for all of them. The file for OCR is read by the
-host inside the wall, so a file the model cannot read cannot be sent: `ocr.read` of one fails at once, without a
-retry. Search and Fetch cost $0.75 per 1,000
-requests, OCR $0.225 per 1,000 pages.
+Requests that fail with 408, 429 or 5xx, or get no answer, are tried three times. The retry loop, the
+reading of error bodies and the argument checks are written once, in the helper `_http`, which both load; a
+project's own `.hx/ext/_http.luau` takes its place for both.
 
-A third, `exa`, calls Exa's [Deep Search](https://exa.ai/docs/search/deep-search) with `EXA_API_KEY`, and is listed
-only when that key is set. Deep Search plans several searches, reads what they find, searches again where the
+A file on disk needs no extension: `see(path)` gives a PDF, Word, PowerPoint, Excel or OpenDocument file to the
+model itself, which reads its text, tables and pictures (see [The loop](loop.md)).
+
+`exa` calls Exa's [Deep Search](https://exa.ai/docs/search/deep-search). Deep Search plans several searches, reads what they find, searches again where the
 evidence is thin, and writes a grounded answer. It is for questions that take research; a single lookup is quicker
 and cheaper through `web`.
 

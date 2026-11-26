@@ -7,13 +7,13 @@
 local M = host.load(host.default_loop, "=loop")()
 
 -- The settings at the top of the built-in loop. M.model is host.model, the model `hx --model NAME` or HX_MODEL
--- chose; hx picked the endpoint by that name, so choose the model there rather than here.
+-- chose.
 -- M.max_replies = 100
 
--- The agents function gives tasks to agents that work side by side. They run on deepseek-flash where hx has
--- DeepSeek's key, and on the session's model otherwise, unless a model is named here. M.workflow names a skill
--- that every session in this project is led by, as `hx --rpi` is led by rpi.
--- M.agent_model = "claude-haiku-5-5"
+-- The agents function gives tasks to agents that work side by side. They run on the session's model
+-- unless a model is named here. M.workflow names a skill that every session in this project is led by, as
+-- `hx --rpi` is led by rpi.
+-- M.agent_model = "gemini-4-hydrogen"
 -- M.workflow = "rpi"
 
 -- A function of this project's own, which the model's code can call. `usage` is what the model reads about it;

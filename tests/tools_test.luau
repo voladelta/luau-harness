@@ -131,8 +131,20 @@ check("see says what it shows", shown, ("[image 1 of this result: %sshot.png, im
 check("which is no failure", failed, false)
 check("the images come with the result", #images, 2)
 check("as blocks the model can look at", json.encode(images[1]),
-	json.encode({ type = "image", source = { type = "base64", media_type = "image/png", data = loop.ext("bytes").base64(png) } }))
-check("each of its kind", images[2].source.media_type, "image/webp")
+	json.encode({ type = "image", data = loop.ext("bytes").base64(png), mime_type = "image/png" }))
+check("each of its kind", images[2].mime_type, "image/webp")
+host.write(dir .. "paper.PDF", "%PDF-1.7\n")
+host.write(dir .. "deck.pptx", "PK\3\4rest")
+host.write(dir .. "notes.docx", "plain words")
+shown, failed, images = loop.tools[1].run({ code = ("see(%q) return see(%q)"):format(dir .. "paper.PDF", dir .. "deck.pptx") })
+check("see says which documents it shows", shown, ("[document 2 of this result: %sdeck.pptx, "
+	.. "application/vnd.openxmlformats-officedocument.presentationml.presentation, 8 bytes]"):format(dir))
+check("a document goes whole, for the model to read", json.encode(images[1]),
+	json.encode({ type = "document", data = loop.ext("bytes").base64("%PDF-1.7\n"), mime_type = "application/pdf" }))
+has("a file that only has a document's name", lua(("return see(%q)"):format(dir .. "notes.docx")), "nor a PDF, Word, PowerPoint")
+loop.document_bytes = 10
+has("a document too large to send", lua(("return see(%q)"):format(dir .. "paper.PDF")), "a document may be 10 at most: split it first")
+loop.document_bytes = 20 * 1024 * 1024
 check("a call that looks at nothing has none", select(3, loop.tools[1].run({ code = "return 1" })), nil)
 host.write(dir .. "not.png", "text")
 has("a file that is no image", lua(("return see(%q)"):format(dir .. "not.png")), "not.png is not a PNG, JPEG, GIF or WebP image")
@@ -146,10 +158,10 @@ loop.call_image_bytes = 60
 has("more image bytes than one call sends", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "may be 60 bytes as base64 at most")
 loop.call_image_bytes = 20 * 1024 * 1024
 loop.images_per_call = 1
-has("more images than one call shows", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "one call shows 1 images at most")
+has("more images than one call shows", lua(("see(%q) see(%q)"):format(dir .. "shot.png", dir .. "shot.png")), "one call shows 1 files at most")
 loop.images_per_call = 8
 loop.vision = false
-has("a model that takes no images", lua(("return see(%q)"):format(dir .. "shot.png")), "this session's model takes no images")
+has("a model that takes no images", lua(("return see(%q)"):format(dir .. "shot.png")), "this session's model takes no files")
 loop.vision = true
 
 tools.write(dir .. "e.txt", "alpha beta\nalpha gamma\n")
@@ -400,9 +412,9 @@ check("or runs out of time",
 local replies, next_id = {}, 0
 local function calls(code)
 	next_id += 1
-	return { stop_reason = "tool_use", content = { { type = "tool_use", id = "c" .. next_id, name = "lua", input = { code = code } } } }
+	return { status = "requires_action", steps = { { type = "function_call", id = "c" .. next_id, name = "lua", arguments = { code = code } } } }
 end
-local done = { stop_reason = "end_turn", content = { { type = "thinking", thinking = "", signature = "s" } } }
+local done = { status = "completed", steps = { { type = "thought", signature = "s" } } }
 local request = loop.request
 loop.request = function()
 	return assert(table.remove(replies, 1), "the scripted model ran out of replies")
@@ -430,15 +442,13 @@ check("a sub-agent's conversation is logged, and only its", #logged, 1)
 check("under the session's name and its number", (logged[1] or ""):match("%-sub%-1%.json$"), "-sub-1.json")
 local sub = json.decode(host.read(".hx/log/" .. (logged[1] or "")) or "{}")
 check("with the system prompt it ran on", sub.system, "system")
-check("from its task", sub.messages and sub.messages[1].content, "a sub-task")
-check("to its last reply", sub.messages and #sub.messages, 4)
+check("from its task", sub.steps and sub.steps[1].content[1].text, "a sub-task")
+check("to its last reply", sub.steps and #sub.steps, 4)
 host.sh("rm -rf .hx")
 local reminders = {}
-for _, message in talk.messages do
-	for _, block in if type(message.content) == "table" then message.content else {} do
-		if block.type == "text" then
-			table.insert(reminders, block.text)
-		end
+for i, step in talk.steps do
+	if i > 1 and step.type == "user_input" then
+		table.insert(reminders, step.content[1].text)
 	end
 end
 check("a nested turn neither resets the outer turn's counts nor adds to them", #reminders, 1)

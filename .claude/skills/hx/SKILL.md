@@ -12,8 +12,8 @@ You are in one of two places:
 
 - **Outside**: in a shell, as a person or another agent such as Claude Code. You start `hx` as a command.
 - **Inside**: you are the model hx runs. You have the `lua` tool, and your code calls `bash`, `read`, `write`,
-  `edit`, `see`, `skill` and `ext`. `see(path)` puts a PNG, JPEG, GIF or WebP file into the call's result for
-  you to look at.
+  `edit`, `see`, `skill` and `ext`. `see(path)` puts an image, or a PDF, Word, PowerPoint, Excel or OpenDocument file, into the
+  call's result for you to look at.
 
 The files under `.hx/` mean the same whoever writes them, so extending hx is the same work from either place.
 
@@ -45,10 +45,9 @@ hx --rpi [options] TASK...            the agent as the lead of agents (see "Agen
 ```
 
 - Start it in the project directory. It refuses `/`, the home directory and any directory that holds it.
-- It needs a key in the environment: `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY` for a `claude-*` model, or
-  `GEMINI_API_KEY` for a `gemini-*` one (`--model neon`, `--model carbon`).
-  `HX_KEY_ENV=NAME` reads it from another variable. `--model opus|sonnet|haiku|NAME` or `HX_MODEL` picks the
-  model. `--run` needs no key.
+- It needs `GEMINI_API_KEY` in the environment; `HX_KEY_ENV=NAME` reads the key from another variable.
+  `--model carbon|argon|neon|hydrogen|NAME` or `HX_MODEL` picks the model, `gemini-4-neon` by default. `--run`
+  needs no key.
 - The answer goes to stdout, progress and errors to stderr: `hx -q "..." > answer.txt`. Exit status: 0 done, 1 the
   run failed, 2 bad usage or hx cannot start here, 130 interrupted, 143 terminated.
 - When no person is at the terminal, pass `--no-input` and the task as words or on stdin. Stdin is read only when
@@ -105,12 +104,10 @@ return agents({
   under the name that did it. A new name starts a new agent.
 - The call returns after `M.agent_wait` seconds at most (270), with the reports so far and a line for each
   agent still at work; `agents()` with no tasks waits again. A report is given once.
-- Agents run on `deepseek-flash` when hx was started with `DEEPSEEK_API_KEY`, and on the session's model
-  otherwise. They have no `agents` of their own, and their words go to stderr, not into the answer.
+- Agents run on the session's model, and on Hydrogen under `--rpi`. They have no `agents` of their own, and their words go to stderr, not into the answer.
 - `hx --rpi TASK`, from outside, leads the whole task that way by the built-in skill `rpi` (research, plan,
-  implement): the lead, Opus unless `--model` names another, researches and plans, agents implement, and it
-  verifies and sends back what fails. It needs `ANTHROPIC_API_KEY`, and `DEEPSEEK_API_KEY` for agents on
-  `deepseek-flash`. Inside any session, `skill("rpi")` is the same procedure.
+  implement): the lead, Carbon unless `--model` names another, researches and plans, agents implement, and it
+  verifies and sends back what fails. Inside any session, `skill("rpi")` is the same procedure.
 - In `.hx/loop.luau`: `M.agent_model`, `M.agent_limit` (8 at once), `M.agent_wait`, `M.agent_seconds` (1800 a
   run) and `M.agent_prompt`. `M.workflow = "NAME"` starts every session under that skill, as `--rpi` does under
   `rpi`, and a project's own `.hx/skills/rpi/SKILL.md` takes the built-in one's place.
@@ -136,7 +133,7 @@ return {
 - Report failure with `error(message, 0)`. Return text, or a table: a table shows as JSON, unless its metatable
   has `__tostring`.
 - A name that starts with `_` is a helper for other extensions and is not listed. `bytes`, `text`, `path`, `search`, `http`,
-  `web`, `ocr`, `exa` and `_http` are built in; a project's file of the same name takes the place of one.
+  `web`, `exa` and `_http` are built in; a project's file of the same name takes the place of one.
 - Keep it as small as the chore. Try it before you report: from inside, call it; from outside,
 
 ```
@@ -170,7 +167,7 @@ Group commits by area, newest first. Run scripts/authors.sh for the credits line
 returns it. What it leaves alone keeps up with hx; `--full` copies the whole loop instead, which the project then
 owns. Change these through `M`:
 
-- Settings: `M.max_replies` (200), `M.max_output` (16000 tokens a reply), `M.compact_at` (150000 prompt tokens),
+- Settings: `M.max_replies` (200), `M.compact_at` (150000 prompt tokens),
   `M.output_limit` (30000 bytes of a result), `M.call_seconds` (600), `M.layout_lines` (60), `M.skill_dirs`.
 - Parts to replace or wrap: `M.system_prompt`, `M.layout`, `M.request`, `M.turn`, `M.compact`,
   `M.compact_prompt`, `M.functions`, `M.tools`.
@@ -190,9 +187,12 @@ table.insert(M.functions, {
 		talk:say(task)
 		M.turn(system, talk) -- replies and tool calls until the sub-agent is done; raises if it fails
 		local words = {}
-		for _, block in talk.messages[#talk.messages].content do
-			if block.type == "text" then
-				table.insert(words, block.text)
+		for _, step in talk.steps do
+			if step.type == "user_input" then
+				table.clear(words)
+			end
+			for _, part in if step.type == "model_output" then step.content else {} do
+				table.insert(words, part.text)
 			end
 		end
 		return table.concat(words, "\n")
@@ -208,9 +208,8 @@ return M
   each in a process of its own, `agents` is already there (see "Agents").
 - A sub-agent shares the model's globals and the wall. Its words also go to stdout, its replies are counted in
   the line at the end of the run, and its conversation has a log of its own (see "Running hx").
-- A sub-agent runs on another model when its conversation names one: `M.Conversation.new("deepseek-flash")`.
-  A model of the session's vendor goes through the session's endpoint; a Claude model under a DeepSeek session
-  needs `ANTHROPIC_API_KEY` set when hx starts, and a DeepSeek model under a Claude session `DEEPSEEK_API_KEY`.
+- A sub-agent runs on another model when its conversation names one: `M.Conversation.new("gemini-4-hydrogen")`.
+  Every model is asked through the one endpoint with the one key.
 - Keep what goes to the model the same from request to request, or the prompt cache is lost: build prompt text
   once, and put nothing that changes (a clock, a counter) into the system prompt or a `usage` line.
 - A loop that does not load, or returns no table with a `main` function, stops hx with the reason on stderr;

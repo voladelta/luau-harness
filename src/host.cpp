@@ -314,7 +314,7 @@ Host::Host(HostConfig config, const Sandbox& sandbox, bool* memory_refused)
     : config_(std::move(config)),
       sandboxed_(sandbox.confined()),
       memory_refused_(memory_refused),
-      http_(std::make_unique<HttpClient>(std::move(config_.endpoints), config_.model, std::move(config_.ca_bundle))),
+      http_(std::make_unique<HttpClient>(std::move(config_.endpoints), std::move(config_.ca_bundle))),
       judge_(std::make_unique<JudgeChannel>(std::move(config_.judge))),
       spawn_(std::make_unique<SpawnPool>()) {
     prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
@@ -354,10 +354,6 @@ void Host::check_deadline(lua_State* L) {
 int Host::post(lua_State* L) {
     Host& host = of(L);
     return host.http_->post(L, host.deadline_);
-}
-
-int Host::route(lua_State* L) {
-    return of(L).http_->route(L);
 }
 
 int Host::sh(lua_State* L) {
@@ -466,7 +462,6 @@ void Host::open(lua_State* L) {
 
     static constexpr luaL_Reg kFunctions[] = {
         {.name = "post", .func = post},
-        {.name = "route", .func = route},
         {.name = "sh", .func = sh},
         {.name = "try", .func = try_},
         {.name = "timed", .func = timed},
