@@ -1498,12 +1498,13 @@ local interactions_wire: Wire = {
 		local counts = type(answer.usage) == "table" and answer.usage or {}
 		local cached = counts.total_cached_tokens or 0
 		local content = gemini_blocks(answer.steps)
-		local calls = false
+		local calls, said = false, false
 		for _, block in content do
 			calls = calls or block.type == "tool_use"
+			said = said or block.type ~= "thinking"
 		end
 		return {
-			content = content,
+			content = if said then content else {},
 			stop_reason = if status == "incomplete" then "max_tokens" elseif calls then "tool_use" else "end_turn",
 			usage = {
 				input_tokens = (counts.total_input_tokens or 0) - cached,
