@@ -40,7 +40,7 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 | `HX_MODEL` | model name; `carbon`, `argon`, `neon` and `hydrogen` stand for `gemini-4-carbon`, `gemini-4-argon`, `gemini-4-neon` and `gemini-4-hydrogen` | `gemini-4-neon` |
 | `HX_API_URL` | the model endpoint, which speaks Gemini's Interactions API | `https://generativelanguage.googleapis.com/v1beta/interactions` |
 | `HX_KEY_ENV` | name of the variable holding the API key | `GEMINI_API_KEY` |
-| `HX_EFFORT` | the model's thinking level: `minimal`, `low`, `medium`, `high` or `xhigh`, sent as `generation_config.thinking_level`; any other value is refused before the model is asked. Only Neon and Hydrogen have `xhigh`; another model gets `high` for it | the model's own: `high` on Neon and Hydrogen, `medium` on Carbon and Argon |
+| `HX_EFFORT` | the model's thinking level: `low`, `medium`, `high` or `xhigh`, sent as `generation_config.thinking_level`; any other value is refused before the model is asked. Only Neon and Hydrogen have `xhigh`; another model gets `high` for it | the model's own: `high` on Neon and Hydrogen, `medium` on Carbon and Argon |
 | `HX_EXA_URL` | Exa's search endpoint, which the built-in `web` and `exa` extensions search through with `EXA_API_KEY` | `https://api.exa.ai/search` |
 | `HX_EXA_CONTENTS_URL` | Exa's contents endpoint, which the built-in `web` extension reads pages through with `EXA_API_KEY` | `https://api.exa.ai/contents` |
 

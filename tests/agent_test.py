@@ -533,7 +533,7 @@ end
         self.assertEqual(self.model.requests[2]["generation_config"], {"thinking_level": "high"})
         done = self.run_hx("go", script=[say("never")], HX_EFFORT="extreme")
         self.assertEqual(done.returncode, 2)
-        self.assertIn("hx: HX_EFFORT=extreme: the efforts are minimal, low, medium, high and xhigh", done.stderr)
+        self.assertIn("hx: HX_EFFORT=extreme: the efforts are low, medium, high and xhigh", done.stderr)
         self.assertEqual(len(self.model.requests), 3)
 
     def test_a_conversation_on_another_model_goes_to_the_same_endpoint_with_the_same_key(self):
