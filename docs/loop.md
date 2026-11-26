@@ -164,7 +164,10 @@ carries a `.gitignore` that keeps all of it out of git.
 A `gemini-*` model is asked through Gemini's Interactions API, not the Messages format, and `M.request` translates
 both ways, so the loop, its tools and a conversation's log are the same on every model. The request is stateless
 (`store: false`): the whole conversation goes as `input` steps, the system prompt as `system_instruction`, the tools
-as `function` tools, and `HX_EFFORT` as `generation_config.thinking_level`. A reply's steps come back as blocks: a
+as `function` tools, and `HX_EFFORT` as `generation_config.thinking_level`. Two settings follow Google's guidance
+for the Gemini 4 models: `M.max_output` is not sent, because `max_output_tokens` there caps thinking and answer
+together and a low cap cuts answers short, so the API's own 65,536 holds; and a request may take 15 minutes, not
+10, since a hard prompt thinks for several. A reply's steps come back as blocks: a
 `thought` as a `thinking` block that keeps the whole step in `signature` and is sent back unchanged, as the API asks
 of a stateless caller; `model_output` as text; a `function_call` as a `tool_use`, answered with a `function_result`.
 `M.gemini` lists the models whose deepest thinking level is below `xhigh`, which a higher `HX_EFFORT` is held to.

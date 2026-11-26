@@ -1288,6 +1288,7 @@ end
 type Wire = {
 	body: (system: string, messages: { Message }, model: string, compaction: { [string]: any }?) -> { [string]: any },
 	beta: ((model: string) -> string?)?,
+	timeout: number?,
 	reply: (answer: any) -> Reply?,
 }
 
@@ -1448,17 +1449,19 @@ local function gemini_blocks(steps: { any }): { Block }
 end
 
 local interactions_wire: Wire = {
+	timeout = 900,
 	body = function(system, messages, model)
 		local specs = json.array({})
 		for _, tool in M.tools do
 			table.insert(specs,
 				{ type = "function", name = tool.name, description = tool_description(tool), parameters = tool.parameters })
 		end
+		local level = thinking_level(model, M.effort)
 		return {
 			model = model,
 			store = false,
 			system_instruction = system,
-			generation_config = { max_output_tokens = M.max_output, thinking_level = thinking_level(model, M.effort) },
+			generation_config = level and { thinking_level = level },
 			input = gemini_steps(messages),
 			tools = specs,
 		}
@@ -1500,7 +1503,7 @@ function M.request(system: string, messages: { Message }, compaction: { [string]
 	local wire = wire_of(name)
 	local body = json.encode(wire.body(system, messages, name, compaction))
 	local endpoint = host.route(name)
-	local options = { beta = wire.beta and wire.beta(name) }
+	local options = { beta = wire.beta and wire.beta(name), timeout = wire.timeout }
 	local attempts = 5
 	for attempt = 1, attempts do
 		local status, text, retry_after = host.post(endpoint, body, options)
