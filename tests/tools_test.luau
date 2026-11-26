@@ -302,6 +302,7 @@ check("its tables can be iterated", lua("local n = 0 for name in host.extensions
 check("and so can the view", lua("local found = false for name in host do found = found or name == 'sh' end return found"), "true")
 check("and pairs goes over the view too", lua("local found = false for name in pairs(host) do found = found or name == 'sh' end return found"), "true")
 check("pairs over a plain table is as ever", lua("local n = 0 for _ in pairs({ a = 1, b = 2 }) do n += 1 end return n"), "2")
+check("and over a table with an iterator of its own", lua("local t = setmetatable({ a = 1 }, { __iter = function() return function() return nil end end }) local n = 0 for _ in pairs(t) do n += 1 end return n"), "1")
 check("_G.print is the print that reaches the model", lua("_G.print('through _G')"), "through _G")
 check("_G is the code's own globals", lua("_G.via_g = 7 return via_g"), "7")
 check("which stay out of the harness", _G.via_g, nil)

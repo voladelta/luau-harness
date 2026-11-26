@@ -73,7 +73,7 @@ searches with Exa's [Search](https://exa.ai/docs/reference/search) and reads a p
 
 | Call | Returns |
 |---|---|
-| `ext("web").search(query, {count?, content?})` | results, best first: `{title, url, date?, author?, highlights, text?}`. Printed or returned from `lua`, they read as a numbered list. `count` is 1 to 100 (default 10); `content = true` asks for each page's text, up to `content_limit` (20,000) characters, beside its highlights |
+| `ext("web").search(query, {count?, content?})` | results, best first: `{title, url, date?, author?, highlights, content?}`. Printed or returned from `lua`, they read as a numbered list. `count` is 1 to 50 (default 10); `content = true` asks for each page's text, up to `content_limit` (20,000) characters, beside its highlights |
 | `ext("web").fetch(url)` | the page as Markdown, its title first as a heading when the page does not show it. A page Exa cannot read raises with Exa's reason, `CRAWL_NOT_FOUND` say |
 
 Requests that fail with 408, 429 or 5xx, or get no answer, are tried three times. The retry loop, the

@@ -33,7 +33,7 @@ Code from the model and from extensions sees `host`, `json` and the standard lib
 an assignment such as `host.sh = nil` raises "host is read-only" instead of breaking every later call, and the
 text such code passes to `host.log` and `host.input` is made printable, so it cannot send an escape sequence to
 the terminal. `_G` there is the code's own globals, and a chunk loaded with `host.load` and no environment gets
-globals of its own. `for key, value in view` iterates a view; `pairs` and `next` see nothing in one. Digging does
+globals of its own. `for key, value in view` iterates a view, and so does `pairs` in the model's code; `next` sees nothing in one. Digging does
 not get past them: a view is frozen, so `rawset` and `setmetatable` raise on it; the standard libraries, `json`,
 the metatable strings share, and `host.extensions`, `host.skills`, `host.args` and `host.endpoints` are read-only
 tables for everyone; and such code has no `getfenv` or `setfenv`, which would hand it the loop's globals. The
@@ -122,7 +122,7 @@ as `system_instruction`, the tools as `function` tools, and `HX_EFFORT`, when se
   Carbon and Argon. `M.xhigh` lists the models that have `xhigh`, Neon and Hydrogen; any other gets `high` for it.
 - **No output cap.** `max_output_tokens` caps thinking and answer together and a low cap cuts answers short, so
   none is sent and the API's own 65,536 holds.
-- **No sampling parameters**, and a request may take `M.request_seconds` (900): a hard prompt thinks for minutes.
+- **No sampling parameters**, and each attempt at a request may take `M.request_seconds` (900): a hard prompt thinks for minutes. One that fails in a passing way is tried up to five times, so a request that times out every time takes that many times as long.
 
 A reply is the steps the API sent, appended to the conversation as they are: a `thought` with its signature, which
 a stateless caller must send back unchanged; `model_output`, the answer; and each `function_call`, which the loop

@@ -183,8 +183,11 @@ local function capture_print(...: any)
 	end
 end
 
+local is_view: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+
 local function read_only(name: string, real: { [any]: any }, own: { [string]: any }?): any
 	local view = {}
+	is_view[view] = true
 	setmetatable(view, table.freeze({
 		__index = function(_, key: any): any
 			local mine = if own and type(key) == "string" then own[key] else nil
@@ -245,9 +248,8 @@ local function lookup(env: any, name: string): any
 		return capture_print
 	elseif name == "pairs" then
 		return function(value: any): ...any
-			local meta = getmetatable(value)
-			if type(meta) == "table" and meta.__iter then
-				return meta.__iter(value)
+			if is_view[value] then
+				return getmetatable(value).__iter(value)
 			end
 			return pairs(value)
 		end
@@ -1122,7 +1124,8 @@ local function lua_description(): string
 	local lines = {
 		"Run Luau code in the project directory. This is how you act: the code calls the functions below. The "
 			.. "result is what the code prints and then what it returns; a function's value shows only when you "
-			.. "print or return it, and a returned table shows as JSON. Globals persist between calls. A result "
+			.. "print or return it, and a returned table shows as JSON unless it has a text form of its own, as "
+			.. "search results do. Globals persist between calls. A result "
 			.. "longer than " .. M.output_limit .. " bytes keeps its start and end, and the whole of it goes to a "
 			.. "file the result names. A call is stopped after " .. M.call_seconds .. " seconds.",
 		"",
@@ -1375,13 +1378,15 @@ function M.request(system: string, steps: { Step }, model: string?): Reply
 	error("unreachable")
 end
 
+local started_on = os.date("%Y-%m-%d")
+
 function M.system_prompt(): string
 	local ripgrep = host.sh("command -v rg", { timeout = 10 }).code == 0
 	local parts = {
 		("# Role\n\nYou are a coding agent working in %s. This session started on %s. You act by running Luau code with the lua "
 			.. "tool; the code calls the functions the tool lists. Put several steps in one call when you know what "
 			.. "each will do, and take one step at a time when the next depends on what the last returned.")
-			:format(host.cwd, os.date("%Y-%m-%d")),
+			:format(host.cwd, started_on),
 		"# Constraints\n\n"
 			.. (host.sandboxed
 				and "- The kernel confines you: you can write inside this project directory and $TMPDIR, and read "
@@ -1427,7 +1432,7 @@ function M.system_prompt(): string
 				.. "and tried, and covers the loop, sub-agents and scripts: load it before you add to the harness." or ""),
 		"# Output\n\n"
 			.. "While you work, write at most a line beside a tool call, and only when it tells the user something "
-			.. "the call does not. When the task is done, finish with a short report: what you changed, what you "
+			.. "the call does not, unless a skill or workflow you follow asks for more, such as a plan. When the task is done, finish with a short report: what you changed, what you "
 			.. "checked, what is left.",
 	}
 	if host.judged then

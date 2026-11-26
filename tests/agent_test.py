@@ -766,8 +766,8 @@ end
         done = self.run_hx("go", script=[
             call("lua", {"code": 'return agents({ { name = "a", task = "do it" } })'}, "c1"), say("ok")])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual({task_of(r): r["model"] for r in self.model.requests},
-                         {"go": "gemini-4-neon", "do it": "gemini-4-hydrogen"})
+        self.assertEqual({(task_of(r), r["model"]) for r in self.model.requests},
+                         {("go", "gemini-4-neon"), ("do it", "gemini-4-hydrogen")})
         with open(os.path.join(self.project, ".hx", "loop.luau"), "w") as f:
             f.write('local M = host.load(host.default_loop, "=loop")()\nM.workflow = "review"\nreturn M\n')
         done = self.run_hx("go")
