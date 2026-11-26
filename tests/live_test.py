@@ -328,6 +328,8 @@ def run_all_at_once():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
     HX = os.path.abspath(sys.argv.pop(1))
     if len(sys.argv) == 1:
         sys.exit(run_all_at_once())
