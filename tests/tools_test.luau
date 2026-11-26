@@ -172,6 +172,18 @@ check("an ambiguous edit changes nothing", host.read(dir .. "e.txt"), "alpha BET
 check("edit all", tools.edit(dir .. "e.txt", "alpha", "%1", true), ("replaced 2 occurrences in %se.txt"):format(dir))
 check("edit is literal, not a pattern", host.read(dir .. "e.txt"), "%1 BETA\n%1 gamma\n")
 raises("edit a missing text", "not found", tools.edit, dir .. "e.txt", "zzz", "x")
+check("edit takes several changes, each on what the one before left",
+	tools.edit(dir .. "e.txt", { { old = "BETA", new = "delta" }, { old = "%1", new = "a", all = true }, { old = "a delta", new = "A" } }),
+	("replaced 4 occurrences in %se.txt"):format(dir))
+check("and writes them together", host.read(dir .. "e.txt"), "A\na gamma\n")
+raises("a change that does not apply is named", "change 2: old text not found", tools.edit, dir .. "e.txt",
+	{ { old = "gamma", new = "G" }, { old = "zzz", new = "x" } })
+check("and then none is written", host.read(dir .. "e.txt"), "A\na gamma\n")
+raises("a change needs its texts", "change 1 must be", tools.edit, dir .. "e.txt", { { old = "A" } })
+raises("a list takes no new beside it", "inside each change", tools.edit, dir .. "e.txt", { { old = "A", new = "B" } }, "x")
+raises("an empty list", "is empty", tools.edit, dir .. "e.txt", {})
+check("edit back", tools.edit(dir .. "e.txt", { { old = "A", new = "%1 BETA" }, { old = "a gamma", new = "%1 gamma" } }),
+	("replaced 2 occurrences in %se.txt"):format(dir))
 raises("edit with an empty old", "must not be empty", tools.edit, dir .. "e.txt", "", "x")
 raises("edit that changes nothing", "change nothing", tools.edit, dir .. "e.txt", "BETA", "BETA")
 raises("a missing text says how to recover", "read the file again", tools.edit, dir .. "e.txt", "zzz", "x")
@@ -285,6 +297,8 @@ check("reads see the host as it is", lua("return host.cwd == " .. ("%q"):format(
 check("a view is the same value each time", lua("return host == _G.host"), "true")
 check("its tables can be iterated", lua("local n = 0 for name in host.extensions do n += 1 end return n > 0"), "true")
 check("and so can the view", lua("local found = false for name in host do found = found or name == 'sh' end return found"), "true")
+check("and pairs goes over the view too", lua("local found = false for name in pairs(host) do found = found or name == 'sh' end return found"), "true")
+check("pairs over a plain table is as ever", lua("local n = 0 for _ in pairs({ a = 1, b = 2 }) do n += 1 end return n"), "2")
 check("_G.print is the print that reaches the model", lua("_G.print('through _G')"), "through _G")
 check("_G is the code's own globals", lua("_G.via_g = 7 return via_g"), "7")
 check("which stay out of the harness", _G.via_g, nil)

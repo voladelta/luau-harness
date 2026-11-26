@@ -243,6 +243,14 @@ local function lookup(env: any, name: string): any
 	end
 	if name == "print" then
 		return capture_print
+	elseif name == "pairs" then
+		return function(value: any): ...any
+			local meta = getmetatable(value)
+			if type(meta) == "table" and meta.__iter then
+				return meta.__iter(value)
+			end
+			return pairs(value)
+		end
 	elseif name == "_G" then
 		return env
 	elseif name == "getfenv" or name == "setfenv" then
@@ -841,7 +849,7 @@ M.functions = {
 	{
 		name = "read",
 		usage = "read(path, offset?, limit?) -> text: whole lines of a text file from line offset (default 1), up "
-			.. "to limit lines (default 2000) or the output limit, each as `NUMBER: text`; the numbers are not part "
+			.. "to limit lines (default 2000) or what a result holds, each as `NUMBER: text`; the numbers are not part "
 			.. "of the file. When that is not the whole file, it ends with the range and the offset to go on from. "
 			.. "For the file's exact contents, as data, use host.read(path).",
 		run = function(path: any, offset: any, limit: any): string
@@ -920,18 +928,42 @@ M.functions = {
 		name = "edit",
 		usage = "edit(path, old, new, all?) -> text: replaces the exact text old with new in a file. old must occur "
 			.. "exactly once, unless all is true, which replaces every occurrence. Copy old from the file without "
-			.. "the line numbers read puts in front.",
+			.. "the line numbers read puts in front. For several changes to one file, pass a list in place of old: "
+			.. "edit(path, {{old = ..., new = ..., all = true?}, ...}). They apply in order, each to the text the "
+			.. "one before left, and the file is written only when every one applies.",
 		run = function(path: any, old: any, new: any, all: any): string
 			check("edit", path, 1, "path", "string")
-			check("edit", old, 2, "old", "string")
-			check("edit", new, 3, "new", "string")
-			check("edit", all, 4, "all", "boolean", true)
-			progress("  edit " .. M.printable(path))
-			if old == "" then
-				error("edit: old must not be empty", 0)
+			local changes: { { old: any, new: any, all: any } }
+			if type(old) == "table" then
+				if new ~= nil or all ~= nil then
+					error("edit: with a list of changes, new and all go inside each change", 0)
+				end
+				if #old == 0 then
+					error("edit: the list of changes is empty", 0)
+				end
+				changes = old
+			else
+				check("edit", old, 2, "old", "string")
+				check("edit", new, 3, "new", "string")
+				check("edit", all, 4, "all", "boolean", true)
+				changes = { { old = old, new = new, all = all } }
 			end
-			if old == new then
-				error("edit: old and new are the same, so this edit would change nothing", 0)
+			progress("  edit " .. M.printable(path))
+			local which = function(i: number): string
+				return if type(old) == "table" then ("change %d: "):format(i) else ""
+			end
+			for i, change in changes do
+				if type(change) ~= "table" or type(change.old) ~= "string" or type(change.new) ~= "string"
+					or change.all ~= nil and type(change.all) ~= "boolean"
+				then
+					error(("edit: change %d must be {old = text, new = text, all = true?}"):format(i), 0)
+				end
+				if change.old == "" then
+					error(("edit: %sold must not be empty"):format(which(i)), 0)
+				end
+				if change.old == change.new then
+					error(("edit: %sold and new are the same, so this edit would change nothing"):format(which(i)), 0)
+				end
 			end
 			local text: string = or_raise(host.read(path))
 			local function replace(from_text: string, to_text: string): ({ string }, number)
@@ -952,20 +984,28 @@ M.functions = {
 			local function crlf(s: string): string
 				return (s:gsub("\r?\n", "\r\n"))
 			end
-			local pieces, count = replace(old, if text:match("\r?\n") == "\r\n" then crlf(new) else new)
-			if count == 0 and text:find("\r\n", 1, true) and old:find("\n", 1, true) then
-				pieces, count = replace(crlf(old), crlf(new))
+			local total = 0
+			for i, change in changes do
+				local from_text: string, to_text: string = change.old, change.new
+				local pieces, count = replace(from_text, if text:match("\r?\n") == "\r\n" then crlf(to_text) else to_text)
+				if count == 0 and text:find("\r\n", 1, true) and from_text:find("\n", 1, true) then
+					pieces, count = replace(crlf(from_text), crlf(to_text))
+				end
+				if count == 0 then
+					local hint = from_text:match("^%s*%d+: ") and " without the line numbers read adds" or ""
+					error(("edit: %sold text not found in %s: read the file again and copy the text exactly%s"):format(
+						which(i), path, hint), 0)
+				end
+				if count > 1 and not change.all then
+					error(("edit: %sold text occurs %d times in %s: add surrounding lines to make it unique, or pass all = true")
+						:format(which(i), count, path), 0)
+				end
+				text = table.concat(pieces)
+				total += count
 			end
-			if count == 0 then
-				local hint = old:match("^%s*%d+: ") and " without the line numbers read adds" or ""
-				error(("edit: old text not found in %s: read the file again and copy the text exactly%s"):format(path, hint), 0)
-			end
-			if count > 1 and not all then
-				error(("edit: old text occurs %d times in %s: add surrounding lines to make it unique, or pass all = true"):format(count, path), 0)
-			end
-			or_raise(host.write(path, table.concat(pieces)))
+			or_raise(host.write(path, text))
 			wrote(path)
-			return ("replaced %d occurrence%s in %s"):format(count, count == 1 and "" or "s", path)
+			return ("replaced %d occurrence%s in %s"):format(total, total == 1 and "" or "s", path)
 		end,
 	},
 	{
@@ -1081,8 +1121,9 @@ local function lua_description(): string
 	local lines = {
 		"Run Luau code in the project directory. This is how you act: the code calls the functions below. The "
 			.. "result is what the code prints and then what it returns; a function's value shows only when you "
-			.. "print or return it. Globals persist between calls. A call is stopped after "
-			.. M.call_seconds .. " seconds.",
+			.. "print or return it, and a returned table shows as JSON. Globals persist between calls. A result "
+			.. "longer than " .. M.output_limit .. " bytes keeps its start and end, and the whole of it goes to a "
+			.. "file the result names. A call is stopped after " .. M.call_seconds .. " seconds.",
 		"",
 	}
 	for _, fn in M.functions do
@@ -1100,8 +1141,9 @@ local function lua_description(): string
 		.. "false to take one away.")
 	table.insert(lines, "- host.walk(dir, {glob?, depth?}) -> {path}: every path under dir, sorted, .git left out, "
 		.. "directories ending in /; glob as \"**/*.luau\". host.stat(path) -> {type, size, mtime, mode, revision}, or nil.")
-	table.insert(lines, "- host.read(path) -> text, host.write(path, text), host.list(dir), json.encode(value, "
-		.. "{indent?}), json.decode(text): the other plain primitives, for working on data.")
+	table.insert(lines, "- host.read(path) -> text, host.write(path, text), host.list(dir), host.env(name) -> text "
+		.. "or nil, json.encode(value, {indent?}), json.decode(text): the other plain primitives, for working on "
+		.. "data. `for name in host do` lists every primitive.")
 	table.insert(lines, "")
 	table.insert(lines, "Do the work in Luau: parsing, counting, deciding and building text and files belong in "
 		.. "your code, with string patterns, string.pack and string.unpack for binary data, ext(\"bytes\") for hex, "
@@ -1359,8 +1401,10 @@ function M.system_prompt(): string
 			.. "- Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit "
 			.. "read a range of lines or go on through a large file. Read a file before you edit it, unless "
 			.. "you wrote or edited it yourself in this session."
-			.. "\n- To search, call ext(\"search\"): grep(pattern, {dir?, glob?}) returns the matches as data and "
-			.. "shows them as path:line: text, and files(glob?) lists the files git does not ignore."
+			.. "\n- To search, call ext(\"search\"): grep(pattern, {dir?, glob?, fixed?, ignore_case?, limit?}) "
+			.. "returns the matches as data and shows them as path:line: text, and files(glob?) lists the files git "
+			.. "does not ignore. pattern is a regex, not a Luau pattern: a literal dot is \\., or pass fixed = true "
+			.. "to search for the text as it is."
 			.. (ripgrep and " For what they do not cover, ripgrep is installed: use rg through bash rather than plain "
 				.. "grep. It is faster, and it skips what .gitignore names." or "")
 			.. "\n- When a call fails, read the error and change the approach or the arguments. Repeat a call "
