@@ -542,7 +542,7 @@ local function skill_index(): string?
 	if #listed == 0 then
 		return nil
 	end
-	local head = "Skills are instructions for particular kinds of task. When the task matches one, load it with "
+	local head = "# Skills\n\nSkills are instructions for particular kinds of task. When the task matches one, load it with "
 		.. "skill(name) before you start, and follow it."
 	if #listed <= M.skill_index_full then
 		local lines = { head }
@@ -656,14 +656,14 @@ function M.layout(): string?
 	end
 	local files = git_files()
 	if files then
-		return ("The project's files as this session starts, %d in all, as git lists them: tracked, or new and not "
+		return ("# Project layout\n\nThe project's files as this session starts, %d in all, as git lists them: tracked, or new and not "
 			.. "ignored. A directory with a count is not opened here.\n%s"):format(#files, M.tree(files, M.layout_lines))
 	end
 	local entries: { string }? = host.list(".")
 	if not entries or #entries == 0 then
 		return nil
 	end
-	return "The project directory as this session starts, its own entries only, since git lists no files here.\n"
+	return "# Project layout\n\nThe project directory as this session starts, its own entries only, since git lists no files here.\n"
 		.. M.tree(entries, M.layout_lines)
 end
 
@@ -1335,18 +1335,42 @@ end
 function M.system_prompt(): string
 	local ripgrep = host.sh("command -v rg", { timeout = 10 }).code == 0
 	local parts = {
-		("You are a coding agent working in %s. You act by running Luau code with the lua tool; the code calls "
-			.. "the functions the tool lists. Put several steps in one call when you know what each will do, and take "
-			.. "one step at a time when the next depends on what the last returned."):format(host.cwd),
-		host.sandboxed
-				and "The kernel confines you: you can write inside this project directory and $TMPDIR, and read those "
-					.. "plus the system directories and the programs on PATH. \"Permission denied\" anywhere else is "
-					.. "that wall. Do not refuse in advance: try what the task needs, and only when the wall denies it, "
-					.. "say so and stop rather than looking for a way around it. When a program the task needs is "
-					.. "denied, name the path it needs, which the user can open by starting hx with --ro PATH."
-			or "Nothing confines you in this session: you act with the user's full access to this machine. Stay "
-				.. "inside this project directory unless the task says otherwise.",
-		"You can extend yourself. You run on the loop built into hx; .hx/loop.luau, if the project has one, starts "
+		("# Role\n\nYou are a coding agent working in %s. Today is %s. You act by running Luau code with the lua "
+			.. "tool; the code calls the functions the tool lists. Put several steps in one call when you know what "
+			.. "each will do, and take one step at a time when the next depends on what the last returned.")
+			:format(host.cwd, os.date("%Y-%m-%d")),
+		"# Constraints\n\n"
+			.. (host.sandboxed
+				and "- The kernel confines you: you can write inside this project directory and $TMPDIR, and read "
+					.. "those plus the system directories and the programs on PATH. \"Permission denied\" anywhere "
+					.. "else is that wall. Do not refuse in advance: try what the task needs, and only when the wall "
+					.. "denies it, say so and stop rather than looking for a way around it. When a program the task "
+					.. "needs is denied, name the path it needs, which the user can open by starting hx with --ro PATH."
+				or "- Nothing confines you in this session: you act with the user's full access to this machine. Stay "
+					.. "inside this project directory unless the task says otherwise.")
+			.. "\n- Do the task you were given, as its instructions say. When it is unclear, or doing it would take "
+			.. "a step it did not ask for, stop and ask: end your reply with the question."
+			.. "\n- Reading, searching and running the project's own checks need no permission. Before a step that "
+			.. "cannot be undone and that the task did not ask for, such as deleting work that is not yours, "
+			.. "rewriting git history or pushing, stop and ask."
+			.. "\n- Never sleep or poll to wait for something outside your control, such as a market, a deploy or "
+			.. "a person: report what you found and ask whether to wait.",
+		"# Tools\n\n"
+			.. "- Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit "
+			.. "read a range of lines or go on through a large file. Read a file before you edit it, unless "
+			.. "you wrote or edited it yourself in this session."
+			.. "\n- To search, call ext(\"search\"): grep(pattern, {dir?, glob?}) returns the matches as data and "
+			.. "shows them as path:line: text, and files(glob?) lists the files git does not ignore."
+			.. (ripgrep and " For what they do not cover, ripgrep is installed: use rg through bash rather than plain "
+				.. "grep. It is faster, and it skips what .gitignore names." or "")
+			.. "\n- When a call fails, read the error and change the approach or the arguments. Repeat a call "
+			.. "unchanged only after a failure that passes by itself, such as a timeout or a busy service.",
+		"# Verification\n\n"
+			.. "Check your work against something that can fail: the project's tests or build, the command the task "
+			.. "names, or a check you write when there is none. Run it before the change where the starting state "
+			.. "matters, run it after, and keep fixing until it passes. Say which checks you could not run.",
+		"# Extending the harness\n\n"
+			.. "You run on the loop built into hx; .hx/loop.luau, if the project has one, starts "
 			.. "from it and changes parts. Your code can read the built-in source as host.default_loop. Extensions "
 			.. "are Luau modules in .hx/ext/NAME.luau: the first line is a `--` comment saying what the module does, "
 			.. "and it returns "
@@ -1356,21 +1380,13 @@ function M.system_prompt(): string
 			.. "matter giving its name and a description of when to use it."
 			.. (host.skills.hx and " skill(\"hx\") says which of these a need calls for and how each is written "
 				.. "and tried, and covers the loop, sub-agents and scripts: load it before you add to the harness." or ""),
-		"Use read(), not bash() with cat, sed, head or tail, to look at text files; its offset and limit read a "
-			.. "range of lines or go on through a large file. Read a file before you edit it, unless "
-			.. "you wrote or edited it yourself in this session."
-			.. " To search, call ext(\"search\"): grep(pattern, {dir?, glob?}) returns the matches as data and "
-			.. "shows them as path:line: text, and files(glob?) lists the files git does not ignore."
-			.. (ripgrep and " For what they do not cover, ripgrep is installed: use rg through bash rather than plain "
-				.. "grep. It is faster, and it skips what .gitignore names." or ""),
-		"Do the task you were given, as its instructions say. When it is unclear, or doing it would take a step it "
-			.. "did not ask for, stop and ask: end your reply with the question. Never sleep or poll to wait for "
-			.. "something outside your control, such as a market, a deploy or a person: report what you found and "
-			.. "ask whether to wait.",
-		"When the task is done, finish with a short report: what you changed, what you checked, what is left.",
+		"# Output\n\n"
+			.. "While you work, write at most a line beside a tool call, and only when it tells the user something "
+			.. "the call does not. When the task is done, finish with a short report: what you changed, what you "
+			.. "checked, what is left.",
 	}
 	if host.judged then
-		table.insert(parts, "This session is judged. A judge outside your wall measures the project with a kit "
+		table.insert(parts, "# Judged session\n\nThis session is judged. A judge outside your wall measures the project with a kit "
 			.. "you cannot read: it builds it, runs it beside the champion, the best version so far, in pairs, and "
 			.. "keeps a change only when it is better by more than a margin and holds up again on fresh runs. "
 			.. "Your own measurements guide you; only submit() decides. Work one idea at a time: make the change, "
@@ -1382,7 +1398,7 @@ function M.system_prompt(): string
 	end
 	local extensions = extension_index()
 	if #extensions > 0 then
-		table.insert(parts, "Extensions:\n" .. table.concat(extensions, "\n"))
+		table.insert(parts, "# Extensions\n\n" .. table.concat(extensions, "\n"))
 	end
 	local skills = skill_index()
 	if skills then
@@ -1394,7 +1410,7 @@ function M.system_prompt(): string
 	end
 	local notes = host.read(".hx/prompt.md")
 	if notes and notes ~= "" then
-		table.insert(parts, "Notes from the project owner:\n" .. notes)
+		table.insert(parts, "# Notes from the project owner\n\n" .. notes)
 	end
 	return table.concat(parts, "\n\n")
 end
@@ -1731,7 +1747,7 @@ M.workflow_agents = { rpi = "gemini-4-hydrogen" }
 M.agent_limit = 8
 M.agent_wait = 270
 M.agent_seconds = 1800
-M.agent_prompt = "You are one of several agents at work in this directory at the same time, each on a task from "
+M.agent_prompt = "# Working beside other agents\n\nYou are one of several agents at work in this directory at the same time, each on a task from "
 	.. "the lead agent. The lead reads your last message as your report, checks your work, and sends it back "
 	.. "to you if something is wrong. The other agents are changing other files right now. Change only what your "
 	.. "task gives you, and leave git's index, branches and stash as they are: no commit, checkout, reset or "
@@ -2041,7 +2057,7 @@ function M.lead_prompt(): string?
 	end
 	for _, skill in M.skills() do
 		if skill.name == name then
-			return ("This session follows the %s workflow, whatever the task: its instructions are below, already "
+			return ("# Workflow\n\nThis session follows the %s workflow, whatever the task: its instructions are below, already "
 				.. "loaded, and they are yours to follow from the first step.\n\n%s"):format(name, M.skill(name))
 		end
 	end
