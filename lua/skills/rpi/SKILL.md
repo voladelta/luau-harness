@@ -21,9 +21,13 @@ Find out before you plan. Change no file in this phase.
 - Find how the project builds, tests and checks itself, and run that once, so you know the state you start from:
   a test that fails now is not an agent's doing later.
 - Note what new code has to follow here: names, error handling, how tests are laid out.
+- Try what the work depends on before anyone builds on it: the tool, the service, the credential, the file the
+  task names. An agent that finds it missing half way has wasted its round.
 
-Stop when you can name every file that will change and say why. Where the task leaves open a choice that
-research cannot settle, take the reading the code supports best, and name it in the plan and in your report.
+Stop when you can name every file that will change, say why, and say what will show the task is done: the
+command and what it prints. Where the task leaves open a choice that research cannot settle, ask before any
+agent starts if the readings would build different things; otherwise take the reading the code supports best,
+and name it in the plan and in your report.
 
 ## 2. Plan
 
@@ -89,4 +93,5 @@ Fix a thing yourself only when the fix is shorter than its description. When an 
 twice, the task was wrong, not the agent: plan that part again, and give it to a new name with what you learned.
 
 When everything passes, report: what changed, in a few lines; what you ran and what it showed; what is left
-open or was assumed.
+open or was assumed. If something about this project cost a round to find out, and a line in `.hx/prompt.md`
+would have saved it, give that line in the report.

@@ -94,7 +94,7 @@ local told = agents({ { name = "first", task = "functions" } })
 has("an agent has the functions", told, "bash read write edit see skill ext on some-model")
 lacks("but not agents", told, "ext agents")
 has("its prompt is the session's and the agents' paragraph", told,
-	"under: the session's prompt\n\nYou are one of several agents at work in this directory")
+	"under: the session's prompt\n\n# Working beside other agents\n\nYou are one of several agents at work in this directory")
 check("the lead keeps its model", loop.model, host.model)
 check("and its functions", loop.functions[#loop.functions].name, "agents")
 

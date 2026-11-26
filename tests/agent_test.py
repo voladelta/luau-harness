@@ -2091,7 +2091,7 @@ end
         self.run_hx("go", script=[say("ok")])
         sent = self.model.requests[-1]
         self.assertEqual(sent["model"], "project-model")
-        self.assertTrue(sent["system_instruction"].startswith("You are a coding agent"))
+        self.assertTrue(sent["system_instruction"].startswith("# Role\n\nYou are a coding agent"))
         self.assertTrue(sent["system_instruction"].endswith("Run `make check` before you report."))
 
     def test_init_full_copies_the_whole_loop(self):
