@@ -985,9 +985,10 @@ M.functions = {
 				return (s:gsub("\r?\n", "\r\n"))
 			end
 			local total = 0
+			local crlf_file = text:match("\r?\n") == "\r\n"
 			for i, change in changes do
 				local from_text: string, to_text: string = change.old, change.new
-				local pieces, count = replace(from_text, if text:match("\r?\n") == "\r\n" then crlf(to_text) else to_text)
+				local pieces, count = replace(from_text, if crlf_file then crlf(to_text) else to_text)
 				if count == 0 and text:find("\r\n", 1, true) and from_text:find("\n", 1, true) then
 					pieces, count = replace(crlf(from_text), crlf(to_text))
 				end
