@@ -170,7 +170,8 @@ together and a low cap cuts answers short, so the API's own 65,536 holds; and a 
 10, since a hard prompt thinks for several. A reply's steps come back as blocks: a
 `thought` as a `thinking` block that keeps the whole step in `signature` and is sent back unchanged, as the API asks
 of a stateless caller; `model_output` as text; a `function_call` as a `tool_use`, answered with a `function_result`.
-`M.gemini` lists the models whose deepest thinking level is below `xhigh`, which a higher `HX_EFFORT` is held to.
+`M.gemini` lists the models that think at `xhigh`, Neon and Hydrogen; on any other a higher `HX_EFFORT` is held to
+`high`.
 Compaction asks for the summary as an ordinary reply, and caching is Gemini's own implicit one, counted from
 `total_cached_tokens`.
 
