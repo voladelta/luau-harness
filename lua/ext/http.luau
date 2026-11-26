@@ -54,6 +54,30 @@ local function last_block(text: string): (number, { [string]: string })
 	return status, headers
 end
 
+local function is_token(text: string): boolean
+	return text:match("^[0-9A-Za-z!#$%%&'*+%-.%^_`|~]+$") ~= nil
+end
+
+local function sweep_stale()
+	while #stale > 0 do
+		local count = math.min(#stale, 200)
+		local cmd: { string | number } = { "rm", "-f", "--" }
+		table.move(stale, 1, count, 4, cmd)
+		local rm_ok, rm_result = pcall(host.sh, cmd)
+		if not rm_ok or type(rm_result) ~= "table" or rm_result.code ~= 0 then
+			return
+		end
+		if count == #stale then
+			table.clear(stale)
+		else
+			table.move(stale, count + 1, #stale, 1, stale)
+			for i = #stale, #stale - count + 1, -1 do
+				stale[i] = nil
+			end
+		end
+	end
+end
+
 function M.request(url: string, options: Options?): { status: number, headers: { [string]: string }, body: string }
 	check(url, "url", "string", true)
 	check(options, "options", "table")
@@ -67,14 +91,20 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 	end
 
 	local timeout = opts.timeout or 60
+	if not (timeout > 0 and timeout < math.huge) then
+		error("http.request: timeout must be a positive finite number", 0)
+	end
 	local method = opts.method and opts.method:upper()
+	if method ~= nil and not is_token(method) then
+		error(("http.request: invalid method %q"):format(opts.method :: string), 0)
+	end
 	local body = if opts.json ~= nil then json.encode(opts.json) else opts.body
 	local headers: { [string]: string } = table.clone(opts.headers or {})
 	local has_content_type = false
 	for name, value in headers do
 		check(name, "header name", "string", true)
 		check(value, ("header %q value"):format(name), "string", true)
-		if name == "" or name:find("[%c:]") then
+		if not is_token(name) then
 			error(("http.request: invalid header name %q"):format(name), 0)
 		end
 		if value:find("[\r\n]") or value:find("\0", 1, true) then
@@ -97,6 +127,7 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 	local command: { string | number } = {
 		"curl",
 		"-sS",
+		"-g",
 		"-L",
 		"--proto",
 		"=http,https",
@@ -147,10 +178,7 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 		end
 		return ran, h, herr, d, derr
 	end)
-	local rm_ok, rm_result = pcall(host.sh, { "rm", "-f", "--", table.unpack(stale) })
-	if rm_ok and type(rm_result) == "table" and rm_result.code == 0 then
-		table.clear(stale)
-	end
+	sweep_stale()
 	if not ok then
 		error(result, 0)
 	end

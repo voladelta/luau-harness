@@ -50,6 +50,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             value = self.headers.get("X-Empty", "")
             keep = self.headers.get("X-Keep", "")
             self.reply(200, f"{present}:{value}:{keep}".encode())
+        elif self.path.startswith("/query?"):
+            self.reply(200, self.path.encode())
         elif self.path == "/slow":
             time.sleep(1)
             self.reply(200, b"late")
@@ -98,6 +100,9 @@ check("no hx-http temp files after success", #host.walk(dir, { glob = "hx-http-*
 
 local empty_hdr = http.request(base .. "/headers", { headers = { ["X-Empty"] = "", ["X-Keep"] = "ok" } })
 check("an empty header value still reaches the server", empty_hdr.body, "1::ok")
+
+local bracket_url = http.request(base .. "/query?filter[a]=1&set={x,y}")
+check("url with brackets and braces is not globbed by curl", bracket_url.body, "/query?filter[a]=1&set={x,y}")
 
 local moved = http.request(base .. "/moved")
 check("a redirect is followed", moved.status, 200)
@@ -159,6 +164,16 @@ raises("CR in header value", "invalid header value", http.request, base .. "/ok"
 raises("LF in header value", "invalid header value", http.request, base .. "/ok", { headers = { ["X-Bad"] = "a\nb" } })
 raises("CRLF injection in header value", "invalid header value", http.request, base .. "/ok", { headers = { ["X-Bad"] = "a\r\nEvil: 1" } })
 raises("NUL in header value", "invalid header value", http.request, base .. "/ok", { headers = { ["X-Bad"] = "a\0b" } })
+raises("space in header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X Bad"] = "x" } })
+raises("trailing space in empty header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X-Empty "] = "" } })
+raises("semicolon in header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X-Bad;"] = "x" } })
+raises("empty method", "invalid method", http.request, base .. "/ok", { method = "" })
+raises("CRLF in method", "invalid method", http.request, base .. "/ok", { method = "GET\r\nX-Evil: 1" })
+raises("space in method", "invalid method", http.request, base .. "/ok", { method = "GET /evil" })
+raises("zero timeout", "timeout must be a positive finite number", http.request, base .. "/ok", { timeout = 0 })
+raises("negative timeout", "timeout must be a positive finite number", http.request, base .. "/ok", { timeout = -1 })
+raises("nan timeout", "timeout must be a positive finite number", http.request, base .. "/ok", { timeout = 0 / 0 })
+raises("infinite timeout", "timeout must be a positive finite number", http.request, base .. "/ok", { timeout = math.huge })
 check("nothing is left in TMPDIR", #host.walk(dir, { glob = "tmp.*" }), 0)
 check("no hx-http temp files left in TMPDIR", #host.walk(dir, { glob = "hx-http-*" }), 0)
 

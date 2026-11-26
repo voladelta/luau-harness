@@ -141,7 +141,7 @@ and, when the model's code has set globals, their names (`M.resume_text`): they 
 checkpoint may not say so. If no summary comes back, the conversation is kept and compacted after a later reply.
 
 Caching is Gemini's own implicit kind, and the loop keeps a prefix that only grows: the system prompt is built
-once per run, the tool description never changes, JSON keys are sorted, and the history is only appended to. The
+once per run, the tool description never changes, JSON keys are sorted, and the history is only appended to unless earlier files have to be dropped past `M.session_image_bytes`. The
 line at the end of a run gives the replies, the tokens in, those read from the cache (`total_cached_tokens`), and
 the tokens out, thoughts included. A run that used several models, a
 sub-agent on another say, gets such a line for each, headed by the model's name: their prices differ, so one sum

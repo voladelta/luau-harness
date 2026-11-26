@@ -109,6 +109,17 @@ lacks("failed with empty errors does not format nil", empty_err, "nil")
 answers = { { 200, '{"status":"failed","steps":[]}' } }
 raises("failed without errors falls back to unknown error", "unknown error", loop.request, "s", hi())
 
+answers = { { 200, '{"status":"failed","steps":[],"error":{"code":"quota","message":"quota exceeded"}}' } }
+raises("failed with singular error object extracts error.message", "quota exceeded", loop.request, "s", hi())
+
+answers = { { 400, '{"error":{"code":"quota_exceeded"}}' } }
+raises("400 with error.code only extracts code", "(400): quota_exceeded", loop.request, "s", hi())
+
+answers = { { 400, '{"error":{},"message":{}}' } }
+local ok_empty_obj, err_empty_obj = pcall(loop.request, "s", hi())
+check("400 with empty error objects fails", ok_empty_obj, false)
+lacks("400 with empty error objects never formats table address", err_empty_obj, "table:")
+
 answers = { { 400, '{"error":{"code":"invalid_request","message":"bad signature"}}' } }
 local ok_400, err_400 = pcall(loop.request, "s", hi())
 check("400 fails", ok_400, false)

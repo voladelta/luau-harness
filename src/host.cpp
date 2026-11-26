@@ -486,6 +486,17 @@ void Host::open(lua_State* L) {
     };
     luaL_register(L, "host", kFunctions);
 
+    lua_rawgetfield(L, LUA_GLOBALSINDEX, "math");
+    if (lua_istable(L, -1)) {
+        lua_rawgetfield(L, -1, "randomseed");
+        if (lua_isfunction(L, -1)) {
+            lua_setfield(L, LUA_REGISTRYINDEX, "hx.randomseed");
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+
     push_strings(L, config_.args);
     lua_setreadonly(L, -1, 1);
     lua_setfield(L, -2, "args");

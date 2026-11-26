@@ -101,6 +101,20 @@ search.ripgrep = nil
 
 raises("an empty pattern", "search.grep: argument 1 (pattern) is empty", search.grep, "")
 raises("a pattern that is not text", "search.grep: argument 1 (pattern) must be a string, not nil", search.grep)
+raises("non-boolean fixed option", "search.grep: argument 2 (options.fixed) must be a boolean, not string",
+	search.grep, "x", { fixed = "false" :: any })
+raises("non-boolean ignore_case option", "search.grep: argument 2 (options.ignore_case) must be a boolean, not string",
+	search.grep, "x", { ignore_case = "true" :: any })
+raises("files in missing dir", "search.files: no-such-dir: No such file or directory", search.files, nil, "no-such-dir")
+raises("files on regular file", "search.files: repo/b.txt is not a directory", search.files, nil, "repo/b.txt")
+for _, ripgrep in { true, false } do
+	if not ripgrep or host.sh("command -v rg").code == 0 then
+		search.ripgrep = ripgrep
+		raises("grep in missing dir", "search.grep: no-such-dir: No such file or directory", search.grep, "x", { dir = "no-such-dir" })
+		raises("grep on regular file", "search.grep: repo/b.txt is not a directory", search.grep, "x", { dir = "repo/b.txt" })
+	end
+end
+search.ripgrep = nil
 has("the lua tool shows matches as lines", loop.tools[1].run({ code = 'return ext("search").grep("gamma", { dir = "repo" })' }),
 	"repo/src/a.luau:2: beta gamma")
 
@@ -191,28 +205,30 @@ search.ripgrep = nil
 host.sh({ "rm", "-f", "repo/src/locale.txt", "repo/src/locked.luau" })
 
 host.sh({ "rm", "-rf", "wt" })
-host.sh({ "mkdir", "-p", "wt/sub" })
+host.sh({ "mkdir", "-p", "wt/sub/locked_dir" })
 assert(host.write("wt/.git", "gitdir: /nope\n"))
 assert(host.write("wt/sub/item.txt", "ancestor-token\n"))
 assert(host.write("wt/sub/locked.txt", "ancestor-token\n"))
-host.sh({ "chmod", "000", "wt/.git", "wt/sub/locked.txt" })
+assert(host.write("wt/sub/locked_dir/hidden.txt", "ancestor-token\n"))
+host.sh({ "chmod", "000", "wt/.git", "wt/sub/locked.txt", "wt/sub/locked_dir" })
 if not host.read("wt/.git") and host.sh("command -v rg").code == 0 then
 	search.ripgrep = true
 	check("rg: ignores unreadable ancestor .git file while keeping target unreadable",
 		tostring(search.grep("ancestor-token", { dir = "wt/sub" })),
-		"wt/sub/item.txt:1: ancestor-token\n[could not read 1 file: wt/sub/locked.txt]")
+		"wt/sub/item.txt:1: ancestor-token\n[could not read 2 files: wt/sub/locked.txt, wt/sub/locked_dir]")
 	check("rg: ignores unreadable ancestor .git file on zero-match",
 		tostring(search.grep("no-such-pattern", { dir = "wt/sub" })),
-		"[no match]\n[could not read 1 file: wt/sub/locked.txt]")
+		"[no match]\n[could not read 2 files: wt/sub/locked.txt, wt/sub/locked_dir]")
 	local abs_sub = (host.sh({ "pwd" }, { cwd = "wt/sub" }).out:gsub("\n$", ""))
 	check("rg: ignores unreadable ancestor .git file for absolute dir",
 		tostring(search.grep("ancestor-token", { dir = abs_sub })),
-		abs_sub .. "/item.txt:1: ancestor-token\n[could not read 1 file: " .. abs_sub .. "/locked.txt]")
+		abs_sub .. "/item.txt:1: ancestor-token\n[could not read 2 files: " .. abs_sub .. "/locked.txt, " .. abs_sub .. "/locked_dir]")
 	check("rg: ignores unreadable ancestor .git file on zero-match for absolute dir",
-		tostring(search.grep("no-such-pattern", { dir = abs_sub })),
-		"[no match]\n[could not read 1 file: " .. abs_sub .. "/locked.txt]")
+		tostring(search.grep("no-such-pattern", { dir = abs_sub .. "//" })),
+		"[no match]\n[could not read 2 files: " .. abs_sub .. "/locked.txt, " .. abs_sub .. "/locked_dir]")
 	search.ripgrep = nil
 end
+host.sh({ "chmod", "755", "wt/sub/locked_dir" })
 host.sh({ "chmod", "644", "wt/.git", "wt/sub/locked.txt" })
 host.sh({ "rm", "-rf", "wt" })
 

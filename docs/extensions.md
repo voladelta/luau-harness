@@ -64,7 +64,7 @@ the user's ripgrep configuration so that its output format stays fixed:
 
 | Call | Returns |
 |---|---|
-| `ext("http").request(url, {method?, headers?, body?, json?, timeout=60})` | `{status, headers, body}`: the status of the last response after redirects, its headers by lower-case name (one named twice is joined with `, `), and its body. Any status is returned, a 404 with the body it came with; only a request that gets no response raises, with curl's message. `json` is a value sent encoded, with `Content-Type: application/json` unless `headers` names one; `body` is sent as it is, and the two do not go together. The method is `GET`, or `POST` with a body |
+| `ext("http").request(url, {method?, headers?, body?, json?, timeout=60})` | `{status, headers, body}`: the status of the last response after redirects, its headers by lower-case name (one named twice is joined with `, `), and its body (up to 64 MiB; `http` and `https` only). Any status is returned, a 404 with the body it came with; only a request that gets no response raises, with curl's message. `json` is a value sent encoded, with `Content-Type: application/json` unless `headers` names one; `body` is sent as it is, and the two do not go together. The method is `GET`, or `POST` with a body |
 
 The other two, `web` and `exa`, call [Exa](https://exa.ai/docs) with `EXA_API_KEY`, and the system prompt lists
 them only when that key is set. A project's own `.hx/ext/web.luau` takes the place of the built-in one. `web`

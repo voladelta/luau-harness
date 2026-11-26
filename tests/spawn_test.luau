@@ -165,13 +165,22 @@ for _, id in rand_ids do
 end
 
 local saved_math = _G.math
+local real_random = math.random
+math.randomseed(99)
 _G.math = nil
 local without_math = host.spawn(function(a, b)
-	return a .. ":" .. b
+	return ("%s:%s:%.17g"):format(a, b, real_random())
 end, "left", "right")
+local without_math_two = host.spawn(function()
+	return ("%.17g"):format(real_random())
+end)
+local parent_without_math = ("%.17g"):format(real_random())
 _G.math = saved_math
 done = wait_all(10)
 check("spawn succeeds when math global is cleared", done[without_math].ok, true)
-check("and keeps arguments intact", done[without_math].text, "left:right")
+local prefix, child_draw = done[without_math].text:match("^(left:right):(.+)$")
+check("and keeps arguments intact", prefix, "left:right")
+check("and still reseeds child PRNG without _G.math",
+	child_draw ~= parent_without_math and child_draw ~= done[without_math_two].text, true)
 
 checks.done("spawn")

@@ -97,6 +97,12 @@ has("its prompt is the session's and the agents' paragraph", told,
 	"under: the session's prompt\n\n# Working beside other agents\n\nYou are one of several agents at work in this directory")
 check("the lead keeps its model", loop.model, host.model)
 check("and its functions", loop.functions[#loop.functions].name, "agents")
+loop.agent_model = nil
+loop.workflow = "RPI"
+has("normalized workflow resolves workflow_agents model",
+	agents({ { name = "first", task = "functions" } }), "on gemini-4-hydrogen")
+loop.workflow = nil
+loop.agent_model = "some-model"
 
 mark = "the lead's"
 has("an agent sees the lead's globals", agents({ { name = "first", task = "global" } }), "mark was the lead's")

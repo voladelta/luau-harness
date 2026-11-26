@@ -188,11 +188,18 @@ table.insert(M.functions, {
 		M.turn(system, talk) -- replies and tool calls until the sub-agent is done; raises if it fails
 		local words = {}
 		for _, step in talk.steps do
-			if step.type == "user_input" then
+			if step.type == "user_input" or step.type == "function_result" then
 				table.clear(words)
-			end
-			for _, part in if step.type == "model_output" then step.content else {} do
-				table.insert(words, part.text)
+			elseif step.type == "model_output" then
+				local parts = {}
+				for _, part in step.content or {} do
+					if part.type == "text" and part.text and part.text ~= "" then
+						table.insert(parts, part.text)
+					end
+				end
+				if #parts > 0 then
+					table.insert(words, table.concat(parts))
+				end
 			end
 		end
 		return table.concat(words, "\n")
@@ -242,7 +249,7 @@ with a `main` function is a module: `main()` runs, and the number it returns is 
 | `host.log(text)`, `host.input(prompt)` | a line to stderr; a line from stdin, or `nil` at its end |
 | `host.sleep(seconds)`, `host.env(name)` | |
 | `host.wall_time()`, `host.printable(text)` | epoch `seconds, nanoseconds`; `text` without terminal control characters (other than tab and newline) or reordering marks |
-| `host.args`, `host.cwd`, `host.model`, `host.sandboxed`, `host.quiet`, `host.tty`, `host.interactive`, `host.judged`, `host.workflow`, `host.default_loop` | values, not calls (`tty` for stdout, `interactive` for a prompt, `judged` for `--judge`, `workflow` for `"rpi"` or `nil`) |
+| `host.args`, `host.cwd`, `host.model`, `host.sandboxed`, `host.quiet`, `host.tty`, `host.interactive`, `host.judged`, `host.workflow`, `host.resume`, `host.default_loop` | values, not calls (`tty` for stdout, `interactive` for a prompt, `judged` for `--judge`, `workflow` for `"rpi"` or `nil`, `resume` for `--resume` or `nil`) |
 | `host.endpoints`, `host.extensions`, `host.skills` | read-only tables: reachable endpoints (`true` when keyed or keyless), built-in extension sources and built-in `SKILL.md` texts |
 | `json.encode(value, {indent=})`, `json.decode(text)`, `json.array(t)`, `json.null` | keys are written sorted; `indent` puts a member on each line |
 

@@ -102,14 +102,18 @@ void reseed_rng(lua_State* L) {
     if (lua_checkstack(L, 4) == 0) {
         return;
     }
-    lua_rawgetfield(L, LUA_GLOBALSINDEX, "math");
-    if (lua_istable(L, -1)) {
-        lua_rawgetfield(L, -1, "randomseed");
-        if (lua_isfunction(L, -1)) {
-            lua_pushnumber(L, static_cast<double>(static_cast<std::int32_t>(child_seed())));
-            if (lua_pcall(L, 1, 0, 0) != 0) {
-                lua_pop(L, 1);
-            }
+    lua_rawgetfield(L, LUA_REGISTRYINDEX, "hx.randomseed");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        lua_rawgetfield(L, LUA_GLOBALSINDEX, "math");
+        if (lua_istable(L, -1)) {
+            lua_rawgetfield(L, -1, "randomseed");
+        }
+    }
+    if (lua_isfunction(L, -1)) {
+        lua_pushnumber(L, static_cast<double>(static_cast<std::int32_t>(child_seed())));
+        if (lua_pcall(L, 1, 0, 0) != 0) {
+            lua_pop(L, 1);
         }
     }
     lua_settop(L, top);

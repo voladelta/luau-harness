@@ -26,10 +26,38 @@ local function check(fname: string, value: unknown, position: number, name: stri
 end
 
 local function prefix_of(dir: string?): string
-	if not dir or dir == "." or dir == "./" or dir == "" then
+	if not dir or dir == "" then
 		return ""
 	end
-	return if dir:sub(-1) == "/" then dir else dir .. "/"
+	local trimmed = dir:gsub("/+$", "")
+	if trimmed == "." then
+		return ""
+	end
+	return if trimmed == "" then "/" else trimmed .. "/"
+end
+
+local function ensure_dir(fname: string, dir: string?)
+	if not dir or prefix_of(dir) == "" then
+		return
+	end
+	local clean = dir:gsub("/+$", "")
+	if clean == "" then
+		clean = "/"
+	end
+	local info, err = host.stat(clean)
+	if not info then
+		error(("search.%s: %s"):format(fname, tostring(err)), 0)
+	end
+	if info.type == "link" then
+		local target, target_err = host.stat(clean .. "/.")
+		if not target then
+			error(("search.%s: %s"):format(fname, (tostring(target_err):gsub("/%.: ", ": "))), 0)
+		end
+		info = target
+	end
+	if info.type ~= "dir" then
+		error(("search.%s: %s is not a directory"):format(fname, dir), 0)
+	end
 end
 
 local function listed(args: { string }, dir: string?): { string }?
@@ -52,6 +80,7 @@ end
 function M.files(glob: string?, dir: string?): { string }
 	check("files", glob, 1, "glob", "string", true)
 	check("files", dir, 2, "dir", "string", true)
+	ensure_dir("files", dir)
 	local prefix = prefix_of(dir)
 	local where = if prefix == "" then nil else prefix
 	local git_glob = if glob and not glob:find("/", 1, true) then "**/" .. glob else glob
@@ -188,16 +217,31 @@ local function collect(args: { string }, limit: number, unreadable_in: (line: st
 	return matches
 end
 
+local function rg_os_error_path(candidate: string): string?
+	local first, repeated = candidate:match("^(.+): IO error for operation on (.+): [^:]+ %(os error %d+%)$")
+	if first and first == repeated then
+		return first
+	end
+	return candidate:match("^(.+): [^:]+ %(os error %d+%)$")
+end
+
 local function within_target(path: string, target: string): boolean
 	if target:sub(1, 1) ~= "/" then
 		return path:sub(1, 1) ~= "/"
 	end
-	local root = prefix_of(target)
-	local bare = if root == "/" then "/" else root:sub(1, -2)
-	return path == bare
-		or path:sub(1, #root) == root
-		or path:sub(1, #bare + 2) == bare .. ": "
-		or path:sub(1, #root + 2) == root .. ": "
+	local bare = target:gsub("/+$", "")
+	if bare == "" then
+		return path:sub(1, 1) == "/"
+	end
+	return path == bare or path:sub(1, #bare + 1) == bare .. "/"
+end
+
+local function target_of(dir: string?): string
+	if not dir or prefix_of(dir) == "" then
+		return "./"
+	end
+	local trimmed = dir:gsub("/+$", "")
+	return if trimmed == "" then "/" else trimmed
 end
 
 local function with_ripgrep(pattern: string, options: Options, limit: number): { Match }
@@ -216,13 +260,13 @@ local function with_ripgrep(pattern: string, options: Options, limit: number): {
 	table.insert(args, "--regexp")
 	table.insert(args, pattern)
 	table.insert(args, "--")
-	local target = if prefix_of(options.dir) == "" then "./" else options.dir :: string
+	local target = target_of(options.dir)
 	table.insert(args, target)
 	local in_os_error = false
 	return collect(args, limit, function(line: string): (string?, boolean?)
 		local body = line:match("^rg: (.+)$")
 		local candidate = body or (if in_os_error then line else nil)
-		local path = if candidate then candidate:match("^(.+): .+ %(os error %d+%)$") else nil
+		local path = if candidate then rg_os_error_path(candidate) else nil
 		in_os_error = path ~= nil
 		if not path then
 			return nil
@@ -262,7 +306,10 @@ function M.grep(pattern: string, options: Options?): { Match }
 	local chosen: Options = options or {}
 	check("grep", chosen.dir, 2, "options.dir", "string", true)
 	check("grep", chosen.glob, 2, "options.glob", "string", true)
+	check("grep", chosen.fixed, 2, "options.fixed", "boolean", true)
+	check("grep", chosen.ignore_case, 2, "options.ignore_case", "boolean", true)
 	check("grep", chosen.limit, 2, "options.limit", "number", true)
+	ensure_dir("grep", chosen.dir)
 	if pattern == "" then
 		error("search.grep: argument 1 (pattern) is empty", 0)
 	end

@@ -147,6 +147,36 @@ broken("call with empty id", { said, { type = "function_call", id = "", name = "
 broken("call with non-string id", { said, { type = "function_call", id = 123, name = "bash", arguments = {} } }, "without an id")
 broken("duplicate open call id", { said, use, use }, "repeats tool call id a")
 broken("result without call_id", { said, use, { type = "function_result", name = "bash", result = {} } }, "was not made")
+broken("partially answered calls before model output",
+	{ said, use, { type = "function_call", id = "b", name = "bash", arguments = {} }, result,
+		{ type = "model_output", content = { { type = "text", text = "x" } } } }, "unanswered")
+
+local guarded = Conversation.new()
+guarded:say("check reply")
+local guarded_before = json.encode(guarded.steps)
+for _, bad_reply in {
+	{ { type = "function_call", name = "bash", arguments = {} } },
+	{ { type = "function_call", id = "", name = "bash", arguments = {} } },
+	{ use, use },
+	{ said },
+	{ result },
+} do
+	local reply_ok = pcall(guarded.reply, guarded, bad_reply)
+	check("bad reply raises", reply_ok, false)
+	check("bad reply leaves steps unchanged", json.encode(guarded.steps), guarded_before)
+	check("bad reply leaves state ready", guarded:state(), "ready")
+end
+local interleaved = guarded:reply({
+	{ type = "thought", signature = "s1" },
+	{ type = "function_call", id = "c1", name = "bash", arguments = {} },
+	{ type = "thought", signature = "s2" },
+	{ type = "function_call", id = "c2", name = "bash", arguments = {} },
+})
+check("interleaved thoughts keep both calls owed", #interleaved, 2)
+guarded:answer(function(c)
+	return "ok " .. (c.id :: string), false
+end)
+check("interleaved thoughts and calls stay sound", guarded:problem(), nil)
 
 local saved_session_bytes = loop.session_image_bytes
 loop.session_image_bytes = 20
@@ -206,6 +236,27 @@ check("conversation stays sound after multi-step eviction", media_talk:problem()
 check("prior fork keeps both original media parts",
 	media_fork.steps[3].result[2] == img1 and media_fork.steps[5].result[2] == doc1, true)
 check("prior fork stays sound", media_fork:problem(), nil)
+
+local batch_talk = Conversation.new()
+batch_talk:say("batch")
+batch_talk:reply({
+	{ type = "function_call", id = "b1", name = "lua", arguments = {} },
+	{ type = "function_call", id = "b2", name = "lua", arguments = {} },
+	{ type = "function_call", id = "b3", name = "lua", arguments = {} },
+})
+batch_talk:answer(function(c)
+	if c.id == "b1" then
+		return "one", false, { img1 }
+	elseif c.id == "b2" then
+		return "two", false, { doc1 }
+	end
+	return "three", false, { img2 }
+end)
+check("oversized multi-call batch evicts earliest call media",
+	json.encode(batch_talk.steps[5].result[2]),
+	json.encode({ type = "text", text = "[earlier image omitted to stay within the request size limit]" }))
+check("multi-call batch keeps later media within limit",
+	batch_talk.steps[6].result[2] == doc1 and batch_talk.steps[7].result[2] == img2, true)
 loop.session_image_bytes = saved_session_bytes
 
 checks.done("conversation")

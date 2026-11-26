@@ -487,9 +487,13 @@ local function match_skills(skills: { Skill }, name: string): { Skill }
 			return { skill }
 		end
 	end
+	local key = skill_key(name)
+	if key == "" then
+		return {}
+	end
 	local found: { Skill } = {}
 	for _, skill in skills do
-		if skill_key(skill.name) == skill_key(name) then
+		if skill_key(skill.name) == key then
 			table.insert(found, skill)
 		end
 	end
@@ -989,7 +993,7 @@ M.functions = {
 				return (s:gsub("\r?\n", "\r\n"))
 			end
 			local total = 0
-			local crlf_file = text:find("\r\n", 1, true) ~= nil and text:gsub("\r\n", ""):find("\n", 1, true) == nil
+			local crlf_file = text:find("\r\n", 1, true) ~= nil and text:byte(1) ~= 10 and text:find("[^\r]\n") == nil
 			for i, change in changes do
 				local from_text: string, to_text: string = change.old, change.new
 				local pieces, count = replace(from_text,
@@ -1342,22 +1346,29 @@ local function tool_specs(): { any }
 end
 
 local function non_empty(value: any): string?
-	if value == nil or value == json.null or value == "" then
-		return nil
+	if type(value) == "string" then
+		return if value ~= "" then value else nil
+	elseif type(value) == "number" or type(value) == "boolean" then
+		return tostring(value)
 	end
-	return tostring(value)
+	return nil
+end
+
+local function detail_of(fault: any): string?
+	if type(fault) == "table" then
+		return non_empty(fault.message) or non_empty(fault.code)
+	end
+	return non_empty(fault)
 end
 
 local function error_message(text: any): string
 	if type(text) == "string" then
 		local decoded = json.decode(text)
 		if type(decoded) == "table" then
-			if type(decoded.error) == "table" and type(decoded.error.message) == "string" and decoded.error.message ~= "" then
-				return decoded.error.message
-			elseif type(decoded.error) == "string" and decoded.error ~= "" then
-				return decoded.error
-			elseif type(decoded.message) == "string" and decoded.message ~= "" then
-				return decoded.message
+			local first = if type(decoded.errors) == "table" then decoded.errors[1] else nil
+			local detail = detail_of(decoded.error) or detail_of(first) or non_empty(decoded.message)
+			if detail then
+				return detail
 			end
 		end
 	end
@@ -1372,9 +1383,7 @@ local function read_reply(text: string): Reply
 	local status = if answer.status == "requires_continuation" then "incomplete" else answer.status
 	if status ~= "completed" and status ~= "requires_action" and status ~= "incomplete" then
 		local first = if type(answer.errors) == "table" then answer.errors[1] else nil
-		local detail = if type(first) == "table"
-			then non_empty(first.message) or non_empty(first.code)
-			else non_empty(first)
+		local detail = detail_of(first) or detail_of(answer.error) or non_empty(answer.message)
 		error(("the model request failed (%s): %s"):format(tostring(status), detail or "unknown error"), 0)
 	end
 	return { steps = answer.steps, status = status, usage = type(answer.usage) == "table" and answer.usage or nil }
@@ -1517,12 +1526,18 @@ local function owed(steps: { Step }): { Step }
 	local calls = {}
 	for i = #steps, 1, -1 do
 		local step = steps[i]
-		if step.type == "user_input" then
+		if type(step) ~= "table" then
+			continue
+		elseif step.type == "user_input" then
 			break
 		elseif step.type == "function_result" then
-			answered[step.call_id :: string] = true
-		elseif step.type == "function_call" and not answered[step.id :: string] then
-			table.insert(calls, 1, step)
+			if type(step.call_id) == "string" and step.call_id ~= "" then
+				answered[step.call_id] = true
+			end
+		elseif step.type == "function_call" then
+			if type(step.id) ~= "string" or step.id == "" or not answered[step.id] then
+				table.insert(calls, 1, step)
+			end
 		end
 	end
 	return calls
@@ -1558,8 +1573,34 @@ function Conversation.say(self: Conversation, text: string)
 	end
 end
 
+local function reply_problem(steps: { Step }, offset: number): string?
+	local seen: { [string]: boolean } = {}
+	for i, step in steps do
+		local at = offset + i
+		if type(step) ~= "table" then
+			return ("step %d is not a step"):format(at)
+		elseif step.type == "user_input" or step.type == "function_result" then
+			return ("step %d is %s, not a model step"):format(at, tostring(step.type))
+		elseif step.type == "function_call" then
+			local id = step.id
+			if type(id) ~= "string" or id == "" then
+				return ("step %d is a tool call without an id"):format(at)
+			end
+			if seen[id] then
+				return ("step %d repeats tool call id %s"):format(at, id)
+			end
+			seen[id] = true
+		end
+	end
+	return nil
+end
+
 function Conversation.reply(self: Conversation, steps: { Step }): { Step }
 	expect(self, "reply", "ready")
+	local problem = reply_problem(steps, #self.steps)
+	if problem then
+		error("conversation: " .. problem, 0)
+	end
 	table.move(steps, 1, #steps, #self.steps + 1, self.steps)
 	return owed(self.steps)
 end
@@ -1572,19 +1613,21 @@ local function step_parts(step: Step): { Part }?
 	return if step.type == "function_result" then step.result else step.content
 end
 
-local function trim_media(steps: { Step }, prior_end: number)
+local function trim_media(steps: { Step })
 	local total = 0
-	for _, step in steps do
-		for _, part in step_parts(step) or {} do
+	local last_step, last_part = 0, 0
+	for i, step in steps do
+		for j, part in step_parts(step) or {} do
 			if media_part(part) then
 				total += #(part.data :: string)
+				last_step, last_part = i, j
 			end
 		end
 	end
 	if total <= M.session_image_bytes then
 		return
 	end
-	for i = 1, prior_end do
+	for i = 1, last_step do
 		if total <= M.session_image_bytes then
 			break
 		end
@@ -1593,11 +1636,13 @@ local function trim_media(steps: { Step }, prior_end: number)
 		if not parts then
 			continue
 		end
+		local stop_part = if i == last_step then last_part - 1 else #parts
 		local cloned_parts: { Part }? = nil
-		for j, part in parts do
+		for j = 1, stop_part do
 			if total <= M.session_image_bytes then
 				break
 			end
+			local part = parts[j]
 			if media_part(part) then
 				local updated = cloned_parts or table.clone(parts)
 				if not cloned_parts then
@@ -1638,10 +1683,9 @@ function Conversation.answer(self: Conversation, run: (Step) -> (string, boolean
 		table.insert(results,
 			{ type = "function_result", call_id = call.id, name = call.name, is_error = failed or nil, result = result })
 	end
-	local prior_end = #self.steps
-	table.move(results, 1, #results, prior_end + 1, self.steps)
+	table.move(results, 1, #results, #self.steps + 1, self.steps)
 	if added_media then
-		trim_media(self.steps, prior_end)
+		trim_media(self.steps)
 	end
 	if self.on_answer then
 		self.on_answer(self)
@@ -1675,12 +1719,16 @@ end
 function Conversation.problem(self: Conversation): string?
 	local open: { [string]: boolean } = {}
 	local unanswered = 0
+	local answering = false
 	for i, step in self.steps do
 		if type(step) ~= "table" then
 			return ("step %d is not a step"):format(i)
 		elseif i == 1 and step.type ~= "user_input" then
 			return "step 1 is the model's, where the user should speak"
 		elseif step.type == "function_call" then
+			if answering then
+				return ("step %d leaves a tool call unanswered"):format(i)
+			end
 			local id = step.id
 			if type(id) ~= "string" or id == "" then
 				return ("step %d is a tool call without an id"):format(i)
@@ -1697,7 +1745,10 @@ function Conversation.problem(self: Conversation): string?
 			end
 			open[call_id] = nil
 			unanswered -= 1
-		elseif unanswered > 0 then
+			answering = unanswered > 0
+		elseif step.type == "user_input" and unanswered > 0 then
+			return ("step %d leaves a tool call unanswered"):format(i)
+		elseif answering then
 			return ("step %d leaves a tool call unanswered"):format(i)
 		end
 	end
@@ -1944,7 +1995,30 @@ function at_work(): { string }
 end
 
 local function agent_model(): string
-	return M.agent_model or M.workflow_agents[M.workflow or ""] or M.model
+	if M.agent_model then
+		return M.agent_model
+	end
+	local workflow = M.workflow and trim(M.workflow) or nil
+	if workflow and workflow ~= "" then
+		if M.workflow_agents[workflow] then
+			return M.workflow_agents[workflow]
+		end
+		local key = skill_key(workflow)
+		if key ~= "" then
+			local matched: string? = nil
+			local count = 0
+			for name, model in M.workflow_agents do
+				if skill_key(name) == key then
+					matched = model
+					count += 1
+				end
+			end
+			if count == 1 and matched then
+				return matched
+			end
+		end
+	end
+	return M.model
 end
 
 local function agent_named(name: string): Agent
@@ -2213,8 +2287,12 @@ table.insert(M.functions, {
 M.workflow = host.workflow :: string?
 
 function M.lead_prompt(): string?
-	local name = M.workflow
-	if not name then
+	local raw = M.workflow
+	if not raw then
+		return nil
+	end
+	local name = trim(raw)
+	if name == "" then
 		return nil
 	end
 	local found = match_skills(M.skills(), name)
