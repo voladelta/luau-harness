@@ -30,15 +30,26 @@ namespace {
 constexpr std::size_t kMaxResponse = std::size_t{256} << 20;
 constexpr std::size_t kMaxUpload = std::size_t{100} << 20;
 
+struct ResponseBuffer {
+    std::string body;
+    bool too_large = false;
+};
+
 // NOLINTNEXTLINE(misc-const-correctness)
 std::size_t on_body(char* data, std::size_t size, std::size_t count, void* user) noexcept {
-    auto* body = static_cast<std::string*>(user);
+    auto* out = static_cast<ResponseBuffer*>(user);
+    const std::size_t room = kMaxResponse - out->body.size();
+    if (size != 0 && count > room / size) {
+        out->too_large = true;
+        return 0;
+    }
     const std::size_t bytes = size * count;
-    if (body->size() + bytes > kMaxResponse) {
+    if (bytes > room) {
+        out->too_large = true;
         return 0;
     }
     try {
-        body->append(data, bytes);
+        out->body.append(data, bytes);
     } catch (...) {
         return 0;
     }
@@ -99,7 +110,7 @@ int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
             headers.add(std::string(header));
         }
     }
-    std::string response;
+    ResponseBuffer response;
     std::array<char, CURL_ERROR_SIZE> error_buffer{};
     curl_easy_setopt(curl, CURLOPT_URL, endpoint.url.c_str());
 #if LIBCURL_VERSION_NUM >= 0x075500
@@ -113,6 +124,7 @@ int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(kMaxResponse));
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_progress);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -135,10 +147,13 @@ int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_li
             keep_limit_check();
             raise_error(L, "timeout");
         }
+        if (code == CURLE_FILESIZE_EXCEEDED || (code == CURLE_WRITE_ERROR && response.too_large)) {
+            return fail(L, "the response body exceeds 256 MiB");
+        }
         return fail(L, error_buffer.front() != '\0' ? error_buffer.data() : curl_easy_strerror(code));
     }
     lua_pushnumber(L, static_cast<double>(status));
-    lua_pushlstring(L, response.data(), response.size());
+    lua_pushlstring(L, response.body.data(), response.body.size());
     if (retry_after <= 0) {
         return 2;
     }

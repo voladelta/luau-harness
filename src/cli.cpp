@@ -88,7 +88,7 @@ environment:
   HX_MODEL          model name; carbon, argon, neon and hydrogen are the Gemini 4 models (default
                     gemini-4-neon)
   HX_API_URL        the model endpoint, which speaks Gemini's Interactions API (default
-                    https://generativelanguage.googleapis.com/v1beta/interactions)
+                    https://generativelanguage.googleapis.com/v1/interactions)
   HX_KEY_ENV        name of the variable that holds the API key (default GEMINI_API_KEY)
   HX_EFFORT         the model's thinking level: low, medium, high or xhigh, where xhigh is
                     high on a model without it (default: the model's own)
@@ -107,7 +107,7 @@ exit status:
 docs: https://github.com/voladelta/luau-harness
 )";
 
-constexpr const char* kModelUrl = "https://generativelanguage.googleapis.com/v1beta/interactions";
+constexpr const char* kModelUrl = "https://generativelanguage.googleapis.com/v1/interactions";
 constexpr const char* kModelKeyEnv = "GEMINI_API_KEY";
 constexpr const char* kModel = "gemini-4-neon";
 

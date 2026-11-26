@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -70,6 +71,50 @@ std::string result_text(lua_State* L, bool& returned) {
                         : std::string("(error is not a string)");
 }
 
+std::uint32_t child_seed() noexcept {
+    auto state = static_cast<std::uint64_t>(getpid());
+    timespec monotonic{};
+    if (clock_gettime(CLOCK_MONOTONIC, &monotonic) == 0) {
+        state ^= static_cast<std::uint64_t>(monotonic.tv_sec) * 0x9e3779b97f4a7c15ULL;
+        state = (state << 13) | (state >> 51);
+        state ^= static_cast<std::uint64_t>(monotonic.tv_nsec);
+    }
+    std::uint32_t entropy = 0;
+    if (getentropy(&entropy, sizeof(entropy)) == 0) {
+        state ^= static_cast<std::uint64_t>(entropy) << 32;
+    } else {
+        timespec realtime{};
+        if (clock_gettime(CLOCK_REALTIME, &realtime) == 0) {
+            state ^= static_cast<std::uint64_t>(realtime.tv_sec) * 0x9e3779b97f4a7c15ULL;
+            state ^= static_cast<std::uint64_t>(realtime.tv_nsec);
+        }
+    }
+    state ^= state >> 30;
+    state *= 0xbf58476d1ce4e5b9ULL;
+    state ^= state >> 27;
+    state *= 0x94d049bb133111ebULL;
+    state ^= state >> 31;
+    return static_cast<std::uint32_t>(state ^ (state >> 32));
+}
+
+void reseed_rng(lua_State* L) {
+    const int top = lua_gettop(L);
+    if (lua_checkstack(L, 4) == 0) {
+        return;
+    }
+    lua_rawgetfield(L, LUA_GLOBALSINDEX, "math");
+    if (lua_istable(L, -1)) {
+        lua_rawgetfield(L, -1, "randomseed");
+        if (lua_isfunction(L, -1)) {
+            lua_pushnumber(L, static_cast<double>(static_cast<std::int32_t>(child_seed())));
+            if (lua_pcall(L, 1, 0, 0) != 0) {
+                lua_pop(L, 1);
+            }
+        }
+    }
+    lua_settop(L, top);
+}
+
 }  // namespace
 
 void SpawnPool::drain(Spawned& child) {
@@ -95,8 +140,9 @@ void SpawnPool::run_child(lua_State* L, int result_fd, const std::function<void(
         in_child();
         renew_limit_timer();
         prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-        [[maybe_unused]] FILE* const in = std::freopen("/dev/null", "r", stdin);
+        [[maybe_unused]] const FILE* const in = std::freopen("/dev/null", "r", stdin);
         std::cin.clear();
+        reseed_rng(L);
 
         bool returned = lua_pcall(L, lua_gettop(L) - 1, 1, 0) == 0;
         const std::string text = result_text(L, returned);

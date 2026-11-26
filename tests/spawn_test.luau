@@ -139,4 +139,39 @@ check("a child that was waited for is gone", host.stop(lasting), false)
 
 raises("spawn takes a function", "function expected", host.spawn, "not a function")
 
+math.randomseed(42)
+local rand_ids = {}
+for i = 1, 6 do
+	rand_ids[i] = host.spawn(function()
+		local draws = {}
+		for j = 1, 4 do
+			draws[j] = ("%.17g"):format(math.random())
+		end
+		return table.concat(draws, ",")
+	end)
+end
+local parent_draws = {}
+for j = 1, 4 do
+	parent_draws[j] = ("%.17g"):format(math.random())
+end
+local parent_seq = table.concat(parent_draws, ",")
+done = wait_all(10)
+local seen_seqs: { [string]: boolean } = {}
+for _, id in rand_ids do
+	check("random child succeeded", done[id].ok, true)
+	check("child random sequence differs from parent", done[id].text ~= parent_seq, true)
+	check("child random sequence is distinct", seen_seqs[done[id].text] == nil, true)
+	seen_seqs[done[id].text] = true
+end
+
+local saved_math = _G.math
+_G.math = nil
+local without_math = host.spawn(function(a, b)
+	return a .. ":" .. b
+end, "left", "right")
+_G.math = saved_math
+done = wait_all(10)
+check("spawn succeeds when math global is cleared", done[without_math].ok, true)
+check("and keeps arguments intact", done[without_math].text, "left:right")
+
 checks.done("spawn")

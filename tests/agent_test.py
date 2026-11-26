@@ -42,7 +42,7 @@ class Model(http.server.ThreadingHTTPServer):
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server_address[1]}/v1beta/interactions"
+        return f"http://127.0.0.1:{self.server_address[1]}/v1/interactions"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -814,6 +814,7 @@ end
         done = self.run_hx("--help")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("examples:", done.stdout)
+        self.assertIn("https://generativelanguage.googleapis.com/v1/interactions", done.stdout)
         self.assertEqual(done.stderr, "")
         done = self.run_hx("--version")
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1934,6 +1935,39 @@ end
         self.assertIn("there is an endpoint named mine already", twice.stderr)
         self.assertIn("--resume goes on with the agent's conversation",
                       self.run_hx("--resume", "last", "--run", "x.luau").stderr)
+
+    def test_oversized_response_fails_without_downloading_all_bytes(self):
+        stop = threading.Event()
+
+        class HugeHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(270 * 1024 * 1024))
+                self.end_headers()
+                stop.wait(10)
+
+            def log_message(self, *args):
+                pass
+
+        class HugeServer(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+
+        server = HugeServer(("127.0.0.1", 0), HugeHandler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(stop.set)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}/huge"
+        started = time.monotonic()
+        done = self.run_hx("--endpoint", f"huge={url}", "--run", "-", stdin="print(host.post('huge', '{}'))\n",
+                           HUGE_API_KEY="k")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "nil\tthe response body exceeds 256 MiB\n")
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_without_an_exa_key_the_tools_say_so(self):
         done = self.run_hx("go", script=[
