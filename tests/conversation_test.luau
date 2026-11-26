@@ -142,5 +142,70 @@ broken("unanswered call", { said, use, said }, "unanswered")
 broken("result for no call", { said, result }, "was not made")
 broken("a call answered twice", { said, use, result, result }, "was not made")
 broken("result for another call", { said, use, { type = "function_result", call_id = "z", name = "bash", result = {} } }, "was not made")
+broken("call without id", { said, { type = "function_call", name = "bash", arguments = {} } }, "without an id")
+broken("call with empty id", { said, { type = "function_call", id = "", name = "bash", arguments = {} } }, "without an id")
+broken("call with non-string id", { said, { type = "function_call", id = 123, name = "bash", arguments = {} } }, "without an id")
+broken("duplicate open call id", { said, use, use }, "repeats tool call id a")
+broken("result without call_id", { said, use, { type = "function_result", name = "bash", result = {} } }, "was not made")
+
+local saved_session_bytes = loop.session_image_bytes
+loop.session_image_bytes = 20
+local media_talk = Conversation.new()
+media_talk:say("watch")
+local img1 = { type = "image", data = string.rep("A", 10), mime_type = "image/png" }
+local doc1 = { type = "document", data = string.rep("B", 10), mime_type = "application/pdf" }
+local img2 = { type = "image", data = string.rep("C", 10), mime_type = "image/png" }
+local img3 = { type = "image", data = string.rep("D", 12), mime_type = "image/png" }
+
+media_talk:reply({ { type = "function_call", id = "m1", name = "lua", arguments = {} } })
+media_talk:answer(function()
+	return "first", false, { img1 }
+end)
+local step1 = media_talk.steps[3]
+
+media_talk:reply({ { type = "function_call", id = "m2", name = "lua", arguments = {} } })
+media_talk:answer(function()
+	return "second", false, { doc1 }
+end)
+local step2 = media_talk.steps[5]
+check("within session_image_bytes, earlier step stays untouched", media_talk.steps[3], step1)
+check("within session_image_bytes, earlier media remains", media_talk.steps[3].result[2], img1)
+
+local media_fork = media_talk:fork()
+
+media_talk:reply({ { type = "function_call", id = "m3", name = "lua", arguments = {} } })
+media_talk:answer(function()
+	return "text only", false
+end)
+check("text-only turn leaves earlier media untouched", media_talk.steps[3], step1)
+
+media_talk:reply({ { type = "function_call", id = "m4", name = "lua", arguments = {} } })
+media_talk:answer(function()
+	return "fourth", false, { img2 }
+end)
+check("exceeding session_image_bytes evicts the oldest media part first",
+	json.encode(media_talk.steps[3].result[2]),
+	json.encode({ type = "text", text = "[earlier image omitted to stay within the request size limit]" }))
+check("eviction stops once back within limit, keeping newer earlier step untouched", media_talk.steps[5], step2)
+check("newest media part stays", media_talk.steps[9].result[2], img2)
+check("eviction keeps conversation sound", media_talk:problem(), nil)
+check("eviction leaves prior fork intact", media_fork.steps[3].result[2], img1)
+
+media_talk:reply({ { type = "function_call", id = "m5", name = "lua", arguments = {} } })
+media_talk:answer(function()
+	return "fifth", false, { img3 }
+end)
+check("evicts oldest remaining document part when needed",
+	json.encode(media_talk.steps[5].result[2]),
+	json.encode({ type = "text", text = "[earlier document omitted to stay within the request size limit]" }))
+check("evicts across multiple steps until within limit",
+	json.encode(media_talk.steps[9].result[2]),
+	json.encode({ type = "text", text = "[earlier image omitted to stay within the request size limit]" }))
+check("newest oversized-history media part stays", media_talk.steps[11].result[2], img3)
+check("conversation stays sound after multi-step eviction", media_talk:problem(), nil)
+check("prior fork keeps both original media parts",
+	media_fork.steps[3].result[2] == img1 and media_fork.steps[5].result[2] == doc1, true)
+check("prior fork stays sound", media_fork:problem(), nil)
+loop.session_image_bytes = saved_session_bytes
 
 checks.done("conversation")

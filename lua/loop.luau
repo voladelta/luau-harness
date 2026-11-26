@@ -481,26 +481,28 @@ local function listed_skills(): { Skill }
 	return listed
 end
 
+local function match_skills(skills: { Skill }, name: string): { Skill }
+	for _, skill in skills do
+		if skill.name == name then
+			return { skill }
+		end
+	end
+	local found: { Skill } = {}
+	for _, skill in skills do
+		if skill_key(skill.name) == skill_key(name) then
+			table.insert(found, skill)
+		end
+	end
+	return found
+end
+
 function M.skill(name: string?): string
 	local skills = M.skills()
 	if #skills == 0 then
 		return "There are no skills. A skill is a directory with a SKILL.md, looked for in "
 			.. table.concat(M.skill_dirs, ", ") .. "."
 	end
-	local found: { Skill } = {}
-	for _, skill in skills do
-		if name and skill.name == name then
-			found = { skill }
-			break
-		end
-	end
-	if name and #found == 0 then
-		for _, skill in skills do
-			if skill_key(skill.name) == skill_key(name) then
-				table.insert(found, skill)
-			end
-		end
-	end
+	local found = if name then match_skills(skills, name) else {}
 	if #found == 1 then
 		local skill = found[1]
 		local source: string?, err: string? = skill.source, nil
@@ -778,11 +780,11 @@ M.vision = true
 M.image_bytes = 5 * 1024 * 1024
 M.images_per_call = 8
 M.call_image_bytes = 20 * 1024 * 1024
+M.session_image_bytes = 60 * 1024 * 1024
 
 local image_kinds = {
 	{ type = "image/png", starts = "\137PNG\r\n\26\n" },
 	{ type = "image/jpeg", starts = "\255\216\255" },
-	{ type = "image/gif", starts = "GIF8" },
 	{ type = "image/webp", starts = "RIFF", at_9 = "WEBP" },
 }
 
@@ -987,10 +989,11 @@ M.functions = {
 				return (s:gsub("\r?\n", "\r\n"))
 			end
 			local total = 0
-			local crlf_file = text:match("\r?\n") == "\r\n"
+			local crlf_file = text:find("\r\n", 1, true) ~= nil and text:gsub("\r\n", ""):find("\n", 1, true) == nil
 			for i, change in changes do
 				local from_text: string, to_text: string = change.old, change.new
-				local pieces, count = replace(from_text, if crlf_file then crlf(to_text) else to_text)
+				local pieces, count = replace(from_text,
+					if crlf_file or from_text:find("\r\n", 1, true) ~= nil then crlf(to_text) else to_text)
 				if count == 0 and text:find("\r\n", 1, true) and from_text:find("\n", 1, true) then
 					pieces, count = replace(crlf(from_text), crlf(to_text))
 				end
@@ -1013,8 +1016,8 @@ M.functions = {
 	},
 	{
 		name = "see",
-		usage = "see(path) -> text: puts a file into this call's result for you to look at: an image, PNG, JPEG, GIF "
-			.. "or WebP, such as a screenshot, a chart or a rendered page; or a document, PDF, Word, PowerPoint, Excel "
+		usage = "see(path) -> text: puts a file into this call's result for you to look at: an image, PNG, JPEG or WebP, "
+			.. "such as a screenshot, a chart or a rendered page; or a document, PDF, Word, PowerPoint, Excel "
 			.. "or OpenDocument, which you take in whole, text, tables and figures. A file of plain text comes from read.",
 		run = function(path: any): string
 			check("see", path, 1, "path", "string")
@@ -1032,7 +1035,7 @@ M.functions = {
 			local data: string = or_raise(host.read(path))
 			local part = M.image(data) or M.document(path, data)
 			if not part then
-				error(("see: %s is not a PNG, JPEG, GIF or WebP image, nor a PDF, Word, PowerPoint, Excel or "
+				error(("see: %s is not a PNG, JPEG or WebP image, nor a PDF, Word, PowerPoint, Excel or "
 					.. "OpenDocument file"):format(path), 0)
 			end
 			local sent = #(part.data :: string)
@@ -1296,15 +1299,21 @@ local function count_usage(reply: Reply, model: string)
 end
 
 local function text_of(steps: { Step }): string
-	local parts = {}
+	local chunks = {}
 	for _, step in steps do
-		for _, part in if step.type == "model_output" then step.content or {} else {} do
-			if part.type == "text" and part.text ~= "" then
-				table.insert(parts, part.text :: string)
+		if step.type == "model_output" then
+			local parts = {}
+			for _, part in step.content or {} do
+				if part.type == "text" and type(part.text) == "string" and part.text ~= "" then
+					table.insert(parts, part.text)
+				end
+			end
+			if #parts > 0 then
+				table.insert(chunks, table.concat(parts))
 			end
 		end
 	end
-	return table.concat(parts, "\n")
+	return table.concat(chunks, "\n")
 end
 
 local function has_content(reply: Reply): boolean
@@ -1332,15 +1341,41 @@ local function tool_specs(): { any }
 	return specs
 end
 
+local function non_empty(value: any): string?
+	if value == nil or value == json.null or value == "" then
+		return nil
+	end
+	return tostring(value)
+end
+
+local function error_message(text: any): string
+	if type(text) == "string" then
+		local decoded = json.decode(text)
+		if type(decoded) == "table" then
+			if type(decoded.error) == "table" and type(decoded.error.message) == "string" and decoded.error.message ~= "" then
+				return decoded.error.message
+			elseif type(decoded.error) == "string" and decoded.error ~= "" then
+				return decoded.error
+			elseif type(decoded.message) == "string" and decoded.message ~= "" then
+				return decoded.message
+			end
+		end
+	end
+	return tostring(text):sub(1, 500)
+end
+
 local function read_reply(text: string): Reply
 	local answer, err = json.decode(text)
 	if type(answer) ~= "table" or type(answer.steps) ~= "table" then
 		error("the model endpoint sent a reply this loop cannot read: " .. (err or text:sub(1, 300)), 0)
 	end
-	local status = answer.status
+	local status = if answer.status == "requires_continuation" then "incomplete" else answer.status
 	if status ~= "completed" and status ~= "requires_action" and status ~= "incomplete" then
-		local fault = type(answer.errors) == "table" and answer.errors[1] or {}
-		error(("the model request failed (%s): %s"):format(tostring(status), tostring(fault.message or fault.code)), 0)
+		local first = if type(answer.errors) == "table" then answer.errors[1] else nil
+		local detail = if type(first) == "table"
+			then non_empty(first.message) or non_empty(first.code)
+			else non_empty(first)
+		error(("the model request failed (%s): %s"):format(tostring(status), detail or "unknown error"), 0)
 	end
 	return { steps = answer.steps, status = status, usage = type(answer.usage) == "table" and answer.usage or nil }
 end
@@ -1369,10 +1404,11 @@ function M.request(system: string, steps: { Step }, model: string?): Reply
 		end
 		local transient = type(status) ~= "number" or status == 408 or status == 409 or status == 429 or status >= 500
 		if not transient or attempt == attempts then
-			error(("the model request failed (%s): %s"):format(tostring(status or "no response"), tostring(text):sub(1, 500)), 0)
+			error(("the model request failed (%s): %s"):format(tostring(status or "no response"), error_message(text)), 0)
 		end
-		local wait = math.min(math.max(2 ^ attempt, retry_after or 0), 120)
-		progress(("model request failed (%s), retrying in %d s"):format(tostring(status or text), wait))
+		local backoff = math.floor((2 ^ (attempt - 1)) * (1 + math.random()) * 10 + 0.5) / 10
+		local wait = math.min(math.max(backoff, retry_after or 0), 120)
+		progress(("model request failed (%s), retrying in %g s"):format(tostring(status or text), wait))
 		host.sleep(wait)
 	end
 	error("unreachable")
@@ -1528,17 +1564,85 @@ function Conversation.reply(self: Conversation, steps: { Step }): { Step }
 	return owed(self.steps)
 end
 
+local function media_part(part: Part): boolean
+	return (part.type == "image" or part.type == "document") and type(part.data) == "string"
+end
+
+local function step_parts(step: Step): { Part }?
+	return if step.type == "function_result" then step.result else step.content
+end
+
+local function trim_media(steps: { Step }, prior_end: number)
+	local total = 0
+	for _, step in steps do
+		for _, part in step_parts(step) or {} do
+			if media_part(part) then
+				total += #(part.data :: string)
+			end
+		end
+	end
+	if total <= M.session_image_bytes then
+		return
+	end
+	for i = 1, prior_end do
+		if total <= M.session_image_bytes then
+			break
+		end
+		local step = steps[i]
+		local parts = step_parts(step)
+		if not parts then
+			continue
+		end
+		local cloned_parts: { Part }? = nil
+		for j, part in parts do
+			if total <= M.session_image_bytes then
+				break
+			end
+			if media_part(part) then
+				local updated = cloned_parts or table.clone(parts)
+				if not cloned_parts then
+					cloned_parts = updated
+					local cloned_step = table.clone(step)
+					if step.type == "function_result" then
+						cloned_step.result = updated
+					else
+						cloned_step.content = updated
+					end
+					steps[i] = cloned_step
+				end
+				total -= #(part.data :: string)
+				updated[j] = {
+					type = "text",
+					text = ("[earlier %s omitted to stay within the request size limit]"):format(part.type),
+				}
+			end
+		end
+	end
+end
+
 function Conversation.answer(self: Conversation, run: (Step) -> (string, boolean?, { Part }?))
 	expect(self, "answer", "owing")
 	local results: { Step } = {}
+	local added_media = false
 	for _, call in owed(self.steps) do
 		local text, failed, images = run(call)
 		local result: { Part } = { { type = "text", text = text } }
-		table.move(images or {}, 1, #(images or {}), 2, result)
+		if images then
+			for _, part in images do
+				if media_part(part) then
+					added_media = true
+				end
+			end
+			table.move(images, 1, #images, 2, result)
+		end
 		table.insert(results,
 			{ type = "function_result", call_id = call.id, name = call.name, is_error = failed or nil, result = result })
 	end
-	table.move(results, 1, #results, #self.steps + 1, self.steps)
+	local prior_end = #self.steps
+	table.move(results, 1, #results, prior_end + 1, self.steps)
+	if added_media then
+		trim_media(self.steps, prior_end)
+	end
 	if self.on_answer then
 		self.on_answer(self)
 	end
@@ -1577,13 +1681,21 @@ function Conversation.problem(self: Conversation): string?
 		elseif i == 1 and step.type ~= "user_input" then
 			return "step 1 is the model's, where the user should speak"
 		elseif step.type == "function_call" then
-			open[step.id :: string] = true
+			local id = step.id
+			if type(id) ~= "string" or id == "" then
+				return ("step %d is a tool call without an id"):format(i)
+			end
+			if open[id] then
+				return ("step %d repeats tool call id %s"):format(i, id)
+			end
+			open[id] = true
 			unanswered += 1
 		elseif step.type == "function_result" then
-			if not open[step.call_id :: string] then
+			local call_id = step.call_id
+			if type(call_id) ~= "string" or not open[call_id] then
 				return ("step %d answers a tool call that was not made"):format(i)
 			end
-			open[step.call_id :: string] = nil
+			open[call_id] = nil
 			unanswered -= 1
 		elseif unanswered > 0 then
 			return ("step %d leaves a tool call unanswered"):format(i)
@@ -2105,11 +2217,13 @@ function M.lead_prompt(): string?
 	if not name then
 		return nil
 	end
-	for _, skill in M.skills() do
-		if skill.name == name then
-			return ("# Workflow\n\nThis session follows the %s workflow, whatever the task: its instructions are below, already "
-				.. "loaded, and they are yours to follow from the first step.\n\n%s"):format(name, M.skill(name))
-		end
+	local found = match_skills(M.skills(), name)
+	if #found == 1 then
+		local skill = found[1]
+		return ("# Workflow\n\nThis session follows the %s workflow, whatever the task: its instructions are below, already "
+			.. "loaded, and they are yours to follow from the first step.\n\n%s"):format(skill.name, M.skill(skill.name))
+	elseif #found > 1 then
+		error(("the workflow %s matches several skills; name one exactly"):format(name), 0)
 	end
 	error(("the workflow %s needs a skill of that name, and there is none"):format(name), 0)
 end

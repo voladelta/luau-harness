@@ -147,7 +147,9 @@ has("a document too large to send", lua(("return see(%q)"):format(dir .. "paper.
 loop.document_bytes = 20 * 1024 * 1024
 check("a call that looks at nothing has none", select(3, loop.tools[1].run({ code = "return 1" })), nil)
 host.write(dir .. "not.png", "text")
-has("a file that is no image", lua(("return see(%q)"):format(dir .. "not.png")), "not.png is not a PNG, JPEG, GIF or WebP image")
+has("a file that is no image", lua(("return see(%q)"):format(dir .. "not.png")), "not.png is not a PNG, JPEG or WebP image")
+host.write(dir .. "anim.gif", "GIF89a\1\0\1\0\0\0\0;")
+has("a GIF is rejected", lua(("return see(%q)"):format(dir .. "anim.gif")), "anim.gif is not a PNG, JPEG or WebP image")
 raises("see outside a call's result", "this is not one", tools.see, dir .. "shot.png")
 loop.image_bytes = 10
 has("an image too large to send", lua(("return see(%q)"):format(dir .. "shot.png")), "is 28 bytes, 40 as base64, and an image may be 10 at most")
@@ -203,6 +205,11 @@ check("and keeps them when it has them already", host.read(dir .. "crlf2.txt"), 
 tools.write(dir .. "lf.txt", "one\ntwo\n")
 tools.edit(dir .. "lf.txt", "two", "2\n2b")
 check("a file with \\n ends keeps them", host.read(dir .. "lf.txt"), "one\n2\n2b\n")
+tools.write(dir .. "mixed.txt", "one\r\ntwo\nthree\n")
+tools.edit(dir .. "mixed.txt", "three", "3\n3b")
+check("editing the \\n tail of a mixed file keeps \\n ends", host.read(dir .. "mixed.txt"), "one\r\ntwo\n3\n3b\n")
+tools.edit(dir .. "mixed.txt", "one\r\ntwo", "1\n2")
+check("editing a \\r\\n slice keeps \\r\\n ends", host.read(dir .. "mixed.txt"), "1\r\n2\n3\n3b\n")
 
 check("bash", tools.bash("echo out; echo err >&2; exit 3"), "out\nerr\n[exit 3]")
 check("bash adds a newline before the status", tools.bash("printf x"), "x\n[exit 0]")
@@ -493,5 +500,19 @@ check("a paste on one line", message({ "\27[200~one\27[201~", "next" }), "one")
 check("typed text around a paste", message({ "before \27[200~a", "b\27[201~ after" }), "before a\nb after")
 check("a paste cut short by the end of input", message({ "\27[200~a", "b" }), "a\nb")
 check("empty lines in a paste", message({ "\27[200~a", "", "b\27[201~" }), "a\n\nb")
+
+local logged_lead = {}
+local real_log, was_quiet = host.log, host.quiet
+host.quiet = false
+host.log = function(line)
+	table.insert(logged_lead, line)
+end
+loop.workflow = "RPI"
+local lead = loop.lead_prompt()
+loop.workflow = nil
+host.quiet = was_quiet
+host.log = real_log
+has("lead_prompt normalizes the workflow skill name", lead, "follows the rpi workflow")
+check("lead_prompt logs the workflow skill", table.concat(logged_lead, "\n"), "  skill rpi")
 
 checks.done("tools")
