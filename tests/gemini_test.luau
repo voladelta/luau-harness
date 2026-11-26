@@ -43,7 +43,8 @@ check("the model", sent.model, "gemini-4-carbon")
 check("nothing is stored", sent.store, false)
 check("the system prompt", sent.system_instruction, "be brief")
 check("no Messages fields", sent.messages or sent.system or sent.max_tokens, nil)
-check("the output limit", sent.generation_config.max_output_tokens, 9000)
+check("thinking shares Gemini's output limit, so the loop's is not sent", sent.generation_config.max_output_tokens, nil)
+check("a hard prompt gets fifteen minutes", calls[1].options.timeout, 900)
 check("effort is held to what the model has", sent.generation_config.thinking_level, "high")
 check("a function tool", json.encode(sent.tools[1]),
 	json.encode({ type = "function", name = "luau", description = "run code", parameters = { type = "object" } }))
@@ -90,8 +91,10 @@ loop.request("s", { { role = "assistant", content = { { type = "thinking", think
 	{ role = "user", content = "hi" } }, nil, "gemini-4-neon")
 check("another vendor's thinking stays behind", #calls[3].request.input, 1)
 
+loop.effort = nil
 answers = { interaction("incomplete", { { type = "model_output", content = { { type = "text", text = "cut" } } } }) }
 check("a cut reply", loop.request("s", { { role = "user", content = "hi" } }, nil, "gemini-4-neon").stop_reason, "max_tokens")
+check("no effort leaves the model its own thinking level", calls[#calls].request.generation_config, nil)
 
 answers = { { 200, json.encode({ status = "failed", steps = {}, errors = { { code = "internal", message = "it broke" } } }) } }
 raises("a failed interaction", "it broke", loop.request, "s", { { role = "user", content = "hi" } }, nil, "gemini-4-neon")
@@ -107,6 +110,8 @@ reply = loop.request("s", { { role = "user", content = "hi" } }, nil, "deepseek-
 sent = calls[before + 1].request
 check("other models keep the Messages format", json.encode({ sent.system, sent.messages[1].content, sent.tools[1].input_schema.type, sent.input }),
 	json.encode({ "s", "hi", "object", nil } :: { any }))
+check("their output limit", sent.max_tokens, 9000)
+check("and the host's timeout", calls[before + 1].options.timeout, nil)
 check("and its reply", reply.content[1].text, "hi")
 
 T.done("gemini")
