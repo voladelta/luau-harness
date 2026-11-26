@@ -94,6 +94,13 @@ loop.request("s", { { role = "assistant", content = { { type = "thinking", think
 	{ role = "user", content = "hi" } }, nil, "gemini-4-neon")
 check("another vendor's thinking stays behind", #calls[3].request.input, 1)
 
+answers = { interaction("completed", { thought }),
+	interaction("completed", { thought, { type = "model_output", content = { { type = "text", text = "said" } } } }) }
+reply = loop.request("s", { { role = "user", content = "hi" } }, nil, "gemini-4-neon")
+check("a thought with nothing after it is an empty reply, asked for again", reply.content[2].text, "said")
+table.remove(calls)
+table.remove(calls)
+
 loop.effort = nil
 answers = { interaction("incomplete", { { type = "model_output", content = { { type = "text", text = "cut" } } } }) }
 check("a cut reply", loop.request("s", { { role = "user", content = "hi" } }, nil, "gemini-4-neon").stop_reason, "max_tokens")
