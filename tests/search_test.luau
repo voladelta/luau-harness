@@ -132,4 +132,88 @@ end
 search.ripgrep = nil
 host.sh({ "git", "-C", "repo", "rm", "-fq", "dirlink" })
 
+local real_sh = host.sh
+local function with_locale(locale: string, fn: () -> ())
+	host.sh = function(command: any, options: any): any
+		local merged = if options then table.clone(options) else {}
+		local env = if merged.env then table.clone(merged.env) else {}
+		env.LANG = locale
+		env.LC_ALL = locale
+		env.LC_MESSAGES = locale
+		merged.env = env
+		return real_sh(command, merged)
+	end
+	local ok, err = pcall(fn)
+	host.sh = real_sh
+	if not ok then
+		error(err, 0)
+	end
+end
+
+local locales = { "C.UTF-8" }
+if host.sh("LC_ALL=en_US.UTF-8 locale charmap 2>/dev/null").out:find("UTF-8", 1, true) then
+	table.insert(locales, "en_US.UTF-8")
+end
+
+assert(host.write("repo/src/locale.txt", "alpha\nmixed\nBeta\nÉlan\ná\nzebra\n"))
+host.write("repo/src/locked.luau", "beta\n")
+host.sh({ "chmod", "000", "repo/src/locked.luau" })
+local can_lock = not host.read("repo/src/locked.luau")
+
+for _, locale in locales do
+	with_locale(locale, function()
+		search.ripgrep = false
+		check("grep (" .. locale .. "): [A-Z] matches only ASCII uppercase",
+			tostring(search.grep("[A-Z]", { dir = "repo/src", glob = "locale.txt" })),
+			"repo/src/locale.txt:3: Beta")
+		if can_lock then
+			local found = search.grep("gamma", { dir = "repo/src" })
+			check("grep (" .. locale .. "): unreadable file does not lose matches", #found, 1)
+			check("grep (" .. locale .. "): unreadable file is named among matches", tostring(found),
+				"repo/src/a.luau:2: beta gamma\n[could not read 1 file: repo/src/locked.luau]")
+			check("grep (" .. locale .. "): unreadable file is named on zero-match",
+				tostring(search.grep("no-such-pattern", { dir = "repo/src" })),
+				"[no match]\n[could not read 1 file: repo/src/locked.luau]")
+		end
+		if host.sh("command -v rg").code == 0 then
+			search.ripgrep = true
+			check("rg (" .. locale .. "): [A-Z] matches only ASCII uppercase",
+				tostring(search.grep("[A-Z]", { dir = "repo/src", glob = "locale.txt" })),
+				"repo/src/locale.txt:3: Beta")
+			check("rg (" .. locale .. "): keeps Unicode case folding",
+				tostring(search.grep("élan", { dir = "repo/src", glob = "locale.txt", ignore_case = true })),
+				"repo/src/locale.txt:4: Élan")
+		end
+	end)
+end
+
+search.ripgrep = nil
+host.sh({ "rm", "-f", "repo/src/locale.txt", "repo/src/locked.luau" })
+
+host.sh({ "rm", "-rf", "wt" })
+host.sh({ "mkdir", "-p", "wt/sub" })
+assert(host.write("wt/.git", "gitdir: /nope\n"))
+assert(host.write("wt/sub/item.txt", "ancestor-token\n"))
+assert(host.write("wt/sub/locked.txt", "ancestor-token\n"))
+host.sh({ "chmod", "000", "wt/.git", "wt/sub/locked.txt" })
+if not host.read("wt/.git") and host.sh("command -v rg").code == 0 then
+	search.ripgrep = true
+	check("rg: ignores unreadable ancestor .git file while keeping target unreadable",
+		tostring(search.grep("ancestor-token", { dir = "wt/sub" })),
+		"wt/sub/item.txt:1: ancestor-token\n[could not read 1 file: wt/sub/locked.txt]")
+	check("rg: ignores unreadable ancestor .git file on zero-match",
+		tostring(search.grep("no-such-pattern", { dir = "wt/sub" })),
+		"[no match]\n[could not read 1 file: wt/sub/locked.txt]")
+	local abs_sub = (host.sh({ "pwd" }, { cwd = "wt/sub" }).out:gsub("\n$", ""))
+	check("rg: ignores unreadable ancestor .git file for absolute dir",
+		tostring(search.grep("ancestor-token", { dir = abs_sub })),
+		abs_sub .. "/item.txt:1: ancestor-token\n[could not read 1 file: " .. abs_sub .. "/locked.txt]")
+	check("rg: ignores unreadable ancestor .git file on zero-match for absolute dir",
+		tostring(search.grep("no-such-pattern", { dir = abs_sub })),
+		"[no match]\n[could not read 1 file: " .. abs_sub .. "/locked.txt]")
+	search.ripgrep = nil
+end
+host.sh({ "chmod", "644", "wt/.git", "wt/sub/locked.txt" })
+host.sh({ "rm", "-rf", "wt" })
+
 checks.done("search")

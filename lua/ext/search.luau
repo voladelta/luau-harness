@@ -139,7 +139,7 @@ if ((status[1] != 0)); then exit 250; fi
 exit "${status[0]}"
 ]]
 
-local function collect(args: { string }, limit: number, unreadable_in: (line: string) -> string?, input: string?): { Match }
+local function collect(args: { string }, limit: number, unreadable_in: (line: string) -> (string?, boolean?), input: string?): { Match }
 	local command = { "bash", "-c", preview_matches, "search.grep", tostring(limit + 1), tostring(M.text_limit) }
 	table.move(args, 1, #args, #command + 1, command)
 	local result = host.sh(command, { split = true, input = input, timeout = M.seconds })
@@ -171,10 +171,10 @@ local function collect(args: { string }, limit: number, unreadable_in: (line: st
 	end
 	local unreadable, problems = {}, {}
 	for _, line in result.err:split("\n") do
-		local path = unreadable_in(line)
+		local path, ignore = unreadable_in(line)
 		if path then
 			table.insert(unreadable, (path:gsub("^%./", "")))
-		elseif line:find("%S") then
+		elseif not ignore and line:find("%S") then
 			table.insert(problems, line)
 		end
 	end
@@ -186,6 +186,18 @@ local function collect(args: { string }, limit: number, unreadable_in: (line: st
 		matches.unreadable = unreadable
 	end
 	return matches
+end
+
+local function within_target(path: string, target: string): boolean
+	if target:sub(1, 1) ~= "/" then
+		return path:sub(1, 1) ~= "/"
+	end
+	local root = prefix_of(target)
+	local bare = if root == "/" then "/" else root:sub(1, -2)
+	return path == bare
+		or path:sub(1, #root) == root
+		or path:sub(1, #bare + 2) == bare .. ": "
+		or path:sub(1, #root + 2) == root .. ": "
 end
 
 local function with_ripgrep(pattern: string, options: Options, limit: number): { Match }
@@ -204,9 +216,21 @@ local function with_ripgrep(pattern: string, options: Options, limit: number): {
 	table.insert(args, "--regexp")
 	table.insert(args, pattern)
 	table.insert(args, "--")
-	table.insert(args, prefix_of(options.dir) == "" and "./" or options.dir :: string)
-	return collect(args, limit, function(line: string): string?
-		return line:match("^rg: (.+): .+ %(os error %d+%)$")
+	local target = if prefix_of(options.dir) == "" then "./" else options.dir :: string
+	table.insert(args, target)
+	local in_os_error = false
+	return collect(args, limit, function(line: string): (string?, boolean?)
+		local body = line:match("^rg: (.+)$")
+		local candidate = body or (if in_os_error then line else nil)
+		local path = if candidate then candidate:match("^(.+): .+ %(os error %d+%)$") else nil
+		in_os_error = path ~= nil
+		if not path then
+			return nil
+		end
+		if not within_target(path, target) then
+			return nil, true
+		end
+		return path
 	end)
 end
 
@@ -219,14 +243,14 @@ local function with_grep(pattern: string, options: Options, limit: number): { Ma
 	for _, path in paths do
 		listed_paths[path] = true
 	end
-	local args = { "xargs", "-0", "grep", "-nHIZ", "-d", "skip", if options.fixed then "-F" else "-E" }
+	local args = { "env", "LC_ALL=C", "xargs", "-0", "grep", "-nHIZ", "-d", "skip", if options.fixed then "-F" else "-E" }
 	if options.ignore_case then
 		table.insert(args, "-i")
 	end
 	table.insert(args, "-e")
 	table.insert(args, pattern)
 	table.insert(args, "--")
-	return collect(args, limit, function(line: string): string?
+	return collect(args, limit, function(line: string): (string?, boolean?)
 		local path = line:match("^grep: (.+): [^:]+$")
 		return if path and listed_paths[path] then path else nil
 	end, table.concat(paths, "\0"))

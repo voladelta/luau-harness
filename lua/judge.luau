@@ -472,7 +472,8 @@ local function main(): number
 		return 2
 	end
 	config = given
-	math.randomseed(os.time())
+	local seconds, nanoseconds = host.wall_time()
+	math.randomseed(bit32.band(bit32.bxor(seconds % 0x100000000, nanoseconds), 0x7fffffff))
 	local started, err = host.try(start)
 	if not started then
 		print((("cannot measure the starting point: " .. tostring(err)):gsub("\n", " ")))
