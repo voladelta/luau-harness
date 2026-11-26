@@ -1335,7 +1335,7 @@ end
 function M.system_prompt(): string
 	local ripgrep = host.sh("command -v rg", { timeout = 10 }).code == 0
 	local parts = {
-		("# Role\n\nYou are a coding agent working in %s. Today is %s. You act by running Luau code with the lua "
+		("# Role\n\nYou are a coding agent working in %s. This session started on %s. You act by running Luau code with the lua "
 			.. "tool; the code calls the functions the tool lists. Put several steps in one call when you know what "
 			.. "each will do, and take one step at a time when the next depends on what the last returned.")
 			:format(host.cwd, os.date("%Y-%m-%d")),
