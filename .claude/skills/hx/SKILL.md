@@ -45,7 +45,8 @@ hx --rpi [options] TASK...            the agent as the lead of agents (see "Agen
 ```
 
 - Start it in the project directory. It refuses `/`, the home directory and any directory that holds it.
-- It needs a key in the environment: `DEEPSEEK_API_KEY`, or `ANTHROPIC_API_KEY` for a `claude-*` model.
+- It needs a key in the environment: `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY` for a `claude-*` model, or
+  `GEMINI_API_KEY` for a `gemini-*` one (`--model neon`, `--model carbon`).
   `HX_KEY_ENV=NAME` reads it from another variable. `--model opus|sonnet|haiku|NAME` or `HX_MODEL` picks the
   model. `--run` needs no key.
 - The answer goes to stdout, progress and errors to stderr: `hx -q "..." > answer.txt`. Exit status: 0 done, 1 the

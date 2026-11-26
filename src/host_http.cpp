@@ -102,12 +102,23 @@ std::string beta_option(lua_State* L, int idx) {
     return value;
 }
 
+constexpr std::string_view key_header(Auth auth) noexcept {
+    switch (auth) {
+        case Auth::Bearer:
+            return "Authorization: Bearer ";
+        case Auth::GoogleKey:
+            return "x-goog-api-key: ";
+        case Auth::ApiKey:
+            break;
+    }
+    return "x-api-key: ";
+}
+
 int send(lua_State* L, CURL* curl, const Endpoint& endpoint, std::initializer_list<std::string_view> extra,
          double timeout, double deadline, const std::string& ca_bundle) {
     Headers headers;
     if (!endpoint.key.empty()) {
-        headers.add(endpoint.auth == Auth::Bearer ? fmt::format("Authorization: Bearer {}", endpoint.key)
-                                                  : fmt::format("x-api-key: {}", endpoint.key));
+        headers.add(fmt::format("{}{}", key_header(endpoint.auth), endpoint.key));
     }
     for (const std::string& header : endpoint.headers) {
         headers.add(header);

@@ -159,6 +159,18 @@ under the session's name with `-sub-1`, `-sub-2` and so on; so is each agent's, 
 first given a task. The logs hold file contents, so that directory
 carries a `.gitignore` that keeps all of it out of git.
 
+## Gemini models
+
+A `gemini-*` model is asked through Gemini's Interactions API, not the Messages format, and `M.request` translates
+both ways, so the loop, its tools and a conversation's log are the same on every model. The request is stateless
+(`store: false`): the whole conversation goes as `input` steps, the system prompt as `system_instruction`, the tools
+as `function` tools, and `HX_EFFORT` as `generation_config.thinking_level`. A reply's steps come back as blocks: a
+`thought` as a `thinking` block that keeps the whole step in `signature` and is sent back unchanged, as the API asks
+of a stateless caller; `model_output` as text; a `function_call` as a `tool_use`, answered with a `function_result`.
+`M.gemini` lists the models whose deepest thinking level is below `xhigh`, which a higher `HX_EFFORT` is held to.
+Compaction asks for the summary as an ordinary reply, and caching is Gemini's own implicit one, counted from
+`total_cached_tokens`.
+
 ## The conversation is a state machine
 
 The Messages API accepts one shape of history only: it starts with the user, roles alternate, and a reply

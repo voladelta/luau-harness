@@ -22,6 +22,7 @@ class SpawnPool;
 enum class Auth : std::uint8_t {
     ApiKey,
     Bearer,
+    GoogleKey,
 };
 
 struct Endpoint {
@@ -36,7 +37,7 @@ struct Endpoint {
 inline constexpr std::string_view kSessionEndpoint = "session";
 
 [[nodiscard]] constexpr std::string_view vendor_of(std::string_view model) noexcept {
-    return model.starts_with("claude-") ? "anthropic" : "deepseek";
+    return model.starts_with("claude-") ? "anthropic" : model.starts_with("gemini-") ? "gemini" : "deepseek";
 }
 
 struct HostConfig {
