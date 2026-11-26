@@ -41,6 +41,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
         elif self.path == "/moved":
             self.reply(302, b"", [("Location", "/ok")])
+        elif self.path == "/redirect-ftp":
+            self.reply(302, b"", [("Location", "ftp://127.0.0.1:1/x")])
+        elif self.path == "/redirect-file":
+            self.reply(302, b"", [("Location", "file:///etc/passwd")])
+        elif self.path == "/headers":
+            present = "1" if "X-Empty" in self.headers else "0"
+            value = self.headers.get("X-Empty", "")
+            keep = self.headers.get("X-Keep", "")
+            self.reply(200, f"{present}:{value}:{keep}".encode())
         elif self.path == "/slow":
             time.sleep(1)
             self.reply(200, b"late")
@@ -85,6 +94,10 @@ check("a GET's status", ok.status, 200)
 check("its body", ok.body, "hello")
 check("a header named twice is joined", ok.headers["x-twice"], "a, b")
 check("names are lower case", ok.headers["content-length"], "5")
+check("no hx-http temp files after success", #host.walk(dir, { glob = "hx-http-*" }), 0)
+
+local empty_hdr = http.request(base .. "/headers", { headers = { ["X-Empty"] = "", ["X-Keep"] = "ok" } })
+check("an empty header value still reaches the server", empty_hdr.body, "1::ok")
 
 local moved = http.request(base .. "/moved")
 check("a redirect is followed", moved.status, 200)
@@ -133,6 +146,20 @@ check("a curl that dies without a word is still explained", killed_err,
 	"http.request " .. base .. "/slow: killed by signal 9")
 raises("body and json both", "give body or json, not both", http.request, base, { body = "x", json = {} })
 raises("a url that is not text", "http.request: url must be a string, not nil", http.request)
+raises("redirect to ftp is rejected", "curl: (1)", http.request, base .. "/redirect-ftp")
+raises("redirect to file is rejected", "curl: (1)", http.request, base .. "/redirect-file")
+raises("direct file scheme is rejected", "curl: (1)", http.request, "file:///etc/passwd")
+raises("empty header name", "invalid header name", http.request, base .. "/ok", { headers = { [""] = "x" } })
+raises("colon in header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X-Bad: 1"] = "x" } })
+raises("CR in header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X-Bad\r"] = "x" } })
+raises("LF in header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X-Bad\n"] = "x" } })
+raises("CRLF in header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X-Bad\r\nEvil"] = "x" } })
+raises("control char in header name", "invalid header name", http.request, base .. "/ok", { headers = { ["X-Bad\1"] = "x" } })
+raises("CR in header value", "invalid header value", http.request, base .. "/ok", { headers = { ["X-Bad"] = "a\rb" } })
+raises("LF in header value", "invalid header value", http.request, base .. "/ok", { headers = { ["X-Bad"] = "a\nb" } })
+raises("CRLF injection in header value", "invalid header value", http.request, base .. "/ok", { headers = { ["X-Bad"] = "a\r\nEvil: 1" } })
+raises("NUL in header value", "invalid header value", http.request, base .. "/ok", { headers = { ["X-Bad"] = "a\0b" } })
 check("nothing is left in TMPDIR", #host.walk(dir, { glob = "tmp.*" }), 0)
+check("no hx-http temp files left in TMPDIR", #host.walk(dir, { glob = "hx-http-*" }), 0)
 
 checks.done("http")

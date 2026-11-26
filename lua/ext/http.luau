@@ -5,6 +5,8 @@ local M = {}
 
 local largest_body = 64 * 1024 * 1024
 local too_large = "larger than 64 MiB"
+local seq = 0
+local stale: { string } = {}
 
 type Options = {
 	method: string?,
@@ -18,6 +20,15 @@ local function check(value: unknown, name: string, kind: string, required: boole
 	if (value ~= nil or required) and type(value) ~= kind then
 		error(("http.request: %s must be a %s, not %s"):format(name, kind, type(value)), 0)
 	end
+end
+
+local function temp_dir(): string
+	local dir = host.env("TMPDIR")
+	if not dir or dir == "" then
+		return "/tmp"
+	end
+	local trimmed = dir:gsub("/+$", "")
+	return if trimmed == "" then "/" else trimmed
 end
 
 local function without_path(err: string?, path: string): string
@@ -60,24 +71,46 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 	local body = if opts.json ~= nil then json.encode(opts.json) else opts.body
 	local headers: { [string]: string } = table.clone(opts.headers or {})
 	local has_content_type = false
-	for name in headers do
+	for name, value in headers do
+		check(name, "header name", "string", true)
+		check(value, ("header %q value"):format(name), "string", true)
+		if name == "" or name:find("[%c:]") then
+			error(("http.request: invalid header name %q"):format(name), 0)
+		end
+		if value:find("[\r\n]") or value:find("\0", 1, true) then
+			error(("http.request: invalid header value for %q"):format(name), 0)
+		end
 		if name:lower() == "content-type" then
 			has_content_type = true
-			break
 		end
 	end
 	if opts.json ~= nil and not has_content_type then
 		headers["Content-Type"] = "application/json"
 	end
 
-	local made = host.sh({ "mktemp", "-d" })
-	if made.code ~= 0 then
-		error("http.request: cannot make a directory for the response: " .. made.out, 0)
-	end
-	local where = (made.out:gsub("%s+$", ""))
-	local head_file, body_file = where .. "/head", where .. "/body"
-	local command: { string | number } = { "curl", "-sS", "-L", "--max-time", timeout, "--max-filesize", largest_body, "-D",
-		head_file, "-o", body_file }
+	seq += 1
+	local sec, nsec = host.wall_time()
+	local prefix = ("%s/hx-http-%d-%d-%d-%x"):format(temp_dir(), sec, nsec, seq, math.random(0, 0x7fffffff))
+	local head_file, body_file = prefix .. ".head", prefix .. ".body"
+	table.insert(stale, head_file)
+	table.insert(stale, body_file)
+	local command: { string | number } = {
+		"curl",
+		"-sS",
+		"-L",
+		"--proto",
+		"=http,https",
+		"--proto-redir",
+		"=http,https",
+		"--max-time",
+		timeout,
+		"--max-filesize",
+		largest_body,
+		"-D",
+		head_file,
+		"-o",
+		body_file,
+	}
 	if method == "HEAD" then
 		table.insert(command, "-I")
 	elseif method then
@@ -86,7 +119,7 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 	end
 	for name, value in headers do
 		table.insert(command, "-H")
-		table.insert(command, ("%s: %s"):format(name, value))
+		table.insert(command, if value == "" then name .. ";" else ("%s: %s"):format(name, value))
 	end
 	if body then
 		table.insert(command, "--data-binary")
@@ -97,6 +130,9 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 
 	local ok, result, head, head_err, data, data_err = pcall(function()
 		local ran = host.sh(command, { input = body, timeout = timeout + 10 })
+		if ran.code ~= 0 then
+			return ran, nil, nil, nil, nil
+		end
 		local h: string?, herr: string? = nil, nil
 		if host.stat(head_file) then
 			h, herr = host.read(head_file)
@@ -111,7 +147,10 @@ function M.request(url: string, options: Options?): { status: number, headers: {
 		end
 		return ran, h, herr, d, derr
 	end)
-	pcall(host.sh, { "rm", "-rf", where })
+	local rm_ok, rm_result = pcall(host.sh, { "rm", "-f", "--", table.unpack(stale) })
+	if rm_ok and type(rm_result) == "table" and rm_result.code == 0 then
+		table.clear(stale)
+	end
 	if not ok then
 		error(result, 0)
 	end
