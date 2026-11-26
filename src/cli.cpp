@@ -90,7 +90,7 @@ environment:
   HX_API_URL        the model endpoint, which speaks Gemini's Interactions API (default
                     https://generativelanguage.googleapis.com/v1beta/interactions)
   HX_KEY_ENV        name of the variable that holds the API key (default GEMINI_API_KEY)
-  HX_EFFORT         the model's thinking level: minimal, low, medium, high or xhigh, where xhigh is
+  HX_EFFORT         the model's thinking level: low, medium, high or xhigh, where xhigh is
                     high on a model without it (default: the model's own)
   HX_EXA_URL        Exa's search endpoint, which the built-in web and exa extensions search through
                     with EXA_API_KEY (default https://api.exa.ai/search)
@@ -144,7 +144,7 @@ constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
 };
 constexpr std::string_view kRpiLead = "carbon";
 constexpr const char* kRpiWorkflow = "rpi";
-constexpr std::string_view kEfforts[] = {"minimal", "low", "medium", "high", "xhigh"};
+constexpr std::string_view kEfforts[] = {"low", "medium", "high", "xhigh"};
 
 constexpr std::string_view kOptionNames[] = {
     "--model",   "--ro",       "--rw",   "--keep-env",      "--unix-sockets", "--no-sandbox",
@@ -345,7 +345,7 @@ void check_effort() {
     if (const std::string effort = env_or("HX_EFFORT", ""); effort.empty()) {
         unsetenv("HX_EFFORT");  // NOLINT(concurrency-mt-unsafe)
     } else if (std::ranges::find(kEfforts, effort) == std::end(kEfforts)) {
-        throw UsageError(fmt::format("HX_EFFORT={}: the efforts are minimal, low, medium, high and xhigh", effort));
+        throw UsageError(fmt::format("HX_EFFORT={}: the efforts are low, medium, high and xhigh", effort));
     }
 }
 
