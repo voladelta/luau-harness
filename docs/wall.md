@@ -55,8 +55,9 @@ Also in force:
   `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS` (`MY_API_KEY`, `OPENAI_APIKEY`, `PGPASSWORD`),
   or in `_PAT` or `_PWD` (`GITHUB_PAT`, `MYSQL_PWD`; `PWD` and `OLDPWD` stay). `--keep-env NAME` keeps one. Luau
   code never sees the key: the host adds it to requests for the configured endpoint only, and commands cannot
-  read it out of the host's memory. `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY` and `EXA_API_KEY` are kept the same way,
-  whatever the model, and each is sent only to its own endpoints: `HX_ANTHROPIC_URL`; `HX_DEEPSEEK_URL` and
+  read it out of the host's memory. `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY` and `EXA_API_KEY` are
+  kept the same way, whatever the model, and each is sent only to its own endpoints: `HX_ANTHROPIC_URL`;
+  `HX_GEMINI_URL`; `HX_DEEPSEEK_URL` and
   DeepSeek's tools, `HX_TOOLS_URL/search`, `/fetch` and `/ocr`; and `HX_EXA_URL`. The key of an endpoint added
   with `--endpoint NAME=URL`, `NAME_API_KEY`, is kept the same way and sent to that URL only.
 - The VM has a memory ceiling of 1 GiB, and below it takes only what the system can spare: each time it grows by

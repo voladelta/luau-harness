@@ -595,12 +595,39 @@ end
         done = self.run_hx("--run", "-", stdin=script)
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
-        self.assertIn("no endpoint chat; the endpoints are session, anthropic, deepseek, search, fetch, ocr and exa",
+        self.assertIn("no endpoint chat; the endpoints are session, anthropic, deepseek, gemini, search, fetch, ocr and exa",
                       lines[0])
         self.assertIn("no endpoint https://example.com", lines[1])
         self.assertEqual(lines[2], "nil\tno DEEPSEEK_API_KEY: hx was started without one, so host.post cannot reach "
                          "the deepseek endpoint")
         self.assertEqual(lines[3], "anthropic\tsession\tsession")
+
+    def test_a_gemini_session_speaks_the_interactions_api_with_a_google_key(self):
+        usage = {"total_input_tokens": 10, "total_cached_tokens": 4, "total_output_tokens": 3, "total_thought_tokens": 2}
+        thought = {"type": "thought", "signature": "c2lnbmVk"}
+        asked = {"type": "function_call", "id": "f1", "name": "lua", "arguments": {"code": "return 6 * 7"}}
+        answered = {"type": "model_output", "content": [text("forty-two")]}
+        done = self.run_hx("--model", "neon", "go", script=[
+            (200, {"status": "requires_action", "steps": [thought, asked], "usage": usage}),
+            (200, {"status": "completed", "steps": [answered], "usage": usage})])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "forty-two\n")
+        self.assertIn("[2 replies, 20 tokens in (8 read from cache, 0 written to it), 10 out]", done.stderr)
+        for sent, headers in zip(self.model.requests, self.model.headers):
+            self.assertEqual(headers["x-goog-api-key"], KEY)
+            self.assertNotIn("x-api-key", headers)
+            self.assertNotIn("anthropic-version", headers)
+            self.assertEqual(sent["model"], "gemini-4-neon")
+            self.assertNotIn("messages", sent)
+        self.assertEqual(self.model.requests[1]["input"][1:], [
+            thought, asked,
+            {"type": "function_result", "call_id": "f1", "name": "lua", "result": [text("42")]}])
+        done = self.run_hx("--run", "-", stdin="print(host.route('gemini-4-carbon'), host.route('gemini-4-neon'))\n",
+                           HX_MODEL="opus")
+        self.assertEqual(done.stdout, "gemini\tgemini\n", done.stderr)
+        done = self.run_hx("--run", "-", stdin="print(host.route('gemini-4-carbon'), host.route('claude-opus-5-5'))\n",
+                           HX_MODEL="neon")
+        self.assertEqual(done.stdout, "session\tanthropic\n", done.stderr)
 
     def test_a_claude_agent_under_a_deepseek_session_goes_to_anthropic_with_its_key(self):
         os.makedirs(os.path.join(self.project, ".hx"))

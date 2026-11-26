@@ -55,7 +55,8 @@ examples:
   hx -q "summarise the README" > summary.txt
 
 options:
-  --model NAME      model to ask (overrides HX_MODEL): opus, sonnet, haiku or a full name
+  --model NAME      model to ask (overrides HX_MODEL): opus, sonnet, haiku, carbon, argon, neon,
+                    hydrogen or a full name
   --judge KIT       judge the agent's changes with the kit in directory KIT (run, and optionally build
                     and check); the agent cannot read the kit, and the champion, its patch and the
                     ledger go to a directory outside the wall
@@ -85,12 +86,17 @@ options:
   A value can follow its option as the next word or after =, as in --ro=PATH.
 
 environment:
-  HX_MODEL          model name; opus, sonnet and haiku are the current Claude models (default
-                    deepseek-flash, or claude-opus-5-5 when only ANTHROPIC_API_KEY is set)
-  HX_API_URL        Anthropic Messages endpoint (default https://api.anthropic.com/v1/messages for
-                    a claude-* model, https://api.deepseek.com/anthropic/v1/messages otherwise)
+  HX_MODEL          model name; opus, sonnet and haiku are the current Claude models, and carbon,
+                    argon, neon and hydrogen the Gemini 4 ones (default deepseek-flash; without
+                    DEEPSEEK_API_KEY, claude-opus-5-5 when ANTHROPIC_API_KEY is set, or
+                    gemini-4-neon when GEMINI_API_KEY is)
+  HX_API_URL        the session's endpoint: Gemini's Interactions API for a gemini-* model, the
+                    Anthropic Messages format otherwise (default
+                    https://api.anthropic.com/v1/messages for a claude-* model,
+                    https://generativelanguage.googleapis.com/v1beta/interactions for a gemini-*
+                    one, https://api.deepseek.com/anthropic/v1/messages otherwise)
   HX_KEY_ENV        name of the variable that holds the API key (default ANTHROPIC_API_KEY for a
-                    claude-* model, DEEPSEEK_API_KEY otherwise)
+                    claude-* model, GEMINI_API_KEY for a gemini-* one, DEEPSEEK_API_KEY otherwise)
   HX_EFFORT         how hard the model thinks: low, medium, high, xhigh or max (default: medium on
                     the Claude models hx knows, the endpoint's own otherwise)
   HX_TOOLS_URL      base of DeepSeek's search, fetch and OCR endpoints, which the built-in web and ocr
@@ -104,6 +110,9 @@ environment:
   HX_ANTHROPIC_URL  Anthropic's Messages endpoint, which a Claude model under a session on another
                     model is asked through, with ANTHROPIC_API_KEY (default
                     https://api.anthropic.com/v1/messages)
+  HX_GEMINI_URL     Gemini's Interactions endpoint, which a Gemini model under a session on another
+                    model is asked through, with GEMINI_API_KEY (default
+                    https://generativelanguage.googleapis.com/v1beta/interactions)
 
 output:
   The model's words go to stdout; progress, warnings and errors go to stderr.
@@ -119,6 +128,7 @@ struct Vendor {
     const char* url;
     const char* url_env;
     const char* key_env;
+    Auth auth;
     const char* version;
     const char* model;
 };
@@ -129,6 +139,7 @@ constexpr Vendor kVendors[] = {
         .url = "https://api.anthropic.com/v1/messages",
         .url_env = "HX_ANTHROPIC_URL",
         .key_env = "ANTHROPIC_API_KEY",
+        .auth = Auth::ApiKey,
         .version = "anthropic-version: 2026-10-21",
         .model = "claude-opus-5-5",
     },
@@ -137,11 +148,20 @@ constexpr Vendor kVendors[] = {
         .url = "https://api.deepseek.com/anthropic/v1/messages",
         .url_env = "HX_DEEPSEEK_URL",
         .key_env = "DEEPSEEK_API_KEY",
+        .auth = Auth::ApiKey,
         .version = "anthropic-version: 2023-06-01",
         .model = "deepseek-flash",
     },
+    {
+        .name = "gemini",
+        .url = "https://generativelanguage.googleapis.com/v1beta/interactions",
+        .url_env = "HX_GEMINI_URL",
+        .key_env = "GEMINI_API_KEY",
+        .auth = Auth::GoogleKey,
+        .version = nullptr,
+        .model = "gemini-4-neon",
+    },
 };
-constexpr const Vendor& kAnthropic = kVendors[0];
 constexpr const Vendor& kDeepSeek = kVendors[1];
 
 constexpr const char* kToolsUrl = "https://api.deepseek.com/v1/tools";
@@ -194,6 +214,10 @@ constexpr std::pair<std::string_view, std::string_view> kModelAliases[] = {
     {"opus", "claude-opus-5-5"},
     {"sonnet", "claude-sonnet-5-5"},
     {"haiku", "claude-haiku-5-5"},
+    {"carbon", "gemini-4-carbon"},
+    {"argon", "gemini-4-argon"},
+    {"neon", "gemini-4-neon"},
+    {"hydrogen", "gemini-4-hydrogen"},
 };
 constexpr std::string_view kRpiLead = "opus";
 constexpr const char* kRpiWorkflow = "rpi";
@@ -385,6 +409,19 @@ struct ModelChoice {
     const Vendor* vendor;
 };
 
+const Vendor& default_vendor() {
+    const auto has_key = [](const Vendor& vendor) { return !env_or(vendor.key_env, "").empty(); };
+    if (has_key(kDeepSeek) || !env_or("HX_API_URL", "").empty()) {
+        return kDeepSeek;
+    }
+    const auto* const keyed = std::ranges::find_if(kVendors, has_key);
+    return keyed != std::end(kVendors) ? *keyed : kDeepSeek;
+}
+
+std::vector<std::string> version_headers(const Vendor& vendor) {
+    return vendor.version != nullptr ? std::vector<std::string>{vendor.version} : std::vector<std::string>{};
+}
+
 ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
     std::string model = rpi ? std::string(kRpiLead) : env_or("HX_MODEL", "");
     if (flag) {
@@ -396,8 +433,7 @@ ModelChoice choose_endpoint(const std::optional<std::string>& flag, bool rpi) {
         }
     }
     if (model.empty()) {
-        const bool only_anthropic = env_or(kDeepSeek.key_env, "").empty() && !env_or(kAnthropic.key_env, "").empty();
-        model = only_anthropic && env_or("HX_API_URL", "").empty() ? kAnthropic.model : kDeepSeek.model;
+        model = default_vendor().model;
     }
     const Vendor& vendor = find_vendor(model);
     return {
@@ -448,19 +484,19 @@ std::vector<Endpoint> resolve_endpoints(const ModelChoice& model, const std::vec
     list.push_back({
         .name = std::string(kSessionEndpoint),
         .url = model.url,
-        .auth = Auth::ApiKey,
+        .auth = model.vendor->auth,
         .key = key(model.key_env),
         .key_env = "",
-        .headers = {model.vendor->version},
+        .headers = version_headers(*model.vendor),
     });
     for (const Vendor& vendor : kVendors) {
         list.push_back({
             .name = std::string(vendor.name),
             .url = env_or(vendor.url_env, vendor.url),
-            .auth = Auth::ApiKey,
+            .auth = vendor.auth,
             .key = key(vendor.key_env),
             .key_env = vendor.key_env,
-            .headers = {vendor.version},
+            .headers = version_headers(vendor),
         });
     }
     for (const Service& service : kServices) {

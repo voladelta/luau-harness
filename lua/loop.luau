@@ -1247,15 +1247,6 @@ local function count_usage(reply: Reply, model: string)
 	end
 end
 
-local function tool_specs(): { any }
-	local specs = json.array({})
-	for _, tool in M.tools do
-		local description = type(tool.description) == "function" and tool.description() or tool.description
-		table.insert(specs, { name = tool.name, description = description, input_schema = tool.parameters })
-	end
-	return specs
-end
-
 local function has_content(reply: Reply): boolean
 	if reply.stop_reason == "max_tokens" or reply.stop_reason == "refusal" then
 		return true
@@ -1290,61 +1281,240 @@ local function after_fallback(reply: Reply)
 	reply.content = kept
 end
 
-function M.request(system: string, messages: { Message }, compaction: { [string]: any }?, model: string?): Reply
-	local name = model or M.model
-	local is_claude, features = claude_model(name)
-	local thinking = { type = "adaptive" }
+local function tool_description(tool: Tool): string
+	return if type(tool.description) == "function" then tool.description() else tool.description
+end
+
+type Wire = {
+	body: (system: string, messages: { Message }, model: string, compaction: { [string]: any }?) -> { [string]: any },
+	beta: ((model: string) -> string?)?,
+	reply: (answer: any) -> Reply?,
+}
+
+local function claude_betas(features: Features?): { string }
 	local betas = {}
-	local fallbacks = nil
 	if features then
-		thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
 		table.insert(betas, "thinking-binding-controls-2026-08-01")
 		if features.display then
-			thinking.display = features.display
 			table.insert(betas, "thinking-display-updates-2026-08-18")
 		end
 		if features.fallbacks then
-			fallbacks = features.fallbacks
 			table.insert(betas, "server-side-fallback-2026-07-01")
 		end
 		if features.compaction then
 			table.insert(betas, "compact-2026-09-04")
 		end
 	end
-	local effort = M.effort or (features and features.effort)
-	local system_field: string | { { [string]: any } } = system
-	if is_claude then
-		system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
+	return betas
+end
+
+local messages_wire: Wire = {
+	body = function(system, messages, model, compaction)
+		local is_claude, features = claude_model(model)
+		local thinking = { type = "adaptive" }
+		if features then
+			thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
+			thinking.display = features.display
+		end
+		local effort = M.effort or (features and features.effort)
+		local system_field: string | { { [string]: any } } = system
+		if is_claude then
+			system_field = { { type = "text", text = system, cache_control = { type = "ephemeral" } } }
+		end
+		local specs = json.array({})
+		for _, tool in M.tools do
+			table.insert(specs, { name = tool.name, description = tool_description(tool), input_schema = tool.parameters })
+		end
+		return {
+			model = model,
+			max_tokens = M.max_output,
+			thinking = if is_claude then thinking else nil,
+			output_config = effort and { effort = effort } or nil,
+			fallbacks = features and features.fallbacks,
+			cache_control = { type = "ephemeral" },
+			system = system_field,
+			messages = messages,
+			tools = specs,
+			compaction = compaction,
+		}
+	end,
+	beta = function(model)
+		local betas = claude_betas(select(2, claude_model(model)))
+		return #betas > 0 and table.concat(betas, ",") or nil
+	end,
+	reply = function(answer)
+		if type(answer.content) ~= "table" then
+			return nil
+		end
+		after_fallback(answer)
+		return answer
+	end,
+}
+
+M.gemini = {
+	["gemini-4-carbon"] = { deepest = "high" },
+	["gemini-4-argon"] = { deepest = "high" },
+}
+local efforts = { "low", "medium", "high", "xhigh", "max" }
+
+local function thinking_level(model: string, effort: string?): string?
+	local deepest = (M.gemini[model] or {}).deepest or "xhigh"
+	local asked = effort and table.find(efforts, effort)
+	return if asked and asked > (table.find(efforts, deepest) :: number) then deepest else effort
+end
+
+local function gemini_content(block: Block): { [string]: any }?
+	if block.type == "text" then
+		return block.text ~= "" and { type = "text", text = block.text } or nil
+	elseif block.type == "image" then
+		return { type = "image", data = block.source.data, mime_type = block.source.media_type }
+	elseif block.type == "compaction" and type(block.content) == "string" then
+		return { type = "text", text = block.content }
 	end
-	local body = json.encode({
-		model = name,
-		max_tokens = M.max_output,
-		thinking = if is_claude then thinking else nil,
-		output_config = effort and { effort = effort } or nil,
-		fallbacks = fallbacks,
-		cache_control = { type = "ephemeral" },
-		system = system_field,
-		messages = messages,
-		tools = tool_specs(),
-		compaction = compaction,
-	})
+	return nil
+end
+
+local function gemini_thought(block: Block): { [string]: any }?
+	local signature = (block :: any).signature
+	local step = type(signature) == "string" and json.decode(signature)
+	return type(step) == "table" and step.type == "thought" and step or nil
+end
+
+local function gemini_result(block: Block, name: string?): { [string]: any }
+	local content = block.content
+	local parts: { Block } = if type(content) == "table" then content else { { type = "text", text = tostring(content or "") } }
+	local result = json.array({})
+	for _, part in parts do
+		table.insert(result, gemini_content(part))
+	end
+	return { type = "function_result", call_id = block.tool_use_id, name = name, is_error = block.is_error, result = result }
+end
+
+local function gemini_steps(messages: { Message }): { any }
+	local steps = json.array({})
+	local names: { [string]: string } = {}
+	for _, message in messages do
+		local content = message.content
+		local blocks: { Block } = if type(content) == "string" then { { type = "text", text = content } } else content
+		local said: { any }? = nil
+		for _, block in blocks do
+			local part = gemini_content(block)
+			if part then
+				if not said then
+					said = json.array({})
+					table.insert(steps, { type = message.role == "assistant" and "model_output" or "user_input", content = said })
+				end
+				table.insert(said :: { any }, part)
+				continue
+			end
+			local step = nil
+			if block.type == "thinking" then
+				step = gemini_thought(block)
+			elseif block.type == "tool_use" then
+				names[block.id :: string] = block.name :: string
+				step = { type = "function_call", id = block.id, name = block.name, arguments = block.input }
+			elseif block.type == "tool_result" then
+				step = gemini_result(block, names[block.tool_use_id :: string])
+			end
+			if step then
+				said = nil
+				table.insert(steps, step)
+			end
+		end
+	end
+	return steps
+end
+
+local function gemini_blocks(steps: { any }): { Block }
+	local blocks: { Block } = {}
+	for _, step in steps do
+		if step.type == "thought" then
+			local summary = {}
+			for _, part in step.summary or {} do
+				table.insert(summary, part.text)
+			end
+			table.insert(blocks, { type = "thinking", thinking = table.concat(summary, "\n"), signature = json.encode(step) } :: any)
+		elseif step.type == "model_output" then
+			for _, part in step.content or {} do
+				if part.type == "text" then
+					table.insert(blocks, { type = "text", text = part.text })
+				end
+			end
+		elseif step.type == "function_call" then
+			table.insert(blocks, { type = "tool_use", id = step.id, name = step.name, input = step.arguments })
+		end
+	end
+	return blocks
+end
+
+local interactions_wire: Wire = {
+	body = function(system, messages, model)
+		local specs = json.array({})
+		for _, tool in M.tools do
+			table.insert(specs,
+				{ type = "function", name = tool.name, description = tool_description(tool), parameters = tool.parameters })
+		end
+		return {
+			model = model,
+			store = false,
+			system_instruction = system,
+			generation_config = { max_output_tokens = M.max_output, thinking_level = thinking_level(model, M.effort) },
+			input = gemini_steps(messages),
+			tools = specs,
+		}
+	end,
+	reply = function(answer)
+		if type(answer.steps) ~= "table" then
+			return nil
+		end
+		local status = answer.status
+		if status ~= "completed" and status ~= "requires_action" and status ~= "incomplete" then
+			local fault = type(answer.errors) == "table" and answer.errors[1] or {}
+			error(("the model request failed (%s): %s"):format(tostring(status), tostring(fault.message or fault.code)), 0)
+		end
+		local counts = type(answer.usage) == "table" and answer.usage or {}
+		local cached = counts.total_cached_tokens or 0
+		local content = gemini_blocks(answer.steps)
+		local calls = false
+		for _, block in content do
+			calls = calls or block.type == "tool_use"
+		end
+		return {
+			content = content,
+			stop_reason = if status == "incomplete" then "max_tokens" elseif calls then "tool_use" else "end_turn",
+			usage = {
+				input_tokens = (counts.total_input_tokens or 0) - cached,
+				cache_read_input_tokens = cached,
+				output_tokens = (counts.total_output_tokens or 0) + (counts.total_thought_tokens or 0),
+			},
+		}
+	end,
+}
+
+local function wire_of(model: string): Wire
+	return if model:match("^gemini%-") then interactions_wire else messages_wire
+end
+
+function M.request(system: string, messages: { Message }, compaction: { [string]: any }?, model: string?): Reply
+	local name = model or M.model
+	local wire = wire_of(name)
+	local body = json.encode(wire.body(system, messages, name, compaction))
 	local endpoint = host.route(name)
-	local options = { beta = #betas > 0 and table.concat(betas, ",") or nil }
+	local options = { beta = wire.beta and wire.beta(name) }
 	local attempts = 5
 	for attempt = 1, attempts do
 		local status, text, retry_after = host.post(endpoint, body, options)
 		if status == 200 then
-			local reply, err = json.decode(text)
-			if type(reply) == "table" and type(reply.content) == "table" then
-				after_fallback(reply)
-				count_usage(reply, name)
-				if compaction or has_content(reply) then
-					return reply
-				end
-				status, text = "empty reply", "the model sent a reply with nothing in it"
-			else
+			local answer, err = json.decode(text)
+			local reply = type(answer) == "table" and wire.reply(answer)
+			if not reply then
 				error("the model endpoint sent a reply this loop cannot read: " .. (err or text:sub(1, 300)), 0)
 			end
+			count_usage(reply, name)
+			if compaction or has_content(reply) then
+				return reply
+			end
+			status, text = "empty reply", "the model sent a reply with nothing in it"
 		end
 		local transient = type(status) ~= "number" or status == 408 or status == 409 or status == 429 or status >= 500
 		if not transient or attempt == attempts then

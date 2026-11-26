@@ -37,14 +37,15 @@ it with `host.input`. Text that goes with an instruction goes on stdin with it:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `HX_MODEL` | model name; `opus`, `sonnet` and `haiku` stand for `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` | `deepseek-flash`, or `claude-opus-5-5` when `ANTHROPIC_API_KEY` is set and `DEEPSEEK_API_KEY` is not |
-| `HX_API_URL` | Anthropic Messages endpoint | `https://api.anthropic.com/v1/messages` for a `claude-*` model, `https://api.deepseek.com/anthropic/v1/messages` otherwise |
-| `HX_KEY_ENV` | name of the variable holding the API key | `ANTHROPIC_API_KEY` for a `claude-*` model, `DEEPSEEK_API_KEY` otherwise |
-| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked. DeepSeek has three levels: it takes `medium` and `xhigh` for `high` | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
+| `HX_MODEL` | model name; `opus`, `sonnet` and `haiku` stand for `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5`; `carbon`, `argon`, `neon` and `hydrogen` for `gemini-4-carbon`, `gemini-4-argon`, `gemini-4-neon` and `gemini-4-hydrogen` | `deepseek-flash`; without `DEEPSEEK_API_KEY`, `claude-opus-5-5` when `ANTHROPIC_API_KEY` is set, or `gemini-4-neon` when `GEMINI_API_KEY` is |
+| `HX_API_URL` | the session's endpoint: Gemini's Interactions API for a `gemini-*` model, an Anthropic Messages endpoint otherwise | `https://api.anthropic.com/v1/messages` for a `claude-*` model, `https://generativelanguage.googleapis.com/v1beta/interactions` for a `gemini-*` one, `https://api.deepseek.com/anthropic/v1/messages` otherwise |
+| `HX_KEY_ENV` | name of the variable holding the API key | `ANTHROPIC_API_KEY` for a `claude-*` model, `GEMINI_API_KEY` for a `gemini-*` one, `DEEPSEEK_API_KEY` otherwise |
+| `HX_EFFORT` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `output_config.effort`; any other value is refused before the model is asked. DeepSeek has three levels: it takes `medium` and `xhigh` for `high`. A Gemini model gets it as `generation_config.thinking_level`, held to the deepest level the model has: `xhigh`, or `high` on Carbon and Argon | `medium` on the Claude models below, the endpoint's otherwise (`high` on DeepSeek) |
 | `HX_TOOLS_URL` | base of DeepSeek's Search, Fetch and OCR endpoints, which the built-in `web` and `ocr` extensions call with `DEEPSEEK_API_KEY`, whatever the model | `https://api.deepseek.com/v1/tools` |
 | `HX_EXA_URL` | Exa's search endpoint, which the built-in `exa` extension calls with `EXA_API_KEY`, whatever the model | `https://api.exa.ai/search` |
 | `HX_DEEPSEEK_URL` | DeepSeek's Messages endpoint, which a DeepSeek model under a session on a Claude model is asked through, an agent say, with `DEEPSEEK_API_KEY` | `https://api.deepseek.com/anthropic/v1/messages` |
 | `HX_ANTHROPIC_URL` | Anthropic's Messages endpoint, which a Claude model under a session on another model is asked through, with `ANTHROPIC_API_KEY` | `https://api.anthropic.com/v1/messages` |
+| `HX_GEMINI_URL` | Gemini's Interactions endpoint, which a Gemini model under a session on another model is asked through, with `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/v1beta/interactions` |
 
 The model's words go to stdout and progress lines go to stderr, so `hx "..." > answer.txt` captures the answer.
 Exit status: 0 done, 1 the run failed, 2 bad usage or `hx` cannot start here, 130 interrupted (Ctrl-C), 143
