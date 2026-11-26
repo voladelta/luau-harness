@@ -1353,13 +1353,13 @@ local messages_wire: Wire = {
 }
 
 M.gemini = {
-	["gemini-4-carbon"] = { deepest = "high" },
-	["gemini-4-argon"] = { deepest = "high" },
+	["gemini-4-neon"] = { deepest = "xhigh" },
+	["gemini-4-hydrogen"] = { deepest = "xhigh" },
 }
 local efforts = { "low", "medium", "high", "xhigh", "max" }
 
 local function thinking_level(model: string, effort: string?): string?
-	local deepest = (M.gemini[model] or {}).deepest or "xhigh"
+	local deepest = (M.gemini[model] or {}).deepest or "high"
 	local asked = effort and table.find(efforts, effort)
 	return if asked and asked > (table.find(efforts, deepest) :: number) then deepest else effort
 end

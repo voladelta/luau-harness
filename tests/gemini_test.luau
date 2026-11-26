@@ -74,6 +74,9 @@ reply = loop.request("be brief", {
 }, nil, "gemini-4-neon")
 sent = calls[2].request
 check("neon thinks as hard as asked", sent.generation_config.thinking_level, "xhigh")
+answers = { interaction("completed", { { type = "model_output", content = { { type = "text", text = "ok" } } } }) }
+loop.request("s", { { role = "user", content = "hi" } }, nil, "gemini-3.8-flash")
+check("a model the loop does not list stops at high", table.remove(calls).request.generation_config.thinking_level, "high")
 check("the turn goes back step by step", json.encode(sent.input), json.encode({
 	{ type = "user_input", content = { { type = "text", text = "what is one?" } } },
 	thought,
