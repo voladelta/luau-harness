@@ -1766,7 +1766,7 @@ function at_work(): { string }
 end
 
 local function agent_model(): string
-	return M.agent_model or M.workflow_agents[host.workflow or ""] or M.model
+	return M.agent_model or M.workflow_agents[M.workflow or ""] or M.model
 end
 
 local function agent_named(name: string): Agent
