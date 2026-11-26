@@ -1309,6 +1309,32 @@ local function claude_betas(features: Features?): { string }
 	return betas
 end
 
+local function gemini_thought(block: Block): { [string]: any }?
+	local signature = (block :: any).signature
+	local step = type(signature) == "string" and json.decode(signature)
+	return type(step) == "table" and step.type == "thought" and step or nil
+end
+
+local function without_gemini_thoughts(messages: { Message }): { Message }
+	local kept = table.create(#messages)
+	for i, message in messages do
+		kept[i] = message
+		if type(message.content) ~= "table" then
+			continue
+		end
+		local blocks = {}
+		for _, block in message.content :: { Block } do
+			if not (block.type == "thinking" and gemini_thought(block)) then
+				table.insert(blocks, block)
+			end
+		end
+		if #blocks < #(message.content :: { Block }) then
+			kept[i] = { role = message.role, content = blocks }
+		end
+	end
+	return kept
+end
+
 local messages_wire: Wire = {
 	body = function(system, messages, model, compaction)
 		local is_claude, features = claude_model(model)
@@ -1334,7 +1360,7 @@ local messages_wire: Wire = {
 			fallbacks = features and features.fallbacks,
 			cache_control = { type = "ephemeral" },
 			system = system_field,
-			messages = messages,
+			messages = without_gemini_thoughts(messages),
 			tools = specs,
 			compaction = compaction,
 		}
@@ -1373,12 +1399,6 @@ local function gemini_content(block: Block): { [string]: any }?
 		return { type = "text", text = block.content }
 	end
 	return nil
-end
-
-local function gemini_thought(block: Block): { [string]: any }?
-	local signature = (block :: any).signature
-	local step = type(signature) == "string" and json.decode(signature)
-	return type(step) == "table" and step.type == "thought" and step or nil
 end
 
 local function gemini_result(block: Block, name: string?): { [string]: any }

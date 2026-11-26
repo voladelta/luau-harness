@@ -117,4 +117,15 @@ check("their output limit", sent.max_tokens, 9000)
 check("and the host's timeout", calls[before + 1].options.timeout, nil)
 check("and its reply", reply.content[1].text, "hi")
 
+answers = { { 200, json.encode({ content = { { type = "text", text = "hi" } }, stop_reason = "end_turn" }) } }
+local signed = { type = "thinking", thinking = "x", signature = "claude-signed" }
+loop.request("s", {
+	{ role = "user", content = "hi" },
+	{ role = "assistant", content = { { type = "thinking", thinking = "weigh it", signature = json.encode(thought) }, signed,
+		{ type = "text", text = "Looking." } } :: { any } },
+	{ role = "user", content = "go on" },
+}, nil, "claude-opus-5-5")
+check("a Gemini thought stays behind when another vendor takes the conversation over",
+	json.encode(calls[#calls].request.messages[2].content), json.encode({ signed, { type = "text", text = "Looking." } } :: { any }))
+
 T.done("gemini")
