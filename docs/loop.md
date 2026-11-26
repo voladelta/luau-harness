@@ -12,7 +12,7 @@ call to the next. The code acts through these functions:
 | `read(path, offset?, limit?)` | returns a range of lines of a file, numbered, and where to go on; `\r\n` line ends are shown as plain ones |
 | `write(path, content)` | creates or overwrites a file. It refuses one that changed since the conversation last read or wrote it, and says to read it again (see [Agents](agents.md)) |
 | `edit(path, old, new, all?)` | replaces an exact piece of text that occurs once; in a file with `\r\n` line ends, text written with `\n` ends is found too, and what goes in gets `\r\n` ends. A list `{{old = ..., new = ..., all = true?}, ...}` in place of `old` makes several changes in order and writes the file only when every one applies |
-| `see(path)` | puts a file into the call's result, after the text, for the model to look at: a PNG, JPEG, GIF or WebP image, at most `M.image_bytes` (5 MiB, as base64), or a PDF, Word, PowerPoint, Excel or OpenDocument file, at most `M.document_bytes` (20 MiB, as base64), which Gemini reads itself, text, tables and pictures. One call shows `M.images_per_call` (8) files and `M.call_image_bytes` (20 MiB, as base64) at most. `M.vision = false` turns it away for a model that takes none |
+| `see(path)` | puts a file into the call's result, after the text, for the model to look at: a PNG, JPEG or WebP image, at most `M.image_bytes` (5 MiB, as base64), or a PDF, Word, PowerPoint, Excel or OpenDocument file, at most `M.document_bytes` (20 MiB, as base64), which Gemini reads itself, text, tables and pictures. One call shows `M.images_per_call` (8) files and `M.call_image_bytes` (20 MiB, as base64) at most; past `M.session_image_bytes` (60 MiB, as base64) across a conversation, the oldest earlier files are dropped from history so stateless requests stay within the API's size limit. `M.vision = false` turns it away for a model that takes none |
 | `skill(name?)` | a skill's instructions, by name; with no name, or a name no skill has, the list of skills to pick from (see [Skills](skills.md)) |
 | `ext(name)` | an extension's table of functions |
 | `agents(tasks)` | gives each task to an agent, all at work at the same time, and returns their reports (see [Agents](agents.md)) |
@@ -99,9 +99,11 @@ repeats on its own and leaves the outer turn's counts alone. The model's globals
 sub-agent runs inside the session's process, while the session waits for it; the `agents` function runs several
 at once, each in a process of its own (see [Agents](agents.md)).
 
-hx does not bring a search tool: the model searches through `bash`. Where `rg` is on the `PATH`, the system
-prompt says that ripgrep is installed and to use it rather than plain grep, since it is faster and skips what
-`.gitignore` names; where it is not, the prompt does not name it.
+`hx` brings the built-in `search` extension (`ext("search").grep` and `ext("search").files`, see
+[Extensions](extensions.md)), and the system prompt tells the model to use it first rather than plain shell
+searches. When `rg` is on the `PATH`, `search` uses it, and the system prompt also tells the model to use `rg`
+through `bash` for what `search` does not cover, since it is faster than plain grep and skips what `.gitignore`
+names; where `rg` is not on the `PATH`, the prompt does not name it.
 
 Some habits of the model are handled in the loop rather than left to the prompt: a function call that gets the same
 result for the 3rd, 5th and 8th time in a task, whatever ran in between, gets a reminder to stop and report, and to
@@ -121,15 +123,17 @@ as `system_instruction`, the tools as `function` tools, and `HX_EFFORT`, when se
 - **Thinking level.** Unset, each model thinks at its own default, `high` on Neon and Hydrogen and `medium` on
   Carbon and Argon. `M.xhigh` lists the models that have `xhigh`, Neon and Hydrogen; any other gets `high` for it.
 - **No output cap.** `max_output_tokens` caps thinking and answer together and a low cap cuts answers short, so
-  none is sent and the API's own 65,536 holds.
+  none is sent and each model's own API limit holds (65,536 tokens on Neon and Hydrogen; 32,768 per non-streaming
+  hop on Carbon and Argon).
 - **No sampling parameters**, and each attempt at a request may take `M.request_seconds` (900): a hard prompt thinks for minutes. One that fails in a passing way is tried up to five times, so a request that times out every time takes that many times as long.
 
 A reply is the steps the API sent, appended to the conversation as they are: a `thought` with its signature, which
 a stateless caller must send back unchanged; `model_output`, the answer; and each `function_call`, which the loop
 answers with a `function_result` whose `result` is the text and any images or documents `see` added. A reply with
-status `incomplete` was cut off and is answered with a request to go on; `failed` or any status other than
-`completed` and `requires_action` raises with the API's message. A reply with nothing but thoughts is asked for
-again. Requests that fail with 408, 409, 429 or 5xx, or get no answer, are tried five times.
+status `incomplete` or `requires_continuation` was cut off and is answered with a request to go on; `failed` or any
+status other than `completed` and `requires_action` raises with the API's message. A reply with nothing but
+thoughts is asked for again. Requests that fail with 408, 409, 429 or 5xx, or get no answer, are tried five times
+with jittered backoff, respecting `Retry-After` when larger.
 
 Past `M.compact_at` prompt tokens the loop compacts: it asks the model, on a fork of the conversation, for a
 checkpoint (`M.compact_prompt`), and the conversation starts again from that text followed by `M.resume_prompt`

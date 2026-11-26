@@ -223,15 +223,16 @@ assert(type(M.main) == "function") print("loop ok")' | hx -q --run -
 ## Scripts: `hx --run`
 
 A script gets `host`, `json` and the standard Luau libraries, behind the same wall as the agent, with no model
-and no key. Its arguments are `host.args`, and `print` writes to stdout. There is no `require`: load another file
-with `host.load(host.read(path), "=" .. path)()`. An error exits 1. A script that returns a table with a `main`
-function is a module: `main()` runs, and the number it returns is the exit status.
+loop and needing no key. Its arguments are `host.args`, and `print` writes to stdout. There is no `require`: load
+another file with `host.load(host.read(path), "=" .. path)()`. An error exits 1. A script that returns a table
+with a `main` function is a module: `main()` runs, and the number it returns is the exit status.
 
 | Primitive | Returns |
 |---|---|
-| `host.sh(command, {timeout=120, input=, cwd=, env=, split=})` | `{out, err, code, signal, timed_out, seconds}`: `out` whole up to 16 MiB; with `split = true` it is stdout alone and `err` is stderr. `command` is a bash string, or `{program, arg, ...}` with no quoting needed; `input` goes to stdin; `cwd` is where it runs; `env` sets variables, `false` takes one away |
+| `host.post(endpoint, body, {timeout=600})` | `status, text[, retry_after]`, or `nil, error`: POST JSON (string `body`) or a multipart form (table with optional `file` path, up to 100 MiB) to `session`, `exa`, `contents` or a `--endpoint NAME=URL`. Returns `nil, error` for `exa`, `contents` or `--endpoint` without its key; `--run` needs no `GEMINI_API_KEY`, so `session` sends no key unless one was in the environment |
+| `host.sh(command, {timeout=120, input=, cwd=, env=, read=, write=, inert=, hangup=, split=})` | `{out, err, code, signal, timed_out, seconds, omitted, err_omitted}`: `out` whole up to 16 MiB, clipped past that (`omitted` counts lost bytes); with `split = true` it is stdout alone and `err` is stderr (`err_omitted` counts what `err` lost). `command` is a bash string, or `{program, arg, ...}` with no quoting needed; `input` goes to stdin; `cwd` is where it runs; `env` sets variables, `false` takes one away; `read`, `write` and `inert` list paths for a narrower wall; `hangup = true` ends it when stdin's writer hangs up |
 | `host.read(path)`, `host.write(path, data)`, `host.list(dir)` | the value, or `nil, error`: they do not raise. `write` makes missing directories |
-| `host.walk(dir, {glob=, depth=})`, `host.stat(path)` | every path under `dir`, sorted, `.git` left out, `"**/*.luau"`; `{type, size, mtime, mode, target}` of a path, a link not followed. Or `nil, error` |
+| `host.walk(dir, {glob=, depth=})`, `host.stat(path)` | every path under `dir`, sorted, `.git` left out, `"**/*.luau"`; `{type, size, mtime, mode, target, revision}` of a path, a link not followed (`revision` tracks file identity, size and timestamps). Or `nil, error` |
 | `host.load(source, name, env?)` | a function, or `nil, error` |
 | `host.try(fn, ...)`, `host.timed(seconds, fn, ...)` | `true, ...` or `false, error` |
 | `host.spawn(fn, ...)` | an id: forks hx, and the child runs `fn(...)` in a copy of the VM while the parent goes on. Only files and the string `fn` returns reach the parent |
@@ -240,12 +241,14 @@ function is a module: `main()` runs, and the number it returns is the exit statu
 | `host.clip(text, limit)` | `text`, or `head, tail` when it is longer |
 | `host.log(text)`, `host.input(prompt)` | a line to stderr; a line from stdin, or `nil` at its end |
 | `host.sleep(seconds)`, `host.env(name)` | |
-| `host.args`, `host.cwd`, `host.model`, `host.sandboxed`, `host.quiet`, `host.default_loop` | values, not calls |
+| `host.wall_time()`, `host.printable(text)` | epoch `seconds, nanoseconds`; `text` without terminal control characters (other than tab and newline) or reordering marks |
+| `host.args`, `host.cwd`, `host.model`, `host.sandboxed`, `host.quiet`, `host.tty`, `host.interactive`, `host.judged`, `host.workflow`, `host.default_loop` | values, not calls (`tty` for stdout, `interactive` for a prompt, `judged` for `--judge`, `workflow` for `"rpi"` or `nil`) |
+| `host.endpoints`, `host.extensions`, `host.skills` | read-only tables: reachable endpoints (`true` when keyed or keyless), built-in extension sources and built-in `SKILL.md` texts |
 | `json.encode(value, {indent=})`, `json.decode(text)`, `json.array(t)`, `json.null` | keys are written sorted; `indent` puts a member on each line |
 
 Ctrl-C raises `"interrupted"` again at every step until the outermost `host.try` or `host.timed` returns, so a
-plain `pcall` cannot swallow a stop. Inside `host.timed`, `sh`, `sleep` and the model call give up when the limit
-passes.
+plain `pcall` cannot swallow a stop. Inside `host.timed`, `post`, `sh` and `sleep` give up when the limit
+passes, and so do `read` and `write` waiting on a FIFO or a device.
 
 ## The judge
 
